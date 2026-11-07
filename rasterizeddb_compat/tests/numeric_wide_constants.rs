@@ -119,6 +119,11 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
         ("SELECT c FROM r UNION ALL SELECT d FROM r ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
         ("SELECT d FROM r UNION ALL SELECT c FROM r ORDER BY 1 DESC", &["44812.65", "3.1415", "-0.0001", "-2.55"]),
         ("SELECT c FROM r UNION ALL SELECT i FROM r ORDER BY 1", &["-2.55", "4", "7", "44812.65"]),
+        // An integer first: the column is `numeric` all the same, as
+        // PostgreSQL resolves it (it was refused, described as the integer).
+        ("SELECT i FROM r UNION ALL SELECT c FROM r ORDER BY 1", &["-2.55", "4", "7", "44812.65"]),
+        // Beside a float, `double precision`, each NUMERIC read at its scale.
+        ("SELECT c FROM r UNION ALL SELECT c::float8 FROM r ORDER BY 1", &["-2.55", "-2.55", "44812.65", "44812.65"]),
         ("SELECT c FROM r UNION SELECT d FROM r ORDER BY 1", &["-2.55", "-0.0001", "3.1415", "44812.65"]),
         ("SELECT c FROM u2 UNION SELECT d FROM u2", &["1.25"]),
         // A branch that is an expression, an aggregate or a constant has no
@@ -152,9 +157,6 @@ async fn wide_constants_and_mixed_scales_are_postgres_own() {
     // integer first branch over a NUMERIC one.
     for (sql, code) in [
         ("INSERT INTO ck VALUES (2, 1.123456789124)", "23514"),
-        ("SELECT i FROM r UNION ALL SELECT c FROM r", "0A000"),
-        // Never mixed with a float, which read as NUMERIC rendered blanks.
-        ("SELECT c FROM r UNION ALL SELECT c::float8 FROM r", "0A000"),
     ] {
         let got = text(&client, sql).await;
         if got != Err(code.to_string()) {

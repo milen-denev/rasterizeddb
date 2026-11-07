@@ -5422,11 +5422,17 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         }
         acc
     });
-    // PostgreSQL names the combined columns after the first branch.
+    // PostgreSQL names the combined columns after the first branch; one with
+    // no FROM by its constants' names.
     let names = parts
         .branches
         .first()
-        .map(|b| crate::core::rql::cte::output_names(b))
+        .map(|b| match crate::core::rql::set_ops::constant_branch(b).and_then(|_| {
+            crate::core::rql::no_from::parse(b.trim().trim_start_matches('(').trim_end_matches(')'))
+        }) {
+            Some(Ok(select)) => select.columns().into_iter().map(|(name, _)| Some(name)).collect(),
+            _ => crate::core::rql::cte::output_names(b),
+        })
         .unwrap_or_default();
     let widen = crate::core::rql::set_ops::widened_integers(&parts, database);
     let mut combined = match crate::core::rql::set_ops::Combined::new(
@@ -5450,28 +5456,19 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
             .branches
             .iter()
             .enumerate()
-            .map(|(at, b)| {
-                let mut types = crate::core::rql::cte::declared_item_types_among(b, database, &[]);
-                // Not in the first branch, which describes the column: a
-                // constant there is described as the float it is carried as.
-                if let Some(own) = recognize_query_purpose(b).and_then(|p| query_output_types(&p, database, at > 0)) {
-                    types.resize(types.len().max(own.len()), None);
-                    for (at, t) in own.into_iter().enumerate() {
-                        if types[at].is_none() {
-                            types[at] = Some(t);
-                        }
-                    }
-                }
-                types
-            })
+            .map(|(at, b)| crate::core::rql::set_ops::branch_types(b, database, &[], at > 0))
             .collect();
         if declared.iter().any(|d| d.iter().any(|t| *t == Some(crate::core::db_type::DbType::DECIMAL)))
             || parts.branches.len() > declared.iter().filter(|d| !d.is_empty()).count()
         {
+            // A branch with no FROM: the places each constant was written with.
             let scales: Vec<Option<Vec<u32>>> = parts
                 .branches
                 .iter()
-                .map(|b| recognize_query_purpose(b).and_then(|p| query_output_scales(&p, database)))
+                .map(|b| match crate::core::rql::set_ops::constant_branch(b) {
+                    Some(constants) => Some(constants.into_iter().map(|(_, scale)| scale).collect()),
+                    None => recognize_query_purpose(b).and_then(|p| query_output_scales(&p, database)),
+                })
                 .collect();
             match crate::core::rql::set_ops::union_decimal_scales(&declared, &scales) {
                 Ok(rescale) => combined.rescale(rescale),

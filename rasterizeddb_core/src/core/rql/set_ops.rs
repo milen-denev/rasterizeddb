@@ -28,6 +28,87 @@ use crate::core::db_type::DbType;
 use crate::core::row::row::{serialized_cells, serialized_rows};
 use crate::core::rql::join::UnionParts;
 
+/// A branch with no `FROM` (`SELECT 1.5, 'z'`): each item's type as
+/// PostgreSQL types the constant, and the places it was written with. An
+/// integer is `integer` (`bigint` past it), a number with a point
+/// `numeric`, a string `text`, `true`/`false` `boolean`, `NULL` unknown
+/// (`DbType::NULL`); anything else (an expression) unknown (`None`). `None`
+/// for a branch that has a `FROM`, or that this cannot read.
+///
+/// Without it, such a branch's types were unknown: a NUMERIC column beside it
+/// was refused, and an integer column never learned of its `2.5`, which went
+/// out as NULL under the integer's description.
+pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
+    let text = branch.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    if text.len() < 7 || !text[..7].eq_ignore_ascii_case("SELECT ") {
+        return None;
+    }
+    let list = &text[7..];
+    for keyword in ["FROM", "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET"] {
+        if crate::core::rql::join::find_keyword(list, keyword, 0).is_some() {
+            return None;
+        }
+    }
+    let list = crate::core::rql::cte::without_set_quantifier(list);
+    Some(
+        crate::core::rql::lexer_ct::split_definitions(list)
+            .iter()
+            .map(|item| {
+                let item = item.trim();
+                let value = match crate::core::rql::join::find_keyword(item, "AS", 0) {
+                    Some(at) => item[..at].trim(),
+                    None => item,
+                };
+                if value.eq_ignore_ascii_case("NULL") {
+                    (Some(DbType::NULL), 0)
+                } else if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") {
+                    (Some(DbType::BOOL), 0)
+                } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+                    (Some(DbType::STRING), 0)
+                } else if let Ok(n) = value.parse::<i64>() {
+                    (Some(if i32::try_from(n).is_ok() { DbType::I32 } else { DbType::I64 }), 0)
+                } else if value.trim_start_matches(['-', '+']).chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '-' | '+'))
+                    && value.chars().any(|c| c.is_ascii_digit())
+                {
+                    // `1.50`, `1e2`, `1.5e-3`: `numeric`, at the places
+                    // PostgreSQL shows it with (`1e2` is 100, `1e-2` 0.01).
+                    match crate::core::rql::pg_numeric::parse_text(value) {
+                        Some(n) => (Some(DbType::DECIMAL), n.s),
+                        None => (None, 0),
+                    }
+                } else {
+                    (None, 0)
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Each output column's type in `branch`: as declared, else as its select
+/// list types it, else as its constants are typed (`constant_branch`).
+pub fn branch_types(
+    branch: &str,
+    database: &Arc<Database>,
+    relations: &[(String, crate::core::rql::cte::ScratchFields)],
+    in_later_branch: bool,
+) -> Vec<Option<DbType>> {
+    if let Some(constants) = constant_branch(branch) {
+        return constants.into_iter().map(|(t, _)| t).collect();
+    }
+    let mut types = crate::core::rql::cte::declared_item_types_among(branch, database, relations);
+    if let Some(own) = crate::core::rql::lexer_s1::recognize_query_purpose(branch)
+        .and_then(|p| crate::core::rql::executor::query_output_types(&p, database, in_later_branch))
+    {
+        types.resize(types.len().max(own.len()), None);
+        for (at, t) in own.into_iter().enumerate() {
+            if types[at].is_none() {
+                types[at] = Some(t);
+            }
+        }
+    }
+    types
+}
+
 /// For each output column of a `UNION`, the integer type its values are
 /// widened to, when its branches declare integers of different widths, as
 /// PostgreSQL widens `int` and `bigint` to `bigint`. `None` where nothing
@@ -54,23 +135,8 @@ pub fn widened_branch_integers(
     // the select list's own. Unread, `SELECT i FROM nn UNION SELECT 1 FROM mm`
     // sent the constant's eight bytes under `i`'s int4 description, which
     // rendered empty.
-    let declared: Vec<Vec<Option<DbType>>> = branches
-        .iter()
-        .map(|branch| {
-            let mut types = crate::core::rql::cte::declared_item_types_among(branch, database, relations);
-            if let Some(own) = crate::core::rql::lexer_s1::recognize_query_purpose(branch)
-                .and_then(|p| crate::core::rql::executor::query_output_types(&p, database, false))
-            {
-                types.resize(types.len().max(own.len()), None);
-                for (at, t) in own.into_iter().enumerate() {
-                    if types[at].is_none() {
-                        types[at] = Some(t);
-                    }
-                }
-            }
-            types
-        })
-        .collect();
+    let declared: Vec<Vec<Option<DbType>>> =
+        branches.iter().map(|branch| branch_types(branch, database, relations, false)).collect();
     let width = declared.iter().map(Vec::len).min().unwrap_or(0);
     // `character(n)` in the first branch and text in another: PostgreSQL
     // resolves the column to `bpchar` (the first branch's type wins where each
@@ -98,6 +164,25 @@ pub fn widened_branch_integers(
             }
             let types: Vec<&DbType> =
                 declared.iter().map(|b| b[at].as_ref()).collect::<Option<Vec<_>>>()?;
+            // NUMERIC beside integers (or NULLs): PostgreSQL resolves the
+            // column to `numeric`, and each cell is carried as one at its own
+            // scale (`union_decimal_scales`). Described so whichever branch
+            // came first: an integer's description dropped `2.5` as NULL.
+            let integer = |t: &DbType| matches!(t, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32);
+            // A float beside other numbers: PostgreSQL resolves the column to
+            // `double precision`, every cell converted to one (`push_widened`).
+            let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+            if types.iter().any(|t| float(t))
+                && !types.iter().all(|t| **t == DbType::F64 || **t == DbType::NULL)
+                && types.iter().all(|t| float(t) || **t == DbType::DECIMAL || **t == DbType::NULL || integer(t))
+            {
+                return Some(DbType::F64);
+            }
+            if types.iter().any(|t| **t == DbType::DECIMAL)
+                && types.iter().all(|t| **t == DbType::DECIMAL || **t == DbType::NULL || integer(t))
+            {
+                return Some(DbType::DECIMAL);
+            }
             if types.windows(2).all(|w| w[0] == w[1]) {
                 return None;
             }
@@ -242,13 +327,16 @@ pub fn union_decimal_scales(
         if types.iter().any(Option::is_none) {
             return refuse("of a type this cannot tell in another (a constant with no FROM, a join)");
         }
-        if let Some(other) =
-            types.iter().flatten().find(|t| ***t != DbType::DECIMAL && ***t != DbType::NULL && !integer_type(t))
+        // A float makes the column `double precision` (`widened_branch_integers`):
+        // its NUMERIC cells are carried at their own scale first, so the
+        // conversion reads each at the right one.
+        let float = |t: &DbType| matches!(t, DbType::F32 | DbType::F64);
+        if let Some(other) = types
+            .iter()
+            .flatten()
+            .find(|t| ***t != DbType::DECIMAL && ***t != DbType::NULL && !integer_type(t) && !float(t))
         {
             return refuse(&format!("{other} in another"));
-        }
-        if *types[0].expect("known") != DbType::DECIMAL {
-            return refuse("an integer in the first, which this would describe as the integer");
         }
         // The scale each branch's cells are at: a column's declared one, an
         // expression's display scale or the engine's (`query_output_scales`).
@@ -333,11 +421,33 @@ fn push_widened(
             continue;
         }
         let wide = scaled.or_else(|| {
-            widen.get(position).and_then(|t| t.as_ref()).and_then(|ty| {
+            widen.get(position).and_then(|t| t.as_ref()).filter(|t| **t != DbType::F64).and_then(|ty| {
                 let bytes = integer_bytes(integer(&cell.column_type, cell.data)?, ty)?;
                 Some((ty.clone(), bytes))
             })
         });
+        // A column resolved to `double precision`: each number as one, a
+        // NUMERIC read at the scale it carries (rescaled above).
+        let wide = match widen.get(position) {
+            Some(Some(DbType::F64)) => {
+                let (ty, data) = match &wide {
+                    Some((ty, bytes)) => (ty.clone(), bytes.as_slice()),
+                    None => (cell.column_type.clone(), cell.data),
+                };
+                let value = match ty {
+                    DbType::F64 => le::<8>(data).map(f64::from_le_bytes),
+                    DbType::F32 => le::<4>(data).map(|b| f32::from_le_bytes(b) as f64),
+                    DbType::DECIMAL => decimal_at(data, crate::core::value_codec::DECIMAL_SCALE)
+                        .and_then(|(m, s)| format!("{m}e-{s}").parse::<f64>().ok()),
+                    ref t => integer(t, data).map(|v| v as f64),
+                };
+                match value {
+                    Some(v) => Some((DbType::F64, v.to_le_bytes().to_vec())),
+                    None => wide,
+                }
+            }
+            _ => wide,
+        };
         let (ty, data) = match &wide {
             Some((ty, bytes)) => (ty, bytes.as_slice()),
             None => (&cell.column_type, cell.data),

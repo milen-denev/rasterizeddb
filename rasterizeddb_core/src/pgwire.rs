@@ -4274,7 +4274,12 @@ pub(crate) async fn describe_query(
     // A parenthesised first branch of a `UNION` is described on its own, as
     // the simple query path plans it.
     let first_branch = match crate::core::rql::join::split_union(stmt) {
-        Some(Ok(parts)) if stmt.starts_with('(') => parts.branches.into_iter().next(),
+        Some(Ok(parts))
+            if stmt.starts_with('(')
+                || parts.branches.first().is_some_and(|b| crate::core::rql::set_ops::constant_branch(b).is_some()) =>
+        {
+            parts.branches.into_iter().next()
+        }
         _ => None,
     };
     match describe_resolved(database, first_branch.as_deref().unwrap_or(stmt), &[]).await? {
@@ -6894,6 +6899,12 @@ fn result_description(
         // the command.
         #[cfg(feature = "kv_cache")]
         QueryPurpose::KvCache(sql) => Some(crate::core::kv_cache::sql::result_fields(sql)),
+        // A set operation whose first branch has no FROM: described by that
+        // branch's constants (`no_from`), as `describe_query` describes it;
+        // its columns are widened with the others below.
+        QueryPurpose::QueryRows(qr) if from_less_first_branch(&qr.query).is_some() => {
+            from_less_first_branch(&qr.query)
+        }
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
             let schema_of = |name: &str| database.schema_view(name).map(|t| t.schema().fields.clone());
             match crate::core::rql::join::plan_statement(&crate::core::rql::join::first_branch(&qr.query), &schema_of) {
@@ -10195,6 +10206,22 @@ fn validate_serialized_rows(rows_bytes: &[u8]) -> io::Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+/// The columns of a set operation's first branch when it has no `FROM`
+/// (`SELECT 1.5 UNION SELECT n FROM t`), read from its constants; `None`
+/// otherwise. Planned as a whole, the statement read the select list up to
+/// the next branch's `FROM` (`1.5 UNION SELECT n`).
+fn from_less_first_branch(query: &str) -> Option<Vec<(String, DbType)>> {
+    let Some(Ok(parts)) = crate::core::rql::join::split_union(query) else {
+        return None;
+    };
+    let first = parts.branches.first()?;
+    crate::core::rql::set_ops::constant_branch(first)?;
+    match crate::core::rql::no_from::parse(first.trim().trim_start_matches('(').trim_end_matches(')')) {
+        Some(Ok(select)) => Some(select.columns()),
+        _ => None,
+    }
 }
 
 /// The columns a serialized result goes out under: `fields` when the

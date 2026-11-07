@@ -171,7 +171,7 @@ fn item_label(item: &str) -> Option<String> {
 /// a` names its column `a`, as PostgreSQL does. Read as part of the item, the
 /// first column was `DISTINCT a`, which names nothing, and a derived table or
 /// a `WITH` over it was refused as having "a column this cannot name".
-fn without_set_quantifier(list: &str) -> &str {
+pub(crate) fn without_set_quantifier(list: &str) -> &str {
     let trimmed = list.trim_start();
     let word = |w: &str| {
         trimmed.len() > w.len()

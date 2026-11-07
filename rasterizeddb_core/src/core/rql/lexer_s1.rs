@@ -658,6 +658,11 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
             } else {
                 None
             }
+        } else if let Some(Ok(_)) = crate::core::rql::join::split_union(query_trimmed) {
+            // A set operation of branches with no FROM (`SELECT 1.5 UNION
+            // SELECT 2.25`): a query over no relation, which the executor's
+            // set-operation path runs branch by branch.
+            Some(QueryRows(QueryRowsData { table_name: String::new(), query: query_trimmed.to_string() }))
         } else {
             None
         }
