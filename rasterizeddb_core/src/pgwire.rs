@@ -7655,6 +7655,7 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // type jsonb but expression is of type integer").
     if (has("foreign key constraint") && has("cannot be implemented") && has("are of incompatible types"))
         || has(" but expression is of type ")
+        || has("cannot be cast automatically to type")
     {
         return "42804";
     }

@@ -288,12 +288,13 @@ fn every_metadata_ddl_answers_like_a_plain_twin_and_survives_a_restart() {
     pair.ok("ALTER TABLE {t} DROP COLUMN f");
     pair.fails_alike("SELECT f FROM {t}");
     pair.refused("ALTER TABLE {t} DROP COLUMN tenant_id", "partition key column");
-    // Rewritten into a new uid (phase 6 P8), like the twin; a storage-type
-    // change is refused on both.
+    // Rewritten into a new uid (phase 6 P8), like the twin; so is a type
+    // change, every value converted (`retype_by_cast`).
     pair.ok("ALTER TABLE {t} ADD COLUMN extra INT");
     pair.ok("ALTER TABLE {t} ADD COLUMN extra2 INT DEFAULT 5");
     pair.ok("SELECT tenant_id, id, extra, extra2 FROM {t} ORDER BY tenant_id, id");
-    pair.fails_alike("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT");
+    pair.ok("ALTER TABLE {t} ALTER COLUMN n TYPE BIGINT");
+    pair.ok("SELECT tenant_id, id, n FROM {t} ORDER BY tenant_id, id");
     pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id TYPE INT", "partition key column");
     pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS n INT");
     pair.fails("ALTER TABLE {t} ADD COLUMN n INT", "42701");

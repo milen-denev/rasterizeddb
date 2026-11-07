@@ -402,8 +402,8 @@ fn foreign_keys_onto_a_partitioned_table_reference_its_partition_key() {
 }
 
 /// Metadata DDL on a partitioned table runs (phase 3 P1, §11), and what
-/// rewrites every row does so (phase 6 P8); a storage-type change and a key
-/// column's change are refused with 0A000 before they write: the shell's schema file is unchanged and
+/// rewrites every row does so (phase 6 P8), a type change among them; a key
+/// column's change is refused with 0A000 before it writes: the shell's schema file is unchanged and
 /// no catalogue row is written.
 #[test]
 fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
@@ -421,8 +421,6 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
         let before = on_disk_schema(&db, "pd_alt").await;
         let len = catalogue_len(&db).await;
         for (sql, why) in [
-            // A storage-type change, refused on any table.
-            ("ALTER TABLE pd_alt ALTER COLUMN n TYPE BIGINT", "rewrite every row"),
             ("ALTER TABLE pd_alt ALTER COLUMN k TYPE BIGINT", "partition key column"),
             ("ALTER TABLE pd_alt ALTER COLUMN k DROP NOT NULL", "must be NOT NULL"),
             ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column"),
@@ -468,6 +466,11 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
         run(&db, "ALTER TABLE pd_alt2 ADD COLUMN x INT DEFAULT 7").await.expect("a populated ADD COLUMN");
         run(&db, "ALTER TABLE IF EXISTS pd_alt2 ADD COLUMN y INT").await.expect("IF EXISTS");
         assert!(db.is_partitioned("pd_alt2"));
+        // A type change rewrites every row the same way, each value converted.
+        run(&db, "ALTER TABLE pd_alt2 ALTER COLUMN m TYPE BIGINT").await.expect("a type change");
+        assert!(db.is_partitioned("pd_alt2"));
+        let e = run(&db, "ALTER TABLE pd_alt2 ALTER COLUMN m TYPE BOOLEAN").await.expect_err("no assignment cast");
+        assert!(e.contains("cannot be cast automatically"), "{e}");
     });
 }
 

@@ -350,10 +350,9 @@ const REFUSED: &[Refusal] = &[
     refused(UniqueWithoutKey, "never (§1b)"),
     refused(DropNotNullKey, "never (§1.5)"),
     refused(DropKeyColumn, "never (§1.5)"),
-    // AddColumnPopulated is built (phase 6 P8, every row rewritten into a
-    // new uid) and compared with the twin. AlterType (INT to BIGINT) is a
-    // storage-type change, which no table supports yet.
-    refused(AlterType, "a storage-type change, on any table"),
+    // AddColumnPopulated and AlterType (INT to BIGINT, every value
+    // converted) are built (phase 6 P8, every row rewritten into a new uid)
+    // and compared with the twin.
     Refusal {
         kind: DropNotNull,
         code: "0A000",
@@ -2741,9 +2740,10 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         let op = generator.op(kind);
         twin.run(at, &op);
         generator.reshaped = twin.reshaped;
-        // A populated ADD COLUMN rewrites the table into a new uid (phase 6
-        // P8), and only it does.
-        if kind == AddColumnPopulated
+        // A populated ADD COLUMN and a type change rewrite the table into a
+        // new uid (phase 6 P8), and only they do (a type change to the type
+        // the column has is a no-op, and keeps it).
+        if matches!(kind, AddColumnPopulated | AlterType)
             && let Some(now) = twin.server.as_ref().unwrap().db.partitioned_table(PART).map(|t| t.uid())
         {
             twin.uid = now;
