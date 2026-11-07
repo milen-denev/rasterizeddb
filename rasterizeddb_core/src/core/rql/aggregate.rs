@@ -3840,7 +3840,7 @@ mod fold_bench {
         let which = std::env::var("FOLD_BENCH_IMPL").unwrap_or_else(|_| "new".into());
         let k = SchemaField::new("k".into(), DbType::I64, 8, 0, 0, false);
         let v = SchemaField::new("v".into(), DbType::I64, 8, 0, 1, false);
-        let agg = |func, arg: Option<SchemaField>| SelectItem::Aggregate { distinct: false,
+        let agg = |func, arg: Option<SchemaField>| SelectItem::Aggregate { distinct: false, call: None,
             func,
             arg,
             label: "a".into(),
@@ -3894,6 +3894,44 @@ mod fold_bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Partial folds of a collecting aggregate (one per worker) append, and
+    /// the call's order is applied once over the union; partial boolean
+    /// folds combine. A fold split across workers merges these.
+    ///
+    /// Mutation: `merge` dropping the other worker's values.
+    #[test]
+    fn collecting_and_boolean_partials_merge_into_one_answer() {
+        let text = SchemaField::new("s".to_string(), DbType::STRING, 0, 0, 0, false);
+        let key = |n: i32| vec![Some((n.to_le_bytes().to_vec(), DbType::I32))];
+        let partial = |pairs: &[(i32, &str)]| {
+            let mut acc = Acc::new(AggFunc::StringAgg, Some(&text));
+            if let Acc::Collect { values, order, delimiter, .. } = &mut acc {
+                *order = vec![(true, true)];
+                *delimiter = Some(",".to_string());
+                for (k, v) in pairs {
+                    values.push((key(*k), Some(v.as_bytes().to_vec())));
+                }
+            }
+            acc
+        };
+        let mut a = partial(&[(1, "a"), (4, "d")]);
+        let b = partial(&[(3, "c"), (2, "b")]);
+        a.merge(&b);
+        let out = a.finish_nullable(AggFunc::StringAgg, &DbType::STRING).unwrap().unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "d,c,b,a");
+
+        let boolean = SchemaField::new("b".to_string(), DbType::BOOL, 1, 0, 0, false);
+        let mut x = Acc::new(AggFunc::BoolAnd, Some(&boolean));
+        x.accumulate(Some(&[1]), Some(&DbType::BOOL));
+        let mut y = Acc::new(AggFunc::BoolAnd, Some(&boolean));
+        y.accumulate(Some(&[0]), Some(&DbType::BOOL));
+        x.merge(&y);
+        assert_eq!(x.finish_nullable(AggFunc::BoolAnd, &DbType::BOOL).unwrap(), Some(vec![0]));
+        assert_eq!(x.finish_nullable(AggFunc::BoolOr, &DbType::BOOL).unwrap(), Some(vec![1]));
+        let none = Acc::new(AggFunc::BoolOr, Some(&boolean));
+        assert_eq!(none.finish_nullable(AggFunc::BoolOr, &DbType::BOOL).unwrap(), None);
+    }
 
     #[test]
     fn gen_random_uuid_differs_every_call() {
@@ -3981,7 +4019,7 @@ mod tests {
     }
 
     fn agg(func: AggFunc, arg: Option<SchemaField>) -> SelectItem {
-        SelectItem::Aggregate { distinct: false,
+        SelectItem::Aggregate { distinct: false, call: None,
             func,
             arg,
             label: func.name().to_string(),
@@ -4063,7 +4101,7 @@ mod tests {
                 label,
                 arg_expr,
                 ..
-            } => SelectItem::Aggregate { distinct: false,
+            } => SelectItem::Aggregate { distinct: false, call: None,
                 func,
                 arg,
                 label,
@@ -4159,6 +4197,7 @@ mod tests {
                 arg: Some(f.clone()),
                 arg_expr: None,
                 filter: None,
+                call: None,
             }],
             db_type: DbType::I64,
             label: "next".to_string(),
@@ -4254,6 +4293,7 @@ mod tests {
                 arg: Some(f),
                 arg_expr: None,
                 filter: None,
+                call: None,
             }],
             db_type: DbType::I64,
             label: "x".to_string(),
@@ -5350,7 +5390,7 @@ mod fold_equivalence {
     }
 
     fn agg(func: AggFunc, arg: Option<SchemaField>, label: &str) -> SelectItem {
-        SelectItem::Aggregate { distinct: false,
+        SelectItem::Aggregate { distinct: false, call: None,
             func,
             arg,
             label: label.to_string(),
@@ -5527,7 +5567,7 @@ mod fold_equivalence {
                 db_type: DbType::I64,
                 label: "k2p1".into(),
             },
-            SelectItem::Aggregate { distinct: false,
+            SelectItem::Aggregate { distinct: false, call: None,
                 func: AggFunc::Sum,
                 arg: Some(v.clone()),
                 label: "pos".into(),
