@@ -1068,6 +1068,19 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             }
         }
 
+        // A text column or value against a number or boolean written without
+        // quotes: PostgreSQL types `5` as an integer and `true` as a boolean,
+        // and has no `text = integer` or `text > boolean`. Reconciliation
+        // below would make the literal text, so `g = 5` matched no row and
+        // `g > 1` compared 'x' with '1' and matched them all.
+        if comparing {
+            if let Some(message) =
+                Self::text_against_typed_literal(op_str, &left_op, &left_type, &right_op, &right_type)
+            {
+                return Err(message);
+            }
+        }
+
         // A literal's type comes from how it was written, not from what it is
         // compared against: `200` is an `i32` and `'1111-…'` is text, even when
         // the column is a `DECIMAL` or a `UUID`. The evaluator does no
@@ -1190,6 +1203,57 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             if op_str == "!=" { "<>" } else { op_str },
             name(right_op, right_type)
         ))
+    }
+
+    /// PostgreSQL's 42883 for a text operand against a number or boolean
+    /// literal, or `None`. A quoted literal is text here and is not one: it
+    /// is an untyped constant that takes the other side's type, as `n = '5'`
+    /// does. A literal written with a fraction is a `numeric` to PostgreSQL
+    /// (the engine parses it as a float).
+    fn text_against_typed_literal(
+        op_str: &str,
+        left_op: &ComparisonOperand,
+        left_type: &DbType,
+        right_op: &ComparisonOperand,
+        right_type: &DbType,
+    ) -> Option<String> {
+        let text = |o: &ComparisonOperand, t: &DbType| {
+            !matches!(o, ComparisonOperand::Direct(_))
+                && matches!(t, DbType::STRING | DbType::CHAR | DbType::BPCHAR(_))
+        };
+        let typed_literal = |o: &ComparisonOperand, t: &DbType| -> Option<&'static str> {
+            if !matches!(o, ComparisonOperand::Direct(_)) {
+                return None;
+            }
+            Some(match t {
+                DbType::F32 | DbType::F64 => "numeric",
+                DbType::I8
+                | DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::I128
+                | DbType::U8
+                | DbType::U16
+                | DbType::U32
+                | DbType::U64
+                | DbType::U128
+                | DbType::DECIMAL
+                | DbType::BOOL => crate::core::value_codec::pg_input_type_name(t),
+                _ => return None,
+            })
+        };
+        let op = if op_str == "!=" { "<>" } else { op_str };
+        if text(left_op, left_type) {
+            if let Some(name) = typed_literal(right_op, right_type) {
+                return Some(format!("operator does not exist: text {op} {name}"));
+            }
+        }
+        if text(right_op, right_type) {
+            if let Some(name) = typed_literal(left_op, left_type) {
+                return Some(format!("operator does not exist: {name} {op} text"));
+            }
+        }
+        None
     }
 
     /// The refusal for a computed operand that is still of a different type

@@ -680,6 +680,32 @@ impl KeyNumber {
     }
 }
 
+/// PostgreSQL's 42883 for a join key pairing a text column with a column of
+/// any other type but a legacy `CHAR`, or `None`. Text has no implicit cast
+/// to a number, a boolean, a date or a uuid, so `a.g = b.id` with `g` text
+/// and `id` an integer has no operator. Matched by bytes, the two never met
+/// and the join answered no rows.
+fn key_type_mismatch(l: &SchemaField, r: &SchemaField) -> Option<String> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    let text_name = |f: &SchemaField| -> Option<&'static str> {
+        match (&f.db_type, f.text_typmod()) {
+            (DbType::STRING, Some(TextTypmod::Varchar(_))) => Some("character varying"),
+            (DbType::STRING, Some(TextTypmod::Bpchar(_))) | (DbType::BPCHAR(_), _) => Some("character"),
+            (DbType::STRING, _) => Some("text"),
+            _ => None,
+        }
+    };
+    let other = |f: &SchemaField| match f.db_type {
+        DbType::STRING | DbType::BPCHAR(_) | DbType::CHAR | DbType::NULL | DbType::UNKNOWN => None,
+        _ => Some(crate::core::value_codec::pg_input_type_name(&f.literal_type())),
+    };
+    match (text_name(l), text_name(r)) {
+        (Some(t), None) => other(r).map(|o| format!("operator does not exist: {t} = {o}")),
+        (None, Some(t)) => other(l).map(|o| format!("operator does not exist: {o} = {t}")),
+        _ => None,
+    }
+}
+
 /// The numeric reading two key columns need, when they need one: numbers of
 /// different types or scales (an unconstrained NUMERIC is at nine places).
 fn key_numbers(l: &SchemaField, r: &SchemaField) -> Option<(KeyNumber, KeyNumber)> {
@@ -1105,6 +1131,9 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                 });
             match (l, r) {
                 (Some((mut l, l_doc, l_kind, l_field)), Some((mut r, r_doc, r_kind, r_field))) => {
+                    if let Some(message) = key_type_mismatch(&l_field, &r_field) {
+                        return Err(message);
+                    }
                     // Numbers of different types or scales meet by value.
                     if let Some((ln, rn)) = key_numbers(&l_field, &r_field) {
                         l.number = Some(ln);

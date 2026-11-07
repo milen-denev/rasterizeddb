@@ -414,3 +414,47 @@ async fn create_table_as_matches_postgresql() {
     assert!(prepared.columns().is_empty());
     assert_eq!(c.execute(&prepared, &[]).await.unwrap(), 3);
 }
+
+/// A text value compared with a number or a boolean written without quotes
+/// is PostgreSQL's 42883: it types `1` as an integer, `1.5` as a numeric and
+/// `true` as a boolean, and has no operator between them and text. The engine
+/// read the literal as text instead: `g = 1` matched only the text '1', and
+/// `g > 1` compared 'x' with '1' and returned every row. A quoted literal is
+/// untyped and takes the other side's type, as in PostgreSQL.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_against_a_number_is_refused_as_postgresql_refuses_it() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE a (id INT, g TEXT, c CHAR(2), v VARCHAR(5))",
+        "CREATE TABLE b (id INT, w INT)",
+        "INSERT INTO a VALUES (1, '1', 'x', '5'), (2, 'x', '2', 'y')",
+        "INSERT INTO b VALUES (1, 10)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SELECT id FROM a WHERE g = 1",
+        "SELECT id FROM a WHERE g > 1",
+        "SELECT id FROM a WHERE 1 = g",
+        "SELECT id FROM a WHERE g <> 1.5",
+        "SELECT id FROM a WHERE g = true",
+        "SELECT id FROM a WHERE v = 5",
+        "SELECT id FROM a WHERE c = 2",
+        "SELECT id, g = 1 FROM a ORDER BY id",
+        "SELECT a.id FROM a JOIN b ON a.g = b.id",
+    ] {
+        let e = c.simple_query(sql).await.expect_err(sql);
+        assert_eq!(e.code().map(|s| s.code()), Some("42883"), "{sql}: {e}");
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT id FROM a WHERE g = '1' ORDER BY id", &["1"]),
+        ("SELECT id FROM a WHERE id = '2'", &["2"]),
+        ("SELECT id FROM a WHERE g IS NULL OR g = 'x' ORDER BY id", &["2"]),
+        ("SELECT id, g = '1' FROM a ORDER BY id", &["1|t", "2|f"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+}

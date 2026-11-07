@@ -2010,7 +2010,7 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
         if let Some(at) = find_operator(text, token) {
             let mut left = Box::new(parse(&text[..at], schema)?);
             let mut right = Box::new(parse(&text[at + token.len()..], schema)?);
-            text_against_float(&left, token, &right)?;
+            text_against_number(&left, token, &right)?;
             // A string compared with a `character(n)` value is read without
             // its trailing spaces, as the value is held (`yields_bpchar`).
             if yields_bpchar(&left) {
@@ -2048,12 +2048,13 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
     Err(format!("condition '{}' is not a comparison", text))
 }
 
-/// PostgreSQL's 42883 for a text value compared with a float: `text =
-/// double precision` has no operator (`t = '1'::float8` in a select list,
-/// a CHECK, a join's condition). A quoted literal is not text here: it is
-/// an untyped constant that takes the other side's type, as `f = '1.5'` does.
-/// It used to answer false.
-fn text_against_float(left: &Expr, op: &str, right: &Expr) -> Result<(), String> {
+/// PostgreSQL's 42883 for a text value compared with a number or a
+/// boolean: `text = double precision`, `text = integer`, `text > boolean`
+/// have no operator (`t = 5` or `t = '1'::float8` in a select list, a CHECK,
+/// a join's condition). A quoted literal is not text here: it is an untyped
+/// constant that takes the other side's type, as `f = '1.5'` does. It used
+/// to answer false for a float, and for an integer to compare the text.
+fn text_against_number(left: &Expr, op: &str, right: &Expr) -> Result<(), String> {
     let text = |e: &Expr| {
         !matches!(e, Expr::Literal { .. } | Expr::Null)
             && matches!(static_type(e), DbType::STRING | DbType::CHAR | DbType::BPCHAR(_))
@@ -2061,6 +2062,18 @@ fn text_against_float(left: &Expr, op: &str, right: &Expr) -> Result<(), String>
     let float = |e: &Expr| match static_type(e) {
         DbType::F64 => Some("double precision"),
         DbType::F32 => Some("real"),
+        t @ (DbType::I8
+        | DbType::I16
+        | DbType::I32
+        | DbType::I64
+        | DbType::I128
+        | DbType::U8
+        | DbType::U16
+        | DbType::U32
+        | DbType::U64
+        | DbType::U128
+        | DbType::DECIMAL
+        | DbType::BOOL) => Some(crate::core::value_codec::pg_input_type_name(&t)),
         _ => None,
     };
     if text(left) {
