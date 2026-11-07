@@ -670,14 +670,14 @@ async fn route_where_narrows_only_on_key_predicates() {
 
 #[test]
 fn the_declared_partition_cap_is_per_database_and_inclusive() {
-    assert_eq!(MAX_DECLARED_PER_DATABASE, 65_536);
+    assert_eq!(MAX_DECLARED_PER_DATABASE, 1 << 20);
     assert_eq!(MAX_DECLARED_PER_DATABASE, super::map::MAX_INITIAL);
     assert_eq!(DEFAULT_PARTITIONS, 64);
     let cap = MAX_DECLARED_PER_DATABASE as u64;
-    check_declared_cap(0, 65_536).unwrap();
+    check_declared_cap(0, 1 << 20).unwrap();
     check_declared_cap(cap / 2, (cap / 2) as u32).unwrap();
     check_declared_cap(cap - 64, 64).unwrap();
-    for (declared, adding) in [(0, 65_537), (cap - 63, 64), (cap, 1), (u64::MAX, 1)] {
+    for (declared, adding) in [(0, (1 << 20) + 1), (cap - 63, 64), (cap, 1), (u64::MAX, 1)] {
         let e = check_declared_cap(declared, adding).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
         assert!(e.to_string().contains("not supported"), "{e}");
@@ -1065,4 +1065,24 @@ async fn an_unreplayed_map_log_leaves_the_declared_count_unknown() {
     let e = declared_in([&a, &b]).unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
     assert!(e.to_string().contains("not supported"), "{e}");
+}
+
+/// A `MATERIALIZE` whose append fails leaves the in-memory state as it was
+/// (`materialize_at` applies in place and restores, plan item 4): the write
+/// fails, and the next one materializes the partition. Mutation: without the
+/// restore the retry is refused as "materialized twice", and with the
+/// partition recorded at a location its row never reached.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_materialize_append_leaves_the_partition_unmaterialized() {
+    let f = fixture().await;
+    let t = create(&f, UID, DbType::I64, 8).await;
+    super::table::materialize_hooks::fail_next(f.dir.path());
+    let e = t.insert_row_in_txn(row(&t, 42, 1), FROZEN_TX).await.unwrap_err();
+    assert!(e.to_string().contains("injected MATERIALIZE"), "{e}");
+    assert!(t.materialized_pids().unwrap().is_empty());
+    insert(&t, 42, 2).await;
+    assert_eq!(t.materialized_pids().unwrap().len(), 1);
+    drop(t);
+    let t = open(&f, UID).await;
+    assert_eq!(t.materialized_pids().unwrap().len(), 1);
 }

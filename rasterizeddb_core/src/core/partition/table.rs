@@ -104,13 +104,14 @@ use crate::core::storage_providers::traits::StorageIO;
 pub const DEFAULT_PARTITIONS: u32 = 64;
 
 /// The most partitions one database may declare across all its tables
-/// (§7.1): 65,536 from phase 3 P5b-3, the most one map lays out
-/// (`map::MAX_INITIAL`). Phase 2's 2,048 stood because every materialized
-/// partition opened at startup; from P5b partitions open on demand under the
-/// open budget, so what a declared partition costs at rest is a map entry
-/// and, once written, its files and a slot. Per database, not per process or
-/// node: a refusal must depend only on replicated state (§12).
-pub const MAX_DECLARED_PER_DATABASE: u32 = 65_536;
+/// (§7.1): 2²⁰, the most one map lays out (`map::MAX_INITIAL`), from plan
+/// item 4's measurement (`cap_scale_tests`, docs/partitioning.md "The cap"):
+/// a declared partition costs about 630 bytes resident whether or not it is
+/// ever written, and a first write no longer depends on how many are
+/// declared. 65,536 from phase 3 P5b-3; phase 2's 2,048 stood while every
+/// materialized partition opened at startup. Per database, not per process
+/// or node: a refusal must depend only on replicated state (§12).
+pub const MAX_DECLARED_PER_DATABASE: u32 = 1_048_576;
 
 /// The only location index phase 2a writes or opens: the root.
 const ROOT_LOC: u32 = 0;
@@ -2631,15 +2632,33 @@ impl Parts {
             },
         };
         let rec = Record::Materialize { pid, floor, loc };
-        let mut next = state.clone();
-        next.apply(&rec).map_err(invalid)?;
+        // Applied in place and put back if the append fails, as
+        // `PinBoard::first_write` does with `DIRTY`: under the state lock
+        // nobody sees the state in between. A copy of the whole state to
+        // apply to made every first write cost the declared count (13 ms a
+        // partition at 2²⁰ declared, 0.8 ms at 2¹⁶; plan item 4).
+        let saved = *state
+            .part(pid)
+            .ok_or_else(|| io::Error::other(format!("internal routing error: the map has no partition {pid}")))?;
+        state.apply(&rec).map_err(invalid)?;
+        #[cfg(test)]
+        let injected = materialize_hooks::fails(&self.root);
+        #[cfg(not(test))]
+        let injected = false;
         // Durable before any row reaches the partition's files, once per
         // partition. Left to the rows' own sync, a crash could lose the
         // record while writeback kept row pages in the new files, and with
         // the map's tail torn the open refuses the whole table for
         // unexplained data (`refuse_torn_leftovers`).
-        self.board.log.append_durable(&rec).await?;
-        *state = next;
+        let appended = if injected {
+            Err(io::Error::other("injected MATERIALIZE append failure"))
+        } else {
+            self.board.log.append_durable(&rec).await
+        };
+        if let Err(e) = appended {
+            state.restore_part(pid, saved);
+            return Err(e);
+        }
         if let Some(dir) = dir {
             let _ = slot.dir.set(dir);
         }
@@ -3032,6 +3051,31 @@ pub(crate) mod instance_count {
     /// The violations recorded under `dir`.
     pub(crate) fn violations(dir: &Path) -> Vec<String> {
         VIOLATIONS.lock().iter().filter(|(d, _)| d.starts_with(dir)).map(|(_, v)| v.clone()).collect()
+    }
+}
+
+/// Test-only: a failing `MATERIALIZE` append, per directory.
+#[cfg(test)]
+pub(crate) mod materialize_hooks {
+    use std::path::{Path, PathBuf};
+
+    static FAILING: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    /// The next `MATERIALIZE` append of a table rooted under `dir` fails,
+    /// as a full disk would, after the record is applied in memory.
+    pub(crate) fn fail_next(dir: &Path) {
+        FAILING.lock().push(dir.to_path_buf());
+    }
+
+    pub(super) fn fails(root: &Path) -> bool {
+        let mut failing = FAILING.lock();
+        match failing.iter().position(|d| root.starts_with(d)) {
+            Some(i) => {
+                failing.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 }
 

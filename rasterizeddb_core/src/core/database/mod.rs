@@ -36,6 +36,8 @@ mod partition_resident_tests;
 #[cfg(test)]
 mod lazy_resident_tests;
 #[cfg(test)]
+mod cap_scale_tests;
+#[cfg(test)]
 mod relation_dispatch_tests;
 #[cfg(test)]
 mod reaper_tests;

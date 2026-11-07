@@ -12,7 +12,7 @@ across a close, [as built](#phase-3-p5b-1-as-built)) and P5b-2a (the open
 budget, its sharded CLOCK, idle close and the seal at close,
 [as built](#phase-3-p5b-2a-as-built)), P5b-2b (scan-only fan-out opens,
 [as built](#phase-3-p5b-2b-as-built)) and P5b-3 (prompt descriptor release,
-the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built)), phase 4's P6
+the cap at 65,536, the default N measured, [as built](#phase-3-p5b-3-as-built); the cap at 2²⁰ from plan item 4, [measured](#the-cap-measured-at-one-million)), phase 4's P6
 (placement across storage locations, [as built](#phase-4-p6-as-built)), and phase 5's P7
 (reshape: `SPLIT PARTITION`, `MERGE PARTITIONS`, `ISOLATE KEY`, `SPLIT KEY`,
 `STORAGE MOVE PARTITION`, under ACCESS EXCLUSIVE, [as built](#phase-5-p7-as-built)), and
@@ -607,7 +607,7 @@ says. Refused with a reason: a plain table; a non-leading column; a
 one-point partition split; non-adjacent merges; `SPLIT KEY` on a one-column
 key or naming every key column (one point), or a count that is not a power
 of two in 2..1024; a key whose block already spans partitions (merge
-first); more than 65,536 partitions.
+first); more than 1,048,576 partitions (`MAX_DECLARED_PER_DATABASE`).
 
 **As built, the whole reshape runs under ACCESS EXCLUSIVE on the logical
 name**, not with writers running and a fence for the delta (§6.2 steps
@@ -879,7 +879,7 @@ back to their count before within a second, then the same after a restart.
 partitioned case (it held before). `the_budget_counts_what_tables_and_
 partitions_hold` now pins the settled twenty (it asserted at least 40).
 
-**The cap: 65,536 per database** (`MAX_DECLARED_PER_DATABASE`), from
+**The cap: 65,536 per database** (raised to 2²⁰ by plan item 4, [below](#the-cap-measured-at-one-million)) (`MAX_DECLARED_PER_DATABASE`), from
 2,048. Phase 2's figure stood because every materialized partition opened at
 startup; from P5b a declared partition costs a map entry at rest and, once
 written, its files and a slot. 65,536 is the most one map lays out
@@ -957,6 +957,48 @@ after a clean run does not.
 | a plain open stamping the count only when its listing lands | `budget::tests::a_plain_open_claims_a_due_refresh_before_spawning_it` |
 | the eager load not asking for routed evidence | `a_fan_out_loads_at_once_only_where_routed_traffic_went` |
 | a plain open claiming the refresh but never counting | `plain_tables_opening_keep_the_descriptor_count_fresh` |
+
+### The cap, measured at one million
+
+Plan item 4 (2026-11-07): `MAX_DECLARED_PER_DATABASE` and `map::MAX_INITIAL`
+are 1,048,576 (2²⁰), from 65,536. The measurement is
+`database::cap_scale_tests::declared_partition_scale` (ignored, by hand:
+`CAP_N`, `CAP_TENANTS`, `CAP_DIR`). One table of `CAP_N` declared partitions,
+1,000 tenants written one row each, then reads, a restart and a drop. Release
+build, tmpfs, an idle box:
+
+| | 65,536 | 262,144 | 1,048,576 |
+|---|---|---|---|
+| CREATE | 27–33 ms | 106 ms | 460 ms |
+| map log on disk | 1.6 MB | 6.3 MB | 25 MB |
+| resident, per declared partition | ~720 B | ~650 B | ~630 B |
+| first write of a tenant, before the fix | 0.83 ms | 3.56 ms | 13.35 ms |
+| first write of a tenant, after | 0.21 ms | | 0.26 ms |
+| reopen | 56–62 ms | 284 ms | 1.15 s |
+| routed read | | | 0.1–0.4 ms |
+| unrouted `COUNT(*)`, 1,000 written, warm | 6.6 ms | 8.4 ms | 19 ms |
+| `SHOW PARTITIONS t` | 34 ms, 13 MB | 118 ms, 52 MB | 0.5 s, 207 MB |
+| DROP | 49 ms | 84 ms | 212 ms |
+
+**The fix.** Every first write cost time in the declared count:
+`materialize_at` applied its `MATERIALIZE` to a copy of the whole map state
+(`state.clone()`, every `PartState` and every map entry) so that a failed
+append left the live state alone. It now applies in place under the state lock
+and puts the one partition back if the append fails, as `PinBoard::first_write`
+already did for `DIRTY` (`a_failed_materialize_append_leaves_the_partition_
+unmaterialized`, with a test-only append failure). At today's 65,536 that was
+four times the first-write cost.
+
+**What a declared partition still costs** is about 630 bytes resident
+whether or not it is ever written: its `Slot`, its `PartState` in the map
+state, its map entry (in the state and the epoch), its write watch and its
+lifecycle lock. A table of 2²⁰ declares 640 MB before a row exists, and a
+reopen replays a 25 MB log. Both scale with what was declared, not with the
+cap, so the cap stays a bound on mistakes rather than a budget: `SHOW
+PARTITIONS` returns one row per declared partition (207 MB at 2²⁰), and the
+catalogs and the open budget are unchanged. Not done: unmaterialized
+partitions holding only their range (a lazy slot, watch and lock), which is
+what would bring the resident cost down to the map entry.
 
 ## Phase 3 P5b-2b as built
 
@@ -3088,7 +3130,7 @@ measurements fix that default (§8). **Measured in P5b-3, it stays 64**: at
 2,000 tenants 1024 partitions made unrouted reads 10 to 20 times slower, and
 250 times under a small open budget, for point reads no faster ([Phase 3
 P5b-3 as built](#phase-3-p5b-3-as-built)). `RangeMap::initial` lays out at most
-65,536 (`MAX_INITIAL`, `core/partition/map.rs:13`).
+1,048,576 (`MAX_INITIAL`, `core/partition/map.rs:13`; 65,536 until plan item 4).
 
 ### 1.3 The hash
 

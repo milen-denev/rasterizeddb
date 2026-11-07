@@ -10,7 +10,7 @@ pub const SPACE_END: u128 = 1u128 << 64;
 pub const BLOCK: u64 = 1 << 16;
 
 /// The most partitions [`RangeMap::initial`] lays out (§15, phase 3).
-pub const MAX_INITIAL: u32 = 65_536;
+pub const MAX_INITIAL: u32 = 1_048_576;
 
 /// A half-open `[lo, hi)` of routing points. `hi` may be [`SPACE_END`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn initial_boundaries_fall_between_tenant_blocks() {
-        for n in [1u32, 2, 3, 7, 10, 1000, 1023, 1024, 4097, 65_535, 65_536] {
+        for n in [1u32, 2, 3, 7, 10, 1000, 1023, 1024, 4097, 65_535, 65_536, 1_048_575, 1_048_576] {
             let map = RangeMap::initial(n).unwrap();
             assert_eq!(map.len(), n as usize);
             for &(lo, _) in map.entries() {
@@ -176,7 +176,7 @@ mod tests {
             }
         }
         assert!(RangeMap::initial(0).is_err());
-        assert!(RangeMap::initial(65_537).is_err());
+        assert!(RangeMap::initial(1_048_577).is_err());
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         // Blocks at the space's two ends, next to boundaries, and spread
         // pseudo-randomly between.
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for n in [1u32, 3, 7, 1024, 65_536] {
+        for n in [1u32, 3, 7, 1024, 65_536, 1_048_576] {
             let map = RangeMap::initial(n).unwrap();
             let mut blocks: Vec<u64> = vec![0, (1 << 48) - 1];
             for &(lo, _) in map.entries().iter().take(64) {

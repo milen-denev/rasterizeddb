@@ -352,8 +352,8 @@ async fn the_cap_counts_declared_partitions_per_database() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let db = open(root).await;
-    create(&db, "t1", 32_768).await;
-    create(&db, "t2", 32_768).await;
+    create(&db, "t1", MAX_DECLARED_PER_DATABASE_FOR_TESTS / 2).await;
+    create(&db, "t2", MAX_DECLARED_PER_DATABASE_FOR_TESTS / 2).await;
     let refused = db.create_partitioned_table(acct("t3"), &["tenant_id"], 1).await.unwrap_err();
     assert_eq!(refused.kind(), io::ErrorKind::Unsupported, "{refused}");
     assert!(refused.to_string().contains("not supported"), "{refused}");

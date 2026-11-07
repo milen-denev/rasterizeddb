@@ -1044,7 +1044,7 @@ tables at ~25 fds each, sockets, a v2 without v1's provider removal at 16, or
 a **resident-bytes term** in the budget (`partition_resident_budget`). 4,096
 per shard is above phase 2a's cap of 2,048 declared partitions per database, so
 this layout needs partitioning phase 3, whose cap is 65,536 partitions per
-node, sixteen times this. Directory entries are about a twenty-fourth of
+node, sixteen times this (1,048,576 per database since plan item 4). Directory entries are about a twenty-fourth of
 partitioning's 600k. Checkpoints
 sync only dirty files since `b0935eb`, but sequentially: a burst over 382
 partitions dirties ~1,150 files, a 2.6 s pass at the 2.3 ms per fsync measured
