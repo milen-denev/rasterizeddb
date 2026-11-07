@@ -2231,8 +2231,46 @@ pub(crate) struct ReferencedColumn {
     literals: Vec<String>,
 }
 
+/// A blocking foreign key (`NO ACTION`, `RESTRICT`) from `parent_table` to
+/// itself, checked once its `DELETE` has run ([`check_self_references`]).
+///
+/// The rows referencing a deleted key are the table's own, and the same
+/// statement may be deleting them too: `DELETE FROM tree`, or `TRUNCATE
+/// tree`, takes every node with its children. Checked before the delete,
+/// they were found and the statement refused (23503) where PostgreSQL,
+/// checking at the end of the statement, deletes them all.
+pub(crate) struct SelfReference {
+    fk_name: String,
+    column: String,
+    literals: Vec<String>,
+}
+
+/// After the `DELETE` from `table` ran: a deleted key a remaining row of
+/// `table` still references is the violation PostgreSQL reports at the end
+/// of the statement. Read as of now with `tx`'s own deletes applied.
+async fn check_self_references(
+    database: &Arc<Database>,
+    table: &str,
+    deferred: &[SelfReference],
+    tx: TxId,
+) -> Result<(), String> {
+    for check in deferred {
+        let left = referenced_values_now(database, table, &check.column, &check.literals, tx, Some(1), KeySide::Child)
+            .await
+            .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", check.fk_name, e))?;
+        if !left.is_empty() {
+            return Err(format!(
+                "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                table, check.fk_name, table
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Applies each referencing table's `ON DELETE` action to the rows about to be
-/// removed from `parent_table`.
+/// removed from `parent_table`, and returns the checks of a table's foreign
+/// keys onto itself, which wait for the delete ([`SelfReference`]).
 ///
 /// `keys` holds, per referenced column, the values of those rows.
 ///
@@ -2250,11 +2288,12 @@ async fn apply_on_delete(
     // The transaction of the DELETE that triggered this. A cascade must land in
     // it, or the effect would be visible while its cause was not.
     tx: TxId,
-) -> Result<(), String> {
+) -> Result<Vec<SelfReference>, String> {
     use crate::core::rql::foreign_key::ReferentialAction;
 
+    let mut deferred = Vec::new();
     if keys.iter().all(|k| k.stored.is_empty()) {
-        return Ok(());
+        return Ok(deferred);
     }
     if depth >= MAX_CASCADE_DEPTH {
         return Err(format!(
@@ -2327,6 +2366,16 @@ async fn apply_on_delete(
         };
 
         if fk.on_delete.blocks() {
+            // The table onto itself: its referencing rows may be deleted by
+            // this same statement, so asked once it has run.
+            if child_table.eq_ignore_ascii_case(parent_table) {
+                deferred.push(SelfReference {
+                    fk_name: fk.name.clone(),
+                    column: fk.column.clone(),
+                    literals: child_literals,
+                });
+                continue;
+            }
             let referencing = referenced_values_now(
                 database,
                 &child_table,
@@ -2419,7 +2468,7 @@ async fn apply_on_delete(
         }
     }
 
-    Ok(())
+    Ok(deferred)
 }
 
 /// The referenced values of the rows a `DELETE` is about to remove, one entry
@@ -7640,6 +7689,117 @@ async fn execute_lock_table(
     ddl_ok(0)
 }
 
+/// `TRUNCATE` (`rql::truncate`): every named table's rows deleted, as one
+/// statement of transaction `tx`, under ACCESS EXCLUSIVE on each.
+///
+/// Rows deleted rather than files replaced, because this engine's DDL does
+/// not roll back and PostgreSQL's TRUNCATE does; the space comes back at the
+/// next vacuum. A table another one's foreign key references is refused
+/// unless that one is truncated too, named or by `CASCADE` (0A000, as in
+/// PostgreSQL), and the referencing tables are emptied first, so no delete
+/// finds a row still pointing at it and no `ON DELETE` action runs. `tx` is
+/// a real transaction even in autocommit: the wire layer opens one for the
+/// statement, so several tables are emptied all or nothing.
+#[inline(never)]
+async fn execute_truncate(database: &Arc<Database>, sql: &str, depth: usize, tx: TxId) -> Vec<u8> {
+    let statement = match crate::core::rql::truncate::parse(sql) {
+        Some(Ok(statement)) => statement,
+        Some(Err(e)) => return ddl_error(&e),
+        None => return ddl_error("syntax error or unsupported query"),
+    };
+    if tx == crate::core::mvcc::transaction::FROZEN_TX {
+        return ddl_error("TRUNCATE needs a transaction of its own; none was opened for it");
+    }
+    let mut tables: Vec<String> = Vec::new();
+    for name in &statement.tables {
+        let Some(table) = database.resolve_key(name) else {
+            return ddl_error(&format!("relation \"{name}\" does not exist"));
+        };
+        if !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
+    // Every table whose foreign key references one of these: truncated too
+    // (`CASCADE`), or the statement is refused.
+    let mut at = 0;
+    while at < tables.len() {
+        let parent = tables[at].clone();
+        for (child, fk) in database.referencing_keys(&parent) {
+            if fk.is_deleted {
+                continue;
+            }
+            let child = database.resolve_key(&child).unwrap_or(child);
+            if tables.contains(&child) {
+                continue;
+            }
+            if !statement.cascade {
+                return ddl_error(&format!(
+                    "cannot truncate a table referenced in a foreign key constraint: table \"{child}\" \
+                     references \"{parent}\"; truncate table \"{child}\" at the same time, or use TRUNCATE ... CASCADE"
+                ));
+            }
+            info!("truncate cascades to table \"{child}\"");
+            tables.push(child);
+        }
+        at += 1;
+    }
+    for table in &tables {
+        if let Err(e) = Box::pin(database.relation_for(table, owner(), TableMode::AccessExclusive)).await {
+            return ddl_error(&e);
+        }
+    }
+    // Referencing tables first: a parent's rows go only once nothing in the
+    // statement still points at them. A cycle (a table referencing itself,
+    // or two referencing each other) is broken where the walk meets it.
+    let mut order: Vec<String> = Vec::new();
+    fn visit(database: &Database, table: &str, tables: &[String], order: &mut Vec<String>, on_path: &mut Vec<String>) {
+        if order.iter().any(|t| t == table) || on_path.iter().any(|t| t == table) {
+            return;
+        }
+        on_path.push(table.to_string());
+        for (child, fk) in database.referencing_keys(table) {
+            let child = database.resolve_key(&child).unwrap_or(child);
+            if !fk.is_deleted && child != table && tables.contains(&child) {
+                visit(database, &child, tables, order, on_path);
+            }
+        }
+        on_path.pop();
+        order.push(table.to_string());
+    }
+    for table in &tables {
+        visit(database, table, &tables, &mut order, &mut Vec::new());
+    }
+    for table in &order {
+        let delete = format!("DELETE FROM {}", crate::core::rql::ctas::quote_ident(table));
+        let Some(purpose) = recognize_query_purpose(&delete) else {
+            return ddl_error(&format!("could not empty \"{table}\""));
+        };
+        let response = Box::pin(execute_with_context(purpose, database.clone(), depth + 1, tx)).await;
+        if response.first() == Some(&3) {
+            return response;
+        }
+    }
+    if statement.restart_identity {
+        for table in &tables {
+            let Some(view) = database.schema_view(table) else { continue };
+            for default in view.schema().defaults.iter().filter(|d| !d.is_deleted) {
+                let Some(name) = crate::core::rql::sequence::parse_nextval(&default.expression) else {
+                    continue;
+                };
+                // The table's own sequences only, as PostgreSQL restarts
+                // those its columns own: one shared with another table would
+                // hand that table values it already holds.
+                let name = name.to_ascii_lowercase();
+                if name == crate::core::rql::sequence::sequence_name(table, &default.column) {
+                    crate::core::rql::sequence::restart(database.id, &name, tx);
+                }
+            }
+        }
+    }
+    note_write(database, tx, depth, sql, None);
+    ddl_ok(0)
+}
+
 /// The `WHERE` clause of an `UPDATE`/`DELETE`, with `RETURNING` removed and any
 /// relation alias stripped from its column references.
 ///
@@ -12734,6 +12894,7 @@ async fn seed_sequences(
     database: &Arc<Database>,
     table_name: &str,
     target: Option<&crate::core::database::Relation>,
+    tx: TxId,
 ) -> Result<(), String> {
     let (table, partitioned) = match target {
         Some(crate::core::database::Relation::Plain(table)) => (table.clone(), None),
@@ -12752,7 +12913,9 @@ async fn seed_sequences(
         let Some(name) = crate::core::rql::sequence::parse_nextval(expression) else {
             continue;
         };
-        if !crate::core::rql::sequence::is_floored(database.id, &name, table_name) {
+        if !crate::core::rql::sequence::is_floored(database.id, &name, table_name)
+            && !crate::core::rql::sequence::restarted_by(database.id, &name, tx)
+        {
             wanted.push((name, field.clone()));
         }
     }
@@ -12856,14 +13019,21 @@ fn has_unseeded_sequence(
     database: &Database,
     table_name: &str,
     schema: &crate::core::row::schema::TableSchema,
+    tx: TxId,
 ) -> bool {
     if schema.defaults.is_empty() {
         return false;
     }
+    // A `TRUNCATE … RESTART IDENTITY` that has ended, either way, lets its
+    // sequences be marked again (`sequence::restart`).
+    crate::core::rql::sequence::settle_restarts(database.id, |tx| !database.transactions.unfinished(tx));
     schema.fields.iter().filter(|f| !f.is_deleted).any(|field| {
         crate::core::rql::column_default::expression_for(&field.name, &schema.defaults)
             .and_then(crate::core::rql::sequence::parse_nextval)
-            .is_some_and(|name| !crate::core::rql::sequence::is_floored(database.id, &name, table_name))
+            .is_some_and(|name| {
+                !crate::core::rql::sequence::is_floored(database.id, &name, table_name)
+                    && !crate::core::rql::sequence::restarted_by(database.id, &name, tx)
+            })
     })
 }
 
@@ -15965,6 +16135,8 @@ fn query_sql(query: &QueryPurpose) -> String {
         // A lock is a property of the transaction, not a change to any row, so
         // it has no statement text worth recording or replicating.
         QueryPurpose::LockTable(_) => String::new(),
+        // A replica runs the TRUNCATE itself, not the deletes it is made of.
+        QueryPurpose::Truncate(s) => s.clone(),
         QueryPurpose::InsertRow(d) => d.query.clone(),
         QueryPurpose::QueryRows(d) => d.query.clone(),
         // A read: nothing to retry or replicate.
@@ -18107,9 +18279,9 @@ pub(crate) async fn insert_loaded_row(
         .await
         .ok()
         .flatten()?;
-    if has_unseeded_sequence(database, table_name, &table.schema) {
+    if has_unseeded_sequence(database, table_name, &table.schema, tx) {
         let target = crate::core::database::Relation::Plain(table.clone());
-        Box::pin(seed_sequences(database, table_name, Some(&target))).await.ok()?;
+        Box::pin(seed_sequences(database, table_name, Some(&target), tx)).await.ok()?;
     }
     let schema = &table.schema;
     if !schema.json_columns.is_empty() {
@@ -18901,6 +19073,9 @@ pub(crate) async fn execute_with_need(
             }
             return response;
         }
+        QueryPurpose::Truncate(sql) => {
+            return Box::pin(execute_truncate(&database, sql, depth, tx)).await;
+        }
         // `LOCK TABLE` changes nothing and reads nothing: it takes a lock the
         // transaction holds until it ends.
         QueryPurpose::LockTable(statement) => {
@@ -19246,8 +19421,8 @@ pub(crate) async fn execute_with_need(
             // in memory and a reopened database has not yet learned what the
             // table already holds. Skipped for a table with no serial column,
             // and after the first insert for one that has.
-            if target.as_ref().is_some_and(|t| has_unseeded_sequence(&database, &row_data.table_name, t.schema())) {
-                if let Err(e) = Box::pin(seed_sequences(&database, &row_data.table_name, target.as_ref())).await {
+            if target.as_ref().is_some_and(|t| has_unseeded_sequence(&database, &row_data.table_name, t.schema(), tx)) {
+                if let Err(e) = Box::pin(seed_sequences(&database, &row_data.table_name, target.as_ref(), tx)).await {
                     error!("{}", e);
                     return ddl_error(&e);
                 }
@@ -20018,6 +20193,7 @@ pub(crate) async fn execute_with_need(
             // deletes must be the same rows. See `keys_about_to_be_deleted`.
             // Or the one its reads took, when it read first (a subquery).
             let referenced = !referencing_keys(&database, &table_name).is_empty();
+            let mut self_references: Vec<SelfReference> = Vec::new();
             let statement_visibility = statement_snapshot_for(depth, || {
                 if referenced { table.statement_visibility(tx) } else { table.statement_visibility_deferred(tx) }
             })
@@ -20037,13 +20213,13 @@ pub(crate) async fn execute_with_need(
                 }
                 None => Ok(Vec::new()),
             } {
-                Ok(keys) => {
-                    if let Err(e) = apply_on_delete(&database, &table_name, &keys, depth, tx).await
-                    {
+                Ok(keys) => match apply_on_delete(&database, &table_name, &keys, depth, tx).await {
+                    Ok(checks) => self_references = checks,
+                    Err(e) => {
                         error!("{}", e);
                         return ddl_error(&e);
                     }
-                }
+                },
                 Err(e) => {
                     error!("Could not read the rows a DELETE would affect: {}", e);
                     return ddl_error(&e);
@@ -20078,6 +20254,10 @@ pub(crate) async fn execute_with_need(
             {
                 Ok(n) => {
                     info!("Deleted {} rows", n);
+                    if let Err(e) = check_self_references(&database, &table_name, &self_references, tx).await {
+                        error!("{}", e);
+                        return ddl_error(&e);
+                    }
                     note_write(&database, tx, depth, &query_sql(&query), Some(&table_name));
                     let returning = if returning_wanted {
                         match returning_rows_for_write(&table, &query_sql(&query), before, None, &[], &database, tx).await {
@@ -20643,6 +20823,7 @@ async fn execute_partitioned_delete(
     // referenced-key locks taken under the logical name and each child's
     // action run, and the same snapshot handed to every partition's write.
     let referenced = !referencing_keys(database, table_name).is_empty();
+    let mut self_references: Vec<SelfReference> = Vec::new();
     let statement_visibility = statement_snapshot_for(depth, || pt.statement_visibility(tx))
         .or_else(|| referenced.then(|| pt.visibility_for(tx)));
     if let Some(visibility) = statement_visibility.as_ref().filter(|_| referenced) {
@@ -20656,9 +20837,12 @@ async fn execute_partitioned_delete(
                 return ddl_error(&e);
             }
         };
-        if let Err(e) = apply_on_delete(database, table_name, &keys, depth, tx).await {
-            error!("{}", e);
-            return ddl_error(&e);
+        match apply_on_delete(database, table_name, &keys, depth, tx).await {
+            Ok(checks) => self_references = checks,
+            Err(e) => {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
         }
     }
     let mut before: Vec<crate::core::row::row::Row> = Vec::new();
@@ -20683,6 +20867,10 @@ async fn execute_partitioned_delete(
     match outcome {
         Ok(n) => {
             info!("Deleted {} rows", n);
+            if let Err(e) = check_self_references(database, table_name, &self_references, tx).await {
+                error!("{}", e);
+                return ddl_error(&e);
+            }
             note_write(database, tx, depth, &sql, Some(table_name));
             let returning = returning_wanted.then_some((before, None, &[][..]));
             partitioned_write_reply(&pt, &sql, n, returning, database, tx).await

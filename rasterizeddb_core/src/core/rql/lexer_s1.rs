@@ -24,6 +24,9 @@ pub enum QueryPurpose {
     /// statement, so the caller is told which clause was wrong instead of
     /// getting a bare syntax error.
     LockTable(Result<crate::core::rql::row_lock::LockTable, String>),
+    /// `TRUNCATE …` as written (`rql::truncate`): the text is what a replica
+    /// runs.
+    Truncate(String),
     /// `SET` / `SHOW` / `RESET FILTER` — tuning the filter index from SQL.
     /// Parsed and executed by `core::filter::sql`.
     FilterControl(String),
@@ -584,6 +587,10 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
         } else {
             Some(AddColumn(query_trimmed.to_string()))
         }
+    } else if simd_compare_strings(query_bytes, b"TRUNCATE", &StartsWith)
+        && query_bytes.get(b"TRUNCATE".len()).is_none_or(|b| b.is_ascii_whitespace())
+    {
+        Some(Truncate(query_trimmed.to_string()))
     } else if simd_compare_strings(query_bytes, b"LOCK", &StartsWith) {
         match crate::core::rql::row_lock::parse_lock_table(query_trimmed) {
             Some(outcome) => Some(LockTable(outcome)),

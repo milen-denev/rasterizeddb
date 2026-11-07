@@ -930,7 +930,7 @@ pub fn matching_close(text: &str, open: usize) -> Option<usize> {
 }
 
 /// [`fold_unquoted_identifiers`] for a statement whose names are the
-/// engine's own (a query, DML, table and index DDL, VACUUM, LOCK);
+/// engine's own (a query, DML, table and index DDL, VACUUM, LOCK, TRUNCATE);
 /// borrowed and untouched for any other, whose words are its own (a KV key,
 /// a setting, a backup's or a database's name).
 ///
@@ -945,7 +945,7 @@ pub fn fold_core_statement(sql: &str) -> Cow<'_, str> {
     let first = words.next().unwrap_or("");
     let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
     let core = sql.trim_start().starts_with('(')
-        || ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "VALUES", "VACUUM", "LOCK"]
+        || ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "VALUES", "VACUUM", "LOCK", "TRUNCATE"]
             .iter()
             .any(|k| is(first, k))
         || match (first, words.next().unwrap_or(""), words.next().unwrap_or("")) {

@@ -6113,8 +6113,11 @@ where
         Some(tx) => Some((tx, false)),
         // A derived table read at the wire too: its rows and the write are
         // one transaction's, so the write is handed their snapshot.
+        // A TRUNCATE too: its tables are emptied as one transaction's
+        // deletes, all or none (`executor::execute_truncate`).
         None if crate::core::rql::cte::has_with_clause(stmt)
-            || crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt) =>
+            || crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt)
+            || is_truncate(stmt) =>
         {
             let tx = match crate::core::mvcc::owner::adopt_transaction() {
                 Some(o) => o,
@@ -6157,11 +6160,9 @@ where
     // it can be seen: by abort time the damage is already applied.
     if state.current_tx().is_some() {
         let head = stmt.trim_start().to_ascii_uppercase();
-        if head.starts_with("CREATE")
-            || head.starts_with("ALTER")
-            || head.starts_with("DROP")
-            || head.starts_with("TRUNCATE")
-        {
+        // Not TRUNCATE: it deletes rows in the block's transaction, and
+        // rolls back with it (`executor::execute_truncate`).
+        if head.starts_with("CREATE") || head.starts_with("ALTER") || head.starts_with("DROP") {
             log::warn!(
                 "DDL inside an explicit transaction cannot be rolled back by this engine; if this block aborts, its effects will persist: {}",
                 stmt.chars().take(120).collect::<String>()
@@ -6722,6 +6723,7 @@ where
         | QueryPurpose::RenameColumn(_) => PurposeKind::AlterTable,
         QueryPurpose::Vacuum(_) => PurposeKind::Vacuum,
         QueryPurpose::LockTable(_) => PurposeKind::LockTable,
+        QueryPurpose::Truncate(_) => PurposeKind::Truncate,
         QueryPurpose::InsertRow(_) => PurposeKind::InsertRow,
         QueryPurpose::UpdateRow(_) => PurposeKind::UpdateRow,
         QueryPurpose::DeleteRow(_) => PurposeKind::DeleteRow,
@@ -6743,6 +6745,7 @@ where
             PurposeKind::InsertRow => Some("INSERT"),
             PurposeKind::UpdateRow => Some("UPDATE"),
             PurposeKind::DeleteRow => Some("DELETE"),
+            PurposeKind::Truncate => Some("TRUNCATE TABLE"),
             _ => None,
         };
         if let Some(verb) = verb {
@@ -7572,6 +7575,13 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("cannot reshape:") {
         return "22023";
     }
+    // `TRUNCATE` of a table another table's foreign key references, that
+    // one not truncated with it: `feature_not_supported`, as PostgreSQL's.
+    // Early: the message names the tables, and "references" or a table's
+    // name could steer the branches below.
+    if has("cannot truncate a table referenced in a foreign key constraint") {
+        return "0A000";
+    }
     // `INSERT … VALUES` arity (`lexer_ir::values_arity_error`):
     // PostgreSQL's syntax_error.
     if has("insert has more expressions than target columns")
@@ -7878,11 +7888,19 @@ enum PurposeKind {
     DropIndex,
     Vacuum,
     LockTable,
+    Truncate,
     InsertRow,
     UpdateRow,
     DeleteRow,
     QueryRows,
     Other,
+}
+
+/// Whether `stmt` is a `TRUNCATE`.
+fn is_truncate(stmt: &str) -> bool {
+    let head = stmt.trim_start();
+    head.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("TRUNCATE"))
+        && head[8..].starts_with(|c: char| c.is_ascii_whitespace())
 }
 
 /// The `CommandComplete` tag PostgreSQL sends for a statement.
@@ -7902,6 +7920,7 @@ fn command_tag(kind: PurposeKind, rows_affected: Option<u64>) -> String {
         (PurposeKind::DropIndex, _) => "DROP INDEX".to_string(),
         (PurposeKind::Vacuum, _) => "VACUUM".to_string(),
         (PurposeKind::LockTable, _) => "LOCK TABLE".to_string(),
+        (PurposeKind::Truncate, _) => "TRUNCATE TABLE".to_string(),
         (PurposeKind::InsertRow, Some(n)) => format!("INSERT 0 {}", n),
         (PurposeKind::UpdateRow, Some(n)) => format!("UPDATE {}", n),
         (PurposeKind::DeleteRow, Some(n)) => format!("DELETE {}", n),

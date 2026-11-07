@@ -180,6 +180,11 @@ pub fn forget_table_floors(database: u64, table: &str) {
 /// [`seed`] that put it there, never before: a concurrent insert that sees
 /// the mark takes values straight away.
 pub fn mark_floored(database: u64, name: &str, table: &str) {
+    // A restart whose transaction may still roll back: seeded again by every
+    // insert until it ends (`restart`).
+    if !RESTARTED.is_empty() && RESTARTED.contains_key(&key(database, name)) {
+        return;
+    }
     FLOORED.insert(floor_key(database, name, table), ());
 }
 
@@ -202,6 +207,49 @@ pub fn current(database: u64, name: &str) -> Option<i64> {
     SEQUENCES
         .get(&key(database, name))
         .map(|v| v.value().load(Ordering::SeqCst))
+}
+
+/// Sequences a `TRUNCATE … RESTART IDENTITY` restarted, by [`key`], and the
+/// transaction that did, until an insert finds it ended
+/// ([`settle_restarts`]). Meanwhile no floor is marked on them.
+static RESTARTED: std::sync::LazyLock<DashMap<String, u64>> = std::sync::LazyLock::new(DashMap::new);
+
+/// Starts `database`'s sequence `name` again for transaction `tx`: the next
+/// value is 1, as after `TRUNCATE … RESTART IDENTITY`.
+///
+/// Undoable, as PostgreSQL's is. Its floor marks go, and none is marked
+/// while `tx` may still end either way, so every insert seeds the counter
+/// again from the rows it can see ([`seed`] only ever raises a counter).
+/// After `tx` ends, the next insert seeds it once more and marks it as
+/// usual: a TRUNCATE that committed left no rows, so the counter stays where
+/// `tx`'s own inserts took it; one that rolled back left the rows, and the
+/// counter is raised above them. A mark made by `tx`'s own insert would have
+/// outlived the rollback and handed out a value a restored row holds.
+pub fn restart(database: u64, name: &str, tx: u64) {
+    SEQUENCES.insert(key(database, name), AtomicI64::new(0));
+    forget_floors(database, name);
+    RESTARTED.insert(key(database, name), tx);
+}
+
+/// Whether `tx` restarted `database`'s sequence `name` and has not been
+/// found ended since: its own inserts then take values from the restarted
+/// counter as they come, without seeding it (the seeding scan reads past
+/// `tx`'s own deletes, so it would raise the counter back above the rows
+/// the TRUNCATE removed). No other transaction inserts meanwhile: the
+/// TRUNCATE holds ACCESS EXCLUSIVE on the table to `tx`'s end.
+pub fn restarted_by(database: u64, name: &str, tx: u64) -> bool {
+    !RESTARTED.is_empty() && RESTARTED.get(&key(database, name)).is_some_and(|by| *by == tx)
+}
+
+/// Ends the restarts of `database` whose transaction has `finished`, so
+/// their sequences take floor marks again (see [`restart`]). Free when
+/// nothing was restarted.
+pub fn settle_restarts(database: u64, finished: impl Fn(u64) -> bool) {
+    if RESTARTED.is_empty() {
+        return;
+    }
+    let prefix = key(database, "");
+    RESTARTED.retain(|k, tx| !(k.starts_with(&prefix) && finished(*tx)));
 }
 
 /// Forgets `database`'s sequences `names`, for a table that has been dropped.
@@ -481,6 +529,31 @@ mod tests {
         assert!(is_floored(DB, name, "Acct"));
         forget_table_floors(DB, "Acct");
         assert!(!is_floored(DB, name, "ACCT"), "a mark under another spelling outlived the table's forget");
+    }
+
+    /// A restart is its transaction's until an insert finds that ended: no
+    /// floor is marked meanwhile, and afterwards marks are taken again (a
+    /// sequence never settled would be seeded by a scan at every insert).
+    ///
+    /// Mutations: `settle_restarts` that never clears; `mark_floored`
+    /// without its pending-restart guard.
+    #[test]
+    fn a_restart_is_pending_until_its_transaction_ends() {
+        let name = "restart_test_seq";
+        seed(DB, name, 40);
+        mark_floored(DB, name, "rt");
+        restart(DB, name, 7);
+        assert_eq!(next(DB, name), 1, "the counter did not restart");
+        assert!(!is_floored(DB, name, "rt"), "the old floor outlived the restart");
+        assert!(restarted_by(DB, name, 7) && !restarted_by(DB, name, 8));
+        mark_floored(DB, name, "rt");
+        assert!(!is_floored(DB, name, "rt"), "a floor was marked while the restart could still roll back");
+        settle_restarts(DB, |tx| tx != 7);
+        assert!(restarted_by(DB, name, 7), "settled while its transaction was still running");
+        settle_restarts(DB, |tx| tx == 7);
+        assert!(!restarted_by(DB, name, 7));
+        mark_floored(DB, name, "rt");
+        assert!(is_floored(DB, name, "rt"), "no floor is marked after the restart ended");
     }
 
     #[test]
