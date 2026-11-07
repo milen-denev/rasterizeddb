@@ -89,7 +89,7 @@ fn build(list: &str, condition: Option<&str>, limit: Option<&str>, offset: Optio
         // not read; tried once that has failed, as the select list does.
         let parsed = match expr::parse(&text, &[]) {
             Ok(parsed) => parsed,
-            Err(e) => crate::core::rql::join::comparison_value(&text, &[]).ok_or_else(|| no_column(e, &text))?,
+            Err(e) => crate::core::rql::join::comparison_value(&text, &[])?.ok_or_else(|| no_column(e, &text))?,
         };
         if !expr::columns_of(&parsed).is_empty() {
             return Err(format!("column \"{}\" does not exist", text.trim()));

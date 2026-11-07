@@ -3730,9 +3730,11 @@ pub fn plan(
             }
             // A comparison is a boolean value here, which the expression
             // grammar does not read; it is tried only once that has failed.
-            let parsed = crate::core::rql::expr::parse(&rewritten, &layout.schema)
-                .or_else(|e| comparison_value(&rewritten, &layout.schema).ok_or(e))
-                .map_err(|e| match ambiguous_in(&e, &schemas) {
+            let parsed = match crate::core::rql::expr::parse(&rewritten, &layout.schema) {
+                Ok(parsed) => Ok(parsed),
+                Err(e) => comparison_value(&rewritten, &layout.schema)?.ok_or(e),
+            }
+            .map_err(|e| match ambiguous_in(&e, &schemas) {
                     // A bare name more than one relation has: PostgreSQL's
                     // 42702, not an unknown name.
                     Some(name) => format!("column reference \"{}\" is ambiguous", name),
@@ -4821,8 +4823,17 @@ fn build_aggregate_stage(
     // Ordering is by output label: a group has no relation to sort within.
     let mut fold_order = Vec::with_capacity(order_by.len());
     for term in order_by {
-        let label = crate::core::rql::aggregate::resolve_order_label(&term.token, &fold_items)
-            .ok_or_else(|| format!("ORDER BY term '{}' is not in the SELECT list", term.token))?;
+        // `ORDER BY 1`: the first output column, as PostgreSQL reads a
+        // position. It was refused over a grouped join.
+        let position = term.token.trim().parse::<usize>().ok();
+        let label = match position {
+            Some(n) => fold_items
+                .get(n.wrapping_sub(1))
+                .map(|item| item.label().to_string())
+                .ok_or_else(|| format!("ORDER BY position {} is not in the select list, which has {} item(s)", n, fold_items.len()))?,
+            None => crate::core::rql::aggregate::resolve_order_label(&term.token, &fold_items)
+                .ok_or_else(|| format!("ORDER BY term '{}' is not in the SELECT list", term.token))?,
+        };
         fold_order.push((label, term.descending, term.nulls_first));
     }
 
@@ -4922,10 +4933,14 @@ fn is_column_reference(text: &str) -> bool {
 /// false. A condition here evaluates to a plain `bool`, so for a comparison
 /// between two values the NULL cases are stated as arms ahead of it. A null
 /// test is never NULL and needs none.
+///
+/// `Err` only for a constant that is not a value of the type it meets
+/// (`n = 'q'`: 22P02), which is the answer rather than a reason to try the
+/// next reading; anything else that does not parse is `Ok(None)`.
 pub(crate) fn comparison_value(
     text: &str,
     schema: &[SchemaField],
-) -> Option<crate::core::rql::expr::Expr> {
+) -> Result<Option<crate::core::rql::expr::Expr>, String> {
     use crate::core::rql::expr::{Cmp, Cond, Condition, Expr};
     let boolean = |value: bool| Expr::Literal {
         bytes: vec![value as u8],
@@ -4938,19 +4953,28 @@ pub(crate) fn comparison_value(
         // NULL)`, a NULL `x`). `NOT` is evaluated three-valued
         // (`Cond::Not`), so UNKNOWN takes neither arm. It was "function
         // 'x IN' is not supported yet".
+        Err(e) if crate::core::rql::expr::is_input_error(&e) => return Err(e),
+        // A combination of conditions too (`(n > 1 OR n IN (NULL))`, `NOT
+        // (a = b)`), which is how a quantified subquery is answered
+        // (`subquery::quantified_predicate`).
         Err(_)
-            if find_keyword(text, "IN", 0).is_some() || find_keyword(text, "BETWEEN", 0).is_some() =>
+            if ["IN", "BETWEEN", "AND", "OR", "NOT"].iter().any(|w| find_keyword(text, w, 0).is_some())
+                || is_parenthesised(text) =>
         {
-            let cond = crate::core::rql::expr::parse_cond(text, schema).ok()?;
-            return Some(Expr::Case {
+            let cond = match crate::core::rql::expr::parse_cond(text, schema) {
+                Ok(cond) => cond,
+                Err(e) if crate::core::rql::expr::is_input_error(&e) => return Err(e),
+                Err(_) => return Ok(None),
+            };
+            return Ok(Some(Expr::Case {
                 whens: vec![
                     (cond.clone(), boolean(true)),
                     (Cond::Not(Box::new(cond)), boolean(false)),
                 ],
                 otherwise: Some(Box::new(Expr::Null)),
-            });
+            }));
         }
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
     let is_null = |operand: &Expr| {
         Cond::Cmp(Condition {
@@ -4966,10 +4990,16 @@ pub(crate) fn comparison_value(
         whens.push((is_null(right), Expr::Null));
     }
     whens.push((Cond::Cmp(condition), boolean(true)));
-    Some(Expr::Case {
+    Ok(Some(Expr::Case {
         whens,
         otherwise: Some(Box::new(boolean(false))),
-    })
+    }))
+}
+
+/// Whether `text` is one parenthesised whole, `( … )`.
+fn is_parenthesised(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with('(') && crate::core::sql_scan::matching_close(t, 0) == Some(t.len() - 1)
 }
 
 /// The name PostgreSQL gives a select item written without an alias — its

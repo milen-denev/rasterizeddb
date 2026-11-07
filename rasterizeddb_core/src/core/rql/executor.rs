@@ -1124,6 +1124,27 @@ pub async fn substitute_in_subqueries(
         );
     }
 
+    // `x > ANY (SELECT …)`, `x = ALL (SELECT …)`: the predicate the
+    // subquery's values make it (`subquery::quantified_predicate`). Before
+    // the scalar subqueries, which would read it as one value.
+    for _ in 0..MAX_SUBQUERIES {
+        let Some(found) = crate::core::sql_scan::find_quantified_subquery(&current) else {
+            break;
+        };
+        let found = found?;
+        let rows = run_subquery_for(&found.inner_sql, database, tx, SubqueryNeed::Membership).await?;
+        let document = crate::core::rql::cte::document_columns(&found.inner_sql, database)
+            .first()
+            .copied()
+            .unwrap_or(false);
+        let exact = !crate::core::rql::cte::blank_padded_columns(&found.inner_sql, database)
+            .first()
+            .copied()
+            .unwrap_or(false);
+        let predicate = subquery::quantified_predicate(&found, &rows, document, exact)?;
+        current = format!("{}{}{}", &current[..found.start], predicate, &current[found.end..]);
+    }
+
     // A subquery in value position resolves to a constant, which the select
     // list then treats exactly like a written literal.
     for _ in 0..MAX_SUBQUERIES {
@@ -1207,13 +1228,12 @@ pub async fn substitute_in_subqueries(
         let real_operand = in_operand_is_real(&current, found.negated_start.unwrap_or(found.start), sql, database);
         let (list, had_null) = subquery::rows_to_value_list_as(&rows, document, exact, real_operand)?;
 
-        // `x NOT IN (…, NULL)` is never true: x either equals a value (false)
-        // or is compared against NULL (unknown). `x IN ()` expresses exactly
-        // that — it never holds, and a NULL x is excluded as well.
-        let (start, replacement) = match (had_null, found.negated_start) {
-            (true, Some(not_at)) => (not_at, "IN ()".to_string()),
-            _ => (found.start, list),
-        };
+        // A NULL among the values stays in the list: `x IN (1, NULL)` is
+        // UNKNOWN where `x` is not 1, and `x NOT IN (…, NULL)` is never true,
+        // which the scan and the evaluator read three-valued. Left out, `x IN`
+        // was false there, so `NOT (x IN (SELECT …))` kept the row PostgreSQL
+        // drops, and `x IN (SELECT …)` as a value was false, not NULL.
+        let (start, replacement) = (found.start, if had_null { subquery::list_with_null(&list) } else { list });
         // A `character(n)` subquery's values meet a `character varying`
         // operand blank-padded, as PostgreSQL's `varchar = bpchar` resolves:
         // its trailing spaces are not part of it. As untyped literals they

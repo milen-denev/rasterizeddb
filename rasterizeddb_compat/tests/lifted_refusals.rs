@@ -459,6 +459,179 @@ async fn text_against_a_number_is_refused_as_postgresql_refuses_it() {
     }
 }
 
+/// A quoted literal compared with a number or a boolean takes that type, as
+/// PostgreSQL resolves an untyped constant: `'1' = 1` is true, and `'a' = 1`
+/// is 22P02 (22003 past the type's range). In the expression evaluator the
+/// literal stayed text and was compared byte for byte, so `'1' = 1`, `'2.5' <
+/// 3.0` and `'true' = true` were all false, and `n = 'q'` false; in a scan
+/// the refusal was "could not compile the query plan" (PostgreSQL 17, `docker
+/// run --rm postgres:17`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untyped_literal_takes_the_other_sides_type() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE t (id INT, n INT, x NUMERIC(10,2), f REAL, b BOOLEAN)",
+        "INSERT INTO t VALUES (1, 1, 1.50, 0.1, true), (2, NULL, 2.00, NULL, NULL), (3, 3, NULL, 2.5, false)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT '1' = 1, ' 1 ' = 1, '2.5' < 3.0, 'true' = true, 'of' = false, 'y' = true", &["t|t|t|t|t|t"]),
+        ("SELECT id, n = '3', x > '2', f = '0.1', b = 'yes' FROM t ORDER BY id", &[
+            "1|f|f|t|t", "2|NULL|f|NULL|NULL", "3|t|NULL|f|f",
+        ]),
+        ("SELECT id, n IN ('1', '4') FROM t ORDER BY id", &["1|t", "2|NULL", "3|f"]),
+        ("SELECT id, CASE WHEN n = '3' THEN 'y' ELSE 'n' END FROM t ORDER BY id", &["1|n", "2|n", "3|y"]),
+        ("SELECT id FROM t WHERE n = '3'", &["3"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    for (sql, code, message) in [
+        ("SELECT 'a' = 1", "22P02", "invalid input syntax for type integer: \"a\""),
+        ("SELECT 1 = 'a'", "22P02", "invalid input syntax for type integer: \"a\""),
+        ("SELECT '1.5' = 1", "22P02", "invalid input syntax for type integer: \"1.5\""),
+        ("SELECT 'x' < 2.5", "22P02", "invalid input syntax for type numeric: \"x\""),
+        ("SELECT 'x' = true", "22P02", "invalid input syntax for type boolean: \"x\""),
+        ("SELECT 'o' = false", "22P02", "invalid input syntax for type boolean: \"o\""),
+        ("SELECT '3000000000' = 1", "22003", "value \"3000000000\" is out of range for type integer"),
+        ("SELECT id, n = 'q' FROM t", "22P02", "invalid input syntax for type integer: \"q\""),
+        ("SELECT id, n IN ('1', 'q') FROM t", "22P02", "invalid input syntax for type integer: \"q\""),
+        ("SELECT CASE WHEN n = 'q' THEN 1 END FROM t", "22P02", "invalid input syntax for type integer: \"q\""),
+        ("SELECT id FROM t WHERE id = 'a'", "22P02", "invalid input syntax for type integer: \"a\""),
+        ("SELECT id FROM t WHERE 'b' < id", "22P02", "invalid input syntax for type integer: \"b\""),
+        ("SELECT id FROM t WHERE id IN ('1', 'x')", "22P02", "invalid input syntax for type integer: \"x\""),
+    ] {
+        let e = c.simple_query(sql).await.expect_err(sql);
+        let db = e.as_db_error().unwrap_or_else(|| panic!("{sql}: {e}"));
+        assert_eq!((db.code().code(), db.message()), (code, message), "{sql}");
+    }
+}
+
+/// A join operand that is an expression (`ON a.g = b.id::text`, `ON a.n + 1
+/// = b.id`, `ON lower(a.g) = lower(b.v)`), computed by a derived table
+/// standing in for its relation (`core::rql::join_on`); an expression as a
+/// window's PARTITION BY or ORDER BY term; and `ORDER BY 1` over a grouped
+/// join. They were "column 'id::text' not found in relation 'b'", "'%' is not
+/// a sort direction" and "ORDER BY term '1' is not in the SELECT list"
+/// (PostgreSQL 17, `docker run --rm postgres:17`).
+#[tokio::test(flavor = "multi_thread")]
+async fn join_operands_and_window_terms_may_be_expressions() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, g TEXT, n INT)",
+        "CREATE TABLE u (id INT PRIMARY KEY, v TEXT, x NUMERIC(10,2))",
+        "INSERT INTO t VALUES (1,'1',1),(2,'2',NULL),(3,'x',3),(4,'3',4),(5,NULL,2)",
+        "INSERT INTO u VALUES (1,'1',1.50),(2,'4',2.00),(3,'3',NULL),(4,'zz',3.25)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT a.id, b.id FROM t a JOIN u b ON a.g = b.id::text ORDER BY 1,2", &["1|1", "2|2", "4|3"]),
+        ("SELECT a.id, b.id FROM t a JOIN u b ON CAST(a.id AS text) = b.v ORDER BY 1,2", &["1|1", "3|3", "4|2"]),
+        ("SELECT a.id, b.id FROM t a LEFT JOIN u b ON a.g = b.id::text ORDER BY 1,2", &["1|1", "2|2", "3|NULL", "4|3", "5|NULL"]),
+        ("SELECT a.id, b.id FROM t a RIGHT JOIN u b ON a.n + 1 = b.id ORDER BY 2", &["NULL|1", "1|2", "5|3", "3|4"]),
+        ("SELECT a.id, b.id FROM t a JOIN u b ON a.id = b.id AND a.g = b.v::text ORDER BY 1,2", &["1|1"]),
+        ("SELECT a.id, b.id FROM t a JOIN u b ON a.n::numeric = b.x ORDER BY 1,2", &["5|2"]),
+        ("SELECT a.*, b.* FROM t a JOIN u b ON a.g = b.id::text ORDER BY 1", &[
+            "1|1|1|1|1|1.50", "2|2|NULL|2|4|2.00", "4|3|4|3|3|NULL",
+        ]),
+        ("SELECT * FROM t a JOIN u b ON lower(a.g) = lower(b.v) ORDER BY 1", &["1|1|1|1|1|1.50", "4|3|4|3|3|NULL"]),
+        ("SELECT a.id, b.v, rank() OVER (ORDER BY b.v) FROM t a JOIN u b ON a.g = b.id::text ORDER BY 1", &[
+            "1|1|1", "2|4|3", "4|3|2",
+        ]),
+        ("SELECT count(*) FROM t a JOIN u b ON a.g = b.id::text", &["3"]),
+        ("SELECT a.g, count(*) FROM t a JOIN u b ON a.n + 1 = b.id GROUP BY a.g ORDER BY 1", &["1|1", "x|1", "NULL|1"]),
+        ("SELECT a.g, count(*) FROM t a JOIN u b ON a.n = b.id GROUP BY a.g ORDER BY 2 DESC, 1", &["1|1", "3|1", "x|1", "NULL|1"]),
+        ("SELECT id, row_number() OVER (PARTITION BY n % 2 ORDER BY id) FROM t ORDER BY id", &["1|1", "2|1", "3|2", "4|1", "5|2"]),
+        ("SELECT id, count(*) OVER (PARTITION BY lower(g)) FROM t ORDER BY id", &["1|1", "2|1", "3|1", "4|1", "5|1"]),
+        ("SELECT id, row_number() OVER (ORDER BY n * -1, id) FROM t ORDER BY id", &["1|4", "2|5", "3|2", "4|1", "5|3"]),
+        ("SELECT id, sum(n) OVER (PARTITION BY n > 2 ORDER BY id) FROM t ORDER BY id", &["1|1", "2|NULL", "3|3", "4|7", "5|3"]),
+        ("SELECT id, rank() OVER (PARTITION BY coalesce(n, 0) % 2 ORDER BY id DESC) FROM t ORDER BY id", &[
+            "1|2", "2|3", "3|1", "4|2", "5|1",
+        ]),
+        ("SELECT id, n, row_number() OVER (PARTITION BY n % 2 ORDER BY id) AS rn FROM t WHERE id > 1 ORDER BY rn, id", &[
+            "2|NULL|1", "3|3|1", "4|4|1", "5|2|2",
+        ]),
+        ("SELECT *, row_number() OVER (ORDER BY coalesce(n, 0) DESC) FROM t ORDER BY id", &[
+            "1|1|1|4", "2|2|NULL|5", "3|x|3|2", "4|3|4|1", "5|NULL|2|3",
+        ]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    // The operand is computed for every row, as PostgreSQL's hash join does.
+    let e = c.simple_query("SELECT a.id FROM t a JOIN u b ON a.g::int = b.id").await.expect_err("bad cast");
+    let db = e.as_db_error().expect("db error");
+    assert_eq!((db.code().code(), db.message()), ("22P02", "invalid input syntax for type integer: \"x\""));
+}
+
+/// `x op ANY|SOME|ALL (SELECT …)` for every operator, with SQL's three
+/// values: a NULL among the subquery's values, an empty subquery, `NOT`
+/// around it, a value in the select list, and in UPDATE and DELETE. And `NOT
+/// (x IN (SELECT …))` when the subquery holds a NULL: the NULL was left out of
+/// the substituted list, so the row PostgreSQL drops was kept, and `x IN
+/// (SELECT …)` as a value was false rather than NULL (PostgreSQL 17, `docker
+/// run --rm postgres:17`).
+#[tokio::test(flavor = "multi_thread")]
+async fn quantified_subqueries_match_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, g TEXT, n INT, c CHAR(4), d DATE, b BOOLEAN, x NUMERIC(10,2))",
+        "INSERT INTO t VALUES (1,'1',1,'ab','2024-01-01',true,1.50),(2,'2',NULL,NULL,NULL,NULL,NULL),\
+         (3,'x',3,'cd','2024-02-01',false,2.25),(4,'3',4,'ab  ','2024-03-01',true,NULL),(5,NULL,2,'zz','2024-01-01',false,3.00)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let none: &[&str] = &[];
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT id FROM t WHERE NOT (n IN (SELECT n FROM t WHERE id < 3)) ORDER BY id", none),
+        ("SELECT id, n IN (SELECT n FROM t WHERE id < 3) FROM t ORDER BY id", &["1|t", "2|NULL", "3|NULL", "4|NULL", "5|NULL"]),
+        ("SELECT id FROM t WHERE NOT (n NOT IN (SELECT n FROM t WHERE id < 3)) ORDER BY id", &["1"]),
+        ("SELECT id FROM t WHERE NOT (c IN (SELECT c FROM t WHERE id IN (1,2))) ORDER BY id", none),
+        ("SELECT id FROM t WHERE NOT (d NOT IN (SELECT d FROM t WHERE id IN (1,2))) ORDER BY id", &["1", "5"]),
+        ("SELECT id FROM t WHERE NOT (b IN (SELECT b FROM t WHERE id IN (1,2))) ORDER BY id", none),
+        ("SELECT id FROM t WHERE NOT (n = ANY (SELECT n FROM t WHERE id < 3)) ORDER BY id", none),
+        ("SELECT id FROM t WHERE n > ANY (SELECT n FROM t WHERE id < 3) ORDER BY id", &["3", "4", "5"]),
+        ("SELECT id FROM t WHERE n >= ALL (SELECT n FROM t WHERE id IN (1,3)) ORDER BY id", &["3", "4"]),
+        ("SELECT id FROM t WHERE n >= ALL (SELECT n FROM t) ORDER BY id", none),
+        ("SELECT id FROM t WHERE NOT (n >= ALL (SELECT n FROM t)) ORDER BY id", &["1", "3", "5"]),
+        ("SELECT id FROM t WHERE NOT (n > ANY (SELECT n FROM t WHERE id < 3)) ORDER BY id", none),
+        ("SELECT id FROM t WHERE NOT (n > ANY (SELECT n FROM t WHERE id IN (1,3))) ORDER BY id", &["1"]),
+        ("SELECT id FROM t WHERE n < SOME (SELECT n FROM t WHERE id > 100) ORDER BY id", none),
+        ("SELECT id FROM t WHERE n < ALL (SELECT n FROM t WHERE id > 100) ORDER BY id", &["1", "2", "3", "4", "5"]),
+        ("SELECT id FROM t WHERE NOT (n < ALL (SELECT n FROM t WHERE id > 100)) ORDER BY id", none),
+        ("SELECT id FROM t WHERE n = ALL (SELECT 3) ORDER BY id", &["3"]),
+        ("SELECT id FROM t WHERE NOT (n = ALL (SELECT n FROM t WHERE id IN (1,3))) ORDER BY id", &["1", "3", "4", "5"]),
+        ("SELECT id, n > ANY (SELECT n FROM t WHERE id < 3) FROM t ORDER BY id", &["1|NULL", "2|NULL", "3|t", "4|t", "5|t"]),
+        ("SELECT id, n <> ANY (SELECT n FROM t WHERE id IN (1,3)) FROM t ORDER BY id", &["1|t", "2|NULL", "3|t", "4|t", "5|t"]),
+        ("SELECT id, n <> ANY (SELECT n FROM t WHERE id IN (1,2)) FROM t ORDER BY id", &["1|NULL", "2|NULL", "3|t", "4|t", "5|t"]),
+        ("SELECT id, n <= ALL (SELECT n FROM t WHERE id IN (1,2,5)) FROM t ORDER BY id", &["1|NULL", "2|NULL", "3|f", "4|f", "5|f"]),
+        ("SELECT id, n = ALL (SELECT n FROM t WHERE id = 2) FROM t ORDER BY id", &["1|NULL", "2|NULL", "3|NULL", "4|NULL", "5|NULL"]),
+        ("SELECT id FROM t WHERE g > ANY (SELECT g FROM t WHERE id IN (1,2)) ORDER BY id", &["2", "3", "4"]),
+        ("SELECT id FROM t WHERE x < ALL (SELECT x FROM t WHERE id IN (3,5)) ORDER BY id", &["1"]),
+        ("SELECT id FROM t WHERE d >= ALL (SELECT d FROM t WHERE id IN (1,5)) ORDER BY id", &["1", "3", "4", "5"]),
+        ("SELECT id FROM t WHERE n + 1 > ANY (SELECT n FROM t WHERE id IN (1,3)) ORDER BY id", &["1", "3", "4", "5"]),
+        ("SELECT id FROM t WHERE id > 1 AND n > ALL (SELECT n FROM t WHERE id IN (1,5)) ORDER BY id", &["3", "4"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    c.simple_query("UPDATE t SET g = 'big' WHERE n > ALL (SELECT n FROM t WHERE id IN (1,5))").await.expect("update");
+    assert_eq!(rows(&c, "SELECT id, g FROM t ORDER BY id").await, ["1|1", "2|2", "3|big", "4|big", "5|NULL"]);
+    c.simple_query("DELETE FROM t WHERE n < ANY (SELECT 2)").await.expect("delete");
+    assert_eq!(rows(&c, "SELECT id FROM t ORDER BY id").await, ["2", "3", "4", "5"]);
+    // An expression operand when the subquery yields a NULL: refused, not guessed.
+    let e = c.simple_query("SELECT id FROM t WHERE n + 1 > ANY (SELECT n FROM t)").await.expect_err("expr + NULL");
+    assert_eq!(e.code().map(|s| s.code()), Some("0A000"), "{e}");
+}
+
 /// `trunc`, a quantified subquery (`= ANY`, `<> ALL`), `IN` as a value, and
 /// a number with a fraction assigned to an integer column, each as
 /// PostgreSQL 17 answers (`docker run --rm postgres:17`). They were "function
@@ -503,8 +676,8 @@ async fn trunc_quantified_subqueries_in_values_and_integer_rounding_match_postgr
     // A quoted fraction is a string, which an integer refuses as PostgreSQL does.
     let e = c.simple_query("INSERT INTO ti (i) VALUES ('2.5')").await.expect_err("quoted fraction");
     assert_eq!(e.code().map(|s| s.code()), Some("22P02"), "{e}");
-    let e = c.simple_query("SELECT id FROM a WHERE id > ANY (SELECT w FROM b)").await.expect_err("> ANY");
-    assert_eq!(e.code().map(|s| s.code()), Some("0A000"), "{e}");
+    // `> ANY (subquery)` is answered now (`quantified_subqueries_match_postgresql`).
+    assert!(rows(&c, "SELECT id FROM a WHERE id > ANY (SELECT w FROM b)").await.is_empty());
 }
 
 /// `INTERSECT` and `EXCEPT`, with and without `ALL`, as PostgreSQL 17

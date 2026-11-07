@@ -606,7 +606,7 @@ fn parse_select_items(
                 }
             }
         }
-        if let Some(parsed) = crate::core::rql::join::comparison_value(expr, schema) {
+        if let Some(parsed) = crate::core::rql::join::comparison_value(expr, schema)? {
             out.push(SelectItem::RowExpr {
                 db_type: crate::core::rql::expr::static_type(&parsed),
                 expr: parsed,
@@ -662,6 +662,11 @@ fn parse_select_items(
                 // `EXTRACT(DOW FROM ts)` blamed EXTRACT. Aggregates were
                 // tried above.
                 Err(e) => {
+                    // A constant that is not a value of the type it meets
+                    // (`CASE WHEN n = 'q'`): PostgreSQL's 22P02, not CASE.
+                    if crate::core::rql::expr::is_input_error(&e) {
+                        return Err(e);
+                    }
                     if let Some(open) = expr.find('(') {
                         let head = expr[..open].trim().to_ascii_uppercase();
                         let known = crate::core::rql::expr::FUNCTIONS.contains(&head.as_str())

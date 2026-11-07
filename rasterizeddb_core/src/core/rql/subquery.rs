@@ -1453,6 +1453,147 @@ pub fn subquery_literal(db_type: &DbType, bytes: &[u8], exact_text: bool) -> Opt
     })
 }
 
+/// A value list from [`rows_to_value_list`] with the NULL it left out put
+/// back: `()` is `(NULL)`, `(1, 2)` is `(1, 2, NULL)`.
+pub fn list_with_null(list: &str) -> String {
+    let list = list.trim();
+    let inner = list.strip_prefix('(').and_then(|l| l.strip_suffix(')')).unwrap_or(list).trim();
+    if inner.is_empty() {
+        "(NULL)".to_string()
+    } else {
+        format!("({inner}, NULL)")
+    }
+}
+
+/// The predicate `x op ANY|ALL (subquery)` is, given the subquery's rows,
+/// with SQL's three values: a NULL among them makes a comparison that no
+/// value decides UNKNOWN, written `x IN (NULL)` (UNKNOWN for every `x`,
+/// which the scan and the evaluator both read three-valued, `NOT` included).
+///
+/// - `ANY`: true when some value passes, so `x > ANY` is `x > min`, `x < ANY`
+///   is `x < max`, `x <> ANY` holds for any `x` once two values differ; no
+///   rows is false. With a NULL: `(… OR x IN (NULL))`.
+/// - `ALL`: false when some value fails, so `x > ALL` is `x > max`, `x = ALL`
+///   is false once two values differ; no rows is true. With a NULL: `(… AND
+///   x IN (NULL))`.
+///
+/// It was refused: `min`/`max` alone hold in a filter but not under `NOT`
+/// when the subquery yields a NULL.
+pub fn quantified_predicate(
+    q: &crate::core::sql_scan::QuantifiedSubquery,
+    rows: &[Row],
+    document: bool,
+    exact_text: bool,
+) -> Result<String, String> {
+    use crate::core::rql::expr::Value;
+    let quantifier = if q.all { "ALL" } else { "ANY" };
+    if rows.is_empty() {
+        return Ok(if q.all { "(1 = 1)" } else { "(1 = 0)" }.to_string());
+    }
+    let mut values: Vec<(Value, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(u8, Vec<u8>)> = std::collections::HashSet::new();
+    let mut has_null = false;
+    for row in rows {
+        if row.columns.len() != 1 {
+            return Err("subquery has too many columns".to_string());
+        }
+        let column = &row.columns[0];
+        if column.column_type == DbType::NULL {
+            has_null = true;
+            continue;
+        }
+        let bytes = column.data.into_slice();
+        let db_type = if document && column.column_type == DbType::STRING {
+            DbType::JSONB
+        } else {
+            column.column_type.clone()
+        };
+        let key = match (db_type == DbType::DECIMAL)
+            .then(|| crate::core::value_codec::canonical_numeric_cell(bytes))
+            .flatten()
+        {
+            Some(canonical) => canonical,
+            None => bytes.to_vec(),
+        };
+        if !seen.insert((db_type.to_byte(), key)) {
+            continue;
+        }
+        let literal = subquery_literal(&db_type, bytes, exact_text)
+            .ok_or_else(|| format!("subquery returned a {} value that cannot be compared", db_type))?;
+        values.push((Value::Data { bytes: bytes.to_vec(), db_type }, literal));
+    }
+    if document && !matches!(q.op, "=" | "<>") {
+        return Err(format!("{} {quantifier} (subquery) over a json value is not supported", q.op));
+    }
+    let x = q.operand.as_str();
+    let bare = crate::core::rql::window_join::is_bare_reference(x);
+    let unknown = || -> Result<String, String> {
+        if bare {
+            Ok(format!("{x} IN (NULL)"))
+        } else {
+            Err(format!(
+                "{} {quantifier} (subquery) over an expression, when the subquery yields a NULL, is not \
+                 supported yet; compare a column, or filter the NULLs out of the subquery",
+                q.op
+            ))
+        }
+    };
+    let list = |values: &[(Value, String)]| -> String {
+        let mut items: Vec<&str> = values.iter().map(|(_, l)| l.as_str()).collect();
+        if has_null {
+            items.push("NULL");
+        }
+        format!("({})", items.join(", "))
+    };
+    // The value an ordering comparison has to beat: the least for `> ANY`
+    // and `< ALL`, the greatest for `< ANY` and `> ALL`.
+    let extreme = |least: bool| -> Option<&String> {
+        let mut best: Option<&(Value, String)> = None;
+        for v in &values {
+            best = match best {
+                None => Some(v),
+                Some(b) => {
+                    let ord = crate::core::rql::expr::compare_total(&v.0, &b.0)?;
+                    if (least && ord.is_lt()) || (!least && ord.is_gt()) { Some(v) } else { Some(b) }
+                }
+            };
+        }
+        best.map(|(_, l)| l)
+    };
+    let base: Option<String> = match (q.op, q.all) {
+        ("=", false) => return Ok(format!("({x} IN {})", list(&values))),
+        ("<>", true) => return Ok(format!("({x} NOT IN {})", list(&values))),
+        ("<>", false) => match values.len() {
+            0 => None,
+            1 => Some(format!("{x} <> {}", values[0].1)),
+            // Any `x` differs from one of two values; a NULL `x` is UNKNOWN.
+            _ => return Ok(format!("({x} IS NOT NULL OR {})", unknown()?)),
+        },
+        ("=", true) => match values.len() {
+            0 => None,
+            1 => Some(format!("{x} = {}", values[0].1)),
+            // No `x` equals two values; a NULL `x` is UNKNOWN.
+            _ => return Ok(format!("({} AND {x} IS NULL)", unknown()?)),
+        },
+        (op, all) => {
+            let least = matches!(op, ">" | ">=") != all;
+            match values.is_empty() {
+                true => None,
+                false => Some(format!(
+                    "{x} {op} {}",
+                    extreme(least).ok_or_else(|| "the subquery's values cannot be ordered".to_string())?
+                )),
+            }
+        }
+    };
+    Ok(match (base, has_null) {
+        (None, _) => format!("({})", unknown()?),
+        (Some(base), false) => format!("({base})"),
+        (Some(base), true) if q.all => format!("({base} AND {})", unknown()?),
+        (Some(base), true) => format!("({base} OR {})", unknown()?),
+    })
+}
+
 pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Result<(String, bool), String> {
     rows_to_value_list_as(rows, document, exact_text, false)
 }
@@ -1545,6 +1686,13 @@ pub fn rows_to_value_list_as(
 #[cfg(test)]
 mod correlation_tests {
     use super::*;
+
+    #[test]
+    fn a_null_goes_back_into_the_list() {
+        assert_eq!(list_with_null("()"), "(NULL)");
+        assert_eq!(list_with_null("(1, 2)"), "(1, 2, NULL)");
+        assert_eq!(list_with_null("(('ab ' || ''), 'c')"), "(('ab ' || ''), 'c', NULL)");
+    }
 
     #[test]
     fn a_subquery_reading_an_outer_column_is_correlated() {

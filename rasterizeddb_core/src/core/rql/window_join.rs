@@ -94,10 +94,27 @@ fn rewrite_select(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>>) -
         return None;
     }
 
-    // The source: a join, every relation of it a table with known columns.
+    // A window's `PARTITION BY` or `ORDER BY` term that is an expression
+    // (`PARTITION BY n % 2`, `ORDER BY lower(g)`) is computed by the inner
+    // query as a column of its own: the scan's windows read columns only.
+    let mut refs: Vec<String> = Vec::new();
+    let list = window_terms(list, &mut refs)?;
+    let list = list.as_str();
+    let order_text = match order_text {
+        Some(text) => Some(window_terms(text, &mut refs)?),
+        None => None,
+    };
+    let order_text = order_text.as_deref();
+    let computed = !refs.is_empty();
+
+    // The source: a join, or one table whose windows need such a column;
+    // every relation a table with known columns.
     let source_end = find_keyword(body, "WHERE", 0).unwrap_or(body.len());
     let source = &body[..source_end];
-    if find_keyword(source, "JOIN", 0).is_none() && !crate::core::rql::lexer_ct::split_definitions(source).len().gt(&1) {
+    if !computed
+        && find_keyword(source, "JOIN", 0).is_none()
+        && !crate::core::rql::lexer_ct::split_definitions(source).len().gt(&1)
+    {
         return None;
     }
     let relations = crate::core::rql::join::parse_from_clause(source.trim()).ok()?;
@@ -107,17 +124,35 @@ fn rewrite_select(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>>) -
     }
 
     let items = crate::core::rql::lexer_ct::split_definitions(list);
-    if items.iter().any(|i| {
-        let i = i.trim();
-        i == "*" || i.ends_with(".*")
-    }) {
-        return None;
-    }
-    let mut refs: Vec<String> = Vec::new();
     let mut outer_items = Vec::with_capacity(items.len());
     let mut output_names: Vec<String> = Vec::with_capacity(items.len());
     for raw in &items {
         let raw = raw.trim();
+        // `*` and `x.*`: each column of the relations they name, in order,
+        // under its own name, as PostgreSQL expands them.
+        let star = if raw == "*" {
+            Some(None)
+        } else {
+            raw.strip_suffix(".*").map(|q| Some(q.trim().trim_matches('"')))
+        };
+        if let Some(qualifier) = star {
+            let mut any = false;
+            for (label, columns) in &known {
+                if qualifier.is_some_and(|q| !q.eq_ignore_ascii_case(label)) {
+                    continue;
+                }
+                any = true;
+                for column in columns {
+                    let at = slot(&mut refs, format!("{label}.{column}"));
+                    output_names.push(column.clone());
+                    outer_items.push(format!("__w{at} AS {}", quote(column)));
+                }
+            }
+            if !any {
+                return None;
+            }
+            continue;
+        }
         let (expr, alias) = split_alias(raw);
         let rewritten = replace_references(expr, &known, &mut refs)?;
         let name = match alias {
@@ -181,6 +216,161 @@ fn rewrite_select(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>>) -
     Some(out)
 }
 
+/// The index of `reference` in `refs`, added when it is new.
+fn slot(refs: &mut Vec<String>, reference: String) -> usize {
+    refs.iter().position(|r| r.eq_ignore_ascii_case(&reference)).unwrap_or_else(|| {
+        refs.push(reference);
+        refs.len() - 1
+    })
+}
+
+/// `text` with each `PARTITION BY` and `ORDER BY` term of every `OVER (…)`
+/// that is not a bare column replaced by `__wN`, its expression added to
+/// `refs` for the inner query to compute. `None` for a named window.
+fn window_terms(text: &str, refs: &mut Vec<String>) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(at) = find_keyword(text, "OVER", from) {
+        let after = at + "OVER".len();
+        let open = after + (text[after..].len() - text[after..].trim_start().len());
+        if text.as_bytes().get(open) != Some(&b'(') {
+            return None;
+        }
+        let close = matching_paren(text, open)?;
+        out.push_str(&text[copied..open + 1]);
+        out.push_str(&window_spec(&text[open + 1..close], refs)?);
+        copied = close;
+        from = close;
+    }
+    out.push_str(&text[copied..]);
+    Some(out)
+}
+
+/// One window specification, its expression terms replaced.
+fn window_spec(spec: &str, refs: &mut Vec<String>) -> Option<String> {
+    let partition = find_phrase(spec, &["PARTITION", "BY"], 0);
+    let order = find_phrase(spec, &["ORDER", "BY"], 0);
+    if let (Some(p), Some(o)) = (partition, order) {
+        if o < p {
+            return None;
+        }
+    }
+    let frame = ["ROWS", "RANGE", "GROUPS"]
+        .iter()
+        .filter_map(|w| find_keyword(spec, w, order.or(partition).unwrap_or(0)))
+        .min();
+    let mut out = spec[..partition.or(order).or(frame).unwrap_or(spec.len())].to_string();
+    if let Some(p) = partition {
+        let end = order.or(frame).unwrap_or(spec.len());
+        out.push_str("PARTITION BY ");
+        out.push_str(&window_list(&spec[after_words(spec, p, 2)..end], false, refs)?);
+        out.push(' ');
+    }
+    if let Some(o) = order {
+        let end = frame.unwrap_or(spec.len());
+        out.push_str("ORDER BY ");
+        out.push_str(&window_list(&spec[after_words(spec, o, 2)..end], true, refs)?);
+        out.push(' ');
+    }
+    if let Some(f) = frame {
+        out.push_str(&spec[f..]);
+    }
+    Some(out.trim_end().to_string())
+}
+
+/// A comma-separated list of window terms; `sort` for `ORDER BY`, whose
+/// terms may end in `ASC`, `DESC` and `NULLS FIRST|LAST`.
+fn window_list(list: &str, sort: bool, refs: &mut Vec<String>) -> Option<String> {
+    let mut terms = Vec::new();
+    for term in crate::core::rql::lexer_ct::split_definitions(list) {
+        let term = term.trim();
+        if term.is_empty() {
+            return None;
+        }
+        let mut expr_end = term.len();
+        if sort {
+            loop {
+                let head = term[..expr_end].trim_end();
+                let Some(space) = head.rfind(char::is_whitespace) else { break };
+                let word = &head[space + 1..];
+                if ["ASC", "DESC", "NULLS", "FIRST", "LAST"].iter().any(|m| word.eq_ignore_ascii_case(m)) {
+                    expr_end = space;
+                } else {
+                    break;
+                }
+            }
+        }
+        let expr = term[..expr_end].trim();
+        if is_bare_reference(expr) {
+            terms.push(term.to_string());
+        } else {
+            let at = slot(refs, expr.to_string());
+            terms.push(format!("__w{at}{}", &term[expr_end..]));
+        }
+    }
+    Some(terms.join(", "))
+}
+
+/// A column, qualified or not, or a number: what a window reads as is.
+pub(crate) fn is_bare_reference(expr: &str) -> bool {
+    if !expr.is_empty() && expr.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let mut at = 0;
+    for part in 0..2 {
+        let Some((_, end)) = read_identifier(expr, at) else { return false };
+        if end == expr.len() {
+            return true;
+        }
+        if part == 1 || expr.as_bytes()[end] != b'.' {
+            return false;
+        }
+        at = end + 1;
+    }
+    false
+}
+
+/// The position after `n` words starting at `at`.
+fn after_words(text: &str, at: usize, n: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = at;
+    for _ in 0..n {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// The `)` closing the `(` at `open`, outside quotes.
+pub(crate) fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for (i, &c) in bytes.iter().enumerate().skip(open) {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
 /// `expr AS name` or `expr name` as `(expr, Some(name))`.
 fn split_alias(item: &str) -> (&str, Option<&str>) {
     if let Some(at) = last_top_level_keyword(item, "AS") {
@@ -216,7 +406,7 @@ fn quote(name: &str) -> String {
 /// it (`__wN`), adding new ones to `refs` as `label.column`. `None` for a
 /// bare name two relations share (PostgreSQL's 42702, left to the native
 /// path), or an unknown qualifier.
-fn replace_references(text: &str, known: &[(String, Vec<String>)], refs: &mut Vec<String>) -> Option<String> {
+pub(crate) fn replace_references(text: &str, known: &[(String, Vec<String>)], refs: &mut Vec<String>) -> Option<String> {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len() + 16);
     let mut i = 0usize;
@@ -384,12 +574,41 @@ mod tests {
     }
 
     #[test]
+    fn an_expression_window_term_is_computed_by_the_inner_query() {
+        let got = rewrite_statement(
+            "SELECT id, row_number() OVER (PARTITION BY id % 2 ORDER BY lower(g) DESC NULLS LAST, id) FROM a ORDER BY id",
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            "SELECT __w2 AS \"id\", row_number() OVER (PARTITION BY __w0 ORDER BY __w1 DESC NULLS LAST, __w2) AS \"row_number\" \
+             FROM (SELECT id % 2 AS __w0, lower(g) AS __w1, a.id AS __w2 FROM a) __w ORDER BY id"
+        );
+        // A frame stays; a bare column or a number is read as it is.
+        let got = rewrite_statement(
+            "SELECT sum(id) OVER (PARTITION BY g ORDER BY id * -1 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM a",
+            &columns,
+        )
+        .unwrap();
+        assert!(got.contains("OVER (PARTITION BY __w2 ORDER BY __w0 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"), "{got}");
+        assert!(got.contains("id * -1 AS __w0"), "{got}");
+        // `*` is each column, under its own name.
+        let got = rewrite_statement("SELECT *, rank() OVER (ORDER BY b.w) FROM a JOIN b ON a.id = b.id", &columns).unwrap();
+        assert!(
+            got.starts_with("SELECT __w0 AS \"id\", __w1 AS \"g\", __w2 AS \"first\", __w3 AS \"id\", __w4 AS \"w\", rank()"),
+            "{got}"
+        );
+        // Columns only, one table: nothing to do.
+        assert!(rewrite_statement("SELECT rank() OVER (PARTITION BY g ORDER BY id DESC) FROM a", &columns).is_none());
+    }
+
+    #[test]
     fn what_it_cannot_rewrite_faithfully_is_left_alone() {
         for sql in [
             "SELECT id, rank() OVER (ORDER BY w) FROM a JOIN b ON a.id = b.id",
             "SELECT a.id FROM a JOIN b ON a.id = b.id",
             "SELECT rank() OVER (ORDER BY id) FROM a",
-            "SELECT *, rank() OVER (ORDER BY w) FROM a JOIN b ON a.id = b.id",
             "SELECT a.id, rank() OVER (ORDER BY b.w) FROM a JOIN c ON a.id = c.id",
             "SELECT a.g, count(*) OVER () FROM a JOIN b ON a.id = b.id GROUP BY a.g",
             "WITH x AS (SELECT 1) SELECT rank() OVER (ORDER BY b.w) FROM a JOIN b ON a.id = b.id",

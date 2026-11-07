@@ -688,11 +688,11 @@ pub fn quantified_subqueries(sql: &str) -> Result<Option<String>, String> {
         let replacement = match (op, quantifier.eq_ignore_ascii_case("ALL")) {
             ("=", false) => "IN",
             ("<>" | "!=", true) => "NOT IN",
+            // Answered with the subquery's values in hand, by the executor
+            // (`find_quantified_subquery`).
             _ => {
-                return Err(format!(
-                    "{op} {} (subquery) is not supported yet; = ANY and <> ALL are",
-                    quantifier.to_ascii_uppercase()
-                ))
+                i = word_end;
+                continue;
             }
         };
         let o = out.get_or_insert_with(|| String::with_capacity(sql.len() + 8));
@@ -710,6 +710,150 @@ pub fn quantified_subqueries(sql: &str) -> Result<Option<String>, String> {
         o.push_str(&sql[copied..]);
         o
     }))
+}
+
+/// A comparison with a quantified subquery, `x > ANY (SELECT …)`: where its
+/// operand begins, the operator, whether it is `ALL`, where the subquery's
+/// parenthesis closes (exclusive end), and the subquery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantifiedSubquery {
+    pub start: usize,
+    pub operand: String,
+    pub op: &'static str,
+    pub all: bool,
+    pub end: usize,
+    pub inner_sql: String,
+}
+
+/// The first `x op ANY|SOME|ALL (SELECT …)` of `sql` outside quotes, or
+/// `None`. `Err` when its operand cannot be told apart from what precedes it.
+pub fn find_quantified_subquery(sql: &str) -> Option<Result<QuantifiedSubquery, String>> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let boundary = i == 0 || !(is_identifier_byte(bytes[i - 1]) || matches!(bytes[i - 1], b'.' | b'"'));
+        if !(boundary && bytes[i].is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let word_end = bytes[i..].iter().position(|b| !is_identifier_byte(*b)).map_or(bytes.len(), |p| i + p);
+        let word = &sql[i..word_end];
+        let Some(quantifier) = ["ANY", "SOME", "ALL"].into_iter().find(|q| word.eq_ignore_ascii_case(q)) else {
+            i = word_end;
+            continue;
+        };
+        let open = word_end + bytes[word_end..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let subquery = bytes.get(open) == Some(&b'(') && {
+            let inner = sql[open + 1..].trim_start();
+            let head = &inner[..inner.bytes().position(|b| !is_identifier_byte(b)).unwrap_or(inner.len())];
+            head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH")
+        };
+        let before = sql[..i].trim_end();
+        let op = ["<>", "!=", "<=", ">=", "=", "<", ">"].into_iter().find(|op| before.ends_with(op));
+        let (true, Some(op)) = (subquery, op) else {
+            i = word_end;
+            continue;
+        };
+        let Some(close) = matching_close(sql, open) else {
+            return Some(Err("a quantified subquery is missing its closing parenthesis".to_string()));
+        };
+        let op_at = before.len() - op.len();
+        let Some(start) = operand_start(sql, op_at) else {
+            return Some(Err(format!(
+                "the left operand of {op} {} (subquery) could not be read; parenthesise it",
+                quantifier.to_ascii_uppercase()
+            )));
+        };
+        return Some(Ok(QuantifiedSubquery {
+            start,
+            operand: sql[start..op_at].trim().to_string(),
+            op: if op == "!=" { "<>" } else { op },
+            all: quantifier.eq_ignore_ascii_case("ALL"),
+            end: close + 1,
+            inner_sql: sql[open + 1..close].trim().to_string(),
+        }));
+    }
+    None
+}
+
+/// Where the operand ending at `end` begins: a column, a constant, a call,
+/// a parenthesised expression, a cast, and arithmetic over them, back to the
+/// keyword, comma, comparison or unmatched `(` before it. `None` when there
+/// is no operand.
+fn operand_start(sql: &str, end: usize) -> Option<usize> {
+    const STOP_WORDS: &[&str] = &[
+        "AND", "OR", "NOT", "WHERE", "ON", "WHEN", "THEN", "ELSE", "HAVING", "SELECT", "CASE", "IS", "IN", "LIKE",
+        "ILIKE", "BETWEEN", "RETURNING", "SET", "BY", "AS", "DISTINCT", "END", "ALL", "ANY", "SOME",
+    ];
+    let bytes = sql.as_bytes();
+    let mut i = end;
+    let mut start = None;
+    loop {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        match bytes[i - 1] {
+            b')' => {
+                // Back to the matching `(`, outside quotes.
+                let mut depth = 0usize;
+                let mut k = i;
+                let mut quote: Option<u8> = None;
+                loop {
+                    if k == 0 {
+                        return None;
+                    }
+                    k -= 1;
+                    let c = bytes[k];
+                    match quote {
+                        Some(q) if c == q => quote = None,
+                        Some(_) => {}
+                        None => match c {
+                            b'\'' | b'"' => quote = Some(c),
+                            b')' => depth += 1,
+                            b'(' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+                i = k;
+                start = Some(i);
+            }
+            q @ (b'\'' | b'"') => {
+                let open = sql[..i - 1].rfind(q as char)?;
+                i = open;
+                start = Some(i);
+            }
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b':' | b'.' | b'[' | b']' => {
+                i -= 1;
+            }
+            c if is_identifier_byte(c) => {
+                let mut k = i;
+                while k > 0 && is_identifier_byte(bytes[k - 1]) {
+                    k -= 1;
+                }
+                let word = &sql[k..i];
+                if STOP_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
+                    break;
+                }
+                i = k;
+                start = Some(i);
+            }
+            _ => break,
+        }
+    }
+    start
 }
 
 /// Splits `list` on `delimiter` where it stands at nesting depth zero —
@@ -1330,9 +1474,32 @@ mod tests {
         assert!(q("SELECT id FROM a WHERE id = ANY ('{1,2}')").unwrap().is_none());
         assert!(q("SELECT 'x = ANY (SELECT 1)' FROM a").unwrap().is_none());
         assert!(q("SELECT company FROM a").unwrap().is_none());
-        for refused in ["id > ANY (SELECT 1)", "id = ALL (SELECT 1)", "id <> ANY (SELECT 1)", "id <= SOME (SELECT 1)"] {
-            let e = q(&format!("SELECT 1 FROM a WHERE {refused}")).unwrap_err();
-            assert!(e.contains("not supported"), "{refused}: {e}");
+        // Any other operator is answered by the executor, with the values.
+        for left in ["id > ANY (SELECT 1)", "id = ALL (SELECT 1)", "id <> ANY (SELECT 1)", "id <= SOME (SELECT 1)"] {
+            assert!(q(&format!("SELECT 1 FROM a WHERE {left}")).unwrap().is_none(), "{left}");
+        }
+    }
+
+    #[test]
+    fn a_quantified_comparison_is_found_with_its_operand() {
+        use super::find_quantified_subquery as f;
+        let sql = "SELECT id FROM a WHERE x = 1 AND n + 1 >= ALL (SELECT m FROM b WHERE (m) > 0) ORDER BY id";
+        let q = f(sql).unwrap().unwrap();
+        assert_eq!((q.operand.as_str(), q.op, q.all), ("n + 1", ">=", true));
+        assert_eq!(&sql[q.start..q.end], "n + 1 >= ALL (SELECT m FROM b WHERE (m) > 0)");
+        assert_eq!(q.inner_sql, "SELECT m FROM b WHERE (m) > 0");
+        for (sql, operand, op) in [
+            ("SELECT id, lower(a.g)::text<SOME(SELECT g FROM b) FROM a", "lower(a.g)::text", "<"),
+            ("SELECT 1 FROM a WHERE NOT \"N\" != ANY (SELECT 1)", "\"N\"", "<>"),
+            ("SELECT 1 FROM a WHERE (n) > ANY (SELECT 1)", "(n)", ">"),
+            ("UPDATE a SET g = 'x' WHERE n > ALL (SELECT 1)", "n", ">"),
+            ("SELECT 1 FROM a WHERE 'it''s' < ANY (SELECT g FROM b)", "'it''s'", "<"),
+        ] {
+            let q = f(sql).unwrap().unwrap();
+            assert_eq!((q.operand.as_str(), q.op), (operand, op), "{sql}");
+        }
+        for none in ["SELECT 1 FROM a WHERE n = ANY (ARRAY[1])", "SELECT 'n > ANY (SELECT 1)' FROM a", "SELECT 1 UNION ALL (SELECT 2)"] {
+            assert!(f(none).is_none(), "{none}");
         }
     }
 

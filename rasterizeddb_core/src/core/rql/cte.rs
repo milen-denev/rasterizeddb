@@ -1654,7 +1654,17 @@ async fn build_derived(
 ) -> Result<String, String> {
     let (rows, scales) = crate::core::rql::executor::run_query_rows_scaled(query, database, tx)
         .await
-        .map_err(|e| format!("the subquery for '{}' failed: {}", alias, e))?;
+        .map_err(|e| {
+            // A value's input error is PostgreSQL's own words, unwrapped:
+            // a join operand computed by a derived table (`join_on`) is
+            // reported as the join reports it there.
+            let inner = e.strip_prefix("subquery failed: ").unwrap_or(&e);
+            if crate::core::rql::expr::is_input_error(inner) {
+                inner.to_string()
+            } else {
+                format!("the subquery for '{}' failed: {}", alias, e)
+            }
+        })?;
 
     if select_list_of(query).is_none() {
         return Err(format!("the subquery for '{}' must be a SELECT", alias));

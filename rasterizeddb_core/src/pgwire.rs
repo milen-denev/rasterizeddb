@@ -4110,6 +4110,8 @@ pub(crate) async fn describe_query(
     let stmt = quantified.as_deref().unwrap_or(stmt);
     let window_join = crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name));
     let stmt = window_join.as_deref().unwrap_or(stmt);
+    let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name));
+    let stmt = join_on.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
     // A `WITH` prefix is stripped and the statement it introduces is described
@@ -4927,6 +4929,10 @@ where
     // clause that is not one character (`22019`).
     let sqlstate = if sqlstate != "42601" {
         sqlstate
+    } else if crate::core::rql::expr::is_input_error(message) {
+        // A constant that is not a value of the type it meets (`n = 'q'`):
+        // 22P02, or 22003 past the type's range, as PostgreSQL's input.
+        sqlstate_for(message)
     } else if message.starts_with("invalid regular expression") {
         "2201B"
     } else if message.starts_with("LIKE pattern must not end with escape character") {
@@ -6016,6 +6022,17 @@ where
         Some(rewritten) => {
             window_join = rewritten;
             window_join.as_str()
+        }
+        None => stmt,
+    };
+    // A join operand that is an expression (`ON a.g = b.id::text`), computed
+    // by a derived table standing in for its relation (`core::rql::join_on`).
+    // After the window rewrite, whose inner query may hold the join.
+    let join_on;
+    let stmt = match crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name)) {
+        Some(rewritten) => {
+            join_on = rewritten;
+            join_on.as_str()
         }
         None => stmt,
     };

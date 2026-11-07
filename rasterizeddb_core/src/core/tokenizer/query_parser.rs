@@ -1354,8 +1354,16 @@ impl<'a, 'b> QueryParser<'a, 'b> {
             from: &DbType,
             to: &DbType,
         ) -> Result<MemoryBlock, String> {
-            let bytes = crate::core::value_codec::coerce_literal(literal.into_slice(), from, to)
-                .ok_or_else(|| format!("literal cannot be compared against a {} column", to))?;
+            // A quoted literal that is not a value of the column's type is
+            // PostgreSQL's input error (`id = 'a'`: 22P02), as its cast is.
+            let bytes = crate::core::value_codec::coerce_literal(literal.into_slice(), from, to).ok_or_else(|| {
+                if *from == DbType::STRING {
+                    let text = String::from_utf8_lossy(literal.into_slice());
+                    crate::core::value_codec::refusal_message(to, &crate::core::value_codec::quote_sql(&text))
+                } else {
+                    format!("literal cannot be compared against a {} column", to)
+                }
+            })?;
             let mut mb = MEMORY_POOL.acquire(bytes.len());
             mb.into_slice_mut().copy_from_slice(&bytes);
             Ok(mb)

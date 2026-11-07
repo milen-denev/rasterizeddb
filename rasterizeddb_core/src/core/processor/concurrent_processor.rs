@@ -788,6 +788,11 @@ impl ConcurrentProcessor {
             let mut parser = QueryParser::new(tokens_arc.as_ref(), processor_mut)
                 .with_scales(schema_arc.as_slice());
             if let Err(e) = parser.execute(&plan_columns) {
+                // A constant that is not a value of its column's type is
+                // PostgreSQL's input error, in its words (`id = 'a'`).
+                if crate::core::rql::expr::is_input_error(&e) {
+                    return Err(e);
+                }
                 return Err(format!("could not compile the query plan: {}", e));
             }
         }

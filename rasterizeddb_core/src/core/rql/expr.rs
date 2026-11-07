@@ -2015,6 +2015,8 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
             let mut left = Box::new(parse(&text[..at], schema)?);
             let mut right = Box::new(parse(&text[at + token.len()..], schema)?);
             text_against_number(&left, token, &right)?;
+            untyped_literal_as(&left, &mut right)?;
+            untyped_literal_as(&right, &mut left)?;
             // A string compared with a `character(n)` value is read without
             // its trailing spaces, as the value is held (`yields_bpchar`).
             if yields_bpchar(&left) {
@@ -2090,6 +2092,109 @@ fn text_against_number(left: &Expr, op: &str, right: &Expr) -> Result<(), String
             return Err(format!("operator does not exist: {name} {op} text"));
         }
     }
+    Ok(())
+}
+
+/// Whether `message` is a value's input error: a constant that is not a value
+/// of the type it is read as (22P02), or one past its range (22003).
+pub(crate) fn is_input_error(message: &str) -> bool {
+    message.starts_with("invalid input syntax for type ")
+        || (message.starts_with("value \"") && message.contains("\" is out of range for type "))
+        || (message.starts_with('"') && message.contains("\" is out of range for type "))
+}
+
+/// A quoted literal compared with a number or a boolean, read as that type,
+/// as PostgreSQL resolves an untyped constant: `'1' = 1` is `1 = 1`, and
+/// `'a' = 1` is 22P02 (`invalid input syntax for type integer: "a"`). Left
+/// as text it was compared byte for byte against the other side's encoding
+/// and answered false, so `'1' = 1`, `'2.5' < 3.0` and `'true' = true` were
+/// all false. Only when the other side's type is certain: a column, a cast,
+/// a typed constant.
+fn untyped_literal_as(other: &Expr, literal: &mut Expr) -> Result<(), String> {
+    let Expr::Literal { bytes, db_type: DbType::STRING } = &*literal else { return Ok(()) };
+    if matches!(other, Expr::Literal { db_type: DbType::STRING, .. } | Expr::Null) {
+        return Ok(());
+    }
+    let target = static_type(other);
+    let text = String::from_utf8_lossy(bytes).to_string();
+    let refuse = || crate::core::value_codec::refusal_message(&target, &crate::core::value_codec::quote_sql(&text));
+    let t = text.trim();
+    let converted = match target {
+        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => {
+            let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refuse());
+            }
+            let v: i128 = t.parse().map_err(|_| refuse())?;
+            let (lo, hi): (i128, i128) = match target {
+                DbType::I8 => (i8::MIN.into(), i8::MAX.into()),
+                DbType::I16 => (i16::MIN.into(), i16::MAX.into()),
+                DbType::I32 => (i32::MIN.into(), i32::MAX.into()),
+                DbType::U8 => (0, u8::MAX.into()),
+                DbType::U16 => (0, u16::MAX.into()),
+                DbType::U32 => (0, u32::MAX.into()),
+                DbType::U64 => (0, u64::MAX.into()),
+                _ => (i64::MIN.into(), i64::MAX.into()),
+            };
+            if v < lo || v > hi {
+                return Err(refuse());
+            }
+            match i64::try_from(v) {
+                Ok(v) => Expr::Literal { bytes: v.to_le_bytes().to_vec(), db_type: DbType::I64 },
+                Err(_) => Expr::Literal { bytes: (v as u64).to_le_bytes().to_vec(), db_type: DbType::U64 },
+            }
+        }
+        DbType::F32 | DbType::F64 => {
+            let v: f64 = match t.to_ascii_lowercase().as_str() {
+                "nan" => f64::NAN,
+                "infinity" | "+infinity" | "inf" | "+inf" => f64::INFINITY,
+                "-infinity" | "-inf" => f64::NEG_INFINITY,
+                _ if t.bytes().any(|b| b.is_ascii_digit()) && t.bytes().all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b)) => {
+                    t.parse().map_err(|_| refuse())?
+                }
+                _ => return Err(refuse()),
+            };
+            if target == DbType::F32 {
+                Expr::Literal { bytes: (v as f32).to_le_bytes().to_vec(), db_type: DbType::F32 }
+            } else {
+                Expr::Literal { bytes: v.to_le_bytes().to_vec(), db_type: DbType::F64 }
+            }
+        }
+        DbType::DECIMAL => {
+            let body = t.strip_prefix(['-', '+']).unwrap_or(t);
+            let mantissa = body.split(['e', 'E']).next().unwrap_or("");
+            let exponent = body.split_once(['e', 'E']).map(|(_, e)| e);
+            let numeric = mantissa.bytes().any(|b| b.is_ascii_digit())
+                && mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && mantissa.bytes().filter(|&b| b == b'.').count() <= 1
+                && exponent.is_none_or(|e| {
+                    let e = e.strip_prefix(['-', '+']).unwrap_or(e);
+                    !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit())
+                });
+            if !numeric {
+                return Err(refuse());
+            }
+            match parse(t, &[])? {
+                lit @ Expr::Literal { .. } => lit,
+                _ => return Err(refuse()),
+            }
+        }
+        DbType::BOOL => {
+            let lower = t.to_ascii_lowercase();
+            // PostgreSQL's `boolin`: a prefix of true/yes/false/no, on, off
+            // (or `of`), 1 or 0, any case; a lone `o` is ambiguous.
+            let prefix = |word: &str| !lower.is_empty() && word.starts_with(lower.as_str());
+            let truthy = lower == "1" || lower == "on" || prefix("true") || prefix("yes");
+            let falsy = lower == "0" || (lower.len() >= 2 && prefix("off")) || prefix("false") || prefix("no");
+            match (truthy, falsy) {
+                (true, false) => Expr::Literal { bytes: vec![1], db_type: DbType::BOOL },
+                (false, true) => Expr::Literal { bytes: vec![0], db_type: DbType::BOOL },
+                _ => return Err(refuse()),
+            }
+        }
+        _ => return Ok(()),
+    };
+    *literal = converted;
     Ok(())
 }
 
