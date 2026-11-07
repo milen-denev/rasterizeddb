@@ -5030,6 +5030,29 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         }
     }
 
+    // `INTERSECT` or `EXCEPT` anywhere: every branch's rows first, then the
+    // chain evaluated over them (`set_ops::Combined::push_set_ops`). They
+    // were refused by name.
+    if !parts.is_plain_union() {
+        let mut leaves: Vec<Vec<u8>> = Vec::with_capacity(parts.branches.len());
+        for branch in &parts.branches {
+            if branch.trim().is_empty() {
+                return ddl_error("a set operation's branch is empty");
+            }
+            match run_subquery_serialized(branch, database, tx).await {
+                Ok(bytes) => leaves.push(bytes),
+                Err(e) => return ddl_error(&e),
+            }
+        }
+        if let Err(e) = combined.push_set_ops(&parts, &leaves) {
+            return ddl_error(&e);
+        }
+        return match combined.finish() {
+            Ok(result) => result,
+            Err(e) => ddl_error(&e),
+        };
+    }
+
     // Each branch's rows stay serialized from the subquery response to the
     // result: no `Vec<Row>` (1.5 KB a row).
     for (at, branch) in parts.branches.iter().enumerate() {

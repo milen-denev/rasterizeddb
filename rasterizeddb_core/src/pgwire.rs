@@ -4610,7 +4610,7 @@ async fn describe_resolved(
                         .or_else(|| crate::core::rql::catalog_views::synthetic_schema(name))
                 };
                 return Ok(
-                    match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
+                    match crate::core::rql::join::plan_statement(&crate::core::rql::join::first_branch(&qr.query), &schema_of) {
                         Ok(plan) => Some((
                             join_output_columns(&plan, database)
                                 .into_iter()
@@ -6803,7 +6803,7 @@ fn result_description(
         QueryPurpose::KvCache(sql) => Some(crate::core::kv_cache::sql::result_fields(sql)),
         QueryPurpose::QueryRows(qr) if crate::core::rql::join::statement_has_join(&qr.query) => {
             let schema_of = |name: &str| database.schema_view(name).map(|t| t.schema().fields.clone());
-            match crate::core::rql::join::plan_statement(&qr.query, &schema_of) {
+            match crate::core::rql::join::plan_statement(&crate::core::rql::join::first_branch(&qr.query), &schema_of) {
                 Ok(plan) => Some(join_output_columns(&plan, database)),
                 // A comparison with no operator (`text = double precision`)
                 // is PostgreSQL's 42883, not a syntax error.

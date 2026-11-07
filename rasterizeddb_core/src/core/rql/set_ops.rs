@@ -480,6 +480,75 @@ impl Combined {
         Ok(())
     }
 
+    /// Every branch's serialized rows, combined by `parts.ops` where they
+    /// are not all `UNION`: `INTERSECT` binds tighter than `UNION` and
+    /// `EXCEPT`, which apply from the left, as in PostgreSQL. Rows are equal
+    /// as a bare `UNION` finds them ([`duplicate_key`]: NULL equals NULL, a
+    /// document by value, integers and decimals in the column's common
+    /// form). Without `ALL` each result is distinct; with it, a bag:
+    /// `INTERSECT ALL` keeps a row as often as both sides have it, `EXCEPT
+    /// ALL` as often as the left has it more.
+    pub fn push_set_ops(&mut self, parts: &UnionParts, leaves: &[Vec<u8>]) -> Result<(), String> {
+        use crate::core::rql::join::SetKind;
+        let read = |e: std::io::Error| format!("a set operation's rows could not be read: {}", e);
+        let mut sets: Vec<Vec<SetRow<'_>>> = Vec::with_capacity(leaves.len());
+        for (branch, bytes) in leaves.iter().enumerate() {
+            let rescale = self.rescale.as_ref().and_then(|r| r.get(branch)).map(Vec::as_slice);
+            let mut rows = Vec::new();
+            for row in serialized_rows(bytes) {
+                let row = row.map_err(read)?;
+                let mut key = Vec::new();
+                duplicate_key(row, &self.documents, rescale, &self.widen, &mut key).map_err(read)?;
+                rows.push(SetRow { branch, row, key });
+            }
+            sets.push(rows);
+        }
+        // The `INTERSECT` runs first, each into one term.
+        let mut sets = sets.into_iter();
+        let mut current = sets.next().unwrap_or_default();
+        let mut terms: Vec<Vec<SetRow<'_>>> = Vec::new();
+        let mut between = Vec::new();
+        for (op, next) in parts.ops.iter().zip(sets) {
+            if op.kind == SetKind::Intersect {
+                current = intersect_rows(current, next, op.all);
+            } else {
+                terms.push(std::mem::take(&mut current));
+                between.push(*op);
+                current = next;
+            }
+        }
+        terms.push(current);
+        let mut terms = terms.into_iter();
+        let mut result = terms.next().unwrap_or_default();
+        for (op, next) in between.into_iter().zip(terms) {
+            result = match op.kind {
+                SetKind::Except => except_rows(result, next, op.all),
+                _ => union_rows(result, next, op.all),
+            };
+        }
+        for row in result {
+            if self.is_full() {
+                break;
+            }
+            self.keep(row.row, row.branch)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps one row of branch `branch` as it is, widened or rescaled as the
+    /// column says.
+    fn keep(&mut self, row: &[u8], branch: usize) -> Result<(), String> {
+        let rescale: Option<Vec<Option<u32>>> = self.rescale.as_ref().and_then(|r| r.get(branch)).cloned();
+        self.starts.push(self.out.len());
+        if self.widen.iter().any(Option::is_some) || rescale.is_some() {
+            push_widened(row, &self.widen, rescale.as_deref(), &mut self.out)
+                .map_err(|e| format!("a set operation's rows could not be read: {}", e))?;
+        } else {
+            self.out.extend_from_slice(row);
+        }
+        Ok(())
+    }
+
     /// The combined rows, sorted, offset and limited, after what `out` began
     /// with.
     pub fn finish(self) -> Result<Vec<u8>, String> {
@@ -554,6 +623,71 @@ impl Combined {
 /// PostgreSQL sorts a set operation by its output columns only: a position, or
 /// a name the first branch gives a column. An expression is refused there, as
 /// it is here, rather than sorted by something else.
+/// One row of a set operation's operand: its branch, its bytes, and the key
+/// it is compared by.
+struct SetRow<'a> {
+    branch: usize,
+    row: &'a [u8],
+    key: Vec<u8>,
+}
+
+/// How many times each key appears in `rows`.
+fn key_counts(rows: &[SetRow<'_>]) -> std::collections::HashMap<Vec<u8>, usize> {
+    let mut counts = std::collections::HashMap::with_capacity(rows.len());
+    for r in rows {
+        *counts.entry(r.key.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// `a UNION [ALL] b`: each distinct row once, or every row of both.
+fn union_rows<'a>(mut a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    a.extend(b);
+    if all {
+        return a;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(a.len());
+    a.into_iter().filter(|r| seen.insert(r.key.clone())).collect()
+}
+
+/// `a INTERSECT [ALL] b`: each row of `a` that `b` has, once; or as many
+/// times as both have it.
+fn intersect_rows<'a>(a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    let mut counts = key_counts(&b);
+    let mut seen = std::collections::HashSet::new();
+    a.into_iter()
+        .filter(|r| match counts.get_mut(&r.key) {
+            Some(n) if *n > 0 => {
+                if all {
+                    *n -= 1;
+                    true
+                } else {
+                    seen.insert(r.key.clone())
+                }
+            }
+            _ => false,
+        })
+        .collect()
+}
+
+/// `a EXCEPT [ALL] b`: each row of `a` that `b` lacks, once; or as many
+/// times as `a` has it more than `b`.
+fn except_rows<'a>(a: Vec<SetRow<'a>>, b: Vec<SetRow<'a>>, all: bool) -> Vec<SetRow<'a>> {
+    let mut counts = key_counts(&b);
+    let mut seen = std::collections::HashSet::new();
+    a.into_iter()
+        .filter(|r| match counts.get_mut(&r.key) {
+            Some(n) if *n > 0 => {
+                if all {
+                    *n -= 1;
+                }
+                false
+            }
+            _ => all || seen.insert(r.key.clone()),
+        })
+        .collect()
+}
+
 fn resolve_sort(clause: &str, names: &[Option<String>]) -> Result<Vec<SortKey>, String> {
     let terms = crate::core::rql::order_by::parse(clause)?;
     let mut keys = Vec::with_capacity(terms.len());

@@ -2444,11 +2444,29 @@ pub fn find_phrase(sql: &str, words: &[&str], start: usize) -> Option<usize> {
     }
 }
 
+/// Which set operation joins two branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// A set operator between two branches, with or without `ALL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetOp {
+    pub kind: SetKind,
+    pub all: bool,
+}
+
 /// A `SELECT … UNION [ALL] SELECT …` taken apart: its branches, which of them
 /// are combined without duplicates, and the clauses that apply to the
-/// combined rows.
+/// combined rows. `INTERSECT` and `EXCEPT` too, with the operator between
+/// each pair of branches in [`UnionParts::ops`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnionParts {
+    /// The operator between branch `i` and `i + 1`.
+    pub ops: Vec<SetOp>,
     /// Each branch as a plain `SELECT`, the parentheses around it removed.
     pub branches: Vec<String>,
     /// How many leading branches are combined with duplicates removed.
@@ -2480,7 +2498,7 @@ pub struct UnionParts {
 /// And until the trailing `ORDER BY` was lifted off too, it sorted only the
 /// last branch, and the `LIMIT` behind it was not found.
 pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
-    let (branches, distinct_prefix, tail) = union_pieces(sql)?;
+    let (branches, distinct_prefix, tail, ops) = union_pieces(sql)?;
     // A row lock on any branch, or on the whole, locks rows a union's output
     // does not name: PostgreSQL refuses it, and so does this. The last
     // branch's clause used to lock that branch's rows alone.
@@ -2490,6 +2508,7 @@ pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
         }
     }
     let mut parts = UnionParts {
+        ops,
         branches,
         distinct_prefix,
         order_by: None,
@@ -2511,31 +2530,62 @@ pub fn split_union(sql: &str) -> Option<Result<UnionParts, String>> {
 /// only from a split that succeeded said `int` for a column the rows were
 /// sent as `bigint`.
 pub fn union_branches(sql: &str) -> Option<Vec<String>> {
-    union_pieces(sql).map(|(branches, _, _)| branches)
+    union_pieces(sql).map(|(branches, _, _, _)| branches)
+}
+
+/// The first branch of a set operation, which describes its columns as in
+/// PostgreSQL, or the whole statement when it is not one. A join planned
+/// whole read the next branch as part of its own clauses.
+pub fn first_branch(sql: &str) -> std::borrow::Cow<'_, str> {
+    match split_union(sql) {
+        Some(Ok(parts)) => parts
+            .branches
+            .into_iter()
+            .next()
+            .map_or(std::borrow::Cow::Borrowed(sql), std::borrow::Cow::Owned),
+        _ => std::borrow::Cow::Borrowed(sql),
+    }
+}
+
+impl UnionParts {
+    /// Every operator is a `UNION`, which the distinct prefix describes.
+    pub fn is_plain_union(&self) -> bool {
+        self.ops.iter().all(|op| op.kind == SetKind::Union)
+    }
 }
 
 /// The branches, the length of the distinct prefix, and the trailing clauses
 /// lifted off the last branch, still unread.
-fn union_pieces(sql: &str) -> Option<(Vec<String>, usize, String)> {
+fn union_pieces(sql: &str) -> Option<(Vec<String>, usize, String, Vec<SetOp>)> {
     let mut branches: Vec<String> = Vec::new();
+    let mut ops: Vec<SetOp> = Vec::new();
     let mut last_distinct: Option<usize> = None;
     let mut rest = sql;
 
     loop {
-        let Some(at) = find_keyword(rest, "UNION", 0) else {
+        // The first top-level set operator of any kind.
+        let next = [("UNION", SetKind::Union), ("INTERSECT", SetKind::Intersect), ("EXCEPT", SetKind::Except)]
+            .into_iter()
+            .filter_map(|(word, kind)| find_keyword(rest, word, 0).map(|at| (at, word, kind)))
+            .min_by_key(|(at, _, _)| *at);
+        let Some((at, word, kind)) = next else {
             branches.push(rest.trim().to_string());
             break;
         };
         branches.push(rest[..at].trim().to_string());
-        let after = rest[at + "UNION".len()..].trim_start();
-        // `ALL` keeps duplicates; its absence means distinct.
-        rest = match find_keyword(after, "ALL", 0) {
-            Some(0) => &after["ALL".len()..],
-            _ => {
-                last_distinct = Some(branches.len());
-                after
-            }
+        let after = rest[at + word.len()..].trim_start();
+        // `ALL` keeps duplicates; its absence means distinct. (`DISTINCT`
+        // says so explicitly.)
+        let (all, after) = match (find_keyword(after, "ALL", 0), find_keyword(after, "DISTINCT", 0)) {
+            (Some(0), _) => (true, &after["ALL".len()..]),
+            (_, Some(0)) => (false, &after["DISTINCT".len()..]),
+            _ => (false, after),
         };
+        if kind == SetKind::Union && !all {
+            last_distinct = Some(branches.len());
+        }
+        ops.push(SetOp { kind, all });
+        rest = after;
     }
 
     if branches.len() < 2 {
@@ -2558,7 +2608,7 @@ fn union_pieces(sql: &str) -> Option<(Vec<String>, usize, String)> {
     };
     branches.push(body.to_string());
     let branches = branches.iter().map(|b| unwrap_parentheses(b).to_string()).collect();
-    Some((branches, last_distinct.map_or(0, |at| at + 1), tail.to_string()))
+    Some((branches, last_distinct.map_or(0, |at| at + 1), tail.to_string(), ops))
 }
 
 /// Where `FETCH FIRST` or `FETCH NEXT` opens at the top level of `text`, if
@@ -5094,7 +5144,7 @@ pub fn statement_has_join(sql: &str) -> bool {
     // *next* branch's select list — `FROM a UNION SELECT id, label FROM b` —
     // read as a comma join, and the statement was planned as one, failing
     // with "relation 'label' does not exist".
-    let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING", "UNION"]
+    let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING", "UNION", "INTERSECT", "EXCEPT"]
         .iter()
         .filter_map(|kw| find_keyword(sql, kw, start))
         .min()

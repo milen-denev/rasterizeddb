@@ -218,9 +218,11 @@ fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
                 // not a value: `(SELECT … LIMIT 2) UNION (SELECT …)`. Taken for
                 // one, a branch of two rows was refused as "returned 2 rows".
                 // A branch opens the statement or follows `UNION [ALL]`.
+                // `INTERSECT` and `EXCEPT` likewise, and `DISTINCT` as `ALL`.
+                let set_word = |w: &str| matches!(w, "UNION" | "INTERSECT" | "EXCEPT");
                 let union_branch = (previous_word.is_empty() && sql[..open].trim().is_empty())
-                    || previous_word == "UNION"
-                    || (previous_word == "ALL" && word_before_previous == "UNION");
+                    || set_word(&previous_word)
+                    || (matches!(previous_word.as_str(), "ALL" | "DISTINCT") && set_word(&word_before_previous));
                 let is_select = upper[k..].starts_with("SELECT")
                     && !matches!(previous_word.as_str(), "IN" | "EXISTS")
                     && !derived_table

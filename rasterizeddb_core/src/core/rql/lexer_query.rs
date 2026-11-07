@@ -1658,7 +1658,11 @@ pub fn row_fetch_from_select_query(
     // "unsupported keyword 'UNION' in WHERE clause". The branches are combined
     // by `execute_union`, which reads the whole statement; this only has to
     // parse the first one.
-    let union_pos = find_keyword(after_from, "UNION", 0);
+    // `INTERSECT` and `EXCEPT` likewise (`set_ops::Combined::push_set_ops`).
+    let union_pos = ["UNION", "INTERSECT", "EXCEPT"]
+        .into_iter()
+        .filter_map(|word| find_keyword(after_from, word, 0))
+        .min();
 
     // Table name ends at the earliest clause marker.
     let table_end = [
@@ -1696,7 +1700,7 @@ pub fn row_fetch_from_select_query(
     // an alias and a dropped tail they answered as if absent (`INTERSECT`
     // returned the first branch whole), and as a syntax error they named the
     // wrong problem.
-    for clause in ["INTERSECT", "EXCEPT", "TABLESAMPLE", "WINDOW"] {
+    for clause in ["TABLESAMPLE", "WINDOW"] {
         if find_keyword(after_from, clause, 0).is_some() {
             return Err(format!("{clause} is not supported"));
         }

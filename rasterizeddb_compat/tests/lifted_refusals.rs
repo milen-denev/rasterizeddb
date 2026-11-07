@@ -506,3 +506,46 @@ async fn trunc_quantified_subqueries_in_values_and_integer_rounding_match_postgr
     let e = c.simple_query("SELECT id FROM a WHERE id > ANY (SELECT w FROM b)").await.expect_err("> ANY");
     assert_eq!(e.code().map(|s| s.code()), Some("0A000"), "{e}");
 }
+
+/// `INTERSECT` and `EXCEPT`, with and without `ALL`, as PostgreSQL 17
+/// answers them (`docker run --rm postgres:17`): NULLs equal, bag counts for
+/// `ALL`, `INTERSECT` binding tighter than `UNION` and `EXCEPT`, a
+/// parenthesised operand, a join branch, and a trailing ORDER BY and LIMIT.
+/// They were refused by name ("INTERSECT is not supported").
+#[tokio::test(flavor = "multi_thread")]
+async fn intersect_and_except_match_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE a (id INT, g TEXT, n NUMERIC(10,2), b BIGINT)",
+        "CREATE TABLE b (id INT, w INT, g TEXT)",
+        "INSERT INTO a VALUES (1, 'x', 1.50, 1), (2, 'x', NULL, 2), (2, 'x', NULL, 2), (3, NULL, 2.00, 3), (4, NULL, NULL, 4), (4, NULL, NULL, 4), (4, NULL, NULL, 4)",
+        "INSERT INTO b VALUES (1, 10, 'x'), (2, 20, 'x'), (5, 50, NULL), (2, 21, 'x'), (4, 40, NULL), (4, 41, NULL)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT id, g FROM a INTERSECT SELECT id, g FROM b ORDER BY id", &["1|x", "2|x", "4|NULL"]),
+        ("SELECT id, g FROM a INTERSECT ALL SELECT id, g FROM b ORDER BY id", &["1|x", "2|x", "2|x", "4|NULL", "4|NULL"]),
+        ("SELECT id, g FROM a EXCEPT SELECT id, g FROM b ORDER BY id", &["3|NULL"]),
+        ("SELECT id, g FROM a EXCEPT ALL SELECT id, g FROM b ORDER BY id", &["3|NULL", "4|NULL"]),
+        ("SELECT id FROM a EXCEPT ALL SELECT id FROM b ORDER BY id", &["3", "4"]),
+        ("SELECT id FROM b EXCEPT SELECT id FROM a ORDER BY id", &["5"]),
+        ("SELECT id FROM a INTERSECT SELECT id FROM b ORDER BY id DESC LIMIT 2", &["4", "2"]),
+        ("SELECT id FROM a INTERSECT SELECT id FROM b UNION SELECT 9 ORDER BY 1", &["1", "2", "4", "9"]),
+        ("SELECT id FROM a EXCEPT SELECT id FROM b EXCEPT SELECT 3 ORDER BY 1", &[]),
+        ("SELECT id FROM a UNION ALL SELECT id FROM b EXCEPT SELECT 4 ORDER BY 1", &["1", "2", "3", "5"]),
+        ("SELECT id FROM a EXCEPT (SELECT id FROM b INTERSECT SELECT 1) ORDER BY 1", &["2", "3", "4"]),
+        ("SELECT b FROM a INTERSECT SELECT id FROM b ORDER BY 1", &["1", "2", "4"]),
+        ("SELECT g FROM a INTERSECT DISTINCT SELECT g FROM b ORDER BY 1", &["x", "NULL"]),
+        ("SELECT count(*) FROM (SELECT id FROM a INTERSECT SELECT id FROM b) s", &["3"]),
+        ("SELECT id FROM a WHERE id IN (SELECT id FROM a EXCEPT SELECT id FROM b) ORDER BY id", &["3"]),
+        ("SELECT a.id FROM a JOIN b ON a.id = b.id INTERSECT SELECT id FROM b WHERE w > 20 ORDER BY 1", &["2", "4"]),
+        ("SELECT id FROM a EXCEPT (SELECT id FROM b INTERSECT SELECT id FROM b WHERE id = 1) ORDER BY 1", &["2", "3", "4"]),
+        ("SELECT a.id FROM a JOIN b ON a.id = b.id UNION SELECT id FROM b WHERE w > 40 ORDER BY 1", &["1", "2", "4", "5"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+}
