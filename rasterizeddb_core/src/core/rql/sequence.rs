@@ -472,13 +472,14 @@ mod tests {
     /// A floor marked under one spelling of a table is that table's in
     /// every spelling, and a forget under another spelling takes it.
     ///
-    /// Mutation: `floor_key` keyed by the spelling (the forget misses it).
+    /// Mutation: `floor_key` or `forget_table_floors` keyed by the spelling
+    /// (the forget misses the mark).
     #[test]
     fn a_floor_mark_is_the_tables_in_any_case() {
         let name = "floor_case_seq";
         mark_floored(DB, name, "ACCT");
         assert!(is_floored(DB, name, "Acct"));
-        forget_table_floors(DB, "acct");
+        forget_table_floors(DB, "Acct");
         assert!(!is_floored(DB, name, "ACCT"), "a mark under another spelling outlived the table's forget");
     }
 

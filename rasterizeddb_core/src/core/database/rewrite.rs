@@ -413,7 +413,9 @@ impl Database {
         FiFut: Future<Output = Result<T, String>>,
     {
         // The table's own name, never the statement's spelling: the files and
-        // the backup below are named by it (identifier case folding).
+        // the backup below are named by it (identifier case folding). The
+        // executor's `rewrite_rows` resolves first, so today this is a
+        // backstop for a caller that does not.
         let resolved = self.resolve_key(table_name);
         let table_name = resolved.as_deref().unwrap_or(table_name);
         // A partitioned table is never rewritten here: per partition it would
