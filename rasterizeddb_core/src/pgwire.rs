@@ -4080,6 +4080,20 @@ fn has_placeholder(sql: &str) -> bool {
     false
 }
 
+/// A relation's visible column names, for a rewrite that reads them
+/// (`window_join`); `None` for a relation the database does not have.
+fn relation_column_names(database: &Database, name: &str) -> Option<Vec<String>> {
+    let view = database.schema_view(name)?;
+    Some(
+        view.schema()
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+            .map(|f| f.name.clone())
+            .collect(),
+    )
+}
+
 pub(crate) async fn describe_query(
     database: &Arc<Database>,
     query: &str,
@@ -4094,6 +4108,8 @@ pub(crate) async fn describe_query(
     let stmt = typed_literals.as_deref().unwrap_or(stmt);
     let quantified = crate::core::sql_scan::quantified_subqueries(stmt).ok().flatten();
     let stmt = quantified.as_deref().unwrap_or(stmt);
+    let window_join = crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name));
+    let stmt = window_join.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
     // A `WITH` prefix is stripped and the statement it introduces is described
@@ -5992,6 +6008,17 @@ where
             return Ok(());
         }
     };
+    // A window function over a join: the same statement over a derived
+    // table of the join's columns (`core::rql::window_join`). First, so a
+    // DISTINCT over it is then a single-table one for `distinct_on`.
+    let window_join;
+    let stmt = match crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name)) {
+        Some(rewritten) => {
+            window_join = rewritten;
+            window_join.as_str()
+        }
+        None => stmt,
+    };
     // `DISTINCT ON` over a join or with an aggregate or a window: the same
     // statement over a derived table, before anything reads its table set
     // (`core::rql::distinct_on`).
@@ -6808,7 +6835,9 @@ fn result_description(
                 // A comparison with no operator (`text = double precision`)
                 // is PostgreSQL's 42883, not a syntax error.
                 Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),
-                Err(e) => return Err(("42601", e)),
+                // The planner's reason has its own class (42702 for an
+                // ambiguous name); a syntax error only when it names none.
+                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
             }
         }
         QueryPurpose::QueryRows(qr) => {
@@ -6903,7 +6932,9 @@ fn result_description(
                 // A comparison with no operator (`text = double precision`)
                 // is PostgreSQL's 42883, not a syntax error.
                 Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),
-                Err(e) => return Err(("42601", e)),
+                // The planner's reason has its own class (42702 for an
+                // ambiguous name); a syntax error only when it names none.
+                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
             }
         }
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
@@ -7544,7 +7575,9 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         return "42883";
     }
     // `ambiguous_column`: a bare name more than one relation has.
-    if has("column reference \"") && has("\" is ambiguous") {
+    // The join planner's own words for it too ("column 'x' is ambiguous;
+    // qualify it …"), which fell through to 42601.
+    if (has("column reference \"") && has("\" is ambiguous")) || (has("column ") && has(" is ambiguous; qualify")) {
         return "42702";
     }
     if has("SELECT DISTINCT ON expressions must match initial ORDER BY expressions") {

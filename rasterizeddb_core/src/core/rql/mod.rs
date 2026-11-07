@@ -41,6 +41,7 @@ pub(crate) mod conflict_wait;
 pub mod cte;
 pub(crate) mod ctas;
 pub(crate) mod distinct_on;
+pub(crate) mod window_join;
 pub mod expr;
 /// PostgreSQL's `numeric` arithmetic with display scales.
 pub(crate) mod pg_numeric;

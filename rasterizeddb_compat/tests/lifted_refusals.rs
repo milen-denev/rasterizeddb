@@ -551,3 +551,43 @@ async fn intersect_and_except_match_postgresql() {
         assert_eq!(rows(&c, sql).await, *want, "{sql}");
     }
 }
+
+/// A window function over a join, as PostgreSQL 17 answers it (`docker run
+/// --rm postgres:17`): computed over a derived table of the join's columns
+/// (`core::rql::window_join`), with PostgreSQL's output names. It was refused
+/// ("could not be read as an expression over this join"). A bare name two
+/// relations share stays 42702.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_functions_over_a_join_match_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE a (id INT, g TEXT, v NUMERIC(10,2))",
+        "CREATE TABLE b (id INT, w INT)",
+        "INSERT INTO a VALUES (1, 'x', 1.55), (2, 'x', -1.55), (3, 'y', NULL), (4, NULL, 10.00), (2, 'x', -1.55)",
+        "INSERT INTO b VALUES (1, 10), (2, 20), (5, 50), (2, 21)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT a.id, b.w, row_number() OVER (PARTITION BY a.id ORDER BY b.w) AS rn FROM a JOIN b ON a.id = b.id ORDER BY a.id, b.w", &["1|10|1", "2|20|1", "2|20|2", "2|21|3", "2|21|4"]),
+        ("SELECT a.g, sum(b.w) OVER (PARTITION BY a.g) AS s FROM a JOIN b ON a.id = b.id ORDER BY 1, 2", &["x|92", "x|92", "x|92", "x|92", "x|92"]),
+        ("SELECT a.id, rank() OVER (ORDER BY b.w DESC) FROM a, b WHERE a.id = b.id ORDER BY 2, 1", &["2|1", "2|1", "2|3", "2|3", "1|5"]),
+        ("SELECT a.id, b.w, sum(b.w) OVER (ORDER BY b.w ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run FROM a JOIN b ON a.id = b.id WHERE b.w > 10 ORDER BY run", &["2|20|20", "2|20|40", "2|21|61", "2|21|82"]),
+        ("SELECT w AS id, lag(w) OVER (ORDER BY w) FROM a JOIN b ON a.id = b.id ORDER BY id DESC LIMIT 3", &["21|20", "21|21", "20|10"]),
+        ("SELECT DISTINCT a.g, count(*) OVER (PARTITION BY a.g) FROM a LEFT JOIN b ON a.id = b.id ORDER BY 1 NULLS FIRST", &["NULL|1", "x|5", "y|1"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    let e = c.simple_query("SELECT id, rank() OVER (ORDER BY w) FROM a JOIN b ON a.id = b.id").await.expect_err("ambiguous");
+    assert_eq!(e.code().map(|s| s.code()), Some("42702"), "{e}");
+    // Described as it runs, under PostgreSQL's names.
+    let prepared = c
+        .prepare("SELECT a.id, b.w, row_number() OVER (PARTITION BY a.id ORDER BY b.w) FROM a JOIN b ON a.id = b.id")
+        .await
+        .expect("prepare");
+    let names: Vec<&str> = prepared.columns().iter().map(|col| col.name()).collect();
+    assert_eq!(names, ["id", "w", "row_number"]);
+}
