@@ -929,6 +929,109 @@ pub fn matching_close(text: &str, open: usize) -> Option<usize> {
     None
 }
 
+/// [`fold_unquoted_identifiers`] for a statement whose names are the
+/// engine's own (a query, DML, table and index DDL, VACUUM, LOCK);
+/// borrowed and untouched for any other, whose words are its own (a KV key,
+/// a setting, a backup's or a database's name).
+///
+/// Applied where a client's statement enters, the wire layer's execute and
+/// describe, before the rewrites that read the text first (CTEs, derived
+/// tables, joins), so they see the names the parsers do. Never to the SQL
+/// the engine writes itself: that splices in names as stored (a JSON
+/// shadow's `Date` beside `date`, a CTE column from a quoted `"ID"`, a table
+/// imported from PostgreSQL), and folding one would name another column.
+pub fn fold_core_statement(sql: &str) -> Cow<'_, str> {
+    let mut words = sql.trim_start().split(|c: char| c.is_ascii_whitespace() || c == '(').filter(|w| !w.is_empty());
+    let first = words.next().unwrap_or("");
+    let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+    let core = sql.trim_start().starts_with('(')
+        || ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "VALUES", "VACUUM", "LOCK"]
+            .iter()
+            .any(|k| is(first, k))
+        || match (first, words.next().unwrap_or(""), words.next().unwrap_or("")) {
+            (c, t, _) if is(c, "CREATE") && (is(t, "TABLE") || is(t, "INDEX")) => true,
+            (c, u, i) if is(c, "CREATE") && is(u, "UNIQUE") && is(i, "INDEX") => true,
+            (a, t, _) if is(a, "ALTER") && is(t, "TABLE") => true,
+            (d, t, _) if is(d, "DROP") && (is(t, "TABLE") || is(t, "INDEX")) => true,
+            _ => false,
+        };
+    if core { fold_unquoted_identifiers(sql) } else { Cow::Borrowed(sql) }
+}
+
+/// PostgreSQL's reserved keywords (and the operator words among its
+/// type-or-function ones): words that can never be an unquoted identifier,
+/// so [`fold_unquoted_identifiers`] leaves them as written. Folding them
+/// would change no name; leaving them keeps the declarations stored as text
+/// (a CHECK, a partial index's predicate, a generated column) reading as
+/// written, `deleted_at IS NULL` rather than `deleted_at is null`.
+const RESERVED_WORDS: &[&str] = &[
+    "ALL", "ANALYSE", "ANALYZE", "AND", "ANY", "ARRAY", "AS", "ASC", "ASYMMETRIC", "BETWEEN", "BOTH", "CASE",
+    "CAST", "CHECK", "COLLATE", "COLUMN", "CONSTRAINT", "CREATE", "CROSS", "CURRENT_CATALOG", "CURRENT_DATE",
+    "CURRENT_ROLE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "DEFAULT", "DEFERRABLE", "DESC",
+    "DISTINCT", "DO", "ELSE", "END", "EXCEPT", "EXISTS", "FALSE", "FETCH", "FOR", "FOREIGN", "FROM", "FULL",
+    "GRANT", "GROUP", "HAVING", "ILIKE", "IN", "INITIALLY", "INNER", "INTERSECT", "INTO", "IS", "ISNULL", "JOIN",
+    "LATERAL", "LEADING", "LIKE", "LIMIT", "LOCALTIME", "LOCALTIMESTAMP", "NATURAL", "NOT", "NOTNULL", "NULL",
+    "OFFSET", "ON", "ONLY", "OR", "ORDER", "OUTER", "OVERLAPS", "PLACING", "PRIMARY", "REFERENCES", "RETURNING",
+    "SELECT", "SESSION_USER", "SIMILAR", "SOME", "SYMMETRIC", "SYSTEM_USER", "TABLE", "THEN", "TO", "TRAILING",
+    "TRUE", "UNION", "UNIQUE", "USER", "USING", "VARIADIC", "WHEN", "WHERE", "WINDOW", "WITH",
+];
+
+/// `sql` with every unquoted identifier folded to lowercase, as PostgreSQL's
+/// lexer folds it: `CREATE TABLE Acct (Name text)` declares `acct` and
+/// `name`, and `SELECT ID AS Ident` is labelled `ident`. Quoted identifiers
+/// (`"Name"`), strings of every kind (`'Name'`, `E'…'`, `$$…$$`), comments,
+/// a word written directly against a string (the prefix of `X'FF'`, `E'…'`,
+/// `U&'…'`) and the [`RESERVED_WORDS`] keep their case. Only ASCII letters
+/// change, so every byte keeps its offset and no two tokens can run
+/// together. Borrowed when there is nothing to fold.
+pub fn fold_unquoted_identifiers(sql: &str) -> Cow<'_, str> {
+    let bytes = sql.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            // A word: an identifier or a keyword. PostgreSQL lets one hold
+            // non-ASCII letters, and folds only the ASCII ones.
+            b if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$' || bytes[i] >= 0x80)
+                {
+                    i += 1;
+                }
+                let word = &bytes[start..i];
+                // A string prefix (`X'…'`, `E'…'`, `U&'…'`) is part of the
+                // literal, not a name.
+                let prefix = bytes.get(i) == Some(&b'\'')
+                    || (bytes.get(i) == Some(&b'&') && matches!(bytes.get(i + 1), Some(b'\'' | b'"')));
+                if !prefix
+                    && word.iter().any(u8::is_ascii_uppercase)
+                    && !RESERVED_WORDS.iter().any(|r| r.as_bytes().eq_ignore_ascii_case(word))
+                {
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    buf[start..i].make_ascii_lowercase();
+                }
+            }
+            // A number: its letters (`1E5`, `0x1F`) are never an identifier.
+            b if b.is_ascii_digit() => {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    match out {
+        // Only ASCII letters changed, so the bytes are still UTF-8.
+        Some(buf) => Cow::Owned(String::from_utf8(buf).expect("ASCII case folding keeps UTF-8")),
+        None => Cow::Borrowed(sql),
+    }
+}
+
 /// Rewrites every escape string (`E'…'`) and dollar-quoted string
 /// (`$tag$…$tag$`) into the standard string it means, leaving everything else
 /// — standard strings, quoted identifiers, comments, `$1` placeholders — byte
@@ -1595,6 +1698,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn unquoted_words_fold_and_quoted_text_keeps_its_case() {
+        let fold = |s: &str| fold_unquoted_identifiers(s).into_owned();
+        assert_eq!(
+            fold("SELECT ID AS Ident, \"Quoted\", 'Str''S' FROM Acct WHERE x = 1E5 AND Y IS NULL"),
+            "SELECT id AS ident, \"Quoted\", 'Str''S' FROM acct WHERE x = 1E5 AND y IS NULL"
+        );
+        // A string's prefix belongs to the literal; an escape string's `\'`
+        // and a dollar quote's body are inside it; comments are left alone.
+        assert_eq!(fold("SELECT X'FF', B'01', U&'A', U&\"B\" FROM T"), "SELECT X'FF', B'01', U&'A', U&\"B\" FROM t");
+        assert_eq!(
+            fold("SELECT E'It\\'S', $Tg$ Body $Tg$, Col -- Don't Fold\n FROM T /* X */"),
+            "SELECT E'It\\'S', $Tg$ Body $Tg$, col -- Don't Fold\n FROM t /* X */"
+        );
+        // Non-ASCII letters stay; the ASCII ones around them fold.
+        assert_eq!(fold("SELECT naïveName FROM Ü"), "SELECT naïvename FROM Ü");
+        assert_eq!(fold("UPDATE t SET A = $1, \"B\"\"C\" = 'x'"), "update t set a = $1, \"B\"\"C\" = 'x'");
+        // Nothing to fold: borrowed.
+        assert!(matches!(fold_unquoted_identifiers("SELECT a FROM \"T\" WHERE b = 'X'"), Cow::Borrowed(_)));
+        // Offsets are kept.
+        let text = "INSERT INTO Tbl (A) VALUES ('Q')";
+        assert_eq!(fold(text), "insert INTO tbl (a) values ('Q')");
+        assert_eq!(fold(text).len(), text.len());
+    }
 
     #[test]
     fn a_relation_star_is_read_as_its_columns() {

@@ -213,7 +213,7 @@ async fn every_ddl_form_acts_on_the_table_under_any_spelling() {
             "SELECT table_name FROM information_schema.tables WHERE lower(table_name) IN ('acct', 'ledger')",
         )
         .await;
-        assert_eq!(names, ["Ledger"], "{kind}: one catalogue entry, under its own name");
+        assert_eq!(names, ["ledger"], "{kind}: one catalogue entry, under its folded name");
         c.simple_query("DROP TABLE ledger").await.unwrap_or_else(|e| panic!("{kind}: drop: {e}"));
         assert_eq!(code(&c, "SELECT * FROM Ledger").await, "42P01", "{kind}: after DROP");
         let mut files = Vec::new();
@@ -273,4 +273,94 @@ async fn a_column_in_another_case_is_that_column() {
         c.prepare(sql).await.expect("prepare").columns().iter().map(|c| c.name().to_string()).collect();
     assert_eq!(simple, ["k", "L", "n"], "simple query labels");
     assert_eq!(described, simple, "Describe and the rows disagree");
+}
+
+async fn labels(c: &tokio_postgres::Client, sql: &str) -> Vec<String> {
+    let simple: Vec<String> = c
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r.columns().iter().map(|c| c.name().to_string()).collect()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{sql}: no row"));
+    let described: Vec<String> =
+        c.prepare(sql).await.expect("prepare").columns().iter().map(|c| c.name().to_string()).collect();
+    assert_eq!(described, simple, "{sql}: Describe and the rows disagree");
+    simple
+}
+
+/// Unquoted names fold to lowercase, as PostgreSQL's lexer folds them: what
+/// a table and its columns are declared as, the labels a query's columns go
+/// out under, an index's name, a CTE's. A client written against PostgreSQL
+/// reads `row["name"]` after `CREATE TABLE t (Name text)`; it found `Name`.
+/// Quoted names keep their case. Names stored in another case before the
+/// fold (here made with quotes) still resolve unquoted: more lenient than
+/// PostgreSQL, so existing databases keep working.
+#[tokio::test(flavor = "multi_thread")]
+async fn unquoted_names_fold_to_lowercase() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE Acct (Id INT PRIMARY KEY, Name TEXT NOT NULL, \"Quoted\" INT, Bal INT DEFAULT 0 CHECK (Bal >= 0))",
+        "INSERT INTO ACCT (ID, NAME, \"Quoted\") VALUES (1, 'Ann', 7), (2, 'Bob', 8)",
+        "CREATE INDEX Acct_Name ON Acct (Name)",
+        "ALTER TABLE Acct ADD COLUMN Extra TEXT",
+        "ALTER TABLE ACCT RENAME COLUMN Extra TO Memo",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        rows(&c, "SELECT table_name FROM information_schema.tables WHERE table_name ILIKE 'acct'").await,
+        ["acct"]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'acct' ORDER BY ordinal_position"
+        )
+        .await,
+        ["id", "name", "Quoted", "bal", "memo"]
+    );
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT * FROM Acct WHERE Id = 1", &["id", "name", "Quoted", "bal", "memo"]),
+        ("SELECT ID, Name FROM acct WHERE id = 1", &["id", "name"]),
+        ("SELECT ID AS Ident, Name AS \"Who\" FROM acct WHERE id = 1", &["ident", "Who"]),
+        ("SELECT count(*) AS Total, MAX(Bal) AS Top FROM acct", &["total", "top"]),
+        ("SELECT UPPER(Name) FROM acct WHERE id = 1", &["upper"]),
+        ("SELECT a.Name AS N FROM acct a JOIN Acct b ON a.ID = B.id WHERE a.id = 1", &["n"]),
+        ("SELECT Ident FROM (SELECT ID AS Ident FROM acct) S WHERE IDENT = 1", &["ident"]),
+        ("WITH Totals AS (SELECT count(*) AS N FROM acct) SELECT N FROM TOTALS", &["n"]),
+        ("SELECT Name, count(*) AS C FROM acct GROUP BY Name ORDER BY NAME LIMIT 1", &["name", "c"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(labels(&c, sql).await, *want, "{sql}");
+    }
+    assert_eq!(rows(&c, "SELECT Ident FROM (SELECT ID AS Ident FROM acct) S WHERE IDENT = 2").await, ["2"]);
+    assert_eq!(rows(&c, "SELECT N FROM (SELECT Name AS N FROM acct) s ORDER BY n DESC").await, ["Bob", "Ann"]);
+    assert_eq!(code(&c, "INSERT INTO acct (id, name, bal) VALUES (3, 'C', -1)").await, "23514");
+    c.simple_query("DROP INDEX ACCT_NAME").await.expect("the index under another spelling");
+    assert_eq!(code(&c, "CREATE TABLE ACCT (id INT)").await, "42P07");
+
+    // Stored in another case (here quoted, as an older database stored an
+    // unquoted name): reached unquoted, for reads and for DDL.
+    for sql in [
+        "CREATE TABLE \"Legacy\" (\"Id\" INT PRIMARY KEY, \"Col\" TEXT)",
+        "INSERT INTO Legacy (Id, Col) VALUES (1, 'x')",
+        "ALTER TABLE Legacy ADD COLUMN Extra INT",
+        "UPDATE legacy SET Extra = 5 WHERE ID = 1",
+        "CREATE INDEX Legacy_Col ON Legacy (Col)",
+        "ALTER TABLE Legacy RENAME COLUMN Col TO Kol",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(rows(&c, "SELECT Id, Kol, Extra FROM LEGACY").await, ["1|x|5"]);
+    // A label is the stored name: `Id` kept its quoted case, `Kol` was
+    // folded when the rename declared it.
+    assert_eq!(labels(&c, "SELECT ID, Kol FROM legacy").await, ["Id", "kol"]);
+    c.simple_query("ALTER TABLE legacy DROP COLUMN extra").await.expect("drop column");
+    c.simple_query("DROP TABLE Legacy").await.expect("drop");
 }

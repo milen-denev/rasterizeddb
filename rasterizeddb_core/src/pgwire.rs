@@ -4146,6 +4146,9 @@ pub(crate) async fn describe_query(
     if stmt.is_empty() {
         return Ok(None);
     }
+    // Folded as it runs (`execute_single_statement`).
+    let folded = crate::core::sql_scan::fold_core_statement(stmt);
+    let stmt = folded.as_ref();
     // Described as it runs: a `DISTINCT ON` the executor rewrites over a
     // derived table (`execute_single_statement`) is described in that form.
     let typed_literals = crate::core::sql_scan::typed_literals_as_casts(stmt);
@@ -6003,6 +6006,12 @@ where
     } else {
         stmt
     };
+    // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
+    // before anything reads one: a CTE or derived table is materialised from
+    // this text, and `jb.id AS ID` beside `ja.id` must be the second `id`
+    // there as it is to the parsers (`sql_scan::fold_core_statement`).
+    let folded = crate::core::sql_scan::fold_core_statement(stmt);
+    let stmt = folded.as_ref();
     // `DATE '2024-01-02'`: the cast it means, before any reader of a value
     // sees the prefix form (`sql_scan::typed_literals_as_casts`).
     let typed_literals;

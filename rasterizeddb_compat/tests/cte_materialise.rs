@@ -511,6 +511,9 @@ async fn a_join_with_a_shared_column_name_is_refused_not_misread() {
         "WITH x AS (SELECT ja.id, jb.id FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY 1",
         "SELECT * FROM (SELECT ja.id, jb.id FROM ja JOIN jb ON jb.aid = ja.id) s ORDER BY 1",
         "WITH w AS (SELECT 1 AS a, 2 AS a) SELECT * FROM w",
+        // Unquoted, `ID` is `id` (folded, as PostgreSQL folds it): the
+        // shared name again.
+        "WITH x AS (SELECT ja.id, jb.id AS ID FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY 1",
     ] {
         let got = rows(&pool, sql).await;
         if !matches!(&got, Err(e) if e.contains("twice; alias one of them with AS")) {
@@ -531,10 +534,10 @@ async fn a_join_with_a_shared_column_name_is_refused_not_misread() {
         ),
         ("SELECT count(*) FROM (SELECT ja.id, jb.id AS bid FROM ja JOIN jb ON jb.aid = ja.id) s", &["2"]),
         ("WITH w AS (SELECT 1 AS a, 2 AS b) SELECT * FROM w", &["1|2"]),
-        // Names that differ only in case are two columns of the relation here,
-        // and both are written, so this one is answered rather than refused.
+        // A quoted name that differs only in case is a second column, and
+        // both are written, so this one is answered rather than refused.
         (
-            "WITH x AS (SELECT ja.id, jb.id AS ID FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY 1",
+            "WITH x AS (SELECT ja.id, jb.id AS \"ID\" FROM ja JOIN jb ON jb.aid = ja.id) SELECT * FROM x ORDER BY 1",
             &["1|10", "2|20"],
         ),
     ] {
