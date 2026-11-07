@@ -67,8 +67,14 @@ static FLOORED: std::sync::LazyLock<DashMap<String, ()>> = std::sync::LazyLock::
 /// [`FLOORED`]: the sequence's [`key`], a separator, the table. The separator
 /// cannot occur in an identifier, so every entry of a sequence starts with
 /// its key and a separator.
+///
+/// The table folded to lowercase: `INSERT INTO ACCT` marks the floor of the
+/// table `Acct` (names resolve in any case, `Database::resolve`). Keyed by
+/// the spelling, the mark escaped `forget_table_floors("Acct")` at a DROP or
+/// RENAME, and a table later taking the name skipped raising its counters to
+/// its own rows.
 fn floor_key(database: u64, name: &str, table: &str) -> String {
-    format!("{}\u{0}{}\u{0}{}", database, name, table)
+    format!("{}\u{0}{}\u{0}{}", database, name, table.to_ascii_lowercase())
 }
 
 /// Drops every [`FLOORED`] entry of `database`'s sequence `name`.
@@ -166,7 +172,7 @@ pub fn is_floored(database: u64, name: &str, table: &str) -> bool {
 /// later takes the name (created, or renamed onto it) would otherwise find
 /// the old table's marks and skip raising the counters to its own rows.
 pub fn forget_table_floors(database: u64, table: &str) {
-    let (prefix, suffix) = (key(database, ""), format!("\u{0}{}", table));
+    let (prefix, suffix) = (key(database, ""), format!("\u{0}{}", table.to_ascii_lowercase()));
     FLOORED.retain(|k, _| !(k.starts_with(&prefix) && k.ends_with(&suffix)));
 }
 
@@ -461,6 +467,19 @@ mod tests {
         seed(DB, name, 41);
         assert_eq!(next(DB, name), 42);
         assert_eq!(next(DB, name), 43);
+    }
+
+    /// A floor marked under one spelling of a table is that table's in
+    /// every spelling, and a forget under another spelling takes it.
+    ///
+    /// Mutation: `floor_key` keyed by the spelling (the forget misses it).
+    #[test]
+    fn a_floor_mark_is_the_tables_in_any_case() {
+        let name = "floor_case_seq";
+        mark_floored(DB, name, "ACCT");
+        assert!(is_floored(DB, name, "Acct"));
+        forget_table_floors(DB, "acct");
+        assert!(!is_floored(DB, name, "ACCT"), "a mark under another spelling outlived the table's forget");
     }
 
     #[test]
