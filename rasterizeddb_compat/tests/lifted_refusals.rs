@@ -534,6 +534,8 @@ async fn intersect_and_except_match_postgresql() {
         ("SELECT id FROM b EXCEPT SELECT id FROM a ORDER BY id", &["5"]),
         ("SELECT id FROM a INTERSECT SELECT id FROM b ORDER BY id DESC LIMIT 2", &["4", "2"]),
         ("SELECT id FROM a INTERSECT SELECT id FROM b UNION SELECT 9 ORDER BY 1", &["1", "2", "4", "9"]),
+        // INTERSECT first: a UNION (b INTERSECT b), not (a UNION b) INTERSECT b.
+        ("SELECT id FROM a UNION SELECT id FROM b INTERSECT SELECT id FROM b ORDER BY 1", &["1", "2", "3", "4", "5"]),
         ("SELECT id FROM a EXCEPT SELECT id FROM b EXCEPT SELECT 3 ORDER BY 1", &[]),
         ("SELECT id FROM a UNION ALL SELECT id FROM b EXCEPT SELECT 4 ORDER BY 1", &["1", "2", "3", "5"]),
         ("SELECT id FROM a EXCEPT (SELECT id FROM b INTERSECT SELECT 1) ORDER BY 1", &["2", "3", "4"]),
