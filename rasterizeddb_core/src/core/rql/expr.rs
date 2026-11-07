@@ -2115,6 +2115,9 @@ fn untyped_literal_as(other: &Expr, literal: &mut Expr) -> Result<(), String> {
     if matches!(other, Expr::Literal { db_type: DbType::STRING, .. } | Expr::Null) {
         return Ok(());
     }
+    if !certain_type(other) {
+        return Ok(());
+    }
     let target = static_type(other);
     let text = String::from_utf8_lossy(bytes).to_string();
     let refuse = || crate::core::value_codec::refusal_message(&target, &crate::core::value_codec::quote_sql(&text));
@@ -2196,6 +2199,38 @@ fn untyped_literal_as(other: &Expr, literal: &mut Expr) -> Result<(), String> {
     };
     *literal = converted;
     Ok(())
+}
+
+/// Whether `expr`'s [`static_type`] is the type PostgreSQL gives it, for
+/// [`untyped_literal_as`]: a column, a cast, a typed constant, and arithmetic
+/// over those when every part is a number. Not a call, and not arithmetic
+/// that may be a date or a time (`a + interval '1 hour'` reads as `bigint`
+/// there, and its literal is a timestamp): those keep comparing as before.
+fn certain_type(expr: &Expr) -> bool {
+    let number = |t: DbType| {
+        matches!(
+            t,
+            DbType::I8
+                | DbType::I16
+                | DbType::I32
+                | DbType::I64
+                | DbType::U8
+                | DbType::U16
+                | DbType::U32
+                | DbType::U64
+                | DbType::F32
+                | DbType::F64
+                | DbType::DECIMAL
+        )
+    };
+    match expr {
+        Expr::Column(_) | Expr::Cast(..) | Expr::TypmodCast { .. } | Expr::NumericCast { .. } => true,
+        Expr::Literal { db_type, .. } => *db_type != DbType::STRING,
+        Expr::Arith(lhs, _, rhs) => {
+            certain_type(lhs) && certain_type(rhs) && number(static_type(lhs)) && number(static_type(rhs))
+        }
+        _ => false,
+    }
 }
 
 /// A quoted literal compared with a `timestamp` (without time zone) value,
