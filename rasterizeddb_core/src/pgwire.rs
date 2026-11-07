@@ -4978,7 +4978,9 @@ where
     } else if message.starts_with("missing FROM-clause entry for table") {
         // A qualifier naming no relation of the statement.
         "42P01"
-    } else if message == "SELECT DISTINCT ON expressions must match initial ORDER BY expressions" {
+    } else if message == "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        || message == "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+    {
         // `invalid_column_reference`, as PostgreSQL reports it.
         "42P10"
     } else if message.starts_with("column reference \"") && message.ends_with("\" is ambiguous") {
@@ -7624,7 +7626,9 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if (has("column reference \"") && has("\" is ambiguous")) || (has("column ") && has(" is ambiguous; qualify")) {
         return "42702";
     }
-    if has("SELECT DISTINCT ON expressions must match initial ORDER BY expressions") {
+    if has("SELECT DISTINCT ON expressions must match initial ORDER BY expressions")
+        || has("in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list")
+    {
         return "42P10";
     }
     // `invalid_column_reference`: an ON CONFLICT target no unique key
@@ -10694,7 +10698,7 @@ fn returning_scales(database: &Arc<Database>, table: &str, sql: &str) -> Option<
 }
 
 /// Renders a value, honouring a column's declared decimal scale.
-fn format_column_text_scaled(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Option<String> {
+pub(crate) fn format_column_text_scaled(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Option<String> {
     // A value carrying its own display scale (an `AVG` result) wins over the
     // column's.
     if db_type == DbType::DECIMAL {

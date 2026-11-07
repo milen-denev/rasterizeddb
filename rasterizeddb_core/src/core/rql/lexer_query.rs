@@ -149,7 +149,7 @@ fn parse_computed_item(
         }
         rewritten.push_str(&expr[cursor..*start]);
         let call = &expr[*start..*end];
-        let (func, arg, arg_expr) = parse_aggregate_call(call, schema)?;
+        let (func, arg, arg_expr, call) = parse_aggregate_call(call, schema)?;
         // `COUNT(*) FILTER (WHERE x) * 100.0 / COUNT(*)`: the clause is this
         // call's, and the synthetic column replaces both.
         let (filter, end) = match trailing_filter(expr, *end) {
@@ -191,7 +191,7 @@ fn parse_computed_item(
             synth_field.without_time_zone = arg.as_ref().is_some_and(|f| f.without_time_zone);
         }
         synth_schema.push(synth_field);
-        inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr, filter });
+        inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr, filter, call });
         rewritten.push_str(&name);
         cursor = end;
     }
@@ -264,18 +264,42 @@ fn aggregate_argument(
     if let Some(field) = schema.iter().find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted) {
         return Ok((field.clone(), None));
     }
-    let parsed = crate::core::rql::expr::parse(arg_text, schema)
-        .map_err(|_| format!("Column '{}' not found in schema", arg_text))?;
+    // A comparison is an argument too (`bool_and(id > 0)`, `count(a = b)`):
+    // the expression grammar has no boolean of its own outside CASE, so it
+    // is read as the CASE that is its value, NULL where it is unknown.
+    let parsed = match crate::core::rql::expr::parse(arg_text, schema) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let as_value = format!("CASE WHEN {arg_text} THEN true WHEN NOT ({arg_text}) THEN false END");
+            crate::core::rql::expr::parse(&as_value, schema)
+                .map_err(|_| format!("Column '{}' not found in schema", arg_text))?
+        }
+    };
     let db_type = crate::core::rql::expr::static_type(&parsed);
     let reads = expr_reads(&parsed, schema);
     let field = SchemaField::new(arg_text.to_string(), db_type.clone(), db_type.get_size(), 0, u64::MAX, false);
     Ok((field, Some(crate::core::rql::aggregate::ArgExpression { expr: parsed, schema: reads })))
 }
 
-fn parse_aggregate_call(
-    call: &str,
+/// An `ORDER BY` key inside an aggregate call, over the table's own columns:
+/// the expression and the columns it reads.
+fn aggregate_order_key(
+    text: &str,
     schema: &SmallVec<[SchemaField; 20]>,
-) -> Result<(AggFunc, Option<SchemaField>, Option<crate::core::rql::aggregate::ArgExpression>), String> {
+) -> Result<(crate::core::rql::expr::Expr, Vec<SchemaField>), String> {
+    let parsed = crate::core::rql::expr::parse(text, schema)?;
+    let reads = expr_reads(&parsed, schema);
+    Ok((parsed, reads))
+}
+
+type AggregateCallParts = (
+    AggFunc,
+    Option<SchemaField>,
+    Option<crate::core::rql::aggregate::ArgExpression>,
+    Option<Box<crate::core::rql::aggregate::AggCall>>,
+);
+
+fn parse_aggregate_call(call: &str, schema: &SmallVec<[SchemaField; 20]>) -> Result<AggregateCallParts, String> {
     let open = call
         .find('(')
         .ok_or_else(|| format!("'{}' is not a call", call))?;
@@ -289,16 +313,20 @@ fn parse_aggregate_call(
     if leading_word(arg_text, "DISTINCT").is_some() {
         return Err("an aggregate over DISTINCT values inside an expression is not supported".to_string());
     }
+    let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(arg_text)?;
 
     if arg_text == "*" {
         if func != AggFunc::Count {
             return Err(format!("{}(*) is not valid", name.to_uppercase()));
         }
-        return Ok((func, None, None));
+        return Ok((func, None, None, None));
     }
     let (field, computed) = aggregate_argument(arg_text, schema)?;
     func.check_argument(Some(&field))?;
-    Ok((func, Some(field), computed))
+    let extras = crate::core::rql::aggregate::build_call(func, arg_text, second, order, false, &mut |key| {
+        aggregate_order_key(key, schema)
+    })?;
+    Ok((func, Some(field), computed, extras))
 }
 
 /// Whether `expr` is exactly one aggregate call, nothing around it.
@@ -716,6 +744,9 @@ fn parse_select_items(
                 Some(rest) => (true, rest),
                 None => (false, leading_word(arg_text, "ALL").unwrap_or(arg_text)),
             };
+            // `string_agg(s, ',' ORDER BY s)`: a second argument and an
+            // ORDER BY inside the call.
+            let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(arg_text)?;
             if distinct && arg_text == "*" {
                 return Err(format!("{}(DISTINCT *) is not valid", func_name.to_uppercase()));
             }
@@ -731,6 +762,9 @@ fn parse_select_items(
             };
 
             func.check_argument(arg.as_ref())?;
+            let call = crate::core::rql::aggregate::build_call(func, arg_text, second, order, distinct, &mut |key| {
+                aggregate_order_key(key, schema)
+            })?;
             out.push(SelectItem::Aggregate {
                 func,
                 arg,
@@ -738,6 +772,7 @@ fn parse_select_items(
                 filter: aggregate_filter,
                 arg_expr: argument_expression,
                 distinct,
+                call,
             });
             continue;
         }
@@ -2316,6 +2351,7 @@ pub fn row_fetch_from_select_query(
                     arg,
                     filter,
                     arg_expr,
+                    call,
                     ..
                 } => {
                     match arg_expr {
@@ -2340,11 +2376,11 @@ pub fn row_fetch_from_select_query(
                     // itself does not, and the fold sees only what the scan
                     // returned — so without this the condition tested a column
                     // that was not there, read as NULL, and rejected every row.
-                    if let Some(filter) = filter {
-                        for f in &filter.schema {
-                            if !cols.iter().any(|c| c == &f.name) {
-                                cols.push(f.name.clone());
-                            }
+                    // An ORDER BY inside the call reads its keys the same way.
+                    let keys = call.iter().flat_map(|c| c.order.iter()).flat_map(|k| k.schema.iter());
+                    for f in filter.iter().flat_map(|f| f.schema.iter()).chain(keys) {
+                        if !cols.iter().any(|c| c == &f.name) {
+                            cols.push(f.name.clone());
                         }
                     }
                 }
@@ -2360,6 +2396,7 @@ pub fn row_fetch_from_select_query(
                             None => input.arg.iter().collect(),
                         };
                         reads.extend(input.filter.iter().flat_map(|f| f.schema.iter()));
+                        reads.extend(input.call.iter().flat_map(|c| c.order.iter()).flat_map(|k| k.schema.iter()));
                         for f in reads {
                             if !cols.iter().any(|c| c == &f.name) {
                                 cols.push(f.name.clone());

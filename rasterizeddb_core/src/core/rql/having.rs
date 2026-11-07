@@ -318,6 +318,7 @@ impl Having {
             label: func.name().to_string(),
             filter: None,
             arg_expr: None,
+            call: None,
         };
         let (ty, scale) = aggregate_result(&item).expect("an aggregate item");
         let lit = lex(literal.trim())?;
@@ -1160,6 +1161,7 @@ mod tests {
                 label: call.to_string(),
                 filter: None,
                 arg_expr: None,
+                call: None,
             })
         }
     }

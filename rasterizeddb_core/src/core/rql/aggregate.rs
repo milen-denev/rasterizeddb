@@ -38,6 +38,19 @@ pub enum AggFunc {
     Variance,
     VarSamp,
     VarPop,
+    /// `string_agg(text, delimiter [ORDER BY …])`: the non-NULL values joined.
+    StringAgg,
+    /// `array_agg(x [ORDER BY …])`: every value, NULL included, as an array.
+    ArrayAgg,
+    /// `json_agg` and `jsonb_agg`: every value, NULL as `null`, as a JSON
+    /// array.
+    JsonAgg,
+    JsonbAgg,
+    /// `bool_and`, `bool_or` and `every` (`bool_and` by another name): over
+    /// the non-NULL values.
+    BoolAnd,
+    BoolOr,
+    Every,
 }
 
 impl AggFunc {
@@ -54,6 +67,13 @@ impl AggFunc {
             "VARIANCE" => AggFunc::Variance,
             "VAR_SAMP" => AggFunc::VarSamp,
             "VAR_POP" => AggFunc::VarPop,
+            "STRING_AGG" => AggFunc::StringAgg,
+            "ARRAY_AGG" => AggFunc::ArrayAgg,
+            "JSON_AGG" => AggFunc::JsonAgg,
+            "JSONB_AGG" => AggFunc::JsonbAgg,
+            "BOOL_AND" => AggFunc::BoolAnd,
+            "BOOL_OR" => AggFunc::BoolOr,
+            "EVERY" => AggFunc::Every,
             _ => return None,
         })
     }
@@ -70,10 +90,32 @@ impl AggFunc {
         })
     }
 
+    /// The aggregates that keep every value, in order, until the group is
+    /// done ([`Acc::Collect`]); the only ones an `ORDER BY` inside the call
+    /// changes.
+    pub fn collects(&self) -> bool {
+        matches!(self, AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg)
+    }
+
     /// Refuses `sum` and `avg` over a legacy `CHAR`, as PostgreSQL has no
     /// such function. They folded nothing (its four bytes are no number) and
     /// answered NULL.
     pub fn check_argument(&self, arg: Option<&SchemaField>) -> Result<(), String> {
+        // `string_agg` joins text (PostgreSQL's other form joins bytea), and
+        // the boolean aggregates read booleans: anything else has no such
+        // function, 42883.
+        if let Some(f) = arg {
+            let shown = || crate::core::value_codec::pg_input_type_name(&f.db_type);
+            match self {
+                AggFunc::StringAgg if !matches!(f.db_type, DbType::STRING | DbType::CHAR) => {
+                    return Err(format!("function string_agg({}, unknown) does not exist", shown()));
+                }
+                AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every if f.db_type != DbType::BOOL => {
+                    return Err(format!("function {}({}) does not exist", self.name(), shown()));
+                }
+                _ => {}
+            }
+        }
         if matches!(self, AggFunc::Sum | AggFunc::Avg) && arg.is_some_and(|f| f.db_type == DbType::CHAR) {
             return Err(format!("function {}(character) does not exist", self.name()));
         }
@@ -125,6 +167,13 @@ impl AggFunc {
             AggFunc::Variance => "variance",
             AggFunc::VarSamp => "var_samp",
             AggFunc::VarPop => "var_pop",
+            AggFunc::StringAgg => "string_agg",
+            AggFunc::ArrayAgg => "array_agg",
+            AggFunc::JsonAgg => "json_agg",
+            AggFunc::JsonbAgg => "jsonb_agg",
+            AggFunc::BoolAnd => "bool_and",
+            AggFunc::BoolOr => "bool_or",
+            AggFunc::Every => "every",
         }
     }
 
@@ -173,6 +222,13 @@ impl AggFunc {
                 Some(DbType::F32) | Some(DbType::F64) => DbType::F64,
                 _ => DbType::DECIMAL,
             },
+            AggFunc::StringAgg => DbType::STRING,
+            // One array type here, described as `text[]`; its text is
+            // PostgreSQL's whatever the element type.
+            AggFunc::ArrayAgg => DbType::ARRAY,
+            // `json_agg`'s text is `jsonb`'s for every value it builds.
+            AggFunc::JsonAgg | AggFunc::JsonbAgg => DbType::JSONB,
+            AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every => DbType::BOOL,
         }
     }
 
@@ -231,6 +287,126 @@ pub struct ArgExpression {
     pub schema: Vec<SchemaField>,
 }
 
+/// What an aggregate call holds besides its argument and FILTER: a second
+/// argument and an `ORDER BY` written inside the parentheses.
+#[derive(Debug, Clone, Default)]
+pub struct AggCall {
+    /// `string_agg`'s delimiter: its text, `None` for SQL NULL, which joins
+    /// with nothing.
+    pub delimiter: Option<String>,
+    /// `string_agg(s, ',' ORDER BY k DESC)`: the order the values are kept
+    /// in, keys evaluated per row.
+    pub order: Vec<AggOrderKey>,
+}
+
+/// One key of an `ORDER BY` inside an aggregate call.
+#[derive(Debug, Clone)]
+pub struct AggOrderKey {
+    pub expr: crate::core::rql::expr::Expr,
+    /// The columns it reads, with their NULL companions.
+    pub schema: Vec<SchemaField>,
+    pub descending: bool,
+    /// Resolved: PostgreSQL puts NULL last ascending and first descending,
+    /// unless the key says otherwise.
+    pub nulls_first: bool,
+}
+
+impl AggCall {
+    /// The keys `row` sorts by, each with the type it evaluated to; `None`
+    /// for a NULL.
+    fn keys(&self, row: &Row) -> Result<Vec<Option<(Vec<u8>, DbType)>>, String> {
+        self.order
+            .iter()
+            .map(|key| {
+                Ok(match crate::core::rql::expr::eval_aggregate_argument(&key.expr, row, &key.schema)? {
+                    crate::core::rql::expr::Value::Data { bytes, db_type } => Some((bytes, db_type)),
+                    crate::core::rql::expr::Value::Null => None,
+                })
+            })
+            .collect()
+    }
+}
+
+/// An aggregate call's argument text split into its argument, a second
+/// argument (`string_agg`'s delimiter), and the text of an `ORDER BY`
+/// written inside the parentheses, each at the top level of the call.
+pub(crate) fn split_call_arguments(text: &str) -> Result<(&str, Option<&str>, Option<&str>), String> {
+    let (args, order) = match crate::core::rql::join::find_keyword(text, "ORDER", 0) {
+        Some(at) => {
+            let rest = text[at + "ORDER".len()..].trim_start();
+            let by = rest.get(..2).filter(|w| w.eq_ignore_ascii_case("BY")).ok_or_else(|| {
+                format!("syntax error at or near \"{}\"", rest.split_whitespace().next().unwrap_or(""))
+            })?;
+            let _ = by;
+            (text[..at].trim(), Some(rest[2..].trim()))
+        }
+        None => (text.trim(), None),
+    };
+    let parts = crate::core::sql_scan::split_top_level(args, b',');
+    match parts.as_slice() {
+        [one] => Ok((one.trim(), None, order)),
+        [one, two] => Ok((one.trim(), Some(two.trim()), order)),
+        _ => Err("an aggregate with more than two arguments is not supported".to_string()),
+    }
+}
+
+/// The [`AggCall`] of an aggregate call: its second argument (`string_agg`'s
+/// delimiter, a constant) and its `ORDER BY` keys, each parsed by
+/// `parse_key` (the expression and the columns it reads). `None` when the
+/// call has neither. Refuses what PostgreSQL refuses: `string_agg` without
+/// its delimiter or another aggregate with one (42883), and under DISTINCT an
+/// `ORDER BY` key that is not the argument (42P10).
+pub(crate) fn build_call(
+    func: AggFunc,
+    argument: &str,
+    second: Option<&str>,
+    order: Option<&str>,
+    distinct: bool,
+    parse_key: &mut dyn FnMut(&str) -> Result<(crate::core::rql::expr::Expr, Vec<SchemaField>), String>,
+) -> Result<Option<Box<AggCall>>, String> {
+    let delimiter = match (func, second) {
+        (AggFunc::StringAgg, None) => return Err("function string_agg(text) does not exist".to_string()),
+        (AggFunc::StringAgg, Some(text)) => {
+            if text.eq_ignore_ascii_case("NULL") {
+                None
+            } else if text.len() >= 2 && text.starts_with('\'') && text.ends_with('\'') {
+                Some(crate::core::value_codec::unquote_sql(text).into_owned())
+            } else {
+                return Err(format!(
+                    "string_agg with the delimiter {text}, not a constant, is not supported yet"
+                ));
+            }
+        }
+        (_, Some(_)) => return Err(format!("function {}(two arguments) does not exist", func.name())),
+        (_, None) => None,
+    };
+    let mut keys = Vec::new();
+    if let Some(order) = order {
+        for term in crate::core::rql::order_by::parse(order)? {
+            if distinct && !term.token.trim().eq_ignore_ascii_case(argument.trim()) {
+                return Err(
+                    "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list".to_string(),
+                );
+            }
+            // Only the aggregates that keep their values in order read it.
+            if !func.collects() {
+                continue;
+            }
+            let (expr, schema) = parse_key(&term.token)?;
+            keys.push(AggOrderKey {
+                expr,
+                schema,
+                descending: term.descending,
+                nulls_first: term.nulls_first.unwrap_or(term.descending),
+            });
+        }
+    }
+    if delimiter.is_none() && keys.is_empty() && !(func == AggFunc::StringAgg && second.is_some()) {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(AggCall { delimiter, order: keys })))
+}
+
 /// The `FILTER (WHERE …)` attached to one aggregate.
 #[derive(Debug, Clone)]
 pub struct AggregateFilter {
@@ -274,6 +450,8 @@ pub enum SelectItem {
         arg_expr: Option<ArgExpression>,
         /// `COUNT(DISTINCT x)`: each value counts once ([`Acc::Distinct`]).
         distinct: bool,
+        /// A delimiter or an `ORDER BY` written in the call ([`AggCall`]).
+        call: Option<Box<AggCall>>,
     },
     /// A constant: `SELECT 1`, or the value a scalar subquery resolved to. It
     /// reads no column, and is the same in every row. A `NULL` has no bytes
@@ -351,6 +529,9 @@ pub struct ComputedInput {
     /// This call's own `FILTER (WHERE …)`: `COUNT(*) FILTER (WHERE x) *
     /// 100.0 / COUNT(*)` filters one input and not the other.
     pub filter: Option<AggregateFilter>,
+    /// A delimiter or an `ORDER BY` written in the call ([`AggCall`]):
+    /// `COALESCE(string_agg(s, ',' ORDER BY s), '')`.
+    pub call: Option<Box<AggCall>>,
 }
 
 impl ComputedInput {
@@ -363,8 +544,7 @@ impl ComputedInput {
         }
         let mut held = None;
         let (bytes, ty) = self.value(row, &mut held)?;
-        acc.accumulate(bytes, ty);
-        Ok(())
+        fold_value(acc, self.call.as_deref(), row, bytes, ty)
     }
 
     /// The value this input folds from `row`, as [`accumulate_aggregate`]
@@ -938,13 +1118,46 @@ pub(crate) enum Acc {
         template: Box<Acc>,
         ty: DbType,
     },
+    /// `string_agg`, `array_agg`, `json_agg`: every value of the group (NULL
+    /// as `None`) with the keys of the call's `ORDER BY`, kept until the
+    /// group is done and sorted then. Workers' partial lists append.
+    Collect {
+        values: Vec<(Vec<Option<(Vec<u8>, DbType)>>, Option<Vec<u8>>)>,
+        /// Each key's direction and NULL placement: `(descending,
+        /// nulls_first)`.
+        order: Vec<(bool, bool)>,
+        /// Over DISTINCT values, replayed with no keys: sorted by the value,
+        /// descending when the call says so (PostgreSQL's DISTINCT sorts).
+        by_value_descending: Option<bool>,
+        /// The argument: its type and NUMERIC scale render each element.
+        elem: Option<SchemaField>,
+        delimiter: Option<String>,
+    },
+    /// `bool_and`, `bool_or`, `every`: whether any non-NULL value was seen,
+    /// whether all were true, whether any was.
+    Bools { seen: bool, all: bool, any: bool },
 }
 
 impl Acc {
     /// The accumulator for one select item: [`Acc::new`], over DISTINCT values
     /// when the item says so.
     pub(crate) fn for_item(func: AggFunc, arg: Option<&SchemaField>, distinct: bool) -> Self {
-        let plain = Acc::new(func, arg);
+        Acc::for_call(func, arg, distinct, None)
+    }
+
+    /// [`Acc::for_item`] for a call carrying a delimiter or an `ORDER BY`.
+    pub(crate) fn for_call(func: AggFunc, arg: Option<&SchemaField>, distinct: bool, call: Option<&AggCall>) -> Self {
+        let mut plain = Acc::new(func, arg);
+        if let Acc::Collect { order, by_value_descending, delimiter, .. } = &mut plain {
+            *delimiter = call.and_then(|c| c.delimiter.clone());
+            let keys = call.map(|c| c.order.as_slice()).unwrap_or(&[]);
+            if distinct {
+                // The keys must be the argument itself (checked at parse).
+                *by_value_descending = Some(keys.first().is_some_and(|k| k.descending));
+            } else {
+                *order = keys.iter().map(|k| (k.descending, k.nulls_first)).collect();
+            }
+        }
         match (distinct, arg) {
             (true, Some(field)) => Acc::Distinct {
                 seen: std::collections::HashSet::new(),
@@ -962,7 +1175,12 @@ impl Acc {
             return None;
         };
         let mut acc = (**template).clone();
-        for value in seen {
+        // In the values' order, so a function that keeps them in order
+        // (`string_agg(DISTINCT s, …)`) answers the same every time, as
+        // PostgreSQL's sorted DISTINCT does.
+        let mut values: Vec<&Vec<u8>> = seen.iter().collect();
+        values.sort_by(|a, b| compare_values(a, b, ty));
+        for value in values {
             acc.accumulate(Some(value), Some(ty));
         }
         Some(acc)
@@ -971,6 +1189,14 @@ impl Acc {
     pub(crate) fn new(func: AggFunc, arg: Option<&SchemaField>) -> Self {
         match func {
             AggFunc::Count => Acc::Count(0),
+            AggFunc::StringAgg | AggFunc::ArrayAgg | AggFunc::JsonAgg | AggFunc::JsonbAgg => Acc::Collect {
+                values: Vec::new(),
+                order: Vec::new(),
+                by_value_descending: None,
+                elem: arg.cloned(),
+                delimiter: None,
+            },
+            AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every => Acc::Bools { seen: false, all: true, any: false },
             AggFunc::Min | AggFunc::Max => Acc::Extreme {
                 best: None,
                 ty: arg.map(|f| f.db_type.clone()).unwrap_or(DbType::I64),
@@ -1018,6 +1244,23 @@ impl Acc {
     }
 
     pub(crate) fn accumulate(&mut self, bytes: Option<&[u8]>, ty: Option<&DbType>) {
+        match self {
+            // A DISTINCT replay, or a call with no ORDER BY: no keys.
+            Acc::Collect { values, .. } => {
+                values.push((Vec::new(), bytes.map(<[u8]>::to_vec)));
+                return;
+            }
+            Acc::Bools { seen, all, any } => {
+                if let Some(value) = bytes {
+                    let v = value.first().is_some_and(|b| *b != 0);
+                    *seen = true;
+                    *all &= v;
+                    *any |= v;
+                }
+                return;
+            }
+            _ => {}
+        }
         if let Acc::Distinct { seen, ty: own, .. } = self {
             if let Some(value) = bytes {
                 // -0.0 and 0.0 are one value to `=`, and so to DISTINCT.
@@ -1044,8 +1287,8 @@ impl Acc {
             return;
         }
         match self {
-            // Kept as a set, before this match.
-            Acc::Distinct { .. } => {}
+            // Kept as a set, or folded, before this match.
+            Acc::Distinct { .. } | Acc::Collect { .. } | Acc::Bools { .. } => {}
             // `COUNT(*)` counts rows; `COUNT(col)` counts rows where the column
             // has a value.
             Acc::Count(n) => {
@@ -1247,6 +1490,12 @@ impl Acc {
             return;
         }
         match (self, other) {
+            (Acc::Collect { values, .. }, Acc::Collect { values: theirs, .. }) => values.extend(theirs.iter().cloned()),
+            (Acc::Bools { seen, all, any }, Acc::Bools { seen: s2, all: a2, any: y2 }) => {
+                *seen |= *s2;
+                *all &= *a2;
+                *any |= *y2;
+            }
             (Acc::Count(a), Acc::Count(b)) => *a += *b,
             (
                 Acc::Moments { n, sum, sum_sq, scale, overflow, .. },
@@ -1376,6 +1625,13 @@ impl Acc {
             return self.finish_moments(variance, sample);
         }
         match self {
+            Acc::Collect { .. } => return self.finish_collected(func),
+            Acc::Bools { seen, all, any } => {
+                return Ok(seen.then(|| vec![u8::from(if func == AggFunc::BoolOr { *any } else { *all })]));
+            }
+            _ => {}
+        }
+        match self {
             Acc::Extreme { best: None, .. } => Ok(None),
             // SUM and AVG over no rows at all are NULL in SQL; COUNT is not.
             Acc::ExactSum { n: 0, .. } | Acc::FloatSum { n: 0, .. }
@@ -1384,6 +1640,134 @@ impl Acc {
                 Ok(None)
             }
             _ => self.finish(func, result_type).map(Some),
+        }
+    }
+
+    /// `string_agg`, `array_agg`, `json_agg`, `jsonb_agg` over the values
+    /// kept, in the call's order: NULL over no rows (and `string_agg` over no
+    /// non-NULL value), as in PostgreSQL.
+    fn finish_collected(&self, func: AggFunc) -> Result<Option<Vec<u8>>, String> {
+        let Acc::Collect { values, order, by_value_descending, elem, delimiter } = self else {
+            return Ok(None);
+        };
+        let mut values: Vec<&(Vec<Option<(Vec<u8>, DbType)>>, Option<Vec<u8>>)> = values.iter().collect();
+        if !order.is_empty() {
+            values.sort_by(|a, b| {
+                for (i, (descending, nulls_first)) in order.iter().enumerate() {
+                    let ord = match (a.0.get(i).and_then(|k| k.as_ref()), b.0.get(i).and_then(|k| k.as_ref())) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => if *nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
+                        (Some(_), None) => if *nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
+                        (Some((x, tx)), Some((y, _))) => {
+                            let o = compare_values(x, y, tx);
+                            if *descending { o.reverse() } else { o }
+                        }
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        } else if by_value_descending == &Some(true) {
+            values.reverse();
+        }
+        let element = |bytes: &[u8]| -> Result<String, String> {
+            let Some(field) = elem else { return Err("an aggregate with no argument".to_string()) };
+            let ty = field.literal_type();
+            let scale = if ty == DbType::DECIMAL && !crate::core::value_codec::keeps_own_scale(field) {
+                Some(field.scale.unwrap_or(DECIMAL_SCALE))
+            } else {
+                None
+            };
+            if ty == DbType::BOOL {
+                return Ok(if bytes.first().is_some_and(|b| *b != 0) { "true" } else { "false" }.to_string());
+            }
+            if ty == DbType::JSONB {
+                let mut out = Vec::new();
+                crate::core::jsonb::render_text_into(bytes, &mut out)?;
+                return String::from_utf8(out).map_err(|e| e.to_string());
+            }
+            crate::pgwire::format_column_text_scaled(ty.clone(), bytes, scale)
+                .ok_or_else(|| format!("a {} value could not be rendered for {}", crate::core::value_codec::pg_input_type_name(&ty), func.name()))
+        };
+        match func {
+            AggFunc::StringAgg => {
+                let present: Vec<&Vec<u8>> = values.iter().filter_map(|(_, v)| v.as_ref()).collect();
+                if present.is_empty() {
+                    return Ok(None);
+                }
+                let sep = delimiter.as_deref().unwrap_or("").as_bytes();
+                let mut out = Vec::new();
+                for (i, v) in present.iter().enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(sep);
+                    }
+                    let text = match elem.as_ref().map(|f| &f.db_type) {
+                        Some(DbType::CHAR) => crate::core::value_codec::legacy_char_text(v).as_bytes(),
+                        _ => v.as_slice(),
+                    };
+                    out.extend_from_slice(text);
+                }
+                Ok(Some(out))
+            }
+            AggFunc::ArrayAgg => {
+                if values.is_empty() {
+                    return Ok(None);
+                }
+                let mut text = String::from("{");
+                for (i, (_, v)) in values.iter().enumerate() {
+                    if i > 0 {
+                        text.push(',');
+                    }
+                    match v {
+                        None => text.push_str("NULL"),
+                        Some(bytes) => text.push_str(&array_element_text(&element(bytes)?)),
+                    }
+                }
+                text.push('}');
+                crate::core::value_codec::parse_array_literal(&text)
+                    .map(Some)
+                    .ok_or_else(|| format!("array_agg could not build the array {text}"))
+            }
+            AggFunc::JsonAgg | AggFunc::JsonbAgg => {
+                if values.is_empty() {
+                    return Ok(None);
+                }
+                let ty = elem.as_ref().map(|f| f.literal_type()).unwrap_or(DbType::NULL);
+                let mut text = String::from("[");
+                for (i, (_, v)) in values.iter().enumerate() {
+                    if i > 0 {
+                        text.push_str(", ");
+                    }
+                    match v {
+                        None => text.push_str("null"),
+                        Some(bytes) => {
+                            let rendered = element(bytes)?;
+                            match ty {
+                                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::I128 | DbType::U8
+                                | DbType::U16 | DbType::U32 | DbType::U64 | DbType::U128 | DbType::DECIMAL => text.push_str(&rendered),
+                                // A float's NaN and infinities are no JSON
+                                // number: PostgreSQL quotes them.
+                                DbType::F32 | DbType::F64 => {
+                                    if rendered.parse::<f64>().is_ok_and(f64::is_finite) {
+                                        text.push_str(&rendered)
+                                    } else {
+                                        text.push_str(&json_string(&rendered))
+                                    }
+                                }
+                                DbType::BOOL | DbType::JSONB => text.push_str(&rendered),
+                                // `to_json` writes a timestamp in ISO 8601.
+                                DbType::TIMESTAMP => text.push_str(&json_string(&rendered.replacen(' ', "T", 1))),
+                                _ => text.push_str(&json_string(&rendered)),
+                            }
+                        }
+                    }
+                }
+                text.push(']');
+                crate::core::jsonb::encode_text(&text).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1507,6 +1891,10 @@ impl Acc {
         Ok(match self {
             // Resolved into its function's accumulator before this match.
             Acc::Distinct { .. } => return Err("a DISTINCT aggregate reached finish unresolved".to_string()),
+            // Finished by `finish_nullable`, which takes them first.
+            Acc::Collect { .. } | Acc::Bools { .. } => {
+                return Err(format!("{} reached finish unfinished", func.name()))
+            }
             // Finished by `finish_moments`, which `finish_nullable` takes first.
             Acc::Moments { .. } | Acc::FloatMoments { .. } => {
                 return Err("a dispersion aggregate reached finish".to_string());
@@ -2018,7 +2406,7 @@ impl<'p> Folder<'p> {
             .items
             .iter()
             .map(|item| match item {
-                SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
+                SelectItem::Aggregate { func, arg, distinct, call, .. } => Acc::for_call(*func, arg.as_ref(), *distinct, call.as_deref()),
                 // A grouping column or a constant needs no accumulator; a
                 // placeholder keeps the run index-aligned with the items.
                 SelectItem::Column { .. }
@@ -2039,7 +2427,7 @@ impl<'p> Folder<'p> {
         for (i, item) in plan.items.iter().enumerate() {
             if let SelectItem::Computed { inputs, .. } = item {
                 computed_at[i] = template.len();
-                template.extend(inputs.iter().map(|input| Acc::new(input.func, input.arg.as_ref())));
+                template.extend(inputs.iter().map(|input| Acc::for_call(input.func, input.arg.as_ref(), false, input.call.as_deref())));
             }
         }
         let stride = template.len();
@@ -2653,7 +3041,7 @@ fn having_template(plan: &AggregatePlan) -> Vec<Acc> {
             h.aggregates
                 .iter()
                 .map(|item| match item {
-                    SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
+                    SelectItem::Aggregate { func, arg, distinct, call, .. } => Acc::for_call(*func, arg.as_ref(), *distinct, call.as_deref()),
                     // The parser records aggregates only; a placeholder keeps
                     // the indices aligned if that ever changes.
                     _ => Acc::Count(0),
@@ -2730,6 +3118,65 @@ fn evaluated_argument(argument: &ArgExpression, declared: &SchemaField, row: &Ro
     })
 }
 
+/// One element of an array's text as PostgreSQL's `array_out` writes it:
+/// quoted when it is empty, spells `NULL`, or holds a brace, a comma, a
+/// quote, a backslash or whitespace, with quotes and backslashes escaped.
+fn array_element_text(text: &str) -> String {
+    let quote = text.is_empty()
+        || text.eq_ignore_ascii_case("NULL")
+        || text.chars().any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+    if !quote {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// `text` as a JSON string.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Folds one value of `row` into `acc`: a collecting accumulator keeps it
+/// with the keys of the call's `ORDER BY` (and keeps a NULL, which
+/// `array_agg` and `json_agg` include); every other kind accumulates it.
+fn fold_value(acc: &mut Acc, call: Option<&AggCall>, row: &Row, bytes: Option<&[u8]>, ty: Option<&DbType>) -> Result<(), String> {
+    if let Acc::Collect { values, .. } = acc {
+        let keys = match call {
+            Some(c) if !c.order.is_empty() => c.keys(row)?,
+            _ => Vec::new(),
+        };
+        values.push((keys, bytes.map(<[u8]>::to_vec)));
+        return Ok(());
+    }
+    acc.accumulate(bytes, ty);
+    Ok(())
+}
+
 /// Folds one row into one aggregate's accumulator. `slot` is where the
 /// aggregate's plain column argument sits in `positions`, if it has one.
 fn accumulate_aggregate(
@@ -2743,6 +3190,7 @@ fn accumulate_aggregate(
         arg,
         filter,
         arg_expr,
+        call,
         ..
     } = item
     else {
@@ -2778,8 +3226,7 @@ fn accumulate_aggregate(
         ),
         _ => (None, None),
     };
-    acc.accumulate(bytes, ty);
-    Ok(())
+    fold_value(acc, call.as_deref(), row, bytes, ty)
 }
 
 /// One aggregate's output cell: its bytes and type, or an empty cell typed
@@ -2950,7 +3397,7 @@ mod fold_previous {
             .items
             .iter()
             .map(|item| match item {
-                SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
+                SelectItem::Aggregate { func, arg, distinct, call, .. } => Acc::for_call(*func, arg.as_ref(), *distinct, call.as_deref()),
                 // A grouping column or a constant needs no accumulator; a
                 // placeholder keeps the two vectors index-aligned.
                 SelectItem::Column { .. }
@@ -2971,7 +3418,7 @@ mod fold_previous {
             .map(|item| match item {
                 SelectItem::Computed { inputs, .. } => inputs
                     .iter()
-                    .map(|i| Acc::new(i.func, i.arg.as_ref()))
+                    .map(|i| Acc::for_call(i.func, i.arg.as_ref(), false, i.call.as_deref()))
                     .collect(),
                 _ => Vec::new(),
             })
@@ -3309,7 +3756,7 @@ mod fold_previous {
                 h.aggregates
                     .iter()
                     .map(|item| match item {
-                        SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
+                        SelectItem::Aggregate { func, arg, distinct, call, .. } => Acc::for_call(*func, arg.as_ref(), *distinct, call.as_deref()),
                         // The parser records aggregates only; a placeholder keeps
                         // the indices aligned if that ever changes.
                         _ => Acc::Count(0),
@@ -4469,7 +4916,7 @@ mod fold_reference {
                     .items
                     .iter()
                     .map(|item| match item {
-                        SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
+                        SelectItem::Aggregate { func, arg, distinct, call, .. } => Acc::for_call(*func, arg.as_ref(), *distinct, call.as_deref()),
                         // A grouping column or a constant needs no accumulator; a
                         // placeholder keeps the two vectors index-aligned.
                         SelectItem::Column { .. }
@@ -4492,7 +4939,7 @@ mod fold_reference {
                     .map(|item| match item {
                         SelectItem::Computed { inputs, .. } => inputs
                             .iter()
-                            .map(|i| Acc::new(i.func, i.arg.as_ref()))
+                            .map(|i| Acc::for_call(i.func, i.arg.as_ref(), false, i.call.as_deref()))
                             .collect(),
                         _ => Vec::new(),
                     })
@@ -4601,7 +5048,7 @@ mod fold_reference {
                 .items
                 .iter()
                 .map(|item| match item {
-                    SelectItem::Aggregate { func, arg, distinct, .. } => Acc::for_item(*func, arg.as_ref(), *distinct),
+                    SelectItem::Aggregate { func, arg, distinct, call, .. } => Acc::for_call(*func, arg.as_ref(), *distinct, call.as_deref()),
                     SelectItem::Column { .. }
                     | SelectItem::Literal { .. }
                     | SelectItem::Scalar { .. }
@@ -4616,7 +5063,7 @@ mod fold_reference {
                 .map(|item| match item {
                     SelectItem::Computed { inputs, .. } => inputs
                         .iter()
-                        .map(|i| Acc::new(i.func, i.arg.as_ref()))
+                        .map(|i| Acc::for_call(i.func, i.arg.as_ref(), false, i.call.as_deref()))
                         .collect(),
                     _ => Vec::new(),
                 })

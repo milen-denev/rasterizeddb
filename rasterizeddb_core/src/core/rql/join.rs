@@ -4446,6 +4446,25 @@ fn build_aggregate_stage(
         positioned
     }
 
+    /// An `ORDER BY` key inside an aggregate over the join: a column of one
+    /// of its relations, projected as an aggregate's argument is, and read
+    /// from the joined row by position. A computed key is refused (its type
+    /// is only known once the fetch lists are settled).
+    fn join_order_key(
+        text: &str,
+        resolve: &dyn Fn(&str) -> Result<(usize, SchemaField), String>,
+        items: &mut Vec<JoinSelectItem>,
+    ) -> Result<(crate::core::rql::expr::Expr, Vec<SchemaField>), String> {
+        let (rel, field) = resolve(text.trim()).map_err(|_| {
+            format!(
+                "ORDER BY {} inside an aggregate over a join is not supported yet; order by a column",
+                text.trim()
+            )
+        })?;
+        let f = positional(rel, field, items);
+        Ok((crate::core::rql::expr::Expr::Column(f.clone()), vec![f]))
+    }
+
     let mut group_by: Vec<SchemaField> = Vec::new();
     // Relations a grouping key determines: grouped by a column that is unique
     // and NOT NULL in that relation (`lexer_query::determines_its_relation`),
@@ -4621,7 +4640,11 @@ fn build_aggregate_stage(
                 let name = call[..open].trim();
                 let func = AggFunc::parse(name)
                     .ok_or_else(|| format!("function '{}' is not supported yet", name))?;
-                let arg_text = call[open + 1..close].trim();
+                let (arg_text, second, order) =
+                    crate::core::rql::aggregate::split_call_arguments(call[open + 1..close].trim())?;
+                let extras = crate::core::rql::aggregate::build_call(func, arg_text, second, order, false, &mut |key| {
+                    join_order_key(key, resolve, items)
+                })?;
 
                 let arg = if arg_text == "*" {
                     if func != AggFunc::Count {
@@ -4657,7 +4680,7 @@ fn build_aggregate_stage(
                     slot as u64,
                     false,
                 ));
-                inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter });
+                inputs.push(crate::core::rql::aggregate::ComputedInput { func, arg, arg_expr: None, filter, call: extras });
                 rewritten.push_str(&synth_name);
                 cursor = end;
             }
@@ -4685,7 +4708,12 @@ fn build_aggregate_stage(
             let close = expr
                 .rfind(')')
                 .ok_or_else(|| format!("unterminated function call in '{}'", entry))?;
-            let arg_text = expr[open + 1..close].trim();
+            // `string_agg(u.tag, ',' ORDER BY u.tag)`: a second argument and
+            // an ORDER BY inside the call, each key a column of the join.
+            let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(expr[open + 1..close].trim())?;
+            let call = crate::core::rql::aggregate::build_call(func, arg_text, second, order, false, &mut |key| {
+                join_order_key(key, resolve, items)
+            })?;
 
             let arg = if arg_text == "*" {
                 if func != AggFunc::Count {
@@ -4720,6 +4748,7 @@ fn build_aggregate_stage(
                 // The join projects a computed argument as a column instead, so
                 // the fold reads it positionally like any other.
                 arg_expr: None,
+                call,
             });
         } else {
             let (rel, field) = resolve(expr)?;
@@ -4775,6 +4804,9 @@ fn build_aggregate_stage(
                 let name = call[..open].trim();
                 let func = AggFunc::parse(name)
                     .ok_or_else(|| format!("function '{}' is not supported yet", name))?;
+                if func.collects() {
+                    return Err(format!("{} in HAVING over a join is not supported yet", func.name()));
+                }
                 let arg_text = call[open + 1..close].trim();
                 let arg = if arg_text == "*" {
                     if func != AggFunc::Count {
@@ -4804,6 +4836,7 @@ fn build_aggregate_stage(
                     label: func.name().to_string(),
                     filter,
                     arg_expr: None,
+                    call: None,
                 })
             };
             let split = crate::core::rql::having::parse(text, &mut resolve_call)?;
