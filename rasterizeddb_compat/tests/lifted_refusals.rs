@@ -458,3 +458,51 @@ async fn text_against_a_number_is_refused_as_postgresql_refuses_it() {
         assert_eq!(rows(&c, sql).await, *want, "{sql}");
     }
 }
+
+/// `trunc`, a quantified subquery (`= ANY`, `<> ALL`), `IN` as a value, and
+/// a number with a fraction assigned to an integer column, each as
+/// PostgreSQL 17 answers (`docker run --rm postgres:17`). They were "function
+/// 'trunc' is not supported yet", "a subquery used as a value returned 2
+/// rows", "function 'id IN' is not supported yet" and "invalid input syntax
+/// for type integer". `> ANY (subquery)` is refused as not supported.
+#[tokio::test(flavor = "multi_thread")]
+async fn trunc_quantified_subqueries_in_values_and_integer_rounding_match_postgresql() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE a (id INT, g TEXT, v NUMERIC(10,2), f FLOAT8)",
+        "CREATE TABLE b (id INT, w INT)",
+        "INSERT INTO a VALUES (1, 'x', 1.55, 2.5), (2, 'x', -1.55, -2.5), (3, 'y', NULL, NULL), (4, NULL, 10.00, 3.7), (2, 'x', -1.55, -2.5)",
+        "INSERT INTO b VALUES (1, 10), (2, 20), (5, 50), (2, 21)",
+        "CREATE TABLE ti (i INT, s SMALLINT, l BIGINT)",
+        "INSERT INTO ti VALUES (2.5, 2.5, 2.5), (3.5, -2.5, 1.4999)",
+        "INSERT INTO ti (i) VALUES (1.5::float8)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT trunc(v), trunc(f), trunc(v, 1), trunc(-2.567, 2), trunc(v, -1) FROM a ORDER BY id, v", &[
+            "1|2|1.5|-2.56|0", "-1|-2|-1.5|-2.56|0", "-1|-2|-1.5|-2.56|0", "NULL|NULL|NULL|-2.56|NULL", "10|3|10.0|-2.56|10",
+        ]),
+        ("SELECT trunc(1234.5678, -2), trunc(5)", &["1200|5"]),
+        ("SELECT id FROM a WHERE id = ANY (SELECT id FROM b) ORDER BY id", &["1", "2", "2"]),
+        ("SELECT id FROM a WHERE id <> ALL (SELECT id FROM b) ORDER BY id", &["3", "4"]),
+        ("SELECT id, id IN (SELECT id FROM b) AS hit FROM a ORDER BY id, g", &["1|t", "2|t", "2|t", "3|f", "4|f"]),
+        ("SELECT id, id IN (1, 3) AS hit, g NOT IN ('x') AS nx FROM a ORDER BY id, g", &[
+            "1|t|f", "2|f|f", "2|f|f", "3|t|t", "4|f|NULL",
+        ]),
+        ("SELECT id, v IN (SELECT w FROM b) FROM a ORDER BY id", &["1|f", "2|f", "2|f", "3|NULL", "4|t"]),
+        ("SELECT * FROM ti ORDER BY i", &["2|NULL|NULL", "3|3|3", "4|-3|1"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    c.simple_query("UPDATE ti SET i = 7.5 WHERE i = 4").await.expect("update");
+    assert_eq!(rows(&c, "SELECT * FROM ti ORDER BY i").await, ["2|NULL|NULL", "3|3|3", "8|-3|1"]);
+    // A quoted fraction is a string, which an integer refuses as PostgreSQL does.
+    let e = c.simple_query("INSERT INTO ti (i) VALUES ('2.5')").await.expect_err("quoted fraction");
+    assert_eq!(e.code().map(|s| s.code()), Some("22P02"), "{e}");
+    let e = c.simple_query("SELECT id FROM a WHERE id > ANY (SELECT w FROM b)").await.expect_err("> ANY");
+    assert_eq!(e.code().map(|s| s.code()), Some("0A000"), "{e}");
+}

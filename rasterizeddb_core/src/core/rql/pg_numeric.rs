@@ -124,6 +124,32 @@ impl PgNum {
         Some(PgNum { m: q.checked_mul(pow10(k)?)?, s: 0 })
     }
 
+    /// `trunc(x, places)`: toward zero, as `trunc_var`. A negative `places`
+    /// truncates to tens, hundreds, … at scale 0 (`trunc(1234.5, -2)` is
+    /// 1200); more places than the value has extends it with zeros.
+    pub(crate) fn trunc_places(self, places: i32) -> Option<Self> {
+        if places >= 0 {
+            let s = places as u32;
+            if s > MAX_SCALE {
+                return None;
+            }
+            if s >= self.s {
+                return Some(PgNum { m: self.at(s)?, s });
+            }
+            // Integer division truncates toward zero.
+            return Some(PgNum { m: self.m / pow10(self.s - s)?, s });
+        }
+        let k = places.unsigned_abs();
+        let Some(divisor) = self.s.checked_add(k).and_then(pow10) else {
+            return Some(PgNum { m: 0, s: 0 });
+        };
+        let q = self.m / divisor;
+        if q == 0 {
+            return Some(PgNum { m: 0, s: 0 });
+        }
+        Some(PgNum { m: q.checked_mul(pow10(k)?)?, s: 0 })
+    }
+
     pub(crate) fn add(self, other: Self) -> Option<Self> {
         let s = self.s.max(other.s);
         Some(PgNum { m: self.at(s)?.checked_add(other.at(s)?)?, s })

@@ -4092,6 +4092,8 @@ pub(crate) async fn describe_query(
     // derived table (`execute_single_statement`) is described in that form.
     let typed_literals = crate::core::sql_scan::typed_literals_as_casts(stmt);
     let stmt = typed_literals.as_deref().unwrap_or(stmt);
+    let quantified = crate::core::sql_scan::quantified_subqueries(stmt).ok().flatten();
+    let stmt = quantified.as_deref().unwrap_or(stmt);
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(stmt);
     let stmt = distinct_on.as_deref().unwrap_or(stmt);
     // A `WITH` prefix is stripped and the statement it introduces is described
@@ -5974,6 +5976,21 @@ where
             typed_literals.as_str()
         }
         None => stmt,
+    };
+    // `x = ANY (SELECT …)` as `x IN (SELECT …)`, `x <> ALL (…)` as `NOT IN`,
+    // before the scalar substitution reads the subquery as a value
+    // (`sql_scan::quantified_subqueries`).
+    let quantified;
+    let stmt = match crate::core::sql_scan::quantified_subqueries(stmt) {
+        Ok(Some(rewritten)) => {
+            quantified = rewritten;
+            quantified.as_str()
+        }
+        Ok(None) => stmt,
+        Err(e) => {
+            fail_statement(state, stream, "0A000", &e).await?;
+            return Ok(());
+        }
     };
     // `DISTINCT ON` over a join or with an aggregate or a window: the same
     // statement over a derived table, before anything reads its table set

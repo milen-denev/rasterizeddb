@@ -4877,10 +4877,30 @@ pub(crate) fn comparison_value(
     schema: &[SchemaField],
 ) -> Option<crate::core::rql::expr::Expr> {
     use crate::core::rql::expr::{Cmp, Cond, Condition, Expr};
-    let condition = crate::core::rql::expr::parse_condition(text, schema).ok()?;
     let boolean = |value: bool| Expr::Literal {
         bytes: vec![value as u8],
         db_type: DbType::BOOL,
+    };
+    let condition = match crate::core::rql::expr::parse_condition(text, schema) {
+        Ok(condition) => condition,
+        // `x [NOT] IN (…)` or `x [NOT] BETWEEN a AND b` as a value: TRUE,
+        // FALSE, or NULL where SQL's three values say UNKNOWN (`2 IN (1,
+        // NULL)`, a NULL `x`). `NOT` is evaluated three-valued
+        // (`Cond::Not`), so UNKNOWN takes neither arm. It was "function
+        // 'x IN' is not supported yet".
+        Err(_)
+            if find_keyword(text, "IN", 0).is_some() || find_keyword(text, "BETWEEN", 0).is_some() =>
+        {
+            let cond = crate::core::rql::expr::parse_cond(text, schema).ok()?;
+            return Some(Expr::Case {
+                whens: vec![
+                    (cond.clone(), boolean(true)),
+                    (Cond::Not(Box::new(cond)), boolean(false)),
+                ],
+                otherwise: Some(Box::new(Expr::Null)),
+            });
+        }
+        Err(_) => return None,
     };
     let is_null = |operand: &Expr| {
         Cond::Cmp(Condition {

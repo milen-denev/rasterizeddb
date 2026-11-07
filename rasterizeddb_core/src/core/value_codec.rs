@@ -606,6 +606,48 @@ pub fn parse_decimal_scaled(text: &str, scale: u32) -> Option<i128> {
     Some(if negative { -unscaled } else { unscaled })
 }
 
+/// The integer PostgreSQL assigns to an integer column for a number literal
+/// written with a fraction or an exponent: `2.5` and `-2.5` (numeric) round
+/// half away from zero to 3 and -3, `1.5::float8` (or `::real`) half to
+/// even, as `rint`. `None` for anything else: an integer already, a quoted
+/// string (`'2.5'`, which PostgreSQL refuses for an integer), an expression,
+/// or a value no `i128` holds. The caller encodes the result at the column's
+/// type, which refuses it past the type's range.
+pub fn integer_from_number_literal(text: &str) -> Option<String> {
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    let (body, float) = match lower.find("::") {
+        Some(at) => {
+            let cast = lower[at + 2..].trim();
+            let float = match cast {
+                "float8" | "float4" | "real" | "double precision" | "float" => true,
+                "numeric" | "decimal" => false,
+                _ => return None,
+            };
+            (t[..at].trim(), float)
+        }
+        None => (t, false),
+    };
+    let body = body.strip_prefix('(').and_then(|b| b.strip_suffix(')')).map(str::trim).unwrap_or(body);
+    let unsigned = body.strip_prefix(['-', '+']).unwrap_or(body);
+    if unsigned.is_empty()
+        || !unsigned.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'-' | b'+'))
+        || !unsigned.bytes().next().is_some_and(|b| b.is_ascii_digit() || b == b'.')
+        || !unsigned.contains(['.', 'e', 'E'])
+    {
+        return None;
+    }
+    if float || body.contains(['e', 'E']) {
+        let f: f64 = body.parse().ok()?;
+        let r = if float { f.round_ties_even() } else { f.round() };
+        if !r.is_finite() || r.abs() >= 1e38 {
+            return None;
+        }
+        return Some(format!("{}", r as i128));
+    }
+    parse_decimal_rounded(body, 0).map(|v| v.to_string())
+}
+
 /// Parses a decimal literal at `scale`, rounding the places past it half away
 /// from zero — PostgreSQL's rule for a value assigned to `NUMERIC(p, s)` and
 /// for a cast to one. [`parse_decimal_scaled`] truncates instead, which is

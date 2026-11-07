@@ -633,6 +633,85 @@ pub fn typed_literals_as_casts(sql: &str) -> Option<String> {
     })
 }
 
+/// `x = ANY (SELECT …)` and `x = SOME (SELECT …)` as `x IN (SELECT …)`,
+/// and `x <> ALL (SELECT …)` as `x NOT IN (SELECT …)`: the standard defines
+/// them as the same predicates, NULLs included, so the rewrite holds in
+/// every context. Read as they were, the subquery reached the scalar
+/// substitution and failed as "a subquery used as a value returned 2 rows".
+///
+/// Any other operator with a quantified subquery (`> ANY`, `= ALL`, `<> ANY`)
+/// is refused as not supported: answering it through `min` or `max` holds
+/// in a WHERE but not under `NOT` when the subquery yields a NULL. `ANY`
+/// over an array (`= ANY (ARRAY[…])`, `= ANY ('{…}')`) is left alone.
+/// `Ok(None)` when there is nothing to rewrite.
+pub fn quantified_subqueries(sql: &str) -> Result<Option<String>, String> {
+    let bytes = sql.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let boundary = i == 0 || !(is_identifier_byte(bytes[i - 1]) || matches!(bytes[i - 1], b'.' | b'"'));
+        if !(boundary && bytes[i].is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        let word_end = bytes[i..].iter().position(|b| !is_identifier_byte(*b)).map_or(bytes.len(), |p| i + p);
+        let word = &sql[i..word_end];
+        let quantifier = ["ANY", "SOME", "ALL"].into_iter().find(|q| word.eq_ignore_ascii_case(q));
+        let Some(quantifier) = quantifier else {
+            i = word_end;
+            continue;
+        };
+        // `(` then `SELECT` or `WITH`: a subquery, not an array.
+        let open = word_end + bytes[word_end..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+        let subquery = bytes.get(open) == Some(&b'(') && {
+            let inner = sql[open + 1..].trim_start();
+            let head = &inner[..inner.bytes().position(|b| !is_identifier_byte(b)).unwrap_or(inner.len())];
+            head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH")
+        };
+        if !subquery {
+            i = word_end;
+            continue;
+        }
+        // The comparison operator just before the quantifier.
+        let before = sql[..i].trim_end();
+        let op = ["<>", "!=", "<=", ">=", "=", "<", ">"].into_iter().find(|op| before.ends_with(op));
+        let Some(op) = op else {
+            i = word_end;
+            continue;
+        };
+        let op_at = before.len() - op.len();
+        let replacement = match (op, quantifier.eq_ignore_ascii_case("ALL")) {
+            ("=", false) => "IN",
+            ("<>" | "!=", true) => "NOT IN",
+            _ => {
+                return Err(format!(
+                    "{op} {} (subquery) is not supported yet; = ANY and <> ALL are",
+                    quantifier.to_ascii_uppercase()
+                ))
+            }
+        };
+        let o = out.get_or_insert_with(|| String::with_capacity(sql.len() + 8));
+        o.push_str(&sql[copied..op_at]);
+        // `x=ANY(` has no space before the operator to keep.
+        if op_at > 0 && !bytes[op_at - 1].is_ascii_whitespace() {
+            o.push(' ');
+        }
+        o.push_str(replacement);
+        o.push(' ');
+        copied = open;
+        i = open;
+    }
+    Ok(out.map(|mut o| {
+        o.push_str(&sql[copied..]);
+        o
+    }))
+}
+
 /// Splits `list` on `delimiter` where it stands at nesting depth zero —
 /// outside every quoted run, comment, `(…)` and `[…]` — returning each piece
 /// trimmed and borrowed from `list`. A trailing empty piece is dropped
@@ -1240,6 +1319,23 @@ fn read_hex(body: &[u8], at: usize, width: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_quantified_subquery_is_an_in_list() {
+        use super::quantified_subqueries as q;
+        assert_eq!(q("SELECT id FROM a WHERE id = ANY (SELECT id FROM b)").unwrap().as_deref(),
+                   Some("SELECT id FROM a WHERE id IN (SELECT id FROM b)"));
+        assert_eq!(q("SELECT 1 FROM a WHERE x=some(select y from b) AND z <> ALL (WITH w AS (SELECT 1) SELECT * FROM w)").unwrap().as_deref(),
+                   Some("SELECT 1 FROM a WHERE x IN (select y from b) AND z NOT IN (WITH w AS (SELECT 1) SELECT * FROM w)"));
+        assert!(q("SELECT id FROM a WHERE id = ANY (ARRAY[1, 2])").unwrap().is_none());
+        assert!(q("SELECT id FROM a WHERE id = ANY ('{1,2}')").unwrap().is_none());
+        assert!(q("SELECT 'x = ANY (SELECT 1)' FROM a").unwrap().is_none());
+        assert!(q("SELECT company FROM a").unwrap().is_none());
+        for refused in ["id > ANY (SELECT 1)", "id = ALL (SELECT 1)", "id <> ANY (SELECT 1)", "id <= SOME (SELECT 1)"] {
+            let e = q(&format!("SELECT 1 FROM a WHERE {refused}")).unwrap_err();
+            assert!(e.contains("not supported"), "{refused}: {e}");
+        }
+    }
+
 
     #[test]
     fn typed_literals_become_casts() {

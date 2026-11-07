@@ -134,6 +134,14 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     // it does not; `strip_redundant_cast` removes only a cast applied to a
     // whole literal, and leaves anything it cannot vouch for to be parsed as
     // before.
+    // `2.5` into an integer column: the integer PostgreSQL assigns (3), not
+    // a refusal of the fraction. Read before the cast is stripped, which
+    // decides how a tie rounds.
+    if crate::core::rql::expr::is_integer_type(db_type) {
+        if let Some(rounded) = crate::core::value_codec::integer_from_number_literal(value_str) {
+            return value_to_mb(&rounded, db_type);
+        }
+    }
     let value_str = crate::core::rql::column_default::strip_redundant_cast(value_str.trim());
 
     #[inline(always)]

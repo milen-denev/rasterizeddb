@@ -151,6 +151,11 @@ fn encode_assignment(
     precision: Option<u32>,
 ) -> Result<MemoryBlock, String> {
     let trimmed = value_str.trim();
+    // `SET i = 7.5` on an integer column: the integer PostgreSQL assigns.
+    let rounded = crate::core::rql::expr::is_integer_type(&field.db_type)
+        .then(|| crate::core::value_codec::integer_from_number_literal(trimmed))
+        .flatten();
+    let trimmed = rounded.as_deref().unwrap_or(trimmed);
     // An unconstrained NUMERIC that keeps each value's own scale takes the
     // number as written, every digit and its display scale.
     if crate::core::value_codec::keeps_own_scale(field) && !trimmed.eq_ignore_ascii_case("NULL") {
