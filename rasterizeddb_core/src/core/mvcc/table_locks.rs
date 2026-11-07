@@ -823,6 +823,7 @@ impl TableLocks {
     /// The caller waits on a queued request (see [`TableLocks::acquire`]) and
     /// must settle it: wait for the grant, or [`TableLocks::abandon`] it.
     pub fn request(&self, owner: LockOwner, table: &str, mode: TableMode, role: WaitRole) -> Request {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         if !mode.is_strong() {
             return match self.fast_try(owner, table, mode) {
                 Fast::Granted => Request::Granted,
@@ -945,6 +946,7 @@ impl TableLocks {
     /// Grants `mode` now or not at all, queueing nothing: the try half of a
     /// reader's try-or-restart for a table found late (§7 Acquisition).
     pub fn try_acquire(&self, owner: LockOwner, table: &str, mode: TableMode) -> bool {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         match self.request(owner, table, mode, WaitRole::AutocommitReader) {
             Request::Granted => true,
             Request::Queued(wait) => {
@@ -997,6 +999,7 @@ impl TableLocks {
     /// Drops one mode `owner` holds on `table`, keeping the rest of its set.
     /// True if it held it.
     pub fn release_mode(&self, owner: LockOwner, table: &str, mode: TableMode) -> bool {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let mut found = false;
         if !mode.is_strong() {
             // A weak mode can sit in the shard and, recorded again after a
@@ -1032,6 +1035,7 @@ impl TableLocks {
     /// which it holds neither: a block's DDL ending AE while keeping RX
     /// (finding L5). False, changing nothing, if it does not hold `from`.
     pub fn downgrade(&self, owner: LockOwner, table: &str, from: TableMode, to: TableMode) -> bool {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let mut main = self.main();
         let Main { tables, owned, waiting } = &mut *main;
         let Some(key) = tables.get_key_value(table).map(|(k, _)| k.clone()) else {
@@ -1106,6 +1110,7 @@ impl TableLocks {
 
     /// The modes `owner` holds on `table`, fast path and main.
     pub fn holds(&self, owner: LockOwner, table: &str) -> ModeSet {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let fast = self.shard(shard_of(owner)).held_on(owner, table);
         let main = self.main();
         fast.union(main.tables.get(table).map_or(ModeSet::EMPTY, |t| t.held_by(owner)))
@@ -1236,6 +1241,7 @@ impl TableLocks {
     /// for a strong one right after a request for it on this table (which
     /// migrated the fast path). Diagnostic and for tests.
     pub fn conflicting_holder(&self, owner: LockOwner, table: &str, mode: TableMode) -> Option<LockOwner> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let main = self.main();
         main.tables.get(table).and_then(|state| {
             state
@@ -1259,6 +1265,7 @@ impl TableLocks {
         timeout: LockTimeout,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), LockError> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         self.acquire_with(owner, table, mode, role, timeout, cancelled, &|o| self.deadlock_check(o))
             .await
     }
@@ -1276,6 +1283,7 @@ impl TableLocks {
         cancelled: &(dyn Fn() -> bool + Sync),
         deadlock_check: &(dyn Fn(LockOwner) -> Option<LockOwner> + Sync),
     ) -> Result<(), LockError> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let wait = match self.request(owner, table, mode, role) {
             Request::Granted => return Ok(()),
             Request::Queued(wait) => wait,

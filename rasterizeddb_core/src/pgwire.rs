@@ -618,6 +618,50 @@ async fn serve_pgwire(
 /// `DROP COLUMN` opens one — a table with 22 fields can legitimately hold
 /// `write_order` 22, which indexed the slice out of bounds and panicked the
 /// worker, dropping the client's connection mid-statement.
+/// The columns a select of plain columns goes out under, for Describe and
+/// for the rows alike, so the two cannot disagree: each fetched column under
+/// its select item's alias. The simple query path once used the field's own
+/// name, so `SELECT id AS k` came back labelled `id` there and `k` under
+/// Describe. `SELECT x AS v FROM t` was described
+/// as `x`, so a driver reading `v` by name found nothing, and a derived table
+/// that renamed a column described as having no columns at all. Matched by
+/// the column, each item once, since the fetch need not be in select-list
+/// order and one column may be selected twice under two names.
+fn plain_select_fields(
+    parsed: &crate::core::rql::lexer_query::QueryRows,
+    table_fields: &[crate::core::row::schema::SchemaField],
+    ty: impl Fn(&crate::core::row::schema::SchemaField) -> DbType,
+) -> Vec<(String, DbType)> {
+    let mut labels: Vec<Option<&str>> = parsed
+        .select_items
+        .iter()
+        .map(|item| match item {
+            crate::core::rql::aggregate::SelectItem::Column { label, .. } => Some(label.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for c in parsed
+        .requested_row_fetch
+        .columns_fetching_data
+        .iter()
+        .take(parsed.visible_columns)
+    {
+        let Some(field) = field_of(table_fields, c.schema_id) else {
+            continue;
+        };
+        let aliased = (0..parsed.select_items.len())
+            .find(|&i| {
+                labels[i].is_some()
+                    && matches!(&parsed.select_items[i], crate::core::rql::aggregate::SelectItem::Column { field: f, .. }
+                        if f.write_order == field.write_order)
+            })
+            .and_then(|i| labels[i].take());
+        out.push((aliased.unwrap_or(&field.name).to_string(), ty(field)));
+    }
+    out
+}
+
 fn field_of<'a>(
     fields: &'a [crate::core::row::schema::SchemaField],
     schema_id: u64,
@@ -4754,45 +4798,15 @@ async fn describe_resolved(
                 return Ok(Some((fields, true)));
             }
 
-            // A column is announced under its alias. `SELECT x AS v FROM t` was
-            // described as `x`, so a driver reading `v` by name found nothing,
-            // and a derived table that renamed a column described as having
-            // no columns at all. Matched by the column, each item once, since
-            // the fetch need not be in select-list order and one column may be
-            // selected twice under two names.
-            let mut labels: Vec<Option<&str>> = parsed
-                .select_items
-                .iter()
-                .map(|item| match item {
-                    crate::core::rql::aggregate::SelectItem::Column { label, .. } => Some(label.as_str()),
-                    _ => None,
-                })
-                .collect();
-            for c in parsed
-                .requested_row_fetch
-                .columns_fetching_data
-                .iter()
-                .take(parsed.visible_columns)
-            {
-                let Some(field) = field_of(&table_fields, c.schema_id) else {
-                    continue;
-                };
-                let aliased = (0..parsed.select_items.len())
-                    .find(|&i| {
-                        labels[i].is_some()
-                            && matches!(&parsed.select_items[i], crate::core::rql::aggregate::SelectItem::Column { field: f, .. }
-                                if f.write_order == field.write_order)
-                    })
-                    .and_then(|i| labels[i].take());
-                let label: String = aliased.unwrap_or(&field.name).to_string();
+            // Each column under its alias, as the rows go out.
+            fields.extend(plain_select_fields(&parsed, &table_fields, |field| {
                 // A catalogue view has no `TableSchema` and no JSON columns, so
                 // the field's own type is what it reports.
-                let ty = match &real_table {
+                match &real_table {
                     Some(t) => reported_type(field, t.schema()),
                     None => field.literal_type(),
-                };
-                fields.push((label, ty));
-            }
+                }
+            }));
             Ok(Some((fields, true)))
         }
         QueryPurpose::InsertRow(ir) => {
@@ -6935,19 +6949,12 @@ fn result_description(
                             .collect::<Vec<_>>(),
                     )
                 }
-                Ok(parsed) => Some(
-                    parsed
-                        .requested_row_fetch
-                        .columns_fetching_data
-                        .iter()
-                        .take(parsed.visible_columns)
-                        .filter_map(|c| {
-                            field_of(&table.schema().fields, c.schema_id).map(|field| {
-                                (field.name.clone(), reported_type(field, table.schema()))
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                // Describe's own list (`plain_select_fields`): the simple
+                // query path labelled `SELECT id AS k` as `id` while Describe
+                // said `k`, so a client reading by name found another column.
+                Ok(parsed) => Some(plain_select_fields(&parsed, &table.schema().fields, |field| {
+                    reported_type(field, table.schema())
+                })),
                 // A comparison with no operator (`text = double precision`)
                 // is PostgreSQL's 42883, not a syntax error.
                 Err(e) if e.starts_with("operator does not exist") => return Err(("42883", e)),

@@ -359,11 +359,44 @@ impl SchemaStats<'_> {
 impl Database {
     /// The one place a table name is resolved to a map key: `find` is asked
     /// with the key `name` means. Every lookup by name in this file goes
-    /// through it. Identifier case folding drops in here (the exact key
-    /// first, then the folded unquoted name); today a name is its own key.
+    /// through it.
+    ///
+    /// The exact key first; failing that, the one key equal to `name`
+    /// ignoring ASCII case. PostgreSQL folds an unquoted identifier to
+    /// lowercase, so `CREATE TABLE X` and then `FROM x` name one table; here
+    /// `FROM x` was 42P01. The collision guard never lets two tables differ
+    /// only by case, so the match is unique and cannot pick a wrong table:
+    /// it is more lenient than PostgreSQL (`"X"` finds `x`), never retargeted.
+    /// Row and table locks are keyed by the folded name for the same reason
+    /// (`mvcc::fold_lock_name`). The fallback scans the keys, on a miss only.
     #[inline]
     fn resolve<T>(&self, name: &str, find: impl Fn(&str) -> Option<T>) -> Option<T> {
-        find(name)
+        if let Some(found) = find(name) {
+            return Some(found);
+        }
+        let key = self.folded_key(name)?;
+        find(&key)
+    }
+
+    /// The registered key equal to `name` ignoring ASCII case, when exactly
+    /// one is and it is not `name` itself.
+    #[cold]
+    fn folded_key(&self, name: &str) -> Option<String> {
+        let mut found: Option<String> = None;
+        let keys = self
+            .table_slots
+            .iter()
+            .map(|e| e.key().clone())
+            .chain(self.partitioned_tables.iter().map(|e| e.key().clone()));
+        for key in keys {
+            if key != name && key.eq_ignore_ascii_case(name) {
+                match &found {
+                    Some(other) if *other != key => return None,
+                    _ => found = Some(key),
+                }
+            }
+        }
+        found
     }
 
     /// The map key a DDL mutator acts on for `name`: the key [`Database::resolve`]
@@ -379,10 +412,10 @@ impl Database {
         })
     }
 
-    /// The key a table lock on `name` is taken under: the key `name`
-    /// resolves to, so two spellings that resolve to one table lock one
-    /// entry once case folding lands in [`Database::resolve`]. Today the
-    /// name itself, borrowed (no allocation on the statement path).
+    /// The key a table lock on `name` is taken under. The name itself,
+    /// borrowed (no allocation on the statement path): the lock managers
+    /// fold it (`mvcc::fold_lock_name`), so two spellings that resolve to
+    /// one table lock one entry.
     #[inline]
     pub(crate) fn lock_key<'n>(&self, name: &'n str) -> std::borrow::Cow<'n, str> {
         std::borrow::Cow::Borrowed(name)

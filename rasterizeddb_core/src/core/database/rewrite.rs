@@ -412,6 +412,10 @@ impl Database {
         Fi: FnOnce(P, Arc<DbTable>) -> FiFut,
         FiFut: Future<Output = Result<T, String>>,
     {
+        // The table's own name, never the statement's spelling: the files and
+        // the backup below are named by it (identifier case folding).
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
         // A partitioned table is never rewritten here: per partition it would
         // not be all or nothing (docs/partitioning.md §11, phase 6). Its
         // callers refuse first; this is the backstop, before anything is held.
@@ -537,6 +541,15 @@ impl Database {
         F: FnOnce(Arc<DbTable>) -> Fut,
         Fut: Future<Output = Result<T, String>>,
     {
+        // The table's own name, never the statement's spelling: the schema
+        // files held aside are named by it, and a spelling's stem names files
+        // nobody has, which the backup then writes (identifier case folding).
+        let resolved = self.resolve_key(table_name);
+        let table_name = resolved.as_deref().unwrap_or(table_name);
+        let also: Vec<String> = also
+            .into_iter()
+            .map(|child| self.resolve_key(&child).unwrap_or(child))
+            .collect();
         let _relocating = super::relocation_permit(self.location.is_some(), table_name).await;
         // A partitioned table's schema files are its shell's,
         // `__pt_<uid>_schema*`: held aside under that stem (§11).

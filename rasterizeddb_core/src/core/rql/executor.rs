@@ -3382,6 +3382,12 @@ where
         Vec<RewrittenVersion>,
     ) -> Result<Vec<RewrittenVersion>, String>,
 {
+    // The table's own name, not the statement's spelling of it: the rewrite
+    // recreates files and the catalogue entry under this name, so `ALTER
+    // TABLE acct` on `Acct` would otherwise be refused by the collision
+    // guard, or, past it, re-file the table under a second name.
+    let canonical = database.resolve_key(table_name);
+    let table_name = canonical.as_deref().unwrap_or(table_name);
     // The rewrite recreates the table's files under its name. A name older
     // builds accepted can be refused by the create; asked after the old files
     // were released, that refusal would lose every row.
@@ -9280,6 +9286,26 @@ fn supply_insert_column_list(
     // re-parse cannot find the clause and it is carried across instead.
     // Without this, `INSERT INTO t VALUES (…) ON CONFLICT DO NOTHING` raised
     // the very violation it was written to skip.
+    InsertConflict {
+        do_nothing: row_data.on_conflict_do_nothing,
+        update: row_data.on_conflict_update.clone(),
+    }
+    .restore(&mut purpose);
+    Some(Ok(purpose))
+}
+
+/// The statement with its column list spelled as the target declares its
+/// columns (`lexer_ir::canonical_column_list`); `None` when it already is.
+/// The `ON CONFLICT` clause is carried across as in
+/// [`supply_insert_column_list`].
+fn canonical_insert_column_list(
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+    schema: Option<&crate::core::row::schema::TableSchema>,
+) -> Option<Result<QueryPurpose, String>> {
+    let rewritten = crate::core::rql::lexer_ir::canonical_column_list(&row_data.query, &schema?.fields)?;
+    let Some(mut purpose) = recognize_query_purpose(&rewritten) else {
+        return Some(Err("could not parse the statement after folding its column list".to_string()));
+    };
     InsertConflict {
         do_nothing: row_data.on_conflict_do_nothing,
         update: row_data.on_conflict_update.clone(),
@@ -19175,6 +19201,19 @@ pub(crate) async fn execute_with_need(
                 Ok(target) => target,
                 Err(e) => return ddl_error(&e),
             };
+
+            // A column list naming columns in another case (`INSERT INTO t
+            // (ID)` for `id`, as PostgreSQL folds it) is re-dispatched spelled
+            // as the table declares them, so every reader below, this gate
+            // first, matches it exactly. Synchronous, as the column list
+            // supplied below.
+            match canonical_insert_column_list(row_data, target.as_ref().map(|t| t.schema())) {
+                Some(Ok(purpose)) => {
+                    return Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await;
+                }
+                Some(Err(e)) => return ddl_error(&e),
+                None => {}
+            }
 
             // Every column the statement names is one of the target's, before
             // anything is computed or written: PostgreSQL's 42703. An unknown

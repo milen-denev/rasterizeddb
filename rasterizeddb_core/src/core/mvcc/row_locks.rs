@@ -511,6 +511,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> Acquired {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         self.acquire_in(Space::Row, table, key, tx, strength, is_live)
     }
 
@@ -520,6 +521,7 @@ impl RowLocks {
     /// now may have been changed after its scan's snapshot (the executor's
     /// `lock_selected_rows`).
     pub fn holds(&self, table: &str, key: &[u8], tx: TxId) -> bool {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         if self.row_count.load(Ordering::Acquire) == 0 {
             return false;
         }
@@ -547,6 +549,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> Option<TxId> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         if self.row_count.load(Ordering::Acquire) == 0 {
             return None;
         }
@@ -578,6 +581,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> Acquired {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let name = referenced_name(table, column);
         self.acquire_in(Space::Referenced, &name, key, tx, strength, is_live)
     }
@@ -593,6 +597,7 @@ impl RowLocks {
     /// [`RowLocks::wait_for_table`]. Under `FROZEN_TX`, which owns nothing,
     /// it only checks.
     pub fn acquire_table(&self, table: &str, tx: TxId, mode: TableMode) -> Acquired {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let id = self.owner_of(tx);
         let Some(owner) = LockOwner::block(id) else {
             return match self.table_conflict(table, tx, mode != TableMode::AccessShare) {
@@ -617,6 +622,7 @@ impl RowLocks {
     /// (`for_write`: ROW EXCLUSIVE) or a read (ACCESS SHARE) would conflict
     /// with. Diagnostic and for tests: statements take the lock instead.
     pub fn table_conflict(&self, table: &str, tx: TxId, for_write: bool) -> Option<TxId> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let id = self.owner_of(tx);
         // `FROZEN_TX` is nobody's owner, so everything held is another's.
         let owner = LockOwner::block(id).unwrap_or(LockOwner::block(u64::MAX).expect("a real id"));
@@ -638,6 +644,7 @@ impl RowLocks {
         timeout: LockTimeout,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<(), LockError> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         self.table_locks
             .acquire_with(owner, table, mode, role, timeout, cancelled, &|o| self.table_deadlock_check(o))
             .await
@@ -711,6 +718,7 @@ impl RowLocks {
         tx: TxId,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> Result<Marked, TxId> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let txn = self.txn_of(tx);
         // Nothing ends `FROZEN_TX`, so a mark under it would never go.
         if txn == crate::core::mvcc::transaction::FROZEN_TX || keys.is_empty() {
@@ -770,6 +778,7 @@ impl RowLocks {
         tx: TxId,
         is_live_owner: &dyn Fn(TxId) -> bool,
     ) -> Option<TxId> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let (me, txn) = (self.owner_of(tx), self.txn_of(tx));
         let inner = self.lock();
         let other = |o: &TxId| *o != me && *o != txn && is_live_owner(*o);
@@ -794,6 +803,7 @@ impl RowLocks {
     /// Gives back a row lock `tx` took and will not keep (a `SKIP LOCKED` or
     /// `NOWAIT` that met a fast-path writer after taking it).
     pub fn release_row(&self, table: &str, key: &[u8], tx: TxId) {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let tx = self.txn_of(tx);
         let mut inner = self.lock();
         let Some(name_id) = inner.names.get(table).copied() else {
@@ -870,6 +880,7 @@ impl RowLocks {
     /// the key that names its rows) asks first: after it, the locks would
     /// name rows nobody looks up, and the rows would be unprotected.
     pub fn txn_holds_rows_on(&self, table: &str, tx: TxId) -> bool {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         if self.row_count.load(Ordering::Acquire) == 0 {
             return false;
         }
@@ -945,6 +956,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> SmallVec<[TxId; 4]> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         self.blockers_in(Space::Row, table, key, tx, strength, is_live)
     }
 
@@ -958,6 +970,7 @@ impl RowLocks {
         strength: LockStrength,
         is_live: &dyn Fn(TxId) -> bool,
     ) -> SmallVec<[TxId; 4]> {
+        let table = &*crate::core::mvcc::fold_lock_name(table);
         let name = referenced_name(table, column);
         self.blockers_in(Space::Referenced, &name, key, tx, strength, is_live)
     }

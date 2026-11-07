@@ -621,6 +621,58 @@ pub fn named_columns(sql: &str) -> Option<Vec<String>> {
     )
 }
 
+/// The statement with each name in its column list spelled as the table
+/// declares it, when one is not: `None` when every name already matches a
+/// column exactly (the common case, no allocation past the scan) or the
+/// statement has no list.
+///
+/// PostgreSQL folds an unquoted identifier to lowercase, so `INSERT INTO t
+/// (ID, Name)` names `id` and `name`. Here every reader of the list matches
+/// it exactly, so `ID` was 42703. A name with no exact match takes the one
+/// live column equal to it ignoring ASCII case; with none, or with two
+/// (`"A"` and `a` both declared), it is left as written, and the 42703 gate
+/// reports it. More lenient than PostgreSQL (`"ID"` finds `id`), never
+/// retargeted: an exact match always wins.
+pub fn canonical_column_list(sql: &str, schema: &[SchemaField]) -> Option<String> {
+    let lead = sql.len() - sql.trim_start().len();
+    let trimmed = &sql[lead..];
+    named_columns(trimmed)?;
+    let open = "INSERT INTO".len() + trimmed["INSERT INTO".len()..].find('(')?;
+    let close = matching_paren(trimmed, open)?;
+    let live = || schema.iter().filter(|f| !f.is_deleted);
+    let mut out = String::new();
+    let mut from = 0usize;
+    let mut at = open + 1;
+    for item in trimmed[open + 1..close].split(',') {
+        let span_start = at + (item.len() - item.trim_start().len());
+        let name = item.trim();
+        at += item.len() + 1;
+        let bare = name.trim_matches('"').trim_matches('\'');
+        if bare.is_empty() || live().any(|f| f.name == bare) {
+            continue;
+        }
+        let mut folded = live().filter(|f| f.name.eq_ignore_ascii_case(bare));
+        // The readers below trim the quotes and never unescape a doubled
+        // one, so a name holding `"` is left for the gate.
+        let (Some(only), None) = (folded.next(), folded.next()) else {
+            continue;
+        };
+        if only.name.contains('"') {
+            continue;
+        }
+        out.push_str(&trimmed[from..span_start]);
+        out.push('"');
+        out.push_str(&only.name);
+        out.push('"');
+        from = span_start + name.len();
+    }
+    if from == 0 {
+        return None;
+    }
+    out.push_str(&trimmed[from..]);
+    Some(format!("{}{}", &sql[..lead], out))
+}
+
 /// PostgreSQL's `INSERT has more expressions than target columns` (42601).
 pub const MORE_EXPRESSIONS: &str = "INSERT has more expressions than target columns";
 /// PostgreSQL's `INSERT has more target columns than expressions` (42601).
@@ -2899,6 +2951,31 @@ mod column_list_supply {
             field("legacy", 3, true),
             field("select", 4, false),
         ]
+    }
+
+    #[test]
+    fn a_column_list_in_another_case_is_spelled_as_declared() {
+        let mut fields = schema();
+        fields.push(field("Mixed", 5, false));
+        fields.push(field("LEGACY", 6, false));
+        let out = canonical_column_list("  INSERT INTO t (ID, Name , mixed,\"SELECT\") VALUES (1, 'a', 2, 3)", &fields);
+        assert_eq!(
+            out.as_deref(),
+            Some("  INSERT INTO t (\"id\", \"name\" , \"Mixed\",\"select\") VALUES (1, 'a', 2, 3)")
+        );
+        // Exact names allocate nothing; an exact match wins over a folded one.
+        assert_eq!(canonical_column_list("INSERT INTO t (id, name) VALUES (1, 'a')", &fields), None);
+        // `legacy` is dropped, so `Legacy` folds only to the live `LEGACY`.
+        assert_eq!(
+            canonical_column_list("INSERT INTO t (Legacy) VALUES (1)", &fields).as_deref(),
+            Some("INSERT INTO t (\"LEGACY\") VALUES (1)")
+        );
+        // Two live columns equal ignoring case: left for the 42703 gate.
+        fields.push(field("mixed", 7, false));
+        assert_eq!(canonical_column_list("INSERT INTO t (MIXED) VALUES (1)", &fields), None);
+        assert_eq!(canonical_column_list("INSERT INTO t (nope) VALUES (1)", &fields), None);
+        assert_eq!(canonical_column_list("INSERT INTO t VALUES (1)", &fields), None);
+        assert_eq!(canonical_column_list("INSERT INTO t SELECT * FROM u", &fields), None);
     }
 
     #[test]

@@ -54,6 +54,22 @@
 //! [`transaction::Snapshot::sees_everything`].
 
 pub mod owner;
+
+/// The key a row or table lock on `name` is held under: the name with ASCII
+/// letters folded to lowercase. Two tables never differ only by case (the
+/// collision guard refuses the second), so the fold names one table, and
+/// `UPDATE X` and `UPDATE x` (which resolve to the same table,
+/// `Database::resolve`) lock one entry. Keyed by the spelling, they locked
+/// two, and a second writer would not wait for the first: a lost update.
+/// Borrowed, without a copy, when the name has no uppercase letter.
+#[inline]
+pub(crate) fn fold_lock_name(name: &str) -> std::borrow::Cow<'_, str> {
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(name)
+    }
+}
 pub mod row_locks;
 pub mod status;
 pub mod table_locks;
