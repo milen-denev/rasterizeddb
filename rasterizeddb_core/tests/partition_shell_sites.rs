@@ -309,7 +309,12 @@ const SITES: &[Site] = &[
     site("ANALYZE site_p", Expect::LikeTwin, "a no-op on both"),
     site("REINDEX TABLE site_p", Expect::LikeTwin, "not a statement here"),
     site("CLUSTER site_p", Expect::LikeTwin, "not a statement here"),
-    site("TRUNCATE site_p", Expect::LikeTwin, "not a statement here"),
+    in_block(
+        "TRUNCATE site_p",
+        Expect::LikeTwin,
+        "a statement since feat/truncate: the partitions' rows deleted under the logical name's ACCESS \
+         EXCLUSIVE, rolled back by the block so the sites below keep their rows",
+    ),
     site("COMMENT ON TABLE site_p IS 'x'", Expect::LikeTwin, "a no-op on both"),
     site("GRANT SELECT ON site_p TO PUBLIC", Expect::LikeTwin, "not a statement here"),
     // Locks.
