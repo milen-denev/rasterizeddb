@@ -139,22 +139,25 @@ async fn alter_column_type_keeps_the_default_through_a_later_rename() {
     let db = open(dir.path()).await;
 
     ok(&db, "CREATE TABLE t (a INT DEFAULT 7, b INT)").await;
-    // A change of width is refused on this branch (every row would need a
-    // rewrite); naming the type the column already has is accepted as a
-    // no-op. Either way the column's default must still be there afterwards,
-    // and must follow a later rename — as in PostgreSQL.
-    let widened = run(&db, "ALTER TABLE t ALTER COLUMN a TYPE BIGINT").await;
-    assert!(
-        is_error(&widened),
-        "widening is refused on this branch; if it is now supported, this test must check \
-         that the DEFAULT survives the widening itself, not only the rename after it"
-    );
-    // The refused ALTER left the default in place.
+    // A change of width rewrites every row (`retype_by_cast`); the column's
+    // default must survive the rewrite itself, in both directions, and then
+    // follow a later rename — as in PostgreSQL.
+    ok(&db, "INSERT INTO t (b) VALUES (-1)").await;
+    ok(&db, "ALTER TABLE t ALTER COLUMN a TYPE BIGINT").await;
     ok(&db, "INSERT INTO t (b) VALUES (0)").await;
-    assert_eq!(ints(&db, "SELECT a FROM t WHERE b = 0").await, vec![Some(7)]);
+    assert_eq!(
+        ints(&db, "SELECT a FROM t WHERE b = 0").await,
+        vec![Some(7)],
+        "widening the column lost its DEFAULT"
+    );
     ok(&db, "ALTER TABLE t ALTER COLUMN a TYPE INT").await;
     ok(&db, "INSERT INTO t (b) VALUES (2)").await;
-    assert_eq!(ints(&db, "SELECT a FROM t WHERE b = 2").await, vec![Some(7)]);
+    assert_eq!(
+        ints(&db, "SELECT a FROM t WHERE b = 2").await,
+        vec![Some(7)],
+        "narrowing the column back lost its DEFAULT"
+    );
+    assert_eq!(ints(&db, "SELECT a FROM t WHERE b = -1").await, vec![Some(7)], "a row's value through both rewrites");
     ok(&db, "ALTER TABLE t RENAME COLUMN a TO c").await;
     ok(&db, "INSERT INTO t (b) VALUES (1)").await;
     assert_eq!(
