@@ -6113,11 +6113,8 @@ where
         Some(tx) => Some((tx, false)),
         // A derived table read at the wire too: its rows and the write are
         // one transaction's, so the write is handed their snapshot.
-        // A TRUNCATE too: its tables are emptied as one transaction's
-        // deletes, all or none (`executor::execute_truncate`).
         None if crate::core::rql::cte::has_with_clause(stmt)
-            || crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt)
-            || is_truncate(stmt) =>
+            || crate::core::rql::statement_snapshot::is_write_read_at_the_wire(stmt) =>
         {
             let tx = match crate::core::mvcc::owner::adopt_transaction() {
                 Some(o) => o,
@@ -7894,13 +7891,6 @@ enum PurposeKind {
     DeleteRow,
     QueryRows,
     Other,
-}
-
-/// Whether `stmt` is a `TRUNCATE`.
-fn is_truncate(stmt: &str) -> bool {
-    let head = stmt.trim_start();
-    head.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("TRUNCATE"))
-        && head[8..].starts_with(|c: char| c.is_ascii_whitespace())
 }
 
 /// The `CommandComplete` tag PostgreSQL sends for a statement.

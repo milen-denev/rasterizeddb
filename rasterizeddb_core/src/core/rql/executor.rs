@@ -7698,8 +7698,9 @@ async fn execute_lock_table(
 /// unless that one is truncated too, named or by `CASCADE` (0A000, as in
 /// PostgreSQL), and the referencing tables are emptied first, so no delete
 /// finds a row still pointing at it and no `ON DELETE` action runs. `tx` is
-/// a real transaction even in autocommit: the wire layer opens one for the
-/// statement, so several tables are emptied all or nothing.
+/// a real transaction even in autocommit (`execute_autocommit` runs the
+/// statement in one, and the deletes join it), so several tables are
+/// emptied all or nothing.
 #[inline(never)]
 async fn execute_truncate(database: &Arc<Database>, sql: &str, depth: usize, tx: TxId) -> Vec<u8> {
     let statement = match crate::core::rql::truncate::parse(sql) {
