@@ -212,7 +212,7 @@ const SITES: &[Site] = &[
     site("ALTER TABLE site_p RENAME COLUMN asset_group_id TO grp", Expect::LikeTwin, "a key column: the hash never sees names"),
     site("SELECT * FROM site_p WHERE tenant_id = 1 AND grp = 2", Expect::LikeTwinAnswered, "routed on the renamed key"),
     site("ALTER TABLE site_p RENAME COLUMN grp TO asset_group_id", Expect::LikeTwin, "phase 3 P1"),
-    site("ALTER TABLE site_q RENAME TO site_p", Expect::Error("42710"), "onto the partitioned name: as onto a plain one"),
+    site("ALTER TABLE site_q RENAME TO site_p", Expect::Error("42P07"), "onto the partitioned name: 42P07, as onto a plain one and in PostgreSQL"),
     site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT", Expect::LikeTwin, "a storage-type change: refused on both"),
     site("ALTER TABLE site_p ALTER COLUMN tenant_id TYPE INT", Expect::Refused, "a partition key column"),
     site("ALTER TABLE site_p ALTER COLUMN n TYPE BIGINT USING n::bigint", Expect::Refused, "USING: refused on both"),

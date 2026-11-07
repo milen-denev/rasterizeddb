@@ -386,15 +386,17 @@ fn foreign_keys_onto_a_partitioned_table_reference_its_partition_key() {
         ] {
             run(&db, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
-        // Identifiers are not case-folded here (an open finding), so the
-        // parent spelled in capitals is no table: 42P01, nothing written.
-        let e = run(&db, "ALTER TABLE pd_fk_child ADD FOREIGN KEY (parent_id) REFERENCES PD_FK_PARENT(id)")
+        // A name resolves in any case (`Database::resolve`), so the parent
+        // spelled in capitals is the same partitioned table, and its key.
+        run(&db, "ALTER TABLE pd_fk_child ADD FOREIGN KEY (parent_id) REFERENCES PD_FK_PARENT(id)")
             .await
-            .expect_err("another spelling");
-        assert!(e.contains("relation \"PD_FK_PARENT\" does not exist"), "{e}");
+            .expect("another spelling of the parent");
         let names: Vec<String> =
             db.table_for_tests("pd_fk_child").unwrap().schema.foreign_keys.iter().map(|f| f.name.clone()).collect();
-        assert_eq!(names, vec!["c_fk", "pd_fk_child_parent_id_fkey", "pd_fk_child_parent_id_fkey1"]);
+        assert_eq!(
+            names,
+            vec!["c_fk", "pd_fk_child_parent_id_fkey", "pd_fk_child_parent_id_fkey1", "pd_fk_child_parent_id_fkey2"]
+        );
         assert_ne!(on_disk_schema(&db, "pd_fk_child").await, before, "the keys are in the sidecar");
     });
 }

@@ -251,7 +251,7 @@ impl Database {
             return Err(io::Error::other(why));
         }
         if self.has_table(new_name) || self.is_partitioned(new_name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a table of that name already exists"));
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("relation \"{new_name}\" already exists")));
         }
         self.refuse_held_name(new_name)?;
         if let Some(held) = self.held_names.lock().first() {

@@ -2544,7 +2544,7 @@ impl Database {
         if self.is_partitioned(new_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "a table of that name already exists",
+                format!("relation \"{new_name}\" already exists"),
             ));
         }
         // A partitioned table moves no file: its catalogue row is re-keyed
@@ -2575,7 +2575,7 @@ impl Database {
         if self.has_table(new_name) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "a table of that name already exists",
+                format!("relation \"{new_name}\" already exists"),
             ));
         }
         self.refuse_held_name(new_name)?;

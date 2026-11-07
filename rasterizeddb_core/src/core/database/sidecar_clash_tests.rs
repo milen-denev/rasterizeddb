@@ -344,7 +344,7 @@ async fn file_names_are_compared_ignoring_case() {
         files_in(dir.path()).contains(&"X.db".to_string()),
         "the premise: file names keep the table name's case"
     );
-    for newcomer in ["x_POINTERS", "x_pointers", "X_POINTERS", "x", "x_Schema_fields"] {
+    for newcomer in ["x_POINTERS", "x_pointers", "X_POINTERS", "x_Schema_fields"] {
         let err = db.add_table(create_stmt(newcomer)).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{newcomer}");
         assert_names_the_file(&err.to_string(), newcomer, "X", newcomer);
@@ -358,17 +358,18 @@ async fn file_names_are_compared_ignoring_case() {
         "both spellings, and why they are one file: {err}"
     );
 
-    // `x` is not `X` here (names are matched exactly), so `IF NOT EXISTS`
-    // must refuse rather than skip: a skip would report a table that every
-    // later statement on `x` says does not exist.
-    let (status, text) = sql(&db, "CREATE TABLE IF NOT EXISTS x (id INT)").await;
-    assert_eq!(status, 3, "IF NOT EXISTS x beside X: {text}");
+    // `x` is `X`: a name resolves in any case (`Database::resolve`), so a
+    // second `x` is the table that exists, 42P07, and `IF NOT EXISTS` skips
+    // it, as it would `X`. Nothing is made under `x`'s own files.
+    let err = db.add_table(create_stmt("x")).await.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "x beside X: {err}");
+    let (status, text) = sql(&db, "CREATE TABLE x (id INT)").await;
+    assert_eq!(status, 3, "x beside X: {text}");
     assert_eq!(crate::pgwire::sqlstate_for(&text), "42P07", "{text}");
-    assert!(
-        text.contains("table \"X\"") && text.contains("case-insensitive filesystem"),
-        "names X and why: {text}"
-    );
-    assert!(!db.has_table("x") && db.has_table("X"));
+    let (status, text) = sql(&db, "CREATE TABLE IF NOT EXISTS x (id INT)").await;
+    assert_eq!(status, 0, "IF NOT EXISTS x beside X skips: {text}");
+    assert!(db.has_table("x") && db.has_table("X"));
+    assert!(!files_in(dir.path()).contains(&"x.db".to_string()), "a second table's files under `x`");
 
     // The other order: `x_POINTERS` first, then `X`.
     let dir = tempfile::tempdir().unwrap();
@@ -379,11 +380,15 @@ async fn file_names_are_compared_ignoring_case() {
     assert_names_the_file(&err.to_string(), "X", "x_POINTERS", "X after x_POINTERS");
     let err = db.rename_table("other", "X").await.unwrap_err();
     assert_names_the_file(&err.to_string(), "X", "x_POINTERS", "rename to X");
-    // Renaming a table onto its own name in another case is the same file
-    // copied onto itself on those filesystems.
+    // Renaming a table onto its own name in another case: `OTHER` is the
+    // table itself now (names resolve in any case), so it already exists,
+    // 42P07, as a rename onto its own name is in PostgreSQL. Before, it was
+    // refused as the same file copied onto itself on those filesystems.
     let err = db.rename_table("other", "OTHER").await.unwrap_err();
-    assert_names_the_file(&err.to_string(), "OTHER", "other", "other -> OTHER");
+    assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "other -> OTHER: {err}");
+    assert_eq!(crate::pgwire::sqlstate_for(&err.to_string()), "42P07", "{err}");
     assert!(db.has_table("other"));
+    assert!(files_in(dir.path()).contains(&"other.db".to_string()), "other's files kept");
     // Unrelated names are unaffected.
     create(&db, "Y").await;
 }
