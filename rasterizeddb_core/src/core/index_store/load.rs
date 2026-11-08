@@ -947,8 +947,13 @@ pub fn capture_sections(indexes: &TableIndexes, gate: &FileGate) -> io::Result<O
                 match ix.seal_run(&|| gate.word().load().cancelled())? {
                     #[allow(unused_mut)]
                     Some(mut bytes) => {
+                        // A run reference has no section layout: a binary
+                        // before INDEX_SECTION_VER 2 wrote it as this one does,
+                        // so playing version 1 leaves it whole. Any other
+                        // version is written over its first bytes, a
+                        // reference this build refuses.
                         #[cfg(test)]
-                        if let Some(v) = gate.dir().and_then(hooks::version) {
+                        if let Some(v) = gate.dir().and_then(hooks::version).filter(|&v| v != 1) {
                             bytes[..2].copy_from_slice(&v.to_le_bytes());
                         }
                         out.push((SectionKind::Index, i as u16, bytes));
