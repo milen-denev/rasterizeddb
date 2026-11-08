@@ -1001,6 +1001,16 @@ impl<S: StorageIO> Table<S> {
         self.write_generation.load(AtomicOrdering::Acquire)
     }
 
+    /// Whether this table's scans consult and fill the query cache. Not a
+    /// statement's own CTE or derived table (`cte::TEMP_TABLE_PREFIX`): it is
+    /// created under a fresh name for one statement and dropped with it, so
+    /// no later scan can ask for what it would store. Each one was a lookup
+    /// that could only miss and an entry that could only evict a useful one:
+    /// a query over a derived table counted a hit and a miss together.
+    pub(crate) fn caches_queries(&self) -> bool {
+        !self.schema.name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+    }
+
     /// The query-cache scope and current generation: what an entry this
     /// table stores is keyed and stamped with.
     #[cfg(test)]
@@ -4878,7 +4888,7 @@ impl<S: StorageIO> Table<S> {
                 schema_fields,
                 d.io_rows.clone(),
                 &mut iterator,
-                cache.then(|| cache_generation_for(&visibility, generation)).flatten(),
+                (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
                 visibility,
             )
             .await
@@ -5009,7 +5019,7 @@ impl<S: StorageIO> Table<S> {
                     &mut iterator,
                     limit,
                     order_by.clone(),
-                    cache.then(|| cache_generation_for(&visibility, generation)).flatten(),
+                    (cache && self.caches_queries()).then(|| cache_generation_for(&visibility, generation)).flatten(),
                     visibility.clone(),
                 )
                 .await?;
@@ -5242,7 +5252,7 @@ impl<S: StorageIO> Table<S> {
                 &mut iterator,
                 limit,
                 order_by,
-                cache_generation_for(&visibility, generation).filter(|_| cache),
+                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
                 visibility,
             )
             .await?;

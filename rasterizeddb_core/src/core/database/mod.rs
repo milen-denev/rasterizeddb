@@ -942,6 +942,13 @@ fn seed_fell_back(_pool: &StoragePool, _seed: &DbStorageProvider, _table_name: &
 /// The durability that costs those milliseconds buys nothing, so it is not
 /// bought. Everything else about the relation is unchanged: it is a real table
 /// with a real schema, created and dropped through the ordinary paths.
+/// Whether `table_name` is a statement's own relation: a CTE's or a derived
+/// table's (`cte::TEMP_TABLE_PREFIX`), created in memory and dropped before
+/// the statement ends.
+fn is_statement_scoped(table_name: &str) -> bool {
+    table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+}
+
 fn temp_seed(table_name: &str) -> Option<Arc<DbStorageProvider>> {
     table_name
         .starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
@@ -2200,7 +2207,16 @@ impl Database {
         // Before the files go: a failure here must leave the table intact rather
         // than half-dropped, and the catalogue is the half that decides whether
         // it exists at all.
-        if let Err(e) = self.forget_in_catalogue(table_name).await {
+        //
+        // A statement's own relation has no row (`add_table_unguarded`). The
+        // search for one read the catalogue's schema, which opens its ten
+        // sidecars and, the first time in a database, creates each with a
+        // directory sync: ~90 ms on the first derived-table query after a
+        // database was made. A row an older build wrote for one is the
+        // startup reaper's (`load_db_tables`).
+        if !is_statement_scoped(table_name)
+            && let Err(e) = self.forget_in_catalogue(table_name).await
+        {
             self.put_back_after_failed_drop(table_name, table).await;
             error!("Could not remove {} from the catalogue: {}", table_name, e);
             return Err(e);
@@ -3935,7 +3951,18 @@ impl Database {
             self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
         }
-        if let Err(e) = self.write_catalogue_row(table_name, 0).await {
+        // Not for a statement's own relation (a CTE's, a derived table's).
+        // It lives in memory and is dropped before the statement ends, so a
+        // row naming it can only ever name nothing: the next open would find
+        // no files for it. Written, it was a logged, synced write on every
+        // such statement (the WAL's fdatasync, ~5 ms on ext4), and its
+        // tombstone stayed in the catalogue for good — every later drop's
+        // row search, and every open, read past one more dead row per query
+        // ever run (1,500 derived-table queries: 148 B to 55 KB of pointers,
+        // 8.3 to 8.8 ms each). See `forget_in_catalogue`'s twin guard.
+        if !is_statement_scoped(table_name)
+            && let Err(e) = self.write_catalogue_row(table_name, 0).await
+        {
             self.abandon_create(table_name, Some(table), intent, pinned).await;
             return Err(e);
         }
