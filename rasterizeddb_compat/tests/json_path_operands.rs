@@ -157,6 +157,8 @@ async fn a_path_reads_from_a_cast_a_group_or_a_call() {
             ("SELECT (d->'o')->>'p' FROM ja WHERE id = 1", &["q"]),
             (r#"SELECT coalesce(d, '{}')->'k' FROM ja WHERE id = 1"#, &[r#""x""#]),
             ("SELECT jsonb_build_object('k', 1)->'k'", &["1"]),
+            // A scalar is a one-element array to jsonb's `->`, not to `#>`.
+            (r#"SELECT '"x"'::jsonb->0, '5'::jsonb->-1, '5'::jsonb->1, '5'::jsonb#>'{0}'"#, &[r#""x"|5|NULL|NULL"#]),
             ("SELECT json_build_object('k', 1)->'k'", &["1"]),
         ],
     )
