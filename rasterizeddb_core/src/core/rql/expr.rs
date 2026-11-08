@@ -6749,8 +6749,13 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
         Expr::PathOf { base, steps, as_text } => {
             let json_text = yields_json_text(base);
             let document = match eval(base, row, schema)? {
-                Value::Data { bytes, .. } => bytes,
                 Value::Null => return Ok(Value::Null),
+                // A `json` value is the text it is.
+                Value::Data { bytes, .. } if json_text => bytes,
+                // A `jsonb` operand may still arrive as text: a branch of
+                // `coalesce(doc, '{"k":1}')` is the literal's. Walked as an
+                // encoded document, the text found nothing and read NULL.
+                value => as_jsonb(value)?,
             };
             path_value(&document, steps, *as_text, json_text)?
         }
