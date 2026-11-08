@@ -1663,3 +1663,92 @@ fn a_load_is_a_mutation_the_census_sees_and_a_capture_is_not() {
         "a capture recorded a mutation"
     );
 }
+
+/// A B-tree map built from several runs (a load from a chunked section)
+/// answers every read as one `BTreeMap` with the same entries does, before
+/// and after writes land in each shard: point reads, ranges that start,
+/// end or sit exactly on a shard's bound, ranges over every shard, inserts
+/// below the first bound and above the last, removals that empty a key,
+/// and `clear`. Keys are drawn from a small alphabet so they hit the bounds.
+#[test]
+fn a_map_built_from_runs_reads_as_one_map() {
+    let mut rng = Rng(0x5a4d_ed01);
+    let key = |r: &mut Rng| -> KeyBuf { KeyBuf::from_vec((0..1 + r.below(3)).map(|_| b'a' + r.below(6) as u8).collect()) };
+    for round in 0..60 {
+        let mut model: BTreeMap<KeyBuf, Slots> = BTreeMap::new();
+        for _ in 0..r_below(&mut rng, 150) {
+            model.entry(key(&mut rng)).or_default().push(rng.next() % 1000);
+        }
+        for slots in model.values_mut() {
+            slots.sort_unstable();
+            slots.dedup();
+        }
+        // Cut the sorted entries into runs of random lengths, some empty.
+        let all: Vec<(KeyBuf, Slots)> = model.iter().map(|(k, s)| (k.clone(), s.clone())).collect();
+        let mut runs = Vec::new();
+        let mut at = 0;
+        while at < all.len() {
+            let n = (rng.below(12) as usize).min(all.len() - at);
+            runs.push(all[at..at + n].to_vec());
+            at += n;
+        }
+        let mut ranged = Ranged::from_runs(runs, 1 + (round % 4) as usize);
+        let probe = |ranged: &Ranged, model: &BTreeMap<KeyBuf, Slots>, rng: &mut Rng, what: &str| {
+            assert_eq!(ranged.len(), model.len(), "{what}: len");
+            assert_eq!(ranged.is_empty(), model.is_empty(), "{what}: is_empty");
+            let got: Vec<_> = ranged.range(Bound::Unbounded, Bound::Unbounded).collect();
+            assert_eq!(got, model.iter().collect::<Vec<_>>(), "{what}: everything");
+            for _ in 0..40 {
+                let k = key(rng);
+                assert_eq!(ranged.get(&k), model.get(&k), "{what}: get {k:?}");
+                let (a, b) = (key(rng), key(rng));
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                fn bound<'k>(k: &'k KeyBuf, r: &mut Rng) -> Bound<&'k [u8]> {
+                    match r.below(3) {
+                        0 => Bound::Included(k.as_slice()),
+                        1 => Bound::Excluded(k.as_slice()),
+                        _ => Bound::Unbounded,
+                    }
+                }
+                let (lb, hb) = (bound(&lo, rng), bound(&hi, rng));
+                if lo == hi && (matches!(lb, Bound::Excluded(_)) || matches!(hb, Bound::Excluded(_))) {
+                    continue;
+                }
+                let got: Vec<_> = ranged.range(lb, hb).collect();
+                let want: Vec<_> = model.range::<[u8], _>((lb, hb)).collect();
+                assert_eq!(got, want, "{what}: range {lb:?}..{hb:?} over bounds {:?}", ranged.bounds);
+            }
+        };
+        probe(&ranged, &model, &mut rng, &format!("round {round} loaded"));
+        // Writes after the load, to whichever shard each key falls in.
+        for _ in 0..60 {
+            let k = key(&mut rng);
+            let slot = rng.next() % 1000;
+            if rng.below(3) == 0 {
+                if let Some(s) = model.get_mut(&k) {
+                    let gone = s[0];
+                    s.remove(0);
+                    if s.is_empty() {
+                        model.remove(&k);
+                    }
+                    let held = ranged.slots_mut(&k).expect("held");
+                    held.remove(0);
+                    if held.is_empty() {
+                        ranged.drop_key(&k);
+                    }
+                    assert!(!ranged.get(&k).is_some_and(|s| s.contains(&gone)) || model.get(&k).is_some_and(|s| s.contains(&gone)));
+                }
+            } else {
+                add_sorted(model.entry(k.clone()).or_default(), slot);
+                add_sorted(ranged.entry(k), slot);
+            }
+        }
+        probe(&ranged, &model, &mut rng, &format!("round {round} written"));
+        ranged.clear();
+        assert!(ranged.is_empty() && ranged.bounds.is_empty() && ranged.maps.len() == 1);
+    }
+}
+
+fn r_below(r: &mut Rng, n: u64) -> u64 {
+    r.below(n)
+}

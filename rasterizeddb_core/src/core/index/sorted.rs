@@ -80,7 +80,11 @@ pub enum SortedReject {
 /// ([`Slots`]), so a million single-slot keys still cost no allocation each.
 pub struct SortedLoad<K> {
     n_slots: u64,
-    entries: Vec<(K, Slots)>,
+    /// The entries, in order, as one or more runs: one when pushed one by
+    /// one, one per stretch when assembled ([`SortedLoad::assemble`]), so a
+    /// B-tree builds a shard from each run in place and a hash index deals
+    /// from each without the runs ever being copied into one.
+    segments: Vec<Vec<(K, Slots)>>,
     unkeyed: Option<Vec<u64>>,
     present: Option<Vec<u64>>,
 }
@@ -88,6 +92,8 @@ pub struct SortedLoad<K> {
 /// A checked stream's parts: the entries, then the unkeyed slots and the
 /// presence words.
 pub(super) type SortedParts<K> = (Vec<(K, Slots)>, Vec<u64>, Vec<u64>);
+/// [`SortedParts`] with the entries as the runs they were taken in.
+pub(super) type SegmentedParts<K> = (Vec<Vec<(K, Slots)>>, Vec<u64>, Vec<u64>);
 
 /// Strictly ascending, and every slot below `n_slots`.
 fn check_slots(slots: &[u64], n_slots: u64, at: Option<usize>) -> Result<(), SortedReject> {
@@ -117,7 +123,7 @@ impl<K: Ord> SortedLoad<K> {
     pub fn with_capacity(n_slots: u64, entries: usize) -> SortedLoad<K> {
         SortedLoad {
             n_slots,
-            entries: Vec::with_capacity(entries),
+            segments: vec![Vec::with_capacity(entries)],
             unkeyed: None,
             present: None,
         }
@@ -125,22 +131,29 @@ impl<K: Ord> SortedLoad<K> {
 
     /// Entries taken so far.
     pub fn entries(&self) -> usize {
-        self.entries.len()
+        self.segments.iter().map(Vec::len).sum()
+    }
+
+    fn last_key(&self) -> Option<&K> {
+        self.segments.iter().rev().find_map(|s| s.last()).map(|(k, _)| k)
     }
 
     fn entry(&mut self, key: K, slots: &[u64]) -> Result<(), SortedReject> {
-        let at = self.entries.len();
+        let at = self.entries();
         if self.unkeyed.is_some() || self.present.is_some() {
             return Err(SortedReject::PartOrder);
         }
         if slots.is_empty() {
             return Err(SortedReject::EmptyEntry { at });
         }
-        if self.entries.last().is_some_and(|(last, _)| *last >= key) {
+        if self.last_key().is_some_and(|last| *last >= key) {
             return Err(SortedReject::KeyOrder { at });
         }
         check_slots(slots, self.n_slots, Some(at))?;
-        self.entries.push((key, Slots::from_slice(slots)));
+        if self.segments.is_empty() {
+            self.segments.push(Vec::new());
+        }
+        self.segments.last_mut().expect("one segment").push((key, Slots::from_slice(slots)));
         Ok(())
     }
 
@@ -169,109 +182,96 @@ impl<K: Ord> SortedLoad<K> {
         Ok(())
     }
 
-    /// The checked parts, once both closing parts have come.
+    /// The checked parts, once both closing parts have come, the entries as
+    /// one vector (copied into one only when they came as several runs).
     pub(super) fn into_parts(self) -> Result<SortedParts<K>, SortedReject> {
+        let (mut segments, unkeyed, present) = self.into_segments()?;
+        let entries = if segments.len() == 1 {
+            segments.pop().expect("one segment")
+        } else {
+            let mut all = Vec::with_capacity(segments.iter().map(Vec::len).sum());
+            for s in segments {
+                all.extend(s);
+            }
+            all
+        };
+        Ok((entries, unkeyed, present))
+    }
+
+    /// The checked parts, the entries as the runs they were taken in, in
+    /// order (none empty).
+    pub(super) fn into_segments(self) -> Result<SegmentedParts<K>, SortedReject> {
+        let segments = self.segments.into_iter().filter(|s| !s.is_empty()).collect();
         match (self.unkeyed, self.present) {
-            (Some(unkeyed), Some(present)) => Ok((self.entries, unkeyed, present)),
+            (Some(unkeyed), Some(present)) => Ok((segments, unkeyed, present)),
             _ => Err(SortedReject::Truncated),
         }
     }
 }
 
-/// One stretch's share of the vector [`SortedLoad::assemble`] fills: room for
-/// exactly its entries, written in order. What it has written is dropped
-/// with it unless the assembly keeps it.
-pub struct Stretch<'a> {
-    room: &'a mut [std::mem::MaybeUninit<(KeyBuf, Slots)>],
-    len: usize,
+/// One stretch of the entries [`SortedLoad::assemble`] takes: exactly its
+/// share, written in order, into a vector of its own.
+pub struct Stretch {
+    entries: Vec<(KeyBuf, Slots)>,
+    share: usize,
     /// Where its first entry sits in the whole stream, for the refusals.
     base: usize,
     n_slots: u64,
 }
 
-impl Stretch<'_> {
+impl Stretch {
     /// Takes the stretch's next entry, checked as [`SortedLoad::push`] checks
     /// one: listing slots, strictly ascending, each below the table's
     /// length, under a key above the one before it in this stretch.
     pub fn push(&mut self, key: &[u8], slots: &[u64]) -> Result<(), SortedReject> {
-        let at = self.base + self.len;
-        if self.len == self.room.len() {
+        let at = self.base + self.entries.len();
+        if self.entries.len() == self.share {
             // More entries than its share: the caller's count was wrong.
             return Err(SortedReject::KeyOrder { at });
         }
         if slots.is_empty() {
             return Err(SortedReject::EmptyEntry { at });
         }
-        if self.len > 0 {
-            // SAFETY: the first `len` slots of `room` are initialised.
-            let (last, _) = unsafe { self.room[self.len - 1].assume_init_ref() };
-            if last.as_slice() >= key {
-                return Err(SortedReject::KeyOrder { at });
-            }
+        if self.entries.last().is_some_and(|(last, _)| last.as_slice() >= key) {
+            return Err(SortedReject::KeyOrder { at });
         }
         check_slots(slots, self.n_slots, Some(at))?;
-        self.room[self.len].write((KeyBuf::from_slice(key), Slots::from_slice(slots)));
-        self.len += 1;
+        self.entries.push((KeyBuf::from_slice(key), Slots::from_slice(slots)));
         Ok(())
-    }
-
-    fn first_and_last(&self) -> Option<(&[u8], &[u8])> {
-        if self.len == 0 {
-            return None;
-        }
-        // SAFETY: the first `len` slots of `room` are initialised.
-        let first = unsafe { self.room[0].assume_init_ref() };
-        let last = unsafe { self.room[self.len - 1].assume_init_ref() };
-        Some((first.0.as_slice(), last.0.as_slice()))
-    }
-}
-
-impl Drop for Stretch<'_> {
-    fn drop(&mut self) {
-        for entry in &mut self.room[..self.len] {
-            // SAFETY: the first `len` slots are initialised, and a stretch the
-            // assembly keeps is forgotten rather than dropped.
-            unsafe { entry.assume_init_drop() };
-        }
     }
 }
 
 impl SortedLoad<KeyBuf> {
     /// A stream whose entries come as `counts.len()` stretches, each decoded
-    /// by `decode(i, stretch)` on one of up to `workers` threads straight
-    /// into its share of one vector: stretch `i` holds exactly `counts[i]`
-    /// entries. Each is checked as it is written (see [`Stretch::push`]),
-    /// and then each stretch's first key against the one before's last, so
-    /// the result is what pushing every entry in order would have taken. A
-    /// stream's closing parts are pushed after, as usual.
+    /// by `decode(i, stretch)` on one of up to `workers` threads into a
+    /// vector of its own: stretch `i` holds exactly `counts[i]` entries.
+    /// Each is checked as it is written (see [`Stretch::push`]), and then
+    /// each stretch's first key against the one before's last, so the result
+    /// is what pushing every entry in order would have taken. A stream's
+    /// closing parts are pushed after, as usual.
     ///
-    /// One vector, filled in place, because joining stretches decoded into
-    /// vectors of their own copied every entry once more, into pages faulted
-    /// in on one thread: as long as the decode the threads saved (a section
-    /// of 1.5M entries, docs/persistent-indexes.md §4).
+    /// The stretches stay the stream's runs: a B-tree builds a shard from
+    /// each in place and a hash index deals from each (`load_sorted`).
+    /// Joining them into one vector copied every entry once more, into pages
+    /// faulted in on one thread: as long as the decode the threads saved (a
+    /// section of 1.5M entries, docs/persistent-indexes.md §4).
     ///
-    /// The first error in stretch order is returned; every entry written is
-    /// dropped then, and if a `decode` panics.
+    /// The first error in stretch order is returned.
     pub fn assemble<E: From<SortedReject> + Send>(
         n_slots: u64,
         counts: &[usize],
         workers: usize,
-        decode: impl Fn(usize, &mut Stretch<'_>) -> Result<(), E> + Sync,
+        decode: impl Fn(usize, &mut Stretch) -> Result<(), E> + Sync,
     ) -> Result<SortedLoad<KeyBuf>, E> {
-        let total: usize = counts.iter().sum();
-        let mut entries: Vec<(KeyBuf, Slots)> = Vec::with_capacity(total);
-        let mut stretches = Vec::with_capacity(counts.len());
-        {
-            let mut room = &mut entries.spare_capacity_mut()[..total];
-            let mut base = 0;
-            for &n in counts {
-                let (mine, rest) = room.split_at_mut(n);
-                stretches.push(parking_lot::Mutex::new(Some(Stretch { room: mine, len: 0, base, n_slots })));
-                room = rest;
-                base += n;
-            }
-        }
-        let outcomes: Vec<parking_lot::Mutex<Option<Result<(), E>>>> =
+        let bases: Vec<usize> = counts
+            .iter()
+            .scan(0usize, |at, &n| {
+                let base = *at;
+                *at += n;
+                Some(base)
+            })
+            .collect();
+        let outcomes: Vec<parking_lot::Mutex<Option<Result<Vec<(KeyBuf, Slots)>, E>>>> =
             counts.iter().map(|_| parking_lot::Mutex::new(None)).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let failed = std::sync::atomic::AtomicBool::new(false);
@@ -282,15 +282,16 @@ impl SortedLoad<KeyBuf> {
                 if i >= counts.len() || failed.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut stretch = stretches[i].lock().take().expect("each stretch is taken once");
-                let mut outcome = decode(i, &mut stretch);
-                if outcome.is_ok() && stretch.len != counts[i] {
-                    outcome = Err(SortedReject::Truncated.into());
-                }
+                let mut stretch =
+                    Stretch { entries: Vec::with_capacity(counts[i]), share: counts[i], base: bases[i], n_slots };
+                let outcome = match decode(i, &mut stretch) {
+                    Ok(()) if stretch.entries.len() == counts[i] => Ok(stretch.entries),
+                    Ok(()) => Err(SortedReject::Truncated.into()),
+                    Err(e) => Err(e),
+                };
                 if outcome.is_err() {
                     failed.store(true, Ordering::Relaxed);
                 }
-                *stretches[i].lock() = Some(stretch);
                 *outcomes[i].lock() = Some(outcome);
             }
         };
@@ -304,42 +305,36 @@ impl SortedLoad<KeyBuf> {
                 }
             });
         }
-        let stretches: Vec<Stretch<'_>> = stretches.into_iter().filter_map(|s| s.into_inner()).collect();
-        // Some stretch failed, or the workers stopped before one: the first
-        // failure in order is the answer, and every stretch drops what it
-        // wrote as `stretches` goes.
-        let mut outcomes = outcomes.into_iter().map(|o| o.into_inner());
-        if let Some(e) = outcomes.by_ref().map(|o| o.unwrap_or(Ok(()))).find_map(Result::err) {
+        // The workers stop taking stretches once one fails, so a stretch may
+        // be left undecoded; then some stretch failed, and the first failure
+        // in order is the answer.
+        let mut outcomes: Vec<Option<Result<Vec<(KeyBuf, Slots)>, E>>> =
+            outcomes.into_iter().map(|o| o.into_inner()).collect();
+        if let Some(e) = outcomes.iter_mut().find_map(|o| match o {
+            Some(Err(_)) => o.take().and_then(Result::err),
+            _ => None,
+        }) {
             return Err(e);
         }
-        if stretches.len() != counts.len() || stretches.iter().zip(counts).any(|(s, &n)| s.len != n) {
-            return Err(SortedReject::Truncated.into());
-        }
-        let mut prev_last: Option<&[u8]> = None;
-        for s in &stretches {
-            if let Some((first, last)) = s.first_and_last() {
-                if prev_last.is_some_and(|p| p >= first) {
-                    return Err(SortedReject::KeyOrder { at: s.base }.into());
-                }
-                prev_last = Some(last);
+        let mut segments = Vec::with_capacity(counts.len());
+        for (o, &base) in outcomes.into_iter().zip(&bases) {
+            let Some(Ok(entries)) = o else { return Err(SortedReject::Truncated.into()) };
+            let prev_last = segments.iter().rev().find_map(|s: &Vec<(KeyBuf, Slots)>| s.last()).map(|(k, _)| k);
+            if let (Some(last), Some((first, _))) = (prev_last, entries.first())
+                && last >= first
+            {
+                return Err(SortedReject::KeyOrder { at: base }.into());
             }
+            segments.push(entries);
         }
-        // Every stretch is full, in order: the vector's first `total` entries
-        // are initialised, and owned by it from here.
-        for s in stretches {
-            std::mem::forget(s);
-        }
-        // SAFETY: the stretches tile `entries`' first `total` slots, each
-        // full, and none drops them now.
-        unsafe { entries.set_len(total) };
-        Ok(SortedLoad { n_slots, entries, unkeyed: None, present: None })
+        Ok(SortedLoad { n_slots, segments, unkeyed: None, present: None })
     }
 
     /// The entries taken so far, owned (the section codec's tests compare
     /// a parallel decode with a serial one).
     #[cfg(test)]
     pub(crate) fn pairs(&self) -> Vec<(Vec<u8>, Vec<u64>)> {
-        self.entries.iter().map(|(k, s)| (k.to_vec(), s.to_vec())).collect()
+        self.segments.iter().flatten().map(|(k, s)| (k.to_vec(), s.to_vec())).collect()
     }
 
     /// The closing parts, owned, once both have come.

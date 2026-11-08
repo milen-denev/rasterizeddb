@@ -108,7 +108,7 @@ pub fn dense_cap(n_slots: u64) -> usize {
 }
 
 enum Data {
-    BTree(RwLock<BTreeMap<KeyBuf, Slots>>),
+    BTree(RwLock<Ranged>),
     Hash(Box<[RwLock<HashMap<KeyBuf, Slots, RandomState>>]>, RandomState),
     /// On disk, under `hybrid` or `disk` residency (docs/disk-indexes.md).
     /// May list a slot under a key it no longer holds, never the reverse.
@@ -273,7 +273,7 @@ impl LiveIndex {
 
     fn memory_data(method: Method) -> Data {
         match method {
-            Method::BTree => Data::BTree(RwLock::new(BTreeMap::new())),
+            Method::BTree => Data::BTree(RwLock::new(Ranged::new())),
             // An inverted index is a `gin::GinIndex`, never one of these;
             // `for_schema` routes it there. A hash is the harmless reading.
             Method::Hash | Method::GinOps | Method::GinPathOps => Data::Hash(
@@ -404,7 +404,7 @@ impl LiveIndex {
                 }
             }
             Some(key) => match &self.data {
-                Data::BTree(map) => add_sorted(map.write().entry(key).or_default(), slot),
+                Data::BTree(map) => add_sorted(map.write().entry(key), slot),
                 Data::Hash(shards, _) => add_sorted(shards[self.shard(&key)].write().entry(key).or_default(), slot),
                 Data::Paged(store) => {
                     // The bit before the entry, the reverse of the maps: a
@@ -522,7 +522,7 @@ impl LiveIndex {
                     let from = after.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
                     block.extend(
                         map.read()
-                            .range::<[u8], _>((from, Bound::Unbounded))
+                            .range(from, Bound::Unbounded)
                             .take(sorted::SORTED_BLOCK)
                             .map(|(key, slots)| (key.clone(), slots.clone())),
                     );
@@ -604,8 +604,9 @@ impl LiveIndex {
     /// union, which lists every version either did.
     pub fn load_sorted(&self, proof: Proof<'_>, stream: sorted::SortedLoad<KeyBuf>) -> Result<(), sorted::SortedReject> {
         crate::core::index_store::census::mutation(proof, self as *const Self as usize, "LiveIndex::load_sorted");
-        let (entries, unkeyed, present) = stream.into_parts()?;
+        let (segments, unkeyed, present) = stream.into_segments()?;
         if let Data::Paged(store) = &self.data {
+            let entries: Vec<(KeyBuf, Slots)> = segments.into_iter().flatten().collect();
             // Bits and unkeyed slots first, then the entries as a run: the
             // order `insert` keeps for a paged index (`paged`'s module docs).
             {
@@ -634,13 +635,12 @@ impl LiveIndex {
             Data::BTree(map) => {
                 let mut map = map.write();
                 if map.is_empty() {
-                    // In key order already, so built in one pass, from the
-                    // decoded vector itself (`collect` over its own
-                    // `into_iter` reuses the allocation).
-                    *map = entries.into_iter().collect();
+                    // In key order already, as runs: a shard from each, built
+                    // in parallel, each from its decoded vector itself.
+                    *map = Ranged::from_runs(segments, install_workers());
                 } else {
-                    for (key, listed) in entries {
-                        merge_sorted(map.entry(key).or_default(), listed);
+                    for (key, listed) in segments.into_iter().flatten() {
+                        merge_sorted(map.entry(key), listed);
                     }
                 }
             }
@@ -649,35 +649,46 @@ impl LiveIndex {
                 // the shards then filled in parallel: they share nothing, and
                 // filling 64 of them one after another was the slowest part of
                 // a load (the hash section's install, 0.14 s for 1.5M keys).
-                let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, INSTALL_WORKERS);
+                let workers = install_workers();
                 // Each key's shard first, worked out on every worker: hashing
                 // the keys one after another was the serial half of the
                 // install. Then each shard's vector sized to what it takes, so
-                // dealing moves every entry once and grows nothing.
-                let mut shard_of = vec![0u8; entries.len()];
-                let step = entries.len().div_ceil(workers).max(1);
-                if workers == 1 || entries.len() < 4096 {
-                    for ((key, _), at) in entries.iter().zip(shard_of.iter_mut()) {
-                        *at = self.shard(key) as u8;
+                // dealing moves every entry once and grows nothing, straight
+                // from the runs the stream came as (never joined first).
+                let runs = segments;
+                let mut shard_of: Vec<Vec<u8>> = runs.iter().map(|r| vec![0u8; r.len()]).collect();
+                let total: usize = runs.iter().map(Vec::len).sum();
+                let step = total.div_ceil(workers).max(4096);
+                let mut pieces: Vec<(&[(KeyBuf, Slots)], &mut [u8])> = Vec::new();
+                for (run, out) in runs.iter().zip(shard_of.iter_mut()) {
+                    pieces.extend(run.chunks(step).zip(out.chunks_mut(step)));
+                }
+                let hash = |pieces: &mut [(&[(KeyBuf, Slots)], &mut [u8])]| {
+                    for (part, out) in pieces.iter_mut() {
+                        for ((key, _), at) in part.iter().zip(out.iter_mut()) {
+                            *at = self.shard(key) as u8;
+                        }
                     }
+                };
+                if workers == 1 || pieces.len() <= 1 {
+                    hash(&mut pieces);
                 } else {
+                    let per = pieces.len().div_ceil(workers);
                     std::thread::scope(|scope| {
-                        for (part, out) in entries.chunks(step).zip(shard_of.chunks_mut(step)) {
-                            scope.spawn(move || {
-                                for ((key, _), at) in part.iter().zip(out.iter_mut()) {
-                                    *at = self.shard(key) as u8;
-                                }
-                            });
+                        for group in pieces.chunks_mut(per) {
+                            scope.spawn(move || hash(group));
                         }
                     });
                 }
                 let mut sizes = [0usize; HASH_SHARDS];
-                for &at in &shard_of {
+                for &at in shard_of.iter().flatten() {
                     sizes[at as usize] += 1;
                 }
                 let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
-                for ((key, listed), at) in entries.into_iter().zip(shard_of) {
-                    dealt[at as usize].push((key, listed));
+                for (run, ids) in runs.into_iter().zip(shard_of) {
+                    for (entry, at) in run.into_iter().zip(ids) {
+                        dealt[at as usize].push(entry);
+                    }
                 }
                 let fill = |pairs: &mut [(&RwLock<HashMap<KeyBuf, Slots, RandomState>>, Vec<(KeyBuf, Slots)>)]| {
                     for (shard, part) in pairs.iter_mut() {
@@ -772,7 +783,7 @@ impl LiveIndex {
             }
         }
         let map = map.read();
-        for (_, slots) in map.range::<[u8], _>((lo, hi)) {
+        for (_, slots) in map.range(lo, hi) {
             out.extend_from_slice(slots);
             if out.len() > cap {
                 return false;
@@ -915,6 +926,120 @@ fn merge_sorted(into: &mut Slots, listed: Slots) {
         for slot in listed {
             add_sorted(into, slot);
         }
+    }
+}
+
+/// The install's worker threads.
+fn install_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, INSTALL_WORKERS)
+}
+
+/// A B-tree index's map, as one or more B-trees over disjoint key ranges:
+/// `maps[i]` holds the keys from `bounds[i - 1]` (the first from the
+/// lowest) up to, not including, `bounds[i]` (the last to the highest).
+///
+/// One map until a load: an index loaded from a snapshot section of
+/// several chunks builds a shard from each chunk's run, all in parallel and
+/// each in place (`BTreeMap`'s bulk build of 1.5M entries was the open's
+/// floor, ~0.1 s on one thread, docs/persistent-indexes.md §4). The bounds
+/// stay as the load set them; inserts after go to the shard their key
+/// falls in, so the shards may grow unevenly, which costs nothing but
+/// balance. Ordered reads chain the shards in order, so every reader sees
+/// one ordered map.
+#[derive(Debug)]
+pub(crate) struct Ranged {
+    bounds: Vec<KeyBuf>,
+    maps: Vec<BTreeMap<KeyBuf, Slots>>,
+}
+
+impl Ranged {
+    fn new() -> Ranged {
+        Ranged { bounds: Vec::new(), maps: vec![BTreeMap::new()] }
+    }
+
+    /// The shard `key` falls in.
+    fn at(&self, key: &[u8]) -> usize {
+        self.bounds.partition_point(|b| b.as_slice() <= key)
+    }
+
+    /// Runs in strictly ascending key order, no key in two, as one sharded
+    /// map: a shard per non-empty run, built on up to `workers` threads.
+    fn from_runs(runs: Vec<Vec<(KeyBuf, Slots)>>, workers: usize) -> Ranged {
+        let runs: Vec<Vec<(KeyBuf, Slots)>> = runs.into_iter().filter(|r| !r.is_empty()).collect();
+        if runs.len() <= 1 {
+            // `collect` over a vector's own `into_iter` reuses it.
+            return Ranged { bounds: Vec::new(), maps: vec![runs.into_iter().flatten().collect()] };
+        }
+        let bounds: Vec<KeyBuf> = runs[1..].iter().map(|r| r[0].0.clone()).collect();
+        let slots: Vec<parking_lot::Mutex<Option<Vec<(KeyBuf, Slots)>>>> =
+            runs.into_iter().map(|r| parking_lot::Mutex::new(Some(r))).collect();
+        let built: Vec<parking_lot::Mutex<Option<BTreeMap<KeyBuf, Slots>>>> =
+            slots.iter().map(|_| parking_lot::Mutex::new(None)).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(run) = slots.get(i).and_then(|s| s.lock().take()) else { return };
+            *built[i].lock() = Some(run.into_iter().collect());
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..workers.clamp(1, slots.len()) {
+                scope.spawn(work);
+            }
+        });
+        let maps = built.into_iter().map(|m| m.into_inner().expect("every run is built")).collect();
+        Ranged { bounds, maps }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.maps.iter().all(BTreeMap::is_empty)
+    }
+
+    fn len(&self) -> usize {
+        self.maps.iter().map(BTreeMap::len).sum()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Slots> {
+        self.maps.iter().flat_map(BTreeMap::values)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&Slots> {
+        self.maps[self.at(key)].get(key)
+    }
+
+    /// The slots under `key`, an empty list put there first if it has none.
+    fn entry(&mut self, key: KeyBuf) -> &mut Slots {
+        let at = self.at(&key);
+        self.maps[at].entry(key).or_default()
+    }
+
+    /// Back to one empty map.
+    fn clear(&mut self) {
+        *self = Ranged::new();
+    }
+
+    /// The entries with keys in `(lo, hi)`, in order, over every shard the
+    /// range reaches. The bounds must make a range `BTreeMap::range` takes.
+    fn range<'a>(&'a self, lo: Bound<&'a [u8]>, hi: Bound<&'a [u8]>) -> impl Iterator<Item = (&'a KeyBuf, &'a Slots)> + 'a {
+        let first = match lo {
+            Bound::Included(k) | Bound::Excluded(k) => self.at(k),
+            Bound::Unbounded => 0,
+        };
+        let last = match hi {
+            Bound::Included(k) | Bound::Excluded(k) => self.at(k),
+            Bound::Unbounded => self.maps.len() - 1,
+        };
+        self.maps[first..=last.max(first)].iter().flat_map(move |m| m.range::<[u8], _>((lo, hi)))
+    }
+}
+
+impl MapLike for Ranged {
+    fn slots_mut(&mut self, key: &[u8]) -> Option<&mut Slots> {
+        let at = self.at(key);
+        self.maps[at].get_mut(key)
+    }
+    fn drop_key(&mut self, key: &[u8]) {
+        let at = self.at(key);
+        self.maps[at].remove(key);
     }
 }
 
