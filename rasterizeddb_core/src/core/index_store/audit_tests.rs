@@ -665,7 +665,14 @@ async fn checks_under_concurrent_writes_never_report_a_mismatch() {
     let mut next = 10_000i64;
     let started = Instant::now();
     let mut burst = 0i64;
-    while started.elapsed() < Duration::from_secs(4) {
+    // Four seconds of writes, and on until a check has completed, up to 30:
+    // a check needs a gap between writes as long as itself, and when the
+    // whole suite runs at once the writes stretch until no gap in four
+    // seconds is (seen as "no check completed" with every check abandoned,
+    // never as a mismatch, known-flaky-tests). The mismatch assertion is the
+    // point; the wait only keeps the liveness one from depending on load.
+    let clean = || hooks::outcomes(d).iter().any(|(_, o)| matches!(o, Outcome::Clean(_)));
+    while started.elapsed() < Duration::from_secs(4) || (!clean() && started.elapsed() < Duration::from_secs(30)) {
         burst += 1;
         insert(&db, "cw", &mut model, next..next + 40).await;
         next += 40;
