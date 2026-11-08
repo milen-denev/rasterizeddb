@@ -8,8 +8,10 @@
 //! computed once and the item materialised into a statement temporary, as a
 //! CTE or a derived table is (`cte::materialize_derived`); the describe path
 //! takes the columns alone (`columns_of`). A call reading another relation's
-//! column (`generate_series(1, t.n)`, which needs LATERAL) is refused
-//! (0A000), as is a set-returning call inside an expression.
+//! column (`generate_series(1, t.n)`) is refused here with a message
+//! `lateral::is_outer_reference_refusal` recognises, and is then run as the
+//! implicit `LATERAL` item it is (`core::rql::lateral`). A set-returning call
+//! inside an expression is refused (0A000).
 
 use crate::core::db_type::DbType;
 use crate::core::rql::expr::{ArithOp, Value};

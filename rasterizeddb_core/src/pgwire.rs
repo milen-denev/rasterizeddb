@@ -4262,6 +4262,52 @@ pub(crate) async fn describe_query(
         }
     }
 
+    // A `LATERAL` item (`core::rql::lateral`): described from its body with
+    // each outer value a NULL of its type, nothing run, and the statement
+    // described against it as a relation under its alias. Several in turn,
+    // each one's description a relation the next is described with; one
+    // that reads an earlier LATERAL item is not described this way.
+    let implicit = crate::core::rql::lateral::with_implicit_marked(stmt);
+    let stmt = implicit.as_deref().unwrap_or(stmt);
+    if crate::core::rql::lateral::next_item(stmt).is_some() {
+        let mut text = stmt.to_string();
+        let mut relations: Vec<(String, ScratchFields)> = Vec::new();
+        let mut described_all = true;
+        for index in 0..16usize {
+            let Some(item) = crate::core::rql::lateral::next_item(&text) else { break };
+            let Ok(item) = item else {
+                described_all = false;
+                break;
+            };
+            let body = match crate::core::rql::lateral::outer_references(&text, &item) {
+                Ok(Some(outer)) => crate::core::rql::lateral::null_body(database, &item, &outer).await.ok(),
+                Ok(None) => Some(item.body.clone()),
+                Err(_) => None,
+            };
+            let columns = match body {
+                Some(body) => Box::pin(describe_query(database, &body)).await?.map(|(columns, _)| columns),
+                None => None,
+            };
+            let Some(mut columns) = columns else {
+                described_all = false;
+                break;
+            };
+            if let Some(names) = &item.columns {
+                for (column, name) in columns.iter_mut().zip(names) {
+                    column.0 = name.clone();
+                }
+            }
+            let name = format!("__described_lateral_{index}");
+            text = crate::core::rql::lateral::rewrite_for_describe(&text, &item, &name);
+            relations.push((name, scratch_fields(&columns)));
+        }
+        if described_all {
+            if let Some(described) = Box::pin(describe_resolved(database, &text, &relations)).await? {
+                return Ok(Some(described));
+            }
+        }
+    }
+
     // A derived table is *not* materialised here, deliberately. Doing that
     // describes by executing: the inner query runs with the describe's stand-in
     // literals substituted, so `WHERE domain_id = NULL` and `LIMIT NULL`
@@ -4299,8 +4345,14 @@ pub(crate) async fn describe_query(
             let Some(item) = crate::core::rql::table_functions::next_item(&text) else {
                 break;
             };
-            let Ok(columns) = crate::core::rql::table_functions::columns_of(&item) else {
-                break;
+            let columns = match crate::core::rql::table_functions::columns_of(&item) {
+                Ok(columns) => columns,
+                // An implicit `LATERAL` item, described as one below.
+                Err(e) if crate::core::rql::lateral::is_outer_reference_refusal(&e) => {
+                    text = crate::core::rql::lateral::mark_implicit(&text, item.start);
+                    continue;
+                }
+                Err(_) => break,
             };
             let name = format!("__described_fn_{}", index);
             text = format!("{}{} {}{}", &text[..item.start], name, item.alias, &text[item.end..]);

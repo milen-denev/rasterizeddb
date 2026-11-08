@@ -128,8 +128,17 @@ fn rewrite_select(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>>) -
                 if rel == other || is_bare_reference(sides[k]) || known[rel].1.is_none() {
                     continue;
                 }
-                let name = format!("__j{next}");
-                next += 1;
+                // Not a name a relation already has: one materialised from an
+                // earlier rewrite carries its `__j0` (`lateral`, two items
+                // keyed on one outer relation).
+                let taken = |n: &str| all_known.iter().any(|(_, cols)| cols.iter().any(|c| c.eq_ignore_ascii_case(n)));
+                let name = loop {
+                    let candidate = format!("__j{next}");
+                    next += 1;
+                    if !taken(&candidate) {
+                        break candidate;
+                    }
+                };
                 computed[rel].push(format!("{} AS {name}", sides[k]));
                 rewritten[k] = format!("{}.{name}", relations[rel].label);
                 changed = true;

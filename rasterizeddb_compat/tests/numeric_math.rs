@@ -63,6 +63,11 @@ async fn each_form_answers_as_postgresql_does() {
         ("f ^ 2", "6.25"),
         ("i ^ 2", "9"),
         ("power(f, i)", "-15.625"),
+        // A float argument takes the double precision form even beside a
+        // NUMERIC one, which casts to it: not 6.2500000000000000.
+        ("power(f, 2.0)", "6.25"),
+        ("f ^ 2.0", "6.25"),
+        ("pg_typeof(power(f, 2.0))", "double precision"),
         // `^` groups left to right, under a unary sign and over `*`.
         ("2 ^ 3 ^ 2", "64"),
         ("-2 ^ 2", "4"),

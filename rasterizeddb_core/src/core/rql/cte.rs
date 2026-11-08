@@ -861,6 +861,181 @@ pub fn reserved_name_refusal(name: &str) -> Option<String> {
 /// drop the temporary table … does not exist". A paginated count run twice at
 /// once is enough to hit it. The name is derived once per execution and carried
 /// through the rewrite and the drop, so it does not need to be reproducible.
+/// [`temp_name`], for the `LATERAL` items `lateral` materialises.
+pub(crate) fn temp_name_for(alias: &str, statement: &str, index: usize) -> String {
+    temp_name(alias, statement, index)
+}
+
+/// [`sql_type_of`], for the `LATERAL` constants `lateral` casts.
+pub(crate) fn sql_type_name(db_type: &DbType) -> Option<&'static str> {
+    sql_type_of(db_type)
+}
+
+/// The columns of a relation this module created, by name, in order.
+pub(crate) fn relation_labels(relation: &str, database: &Arc<Database>) -> Option<Vec<String>> {
+    let view = database.schema_view(relation)?;
+    let mut fields: Vec<_> = view
+        .schema()
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .cloned()
+        .collect();
+    fields.sort_by_key(|f| f.write_order);
+    Some(fields.into_iter().map(|f| f.name).collect())
+}
+
+/// A `LATERAL` item's relation (`lateral::materialize`): each of `runs` is the
+/// item with one tuple of outer values substituted and those values' keys;
+/// its rows are written with the keys after its own columns, as
+/// `__lat_k1`, …. Typed as `described` (the item with each outer value a
+/// NULL of its type) describes it, so the relation has its columns' types
+/// even when no run returns a row. `labels` renames the item's columns.
+/// The temporary is named in `temps` as soon as it exists.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_keyed_relation(
+    described: &str,
+    temp: &str,
+    labels: Option<&[String]>,
+    runs: &[(String, Vec<String>)],
+    alias: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    temps: &mut Vec<String>,
+) -> Result<(), String> {
+    let subject = format!("the LATERAL item '{alias}'");
+    let own = match select_labels(described, database).await {
+        Some(own) => own,
+        None => match Box::pin(crate::pgwire::describe_query(database, described)).await {
+            Ok(Some((fields, true))) if !fields.is_empty() => fields.into_iter().map(|(name, _)| name).collect(),
+            _ => return Err(format!("{subject} has a column this cannot name; alias it with AS")),
+        },
+    };
+    let mut names = own.clone();
+    if let Some(labels) = labels {
+        if labels.len() > names.len() {
+            return Err(format!(
+                "table \"{alias}\" has {} columns available but {} columns specified",
+                names.len(),
+                labels.len()
+            ));
+        }
+        for (name, label) in names.iter_mut().zip(labels) {
+            *name = label.clone();
+        }
+    }
+    let width = own.len();
+    // A run's own computed items and derived tables (`generate_series(…)`
+    // with its outer value in place, `(VALUES …)`), materialised as a
+    // derived table's are, and dropped once the relation is filled: its rows
+    // are copied out.
+    let mut nested_temps: Vec<String> = Vec::new();
+    let filled = fill_keyed_relation(
+        runs, width, &own, &mut names, described, temp, &subject, &mut nested_temps, database, tx, temps,
+    )
+    .await;
+    drop_temps(database, &nested_temps, tx).await;
+    filled
+}
+
+/// [`build_keyed_relation`]'s runs and fill, the nested temporaries each run
+/// creates named in `nested_temps` for the caller to drop.
+#[allow(clippy::too_many_arguments)]
+async fn fill_keyed_relation(
+    runs: &[(String, Vec<String>)],
+    width: usize,
+    own: &[String],
+    names: &mut Vec<String>,
+    described: &str,
+    temp: &str,
+    subject: &str,
+    nested_temps: &mut Vec<String>,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    temps: &mut Vec<String>,
+) -> Result<(), String> {
+    let key_count = runs.first().map_or(0, |(_, keys)| keys.len());
+    let mut rows: Vec<crate::core::row::row::Row> = Vec::new();
+    let mut scales: Option<Vec<u32>> = None;
+    for (body, keys) in runs {
+        let nested = Box::pin(materialize_derived(body, database, tx)).await?;
+        let text = match nested {
+            Some(m) => {
+                nested_temps.extend(m.temps);
+                m.rewritten
+            }
+            None => body.clone(),
+        };
+        let (mut got, got_scales) = crate::core::rql::executor::run_query_rows_scaled(&text, database, tx)
+            .await
+            .map_err(|e| format!("{subject} failed: {e}"))?;
+        if scales.is_none() {
+            scales = got_scales;
+        }
+        for row in &mut got {
+            if row.columns.len() < width {
+                return Err(format!("{subject} returned {} columns but names {}", row.columns.len(), width));
+            }
+            row.columns.truncate(width);
+            for key in keys {
+                let mut block = crate::memory_pool::MEMORY_POOL.acquire(key.len());
+                block.into_slice_mut().copy_from_slice(key.as_bytes());
+                row.columns.push(crate::core::row::row::Column {
+                    schema_id: 0,
+                    data: block,
+                    column_type: DbType::STRING,
+                });
+            }
+        }
+        rows.extend(got);
+    }
+    refuse_repeated_labels(names, subject)?;
+    let mut columns = relation_columns(described, own, &rows, scales.as_deref(), database)
+        .await
+        .map_err(|index| {
+            format!(
+                "{subject} returned a type that cannot be materialised in column '{}'",
+                names.get(index).map(String::as_str).unwrap_or("?")
+            )
+        })?;
+    for n in 1..=key_count {
+        names.push(format!("__lat_k{n}"));
+        columns.push(RelationColumn { sql_type: "TEXT".to_string(), declared: Some(DbType::STRING), scale: None });
+    }
+    let quoted: Vec<String> = names.iter().map(|n| crate::core::rql::ctas::quote_ident(n)).collect();
+    let definitions: Vec<String> =
+        quoted.iter().zip(columns.iter()).map(|(name, column)| format!("{} {}", name, column.sql_type)).collect();
+    create_temporary(&format!("CREATE TABLE {} ({})", temp, definitions.join(", ")), database, tx)
+        .await
+        .map_err(|e| format!("could not materialise {subject}: {e}"))?;
+    temps.push(temp.to_string());
+    for chunk in rows.chunks(TABLE_AS_FILL_ROWS) {
+        let mut tuples: Vec<String> = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            let mut parts: Vec<String> = Vec::with_capacity(names.len());
+            for (index, (cell, column)) in row.columns.iter().zip(columns.iter()).enumerate() {
+                parts.push(cell_literal(column, cell).ok_or_else(|| {
+                    format!(
+                        "{} returned a {:?} value in column '{}' that cannot be stored",
+                        subject,
+                        column.declared.as_ref().unwrap_or(&cell.column_type),
+                        names.get(index).map(String::as_str).unwrap_or("?"),
+                    )
+                })?);
+            }
+            tuples.push(format!("({})", parts.join(", ")));
+        }
+        crate::core::rql::executor::run_statement(
+            &format!("INSERT INTO {} ({}) VALUES {}", temp, quoted.join(", "), tuples.join(", ")),
+            database,
+            tx,
+        )
+        .await
+        .map_err(|e| format!("could not fill {subject}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn temp_name(cte: &str, statement: &str, index: usize) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in statement.bytes().chain(cte.bytes()) {
@@ -2146,7 +2321,16 @@ async fn materialize_derived_inner(
             break;
         };
         found_any = true;
-        let computed = crate::core::rql::table_functions::compute(&item)?;
+        let computed = match crate::core::rql::table_functions::compute(&item) {
+            Ok(computed) => computed,
+            // A function over an earlier item's column is a `LATERAL` item,
+            // with or without the word.
+            Err(e) if crate::core::rql::lateral::is_outer_reference_refusal(&e) => {
+                current = crate::core::rql::lateral::mark_implicit(&current, item.start);
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let temp = temp_name(&item.alias, &current, 100 + index);
         let definitions: Vec<String> = computed
             .columns
@@ -2186,6 +2370,14 @@ async fn materialize_derived_inner(
         temps.push(temp.clone());
         current = format!("{}{} {}{}", &current[..start], temp, alias, &current[end..]);
         let _ = index;
+    }
+
+    // `LATERAL` items last: each reads the items before it, which are
+    // relations by now, and its keys join to them (`lateral`). Its body sits
+    // in parentheses after `LATERAL`, where neither pass above looks.
+    if let Some(rewritten) = crate::core::rql::lateral::materialize(&current, database, temps, tx).await? {
+        current = rewritten;
+        found_any = true;
     }
 
     if !found_any {
