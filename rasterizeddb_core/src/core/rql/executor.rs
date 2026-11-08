@@ -11109,6 +11109,112 @@ async fn execute_storage(sql: &str, database: &Arc<Database>) -> Vec<u8> {
 /// was refused. Reshapes are physical and local (§12): never replicated, as
 /// `STORAGE MOVE TABLE` is not; each node keeps its own map.
 #[inline(never)]
+/// A conversion of plain table to partitioned (`partitioned_convert`),
+/// under ACCESS EXCLUSIVE on the table.
+async fn run_conversion(
+    parsed: Result<crate::core::partition::reshape::Conversion, String>,
+    database: &Arc<Database>,
+    tx: TxId,
+) -> Vec<u8> {
+    let conversion = match parsed {
+        Ok(c) => c,
+        Err(e) => return ddl_error(&e),
+    };
+    let table = conversion.table.clone();
+    match database.relation_for(&table, owner(), TableMode::AccessExclusive).await {
+        Ok(Some(crate::core::database::relation::Relation::Plain(_))) => {}
+        Ok(Some(crate::core::database::relation::Relation::Partitioned(_))) => {
+            return ddl_error(&format!("table \"{table}\" is already partitioned (not supported)"));
+        }
+        Ok(None) => return ddl_error(&format!("relation \"{table}\" does not exist")),
+        Err(e) => return ddl_error(&e),
+    }
+    match convert_rows(database, &table, &conversion.key, conversion.partitions, tx).await {
+        Ok(()) => ddl_ok(0),
+        Err(e) => {
+            error!("{e}");
+            ddl_error(&e)
+        }
+    }
+}
+
+/// [`rewrite_rows`]'s partitioned fill over a plain source: every version a
+/// snapshot can see, read from the plain table and written into a new
+/// partitioned table under its name, each routed by its own point, with
+/// the definition, indexes and defaults carried
+/// (`Database::convert_to_partitioned`).
+async fn convert_rows(
+    database: &Arc<Database>,
+    table_name: &str,
+    key: &[String],
+    partitions: u32,
+    reader: TxId,
+) -> Result<(), String> {
+    struct Plan {
+        versions: Vec<RewrittenVersion>,
+        carried_indexes: Vec<(crate::core::index::IndexDecl, Vec<Option<String>>)>,
+        carried_path_indexes: Vec<crate::core::rql::path_index::PathIndex>,
+        defaults: Vec<crate::core::rql::column_default::ColumnDefault>,
+    }
+    let canonical = database.resolve_key(table_name);
+    let table_name = canonical.as_deref().unwrap_or(table_name);
+    let family = database.transactions.top_level(reader);
+    let database_id = database.id;
+    let read_db = database.clone();
+    let written_by_family = database
+        .convert_to_partitioned(
+            table_name,
+            key,
+            partitions,
+            move |old| async move {
+                let schema = &old.schema.fields;
+                let mut ordered: Vec<crate::core::row::schema::SchemaField> =
+                    schema.iter().filter(|f| !f.is_deleted).cloned().collect();
+                ordered.sort_by_key(|f| f.write_order);
+                let fetch = crate::core::rql::join::fetch_for(&ordered, schema);
+                let name_of: std::collections::HashMap<u64, String> =
+                    schema.iter().map(|f| (f.write_order, f.name.clone())).collect();
+                let versions = read_rewrite_versions(&old, &fetch, &name_of, &read_db).await?;
+                let (definition, carried_indexes, carried_path_indexes) = rewrite_definition(&old.schema, &ordered);
+                let defaults = definition.defaults.clone();
+                Ok((definition, Plan { versions, carried_indexes, carried_path_indexes, defaults }))
+            },
+            |plan, io_schema, fields| {
+                carry_rewrite_indexes(io_schema, fields, plan.carried_indexes.clone(), plan.carried_path_indexes.clone())
+            },
+            |plan, table| {
+                let database = database.clone();
+                async move {
+                    let table_name = table.name().to_string();
+                    let schema = table.shell().schema.fields.clone();
+                    let mut family_versions = 0u64;
+                    for version in plan.versions {
+                        let row = rewrite_payload(&table_name, &schema, &plan.defaults, &version.values, database_id)?;
+                        for id in [version.xmin, version.xmax] {
+                            if id != crate::core::mvcc::transaction::NO_TX
+                                && id != crate::core::mvcc::transaction::FROZEN_TX
+                                && database.transactions.top_level(id) == family
+                            {
+                                family_versions += 1;
+                            }
+                        }
+                        let point = table.point_of_write(&row).map_err(|e| e.to_string())?;
+                        let part = table.partition_for_point(point).await.map_err(|e| e.to_string())?;
+                        part.insert_version(row, version.xmin, version.xmax)
+                            .await
+                            .map_err(|e| format!("could not convert a row of '{}': {}", table_name, e))?;
+                    }
+                    Ok(family_versions > 0)
+                }
+            },
+        )
+        .await?;
+    if written_by_family {
+        database.relation_for(table_name, owner(), TableMode::RowExclusive).await?;
+    }
+    Ok(())
+}
+
 async fn run_reshape(
     parsed: Result<(String, crate::core::partition::reshape::ReshapeOp), String>,
     database: &Arc<Database>,
@@ -19736,6 +19842,15 @@ pub(crate) async fn execute_with_need(
         // An index over a document path. Recorded in the table's sidecar, which
         // is read when the table is opened.
         QueryPurpose::CreateIndex(sql) => {
+            // `CREATE INDEX … USING partition`: the conversion's other
+            // spelling (docs/partitioning.md §2), replicated as logical DDL.
+            if let Some(parsed) = crate::core::partition::reshape::parse_partition_index(sql) {
+                let response = Box::pin(run_conversion(parsed, &database, tx)).await;
+                if response.first() != Some(&3) {
+                    note_write(&database, tx, depth, sql, None);
+                }
+                return response;
+            }
             let response = if crate::core::rql::path_index::parse_create(sql).is_some() {
                 Box::pin(execute_create_path_index(sql, &database)).await
             } else {
@@ -20013,6 +20128,15 @@ pub(crate) async fn execute_with_need(
             // A reshaping ALTER (`SPLIT PARTITION`, `MERGE PARTITIONS`,
             // `ISOLATE KEY`, `SPLIT KEY`): physical and local, never
             // replicated (docs/partitioning.md §12).
+            // A conversion (`ALTER TABLE t PARTITION BY HASH (…)`): logical
+            // DDL, replicated, each node with its own count (§12).
+            if let Some(parsed) = crate::core::partition::reshape::parse_partition_by(sql) {
+                let response = Box::pin(run_conversion(parsed, &database, tx)).await;
+                if response.first() != Some(&3) {
+                    note_write(&database, tx, depth, sql, None);
+                }
+                return response;
+            }
             if let Some(parsed) = crate::core::partition::reshape::parse_alter(sql) {
                 return match Box::pin(run_reshape(parsed, &database)).await {
                     Ok(summary) => {

@@ -427,6 +427,12 @@ impl Database {
     /// Called with the partitioned DDL lock held, so the cap's count is
     /// current.
     fn partitioned_create_refusal(&self, ct: &CreateTable, key: &[&str], partitions: u32) -> io::Result<()> {
+        self.partitioned_name_refusal(ct)?;
+        self.partitioned_shape_refusal(ct, key, partitions)
+    }
+
+    /// Whether `ct`'s name is free for a new partitioned table.
+    fn partitioned_name_refusal(&self, ct: &CreateTable) -> io::Result<()> {
         let name = &ct.table_name;
         if let Some(reason) = table_name_refusal(name) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
@@ -451,6 +457,14 @@ impl Database {
                 format!("table \"{name}\" has a storage placement recorded ({spec}), so the name is taken"),
             ));
         }
+        Ok(())
+    }
+
+    /// Why `ct` cannot be partitioned over `key` into `partitions` here,
+    /// whatever its name: what a `CREATE … PARTITION BY` checks past the
+    /// name, and what a conversion of an existing table checks
+    /// (`partitioned_convert`).
+    fn partitioned_shape_refusal(&self, ct: &CreateTable, key: &[&str], partitions: u32) -> io::Result<()> {
         self.partition_root()?;
         if !pool_mirrors(&self.storage).is_empty() {
             return Err(unsupported(
@@ -1039,6 +1053,10 @@ impl Database {
         Ok(())
     }
 }
+
+#[path = "partitioned_convert.rs"]
+mod convert;
+pub(super) use convert::recover_interrupted_conversion;
 
 /// Physical ALTER of a partitioned table (docs/partitioning.md "Phase 6 P8
 /// as built"): every row rewritten under a new definition, into a new uid.

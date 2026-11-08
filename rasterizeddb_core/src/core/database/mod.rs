@@ -47,6 +47,8 @@ mod reshape_tests;
 mod row_move_tests;
 #[cfg(test)]
 mod physical_alter_tests;
+#[cfg(test)]
+mod convert_tests;
 pub mod relation;
 pub mod slots;
 pub mod table_for;
@@ -1510,6 +1512,12 @@ impl Database {
         // finishes or abandons it by the catalogue rows alone, touching no
         // file (`partitioned_ddl.rs`).
         partitioned_ddl::recover_interrupted_rename(&io_pointers, &io_rows, &io_schema).await;
+
+        // A conversion to a partitioned table a crash interrupted: the plain
+        // table's files released past its commit point, else the intent
+        // dropped (`partitioned_convert.rs`).
+        partitioned::recover_interrupted_conversion(&io_pointers, &io_rows, &io_schema, &storage, &kv_stores, &seeds)
+            .await;
 
         // Before any table opens: a change a crash interrupted is undone from
         // its backup (`rewrite.rs`), so the table opens as it was.

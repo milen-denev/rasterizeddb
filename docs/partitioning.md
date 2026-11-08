@@ -697,8 +697,51 @@ fails the pin test.)*
 
 **Not built (phase 5's rest):** the online copy with a write fence and
 range-bounded re-routes (§6.2 steps 2–4, 7); `STORAGE REBALANCE PARTITIONS`
-(§6.3); conversion (`ALTER TABLE … PARTITION BY`, `CREATE INDEX … USING
-partition`, §11).
+(§6.3). Conversion is built (below).
+
+## Conversion as built
+
+Built on `feat/convert` (2026-11-08): `ALTER TABLE t PARTITION BY HASH (c1
+[, c2 [, c3]]) [PARTITIONS n]` and its spelling `CREATE INDEX [name] ON t
+USING partition (c1, …) [WITH (partitions = n)]`, n 64 when unnamed, as at
+CREATE. `database::partitioned_convert`, `executor::convert_rows`.
+
+**Offline**, not the online copy §11 describes: the statement holds ACCESS
+EXCLUSIVE on `t` throughout, so readers and writers wait for the whole copy.
+The write fence for "only the delta" waits with the online reshape copy.
+
+**Order.** The plain table taken out of the map and retired; every version a
+snapshot can see read (`read_rewrite_versions`, as a plain rewrite reads
+them: committed rows, the converting transaction's own uncommitted ones,
+deleted rows a snapshot still sees); the definition checked as a `CREATE …
+PARTITION BY` is past its name (`partitioned_shape_refusal`: key columns
+NOT NULL and not generated, every unique key holding them, foreign keys
+both ways, JSON shadows, mirrors, the cap); a new uid written and filled,
+each version routed by its own point; then the conversion intent
+(`__convert.intent`, the name and `__pt_<uid>`, checksummed like a rename's)
+written whole; then **the commit point**, the name's catalogue row switched
+from uid 0 to the new uid in one transaction (`swap_catalogue_uid`); then the
+table installed and the plain files released as a DROP releases them after
+its tombstone (records voided, handles dropped, files swept), and the intent
+cleared.
+
+**Recovery** (`recover_interrupted_conversion`, after the renames' at open):
+an intent whose uid the catalogue names finishes the release of the plain
+files; one whose uid it does not is abandoned, the reaper taking the uid's
+files; one that does not parse whole is moved aside to
+`__convert.intent.bad` and nothing is done. A failure before the commit
+point deletes the new uid and reopens the plain table fresh.
+
+**Refused (0A000):** a table already partitioned; one with a storage
+placement outside the root (a pool location, a key/value or memory backend),
+which conversion would move; a statement's temporary; a name a held rename
+still keeps; `PARTITION BY RANGE` or `LIST`. Replicated as logical DDL, each
+node converting with its own count (§12).
+
+Tests: `database::convert_tests` (the twin comparison before and after a
+restart, the converting transaction's own rows on commit and rollback, a
+failure at both points before the commit, a crash right after it, an intent
+from before it), `reshape::parse_tests`, `partition_refusals`.
 
 ## Phase 4 P6 as built
 

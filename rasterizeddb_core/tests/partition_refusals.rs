@@ -267,15 +267,16 @@ async fn attach_and_detach_partition_are_refused_body() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every partitioning statement 2a does not build is refused with "not
-/// supported" (0A000) and a reason, on a plain table and on a partitioned
-/// one, and leaves the catalogue and both tables as they were: the
-/// conversions (`ALTER … PARTITION BY`, `CREATE INDEX … USING partition`) and
-/// the reshapes (`SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE
-/// PARTITIONS`, `STORAGE MOVE PARTITION`, `STORAGE REBALANCE PARTITIONS`),
-/// `PARTITION OF … DEFAULT` and temporary or unlogged partitioned tables. A
-/// statement the ALTER parser's no-op list took would answer success with
-/// nothing done, which is the failure this pins.
+/// Every partitioning statement not built for the table it names is refused
+/// with "not supported" (0A000) and a reason, and leaves the catalogue and
+/// both tables as they were: a conversion (`ALTER … PARTITION BY`, `CREATE
+/// INDEX … USING partition`) of a table already partitioned, the reshapes
+/// (`SPLIT PARTITION`, `ISOLATE KEY`, `SPLIT KEY`, `MERGE PARTITIONS`) of a
+/// plain one, `STORAGE MOVE PARTITION`, `PARTITION OF … DEFAULT` and
+/// temporary or unlogged partitioned tables. A statement the ALTER parser's
+/// no-op list took would answer success with nothing done, which is the
+/// failure this pins. The plain table's conversion is built
+/// (`partitioned_convert`) and is checked last, for converting it.
 #[test]
 fn unbuilt_partitioning_statements_are_refused() {
     on_a_big_stack(unbuilt_partitioning_statements_are_refused_body());
@@ -310,8 +311,10 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
         "STORAGE MOVE PARTITION pu_part FOR (k = 42) TO '/nonexistent'".to_string(),
     ];
     for table in ["pu_plain", "pu_part"] {
-        for tail in ["PARTITION BY HASH (k)", "PARTITION BY HASH (k) PARTITIONS 4"] {
-            statements.push(format!("ALTER TABLE {table} {tail}"));
+        if table == "pu_part" {
+            for tail in ["PARTITION BY HASH (k)", "PARTITION BY HASH (k) PARTITIONS 4"] {
+                statements.push(format!("ALTER TABLE {table} {tail}"));
+            }
         }
         // The reshapes are built (phase 5 P7, `database::reshape_tests` and
         // the twin's `Reshape`); on a plain table they are refused.
@@ -326,10 +329,12 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
                 statements.push(format!("ALTER TABLE {table} {tail}"));
             }
         }
-        statements.push(format!("CREATE INDEX {table}_by ON {table} USING partition (k)"));
-        statements.push(format!(
-            "CREATE INDEX {table}_by ON {table} USING partition (k) WITH (partitions = 4)"
-        ));
+        if table == "pu_part" {
+            statements.push(format!("CREATE INDEX {table}_by ON {table} USING partition (k)"));
+            statements.push(format!(
+                "CREATE INDEX {table}_by ON {table} USING partition (k) WITH (partitions = 4)"
+            ));
+        }
     }
 
     let mut wrong = Vec::new();
@@ -372,4 +377,10 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
         assert_eq!(db.partitioned_count(), 1, "{sql} made pu_plain partitioned");
     }
     assert!(wrong.is_empty(), "statements not refused as unsupported:\n{}", wrong.join("\n"));
+
+    // The plain table converts.
+    run(&db, "CREATE INDEX pu_plain_by ON pu_plain USING partition (k) WITH (partitions = 4)")
+        .await
+        .expect("the plain table converts");
+    assert_eq!(db.partitioned_count(), 2, "pu_plain is partitioned");
 }

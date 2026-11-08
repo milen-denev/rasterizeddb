@@ -551,6 +551,114 @@ pub fn parse_alter(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {
     Some(parsed.map(|op| (table, op)).map_err(|e| format!("syntax error: {e}")))
 }
 
+/// The partition count a conversion takes when it names none, as a
+/// `CREATE … PARTITION BY` does.
+pub const DEFAULT_PARTITIONS: u32 = 64;
+
+/// A conversion (`partitioned_convert`): the table, its key columns and
+/// the partition count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversion {
+    pub table: String,
+    pub key: Vec<String>,
+    pub partitions: u32,
+}
+
+/// The key list of `(a, b, …)` as column names.
+fn key_list(group: &str, verb: &str) -> Result<Vec<String>, String> {
+    let key: Vec<String> = group
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_string())
+        .collect();
+    if key.iter().any(|c| c.is_empty() || c.contains(|ch: char| ch.is_whitespace() || ch == '(')) {
+        return Err(format!("{verb} expects (<column>, …)"));
+    }
+    Ok(key)
+}
+
+/// `ALTER TABLE t PARTITION BY HASH (c1 [, c2 [, c3]]) [PARTITIONS n]`:
+/// `None` when `sql` is another statement.
+pub fn parse_partition_by(sql: &str) -> Option<Result<Conversion, String>> {
+    let toks = tokens(sql).ok()?;
+    if !kw(toks.first(), "ALTER") || !kw(toks.get(1), "TABLE") {
+        return None;
+    }
+    let mut i = 2;
+    if kw(toks.get(i), "ONLY") {
+        i += 1;
+    }
+    let table = name_of(toks.get(i))?;
+    i += 1;
+    if !(kw(toks.get(i), "PARTITION") && kw(toks.get(i + 1), "BY")) {
+        return None;
+    }
+    let verb = "ALTER TABLE … PARTITION BY";
+    let parsed = (|| {
+        if !kw(toks.get(i + 2), "HASH") {
+            return Err(format!("{verb} supports HASH partitioning only (not supported)"));
+        }
+        let Some(Tok::Group(g)) = toks.get(i + 3) else {
+            return Err(format!("{verb} HASH expects (<column>, …)"));
+        };
+        let key = key_list(g, verb)?;
+        let mut j = i + 4;
+        let mut partitions = DEFAULT_PARTITIONS;
+        if kw(toks.get(j), "PARTITIONS") {
+            partitions = match toks.get(j + 1) {
+                Some(Tok::Word(n)) => n.parse::<u32>().map_err(|_| format!("PARTITIONS expects a count, not {n}"))?,
+                _ => return Err("PARTITIONS expects a count".to_string()),
+            };
+            j += 2;
+        }
+        done(&toks, j, verb)?;
+        Ok(Conversion { table: table.clone(), key, partitions })
+    })();
+    Some(parsed.map_err(|e| if e.contains("not supported") { e } else { format!("syntax error: {e}") }))
+}
+
+/// `CREATE INDEX [name] ON t USING partition (c1 [, …]) [WITH (partitions =
+/// n)]`, the user's spelling of the same conversion (§2): `None` when `sql`
+/// is another statement. The index name names nothing afterwards.
+pub fn parse_partition_index(sql: &str) -> Option<Result<Conversion, String>> {
+    let toks = tokens(sql).ok()?;
+    if !kw(toks.first(), "CREATE") || !kw(toks.get(1), "INDEX") {
+        return None;
+    }
+    let on = toks.iter().position(|t| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case("ON")))?;
+    let mut i = on + 1;
+    if kw(toks.get(i), "ONLY") {
+        i += 1;
+    }
+    let table = name_of(toks.get(i))?;
+    i += 1;
+    if !(kw(toks.get(i), "USING") && kw(toks.get(i + 1), "PARTITION")) {
+        return None;
+    }
+    let verb = "CREATE INDEX … USING partition";
+    let parsed = (|| {
+        let Some(Tok::Group(g)) = toks.get(i + 2) else {
+            return Err(format!("{verb} expects (<column>, …)"));
+        };
+        let key = key_list(g, verb)?;
+        let mut j = i + 3;
+        let mut partitions = DEFAULT_PARTITIONS;
+        if kw(toks.get(j), "WITH") {
+            let Some(Tok::Group(options)) = toks.get(j + 1) else {
+                return Err(format!("{verb} … WITH expects (partitions = <n>)"));
+            };
+            let (option, value) = options.split_once('=').ok_or_else(|| format!("{verb} … WITH expects (partitions = <n>)"))?;
+            if !option.trim().eq_ignore_ascii_case("partitions") {
+                return Err(format!("{verb} takes the option partitions only, not {}", option.trim()));
+            }
+            partitions = value.trim().parse::<u32>().map_err(|_| format!("partitions expects a count, not {}", value.trim()))?;
+            j += 2;
+        }
+        done(&toks, j, verb)?;
+        Ok(Conversion { table: table.clone(), key, partitions })
+    })();
+    Some(parsed.map_err(|e| format!("syntax error: {e}")))
+}
+
 /// `STORAGE MOVE PARTITION t FOR (…) TO '<dir>'`: `None` when `sql` is
 /// another statement.
 pub fn parse_move(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {
@@ -576,6 +684,23 @@ mod parse_tests {
 
     fn alter(sql: &str) -> (String, ReshapeOp) {
         parse_alter(sql).expect("a reshape").expect("parses")
+    }
+
+    #[test]
+    fn a_conversion_is_read_from_either_spelling() {
+        let c = parse_partition_by("ALTER TABLE acct PARTITION BY HASH (tenant_id, grp) PARTITIONS 16").unwrap().unwrap();
+        assert_eq!(c, Conversion { table: "acct".into(), key: vec!["tenant_id".into(), "grp".into()], partitions: 16 });
+        let c = parse_partition_by("ALTER TABLE acct PARTITION BY HASH (tenant_id)").unwrap().unwrap();
+        assert_eq!(c.partitions, DEFAULT_PARTITIONS);
+        assert!(parse_partition_by("ALTER TABLE acct PARTITION BY RANGE (d)").unwrap().unwrap_err().contains("not supported"));
+        assert!(parse_partition_by("ALTER TABLE acct PARTITION BY HASH (t) PARTITIONS x").unwrap().is_err());
+        assert!(parse_partition_by("ALTER TABLE acct ADD COLUMN x INT").is_none());
+        let c = parse_partition_index("CREATE INDEX acct_part ON acct USING partition (tenant_id) WITH (partitions = 8)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c, Conversion { table: "acct".into(), key: vec!["tenant_id".into()], partitions: 8 });
+        assert!(parse_partition_index("CREATE INDEX i ON acct USING btree (tenant_id)").is_none());
+        assert!(parse_partition_index("CREATE INDEX i ON acct (tenant_id)").is_none());
     }
 
     #[test]
