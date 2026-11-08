@@ -989,16 +989,29 @@ already did for `DIRTY` (`a_failed_materialize_append_leaves_the_partition_
 unmaterialized`, with a test-only append failure). At today's 65,536 that was
 four times the first-write cost.
 
-**What a declared partition still costs** is about 630 bytes resident
-whether or not it is ever written: its `Slot`, its `PartState` in the map
+**What a declared partition still costs** was about 630 bytes resident
+whether or not it was ever written: its `Slot`, its `PartState` in the map
 state, its map entry (in the state and the epoch), its write watch and its
-lifecycle lock. A table of 2²⁰ declares 640 MB before a row exists, and a
+lifecycle lock. A table of 2²⁰ declared 640 MB before a row existed, and a
 reopen replays a 25 MB log. Both scale with what was declared, not with the
 cap, so the cap stays a bound on mistakes rather than a budget: `SHOW
 PARTITIONS` returns one row per declared partition (207 MB at 2²⁰), and the
-catalogs and the open budget are unchanged. Not done: unmaterialized
-partitions holding only their range (a lazy slot, watch and lock), which is
-what would bring the resident cost down to the map entry.
+catalogs and the open budget are unchanged.
+
+**Lazy per-partition state** (2026-11-08, `feat/lazy-parts`). A slot is
+now its pid, range and materialized flag; its open instance, budget token,
+kept sizes, reference bits and directory are a `SlotLive` built on first use
+(`Slot::live`; `Slot::peek` reads without building). The board's write
+watches and lifecycle locks are built the same way (`PinBoard::watch`,
+`PinBoard::lifecycle`), a watch starting pinned as a bitset of the pins at
+board creation or `grow` says, which is what an eager watch started as.
+Retire and drop wait out only the locks that exist
+(`PinBoard::lifecycle_if_built`): each sets its flag first, and an operation
+that builds a lock later takes it after the flag. Measured at 262,144
+declared (debug build, `declared_partition_scale`): 651.6 B per declared
+partition before, 378.9 B after; CREATE 421 ms before, 315 ms after. What
+remains is the `PartState` and the map entries, which the map's replay and
+liveness checks read by pid.
 
 ## Phase 3 P5b-2b as built
 

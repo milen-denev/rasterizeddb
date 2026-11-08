@@ -156,6 +156,22 @@ struct Slot {
     /// committed row, and which reads the flag after taking that snapshot,
     /// finds it set.
     materialized: AtomicBool,
+    /// Everything else, built on the partition's first use: a declared
+    /// partition nobody has written, routed to or opened holds only the
+    /// three fields above. A table of 2^20 declared partitions held each
+    /// one's open instance, budget token, kept sizes and directory slots
+    /// before a row existed (docs/partitioning.md, "What a declared
+    /// partition still costs"). Never replaced once built, so every
+    /// reference to it stays the partition's.
+    live: OnceLock<Box<SlotLive>>,
+}
+
+/// A [`Slot`]'s state past its range and flag, built by [`Slot::live`] on
+/// first use; [`Slot::peek`] reads it without building it, and a partition
+/// without one is closed, unreferenced, never routed, keeps no sizes and
+/// lives in the root.
+#[derive(Default)]
+struct SlotLive {
     /// The open instance; `None` while the partition is closed or
     /// unmaterialized (phase 3 P5b: partitions open on demand). Every access
     /// clones it under this lock; it is put and taken only while the
@@ -221,54 +237,91 @@ impl KeptSizes {
 
 impl Slot {
     fn new(pid: u32, range: PointRange, materialized: bool, dir: Option<PathBuf>) -> Self {
-        Slot {
-            pid,
-            range,
-            dir: dir.map(OnceLock::from).unwrap_or_default(),
-            materialized: AtomicBool::new(materialized),
-            open: parking_lot::Mutex::new(None),
-            token: parking_lot::Mutex::new(None),
-            referenced: AtomicBool::new(false),
-            routed: AtomicBool::new(false),
-            sizes: parking_lot::Mutex::new(KeptSizes::default()),
+        let slot = Slot { pid, range, materialized: AtomicBool::new(materialized), live: OnceLock::new() };
+        if let Some(dir) = dir {
+            slot.set_dir(dir);
         }
+        slot
+    }
+
+    /// The slot's state, built now if this is its first use.
+    fn live(&self) -> &SlotLive {
+        self.live.get_or_init(Box::default)
+    }
+
+    /// The slot's state if it was ever built.
+    fn peek(&self) -> Option<&SlotLive> {
+        self.live.get().map(|live| &**live)
     }
 
     fn open_now(&self) -> Option<Arc<Table<DbStorageProvider>>> {
-        self.open.lock().clone()
+        self.peek()?.open.lock().clone()
+    }
+
+    fn is_open(&self) -> bool {
+        self.peek().is_some_and(|live| live.open.lock().is_some())
     }
 
     /// The directory its files are in: its own, or `root`.
     fn dir<'a>(&'a self, root: &'a Path) -> &'a Path {
-        self.dir.get().map_or(root, PathBuf::as_path)
+        self.dir_get().map_or(root, PathBuf::as_path)
+    }
+
+    /// Its own directory, unset for the root.
+    fn dir_get(&self) -> Option<&PathBuf> {
+        self.peek()?.dir.get()
+    }
+
+    /// Sets its own directory, once; a later call is ignored, as the
+    /// directory never changes (a move is a reshape, to a new pid).
+    fn set_dir(&self, dir: PathBuf) {
+        let _ = self.live().dir.set(dir);
+    }
+
+    fn referenced_now(&self) -> bool {
+        self.peek().is_some_and(|live| live.referenced.load(Ordering::Relaxed))
+    }
+
+    /// The reference bit, cleared: the CLOCK hand's and the idle round's
+    /// pass.
+    fn take_referenced(&self) -> bool {
+        self.peek().is_some_and(|live| live.referenced.swap(false, Ordering::Relaxed))
+    }
+
+    fn routed_now(&self) -> bool {
+        self.peek().is_some_and(|live| live.routed.load(Ordering::Relaxed))
     }
 
     /// A routed access: the reference bit set, with a store only when it
     /// was clear, so a hot partition's accesses write nothing shared.
     fn touch(&self) {
-        if !self.referenced.load(Ordering::Relaxed) {
-            self.referenced.store(true, Ordering::Relaxed);
+        let live = self.live();
+        if !live.referenced.load(Ordering::Relaxed) {
+            live.referenced.store(true, Ordering::Relaxed);
         }
-        if !self.routed.load(Ordering::Relaxed) {
-            self.routed.store(true, Ordering::Relaxed);
+        if !live.routed.load(Ordering::Relaxed) {
+            live.routed.store(true, Ordering::Relaxed);
         }
     }
 
     /// Puts an opened instance in the slot with its budget token. The
     /// caller holds the lifecycle lock.
     fn put(&self, table: Arc<Table<DbStorageProvider>>, token: budget::Token, referenced: bool) {
-        self.referenced.store(referenced, Ordering::Relaxed);
+        let live = self.live();
+        live.referenced.store(referenced, Ordering::Relaxed);
         if referenced {
-            self.routed.store(true, Ordering::Relaxed);
+            live.routed.store(true, Ordering::Relaxed);
         }
-        *self.token.lock() = Some(token);
-        self.sizes.lock().reset(false);
-        *self.open.lock() = Some(table);
+        *live.token.lock() = Some(token);
+        live.sizes.lock().reset(false);
+        *live.open.lock() = Some(table);
     }
 
     /// The token, given back once the instance has left the slot.
     fn release_token(&self) {
-        drop(self.token.lock().take());
+        if let Some(live) = self.peek() {
+            drop(live.token.lock().take());
+        }
     }
 
     /// This closed partition's (rows, pointers, index-store) lengths, for a
@@ -277,7 +330,7 @@ impl Slot {
     /// way ([`KeptSizes`]).
     fn closed_sizes(&self, root: &Path, uid: u64) -> io::Result<(u64, u64, u64)> {
         let epoch = {
-            let sizes = self.sizes.lock();
+            let sizes = self.live().sizes.lock();
             if let Some(kept) = sizes.kept {
                 return Ok(kept);
             }
@@ -287,7 +340,7 @@ impl Slot {
         #[cfg(test)]
         kept_sizes_hooks::read(root, self.pid);
         if let Some(epoch) = epoch {
-            let mut sizes = self.sizes.lock();
+            let mut sizes = self.live().sizes.lock();
             if sizes.epoch == epoch && !sizes.closing && sizes.kept.is_none() {
                 sizes.kept = Some(read);
             }
@@ -1045,7 +1098,9 @@ impl PartitionedTable {
         if let Ok(live) = &self.live {
             live.parts.retired.store(true, Ordering::SeqCst);
             for slot in live.parts.slots.iter() {
-                let Ok(lock) = live.parts.board.lifecycle(slot.pid) else { continue };
+                // A lock never built is held by nothing, and nothing opened
+                // the partition through it.
+                let Some(lock) = live.parts.board.lifecycle_if_built(slot.pid) else { continue };
                 let _life = lock.lock().await;
                 if let Some(table) = slot.open_now() {
                     table.retire().await;
@@ -1161,6 +1216,13 @@ impl PartitionedTable {
                         // A pid the old instance had no slot for is a
                         // reshape's target: it opens on demand.
                         let Ok(old_slot) = old.slot_at(new.pid) else { continue };
+                        // Asked before the lock: the old instance is retired,
+                        // so nothing opens or closes it now, and a partition
+                        // it never opened takes no lock (one would be built
+                        // for every declared partition).
+                        if old_slot.open_now().is_none() {
+                            continue;
+                        }
                         let lock = next.parts.board.lifecycle(new.pid).map_err(|e| e.to_string())?;
                         let _life = lock.lock().await;
                         if old_slot.open_now().is_none() {
@@ -1170,7 +1232,7 @@ impl PartitionedTable {
                         let token = next.parts.budget.enter(StdArc::downgrade(&next.parts), self.uid, new.pid);
                         #[cfg(test)]
                         instance_count::reopened(&self.root, self.uid, new.pid);
-                        new.put(table, token, old_slot.referenced.load(Ordering::Relaxed));
+                        new.put(table, token, old_slot.referenced_now());
                         #[cfg(test)]
                         crate::core::power_loss::failpoint::hit("test.pddl.partition_reopened", &self.root)
                             .map_err(|e| e.to_string())?;
@@ -1241,6 +1303,17 @@ impl PartitionedTable {
     /// `SHOW` figures, a checkpoint's seals). A closed partition has none:
     /// its next open builds or loads it. Never what a statement over the
     /// table's rows reads, which [`Self::materialized`] opens.
+    /// How many slots have built their state, and how many write watches
+    /// and lifecycle locks the board has built: the partitions something
+    /// used, not every declared one.
+    #[cfg(test)]
+    pub(crate) fn built_per_partition(&self) -> (usize, usize, usize) {
+        let Ok(live) = &self.live else { return (0, 0, 0) };
+        let slots = live.parts.slots.iter().filter(|s| s.peek().is_some()).count();
+        let (watches, locks) = live.parts.board.built();
+        (slots, watches, locks)
+    }
+
     pub fn open_partitions_now(&self) -> Vec<(u32, Arc<Table<DbStorageProvider>>)> {
         let Ok(live) = self.live() else { return Vec::new() };
         live.parts.slots.iter().filter_map(|s| s.open_now().map(|t| (s.pid, t))).collect()
@@ -1254,7 +1327,7 @@ impl PartitionedTable {
 
     /// How many partitions are open now.
     pub fn open_count(&self) -> usize {
-        self.live().map_or(0, |live| live.parts.slots.iter().filter(|s| s.open.lock().is_some()).count())
+        self.live().map_or(0, |live| live.parts.slots.iter().filter(|s| s.is_open()).count())
     }
 
     /// `SET CONFIG vacuum` on this table: every open partition now, and
@@ -1572,7 +1645,7 @@ impl PartitionedTable {
         let live = self.live()?;
         let mut closed = 0;
         for slot in live.parts.slots.iter() {
-            if slot.open.lock().is_some() && live.parts.close(slot.pid).await? == Close::Closed {
+            if slot.is_open() && live.parts.close(slot.pid).await? == Close::Closed {
                 closed += 1;
             }
         }
@@ -1911,7 +1984,7 @@ impl PartitionedTable {
             // each partition's lifecycle lock taken once, after the flag.
             live.parts.retired.store(true, Ordering::SeqCst);
             for slot in live.parts.slots.iter() {
-                if let Ok(lock) = live.parts.board.lifecycle(slot.pid) {
+                if let Some(lock) = live.parts.board.lifecycle_if_built(slot.pid) {
                     drop(lock.lock().await);
                 }
             }
@@ -2370,7 +2443,7 @@ struct Leaving<'a>(&'a Slot);
 impl Drop for Leaving<'_> {
     fn drop(&mut self) {
         {
-            let mut sizes = self.0.sizes.lock();
+            let mut sizes = self.0.live().sizes.lock();
             if sizes.closing {
                 sizes.reset(false);
             }
@@ -2403,7 +2476,7 @@ fn out_of_resources(e: io::Error, table: &str, pid: u32) -> io::Error {
 impl Drop for Parts {
     fn drop(&mut self) {
         for slot in self.slots.iter() {
-            if slot.open.lock().is_some() {
+            if slot.is_open() {
                 instance_count::closed(&self.root, self.uid, slot.pid);
             }
         }
@@ -2465,7 +2538,7 @@ impl Parts {
     /// Clears partition `pid`'s reference bit; whether it was set. The
     /// CLOCK's hand, passing.
     pub(crate) fn take_reference(&self, pid: u32) -> bool {
-        self.slot_at(pid).is_ok_and(|s| s.referenced.swap(false, Ordering::Relaxed))
+        self.slot_at(pid).is_ok_and(|s| s.take_referenced())
     }
 
     /// [`Self::open_slow`] behind a type-erased box: an open runs once per
@@ -2579,7 +2652,7 @@ impl Parts {
                 files::require_existing(dir.as_deref().unwrap_or(&self.root), &files::data_files(self.uid, pid))
                     .map_err(|e| out_of_resources(e, &self.name, pid))?;
                 if let Some(dir) = dir {
-                    let _ = slot.dir.set(dir);
+                    slot.set_dir(dir);
                 }
             }
             Some((None, _)) => {
@@ -2681,7 +2754,7 @@ impl Parts {
             return Err(e);
         }
         if let Some(dir) = dir {
-            let _ = slot.dir.set(dir);
+            slot.set_dir(dir);
         }
         Ok(floor)
     }
@@ -2698,7 +2771,7 @@ impl Parts {
         // fan-outs read would otherwise load every one of their indexes for
         // routed reads that never come (P5b-3).
         let load_if_proven =
-            scan_only && slot.routed.load(Ordering::Relaxed) && self.budget.open() * 2 < self.budget.limit();
+            scan_only && slot.routed_now() && self.budget.open() * 2 < self.budget.limit();
         #[cfg(test)]
         let load_if_proven = load_if_proven && !scan_open_hooks::loads_deferred(&self.root);
         // Never a provider over a missing file, which it would create (I9).
@@ -2711,7 +2784,7 @@ impl Parts {
             cache_scope: format!("{}\u{0}{}", self.db_id, physical),
             physical,
             seed: self.seed.clone(),
-            dir: slot.dir.get().map(|d| d.to_string_lossy().into_owned()),
+            dir: slot.dir_get().map(|d| d.to_string_lossy().into_owned()),
             io_schema: self.shell.io_schema.clone(),
             schema: self.shell.schema.clone(),
             ids: self.ids.clone(),
@@ -2842,7 +2915,7 @@ impl Parts {
         }
         let mut closed = 0;
         for slot in self.slots.iter() {
-            if slot.open.lock().is_none() || slot.referenced.swap(false, Ordering::Relaxed) {
+            if !slot.is_open() || slot.take_referenced() {
                 continue;
             }
             if self.close_for_budget(slot.pid).await {
@@ -2858,7 +2931,7 @@ impl Parts {
             return Ok(Close::Retired);
         }
         let table = {
-            let mut open = slot.open.lock();
+            let mut open = slot.live().open.lock();
             match open.as_ref() {
                 None => return Ok(Close::NotOpen),
                 Some(t) if Arc::strong_count(t) > 1 => return Ok(Close::InUse),
@@ -2867,7 +2940,7 @@ impl Parts {
                     Some(t) => {
                         // Readers from here to the end read the files and
                         // keep nothing (`KeptSizes`).
-                        slot.sizes.lock().reset(true);
+                        slot.live().sizes.lock().reset(true);
                         t
                     }
                     None => return Ok(Close::NotOpen),
@@ -2892,7 +2965,7 @@ impl Parts {
         // stored before the lifecycle lock is released.
         let final_sizes = PartitionedTable::file_lens(&table).await.ok();
         {
-            let mut sizes = slot.sizes.lock();
+            let mut sizes = slot.live().sizes.lock();
             sizes.reset(false);
             sizes.kept = final_sizes;
         }
@@ -2911,7 +2984,7 @@ impl Parts {
             // Still counted in the budget for as long as it lives, with its
             // descriptors (review A round 2, N1): the token goes with the
             // last reference, which a task waits for.
-            let token = slot.token.lock().take();
+            let token = slot.live().token.lock().take();
             tokio::spawn(async move {
                 while Arc::strong_count(&still) > 1 {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;

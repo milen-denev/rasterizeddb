@@ -229,6 +229,70 @@ async fn a_start_opens_nothing_and_an_access_opens_only_what_it_reaches() {
     close(dir.path(), db);
 }
 
+/// A declared partition nobody uses holds no slot state, write watch or
+/// lifecycle lock (docs/partitioning.md, "What a declared partition still
+/// costs"): writes, routed reads and fan-outs build them for the partitions
+/// they reach, the catalogue's per-partition listing and a drop build none,
+/// and a restart starts from none. The answers are the same as ever.
+///
+/// Mutation: `Slot::new` builds its state eagerly, or the board builds every
+/// watch at once; the counts are the declared count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declared_partition_nobody_uses_builds_nothing() {
+    const DECLARED: usize = 4096;
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    exec(
+        &db,
+        &format!(
+            "CREATE TABLE pt (tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, v BIGINT, \
+             PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS {DECLARED}"
+        ),
+    )
+    .await;
+    let t = pt(&db);
+    let (slots, watches, locks) = t.built_per_partition();
+    assert!(slots == 0 && watches == 0 && locks == 0, "an empty table built {slots}, {watches}, {locks}");
+
+    let tenants: Vec<i64> = (1..=10).collect();
+    let values: Vec<String> = tenants.iter().map(|t| format!("({t}, 1, {t})")).collect();
+    exec(&db, &format!("INSERT INTO pt (tenant_id, id, v) VALUES {}", values.join(", "))).await;
+    let touched = {
+        let mut p: Vec<u32> = tenants.iter().map(|x| pid_of_tenant(&t, *x)).collect();
+        p.sort();
+        p.dedup();
+        p.len()
+    };
+    let (slots, watches, locks) = t.built_per_partition();
+    assert!(slots <= touched && watches <= touched && locks <= touched, "{touched} written built {slots}, {watches}, {locks}");
+    assert!(slots >= 1 && locks >= 1, "the written partitions built nothing: {slots}, {watches}, {locks}");
+
+    // A fan-out reads the materialized partitions only; the listing reads
+    // every declared one without building anything for it.
+    assert_eq!(rows(&db, "").await.len(), tenants.len());
+    exec(&db, "SHOW PARTITIONS pt").await;
+    let (slots, watches, locks) = t.built_per_partition();
+    assert!(slots <= touched && watches <= touched && locks <= touched, "after a fan-out: {slots}, {watches}, {locks}");
+
+    // A schema change retires every partition under its lifecycle lock:
+    // only the locks that exist, so it builds none for the rest.
+    exec(&db, "ALTER TABLE pt RENAME COLUMN v TO w").await;
+    let t = pt(&db);
+    let (slots, watches, locks) = t.built_per_partition();
+    assert!(slots <= touched && watches <= touched && locks <= touched, "after a rename: {slots}, {watches}, {locks}");
+    exec(&db, "ALTER TABLE pt RENAME COLUMN w TO v").await;
+    let t = pt(&db);
+
+    let db = restart(dir.path(), db).await;
+    let t = pt(&db);
+    let (slots, _, locks) = t.built_per_partition();
+    // Only the materialized ones may hold a directory or kept sizes.
+    assert!(slots <= touched && locks <= touched, "a restart built {slots} slots, {locks} locks");
+    assert_eq!(rows(&db, "tenant_id = 7").await, vec![(7, 1, 7)]);
+    exec(&db, "DROP TABLE pt").await;
+    close(dir.path(), db);
+}
+
 /// A table's totals without the map log, which a forget round may append to
 /// at any time.
 fn partition_sizes(t: super::table::Totals) -> (u64, u64, u64, u64, u64, u32, u32) {

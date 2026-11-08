@@ -82,14 +82,24 @@ pub struct PinBoard {
     pub(crate) transactions: StdArc<TransactionManager>,
     /// By pid, every pid below the map's `next_pid` (live, retired or
     /// gone): grown when a reshape hands out new pids ([`Self::grow`]), and
-    /// never shrunk, so an index once valid stays valid.
-    watches: parking_lot::RwLock<Vec<StdArc<WriteWatch>>>,
+    /// never shrunk, so an index once valid stays valid. Each built on its
+    /// partition's first use ([`Self::watch`]), starting pinned as
+    /// `initially_pinned` says, and never replaced: a declared partition
+    /// nobody writes holds no watch.
+    watches: parking_lot::RwLock<Vec<Option<StdArc<WriteWatch>>>>,
+    /// By pid, whether its watch starts pinned: the map state's pin when the
+    /// board was built or [`Self::grow`] reached the pid. What an eagerly
+    /// built watch started as, so one built later is the same watch.
+    initially_pinned: parking_lot::RwLock<Vec<u64>>,
     /// By pid, as `watches`: held by every open, materialize and close of the
     /// partition (phase 3 P5b, `table::Parts`), so at most one instance of a
     /// file set is live and no open builds providers over files a close still
     /// lands into (I14). Here rather than in a table instance's slots, so a
-    /// schema change's or a reshape's new instance shares it.
-    lifecycle: parking_lot::RwLock<Vec<StdArc<tokio::sync::Mutex<()>>>>,
+    /// schema change's or a reshape's new instance shares it. Built on first
+    /// use and never replaced ([`Self::lifecycle`]); [`Self::lifecycle_if_built`]
+    /// reads one without building it, for a pass that only waits out what
+    /// holds one.
+    lifecycle: parking_lot::RwLock<Vec<Option<StdArc<tokio::sync::Mutex<()>>>>>,
     /// This board and the scheduler, for the watches [`Self::grow`] adds.
     me: std::sync::Weak<PinBoard>,
     scheduler: std::sync::Weak<Scheduler>,
@@ -151,12 +161,13 @@ impl PinBoard {
         // not: pids are dense below `next_pid`, the map's entries only once
         // no reshape ran (phase 5).
         let n = usize::try_from(state.next_pid()).unwrap_or(usize::MAX).min(u32::MAX as usize);
-        let pins: Vec<bool> = (0..n as u32).map(|pid| state.part(pid).is_some_and(|p| p.pin.is_some())).collect();
-        let board = StdArc::new_cyclic(|me| {
-            let mut watches: Vec<StdArc<WriteWatch>> = Vec::with_capacity(pins.len());
-            for (pid, &pinned) in pins.iter().enumerate() {
-                watches.push(WriteWatch::new(pid as u32, pinned, me.clone(), StdArc::downgrade(scheduler)));
+        let mut pins: Vec<u64> = vec![0; n.div_ceil(64)];
+        for (pid, part) in state.parts() {
+            if part.pin.is_some() && (pid as usize) < n {
+                pins[pid as usize / 64] |= 1 << (pid % 64);
             }
+        }
+        let board = StdArc::new_cyclic(|me| {
             PinBoard {
                 me: me.clone(),
                 scheduler: StdArc::downgrade(scheduler),
@@ -165,9 +176,10 @@ impl PinBoard {
                 state: StdArc::new(tokio::sync::Mutex::new(state)),
                 handle,
                 transactions: transactions.clone(),
-                lifecycle: parking_lot::RwLock::new((0..pins.len()).map(|_| StdArc::new(tokio::sync::Mutex::new(()))).collect()),
+                lifecycle: parking_lot::RwLock::new(vec![None; n]),
                 parts: parking_lot::Mutex::new(std::sync::Weak::new()),
-                watches: parking_lot::RwLock::new(watches),
+                watches: parking_lot::RwLock::new(vec![None; n]),
+                initially_pinned: parking_lot::RwLock::new(pins),
                 sweeping: tokio::sync::Mutex::new(()),
                 cursor: AtomicUsize::new(0),
                 step: std::sync::atomic::AtomicU64::new(FORGET_STEP),
@@ -186,38 +198,74 @@ impl PinBoard {
         board
     }
 
+    /// Partition `pid`'s write watch, built now if this is its first use.
     pub(crate) fn watch(&self, pid: u32) -> io::Result<StdArc<WriteWatch>> {
-        self.watches
-            .read()
-            .get(pid as usize)
-            .filter(|w| w.pid() == pid)
-            .cloned()
-            .ok_or_else(|| io::Error::other(format!("internal error: no write watch for partition {pid}")))
+        let missing = || io::Error::other(format!("internal error: no write watch for partition {pid}"));
+        match self.watches.read().get(pid as usize) {
+            Some(Some(watch)) => return Ok(watch.clone()),
+            Some(None) => {}
+            None => return Err(missing()),
+        }
+        let pinned = self.initially_pinned.read().get(pid as usize / 64).is_some_and(|w| w & (1 << (pid % 64)) != 0);
+        let mut watches = self.watches.write();
+        let entry = watches.get_mut(pid as usize).ok_or_else(missing)?;
+        // Built by whoever got the write lock first; the same one after.
+        Ok(entry
+            .get_or_insert_with(|| WriteWatch::new(pid, pinned, self.me.clone(), self.scheduler.clone()))
+            .clone())
     }
 
-    /// Partition `pid`'s lifecycle lock (see the field).
+    /// Partition `pid`'s lifecycle lock (see the field), built now if this
+    /// is its first use.
     pub(crate) fn lifecycle(&self, pid: u32) -> io::Result<StdArc<tokio::sync::Mutex<()>>> {
-        self.lifecycle
-            .read()
-            .get(pid as usize)
-            .cloned()
-            .ok_or_else(|| io::Error::other(format!("internal error: no lifecycle lock for partition {pid}")))
+        let missing = || io::Error::other(format!("internal error: no lifecycle lock for partition {pid}"));
+        match self.lifecycle.read().get(pid as usize) {
+            Some(Some(lock)) => return Ok(lock.clone()),
+            Some(None) => {}
+            None => return Err(missing()),
+        }
+        let mut locks = self.lifecycle.write();
+        let entry = locks.get_mut(pid as usize).ok_or_else(missing)?;
+        Ok(entry.get_or_insert_with(|| StdArc::new(tokio::sync::Mutex::new(()))).clone())
     }
 
-    /// A watch and a lifecycle lock for every pid below `state`'s
+    /// How many write watches and lifecycle locks have been built.
+    #[cfg(test)]
+    pub(crate) fn built(&self) -> (usize, usize) {
+        (
+            self.watches.read().iter().filter(|w| w.is_some()).count(),
+            self.lifecycle.read().iter().filter(|l| l.is_some()).count(),
+        )
+    }
+
+    /// Partition `pid`'s lifecycle lock if one was ever built, for a pass
+    /// that sets its flag first and then waits out whatever holds each lock
+    /// (retire, drop): a lock not built yet is held by nothing, and whatever
+    /// builds it afterwards takes it after the flag and sees it.
+    pub(crate) fn lifecycle_if_built(&self, pid: u32) -> Option<StdArc<tokio::sync::Mutex<()>>> {
+        self.lifecycle.read().get(pid as usize).cloned().flatten()
+    }
+
+    /// Room for a watch and a lifecycle lock for every pid below `state`'s
     /// `next_pid`: what a reshape's `RESHAPE_BEGIN` handed out (phase 5).
-    /// A new watch starts pinned as `state` says.
+    /// A new pid's watch will start pinned as `state` says now.
     pub(crate) fn grow(&self, state: &MapState) {
         let n = usize::try_from(state.next_pid()).unwrap_or(usize::MAX).min(u32::MAX as usize);
         let mut watches = self.watches.write();
         let mut lifecycle = self.lifecycle.write();
+        let mut pins = self.initially_pinned.write();
+        if pins.len() < n.div_ceil(64) {
+            pins.resize(n.div_ceil(64), 0);
+        }
         while watches.len() < n {
             let pid = watches.len() as u32;
-            let pinned = state.part(pid).is_some_and(|p| p.pin.is_some());
-            watches.push(WriteWatch::new(pid, pinned, self.me.clone(), self.scheduler.clone()));
+            if state.part(pid).is_some_and(|p| p.pin.is_some()) {
+                pins[pid as usize / 64] |= 1 << (pid % 64);
+            }
+            watches.push(None);
         }
         while lifecycle.len() < n {
-            lifecycle.push(StdArc::new(tokio::sync::Mutex::new(())));
+            lifecycle.push(None);
         }
     }
 
