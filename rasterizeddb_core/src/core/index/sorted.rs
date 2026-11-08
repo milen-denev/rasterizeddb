@@ -178,7 +178,176 @@ impl<K: Ord> SortedLoad<K> {
     }
 }
 
+/// One stretch's share of the vector [`SortedLoad::assemble`] fills: room for
+/// exactly its entries, written in order. What it has written is dropped
+/// with it unless the assembly keeps it.
+pub struct Stretch<'a> {
+    room: &'a mut [std::mem::MaybeUninit<(KeyBuf, Slots)>],
+    len: usize,
+    /// Where its first entry sits in the whole stream, for the refusals.
+    base: usize,
+    n_slots: u64,
+}
+
+impl Stretch<'_> {
+    /// Takes the stretch's next entry, checked as [`SortedLoad::push`] checks
+    /// one: listing slots, strictly ascending, each below the table's
+    /// length, under a key above the one before it in this stretch.
+    pub fn push(&mut self, key: &[u8], slots: &[u64]) -> Result<(), SortedReject> {
+        let at = self.base + self.len;
+        if self.len == self.room.len() {
+            // More entries than its share: the caller's count was wrong.
+            return Err(SortedReject::KeyOrder { at });
+        }
+        if slots.is_empty() {
+            return Err(SortedReject::EmptyEntry { at });
+        }
+        if self.len > 0 {
+            // SAFETY: the first `len` slots of `room` are initialised.
+            let (last, _) = unsafe { self.room[self.len - 1].assume_init_ref() };
+            if last.as_slice() >= key {
+                return Err(SortedReject::KeyOrder { at });
+            }
+        }
+        check_slots(slots, self.n_slots, Some(at))?;
+        self.room[self.len].write((KeyBuf::from_slice(key), Slots::from_slice(slots)));
+        self.len += 1;
+        Ok(())
+    }
+
+    fn first_and_last(&self) -> Option<(&[u8], &[u8])> {
+        if self.len == 0 {
+            return None;
+        }
+        // SAFETY: the first `len` slots of `room` are initialised.
+        let first = unsafe { self.room[0].assume_init_ref() };
+        let last = unsafe { self.room[self.len - 1].assume_init_ref() };
+        Some((first.0.as_slice(), last.0.as_slice()))
+    }
+}
+
+impl Drop for Stretch<'_> {
+    fn drop(&mut self) {
+        for entry in &mut self.room[..self.len] {
+            // SAFETY: the first `len` slots are initialised, and a stretch the
+            // assembly keeps is forgotten rather than dropped.
+            unsafe { entry.assume_init_drop() };
+        }
+    }
+}
+
 impl SortedLoad<KeyBuf> {
+    /// A stream whose entries come as `counts.len()` stretches, each decoded
+    /// by `decode(i, stretch)` on one of up to `workers` threads straight
+    /// into its share of one vector: stretch `i` holds exactly `counts[i]`
+    /// entries. Each is checked as it is written (see [`Stretch::push`]),
+    /// and then each stretch's first key against the one before's last, so
+    /// the result is what pushing every entry in order would have taken. A
+    /// stream's closing parts are pushed after, as usual.
+    ///
+    /// One vector, filled in place, because joining stretches decoded into
+    /// vectors of their own copied every entry once more, into pages faulted
+    /// in on one thread: as long as the decode the threads saved (a section
+    /// of 1.5M entries, docs/persistent-indexes.md §4).
+    ///
+    /// The first error in stretch order is returned; every entry written is
+    /// dropped then, and if a `decode` panics.
+    pub fn assemble<E: From<SortedReject> + Send>(
+        n_slots: u64,
+        counts: &[usize],
+        workers: usize,
+        decode: impl Fn(usize, &mut Stretch<'_>) -> Result<(), E> + Sync,
+    ) -> Result<SortedLoad<KeyBuf>, E> {
+        let total: usize = counts.iter().sum();
+        let mut entries: Vec<(KeyBuf, Slots)> = Vec::with_capacity(total);
+        let mut stretches = Vec::with_capacity(counts.len());
+        {
+            let mut room = &mut entries.spare_capacity_mut()[..total];
+            let mut base = 0;
+            for &n in counts {
+                let (mine, rest) = room.split_at_mut(n);
+                stretches.push(parking_lot::Mutex::new(Some(Stretch { room: mine, len: 0, base, n_slots })));
+                room = rest;
+                base += n;
+            }
+        }
+        let outcomes: Vec<parking_lot::Mutex<Option<Result<(), E>>>> =
+            counts.iter().map(|_| parking_lot::Mutex::new(None)).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let work = || {
+            use std::sync::atomic::Ordering;
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= counts.len() || failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mut stretch = stretches[i].lock().take().expect("each stretch is taken once");
+                let mut outcome = decode(i, &mut stretch);
+                if outcome.is_ok() && stretch.len != counts[i] {
+                    outcome = Err(SortedReject::Truncated.into());
+                }
+                if outcome.is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                }
+                *stretches[i].lock() = Some(stretch);
+                *outcomes[i].lock() = Some(outcome);
+            }
+        };
+        let workers = workers.clamp(1, counts.len().max(1));
+        if workers == 1 {
+            work();
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(work);
+                }
+            });
+        }
+        let stretches: Vec<Stretch<'_>> = stretches.into_iter().filter_map(|s| s.into_inner()).collect();
+        // Some stretch failed, or the workers stopped before one: the first
+        // failure in order is the answer, and every stretch drops what it
+        // wrote as `stretches` goes.
+        let mut outcomes = outcomes.into_iter().map(|o| o.into_inner());
+        if let Some(e) = outcomes.by_ref().map(|o| o.unwrap_or(Ok(()))).find_map(Result::err) {
+            return Err(e);
+        }
+        if stretches.len() != counts.len() || stretches.iter().zip(counts).any(|(s, &n)| s.len != n) {
+            return Err(SortedReject::Truncated.into());
+        }
+        let mut prev_last: Option<&[u8]> = None;
+        for s in &stretches {
+            if let Some((first, last)) = s.first_and_last() {
+                if prev_last.is_some_and(|p| p >= first) {
+                    return Err(SortedReject::KeyOrder { at: s.base }.into());
+                }
+                prev_last = Some(last);
+            }
+        }
+        // Every stretch is full, in order: the vector's first `total` entries
+        // are initialised, and owned by it from here.
+        for s in stretches {
+            std::mem::forget(s);
+        }
+        // SAFETY: the stretches tile `entries`' first `total` slots, each
+        // full, and none drops them now.
+        unsafe { entries.set_len(total) };
+        Ok(SortedLoad { n_slots, entries, unkeyed: None, present: None })
+    }
+
+    /// The entries taken so far, owned (the section codec's tests compare
+    /// a parallel decode with a serial one).
+    #[cfg(test)]
+    pub(crate) fn pairs(&self) -> Vec<(Vec<u8>, Vec<u64>)> {
+        self.entries.iter().map(|(k, s)| (k.to_vec(), s.to_vec())).collect()
+    }
+
+    /// The closing parts, owned, once both have come.
+    #[cfg(test)]
+    pub(crate) fn into_parts_for_test(self) -> Result<(Vec<u64>, Vec<u64>), SortedReject> {
+        self.into_parts().map(|(_, unkeyed, present)| (unkeyed, present))
+    }
+
     /// Takes the next part of a B-tree, hash or path index's stream.
     pub fn push(&mut self, part: Sorted<'_, &[u8]>) -> Result<(), SortedReject> {
         match part {

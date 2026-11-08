@@ -483,8 +483,8 @@ async fn a_loaded_index_finds_every_row_a_rebuilt_one_finds() {
 // ---------------------------------------------------------------------------
 
 /// A version bump followed by two read-only reopens moves the build counter
-/// once (§3 rule 2). The seal writes its sections under another version (an
-/// older binary's snapshot); the first reopen proves the snapshot, refuses
+/// once (§3 rule 2). The seal writes its sections under a version this build
+/// does not read (another binary's snapshot); the first reopen proves the snapshot, refuses
 /// the sections, builds, and stays unvouched; its clean point rewrites the
 /// snapshot; the second reopen loads. Each answers as the twin.
 ///
@@ -496,7 +496,7 @@ async fn a_version_bump_rebuilds_once_then_loads() {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
     let _snap = storage_override::set(d, IndexStorage::Snapshot);
-    let older = hooks::write_version(d, index_section::INDEX_SECTION_VER - 1);
+    let older = hooks::write_version(d, index_section::INDEX_SECTION_VER + 1);
     let (model, touched, _) = sealed_table(d, "vb", 1500, 0xb17_3).await;
     drop(older);
     let mut rng = fastrand::Rng::with_seed(0xb17_4);
@@ -522,6 +522,39 @@ async fn a_version_bump_rebuilds_once_then_loads() {
         close(d, db);
     }
     assert_eq!(origins, vec![Origin::FellBack, Origin::Loaded, Origin::Loaded], "the build counter must move once");
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// A snapshot whose sections are version 1 (written before the chunk
+/// table) still loads, as one chunk each: upgrading past it costs no
+/// rebuild. Its clean point keeps the vouched snapshot as it is, and the
+/// next reopen loads it again.
+///
+/// Mutation: the decoder reads version 2 only (the first reopen falls back).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_1_snapshot_loads_without_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let _snap = storage_override::set(d, IndexStorage::Snapshot);
+    let v1 = hooks::write_version(d, 1);
+    let (model, touched, _) = sealed_table(d, "v1", 1500, 0xb17_5).await;
+    drop(v1);
+    let mut rng = fastrand::Rng::with_seed(0xb17_6);
+    let preds = model.battery(&mut rng, &touched);
+    let mut problems = Vec::new();
+    for round in 0..2 {
+        // `Loaded`, not `FellBack`: no section was refused (the process-wide
+        // failure count moves with the other tests' loads).
+        let db = open(d).await;
+        let t = table(&db, "v1");
+        settled(&t).await;
+        assert_eq!(t.index_origin(), Origin::Loaded, "round {round}");
+        problems.extend(answers(&db, "v1", &model, &preds, &format!("reopen {round}")).await);
+        problems.extend(index_superset(&t, &format!("reopen {round}")).await);
+        assert!(checkpoint(&db, "v1").await.is_clean(), "round {round}");
+        drop(t);
+        close(d, db);
+    }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 

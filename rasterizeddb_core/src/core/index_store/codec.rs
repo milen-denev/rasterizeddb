@@ -72,6 +72,13 @@ impl<'a> Reader<'a> {
         Reader { bytes, pos: 0, what }
     }
 
+    /// A reader over `bytes[..end]` positioned at `start` (`start <= end`),
+    /// so a field's position is the same as in a reader of the whole.
+    pub(crate) fn within(bytes: &'a [u8], start: usize, end: usize, what: &'static str) -> Reader<'a> {
+        debug_assert!(start <= end && end <= bytes.len());
+        Reader { bytes: &bytes[..end], pos: start, what }
+    }
+
     pub(crate) fn pos(&self) -> u64 {
         self.pos as u64
     }
