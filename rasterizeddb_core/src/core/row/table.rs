@@ -2467,6 +2467,7 @@ impl<S: StorageIO> Table<S> {
             compaction_gate: Some(&self.compaction_gate),
             alive: Some(&self.maintenance_alive),
             gate: Some(&self.gate),
+            stats: Some(&*d.vacuum_stats),
         };
         let report = crate::core::vacuum::run_once(
             &*d.io_pointers,
@@ -4696,6 +4697,7 @@ impl<S: StorageIO> Table<S> {
             error!("Failed to insert row: {}", e);
             std::io::Error::from(e)
         })?;
+        d.vacuum_stats.inserted_rows.fetch_add(1, AtomicOrdering::Relaxed);
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
@@ -4774,6 +4776,8 @@ impl<S: StorageIO> Table<S> {
                 .delete(d.io_pointers.clone(), record_pos, None, xmax)
                 .await
                 .map_err(std::io::Error::from)?;
+        } else {
+            d.vacuum_stats.inserted_rows.fetch_add(1, AtomicOrdering::Relaxed);
         }
 
         let slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
@@ -5531,6 +5535,9 @@ impl<S: StorageIO> Table<S> {
         // Published before the lock is released, so anyone who takes it next
         // sees a generation that already accounts for everything above.
         self.dead_stamps
+            .fetch_add(deleted_count, AtomicOrdering::Relaxed);
+        d.vacuum_stats
+            .deleted_rows
             .fetch_add(deleted_count, AtomicOrdering::Relaxed);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 

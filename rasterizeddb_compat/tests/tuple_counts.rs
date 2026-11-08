@@ -120,3 +120,188 @@ async fn an_empty_table_reports_no_tuples() {
 
     assert_eq!(tuples(&pool, "empty_t").await, (0, 0));
 }
+
+/// `SHOW TABLE STATS`'s value for `metric` on `table`.
+async fn metric(pool: &sqlx::PgPool, table: &str, metric: &str) -> String {
+    sqlx::query(AssertSqlSafe(format!("SHOW TABLE STATS {}", table)))
+        .fetch_all(pool)
+        .await
+        .expect("SHOW TABLE STATS")
+        .iter()
+        .find(|r| r.get::<String, _>("metric") == metric)
+        .map(|r| r.get::<String, _>("value"))
+        .unwrap_or_else(|| panic!("no `{}` metric", metric))
+}
+
+/// Deletes count before any sweep has run.
+///
+/// The unswept figure is the ids handed out, an upper bound that counted
+/// every deleted row as live. The deletes this instance has seen now come
+/// off it.
+#[tokio::test(flavor = "multi_thread")]
+async fn deletes_are_not_counted_live() {
+    let server = TestServer::start().await.expect("server should start");
+    let pool = server.connect_sqlx().await.expect("should connect");
+
+    run(&pool, "CREATE TABLE del_t (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .expect("create");
+    for id in 1..=10 {
+        run(&pool, &format!("INSERT INTO del_t (id, v) VALUES ({}, 'x')", id))
+            .await
+            .expect("insert");
+    }
+    // Never swept: an insert-only table gives the service nothing to find.
+    assert_eq!(metric(&pool, "del_t", "live_rows").await, "not measured");
+    assert_eq!(metric(&pool, "del_t", "slots_per_live_row").await, "not measured");
+
+    run(&pool, "DELETE FROM del_t WHERE id <= 4").await.expect("delete");
+    assert_eq!(tuples(&pool, "del_t").await, (6, 4), "four of ten deleted");
+    assert_eq!(slots(&pool, "del_t").await, 10);
+}
+
+/// After a sweep, `live` is what it counted, carried forward by the writes
+/// since, and `SHOW TABLE STATS` reports it with the amplification it means.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_measures_live_rows_and_the_writes_after_it_move_them() {
+    let server = TestServer::start().await.expect("server should start");
+    let pool = server.connect_sqlx().await.expect("should connect");
+
+    run(&pool, "CREATE TABLE beat (id INT PRIMARY KEY, holder TEXT NOT NULL)")
+        .await
+        .expect("create");
+    for id in 1..=10 {
+        run(&pool, &format!("INSERT INTO beat (id, holder) VALUES ({}, 'a')", id))
+            .await
+            .expect("insert");
+    }
+    for round in 0..20 {
+        run(
+            &pool,
+            &format!("UPDATE beat SET holder = '{}' WHERE id <= 5", "h".repeat(round + 2)),
+        )
+        .await
+        .expect("update");
+    }
+    run(&pool, "DELETE FROM beat WHERE id IN (9, 10)").await.expect("delete");
+    run(&pool, "VACUUM beat").await.expect("vacuum");
+
+    let slots_now = slots(&pool, "beat").await;
+    assert!(slots_now >= 110, "the updates cost a slot each, got {}", slots_now);
+    assert_eq!(metric(&pool, "beat", "live_rows").await, "8");
+    assert_eq!(
+        metric(&pool, "beat", "slots_per_live_row").await,
+        format!("{:.1}", slots_now as f64 / 8.0)
+    );
+    assert_eq!(tuples(&pool, "beat").await, (8, slots_now - 8));
+
+    // Writes after the sweep move the measured count, an update not at all.
+    run(&pool, "INSERT INTO beat (id, holder) VALUES (11, 'b'), (12, 'b')")
+        .await
+        .expect("insert");
+    run(&pool, "DELETE FROM beat WHERE id = 1").await.expect("delete");
+    run(&pool, "UPDATE beat SET holder = 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' WHERE id = 2")
+        .await
+        .expect("update");
+    assert_eq!(metric(&pool, "beat", "live_rows").await, "9");
+    let slots_now = slots(&pool, "beat").await;
+    assert_eq!(tuples(&pool, "beat").await, (9, slots_now - 9));
+
+    // The figure is what COUNT(*) says, which is the point of measuring it.
+    let counted: i64 = sqlx::query("SELECT COUNT(*) AS n FROM beat")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+        .get("n");
+    assert_eq!(counted, 9);
+}
+
+/// A delete an older snapshot can still see is dead, as PostgreSQL counts
+/// it: the sweep cannot reclaim it yet, but it is not a row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delete_held_by_an_open_snapshot_is_not_live() {
+    let server = TestServer::start().await.expect("server should start");
+    let pool = server.connect_sqlx().await.expect("should connect");
+
+    run(&pool, "CREATE TABLE held_t (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .expect("create");
+    for id in 1..=6 {
+        run(&pool, &format!("INSERT INTO held_t (id, v) VALUES ({}, 'x')", id))
+            .await
+            .expect("insert");
+    }
+    let mut reader = pool.acquire().await.expect("a second connection");
+    reader
+        .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin");
+    let seen: i64 = sqlx::query("SELECT COUNT(*) AS n FROM held_t")
+        .fetch_one(&mut *reader)
+        .await
+        .expect("count")
+        .get("n");
+    assert_eq!(seen, 6);
+
+    run(&pool, "DELETE FROM held_t WHERE id <= 2").await.expect("delete");
+    run(&pool, "VACUUM held_t").await.expect("vacuum");
+    assert_eq!(metric(&pool, "held_t", "live_rows").await, "4");
+    assert_eq!(tuples(&pool, "held_t").await, (4, 2));
+
+    reader.execute("COMMIT").await.expect("commit");
+}
+
+/// A partitioned table is measured once every materialized partition has
+/// been swept, each partition's count clamped to its own slots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_table_is_measured_over_its_partitions() {
+    // File-backed: a partitioned table needs one.
+    struct Root(std::path::PathBuf);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = Root(std::env::temp_dir().join(format!("tuple_counts_ptc_{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&root.0);
+    std::fs::create_dir_all(&root.0).expect("root");
+    let server = TestServer::start_file_backed(&root.0.to_string_lossy())
+        .await
+        .expect("server should start");
+    let pool = server.connect_sqlx().await.expect("should connect");
+
+    run(
+        &pool,
+        "CREATE TABLE ptc (tenant_id BIGINT NOT NULL, id INT NOT NULL, v TEXT NOT NULL, \
+         PRIMARY KEY (tenant_id, id)) PARTITION BY HASH (tenant_id) PARTITIONS 4",
+    )
+    .await
+    .expect("create");
+    for t in 1..=8 {
+        for id in 1..=3 {
+            run(&pool, &format!("INSERT INTO ptc (tenant_id, id, v) VALUES ({}, {}, 'a')", t, id))
+                .await
+                .expect("insert");
+        }
+    }
+    assert_eq!(metric(&pool, "ptc", "live_rows").await, "not measured");
+    assert_eq!(tuples(&pool, "ptc").await, (24, 0));
+
+    for round in 0..5 {
+        run(&pool, &format!("UPDATE ptc SET v = '{}' WHERE id = 1", "u".repeat(round + 2)))
+            .await
+            .expect("update");
+    }
+    run(&pool, "DELETE FROM ptc WHERE id = 3").await.expect("delete");
+    // Before the sweep: ids handed out less the deletes seen.
+    let slots_now = slots(&pool, "ptc").await;
+    assert_eq!(slots_now, 24 + 8 * 5, "one slot per row per update");
+    assert_eq!(tuples(&pool, "ptc").await, (16, slots_now - 16));
+
+    run(&pool, "VACUUM ptc").await.expect("vacuum");
+    assert_eq!(metric(&pool, "ptc", "live_rows").await, "16");
+    assert_eq!(tuples(&pool, "ptc").await, (16, slots_now - 16));
+
+    run(&pool, "INSERT INTO ptc (tenant_id, id, v) VALUES (1, 9, 'b')").await.expect("insert");
+    assert_eq!(metric(&pool, "ptc", "live_rows").await, "17");
+}

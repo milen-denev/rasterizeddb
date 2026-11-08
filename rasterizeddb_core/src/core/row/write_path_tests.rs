@@ -666,6 +666,7 @@ async fn a_running_query_defers_publication() {
         compaction_gate: None,
         alive: None,
         gate: None,
+        stats: None,
     };
     let report = crate::core::vacuum::run_once(
         &*t.data().unwrap().io_pointers,
@@ -1190,6 +1191,7 @@ async fn the_capped_path_never_rehands_a_reused_extent() {
             compaction_gate: None,
             alive: None,
             gate: None,
+            stats: None,
         };
         crate::core::vacuum::run_once(
             &*t.data().unwrap().io_pointers,
@@ -1857,6 +1859,7 @@ async fn a_permanently_busy_table_still_reclaims() {
             compaction_gate: None,
             alive: None,
             gate: None,
+            stats: None,
         };
         crate::core::vacuum::run_once(
             &*t.data().unwrap().io_pointers,

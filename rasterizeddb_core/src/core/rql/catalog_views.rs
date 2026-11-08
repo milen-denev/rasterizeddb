@@ -1411,7 +1411,7 @@ async fn build(
 /// reporting itself empty.
 async fn relation_size(database: &Arc<Database>, name: &str) -> Result<(u64, i64), String> {
     let totals = totals_of(database, name).await?;
-    Ok((totals.bytes, live_and_dead(totals.ids_handed_out, totals.slots).0))
+    Ok((totals.bytes, live_and_dead(&totals).0))
 }
 
 /// One relation's figures through its [`SchemaView`]'s stats accessor: no
@@ -1443,8 +1443,10 @@ async fn totals_of(database: &Arc<Database>, name: &str) -> Result<crate::core::
 /// exact figure runs `SELECT COUNT(*)`, as it would against PostgreSQL.
 ///
 /// ```text
-/// slots = pointer file length / record length      (exact, and free)
-/// live  = min(last_row_id, slots)                  (ids handed out, clamped)
+/// slots = pointer file length / record length            (exact, and free)
+/// live  = swept + inserted since - deleted since         (once a sweep ran)
+///       = last_row_id - deleted since open               (before one has)
+///         either clamped to slots
 /// dead  = slots - live
 /// ```
 ///
@@ -1474,8 +1476,21 @@ async fn totals_of(database: &Arc<Database>, name: &str) -> Result<crate::core::
 /// merely *corrected* by `ANALYZE`.
 ///
 /// It errs by counting deleted rows as live, since their ids were still handed
-/// out. That is the same direction as the old bug but bounded by the slot
-/// count, where the old one was unbounded and uncorrectable.
+/// out. Taking off the deletes this instance has counted narrows that to the
+/// deletes from before it opened, and it stays an upper bound: every deleted
+/// row was handed an id.
+///
+/// # Once a sweep has run
+///
+/// Vacuum's sweep already walks every pointer record, and counting the live
+/// ones costs it one increment. From then on `live` is that count, carried
+/// forward by the rows inserted and deleted since (`VacuumStats::live_rows`):
+/// the only figure here that is a measurement rather than a bound, and the
+/// one that sees deletes from before a restart.
+///
+/// A partitioned table takes it only when every materialized partition is
+/// open and has been swept, each clamped to its own slots. A sum that left a
+/// closed partition out would count its rows as gone.
 ///
 /// # The clamp is load-bearing
 ///
@@ -1497,14 +1512,19 @@ async fn totals_of(database: &Arc<Database>, name: &str) -> Result<crate::core::
 /// Errs on a table that cannot serve data, never `(0, 0)`.
 async fn tuple_counts(database: &Arc<Database>, name: &str) -> Result<(i64, i64), String> {
     let totals = totals_of(database, name).await?;
-    Ok(live_and_dead(totals.ids_handed_out, totals.slots))
+    Ok(live_and_dead(&totals))
 }
 
-/// `live = min(ids handed out, slots)` and `dead = slots - live`; see
-/// [`tuple_counts`] for why, and why the clamp is load-bearing.
-fn live_and_dead(ids_handed_out: u64, slots: u64) -> (i64, i64) {
-    let slots = slots as i64;
-    let live = (ids_handed_out as i64).clamp(0, slots);
+/// `live` as measured or bounded, at most `slots`, and `dead = slots - live`;
+/// see [`tuple_counts`] for why, and why the clamp is load-bearing.
+fn live_and_dead(totals: &crate::core::database::RelationTotals) -> (i64, i64) {
+    let slots = totals.slots;
+    let live = totals
+        .swept_live
+        .unwrap_or_else(|| totals.ids_handed_out.saturating_sub(totals.deleted_since_open))
+        .min(slots);
+    let slots = i64::try_from(slots).unwrap_or(i64::MAX);
+    let live = i64::try_from(live).unwrap_or(i64::MAX).min(slots);
     (live, slots - live)
 }
 

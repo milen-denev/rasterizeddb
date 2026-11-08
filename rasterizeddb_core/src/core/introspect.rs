@@ -567,6 +567,9 @@ struct RowFigures {
     kind: String,
     location: String,
     last_row_id: u64,
+    /// Live rows as a vacuum sweep last measured them, carried forward
+    /// (`RelationTotals::swept_live`). `None` until measured.
+    swept_live: Option<u64>,
     reclaimable: u64,
     filters_ready: bool,
     vacuum_enabled: bool,
@@ -600,11 +603,13 @@ async fn figures(relation: &Relation) -> Result<RowFigures, String> {
             let data = table.data().map_err(e)?;
             let mut vacuum = VacuumFigures::default();
             vacuum.add(&data.vacuum_stats);
+            let swept_live = data.vacuum_stats.live_rows().map(|live| live.min(sizes.row_slots()));
             Ok(RowFigures {
                 sizes,
                 kind: data.io_rows.kind().to_string(),
                 location: data.io_rows.location(),
                 last_row_id: data.ids.last_row_id.load(Ordering::Relaxed),
+                swept_live,
                 reclaimable: data.free_space.free_bytes(),
                 filters_ready: table.filters_ready().map_err(e)?,
                 vacuum_enabled: data.free_space.is_enabled(),
@@ -673,6 +678,7 @@ async fn figures(relation: &Relation) -> Result<RowFigures, String> {
                 kind: io_schema.kind().to_string(),
                 location: io_schema.location(),
                 last_row_id: totals.ids_handed_out,
+                swept_live: totals.swept_live,
                 reclaimable,
                 filters_ready,
                 vacuum_enabled,
@@ -1337,6 +1343,37 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
         "last_row_id",
         figures.last_row_id.to_string(),
         "highest id handed out",
+    );
+    // What `row_slots` cannot say: how many of them are rows. An update
+    // leaves its old version's slot behind and incremental vacuum never
+    // gives slots back, so a heartbeat table reaches thousands of slots per
+    // row while `reclaimable_bytes` (row data, not slots) stays near zero.
+    //
+    // Before a sweep these say `not measured`, never 0: a zero reads as an
+    // empty table, and a never-swept table is the one to ask about. Per
+    // table only; a database-wide ratio would average one table at 4 000:1
+    // into fifty healthy ones and hide it again.
+    let (live_rows, slots_per_row) = match figures.swept_live {
+        None => ("not measured".to_string(), "not measured".to_string()),
+        Some(live) => {
+            let slots = sizes.row_slots();
+            let ratio = match (live, slots) {
+                (0, 0) => "no rows".to_string(),
+                (0, _) => "no live rows".to_string(),
+                (live, slots) => format!("{:.1}", slots as f64 / live as f64),
+            };
+            (live.to_string(), ratio)
+        }
+    };
+    push(
+        "live_rows",
+        live_rows,
+        "counted by the last vacuum sweep, plus inserts and less deletes since",
+    );
+    push(
+        "slots_per_live_row",
+        slots_per_row,
+        "pointer records per live row; VACUUM FULL compacts it toward 1",
     );
 
     push("data_bytes", sizes.data.to_string(), "row data");

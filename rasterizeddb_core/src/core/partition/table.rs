@@ -335,6 +335,13 @@ pub struct Totals {
     pub ids_handed_out: u64,
     pub materialized: u32,
     pub declared: u32,
+    /// The partitions' measured live rows, each clamped to its own slots
+    /// (`VacuumStats::live_rows`), summed. `None` unless every materialized
+    /// partition is open and has been swept: a sum that skipped one would
+    /// read as that partition's rows all being gone.
+    pub swept_live: Option<u64>,
+    /// Rows the open partitions' `DELETE`s removed since each opened.
+    pub deleted_since_open: u64,
 }
 
 /// One partition, as introspection shows it.
@@ -1739,21 +1746,35 @@ impl PartitionedTable {
             ids: live.parts.ids.io.get_len().await,
             ..Totals::default()
         };
+        let mut swept_live = Some(0u64);
         for slot in live.parts.slots.iter() {
-            let lens = match slot.open_now() {
-                Some(table) => Some(Self::file_lens(&table).await?),
+            let open = slot.open_now();
+            let lens = match &open {
+                Some(table) => Some(Self::file_lens(table).await?),
                 // A closed partition, from its files' metadata.
                 None if slot.materialized.load(Ordering::SeqCst) => Some(slot.closed_sizes(slot.dir(&self.root), self.uid)?),
                 None => None,
             };
             if let Some((rows, pointers, filters)) = lens {
+                let slots = pointers / ROW_POINTER_RECORD_LEN as u64;
                 t.materialized += 1;
-                t.slots += pointers / ROW_POINTER_RECORD_LEN as u64;
+                t.slots += slots;
                 t.data += rows;
                 t.pointers += pointers;
                 t.filters += filters;
+                // A closed partition's counts went with its instance.
+                let stats = match &open {
+                    Some(table) => Some(table.vacuum_stats()?),
+                    None => None,
+                };
+                t.deleted_since_open += stats.map_or(0, |s| s.deleted_rows.load(Ordering::Relaxed));
+                swept_live = match (swept_live, stats.and_then(|s| s.live_rows())) {
+                    (Some(sum), Some(live)) => Some(sum + live.min(slots)),
+                    _ => None,
+                };
             }
         }
+        t.swept_live = swept_live.filter(|_| t.materialized > 0);
         t.bytes = t.data + t.pointers + t.filters + t.schema + t.map + t.ids;
         Ok(t)
     }

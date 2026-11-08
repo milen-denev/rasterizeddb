@@ -314,6 +314,15 @@ pub struct RelationTotals {
     pub ids_handed_out: u64,
     /// Pointer records: the pointer file's length over the record length.
     pub slots: u64,
+    /// Live rows as the last complete vacuum sweep counted them, carried
+    /// forward by the inserts and deletes since (`VacuumStats::live_rows`),
+    /// at most `slots`. `None` until one has run; for a partitioned table,
+    /// until every materialized partition is open and has been swept.
+    pub swept_live: Option<u64>,
+    /// Rows `DELETE` removed since the instance opened (a partitioned
+    /// table's open partitions', summed): what the unswept estimate takes
+    /// off `ids_handed_out`.
+    pub deleted_since_open: u64,
 }
 
 /// The stats accessor of a [`SchemaView`].
@@ -333,6 +342,8 @@ impl SchemaStats<'_> {
                     bytes: t.bytes,
                     ids_handed_out: t.ids_handed_out,
                     slots: t.slots,
+                    swept_live: t.swept_live,
+                    deleted_since_open: t.deleted_since_open,
                 })
             }
             ViewOf::Plain(table) => {
@@ -346,10 +357,13 @@ impl SchemaStats<'_> {
                     + table.io_schema.get_len().await
                     + table.index_store_bytes()?
                     + data.ids.io.get_len().await;
+                let slots = pointers / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64;
                 Ok(RelationTotals {
                     bytes,
                     ids_handed_out,
-                    slots: pointers / crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN as u64,
+                    slots,
+                    swept_live: data.vacuum_stats.live_rows().map(|live| live.min(slots)),
+                    deleted_since_open: data.vacuum_stats.deleted_rows.load(Ordering::Relaxed),
                 })
             }
         }

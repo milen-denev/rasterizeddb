@@ -730,6 +730,12 @@ pub struct ReclaimContext<'a> {
     /// `None` where nothing gates the storage (tests driving `run_once`
     /// directly): the sweep then takes its ticket on a detached word.
     pub gate: Option<&'a crate::core::index_store::file_gate::FileGate>,
+    /// Where a complete sweep leaves its live count (see
+    /// [`VacuumStats::live_rows`]), sampled against the write counters the
+    /// moment the scan ends rather than after the drain wait, which can run
+    /// for seconds while inserts the scan never saw land. `None` for tests
+    /// driving `run_once` directly.
+    pub stats: Option<&'a VacuumStats>,
 }
 
 impl ReclaimContext<'_> {
@@ -935,9 +941,62 @@ pub struct VacuumStats {
     /// Makes the next this-many service ticks panic. Tests only.
     #[cfg(test)]
     pub inject_panics: AtomicU64,
+    /// Rows this instance's inserts wrote, one per row, counted when the row
+    /// is written. Monotonic.
+    pub inserted_rows: AtomicU64,
+    /// Rows this instance's `DELETE`s removed, one per row, counted when the
+    /// statement's tombstones are durable. An `UPDATE` moves neither counter:
+    /// its row is still one row. Monotonic.
+    pub deleted_rows: AtomicU64,
+    /// What the last complete sweep counted live, and the two counters as
+    /// they stood when it did. `None` until a sweep of this instance has seen
+    /// every pointer.
+    swept: Mutex<Option<SweptLive>>,
+}
+
+/// A complete sweep's live count and the write counters at its end.
+#[derive(Debug, Clone, Copy)]
+struct SweptLive {
+    live: u64,
+    inserted: u64,
+    deleted: u64,
 }
 
 impl VacuumStats {
+    /// The table's live rows as last measured: the count a complete sweep
+    /// took, plus the rows inserted since and minus the rows deleted since.
+    /// `None` until a sweep of this instance has run: what writes alone
+    /// maintain cannot tell a deleted row from a live one after a restart, so
+    /// it is not offered as a measurement.
+    ///
+    /// The sweep counts a version live when no deleter has stamped it, or its
+    /// deleter is one the horizon has not passed but which has not committed
+    /// either. A committed delete still protected by an older snapshot is
+    /// dead here, as PostgreSQL's `n_dead_tup` counts it: an update-heavy
+    /// table's old versions are the slots this exists to show.
+    ///
+    /// Still an estimate between sweeps, in both directions and by at most the
+    /// writes in flight when it was taken, plus any delete or insert that
+    /// rolled back since (counted when written, not when committed). The next
+    /// sweep replaces it. Callers clamp it to the slot count.
+    pub fn live_rows(&self) -> Option<u64> {
+        let swept = (*self.swept.lock())?;
+        let inserted = self.inserted_rows.load(Ordering::Acquire).wrapping_sub(swept.inserted);
+        let deleted = self.deleted_rows.load(Ordering::Acquire).wrapping_sub(swept.deleted);
+        Some(swept.live.saturating_add(inserted).saturating_sub(deleted))
+    }
+
+    /// Stores a complete sweep's live count against the counters as they are
+    /// now. Called the moment the scan ends: see [`ReclaimContext::stats`].
+    fn record_live(&self, live: u64) {
+        let mut swept = self.swept.lock();
+        *swept = Some(SweptLive {
+            live,
+            inserted: self.inserted_rows.load(Ordering::Acquire),
+            deleted: self.deleted_rows.load(Ordering::Acquire),
+        });
+    }
+
     fn record(&self, report: &VacuumReport) {
         self.runs.fetch_add(1, Ordering::Relaxed);
         self.last_dead_bytes
@@ -1666,6 +1725,11 @@ pub async fn run_once<S: StorageIO>(
     if scan.retired || ctx.retired() {
         return Ok(retired_report(&scan));
     }
+    // The scan saw every pointer, so its count stands, deferred or not:
+    // deferral is about handing out bytes.
+    if let Some(stats) = ctx.stats {
+        stats.record_live(scan.live_rows.saturating_sub(scan.held_rows));
+    }
 
     // Everything below acts on the sweep's decisions as final: fingerprints
     // cleared (and then checkpointed), extents handed to writers. Those
@@ -2209,6 +2273,7 @@ impl<S: StorageIO> VacuumService<S> {
             compaction_gate: Some(&self.compaction_gate),
             alive: Some(&self.alive),
             gate: Some(&file_gate),
+            stats: Some(&self.stats),
         };
 
         match run_once(
