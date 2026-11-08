@@ -16,7 +16,8 @@
 //!     and the pages still resident counted), then time Database::new and
 //!     the wait until table t's indexes and filter are ready. --snapshot
 //!     opens under index_storage = snapshot (the load); without it, under
-//!     rebuild. One RESULT line: the origin, times, RSS, snapshot bytes.
+//!     rebuild. One RESULT line: the origin, times, RSS, snapshot bytes;
+//!     then a SETTLED line, the RSS 300 ms later.
 //!
 //! index_rebuild_bench ptload --dir D --parts P --rows-per R
 //!     a table hash-partitioned P ways on tenant_id, P*R rows, primary key
@@ -407,6 +408,11 @@ async fn open(args: &Args) {
         ixs,
         memory()
     );
+    // And once what the open freed has had time to go back: `settled_rss_mib`
+    // is the figure to compare with a rebuild's.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settled = memory();
+    println!("SETTLED {}", settled.split_whitespace().next().unwrap_or("").replace("rss_mib", "settled_rss_mib"));
 }
 
 async fn pt_load(args: &Args) {

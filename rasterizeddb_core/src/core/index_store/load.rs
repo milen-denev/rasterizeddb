@@ -824,6 +824,36 @@ fn load_now(
     Ok(longest)
 }
 
+/// Gives back to the OS what a big load freed. The load decodes and
+/// installs on worker threads, and glibc keeps what a thread frees in that
+/// thread's arena: the sections' bytes, the hash index's dealt buckets, the
+/// runs a hash index was filled from. That held a 1.5M-row table's process
+/// at ~550 MiB after its load, against ~375 MiB when the load ran on one
+/// thread (docs/persistent-indexes.md §4). `malloc_trim` walks every arena;
+/// it runs on a thread of its own, after the barrier is down, and at most
+/// one at a time, as a startup loads every table at once.
+fn release_load_memory(n_slots: u64) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static TRIMMING: AtomicBool = AtomicBool::new(false);
+        // Below a chunk the load ran on one thread, in its own arena.
+        if n_slots < index_section::CHUNK_ENTRIES || TRIMMING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let spawned = std::thread::Builder::new().name("rdb-load-trim".into()).spawn(|| {
+            // SAFETY: `malloc_trim` takes no pointers; it only returns free
+            // pages of glibc's arenas to the kernel.
+            unsafe { libc::malloc_trim(0) };
+            TRIMMING.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            TRIMMING.store(false, Ordering::Release);
+        }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let _ = n_slots;
+}
+
 /// The indexes of one instance at open: loaded, or built by `rebuild`
 /// (module documentation). Runs on the open's task; `build` is the open's
 /// token.
@@ -875,6 +905,7 @@ where
                         installed.as_secs_f64()
                     );
                     drop(o.barrier.take());
+                    release_load_memory(o.n_slots);
                     return;
                 }
                 Err(e) => {
