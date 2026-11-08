@@ -173,9 +173,16 @@ impl Database {
                 let first = words.first().map(|w| w.to_ascii_uppercase()).unwrap_or_default();
                 let field = name_of(name)?;
                 if first == "TYPE" {
-                    // `USING`, and a type that does not parse, are the arm's.
+                    // `USING` rewrites the values, so on a key column it would
+                    // move rows between partitions; anywhere else, and a type
+                    // that does not parse, are the arm's.
                     if words.iter().any(|w| w.eq_ignore_ascii_case("USING")) {
-                        return None;
+                        return is_key(name).then(|| {
+                            format!(
+                                "ALTER COLUMN {name} TYPE … USING: \"{name}\" is a partition key column of \"{t}\", \
+                                 whose values decide where every row is stored; changing them is not supported"
+                            )
+                        });
                     }
                     let (db_type, _) = crate::core::rql::lexer_alter::parse_column_type(&words[1..]).ok()?;
                     // `literal_type`: a `timestamp` column restated as

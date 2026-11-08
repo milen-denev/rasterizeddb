@@ -7609,6 +7609,15 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("value overflows numeric format") {
         return "22003";
     }
+    if has("aggregate functions are not allowed in transform expressions") {
+        return "42803";
+    }
+    if has("window functions are not allowed in transform expressions") {
+        return "42P20";
+    }
+    if has("cannot use subquery in transform expression") {
+        return "0A000";
+    }
     if has("cannot take logarithm of") {
         return "2201E";
     }

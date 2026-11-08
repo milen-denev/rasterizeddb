@@ -4496,6 +4496,9 @@ enum RetypeTarget {
     Text(Option<crate::core::rql::type_modifier::TextTypmod>),
     Timestamp,
     Date,
+    /// `boolean` or `uuid`, from a `USING` value already of that type, whose
+    /// bytes are the stored form ([`retype_using`]).
+    Raw(crate::core::db_type::DbType),
 }
 
 /// `field`'s stored `bytes` as a conversion source, `None` for a type this
@@ -4653,6 +4656,7 @@ fn retype_value(source: &RetypeSource, target: &RetypeTarget) -> Result<Vec<u8>,
                 .ok_or_else(|| format!("invalid input syntax for type timestamp: \"{date}\"")),
             _ => Err("internal error: only a date converts to a timestamp here".to_string()),
         },
+        RetypeTarget::Raw(_) => Err("internal error: a boolean or uuid is stored as computed".to_string()),
         // A timestamp's day, its time of day dropped, as `timestamp::date`.
         RetypeTarget::Date => match source {
             RetypeSource::Text(ts) => {
@@ -4670,6 +4674,7 @@ fn retype_value(source: &RetypeSource, target: &RetypeTarget) -> Result<Vec<u8>,
 fn retype_null_bytes(target: &RetypeTarget) -> Vec<u8> {
     use crate::core::db_type::DbType;
     match target {
+        RetypeTarget::Raw(t) => vec![0; if *t == DbType::BOOL { 1 } else { 16 }],
         RetypeTarget::Int(DbType::I16) => vec![0; 2],
         RetypeTarget::Int(DbType::I32) | RetypeTarget::Float(DbType::F32) | RetypeTarget::Date => vec![0; 4],
         RetypeTarget::Int(_) | RetypeTarget::Float(_) | RetypeTarget::Timestamp => vec![0; 8],
@@ -4843,6 +4848,278 @@ async fn retype_by_cast(
             block.into_slice_mut().copy_from_slice(&converted);
             let name = version.values[at].0.clone();
             version.values[at] = (name, block, target_type.clone());
+        }
+        unique_keys_hold(definition, &versions, &column, &table)?;
+        Ok(versions)
+    })
+    .await
+}
+
+/// `text`'s words and parentheses outside quoted strings and identifiers,
+/// upper case: `(`, `)` and each run of letters, digits and `_`.
+fn words_outside_quotes(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => i = crate::core::sql_scan::quoted_end(bytes, i, q),
+            b'(' | b')' => {
+                out.push((bytes[i] as char).to_string());
+                i += 1;
+            }
+            b if b.is_ascii_alphanumeric() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                out.push(text[start..i].to_ascii_uppercase());
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// `ALTER COLUMN c TYPE t USING expr`: every row rewritten with the column
+/// set to `expr` evaluated over the row as it was, converted to `t`, all or
+/// nothing ([`rewrite_rows`]). It was refused outright ("USING is not
+/// supported yet"), and a migration that changes a text column's meaning —
+/// `USING s::integer`, `USING to_date(d, 'DD/MM/YYYY')`, `USING n <> 0` —
+/// could only be done by hand.
+///
+/// The value is converted as an explicit cast (`(expr)::t`) converts it, which
+/// takes every pair PostgreSQL's assignment does and some it refuses (42804);
+/// a length or a NUMERIC precision is then held as an assignment holds it
+/// (22001, 22003), not truncated. Every version a snapshot can see is
+/// rewritten, each from its own values. Refused before anything is written,
+/// leaving the table as it was, as [`retype_by_cast`] refuses: a column a
+/// generated column reads, a generated column, either side of a foreign key
+/// (its values change, so references could break), a target type this
+/// rewrite does not store (0A000), a CHECK reading the column that some row
+/// breaks under the new values (23514); and while rewriting, a NULL where the
+/// column is NOT NULL (23502), a value the cast or the type refuses, or two
+/// key values made one (23505). A partitioned table's key columns are refused
+/// before this (`partitioned_alter_refusal`): their values decide where
+/// each row is stored.
+#[allow(clippy::too_many_arguments)]
+async fn retype_using(
+    database: &Arc<Database>,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    field: &crate::core::row::schema::SchemaField,
+    declared: &str,
+    target_type: crate::core::db_type::DbType,
+    using: &str,
+    tx: TxId,
+) -> Result<(), String> {
+    use crate::core::db_type::DbType;
+    use crate::core::rql::expr::{self, Value};
+    use crate::core::rql::{nullable, type_modifier};
+    let (target, cast) = match &target_type {
+        DbType::I16 => (RetypeTarget::Int(DbType::I16), "int2"),
+        DbType::I32 => (RetypeTarget::Int(DbType::I32), "int4"),
+        DbType::I64 => (RetypeTarget::Int(DbType::I64), "int8"),
+        DbType::F32 => (RetypeTarget::Float(DbType::F32), "float4"),
+        DbType::F64 => (RetypeTarget::Float(DbType::F64), "float8"),
+        DbType::DECIMAL => (
+            RetypeTarget::Numeric(match type_modifier::parse_numeric_modifier(declared) {
+                Some(Ok((precision, scale))) => NumericForm::Scaled { precision: precision.into(), scale: scale.into() },
+                Some(Err(e)) => return Err(e),
+                None => NumericForm::Own,
+            }),
+            "numeric",
+        ),
+        DbType::STRING => (
+            RetypeTarget::Text(match type_modifier::parse_text_typmod(declared) {
+                Some(Ok(t)) => Some(t),
+                Some(Err(e)) => return Err(e),
+                None => None,
+            }),
+            "text",
+        ),
+        DbType::TIMESTAMP => (RetypeTarget::Timestamp, "timestamp"),
+        DbType::DATE => (RetypeTarget::Date, "date"),
+        DbType::BOOL => (RetypeTarget::Raw(DbType::BOOL), "bool"),
+        DbType::UUID => (RetypeTarget::Raw(DbType::UUID), "uuid"),
+        other => {
+            return Err(format!(
+                "ALTER COLUMN {} TYPE {} USING: rewriting into {} is not supported yet",
+                field.name,
+                declared,
+                crate::core::value_codec::pg_input_type_name(other)
+            ))
+        }
+    };
+    // What PostgreSQL refuses in a transform expression, with its words
+    // (0A000, 42803, 42P20): the evaluator would refuse each less clearly.
+    let words = words_outside_quotes(using);
+    let called = |i: usize| words.get(i + 1).is_some_and(|w| w == "(");
+    if words.iter().any(|w| w == "SELECT") {
+        return Err("cannot use subquery in transform expression".to_string());
+    }
+    const AGGREGATES: &[&str] = &[
+        "COUNT", "SUM", "AVG", "MIN", "MAX", "STRING_AGG", "ARRAY_AGG", "JSON_AGG", "JSONB_AGG", "BOOL_AND", "BOOL_OR",
+        "EVERY", "STDDEV", "VARIANCE",
+    ];
+    if words.iter().enumerate().any(|(i, w)| w == "OVER" && i > 0) {
+        return Err("window functions are not allowed in transform expressions".to_string());
+    }
+    if words.iter().enumerate().any(|(i, w)| AGGREGATES.contains(&w.as_str()) && called(i)) {
+        return Err("aggregate functions are not allowed in transform expressions".to_string());
+    }
+    let evaluated = expr::parse(&format!("({using})::{cast}"), &schema.fields)
+        .map_err(|e| format!("ALTER COLUMN {} TYPE {} USING {}: {}", field.name, declared, using, e))?;
+
+    let names: Vec<String> = schema.fields.iter().filter(|f| !f.is_deleted).map(|f| f.name.clone()).collect();
+    let reads_column = |text: &str| {
+        crate::core::rql::check::columns_read(text, &names).iter().any(|c| c.eq_ignore_ascii_case(&field.name))
+    };
+    if let Some(g) = schema.generated.iter().find(|g| !g.is_deleted && (reads_column(&g.expression) || g.column.eq_ignore_ascii_case(&field.name))) {
+        return Err(format!(
+            "cannot alter type of a column used by a generated column: column \"{}\" is used by generated \
+             column \"{}\" (not supported)",
+            field.name, g.column
+        ));
+    }
+    let in_a_foreign_key = schema
+        .foreign_keys
+        .iter()
+        .any(|fk| !fk.is_deleted && fk.column.eq_ignore_ascii_case(&field.name))
+        || referencing_keys(database, table_name)
+            .iter()
+            .any(|(_, fk)| !fk.is_deleted && fk.parent_column.eq_ignore_ascii_case(&field.name));
+    if in_a_foreign_key {
+        return Err(format!(
+            "ALTER COLUMN {} TYPE {} USING: the column is a side of a foreign key, whose references the new \
+             values could break; this is not supported yet",
+            field.name, declared
+        ));
+    }
+    // The checks reading the column judge the rows as they will be: the
+    // column read as the transformed value.
+    let transformed = format!("(({using})::{declared})");
+    for check in schema.checks.iter().filter(|c| !c.is_deleted && reads_column(&c.expression)) {
+        let normalized = crate::core::rql::check::normalize_expression(&check.expression);
+        let judged = crate::core::rql::check::replace_column(&normalized, &field.name, &transformed);
+        let probe = format!("SELECT 1 FROM {table_name} WHERE NOT ({judged}) LIMIT 1");
+        match run_subquery(&probe, database, tx).await {
+            Ok(rows) if rows.is_empty() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                    check.name, table_name
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                    "ALTER COLUMN {} TYPE {} USING: check constraint \"{}\" reads the column, and judging it \
+                     under the new values is not supported; drop the check, alter the column, and add the check back",
+                    field.name, declared, check.name
+                ))
+            }
+        }
+    }
+
+    let column = field.name.clone();
+    let table = table_name.to_string();
+    let nullable_column = nullable::is_nullable(&field.name, &schema.fields);
+    let source_fields: Vec<crate::core::row::schema::SchemaField> = schema.fields.to_vec();
+    rewrite_rows(database, table_name, tx, move |definition, mut versions| {
+        let Some(declared_column) = definition.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&column)) else {
+            return Err(format!("column \"{}\" of relation \"{}\" does not exist", column, table));
+        };
+        declared_column.data_type = target_type.clone();
+        definition.type_modifiers.retain(|m| !m.column.eq_ignore_ascii_case(&column));
+        match &target {
+            RetypeTarget::Numeric(NumericForm::Scaled { precision, scale }) => {
+                definition.type_modifiers.push(type_modifier::TypeModifier {
+                    column: column.clone(),
+                    precision: (*precision).try_into().map_err(|_| "numeric precision out of range".to_string())?,
+                    scale: (*scale).try_into().map_err(|_| "numeric scale out of range".to_string())?,
+                    is_deleted: false,
+                });
+            }
+            RetypeTarget::Text(typmod) => {
+                let records = type_modifier::text_typmod_records(&column, *typmod, &definition.type_modifiers);
+                definition.type_modifiers.extend(records);
+            }
+            _ => {}
+        }
+        let companion = nullable::flag_column_name(&column);
+        for version in &mut versions {
+            let Some(at) = version.values.iter().position(|(name, _, _)| name.eq_ignore_ascii_case(&column)) else {
+                continue;
+            };
+            // The version as a row of the table it was read from: each value
+            // under its column's write order, companions included, so the
+            // expression reads NULLs as NULL.
+            let columns: crate::core::row::row::RowColumns = version
+                .values
+                .iter()
+                .filter_map(|(name, block, ty)| {
+                    let f = source_fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))?;
+                    Some(crate::core::row::row::Column {
+                        schema_id: u32::try_from(f.write_order).ok()?,
+                        data: block.clone(),
+                        column_type: ty.clone(),
+                    })
+                })
+                .collect();
+            let row = crate::core::row::row::Row { position: 0, length: 0, columns };
+            let value = expr::eval_output(&evaluated, &row, &source_fields)?;
+            let converted = match (&value, &target) {
+                (Value::Null, _) => None,
+                (Value::Data { bytes, db_type }, RetypeTarget::Raw(t)) => {
+                    if db_type != t {
+                        return Err(format!(
+                            "internal error: USING gave a {} for a {} column",
+                            crate::core::value_codec::pg_input_type_name(db_type),
+                            crate::core::value_codec::pg_input_type_name(t)
+                        ));
+                    }
+                    Some(bytes.clone())
+                }
+                (Value::Data { bytes, db_type }, _) => {
+                    let unreadable = || format!("the USING value for column \"{column}\" could not be read");
+                    let source = match db_type {
+                        DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64 => {
+                            RetypeSource::Int(i128::from(expr::as_i64(&value).ok_or_else(unreadable)?))
+                        }
+                        DbType::F32 => RetypeSource::Float(
+                            f64::from(f32::from_le_bytes(bytes.get(..4).ok_or_else(unreadable)?.try_into().expect("four bytes"))),
+                            true,
+                        ),
+                        DbType::F64 => RetypeSource::Float(
+                            f64::from_le_bytes(bytes.get(..8).ok_or_else(unreadable)?.try_into().expect("eight bytes")),
+                            false,
+                        ),
+                        DbType::DECIMAL => RetypeSource::Num(expr::decimal_value_as_pgnum(bytes)?),
+                        DbType::STRING => RetypeSource::Text(String::from_utf8(bytes.clone()).map_err(|_| unreadable())?),
+                        DbType::DATE => RetypeSource::Text(crate::core::pg_types::format_date(bytes).ok_or_else(unreadable)?),
+                        DbType::TIMESTAMP | DbType::DATETIME => RetypeSource::Text(crate::core::value_codec::format_timestamp_us(
+                            i64::from_le_bytes(bytes.get(..8).ok_or_else(unreadable)?.try_into().expect("eight bytes")),
+                        )),
+                        _ => return Err(unreadable()),
+                    };
+                    Some(retype_value(&source, &target)?)
+                }
+            };
+            if converted.is_none() && !nullable_column {
+                return Err(format!("column \"{column}\" of relation \"{table}\" contains null values"));
+            }
+            let null = converted.is_none();
+            let bytes = converted.unwrap_or_else(|| retype_null_bytes(&target));
+            let mut block = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+            block.into_slice_mut().copy_from_slice(&bytes);
+            let name = version.values[at].0.clone();
+            version.values[at] = (name, block, target_type.clone());
+            if let Some(flag) = version.values.iter_mut().find(|(name, _, _)| name.eq_ignore_ascii_case(&companion)) {
+                let bits = nullable::flag_bytes(null);
+                let mut block = crate::memory_pool::MEMORY_POOL.acquire(bits.len());
+                block.into_slice_mut().copy_from_slice(&bits);
+                flag.1 = block;
+            }
         }
         unique_keys_hold(definition, &versions, &column, &table)?;
         Ok(versions)
@@ -15739,15 +16016,24 @@ async fn execute_alter_table_action(
             // is usually the one the column already has — a statement that asks
             // for no change, and used to be refused as unsupported.
             if first == "TYPE" {
-                // `USING (expr)` transforms every stored value. Nothing here
-                // runs it, so it must not fall into the same-type no-op below:
-                // `TYPE int USING (v * 100)` on an int column would report
-                // success with every row untransformed.
-                if words.iter().any(|w| w.eq_ignore_ascii_case("USING")) {
-                    return ddl_error(&format!(
-                        "ALTER COLUMN {} TYPE ... USING is not supported yet;                          rewrite via an added column and an UPDATE instead",
-                        name
-                    ));
+                // `USING (expr)` transforms every stored value, so it never
+                // takes the same-type no-op below: `TYPE int USING (v * 100)`
+                // on an int column rewrites every row (`retype_using`).
+                if let Some(at) = crate::core::rql::join::find_keyword(&detail, "USING", 0) {
+                    let type_tokens: Vec<&str> = detail[..at].split_whitespace().skip(1).collect();
+                    let using = detail[at + "USING".len()..].trim();
+                    if using.is_empty() {
+                        return ddl_error("syntax error at end of input: USING needs an expression");
+                    }
+                    return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {
+                        Ok((db_type, _)) => {
+                            match retype_using(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), db_type, using, tx).await {
+                                Ok(()) => ddl_ok(0),
+                                Err(e) => ddl_error(&e),
+                            }
+                        }
+                        Err(e) => ddl_error(&e),
+                    };
                 }
                 let type_tokens: Vec<&str> = words[1..].to_vec();
                 return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {

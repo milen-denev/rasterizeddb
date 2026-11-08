@@ -230,28 +230,32 @@ async fn set_not_null_enforces_and_keeps_the_default() {
     shut(db, root);
 }
 
-/// The `ALTER COLUMN … TYPE … USING` silent-drop guard still holds with the
-/// rewrites moved into the reload: a same-type restatement carrying a USING
-/// transform is refused rather than reported as a no-op with the transform
-/// never run, and the rows are untouched; the same restatement without USING
-/// (what sea-orm sends) is still accepted.
+/// `ALTER COLUMN v TYPE INT USING (v * 100)` on an int column: the same
+/// type, so it must not take the same-type no-op and report success with the
+/// transform never run. Every row is rewritten with the value (it was
+/// refused), and the values are the transform's after a reopen too; the same
+/// restatement without USING (what sea-orm sends) is still accepted. A CHECK
+/// that only the transformed values pass is what reads them.
 ///
-/// Mutation: the USING refusal removed; the statement succeeds and the
-/// values are not multiplied.
+/// Mutation: the USING arm removed; the statement takes the no-op, the
+/// values are not multiplied, and the CHECK is refused (23514).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn alter_type_using_is_still_refused_not_dropped() {
+async fn alter_type_using_runs_the_transform_over_the_same_type() {
     let base = tempfile::tempdir().unwrap();
     let root = base.path();
     let db = Arc::new(open(root).await);
     exec(&db, "CREATE TABLE u (id INT PRIMARY KEY, v INT)").await.unwrap();
-    exec(&db, "INSERT INTO u (id, v) VALUES (1, 2)").await.unwrap();
-    let was = fingerprint(&db, "u");
-    let e = exec(&db, "ALTER TABLE u ALTER COLUMN v TYPE INT USING (v * 100)")
+    exec(&db, "INSERT INTO u (id, v) VALUES (1, 2), (2, 3)").await.unwrap();
+    exec(&db, "ALTER TABLE u ALTER COLUMN v TYPE INT USING (v * 100)").await.expect("USING");
+    exec(&db, "ALTER TABLE u ADD CONSTRAINT multiplied CHECK (v IN (200, 300))")
         .await
-        .expect_err("a USING transform was accepted and not run");
-    assert!(e.contains("USING"), "{e}");
-    assert_eq!(fingerprint(&db, "u"), was);
+        .expect("every value is the transform's");
     exec(&db, "ALTER TABLE u ALTER COLUMN v TYPE INT").await.expect("a same-type restatement");
+    shut(db, root);
+    let db = Arc::new(open(root).await);
+    exec(&db, "ALTER TABLE u ADD CONSTRAINT still_multiplied CHECK (v IN (200, 300))")
+        .await
+        .expect("after a reopen");
     shut(db, root);
 }
 

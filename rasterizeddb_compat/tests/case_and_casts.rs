@@ -147,13 +147,16 @@ async fn case_when_and_casts_work_where_an_orm_writes_them() {
     .await;
     check("where case", where_case, "unnamed,c");
 
-    for (label, sql) in [
-        ("alter type using still refused", "ALTER TABLE t ALTER COLUMN v TYPE INT USING (CASE WHEN v IS NULL THEN 0 ELSE v END)"),
-    ] {
-        if run(&pool, sql).await.is_ok() {
-            failures.push(format!("{}: now succeeds — upgrade this cell to assert its value", label));
-        }
-    }
+    // Promoted from "still refused": `USING` rewrites every row with the
+    // transform's value (`retype_using`), here a NULL made 0.
+    let wanted = one_text(&pool, "SELECT string_agg(coalesce(v, 0)::text, ',' ORDER BY id) AS s FROM t", "s").await;
+    let altered = run(&pool, "ALTER TABLE t ALTER COLUMN v TYPE INT USING (CASE WHEN v IS NULL THEN 0 ELSE v END)")
+        .await
+        .map(|_| String::new())
+        .map_err(|e| e.to_string());
+    check("alter type using", altered, "");
+    let got = one_text(&pool, "SELECT string_agg(v::text, ',' ORDER BY id) AS s FROM t", "s").await;
+    check("alter type using: values", got, &wanted.clone().unwrap_or_default());
     // A same-type restatement WITHOUT a transform stays accepted — sea-orm's
     // modify_column restates the type even when nothing changes.
     if let Err(e) = run(&pool, "ALTER TABLE t ALTER COLUMN v TYPE INT").await {

@@ -469,6 +469,48 @@ pub fn suffix_columns(expression: &str, columns: &[String], suffix: &str) -> Str
     out
 }
 
+/// `expression` with every reference to `column` replaced by `replacement`,
+/// read as [`suffix_columns`] reads them: not inside a string, not a function
+/// of that name, not a qualifier.
+pub fn replace_column(expression: &str, column: &str, replacement: &str) -> String {
+    let bytes = expression.as_bytes();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = String::with_capacity(expression.len() + replacement.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+            out.push_str(&expression[i..end]);
+            i = end;
+            continue;
+        }
+        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' || bytes[i] == b'"') && (i == 0 || !word(bytes[i - 1])) {
+            let (end, name) = if bytes[i] == b'"' {
+                let end = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+                (end, expression[i + 1..end.saturating_sub(1)].to_string())
+            } else {
+                let mut j = i;
+                while j < bytes.len() && word(bytes[j]) {
+                    j += 1;
+                }
+                (j, expression[i..j].to_string())
+            };
+            let rest = expression[end..].trim_start();
+            if name.eq_ignore_ascii_case(column) && !rest.starts_with('(') && !rest.starts_with('.') {
+                out.push_str(replacement);
+            } else {
+                out.push_str(&expression[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        let ch = expression[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// A predicate over a table's row that holds where one of `normalized`'s
 /// regular expressions has no answer this engine can vouch for (a locale
 /// class over non-ASCII text): the OR of `__check_regexp_uncertain` over
