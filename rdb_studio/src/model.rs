@@ -295,6 +295,87 @@ impl RowKey {
     }
 }
 
+/// One index of a table, as the table pane lists it.
+///
+/// Read from the `CREATE INDEX` statement each server prints for it, which is
+/// the one description both engines give in the same shape — see
+/// [`crate::dialect::parse_index_def`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexInfo {
+    pub name: String,
+    /// `btree`, `hash`, `gin`, … — the server's word, lower-cased.
+    pub method: String,
+    /// What is inside the index's parentheses, as written: column names, or an
+    /// expression such as `((doc->>'status'))`.
+    pub columns: String,
+    pub unique: bool,
+    /// What owns the index, which decides how — and whether — it can go.
+    pub owner: IndexOwner,
+    /// The whole statement the server printed, for the cases the fields above
+    /// flatten: a `WHERE`, an `INCLUDE`, an operator class.
+    pub definition: String,
+}
+
+impl IndexInfo {
+    /// The kind of index, in the words the dialog offers them by.
+    ///
+    /// A B-tree over `->>` is a *path* index: it is how a document field is
+    /// indexed, and listing it as a B-tree over an expression hides the one
+    /// fact anyone reading the list wants.
+    pub fn kind(&self) -> &str {
+        if self.columns.contains("->>") {
+            "path"
+        } else if self.columns.trim_start().starts_with('(') {
+            "expression"
+        } else {
+            &self.method
+        }
+    }
+}
+
+/// Who an index belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOwner {
+    /// Declared with `CREATE INDEX`; `DROP INDEX` removes it.
+    Declared,
+    /// Brought by a `UNIQUE` constraint, and removed with it.
+    Unique,
+    /// The primary key's, removed with `ALTER TABLE … DROP CONSTRAINT`.
+    Primary,
+}
+
+/// One partition of a hash-partitioned table, from `SHOW PARTITIONS`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionInfo {
+    pub pid: u64,
+    /// The `[lo, hi)` slice of the 64-bit hash space, in the hex the server
+    /// writes. Text because `hi` of the last partition is 2^64, which no
+    /// integer column holds.
+    pub lo: String,
+    pub hi: String,
+    pub location: String,
+    /// `unmaterialized` until a row first lands in it; then it has files.
+    pub state: String,
+    pub row_slots: u64,
+    pub total_bytes: u64,
+}
+
+impl PartitionInfo {
+    /// The share of the hash space this partition covers, as a fraction.
+    ///
+    /// Equal by construction at `CREATE` time, and the column that will show
+    /// it once partitions can be split; `None` when the bounds do not parse.
+    pub fn share(&self) -> Option<f64> {
+        let parse = |s: &str| u128::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        let (lo, hi) = (parse(&self.lo)?, parse(&self.hi)?);
+        (hi > lo).then(|| (hi - lo) as f64 / (1u128 << 64) as f64)
+    }
+
+    pub fn materialized(&self) -> bool {
+        self.state != "unmaterialized"
+    }
+}
+
 /// One edge of the schema map.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Relationship {
@@ -347,23 +428,149 @@ impl TableNode {
 }
 
 /// One runtime knob, as the configuration screen shows it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConfigEntry {
     pub section: String,
     pub key: String,
     pub value: String,
-    /// Whether a running server can change it. The screen greys out the rest
-    /// and says what flag to restart with instead of offering an edit that
-    /// would fail.
+    /// Whether a running server can change it.
     pub hot: bool,
+    /// Whether a change to a setting that is *not* hot can be saved for the
+    /// next start. PostgreSQL can for every `postmaster` setting, through
+    /// `ALTER SYSTEM`; RasterizedDB can from the build whose `SHOW CONFIG`
+    /// reports `pending`. Without it the screen shows the flag to restart
+    /// with instead of an edit that would be refused.
+    pub restart_settable: bool,
     pub set_with: String,
     pub help: String,
+    /// The values it takes, `|`-separated, `:N` marking a number — see
+    /// [`ConfigEntry::choices`]. Empty for a free number or text.
+    pub options: String,
+    /// The value saved for the next start, when there is one. PostgreSQL does
+    /// not say what it is, only that there is one: see `pending_restart`.
+    pub pending: String,
+    /// A change is saved and waits for a restart.
+    pub pending_restart: bool,
+    /// Where the running value came from, in the server's words: `default`,
+    /// `command line`, `saved`; PostgreSQL's `configuration file` and the rest.
+    pub source: String,
 }
 
 impl ConfigEntry {
     pub fn qualified(&self) -> String {
         format!("{}.{}", self.section, self.key)
     }
+
+    /// Whether the screen offers an edit at all.
+    pub fn editable(&self) -> bool {
+        self.hot || self.restart_settable
+    }
+
+    /// The values this setting takes, when it takes a fixed set.
+    ///
+    /// The server's `options` when it reports them. Until every server does,
+    /// two fallbacks keep the common cases a dropdown rather than a text box:
+    /// a few RasterizedDB keys whose grammar the help text spells out, and any
+    /// setting whose current value is a boolean, offered in the spelling it
+    /// already uses — `on|off` for `synchronous_commit`, `true|false` for
+    /// `filter.enabled` — so the current value is one of the choices.
+    pub fn choices(&self) -> Vec<ConfigChoice> {
+        let options = if !self.options.trim().is_empty() {
+            self.options.clone()
+        } else if let Some(known) = known_options(&self.qualified()) {
+            known.to_string()
+        } else {
+            match self.value.trim().to_ascii_lowercase().as_str() {
+                "true" | "false" => "true|false".to_string(),
+                "on" | "off" => "on|off".to_string(),
+                _ => return Vec::new(),
+            }
+        };
+        // An empty entry is a value, not a gap: PostgreSQL's
+        // `ssl_max_protocol_version` takes `''`, meaning no maximum, and lists
+        // it among its `enumvals`. Only repeats are dropped.
+        let mut seen = std::collections::HashSet::new();
+        options
+            .split('|')
+            .map(str::trim)
+            .filter(|o| seen.insert(o.to_string()))
+            .map(|o| match o.strip_suffix('N') {
+                Some(stem) if stem.ends_with(':') => ConfigChoice { stem: stem.to_string(), numeric: true },
+                _ => ConfigChoice { stem: o.to_string(), numeric: false },
+            })
+            .collect()
+    }
+}
+
+/// The RasterizedDB keys with a fixed grammar, for a server that does not
+/// report `options` itself. Removable once every server in use does.
+fn known_options(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "replication.compression" => "none|zstd:N|auto:zstd:N",
+        "replication.mode" => "async|sync|all|quorum:N",
+        "replication.conflict" => "abort|skip|last-writer-wins",
+        "index_snapshot.index_storage" => "rebuild|snapshot",
+        "vacuum.enabled" => "on|off",
+        _ => return None,
+    })
+}
+
+/// One value a setting takes. `numeric` ones are a stem and a number:
+/// `quorum:` and `2` are `quorum:2`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChoice {
+    pub stem: String,
+    pub numeric: bool,
+}
+
+impl ConfigChoice {
+    /// The value this choice and `number` make.
+    pub fn value(&self, number: &str) -> String {
+        if self.numeric {
+            format!("{}{}", self.stem, number.trim())
+        } else {
+            self.stem.clone()
+        }
+    }
+
+    /// Whether `value` is this choice, and with which number. A numeric
+    /// choice also takes its stem bare — `zstd` is `zstd:` with no level,
+    /// which the server reads as its default level.
+    pub fn matches(&self, value: &str) -> Option<String> {
+        let value = value.trim();
+        if !self.numeric {
+            return value.eq_ignore_ascii_case(&self.stem).then(String::new);
+        }
+        if value.eq_ignore_ascii_case(self.stem.trim_end_matches(':')) {
+            return Some(String::new());
+        }
+        let head = value.get(..self.stem.len())?;
+        let number = &value[self.stem.len()..];
+        (head.eq_ignore_ascii_case(&self.stem) && number.chars().all(|c| c.is_ascii_digit()))
+            .then(|| number.to_string())
+    }
+}
+
+impl std::fmt::Display for ConfigChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.numeric {
+            write!(f, "{}…", self.stem.trim_end_matches(':'))
+        } else if self.stem.is_empty() {
+            f.write_str("(none)")
+        } else {
+            f.write_str(&self.stem)
+        }
+    }
+}
+
+/// Which choice `value` is, and its number, or `None` for a value that is
+/// none of them — RasterizedDB's `vacuum.enabled` reads `per table` until
+/// one is picked, and that is shown rather than forced onto a choice.
+pub fn choice_of(choices: &[ConfigChoice], value: &str) -> Option<(usize, String)> {
+    choices
+        .iter()
+        .enumerate()
+        .find_map(|(at, c)| c.matches(value).map(|n| (at, n)))
 }
 
 /// A database on the server.

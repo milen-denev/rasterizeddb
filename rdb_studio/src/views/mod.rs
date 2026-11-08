@@ -45,7 +45,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             screen,
             // The scrim swallows clicks on what is behind it, which is what
             // makes the dialog modal rather than merely on top.
-            container(modal_view(modal, studio.flavor()))
+            container(modal_view(modal, studio))
                 .style(theme::scrim)
                 .width(Fill)
                 .height(Fill)
@@ -320,7 +320,9 @@ fn statusbar(studio: &Studio) -> Element<'_, Message> {
 // Modals
 // ---------------------------------------------------------------------------
 
-fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
+fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> {
+    let flavor = studio.flavor();
+    let pending = studio.modal_pending;
     let body: Element<'_, Message> = match modal {
         Modal::Confirm { title, body, .. } => column![
             dialog_title(title),
@@ -402,7 +404,7 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
                 v
             )),
             error_line(error),
-            dialog_actions("CREATE"),
+            dialog_actions("CREATE", pending),
         ]
         .spacing(12)
         .width(420)
@@ -437,13 +439,15 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
                 .font(theme::MONO)
                 .color(theme::TEXT_FAINT),
             error_line(error),
-            dialog_actions("ADD COLUMN"),
+            dialog_actions("ADD COLUMN", pending),
         ]
         .spacing(12)
         .width(560)
         .into(),
 
-        Modal::CreateTable { name, columns, error } => {
+        Modal::CreateIndex { table, index, error } => index_dialog(studio, table, index, error),
+
+        Modal::CreateTable { name, columns, partitioning, error } => {
             let options = crate::types::choices(flavor);
             let mut list = column![].spacing(8);
             for (index, col) in columns.iter().enumerate() {
@@ -526,9 +530,17 @@ fn modal_view(modal: &Modal, flavor: Flavor) -> Element<'_, Message> {
                 )),
                 section_label("COLUMNS"),
                 scrollable(list).height(Length::Fixed(260.0)).style(theme::scroller),
-                small_button("+ COLUMN", Some(Message::ModalAddColumn)),
+                row![
+                    small_button("+ COLUMN", Some(Message::ModalAddColumn)),
+                    text("Mark several columns PK for a composite primary key.")
+                        .size(10)
+                        .color(theme::TEXT_FAINT),
+                ]
+                .spacing(10)
+                .align_y(Center),
+                partition_section(flavor, columns, partitioning),
                 error_line(error),
-                dialog_actions("CREATE TABLE"),
+                dialog_actions("CREATE TABLE", pending),
             ]
             .spacing(12)
             .width(900)
@@ -551,20 +563,253 @@ fn dialog_title(title: impl Into<String>) -> Element<'static, Message> {
     .into()
 }
 
-fn dialog_actions(confirm: &'static str) -> Element<'static, Message> {
+/// Cancel and confirm. While the statement is with the server the confirm
+/// button says so and cannot be pressed again; cancel still works, and closes
+/// the dialog without waiting.
+fn dialog_actions(confirm: &'static str, pending: bool) -> Element<'static, Message> {
     row![
         Space::new().width(Fill),
         button(text("CANCEL").size(12).font(theme::MONO))
             .padding([7, 14])
             .style(theme::secondary)
             .on_press(Message::ModalCancel),
-        button(text(confirm).size(12).font(theme::MONO))
+        button(text(if pending { "RUNNING…" } else { confirm }).size(12).font(theme::MONO))
             .padding([7, 14])
             .style(theme::primary)
-            .on_press(Message::ModalSubmit),
+            .on_press_maybe((!pending).then_some(Message::ModalSubmit)),
     ]
     .spacing(8)
     .into()
+}
+
+/// A choice shown as a button that is lit while chosen — the column pickers
+/// of the index and partition key forms, where a pick list would hide what is
+/// already chosen. `order` is `Some` while chosen; a place in a key, from 1,
+/// is written in front of the label, and 0 lights it without a number.
+fn chip(label: &str, order: Option<usize>, on_press: Option<Message>) -> Element<'static, Message> {
+    let caption = match order {
+        Some(n) if n > 0 => format!("{} · {}", n, label),
+        _ => label.to_string(),
+    };
+    button(text(caption).size(11).font(theme::MONO))
+        .padding([4, 9])
+        .style(if order.is_some() { theme::primary } else { theme::secondary })
+        .on_press_maybe(on_press)
+        .into()
+}
+
+/// The partitioning half of the new-table dialog.
+///
+/// RasterizedDB only. PostgreSQL's `PARTITION BY HASH` creates a parent that
+/// holds nothing until each child is created with its modulus and remainder,
+/// which is a different act from this one and not what the checkbox would
+/// promise.
+fn partition_section<'a>(
+    flavor: Flavor,
+    columns: &'a [crate::app::NewColumn],
+    partitioning: &'a crate::app::Partitioning,
+) -> Element<'a, Message> {
+    use crate::app::PartitionEdit;
+    if flavor != Flavor::Rasterized {
+        return Space::new().height(0).into();
+    }
+    let enable = toggle("Partition by hash", partitioning.enabled, |v| {
+        Message::PartitionForm(PartitionEdit::Enabled(v))
+    });
+    if !partitioning.enabled {
+        return row![
+            enable,
+            text("spread rows over partitions by a key, so a statement fixing it touches one")
+                .size(10)
+                .color(theme::TEXT_FAINT),
+        ]
+        .spacing(10)
+        .align_y(Center)
+        .into();
+    }
+
+    let mut key = row![].spacing(6).align_y(Center);
+    let full = partitioning.key.len() >= crate::app::MAX_PARTITION_KEY;
+    for (at, column) in columns.iter().enumerate() {
+        if column.name.trim().is_empty() {
+            continue;
+        }
+        let order = partitioning.key.iter().position(|k| *k == at).map(|p| p + 1);
+        let press = (order.is_some() || !full).then_some(Message::PartitionForm(PartitionEdit::Key(at)));
+        key = key.push(chip(column.name.trim(), order, press));
+    }
+
+    column![
+        enable,
+        row![
+            text("KEY").size(10).font(theme::MONO).color(theme::TEXT_DIM).width(Length::Fixed(80.0)),
+            scrollable(key).direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(4).scroller_width(4)
+            )),
+        ]
+        .spacing(6)
+        .align_y(Center),
+        row![
+            text("PARTITIONS").size(10).font(theme::MONO).color(theme::TEXT_DIM).width(Length::Fixed(80.0)),
+            text_input("64", &partitioning.count)
+                .on_input(|v| Message::PartitionForm(PartitionEdit::Count(v)))
+                .padding([4, 6])
+                .size(12)
+                .font(theme::MONO)
+                .style(theme::input)
+                .width(Length::Fixed(78.0)),
+            text("1 to 2048; blank is the server's default").size(10).color(theme::TEXT_FAINT),
+        ]
+        .spacing(6)
+        .align_y(Center),
+        text(
+            "Up to three key columns, leading column first: a query fixing only the first still goes to one partition. Key columns are NOT NULL, of an integer, UUID, TEXT or VARCHAR type, and every PRIMARY KEY and UNIQUE must contain all of them. The key cannot be changed after the table is created."
+        )
+        .size(10)
+        .color(theme::TEXT_FAINT),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// The new-index dialog.
+fn index_dialog<'a>(
+    studio: &'a Studio,
+    table: &'a str,
+    index: &'a crate::app::NewIndex,
+    error: &'a Option<String>,
+) -> Element<'a, Message> {
+    use crate::app::{IndexEdit, IndexKind, IndexMethod};
+    let edit = Message::IndexForm;
+    let documents = studio.document_columns();
+
+    let mut kinds = row![].spacing(6);
+    for kind in IndexKind::ALL {
+        let usable = kind == IndexKind::Columns || !documents.is_empty();
+        kinds = kinds.push(chip(
+            kind.label(),
+            (index.kind == kind).then_some(0),
+            usable.then_some(edit(IndexEdit::Kind(kind))),
+        ));
+    }
+
+    let mut form = column![
+        dialog_title(format!("New index on {}", table)),
+        column![
+            text("Name").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+            text_input("derived from the table and columns", &index.name)
+                .on_input(move |v| edit(IndexEdit::Name(v)))
+                .padding([6, 8])
+                .size(13)
+                .font(theme::MONO)
+                .style(theme::input),
+        ]
+        .spacing(4),
+        column![
+            text("Over").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+            kinds,
+        ]
+        .spacing(4),
+    ]
+    .spacing(12);
+
+    match index.kind {
+        IndexKind::Columns => {
+            let mut picker = row![].spacing(6);
+            for column in &studio.columns {
+                let order = index.columns.iter().position(|c| *c == column.name).map(|p| p + 1);
+                picker = picker.push(chip(&column.name, order, Some(edit(IndexEdit::Column(column.name.clone())))));
+            }
+            form = form
+                .push(
+                    column![
+                        text("Columns, in key order").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+                        scrollable(picker).direction(scrollable::Direction::Horizontal(
+                            scrollable::Scrollbar::new().width(4).scroller_width(4)
+                        )),
+                    ]
+                    .spacing(4),
+                )
+                .push(
+                    column![
+                        text("Method").size(11).font(theme::MONO).color(theme::TEXT_DIM),
+                        row![
+                            pick_list(IndexMethod::ALL, Some(index.method), move |m| edit(IndexEdit::Method(m)))
+                                .padding([6, 8])
+                                .text_size(13)
+                                .width(Length::Fixed(160.0)),
+                            toggle("Unique", index.unique, move |v| edit(IndexEdit::Unique(v))),
+                        ]
+                        .spacing(16)
+                        .align_y(Center),
+                        text(index.method.help()).size(10).color(theme::TEXT_FAINT),
+                        text(if index.unique {
+                            "A unique index is a UNIQUE constraint: it refuses duplicates, and is removed by dropping the constraint."
+                        } else {
+                            ""
+                        })
+                        .size(10)
+                        .color(theme::TEXT_FAINT),
+                    ]
+                    .spacing(4),
+                );
+        }
+        IndexKind::Document | IndexKind::Path => {
+            let mut controls = row![
+                pick_list(documents.clone(), Some(index.document.clone()).filter(|d| !d.is_empty()), move |d| {
+                    edit(IndexEdit::Document(d))
+                })
+                .placeholder("jsonb column")
+                .padding([6, 8])
+                .text_size(13)
+                .width(Length::Fixed(200.0)),
+            ]
+            .spacing(10)
+            .align_y(Center);
+            let help = if index.kind == IndexKind::Document {
+                controls = controls.push(toggle("jsonb_path_ops", index.path_ops, move |v| {
+                    edit(IndexEdit::PathOps(v))
+                }));
+                if index.path_ops {
+                    "jsonb_path_ops: one item per value with its path; answers @> only, with fewer and more selective entries"
+                } else {
+                    "jsonb_ops: every key and value; answers @>, ?, ?| and ?&"
+                }
+            } else {
+                controls = controls.push(
+                    text_input("status   or   user.id", &index.path)
+                        .on_input(move |v| edit(IndexEdit::Path(v)))
+                        .padding([6, 8])
+                        .size(13)
+                        .font(theme::MONO)
+                        .style(theme::input)
+                        .width(Fill),
+                );
+                "a B-tree over the field's text (->>): answers =, ranges and LIKE 'prefix%' on that path; a missing field is NULL and matches nothing"
+            };
+            form = form.push(
+                column![
+                    text(if index.kind == IndexKind::Document { "Document" } else { "Document and path" })
+                        .size(11)
+                        .font(theme::MONO)
+                        .color(theme::TEXT_DIM),
+                    controls,
+                    text(help).size(10).color(theme::TEXT_FAINT),
+                ]
+                .spacing(4),
+            );
+        }
+    }
+
+    let preview = match crate::app::create_index_sql(table, index) {
+        Ok(sql) => format!("Will be written as:  {}", sql),
+        Err(reason) => format!("Not ready: {}", reason),
+    };
+    form.push(text(preview).size(11).font(theme::MONO).color(theme::TEXT_FAINT))
+        .push(error_line(error))
+        .push(dialog_actions("CREATE INDEX", studio.modal_pending))
+        .width(640)
+        .into()
 }
 
 fn error_line(error: &Option<String>) -> Element<'_, Message> {

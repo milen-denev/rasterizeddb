@@ -12,12 +12,26 @@
 //!
 //! The alternative, offering an edit box on everything and relaying the
 //! server's refusal, teaches a person that half the screen does not work.
+//!
+//! A cold setting is editable when the server can *save* it for its next
+//! start — PostgreSQL always can, through `ALTER SYSTEM`, and RasterizedDB can
+//! from the build whose `SHOW CONFIG` reports `pending`. Its button then says
+//! SAVE rather than APPLY, and the row says a restart is waiting until one
+//! happens, because a saved value that the running server is not using is
+//! exactly the state somebody forgets.
+//!
+//! # Choices, not spelling
+//!
+//! A setting with a fixed set of values is a dropdown, so nobody has to know
+//! whether this one is spelled `on` or `true`, or that a quorum is written
+//! `quorum:2`. A choice that carries a number gets a box for the number
+//! beside it. See [`ConfigEntry::choices`] for where the sets come from.
 
-use iced::widget::{Space, column, container, row, rule, text, text_input};
+use iced::widget::{Space, column, container, pick_list, row, rule, text, text_input};
 use iced::{Center, Element, Fill, Length};
 
 use crate::app::{Message, Studio};
-use crate::model::{ConfigEntry, Flavor};
+use crate::model::{ConfigChoice, ConfigEntry, Flavor, choice_of};
 use crate::theme;
 
 use super::{framed, small_button};
@@ -35,6 +49,8 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         .collect();
 
     let hot = matching.iter().filter(|e| e.hot).count();
+    let saved = matching.iter().filter(|e| e.restart_settable).count();
+    let waiting = matching.iter().filter(|e| e.pending_restart).count();
 
     let layout = super::GridLayout::new(studio, "config");
     let specs = vec![
@@ -102,9 +118,11 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             .style(theme::input)
             .width(Length::Fixed(260.0)),
         text(format!(
-            "{} settings · {} changeable while running",
+            "{} settings · {} changeable while running · {} changeable at restart{}",
             matching.len(),
-            hot
+            hot,
+            saved,
+            if waiting > 0 { format!(" · {} waiting for a restart", waiting) } else { String::new() },
         ))
         .size(11)
         .font(theme::MONO)
@@ -117,7 +135,7 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
 
     let body = column![
         toolbar,
-        note(studio.flavor()),
+        note(studio.flavor(), studio.config.iter().any(|e| e.restart_settable)),
         rule::horizontal(1).style(theme::hairline),
         sections,
     ]
@@ -126,16 +144,21 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
     framed("CONFIGURATION", None, body.into())
 }
 
-fn note(flavor: Flavor) -> Element<'static, Message> {
-    let text_body = match flavor {
-        Flavor::Rasterized =>
+fn note(flavor: Flavor, saves_for_restart: bool) -> Element<'static, Message> {
+    let text_body = match (flavor, saves_for_restart) {
+        (Flavor::Rasterized, true) =>
+            "APPLY changes a setting now, through the subsystem that owns it. SAVE keeps a \
+             restart-only setting for the next start; until then the row says a restart is \
+             waiting. A flag given on the server's command line wins over a saved value.",
+        (Flavor::Rasterized, false) =>
             "A change is applied by the subsystem that owns it — the filter surface, the \
              replication surface — so it takes effect immediately and is not written to disk. \
-             It is gone after a restart unless the matching flag is added too.",
-        Flavor::Postgres =>
+             It is gone after a restart unless the matching flag is added too. Restart-only \
+             settings are set by the flags shown beside them: this server cannot save them.",
+        (Flavor::Postgres, _) =>
             "A change is written with ALTER SYSTEM SET and followed by pg_reload_conf(), so it \
-             lands in postgresql.auto.conf and survives a restart. Settings whose context is \
-             postmaster still need one.",
+             lands in postgresql.auto.conf and survives a restart. A postmaster setting is \
+             saved the same way and waits for the restart.",
     };
     container(text(text_body).size(11).color(theme::TEXT_DIM))
         .padding(8)
@@ -153,29 +176,18 @@ fn line<'a>(
     let pending = studio.config_edits.get(&key);
     let dirty = pending.is_some_and(|value| value != &entry.value);
 
-    let control: Element<'_, Message> = if entry.hot {
+    let control: Element<'_, Message> = if entry.editable() {
         let value = pending.cloned().unwrap_or_else(|| entry.value.clone());
-        let apply_key = key.clone();
-        container(
-            row![
-                text_input("", &value)
-                    .on_input({
-                        let key = key.clone();
-                        move |v| Message::ConfigEdit(key.clone(), v)
-                    })
-                    .on_submit(Message::ApplyConfig(key.clone()))
-                    .padding([4, 6])
-                    .size(12)
-                    .font(theme::MONO)
-                    .style(theme::input)
-                    .width(Fill),
-                small_button("APPLY", dirty.then_some(Message::ApplyConfig(apply_key))),
-            ]
-            .spacing(6)
-            .align_y(Center),
-        )
-        .padding([2, 6])
-        .into()
+        let editor = value_editor(&key, entry, &value);
+        let button = small_button(
+            if entry.hot { "APPLY" } else { "SAVE" },
+            dirty.then_some(Message::ApplyConfig(key.clone())),
+        );
+        let mut cell = column![row![editor, button].spacing(6).align_y(Center)].spacing(3);
+        if !entry.hot {
+            cell = cell.push(restart_line(entry));
+        }
+        container(cell).padding([2, 6]).into()
     } else {
         container(
             row![
@@ -200,7 +212,7 @@ fn line<'a>(
                 text(&entry.key)
                     .size(12)
                     .font(theme::MONO)
-                    .color(if entry.hot { theme::TEXT } else { theme::TEXT_DIM })
+                    .color(if entry.editable() { theme::TEXT } else { theme::TEXT_DIM })
                     .width(Fill),
             )
             .padding([5, 6])
@@ -218,4 +230,137 @@ fn line<'a>(
         ],
     )
     .into()
+}
+
+/// The edit for one value: a dropdown when the setting takes a fixed set,
+/// with a number box beside a choice that carries one, and a text box
+/// otherwise.
+fn value_editor<'a>(key: &str, entry: &ConfigEntry, value: &str) -> Element<'a, Message> {
+    let choices = entry.choices();
+    if choices.is_empty() {
+        let key = key.to_string();
+        return text_input("", value)
+            .on_input({
+                let key = key.clone();
+                move |v| Message::ConfigEdit(key.clone(), v)
+            })
+            .on_submit(Message::ApplyConfig(key))
+            .padding([4, 6])
+            .size(12)
+            .font(theme::MONO)
+            .style(theme::input)
+            .width(Fill)
+            .into();
+    }
+
+    let current = choice_of(&choices, value);
+    let selected: Option<ConfigChoice> = current.as_ref().map(|(at, _)| choices[*at].clone());
+    let number = current.as_ref().map(|(_, n)| n.clone()).unwrap_or_default();
+
+    // Switching to a choice that takes a number keeps the number already
+    // there, or starts at 1 — the smallest level, the smallest quorum — so
+    // the value is complete the moment it is picked.
+    let picked_number = if number.is_empty() { "1".to_string() } else { number.clone() };
+    let picker = pick_list(choices, selected.clone(), {
+        let key = key.to_string();
+        move |choice: ConfigChoice| Message::ConfigEdit(key.clone(), choice.value(&picked_number))
+    })
+    // A value that is none of the choices is shown, not replaced:
+    // `vacuum.enabled` reads `per table` until somebody picks one.
+    .placeholder(value.to_string())
+    .padding([4, 6])
+    .text_size(12)
+    .width(Fill);
+
+    match selected.filter(|c| c.numeric) {
+        None => picker.into(),
+        Some(choice) => row![
+            picker,
+            text_input("n", &number)
+                .on_input({
+                    let key = key.to_string();
+                    move |v| {
+                        let digits: String = v.chars().filter(char::is_ascii_digit).collect();
+                        Message::ConfigEdit(key.clone(), choice.value(&digits))
+                    }
+                })
+                .on_submit(Message::ApplyConfig(key.to_string()))
+                .padding([4, 6])
+                .size(12)
+                .font(theme::MONO)
+                .style(theme::input)
+                .width(Length::Fixed(56.0)),
+        ]
+        .spacing(4)
+        .align_y(Center)
+        .into(),
+    }
+}
+
+/// What a restart-only setting is waiting for, under its edit.
+fn restart_line(entry: &ConfigEntry) -> Element<'static, Message> {
+    let mut line = row![super::pill("RESTART", theme::TEXT_FAINT)].spacing(6).align_y(Center);
+    let (message, colour) = if entry.pending_restart {
+        (
+            if entry.pending.is_empty() {
+                "a saved change is waiting for a restart".to_string()
+            } else {
+                format!("saved: {} — waiting for a restart", entry.pending)
+            },
+            theme::WARN,
+        )
+    } else {
+        ("takes effect at the next start".to_string(), theme::TEXT_FAINT)
+    };
+    line = line.push(text(message).size(10).font(theme::MONO).color(colour));
+    if entry.source != "command line" {
+        return line.into();
+    }
+    // Its own line: beside the status it is squeezed into a column a word
+    // wide, and it is the one note on the row that says the save is moot.
+    column![
+        line,
+        text("set on the server's command line, which wins over a saved value: remove the flag for a save to take effect")
+            .size(10)
+            .color(theme::WARN)
+            .width(Fill),
+    ]
+    .spacing(2)
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind of row: a dropdown, a dropdown with a number, a text box,
+    /// a saved restart-only value waiting, and one the server cannot save.
+    #[test]
+    fn every_kind_of_setting_renders() {
+        let (mut studio, _) = Studio::new(None);
+        let row = |section: &str, key: &str, value: &str, hot: bool| ConfigEntry {
+            section: section.into(),
+            key: key.into(),
+            value: value.into(),
+            hot,
+            ..ConfigEntry::default()
+        };
+        studio.config = vec![
+            row("wal", "synchronous_commit", "on", true),
+            row("replication", "mode", "quorum:2", true),
+            row("replication", "compression", "auto:zstd:1", true),
+            row("vacuum", "enabled", "per table", true),
+            row("wal", "writer_delay_ms", "200", true),
+            ConfigEntry {
+                restart_settable: true,
+                pending: "32000".into(),
+                pending_restart: true,
+                source: "command line".into(),
+                ..row("server", "batch_size", "10000", false)
+            },
+            row("cache", "enabled", "false", false),
+        ];
+        studio.config_edits.insert("replication.mode".into(), "all".into());
+        let _ = view(&studio);
+    }
 }

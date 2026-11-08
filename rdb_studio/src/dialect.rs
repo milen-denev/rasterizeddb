@@ -33,9 +33,9 @@
 //! come back empty rather than zero.
 
 use crate::model::{
-    BackupEntry, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, PeerStatus, Relationship,
-    RestoreReport, RestoreTarget, Stat, StatementRecord, StatementShape, StorageLocation,
-    TableInfo, TablePlacement,
+    BackupEntry, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner,
+    PartitionInfo, PeerStatus, Relationship, RestoreReport, RestoreTarget, Stat, StatementRecord,
+    StatementShape, StorageLocation, TableInfo, TablePlacement,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,6 +72,51 @@ pub fn columns_sql(flavor: Flavor, table: &str) -> String {
         Flavor::Rasterized => format!("SHOW COLUMNS FROM {}", quote_ident(table)),
         Flavor::Postgres => PG_COLUMNS.replace("$TABLE$", &quote_literal(table)),
     }
+}
+
+/// What to send for one table's indexes.
+///
+/// Both engines answer `pg_indexes`, and both print each index as the
+/// `CREATE INDEX` that would make it, so the list is one parser over one
+/// shape. PostgreSQL also says which constraint owns each index; RasterizedDB's
+/// `pg_indexes` has no such column, and [`parse_indexes`] works it out from the
+/// definition instead.
+pub fn indexes_sql(flavor: Flavor, table: &str) -> String {
+    match flavor {
+        Flavor::Rasterized => format!(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = {}",
+            quote_literal(table)
+        ),
+        Flavor::Postgres => PG_INDEXES.replace("$TABLE$", &quote_literal(table)),
+    }
+}
+
+/// What to send for a partitioned table's partitions. RasterizedDB only: a
+/// PostgreSQL partitioned table's children are tables of their own, and are
+/// listed as such.
+pub fn partitions_sql(table: &str) -> String {
+    format!("SHOW PARTITIONS {}", quote_ident(table))
+}
+
+/// RasterizedDB's audit of one table's indexes against its rows.
+pub fn index_check_sql(table: &str) -> String {
+    format!("SELECT rdb_index_check({})", quote_literal(table))
+}
+
+/// Removes an index. Only for [`IndexOwner::Declared`]: an index a constraint
+/// owns goes with the constraint, and both servers refuse `DROP INDEX` of one
+/// (RasterizedDB from fc3849c; before it, it answered success and kept it).
+pub fn drop_index_sql(index: &str) -> String {
+    format!("DROP INDEX {}", quote_ident(index))
+}
+
+/// Removes a `UNIQUE` or `PRIMARY KEY` constraint and the index it brought.
+pub fn drop_constraint_sql(table: &str, constraint: &str) -> String {
+    format!(
+        "ALTER TABLE {} DROP CONSTRAINT {}",
+        quote_ident(table),
+        quote_ident(constraint)
+    )
 }
 
 /// What to send for the relationship graph.
@@ -296,7 +341,11 @@ LIMIT 200";
 /// the tab is closed, so the persistent form is used and the reload is chained
 /// onto it.
 pub fn set_config_sql(flavor: Flavor, entry: &ConfigEntry, value: &str) -> Result<String, String> {
-    if !entry.hot {
+    // A restart-only setting goes through the same statement: RasterizedDB's
+    // `SET CONFIG` saves one for the next start, and `ALTER SYSTEM` is how
+    // PostgreSQL always saves; the reload is then what sets its
+    // `pending_restart`, which is how the screen learns the change is waiting.
+    if !entry.editable() {
         return Err(format!(
             "{} is fixed at start-up on this server. Set it with: {}",
             entry.qualified(),
@@ -1215,6 +1264,185 @@ pub fn parse_columns(grid: &Grid) -> Vec<ColumnInfo> {
         .collect()
 }
 
+/// One table's indexes, from [`indexes_sql`].
+///
+/// `primary_columns` is the table's primary key as `SHOW COLUMNS` flags it,
+/// used only against RasterizedDB, whose `pg_indexes` does not say which
+/// index is the key's. There a unique index is the primary key's when it is
+/// named `<table>_pkey`, as the engine names it, or covers exactly the flagged
+/// columns. Erring towards "primary" only hides a button; erring the other way
+/// offers one the server answers with success and ignores.
+pub fn parse_indexes(grid: &Grid, primary_columns: &[&str]) -> Vec<IndexInfo> {
+    let says_owner = grid.column_index("constraint_type").is_some();
+    (0..grid.rows.len())
+        .map(|row| {
+            let name = grid.value(row, "indexname").unwrap_or_default().to_string();
+            let definition = grid.value(row, "indexdef").unwrap_or_default().to_string();
+            let (unique, method, columns) = parse_index_def(&definition)
+                .unwrap_or_else(|| (false, String::new(), String::new()));
+            let owner = if says_owner {
+                match grid.value(row, "constraint_type").unwrap_or_default() {
+                    "primary" => IndexOwner::Primary,
+                    "unique" => IndexOwner::Unique,
+                    _ => IndexOwner::Declared,
+                }
+            } else if !unique {
+                IndexOwner::Declared
+            } else if name.ends_with("_pkey") || same_columns(&columns, primary_columns) {
+                IndexOwner::Primary
+            } else {
+                IndexOwner::Unique
+            };
+            IndexInfo { name, method, columns, unique, owner, definition }
+        })
+        .collect()
+}
+
+/// Whether an index's column list is exactly `wanted`, in any order.
+fn same_columns(columns: &str, wanted: &[&str]) -> bool {
+    if wanted.is_empty() {
+        return false;
+    }
+    let mut have: Vec<String> = columns
+        .split(',')
+        .map(|c| c.trim().trim_matches('"').to_ascii_lowercase())
+        .collect();
+    let mut want: Vec<String> = wanted.iter().map(|c| c.to_ascii_lowercase()).collect();
+    have.sort();
+    want.sort();
+    have == want
+}
+
+/// Reads `CREATE [UNIQUE] INDEX <name> ON <table> USING <method> (<columns>) …`
+/// into whether it is unique, the method, and what is inside the parentheses.
+///
+/// A scan rather than a split, because every part of this can hold the words
+/// and characters a split would cut on: a quoted name containing ` USING `, a
+/// path `((doc->>'a(b'))` with a bracket inside a literal, an operator class
+/// after the column. Quotes are skipped whole and brackets counted, so only a
+/// top-level `USING` and its own closing bracket end anything. `None` for a
+/// definition not in this shape.
+pub fn parse_index_def(definition: &str) -> Option<(bool, String, String)> {
+    let unique = definition
+        .trim_start()
+        .get(..19)
+        .is_some_and(|head| head.eq_ignore_ascii_case("CREATE UNIQUE INDEX"));
+
+    let bytes = definition.as_bytes();
+    let mut i = 0;
+    let mut using = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'') => i = skip_quoted(bytes, i, quote),
+            b'(' => return None,
+            _ if is_word_at(bytes, i, b"USING") => {
+                using = Some(i + 5);
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut i = using?;
+
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let method_start = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let method = definition[method_start..i].to_ascii_lowercase();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+
+    let open = i;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'"' | b'\'') => {
+                i = skip_quoted(bytes, i, quote);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let columns = definition[open + 1..i].trim().to_string();
+                    return Some((unique, method, columns));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index just past the quote that closes the one opening at `start`. A
+/// doubled quote is an escaped one, in both quote styles.
+fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if bytes.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Whether `word` stands alone at `at`, case-insensitively: `USING`, but not
+/// the tail of `REUSING` or the head of `USINGS`.
+fn is_word_at(bytes: &[u8], at: usize, word: &[u8]) -> bool {
+    let boundary = |b: Option<&u8>| b.is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+    bytes.get(at..at + word.len()).is_some_and(|w| w.eq_ignore_ascii_case(word))
+        && boundary(at.checked_sub(1).and_then(|p| bytes.get(p)))
+        && boundary(bytes.get(at + word.len()))
+}
+
+/// A partitioned table's partitions, from [`partitions_sql`].
+pub fn parse_partitions(grid: &Grid) -> Vec<PartitionInfo> {
+    (0..grid.rows.len())
+        .map(|row| PartitionInfo {
+            pid: grid.number(row, "pid").unwrap_or(0),
+            lo: grid.value(row, "lo").unwrap_or_default().to_string(),
+            hi: grid.value(row, "hi").unwrap_or_default().to_string(),
+            location: grid.value(row, "location").unwrap_or_default().to_string(),
+            state: grid.value(row, "state").unwrap_or_default().to_string(),
+            row_slots: grid.number(row, "row_slots").unwrap_or(0),
+            total_bytes: grid.number(row, "total_bytes").unwrap_or(0),
+        })
+        .collect()
+}
+
+/// `rdb_index_check`'s one row, as a status line.
+///
+/// The `result` column is the verdict and already says what was not compared;
+/// the counts in front of it are what makes "clean" mean something.
+pub fn index_check_summary(grid: &Grid) -> String {
+    if grid.rows.is_empty() {
+        return "the index check returned nothing".to_string();
+    }
+    let field = |name: &str| grid.value(0, name).unwrap_or("?").to_string();
+    format!(
+        "{}: {} rows checked against {} index entries, {} missing, {} filter misses — {}",
+        field("relation"),
+        field("rows_checked"),
+        field("index_entries"),
+        field("missing_entries"),
+        field("filter_misses"),
+        field("result"),
+    )
+}
+
 pub fn parse_relationships(grid: &Grid) -> Vec<Relationship> {
     (0..grid.rows.len())
         .map(|row| Relationship {
@@ -1229,17 +1457,90 @@ pub fn parse_relationships(grid: &Grid) -> Vec<Relationship> {
         .collect()
 }
 
+/// The configuration, from either server.
+///
+/// `options`, `pending` and `source` are read when present and empty when
+/// not, so a server that predates them still lists everything. A RasterizedDB
+/// server that reports `pending` can save a restart-only setting for its next
+/// start; one that does not cannot, and its restart-only rows stay read-only.
 pub fn parse_config(grid: &Grid) -> Vec<ConfigEntry> {
+    let saves_for_restart = grid.column_index("pending").is_some();
     (0..grid.rows.len())
-        .map(|row| ConfigEntry {
-            section: grid.value(row, "section").unwrap_or_default().to_string(),
-            key: grid.value(row, "key").unwrap_or_default().to_string(),
-            value: grid.value(row, "value").unwrap_or_default().to_string(),
-            hot: grid.flag(row, "hot_reload").unwrap_or(false),
-            set_with: grid.value(row, "set_with").unwrap_or_default().to_string(),
-            help: grid.value(row, "help").unwrap_or_default().to_string(),
+        .map(|row| {
+            // One possible value is a fixed setting, whatever else the server
+            // can save: `wal.enabled` reads `fixed: always on` with options
+            // `true`, and a SAVE button there would offer a choice of one.
+            let fixed = grid
+                .value(row, "options")
+                .is_some_and(|o| !o.trim().is_empty() && !o.contains('|'));
+            let section = grid.value(row, "section").unwrap_or_default().to_string();
+            let key = grid.value(row, "key").unwrap_or_default().to_string();
+            let value = config_value(&section, &key, grid.value(row, "value").unwrap_or_default());
+            let hot = grid.flag(row, "hot_reload").unwrap_or(false);
+            let pending = grid.value(row, "pending").unwrap_or_default().to_string();
+            ConfigEntry {
+                hot,
+                restart_settable: !hot
+                    && !fixed
+                    && grid.flag(row, "restart_settable").unwrap_or(saves_for_restart),
+                set_with: grid.value(row, "set_with").unwrap_or_default().to_string(),
+                help: grid.value(row, "help").unwrap_or_default().to_string(),
+                options: grid.value(row, "options").unwrap_or_default().to_string(),
+                pending_restart: grid.flag(row, "pending_restart").unwrap_or(!pending.is_empty()),
+                pending,
+                source: grid.value(row, "source").unwrap_or_default().to_string(),
+                section,
+                key,
+                value,
+            }
         })
         .collect()
+}
+
+/// A setting's value in the syntax `SET CONFIG` takes it in.
+///
+/// Today's RasterizedDB prints `replication.compression`, `.mode` and
+/// `.conflict` with Rust's debug formatting — `Compression { mode: Auto,
+/// codec: Zstd, level: 1, … }`, `Quorum(2)`, `LastWriterWins` — which no
+/// statement accepts back. The server side is being fixed to print them
+/// properly; until then this reads the debug form back into the one a
+/// dropdown can match. Anything already in the right form passes through.
+pub fn config_value(section: &str, key: &str, value: &str) -> String {
+    let value = value.trim();
+    if section != "replication" || !value.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return value.to_string();
+    }
+    match key {
+        "compression" => {
+            let field = |name: &str| {
+                value
+                    .split(['{', ',', '}'])
+                    .filter_map(|part| part.split_once(':'))
+                    .find(|(k, _)| k.trim() == name)
+                    .map(|(_, v)| v.trim().to_ascii_lowercase())
+            };
+            match (field("mode"), field("codec"), field("level")) {
+                (Some(mode), Some(codec), level) => {
+                    let level = level.map(|l| format!(":{}", l)).unwrap_or_default();
+                    match (mode.as_str(), codec.as_str()) {
+                        ("off", _) | (_, "none") => "none".to_string(),
+                        ("auto", codec) => format!("auto:{}{}", codec, level),
+                        (_, codec) => format!("{}{}", codec, level),
+                    }
+                }
+                _ => value.to_string(),
+            }
+        }
+        "mode" => match value.strip_prefix("Quorum(").and_then(|r| r.strip_suffix(')')) {
+            Some(n) => format!("quorum:{}", n),
+            None => value.to_ascii_lowercase(),
+        },
+        "conflict" => match value {
+            "LastWriterWins" => "last-writer-wins".to_string(),
+            other => other.to_ascii_lowercase(),
+        },
+        _ => value.to_string(),
+    }
 }
 
 pub fn parse_databases(grid: &Grid) -> Vec<DatabaseInfo> {
@@ -1478,6 +1779,27 @@ LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 WHERE a.attrelid = $TABLE$::regclass AND a.attnum > 0
 ORDER BY a.attnum";
 
+/// One table's indexes. Column names match the RasterizedDB `pg_indexes`
+/// query, plus `constraint_type`, which that side cannot answer.
+///
+/// The constraint is matched on both its index and its own table: a foreign
+/// key records the *referenced* table's index in `conindid`, so without the
+/// `contype` filter a self-referencing table would list its primary key twice.
+const PG_INDEXES: &str = "\
+SELECT
+  ic.relname::text                                AS indexname,
+  pg_get_indexdef(ix.indexrelid)                  AS indexdef,
+  CASE con.contype
+    WHEN 'p' THEN 'primary' WHEN 'u' THEN 'unique' WHEN 'x' THEN 'exclusion'
+    ELSE '' END                                   AS constraint_type
+FROM pg_index ix
+JOIN pg_class ic ON ic.oid = ix.indexrelid
+LEFT JOIN pg_constraint con
+  ON con.conindid = ix.indexrelid AND con.conrelid = ix.indrelid
+ AND con.contype IN ('p', 'u', 'x')
+WHERE ix.indrelid = $TABLE$::regclass
+ORDER BY ic.relname";
+
 /// The relationship graph. `json` edges have no PostgreSQL equivalent — a
 /// `jsonb` column is one value, not a reference — so only `fk` edges appear.
 const PG_SCHEMA_MAP: &str = "\
@@ -1517,11 +1839,18 @@ SELECT
   (context NOT IN ('internal','postmaster'))::text AS hot_reload,
   CASE context
     WHEN 'internal'   THEN 'compiled in; not settable'
-    WHEN 'postmaster' THEN 'postgresql.conf, then restart'
+    WHEN 'postmaster' THEN 'ALTER SYSTEM SET, then restart'
     WHEN 'sighup'     THEN 'ALTER SYSTEM SET, then pg_reload_conf()'
     ELSE 'ALTER SYSTEM SET, then pg_reload_conf()'
   END                                              AS set_with,
-  coalesce(short_desc, '')                         AS help
+  coalesce(short_desc, '')                         AS help,
+  CASE vartype
+    WHEN 'bool' THEN 'on|off'
+    WHEN 'enum' THEN array_to_string(enumvals, '|')
+    ELSE '' END                                    AS options,
+  (context = 'postmaster')::text                   AS restart_settable,
+  pending_restart::text                            AS pending_restart,
+  coalesce(source, '')                             AS source
 FROM pg_settings
 ORDER BY category, name";
 
@@ -1544,6 +1873,120 @@ ORDER BY d.datname";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- indexes ------------------------------------------------------------
+
+    fn index_grid(columns: &[&str], rows: &[&[&str]]) -> Grid {
+        Grid {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows: rows
+                .iter()
+                .map(|r| r.iter().map(|v| Some(v.to_string())).collect())
+                .collect(),
+            ..Grid::default()
+        }
+    }
+
+    /// Both servers' definitions, as each prints them, including the shapes a
+    /// split on spaces or brackets gets wrong.
+    #[test]
+    fn an_index_definition_is_read_past_quotes_and_brackets() {
+        let read = |d: &str| parse_index_def(d).unwrap();
+        assert_eq!(
+            read("CREATE INDEX orders_cs ON public.orders USING btree (customer_id, placed_at)"),
+            (false, "btree".into(), "customer_id, placed_at".into())
+        );
+        assert_eq!(
+            read("CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)"),
+            (true, "btree".into(), "id".into())
+        );
+        assert_eq!(
+            read("CREATE INDEX o ON public.orders USING btree (((doc->>'status')))"),
+            (false, "btree".into(), "((doc->>'status'))".into())
+        );
+        assert_eq!(
+            read("CREATE INDEX g ON public.orders USING gin (doc jsonb_path_ops)"),
+            (false, "gin".into(), "doc jsonb_path_ops".into())
+        );
+        // A bracket inside a literal does not close anything.
+        assert_eq!(
+            read("CREATE INDEX p ON t USING btree (((doc->>'a)(b')))"),
+            (false, "btree".into(), "((doc->>'a)(b'))".into())
+        );
+        // ` USING ` inside a quoted name is part of the name.
+        assert_eq!(
+            read(r#"CREATE INDEX "x USING hash (y)" ON public.t USING btree ("a b")"#),
+            (false, "btree".into(), r#""a b""#.into())
+        );
+        // A trailing WHERE stays out of the columns.
+        assert_eq!(
+            read("CREATE UNIQUE INDEX u ON public.t USING btree (email) WHERE (deleted_at IS NULL)").2,
+            "email"
+        );
+        assert!(parse_index_def("CREATE INDEX reusing_idx ON t (a)").is_none());
+        assert!(parse_index_def("").is_none());
+    }
+
+    /// RasterizedDB's `pg_indexes` does not say which index is the key's; the
+    /// parser must, because offering DROP CONSTRAINT on it reports success and
+    /// keeps the key.
+    #[test]
+    fn a_rasterized_primary_key_index_is_told_from_a_unique_one() {
+        let grid = index_grid(
+            &["indexname", "indexdef"],
+            &[
+                &["orders_pkey", "CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id)"],
+                &["orders_email_key", "CREATE UNIQUE INDEX orders_email_key ON public.orders USING btree (email)"],
+                &["by_customer", "CREATE INDEX by_customer ON public.orders USING hash (customer_id)"],
+                &["k", "CREATE UNIQUE INDEX k ON public.assets USING btree (tenant_id, asset_id)"],
+            ],
+        );
+        let owners: Vec<IndexOwner> = parse_indexes(&grid, &["id"]).iter().map(|i| i.owner).collect();
+        assert_eq!(
+            owners,
+            [IndexOwner::Primary, IndexOwner::Unique, IndexOwner::Declared, IndexOwner::Unique]
+        );
+        // Covering exactly the flagged key columns, under any name.
+        let flagged = parse_indexes(&grid, &["asset_id", "tenant_id"]);
+        assert_eq!(flagged[3].owner, IndexOwner::Primary);
+        assert_eq!(flagged[2].kind(), "hash");
+    }
+
+    /// PostgreSQL says who owns each index, and that is believed over the
+    /// name: a `CREATE UNIQUE INDEX` there is an index, not a constraint.
+    #[test]
+    fn a_postgres_index_owner_comes_from_its_constraint() {
+        let grid = index_grid(
+            &["indexname", "indexdef", "constraint_type"],
+            &[
+                &["t_pkey", "CREATE UNIQUE INDEX t_pkey ON public.t USING btree (id)", "primary"],
+                &["t_u", "CREATE UNIQUE INDEX t_u ON public.t USING btree (a)", ""],
+                &["t_c", "CREATE UNIQUE INDEX t_c ON public.t USING btree (b)", "unique"],
+                &["t_p", "CREATE INDEX t_p ON public.t USING btree (((doc ->> 'k'::text)))", ""],
+            ],
+        );
+        let indexes = parse_indexes(&grid, &[]);
+        let owners: Vec<IndexOwner> = indexes.iter().map(|i| i.owner).collect();
+        assert_eq!(owners, [IndexOwner::Primary, IndexOwner::Declared, IndexOwner::Unique, IndexOwner::Declared]);
+        assert_eq!(indexes[3].kind(), "path");
+    }
+
+    #[test]
+    fn a_partition_share_reads_the_whole_hash_space() {
+        let p = |lo: &str, hi: &str| PartitionInfo {
+            pid: 0,
+            lo: lo.into(),
+            hi: hi.into(),
+            location: String::new(),
+            state: "unmaterialized".into(),
+            row_slots: 0,
+            total_bytes: 0,
+        };
+        // The last partition's `hi` is 2^64, which no u64 holds.
+        assert_eq!(p("0xe000000000000000", "0x10000000000000000").share(), Some(0.125));
+        assert_eq!(p("0x0000000000000000", "0x10000000000000000").share(), Some(1.0));
+        assert_eq!(p("junk", "0x1").share(), None);
+    }
 
     // -- storage placement -----------------------------------------------
 
@@ -1962,9 +2405,107 @@ mod tests {
             hot: false,
             set_with: "--batch-size N (restart)".into(),
             help: String::new(),
+            ..ConfigEntry::default()
         };
         let error = set_config_sql(Flavor::Rasterized, &entry, "32000").unwrap_err();
         assert!(error.contains("--batch-size"), "the error must say what to do instead");
+
+        // A server that can save it for the next start is sent the change.
+        let saved = ConfigEntry { restart_settable: true, ..entry };
+        assert_eq!(
+            set_config_sql(Flavor::Rasterized, &saved, "32000").unwrap(),
+            "SET CONFIG server.batch_size = '32000'"
+        );
+    }
+
+    /// A server that saves startup settings makes its restart-only rows
+    /// editable, except one with a single possible value.
+    #[test]
+    fn a_saving_server_makes_restart_rows_editable_but_not_fixed_ones() {
+        let grid = Grid {
+            columns: ["section", "key", "value", "hot_reload", "set_with", "help", "pending", "options", "source"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            rows: [
+                ["server", "batch_size", "10000", "f", "--batch-size N (restart)", "", "20000", "", "default"],
+                ["wal", "enabled", "true", "f", "fixed: always on", "", "", "true", "default"],
+                ["cache", "enabled", "false", "f", "--enable-cache BOOL (restart)", "", "", "true|false", "command line"],
+                ["wal", "synchronous_commit", "on", "t", "", "", "", "on|off", ""],
+            ]
+            .iter()
+            .map(|r| r.iter().map(|v| Some(v.to_string())).collect())
+            .collect(),
+            ..Grid::default()
+        };
+        let config = parse_config(&grid);
+        assert!(config[0].restart_settable && config[0].pending_restart);
+        assert_eq!(config[0].pending, "20000");
+        assert!(!config[1].editable(), "a choice of one is fixed");
+        assert!(config[2].restart_settable && !config[2].pending_restart);
+        assert_eq!(config[2].source, "command line");
+        assert!(config[3].hot && !config[3].restart_settable);
+        // A server without `pending` cannot save, so nothing cold is editable.
+        let old = Grid { columns: grid.columns[..6].to_vec(), ..grid };
+        assert!(parse_config(&old).iter().filter(|e| !e.hot).all(|e| !e.editable()));
+    }
+
+    /// Today's RasterizedDB prints three replication settings as Rust debug
+    /// output. Read back as the values `SET CONFIG` takes, a dropdown can show
+    /// which one is current; left alone, none of its choices would match.
+    #[test]
+    fn a_debug_printed_setting_is_read_as_its_set_syntax() {
+        let read = |key: &str, value: &str| config_value("replication", key, value);
+        assert_eq!(
+            read("compression", "Compression { mode: Auto, codec: Zstd, level: 1, min_bytes: 512, min_ratio: 0.9 }"),
+            "auto:zstd:1"
+        );
+        assert_eq!(read("compression", "Compression { mode: Always, codec: Zstd, level: 3, min_bytes: 512, min_ratio: 0.9 }"), "zstd:3");
+        assert_eq!(read("compression", "Compression { mode: Off, codec: Zstd, level: 1, min_bytes: 512, min_ratio: 0.9 }"), "none");
+        assert_eq!(read("mode", "Async"), "async");
+        assert_eq!(read("mode", "Quorum(2)"), "quorum:2");
+        assert_eq!(read("mode", "All"), "all");
+        assert_eq!(read("conflict", "LastWriterWins"), "last-writer-wins");
+        // Already in the right spelling, or not one of these: untouched.
+        assert_eq!(read("mode", "quorum:2"), "quorum:2");
+        assert_eq!(config_value("filter", "enabled", "true"), "true");
+    }
+
+    #[test]
+    fn a_setting_with_fixed_values_offers_them() {
+        use crate::model::choice_of;
+        let entry = |key: &str, value: &str, options: &str| ConfigEntry {
+            section: "replication".into(),
+            key: key.into(),
+            value: value.into(),
+            options: options.into(),
+            ..ConfigEntry::default()
+        };
+        let mode = entry("mode", "quorum:2", "");
+        let choices = mode.choices();
+        assert_eq!(choices.iter().map(|c| c.to_string()).collect::<Vec<_>>(), ["async", "sync", "all", "quorum…"]);
+        assert_eq!(choice_of(&choices, "quorum:2"), Some((3, "2".to_string())));
+        assert_eq!(choices[3].value("5"), "quorum:5");
+        assert_eq!(choice_of(&choices, "sometimes"), None);
+
+        let compression = entry("compression", "zstd", "");
+        assert_eq!(choice_of(&compression.choices(), "zstd"), Some((1, String::new())));
+        assert_eq!(choice_of(&compression.choices(), "auto:zstd:9"), Some((2, "9".to_string())));
+
+        // Booleans, in the spelling the value already has.
+        let flag = ConfigEntry { section: "wal".into(), key: "synchronous_commit".into(), value: "on".into(), ..ConfigEntry::default() };
+        assert_eq!(flag.choices().iter().map(|c| c.to_string()).collect::<Vec<_>>(), ["on", "off"]);
+        let flag = ConfigEntry { value: "false".into(), ..flag };
+        assert_eq!(flag.choices().iter().map(|c| c.to_string()).collect::<Vec<_>>(), ["true", "false"]);
+        // The server's own list wins over every fallback.
+        let reported = entry("mode", "async", "async|all");
+        assert_eq!(reported.choices().len(), 2);
+        // A number is a text box.
+        assert!(entry("ack_timeout_ms", "5000", "").choices().is_empty());
+        // PostgreSQL lists an empty value among an enum's choices.
+        let tls = entry("ssl_max_protocol_version", "", "|TLSv1.2|TLSv1.3");
+        assert_eq!(choice_of(&tls.choices(), ""), Some((0, String::new())));
+        assert_eq!(tls.choices()[0].to_string(), "(none)");
     }
 
     #[test]

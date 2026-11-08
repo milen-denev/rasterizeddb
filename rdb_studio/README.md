@@ -14,7 +14,7 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 |---|---|
 | **Dashboard** | What is the database *doing*, as a live line per metric, plus where the space is going |
 | **Overview** | Every statistic the server reports, grouped, with the six that matter as tiles |
-| **Tables** | Every table with its sizes and what is holding it — memory, files, S3 — and one table's columns, constraints and statistics |
+| **Tables** | Every table with its sizes and what is holding it — memory, files, S3 — and one table's columns, indexes, partitions and statistics |
 | **Schema** | The foreign keys as a layered map, each line anchored at the column it joins |
 | **Data** | A page of rows, editable in place, with insert and delete |
 | **Query** | Several statements at a time, each reporting separately, with timings and a history you can prune |
@@ -24,10 +24,38 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 | **Storage** | Which directories the database writes into, how full each is, and which one holds each table |
 | **Replication** | Whether it is on, who it is talking to, and how far behind they are |
 | **Migrate** | Importing a live PostgreSQL database into this one |
-| **Config** | Every runtime knob, with the ones a running server can change actually editable |
+| **Config** | Every runtime knob: the ones a running server can change applied live, restart-only ones saved for the next start where the server can save them, fixed choices as dropdowns |
 
 Databases and tables are created and dropped from the sidebar; columns are added
 from the table detail pane.
+
+## Indexes and partitions
+
+The table pane's lower half switches between **INDEXES**, **PARTITIONS** (only
+for a partitioned table) and **STATISTICS**.
+
+- **NEW INDEX** writes `CREATE INDEX` for every kind the engine builds: columns
+  in key order by B-tree, hash or the server's own choice; a whole `jsonb`
+  document by GIN (`jsonb_ops` or `jsonb_path_ops`); or one document field,
+  `((doc->'user'->>'id'))`, typed as `user.id`. The dialog shows the statement
+  it will send as it is filled in.
+- Each index says who owns it, which decides how it goes: a declared one by
+  `DROP INDEX`, a unique one or the primary key's with its constraint (`ALTER
+  TABLE … DROP CONSTRAINT`). Every drop is checked against the reloaded list
+  afterwards, because a RasterizedDB server before `fc3849c` answered both with
+  success and kept the index; the status bar says so when that happens.
+- **CHECK INDEXES** (RasterizedDB) runs `rdb_index_check`, the audit of a
+  table's indexes against its rows, and reports its verdict.
+- **NEW TABLE** can partition by hash (RasterizedDB): up to three key columns,
+  leading column first, and a partition count. A key column is made NOT NULL as
+  it is picked, and marking several columns PK makes a composite primary key,
+  which a partitioned table usually needs. PARTITIONS lists each partition's
+  slice of the hash space, whether it has files yet, and its size. Partitioned
+  tables cannot yet be altered or indexed — the server refuses both — so the
+  pane does not offer to.
+
+Dialogs stay open until the server answers, and show its refusal where the
+form still is.
 
 ## The two dialects
 

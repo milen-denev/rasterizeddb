@@ -170,6 +170,35 @@ async fn exercise(session: &Session) {
         "{flavor}: synchronous_commit reported as needing a restart, so the console would \
          grey out an edit that in fact works"
     );
+    // It is a dropdown on both, offering the spelling its value is in.
+    let offered: Vec<String> = durability.choices().iter().map(|c| c.to_string()).collect();
+    assert!(
+        offered.iter().any(|c| c.eq_ignore_ascii_case(durability.value.trim())),
+        "{flavor}: synchronous_commit = {:?} is none of the choices {:?}",
+        durability.value,
+        offered
+    );
+    // Every choice-valued setting's current value is one of its choices, or
+    // the dropdown opens on nothing. RasterizedDB's `vacuum.enabled` reads
+    // `per table`, which is shown as it is rather than as a choice.
+    for entry in config.iter().filter(|e| e.editable() && !e.choices().is_empty()) {
+        if entry.qualified() == "vacuum.enabled" {
+            continue;
+        }
+        assert!(
+            rdb_studio::model::choice_of(&entry.choices(), &entry.value).is_some(),
+            "{flavor}: {} = {:?} matches none of {:?}",
+            entry.qualified(),
+            entry.value,
+            entry.choices()
+        );
+    }
+    if matches!(flavor, Flavor::Postgres) {
+        assert!(
+            config.iter().any(|e| !e.hot && e.restart_settable),
+            "{flavor}: no postmaster setting is offered for saving, though ALTER SYSTEM saves them"
+        );
+    }
 
     // What the server has been running. Both panes of the activity page, and
     // the one place a difference between the two servers is not cosmetic: the
@@ -238,7 +267,10 @@ async fn exercise(session: &Session) {
         Err(e) => panic!("{flavor}: statement shapes: {e}"),
     }
 
-    for table in &tables {
+    // The other tests here create and drop `rdb_studio_*_probe` tables on the
+    // same database, in parallel with this one, so one listed above can be
+    // gone by the time it is asked about. They are not the fixture.
+    for table in tables.iter().filter(|t| !(t.name.starts_with("rdb_studio_") && t.name.ends_with("_probe"))) {
         let stats = session
             .query(&dialect::table_stats_sql(flavor, &table.name))
             .await
@@ -411,6 +443,171 @@ async fn rasterizeddb_accepts_the_consoles_writes() {
         return;
     };
     exercise_writes(&session).await;
+}
+
+/// The index pane's statements: every kind the dialog writes, read back by
+/// the shared parser, and removed the way the pane removes each.
+///
+/// The ownership check is the one that matters. RasterizedDB answers both
+/// `DROP INDEX <pkey>` and `ALTER TABLE … DROP CONSTRAINT <pkey>` with success
+/// and keeps the key, so a primary key read as anything else would put a
+/// button on screen that reports doing what it did not.
+async fn exercise_indexes(session: &Session) {
+    use rdb_studio::app::{IndexKind, IndexMethod, NewIndex, create_index_sql};
+    use rdb_studio::model::IndexOwner;
+
+    let flavor = session.flavor;
+    let table = "rdb_studio_index_probe";
+    let quoted = dialect::quote_ident(table);
+    let _ = session.execute(&format!("DROP TABLE IF EXISTS {quoted}")).await;
+    session
+        .execute(&format!(
+            "CREATE TABLE {quoted} (id BIGINT PRIMARY KEY, email TEXT UNIQUE, \
+             customer_id BIGINT, placed_at TIMESTAMP, doc JSONB)"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{flavor}: create: {e}"));
+
+    let forms = [
+        NewIndex { name: "probe_cs".into(), columns: vec!["customer_id".into(), "placed_at".into()], ..NewIndex::new("doc".into()) },
+        NewIndex { name: "probe_hash".into(), method: IndexMethod::Hash, columns: vec!["customer_id".into()], ..NewIndex::new("doc".into()) },
+        NewIndex { name: "probe_gin".into(), kind: IndexKind::Document, path_ops: true, ..NewIndex::new("doc".into()) },
+        NewIndex { name: "probe_path".into(), kind: IndexKind::Path, path: "user.id".into(), ..NewIndex::new("doc".into()) },
+        // No name: the server derives one, and the list must still show it.
+        NewIndex { columns: vec!["placed_at".into()], method: IndexMethod::Btree, ..NewIndex::new("doc".into()) },
+    ];
+    for form in &forms {
+        let sql = create_index_sql(table, form).unwrap();
+        session.execute(&sql).await.unwrap_or_else(|e| panic!("{flavor}: {sql}: {e}"));
+    }
+
+    let read = || async {
+        let columns = dialect::parse_columns(
+            &session.query(&dialect::columns_sql(flavor, table)).await.unwrap(),
+        );
+        let primary: Vec<&str> =
+            columns.iter().filter(|c| c.primary_key).map(|c| c.name.as_str()).collect();
+        let primary: Vec<String> = primary.iter().map(|s| s.to_string()).collect();
+        let grid = session
+            .query(&dialect::indexes_sql(flavor, table))
+            .await
+            .unwrap_or_else(|e| panic!("{flavor}: indexes: {e}"));
+        dialect::parse_indexes(&grid, &primary.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    let indexes = read().await;
+    let find = |name: &str| {
+        indexes
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{flavor}: no index {name} in {:?}", indexes))
+    };
+
+    let primary: Vec<_> = indexes.iter().filter(|i| i.owner == IndexOwner::Primary).collect();
+    assert_eq!(primary.len(), 1, "{flavor}: the primary key's index, once: {:?}", indexes);
+    assert_eq!(primary[0].columns, "id");
+    let unique: Vec<_> = indexes.iter().filter(|i| i.owner == IndexOwner::Unique).collect();
+    assert_eq!(unique.len(), 1, "{flavor}: the UNIQUE email's index, once: {:?}", indexes);
+    assert_eq!(unique[0].columns, "email");
+
+    assert_eq!(find("probe_cs").method, "btree");
+    assert_eq!(find("probe_cs").columns, "customer_id, placed_at");
+    assert_eq!(find("probe_hash").kind(), "hash");
+    assert_eq!(find("probe_gin").kind(), "gin");
+    assert!(find("probe_gin").columns.contains("jsonb_path_ops"), "{flavor}: {:?}", find("probe_gin"));
+    assert_eq!(find("probe_path").kind(), "path", "{flavor}: {:?}", find("probe_path"));
+    assert_eq!(indexes.len(), 7, "{flavor}: {:?}", indexes);
+    for index in &indexes {
+        assert_ne!(index.method, "", "{flavor}: {} read with no method: {}", index.name, index.definition);
+    }
+
+    // Removed as the pane removes each: the declared one by DROP INDEX, the
+    // unique one with its constraint.
+    session.execute(&dialect::drop_index_sql("probe_hash")).await.unwrap();
+    session.execute(&dialect::drop_constraint_sql(table, &unique[0].name)).await.unwrap();
+    let after = read().await;
+    assert!(after.iter().all(|i| i.name != "probe_hash"), "{flavor}: DROP INDEX left it: {:?}", after);
+    assert!(
+        after.iter().all(|i| i.owner != IndexOwner::Unique),
+        "{flavor}: DROP CONSTRAINT left the unique index: {:?}",
+        after
+    );
+    assert_eq!(after.len(), 5, "{flavor}: {:?}", after);
+
+    // The primary key goes the same way. A RasterizedDB server before fc3849c
+    // answered this with success and kept the key; the pane checks for that
+    // after every drop, and this pins the server that no longer does it.
+    let key = primary[0].name.clone();
+    assert!(
+        session.execute(&dialect::drop_index_sql(&key)).await.is_err(),
+        "{flavor}: DROP INDEX of the primary key's index was accepted"
+    );
+    session.execute(&dialect::drop_constraint_sql(table, &key)).await.unwrap();
+    let after = read().await;
+    assert!(
+        after.iter().all(|i| i.name != key),
+        "{flavor}: DROP CONSTRAINT {key} reported success and kept it: {:?}",
+        after
+    );
+
+    session.execute(&format!("DROP TABLE {quoted}")).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_index_pane_reads_and_writes_both_servers() {
+    if let Some(session) = open("RDB_STUDIO_TEST_RDB", Flavor::Rasterized).await {
+        exercise_indexes(&session).await;
+    }
+    if let Some(session) = open("RDB_STUDIO_TEST_PG", Flavor::Postgres).await {
+        exercise_indexes(&session).await;
+    }
+}
+
+/// A partitioned table made by the new-table dialog, as the table pane sees
+/// it. RasterizedDB only; see `views::partition_section` for why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partitioned_table_is_created_and_listed() {
+    use rdb_studio::app::{NewColumn, Partitioning, create_table_with};
+    let Some(session) = open("RDB_STUDIO_TEST_RDB", Flavor::Rasterized).await else {
+        return;
+    };
+    let table = "rdb_studio_partition_probe";
+    let quoted = dialect::quote_ident(table);
+    let _ = session.execute(&format!("DROP TABLE IF EXISTS {quoted}")).await;
+
+    let mut tenant = NewColumn::key(Flavor::Rasterized);
+    tenant.name = "tenant_id".into();
+    let mut id = NewColumn::key(Flavor::Rasterized);
+    id.name = "id".into();
+    let mut body = NewColumn::new(Flavor::Rasterized);
+    body.rename("body".into(), Flavor::Rasterized);
+    let partitioning = Partitioning { enabled: true, key: vec![0], count: "16".into() };
+    let sql = create_table_with(table, &[tenant, id, body], &partitioning).unwrap();
+    session.execute(&sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    session
+        .execute(&format!("INSERT INTO {quoted} (tenant_id, id, body) VALUES (42, 1, 'x'), (7, 2, 'y')"))
+        .await
+        .unwrap();
+
+    let stats = dialect::parse_stats(
+        &session.query(&dialect::table_stats_sql(Flavor::Rasterized, table)).await.unwrap(),
+    );
+    let key = stats.iter().find(|s| s.metric == "partition_key").map(|s| s.value.as_str());
+    assert_eq!(key, Some("tenant_id"), "the pane finds a partitioned table by this metric");
+
+    let partitions =
+        dialect::parse_partitions(&session.query(&dialect::partitions_sql(table)).await.unwrap());
+    assert_eq!(partitions.len(), 16);
+    let rows: u64 = partitions.iter().map(|p| p.row_slots).sum();
+    assert_eq!(rows, 2, "{:?}", partitions);
+    assert!(partitions.iter().any(|p| p.materialized()));
+    let share: f64 = partitions.iter().filter_map(|p| p.share()).sum();
+    assert!((share - 1.0).abs() < 1e-9, "the ranges tile the hash space: {share}");
+
+    // The pane disables NEW INDEX here because the server refuses it; if that
+    // changes, the button should come back.
+    assert!(session.execute(&format!("CREATE INDEX ON {quoted} (body)")).await.is_err());
+
+    session.execute(&format!("DROP TABLE {quoted}")).await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

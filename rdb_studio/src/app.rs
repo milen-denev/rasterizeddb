@@ -55,6 +55,25 @@ pub struct Studio {
     pub db_stats: Vec<Stat>,
     pub table_stats: Vec<Stat>,
     pub columns: Vec<ColumnInfo>,
+    /// The selected table's indexes, loaded once its columns are: which index
+    /// is the primary key's is read against them. See `ColumnsLoaded`.
+    pub indexes: Vec<IndexInfo>,
+    /// The selected table's partitions. Empty for a table that is not
+    /// partitioned, which is asked of `SHOW TABLE STATS` first rather than by
+    /// sending a `SHOW PARTITIONS` that every plain table refuses.
+    pub partitions: Vec<PartitionInfo>,
+    /// Which lens the lower half of the table pane shows.
+    pub detail_section: DetailSection,
+    /// An index the user has confirmed dropping, as `(table, index)`: armed
+    /// when the statement succeeds, checked against the reloaded list. A
+    /// server before fc3849c answers dropping a constraint's index with
+    /// success and keeps it, so success alone is not taken as the answer.
+    pub expect_gone: Option<(String, String)>,
+    pub verify_gone: Option<(String, String)>,
+    /// Whether the partitions lens lists every declared partition, or only
+    /// those holding rows. Only those by default: at the default of 64, the
+    /// few a small table uses are otherwise below the fold.
+    pub show_empty_partitions: bool,
 
     pub schema: SchemaGraph,
     pub schema_pan: iced::Vector,
@@ -102,6 +121,11 @@ pub struct Studio {
     pub last_elapsed: Option<Duration>,
 
     pub modal: Option<Modal>,
+    /// A dialog's statement is with the server. The dialog stays open until
+    /// the answer comes back, so a refusal is shown where the form still is
+    /// rather than in the status bar after the form has gone; this stops a
+    /// second press sending it twice meanwhile.
+    pub modal_pending: bool,
 
     // --- the live dashboard
     pub metrics: Metrics,
@@ -288,9 +312,15 @@ pub struct CellEdit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Modal {
-    CreateTable { name: String, columns: Vec<NewColumn>, error: Option<String> },
+    CreateTable {
+        name: String,
+        columns: Vec<NewColumn>,
+        partitioning: Partitioning,
+        error: Option<String>,
+    },
     CreateDatabase { name: String, error: Option<String> },
     AddColumn { table: String, column: NewColumn, error: Option<String> },
+    CreateIndex { table: String, index: NewIndex, error: Option<String> },
     Confirm { title: String, body: String, statement: String, refresh: Refresh },
     /// A restore, which reports rows rather than a count and therefore cannot
     /// go through the ordinary confirmation path.
@@ -388,6 +418,153 @@ impl NewColumn {
     }
 }
 
+/// How a new table is spread over partitions. RasterizedDB only.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Partitioning {
+    pub enabled: bool,
+    /// Positions in the dialog's column list, in key order. Positions rather
+    /// than names, because a column can be renamed after it was picked; the
+    /// list is renumbered when a column is removed.
+    pub key: Vec<usize>,
+    /// `PARTITIONS n`. Empty leaves it to the server's default.
+    pub count: String,
+}
+
+/// The most columns a partition key takes: the hash is split 48/16 or
+/// 48/8/8 between them, and there is no fourth width.
+pub const MAX_PARTITION_KEY: usize = 3;
+
+/// What a new index is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// One or more plain columns, by B-tree or hash.
+    Columns,
+    /// A whole `jsonb` document, by GIN.
+    Document,
+    /// One field of a document, `((doc->>'k'))`.
+    Path,
+}
+
+impl IndexKind {
+    pub const ALL: [IndexKind; 3] = [IndexKind::Columns, IndexKind::Document, IndexKind::Path];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            IndexKind::Columns => "COLUMNS",
+            IndexKind::Document => "DOCUMENT (GIN)",
+            IndexKind::Path => "DOCUMENT PATH",
+        }
+    }
+}
+
+/// How a column index is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMethod {
+    /// No `USING`: the server chooses from the column types.
+    Automatic,
+    Btree,
+    Hash,
+}
+
+impl IndexMethod {
+    pub const ALL: [IndexMethod; 3] = [IndexMethod::Automatic, IndexMethod::Btree, IndexMethod::Hash];
+
+    fn using(&self) -> Option<&'static str> {
+        match self {
+            IndexMethod::Automatic => None,
+            IndexMethod::Btree => Some("btree"),
+            IndexMethod::Hash => Some("hash"),
+        }
+    }
+
+    pub fn help(&self) -> &'static str {
+        match self {
+            IndexMethod::Automatic => {
+                "the server chooses: hash when every column is UUID, JSONB, MACADDR or CHAR, B-tree otherwise"
+            }
+            IndexMethod::Btree => {
+                "answers =, IN, ranges and LIKE 'prefix%', on the leading column of a composite key"
+            }
+            IndexMethod::Hash => "answers = and IN only, on every column of the key; one probe",
+        }
+    }
+}
+
+impl std::fmt::Display for IndexMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            IndexMethod::Automatic => "automatic",
+            IndexMethod::Btree => "B-tree",
+            IndexMethod::Hash => "hash",
+        })
+    }
+}
+
+/// An index being described in a dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewIndex {
+    /// Empty lets the server derive one from the table and columns.
+    pub name: String,
+    pub kind: IndexKind,
+    pub method: IndexMethod,
+    /// In key order, which is the order they were picked in: a composite
+    /// B-tree answers ranges on its first column only.
+    pub columns: Vec<String>,
+    /// The `jsonb` column a document or path index is over.
+    pub document: String,
+    /// `jsonb_path_ops` rather than the default `jsonb_ops`.
+    pub path_ops: bool,
+    /// The field, as dot-separated keys: `status`, `user.id`.
+    pub path: String,
+    pub unique: bool,
+}
+
+impl NewIndex {
+    pub fn new(document: String) -> Self {
+        Self {
+            name: String::new(),
+            kind: IndexKind::Columns,
+            method: IndexMethod::Automatic,
+            columns: Vec::new(),
+            document,
+            path_ops: false,
+            path: String::new(),
+            unique: false,
+        }
+    }
+}
+
+/// One change to the index dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IndexEdit {
+    Name(String),
+    Kind(IndexKind),
+    Method(IndexMethod),
+    /// Adds the column to the key, or takes it out.
+    Column(String),
+    Document(String),
+    PathOps(bool),
+    Path(String),
+    Unique(bool),
+}
+
+/// One change to the partitioning half of the table dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionEdit {
+    Enabled(bool),
+    /// Adds the column at this position to the key, or takes it out.
+    Key(usize),
+    Count(String),
+}
+
+/// What the lower half of the table pane shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailSection {
+    Indexes,
+    Partitions,
+    Statistics,
+}
+
 /// What to reload after a statement succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refresh {
@@ -433,6 +610,10 @@ pub enum Message {
     DatabasesLoaded(Result<Vec<DatabaseInfo>, String>),
     TableStatsLoaded(Result<Vec<Stat>, String>),
     ColumnsLoaded(Result<Vec<ColumnInfo>, String>),
+    /// Tagged with the table they are for: a slow answer for the table that
+    /// was selected before must not be shown under the one selected now.
+    IndexesLoaded(String, Result<Vec<IndexInfo>, String>),
+    PartitionsLoaded(String, Result<Vec<PartitionInfo>, String>),
     SchemaLoaded(Result<SchemaGraph, String>),
     ConfigLoaded(Result<Vec<ConfigEntry>, String>),
     DataLoaded(Result<(Grid, Option<u64>), String>),
@@ -589,8 +770,21 @@ pub enum Message {
     ModalColumnType(usize, types::Choice),
     ModalSubmit,
     ModalCancel,
+    IndexForm(IndexEdit),
+    PartitionForm(PartitionEdit),
     Confirm { title: String, body: String, statement: String, refresh: Refresh },
     StatementFinished(Refresh, String, Duration, Result<String, String>),
+    /// A dialog's statement came back; see [`Studio::modal_pending`].
+    ModalStatementFinished(Refresh, String, Duration, Result<String, String>),
+
+    // --- the table pane
+    SelectDetailSection(DetailSection),
+    /// Confirm, then drop an index or the constraint owning it, and check
+    /// afterwards that it is gone.
+    DropIndex { title: String, body: String, statement: String, index: String },
+    ShowEmptyPartitions(bool),
+    CheckIndexes,
+    IndexCheckFinished(String, Duration, Result<Grid, String>),
 }
 
 /// The things that can be done to a backup destination.
@@ -745,6 +939,7 @@ pub enum ModalKind {
     CreateTable,
     CreateDatabase,
     AddColumn,
+    CreateIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -789,6 +984,12 @@ impl Studio {
             db_stats: Vec::new(),
             table_stats: Vec::new(),
             columns: Vec::new(),
+            indexes: Vec::new(),
+            partitions: Vec::new(),
+            detail_section: DetailSection::Statistics,
+            expect_gone: None,
+            verify_gone: None,
+            show_empty_partitions: false,
             schema: SchemaGraph::default(),
             schema_pan: iced::Vector::ZERO,
             schema_zoom: 1.0,
@@ -818,6 +1019,7 @@ impl Studio {
             pending_sql: None,
             last_elapsed: None,
             modal: None,
+            modal_pending: false,
             metrics: Metrics::default(),
             live: true,
             interval: 2,
@@ -901,6 +1103,27 @@ impl Studio {
     /// exists so the connection screen has something to show.
     pub fn flavor(&self) -> Flavor {
         self.session.as_ref().map(|s| s.flavor).unwrap_or(self.form.flavor)
+    }
+
+    /// The selected table's partition key, when it is partitioned.
+    ///
+    /// Read from `SHOW TABLE STATS`, which reports it only for a partitioned
+    /// table: `SHOW TABLES` lists one exactly like a plain table.
+    pub fn partition_key(&self) -> Option<&str> {
+        self.table_stats
+            .iter()
+            .find(|s| s.metric == "partition_key")
+            .map(|s| s.value.as_str())
+    }
+
+    /// The selected table's `jsonb` columns, which are what a document or path
+    /// index can be over.
+    pub fn document_columns(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .filter(|c| c.data_type.to_ascii_uppercase().contains("JSON"))
+            .map(|c| c.name.clone())
+            .collect()
     }
 
     /// The tables the sidebar shows, after the filter box.
@@ -1118,6 +1341,8 @@ impl Studio {
                     // "rdb_roles" ORDER BY "id"`, which has no `id`, and the
                     // whole browser reports an error for the table.
                     self.columns.clear();
+                    self.indexes.clear();
+                    self.partitions.clear();
                 }
                 // No `load_page` here: it is issued once the columns land, so
                 // the key it orders by is this table's. See `ColumnsLoaded`.
@@ -1175,7 +1400,42 @@ impl Studio {
                 Task::none()
             }
             Message::TableStatsLoaded(result) => {
-                self.absorb(result, |studio, stats| studio.table_stats = stats)
+                let task = self.absorb(result, |studio, stats| studio.table_stats = stats);
+                // Partitions are asked for only once the table says it has
+                // them: `SHOW PARTITIONS` refuses every plain table, and that
+                // refusal would land in the status bar on every click.
+                if self.partition_key().is_some() {
+                    Task::batch([task, self.load_partitions()])
+                } else {
+                    self.partitions.clear();
+                    if self.detail_section == DetailSection::Partitions {
+                        self.detail_section = DetailSection::Statistics;
+                    }
+                    task
+                }
+            }
+            Message::IndexesLoaded(table, result) => {
+                if self.selected_table.as_deref() != Some(table.as_str()) {
+                    return Task::none();
+                }
+                let task = self.absorb(result, |studio, indexes| studio.indexes = indexes);
+                if let Some((dropped_from, index)) = self.verify_gone.take()
+                    && dropped_from == table
+                    && self.indexes.iter().any(|i| i.name == index)
+                {
+                    self.status = Status::Failed(format!(
+                        "the server reported success, but `{}` is still there: a RasterizedDB \
+                         server before fc3849c keeps a constraint's index when asked to drop it",
+                        index
+                    ));
+                }
+                task
+            }
+            Message::PartitionsLoaded(table, result) => {
+                if self.selected_table.as_deref() != Some(table.as_str()) {
+                    return Task::none();
+                }
+                self.absorb(result, |studio, partitions| studio.partitions = partitions)
             }
             Message::ColumnsLoaded(result) => {
                 // The page waits for this: `row_key` needs the columns of the
@@ -1184,7 +1444,7 @@ impl Studio {
                 // is better than none — `row_key` then finds no key and the
                 // query goes out without an ORDER BY.
                 let task = self.absorb(result, |studio, columns| studio.columns = columns);
-                Task::batch([task, self.load_page()])
+                Task::batch([task, self.load_page(), self.load_indexes()])
             }
             Message::SchemaLoaded(result) => self.absorb(result, |studio, schema| {
                 studio.schema = schema;
@@ -2052,6 +2312,7 @@ impl Studio {
                     ModalKind::CreateTable => Modal::CreateTable {
                         name: String::new(),
                         columns: vec![NewColumn::key(self.flavor())],
+                        partitioning: Partitioning { count: "64".to_string(), ..Partitioning::default() },
                         error: None,
                     },
                     ModalKind::CreateDatabase => {
@@ -2062,10 +2323,76 @@ impl Studio {
                         column: NewColumn::new(self.flavor()),
                         error: None,
                     },
+                    ModalKind::CreateIndex => Modal::CreateIndex {
+                        table: self.selected_table.clone().unwrap_or_default(),
+                        index: NewIndex::new(
+                            self.document_columns().first().cloned().unwrap_or_default(),
+                        ),
+                        error: None,
+                    },
                 });
+                self.modal_pending = false;
                 Task::none()
             }
-            Message::ModalCancel => { self.modal = None; Task::none() }
+            Message::ModalCancel => {
+                self.modal = None;
+                self.modal_pending = false;
+                self.expect_gone = None;
+                Task::none()
+            }
+            Message::DropIndex { title, body, statement, index } => {
+                self.expect_gone = self.selected_table.clone().map(|table| (table, index));
+                self.modal = Some(Modal::Confirm { title, body, statement, refresh: Refresh::CurrentTable });
+                Task::none()
+            }
+            Message::IndexForm(edit) => {
+                let documents = self.document_columns();
+                if let Some(Modal::CreateIndex { index, .. }) = &mut self.modal {
+                    match edit {
+                        IndexEdit::Name(v) => index.name = v,
+                        IndexEdit::Kind(kind) => {
+                            index.kind = kind;
+                            if index.document.is_empty() {
+                                index.document = documents.first().cloned().unwrap_or_default();
+                            }
+                        }
+                        IndexEdit::Method(method) => index.method = method,
+                        IndexEdit::Column(column) => {
+                            match index.columns.iter().position(|c| *c == column) {
+                                Some(at) => { index.columns.remove(at); }
+                                None => index.columns.push(column),
+                            }
+                        }
+                        IndexEdit::Document(v) => index.document = v,
+                        IndexEdit::PathOps(v) => index.path_ops = v,
+                        IndexEdit::Path(v) => index.path = v,
+                        IndexEdit::Unique(v) => index.unique = v,
+                    }
+                }
+                Task::none()
+            }
+            Message::PartitionForm(edit) => {
+                if let Some(Modal::CreateTable { columns, partitioning, .. }) = &mut self.modal {
+                    match edit {
+                        PartitionEdit::Enabled(v) => partitioning.enabled = v,
+                        PartitionEdit::Count(v) => partitioning.count = digits(&v),
+                        PartitionEdit::Key(at) => {
+                            if let Some(found) = partitioning.key.iter().position(|k| *k == at) {
+                                partitioning.key.remove(found);
+                            } else if partitioning.key.len() < MAX_PARTITION_KEY
+                                && let Some(column) = columns.get_mut(at)
+                            {
+                                // A key column must be NOT NULL: a NULL hashes
+                                // like 0 or '' and `IS NULL` could never route.
+                                // Ticking it here, visibly, beats a refusal.
+                                column.nullable = false;
+                                partitioning.key.push(at);
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
             Message::ModalField(field, value) => { self.modal_field(field, value); Task::none() }
             Message::ModalToggle(field, value) => { self.modal_toggle(field, value); Task::none() }
             Message::ModalAddColumn => {
@@ -2076,11 +2403,17 @@ impl Studio {
                 Task::none()
             }
             Message::ModalRemoveColumn(index) => {
-                if let Some(Modal::CreateTable { columns, .. }) = &mut self.modal
+                if let Some(Modal::CreateTable { columns, partitioning, .. }) = &mut self.modal
                     && index < columns.len()
                     && columns.len() > 1
                 {
                     columns.remove(index);
+                    partitioning.key.retain(|k| *k != index);
+                    for k in partitioning.key.iter_mut() {
+                        if *k > index {
+                            *k -= 1;
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -2109,7 +2442,14 @@ impl Studio {
             Message::ModalColumnToggle(index, field, value) => {
                 self.modal_column(index, |column| match field {
                     ModalField::Nullable => column.nullable = value,
-                    ModalField::PrimaryKey => column.primary_key = value,
+                    ModalField::PrimaryKey => {
+                        column.primary_key = value;
+                        // A key column is NOT NULL however it is written;
+                        // the box says so rather than contradicting the DDL.
+                        if value {
+                            column.nullable = false;
+                        }
+                    }
                     ModalField::Unique => column.unique = value,
                     _ => {}
                 });
@@ -2128,6 +2468,9 @@ impl Studio {
                     RunOutcome::Ok { statements: 1, rows: 0, affected: 0 },
                 );
                 self.status = Status::Done(format!("{} · {}", message, duration(elapsed)));
+                if refresh == Refresh::CurrentTable {
+                    self.verify_gone = self.expect_gone.take();
+                }
                 match refresh {
                     Refresh::Tables => Task::batch([self.load_tables(), self.load_schema()]),
                     Refresh::Databases => self.load_databases(),
@@ -2143,6 +2486,54 @@ impl Studio {
                 }
             }
             Message::StatementFinished(_, sql, elapsed, Err(e)) => {
+                self.expect_gone = None;
+                self.record(sql, elapsed, RunOutcome::Failed(e.clone()));
+                self.status = Status::Failed(e);
+                Task::none()
+            }
+            Message::ModalStatementFinished(refresh, sql, elapsed, result) => {
+                // Cancelled meanwhile: the answer still counts, but the dialog
+                // it was for is gone and whatever is open now is another one.
+                let waiting = std::mem::take(&mut self.modal_pending);
+                match &result {
+                    Ok(_) if waiting => self.modal = None,
+                    Err(e) if waiting => self.set_modal_error(e.clone()),
+                    _ => {}
+                }
+                self.update(Message::StatementFinished(refresh, sql, elapsed, result))
+            }
+
+            // ---- the table pane --------------------------------------------
+            Message::SelectDetailSection(section) => {
+                self.detail_section = section;
+                Task::none()
+            }
+            Message::ShowEmptyPartitions(show) => {
+                self.show_empty_partitions = show;
+                Task::none()
+            }
+            Message::CheckIndexes => {
+                let (Some(session), Some(table)) = (self.session.clone(), self.selected_table.clone())
+                else {
+                    return Task::none();
+                };
+                self.status = Status::Busy(format!("checking the indexes of {}", table));
+                let sql = dialect::index_check_sql(&table);
+                Task::perform(
+                    async move {
+                        let started = Instant::now();
+                        let result = session.query(&sql).await;
+                        (sql, started.elapsed(), result)
+                    },
+                    |(sql, elapsed, result)| Message::IndexCheckFinished(sql, elapsed, result),
+                )
+            }
+            Message::IndexCheckFinished(sql, elapsed, Ok(grid)) => {
+                self.record(sql, elapsed, RunOutcome::Ok { statements: 1, rows: grid.rows.len(), affected: 0 });
+                self.status = Status::Done(dialect::index_check_summary(&grid));
+                Task::none()
+            }
+            Message::IndexCheckFinished(sql, elapsed, Err(e)) => {
                 self.record(sql, elapsed, RunOutcome::Failed(e.clone()));
                 self.status = Status::Failed(e);
                 Task::none()
@@ -2591,6 +2982,46 @@ impl Studio {
         )
     }
 
+    /// The selected table's indexes. Issued once its columns have landed,
+    /// which is what tells a RasterizedDB primary key's index from a unique
+    /// one; see [`dialect::parse_indexes`].
+    fn load_indexes(&self) -> Task<Message> {
+        let (Some(session), Some(table)) = (self.session.clone(), self.selected_table.clone())
+        else {
+            return Task::none();
+        };
+        let sql = dialect::indexes_sql(session.flavor, &table);
+        let primary: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        Task::perform(
+            async move {
+                let primary: Vec<&str> = primary.iter().map(String::as_str).collect();
+                let result = session.query(&sql).await.map(|g| dialect::parse_indexes(&g, &primary));
+                (table, result)
+            },
+            |(table, result)| Message::IndexesLoaded(table, result),
+        )
+    }
+
+    fn load_partitions(&self) -> Task<Message> {
+        let (Some(session), Some(table)) = (self.session.clone(), self.selected_table.clone())
+        else {
+            return Task::none();
+        };
+        let sql = dialect::partitions_sql(&table);
+        Task::perform(
+            async move {
+                let result = session.query(&sql).await.map(|g| dialect::parse_partitions(&g));
+                (table, result)
+            },
+            |(table, result)| Message::PartitionsLoaded(table, result),
+        )
+    }
+
     /// Loads the whole graph: the edges, and every table's columns.
     ///
     /// The columns are fetched per table rather than in one statement because
@@ -2907,6 +3338,9 @@ impl Studio {
     }
 
     fn submit_modal(&mut self) -> Task<Message> {
+        if self.modal_pending {
+            return Task::none();
+        }
         let Some(modal) = self.modal.take() else { return Task::none() };
         match modal {
             Modal::Confirm { statement, refresh, .. } => self.statement(statement, refresh),
@@ -2937,26 +3371,83 @@ impl Studio {
                     return Task::none();
                 }
                 let sql = format!("CREATE DATABASE {}", dialect::quote_ident(name.trim()));
-                self.statement(sql, Refresh::Databases)
+                self.modal_statement(Modal::CreateDatabase { name, error: None }, sql, Refresh::Databases)
             }
 
-            Modal::CreateTable { name, columns, .. } => {
-                match create_table_sql(&name, &columns) {
-                    Ok(sql) => self.statement(sql, Refresh::Tables),
+            Modal::CreateTable { name, columns, partitioning, .. } => {
+                match create_table_with(&name, &columns, &partitioning) {
+                    Ok(sql) => self.modal_statement(
+                        Modal::CreateTable { name, columns, partitioning, error: None },
+                        sql,
+                        Refresh::Tables,
+                    ),
                     Err(e) => {
-                        self.modal = Some(Modal::CreateTable { name, columns, error: Some(e) });
+                        self.modal =
+                            Some(Modal::CreateTable { name, columns, partitioning, error: Some(e) });
                         Task::none()
                     }
                 }
             }
 
             Modal::AddColumn { table, column, .. } => match add_column_sql(&table, &column) {
-                Ok(sql) => self.statement(sql, Refresh::CurrentTable),
+                Ok(sql) => self.modal_statement(
+                    Modal::AddColumn { table, column, error: None },
+                    sql,
+                    Refresh::CurrentTable,
+                ),
                 Err(e) => {
                     self.modal = Some(Modal::AddColumn { table, column, error: Some(e) });
                     Task::none()
                 }
             },
+
+            Modal::CreateIndex { table, index, .. } => match create_index_sql(&table, &index) {
+                Ok(sql) => self.modal_statement(
+                    Modal::CreateIndex { table, index, error: None },
+                    sql,
+                    Refresh::CurrentTable,
+                ),
+                Err(e) => {
+                    self.modal = Some(Modal::CreateIndex { table, index, error: Some(e) });
+                    Task::none()
+                }
+            },
+        }
+    }
+
+    /// Sends a dialog's statement and keeps the dialog open until it answers.
+    ///
+    /// The server is the authority on what it accepts, and its refusals are
+    /// specific — "partition key column `k` is nullable", "a B-tree cannot
+    /// order a CHAR column" — so they belong next to the field they are about,
+    /// with the form still filled in, rather than in the status bar after the
+    /// form has been thrown away.
+    fn modal_statement(&mut self, modal: Modal, sql: String, refresh: Refresh) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        self.modal = Some(modal);
+        self.modal_pending = true;
+        self.status = Status::Busy("running".to_string());
+        Task::perform(
+            async move {
+                let started = Instant::now();
+                let result = session.execute(&sql).await;
+                (sql, started.elapsed(), result)
+            },
+            move |(sql, elapsed, result)| {
+                Message::ModalStatementFinished(refresh, sql, elapsed, result)
+            },
+        )
+    }
+
+    fn set_modal_error(&mut self, message: String) {
+        if let Some(
+            Modal::CreateTable { error, .. }
+            | Modal::CreateDatabase { error, .. }
+            | Modal::AddColumn { error, .. }
+            | Modal::CreateIndex { error, .. },
+        ) = &mut self.modal
+        {
+            *error = Some(message);
         }
     }
 }
@@ -3040,6 +3531,19 @@ fn digits(value: &str) -> String {
 /// is wrong while the dialog is still open, instead of arriving as a syntax
 /// error after the dialog has closed and the input is gone.
 pub fn create_table_sql(name: &str, columns: &[NewColumn]) -> Result<String, String> {
+    create_table_with(name, columns, &Partitioning::default())
+}
+
+/// [`create_table_sql`], partitioned when `partitioning` says so.
+///
+/// More than one column marked as the primary key makes a composite key,
+/// written as a table constraint — which is what a partitioned table usually
+/// needs, since its key has to contain every partition key column.
+pub fn create_table_with(
+    name: &str,
+    columns: &[NewColumn],
+    partitioning: &Partitioning,
+) -> Result<String, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("the table needs a name".to_string());
@@ -3051,9 +3555,7 @@ pub fn create_table_sql(name: &str, columns: &[NewColumn]) -> Result<String, Str
     if usable.iter().any(|c| c.data_type().trim().is_empty()) {
         return Err("every column needs a type".to_string());
     }
-    if usable.iter().filter(|c| c.primary_key).count() > 1 {
-        return Err("only one column may be the primary key".to_string());
-    }
+    let composite_key = usable.iter().filter(|c| c.primary_key).count() > 1;
 
     let mut seen = std::collections::HashSet::new();
     for column in &usable {
@@ -3070,8 +3572,12 @@ pub fn create_table_sql(name: &str, columns: &[NewColumn]) -> Result<String, Str
                 dialect::quote_ident(column.name.trim()),
                 column.data_type().trim()
             );
-            if column.primary_key {
+            if column.primary_key && !composite_key {
                 part.push_str(" PRIMARY KEY");
+            } else if column.primary_key {
+                // A key column is NOT NULL either way; saying so lets a
+                // partition key check that reads the column see it.
+                part.push_str(" NOT NULL");
             } else {
                 // `PRIMARY KEY` already implies both, and writing them as well
                 // is refused by some parsers rather than being redundant.
@@ -3089,11 +3595,122 @@ pub fn create_table_sql(name: &str, columns: &[NewColumn]) -> Result<String, Str
         })
         .collect();
 
-    Ok(format!(
+    let mut body = body;
+    if composite_key {
+        let key: Vec<String> = usable
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| dialect::quote_ident(c.name.trim()))
+            .collect();
+        body.push(format!("PRIMARY KEY ({})", key.join(", ")));
+    }
+
+    let mut sql = format!(
         "CREATE TABLE {} ({})",
         dialect::quote_ident(name),
         body.join(", ")
-    ))
+    );
+    if partitioning.enabled {
+        sql.push_str(&partition_clause(columns, partitioning)?);
+    }
+    Ok(sql)
+}
+
+/// ` PARTITION BY HASH (…) [PARTITIONS n]`, checked against what the server
+/// refuses that the dialog can see for itself. The rest — a key type that
+/// cannot route, a unique key missing a key column — the server explains
+/// better, and the dialog stays open to show it.
+fn partition_clause(columns: &[NewColumn], partitioning: &Partitioning) -> Result<String, String> {
+    if partitioning.key.is_empty() {
+        return Err("pick the partition key: one to three columns".to_string());
+    }
+    if partitioning.key.len() > MAX_PARTITION_KEY {
+        return Err(format!("a partition key has at most {} columns", MAX_PARTITION_KEY));
+    }
+    let mut key = Vec::new();
+    for at in &partitioning.key {
+        let Some(column) = columns.get(*at).filter(|c| !c.name.trim().is_empty()) else {
+            return Err("a partition key column has no name".to_string());
+        };
+        if column.nullable && !column.primary_key {
+            return Err(format!(
+                "partition key column `{}` must be NOT NULL: a NULL could never be routed",
+                column.name.trim()
+            ));
+        }
+        key.push(dialect::quote_ident(column.name.trim()));
+    }
+    let mut clause = format!(" PARTITION BY HASH ({})", key.join(", "));
+    let count = partitioning.count.trim();
+    if !count.is_empty() {
+        match count.parse::<u32>() {
+            Ok(n) if (1..=2048).contains(&n) => clause.push_str(&format!(" PARTITIONS {}", n)),
+            _ => return Err("PARTITIONS takes a whole number from 1 to 2048".to_string()),
+        }
+    }
+    Ok(clause)
+}
+
+/// Builds a `CREATE INDEX` from the dialog.
+///
+/// The type rules — no B-tree over `CHAR`, nothing over `INTERVAL` — are left
+/// to the server, which states them precisely and keeps them current; this
+/// checks only that the form says what to index.
+pub fn create_index_sql(table: &str, index: &NewIndex) -> Result<String, String> {
+    if table.trim().is_empty() {
+        return Err("no table is selected".to_string());
+    }
+    let name = match index.name.trim() {
+        "" => String::new(),
+        name => format!("{} ", dialect::quote_ident(name)),
+    };
+    let on = dialect::quote_ident(table.trim());
+
+    match index.kind {
+        IndexKind::Columns => {
+            if index.columns.is_empty() {
+                return Err("pick the columns to index, in key order".to_string());
+            }
+            let columns: Vec<String> = index.columns.iter().map(|c| dialect::quote_ident(c)).collect();
+            Ok(format!(
+                "CREATE {}INDEX {}ON {} {}({})",
+                if index.unique { "UNIQUE " } else { "" },
+                name,
+                on,
+                index.method.using().map(|m| format!("USING {} ", m)).unwrap_or_default(),
+                columns.join(", ")
+            ))
+        }
+        IndexKind::Document => {
+            if index.document.trim().is_empty() {
+                return Err("this table has no jsonb column to index".to_string());
+            }
+            Ok(format!(
+                "CREATE INDEX {}ON {} USING gin ({}{})",
+                name,
+                on,
+                dialect::quote_ident(index.document.trim()),
+                if index.path_ops { " jsonb_path_ops" } else { "" }
+            ))
+        }
+        IndexKind::Path => {
+            if index.document.trim().is_empty() {
+                return Err("this table has no jsonb column to index".to_string());
+            }
+            let keys: Vec<&str> = index.path.split('.').map(str::trim).collect();
+            if keys.iter().any(|k| k.is_empty()) {
+                return Err("the path needs a key, or keys separated by dots: status, user.id".to_string());
+            }
+            // Every step but the last reads a document (`->`); the last reads
+            // text (`->>`), which is the only form the server will index.
+            let mut expression = dialect::quote_ident(index.document.trim());
+            for (at, key) in keys.iter().enumerate() {
+                let arrow = if at + 1 == keys.len() { "->>" } else { "->" };
+                expression.push_str(&format!("{}{}", arrow, dialect::quote_literal(key)));
+            }
+            Ok(format!("CREATE INDEX {}ON {} (({}))", name, on, expression))
+        }
+    }
 }
 
 /// Builds an `ALTER TABLE … ADD COLUMN`.
@@ -3384,16 +4001,96 @@ mod tests {
         assert!(create_table_sql("t", &[column("a", "TEXT"), column("A", "TEXT")])
             .unwrap_err()
             .contains("twice"));
-        assert!(
-            create_table_sql(
-                "t",
-                &[
-                    NewColumn { primary_key: true, ..column("a", "TEXT") },
-                    NewColumn { primary_key: true, ..column("b", "TEXT") },
-                ]
-            )
-            .is_err()
+    }
+
+    /// Two key columns are one composite key, not an error: a partitioned
+    /// table needs one whenever its key is not its whole partition key.
+    #[test]
+    fn two_key_columns_make_a_composite_primary_key() {
+        let sql = create_table_sql(
+            "t",
+            &[
+                NewColumn { primary_key: true, ..column("a", "BIGINT") },
+                NewColumn { primary_key: true, ..column("b", "TEXT") },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE \"t\" (\"a\" BIGINT NOT NULL, \"b\" TEXT NOT NULL, PRIMARY KEY (\"a\", \"b\"))"
         );
+    }
+
+    #[test]
+    fn a_partitioned_table_names_its_key_in_pick_order() {
+        let columns = [
+            NewColumn { primary_key: true, ..column("tenant_id", "BIGINT") },
+            NewColumn { primary_key: true, ..column("id", "BIGINT") },
+            NewColumn { nullable: false, ..column("group_id", "BIGINT") },
+        ];
+        let partitioning = Partitioning { enabled: true, key: vec![0, 2], count: "128".into() };
+        let sql = create_table_with("assets", &columns, &partitioning).unwrap();
+        assert!(
+            sql.ends_with(") PARTITION BY HASH (\"tenant_id\", \"group_id\") PARTITIONS 128"),
+            "{sql}"
+        );
+        // Blank count: the server's default, not `PARTITIONS `.
+        let partitioning = Partitioning { count: String::new(), ..partitioning };
+        assert!(create_table_with("assets", &columns, &partitioning).unwrap().ends_with("\"group_id\")"));
+    }
+
+    #[test]
+    fn a_partition_key_the_server_would_refuse_is_caught_in_the_dialog() {
+        let nullable = [column("k", "BIGINT")];
+        let on = |key: Vec<usize>, count: &str| Partitioning { enabled: true, key, count: count.into() };
+        assert!(create_table_with("t", &nullable, &on(vec![0], "8")).unwrap_err().contains("NOT NULL"));
+        let fine = [NewColumn { nullable: false, ..column("k", "BIGINT") }];
+        assert!(create_table_with("t", &fine, &on(vec![], "8")).is_err());
+        assert!(create_table_with("t", &fine, &on(vec![0], "0")).is_err());
+        assert!(create_table_with("t", &fine, &on(vec![0], "4096")).is_err());
+        assert!(create_table_with("t", &fine, &on(vec![0], "2048")).is_ok());
+        // Switched off, a picked key is not written.
+        let off = Partitioning { enabled: false, ..on(vec![0], "8") };
+        assert!(!create_table_with("t", &fine, &off).unwrap().contains("PARTITION"));
+    }
+
+    #[test]
+    fn an_index_is_written_the_way_each_kind_is_declared() {
+        let mut index = NewIndex::new("doc".into());
+        assert!(create_index_sql("orders", &index).is_err(), "no columns picked");
+
+        index.columns = vec!["customer_id".into(), "placed_at".into()];
+        assert_eq!(
+            create_index_sql("orders", &index).unwrap(),
+            "CREATE INDEX ON \"orders\" (\"customer_id\", \"placed_at\")"
+        );
+        index.method = IndexMethod::Hash;
+        index.name = "by_customer".into();
+        index.unique = true;
+        assert_eq!(
+            create_index_sql("orders", &index).unwrap(),
+            "CREATE UNIQUE INDEX \"by_customer\" ON \"orders\" USING hash (\"customer_id\", \"placed_at\")"
+        );
+
+        index = NewIndex { kind: IndexKind::Document, path_ops: true, ..NewIndex::new("doc".into()) };
+        assert_eq!(
+            create_index_sql("orders", &index).unwrap(),
+            "CREATE INDEX ON \"orders\" USING gin (\"doc\" jsonb_path_ops)"
+        );
+
+        index = NewIndex { kind: IndexKind::Path, path: "user.id".into(), ..NewIndex::new("doc".into()) };
+        assert_eq!(
+            create_index_sql("orders", &index).unwrap(),
+            "CREATE INDEX ON \"orders\" ((\"doc\"->'user'->>'id'))"
+        );
+        // A key with a quote in it stays inside its literal.
+        index.path = "it's".into();
+        assert!(create_index_sql("orders", &index).unwrap().contains("->>'it''s'"));
+        index.path = "a..b".into();
+        assert!(create_index_sql("orders", &index).is_err());
+        index.document.clear();
+        index.path = "a".into();
+        assert!(create_index_sql("orders", &index).is_err());
     }
 
     /// The server refuses this too, but only after the dialog has closed and

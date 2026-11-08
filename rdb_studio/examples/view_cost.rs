@@ -115,6 +115,7 @@ async fn main() {
             hot: i % 3 != 0,
             set_with: "ALTER SYSTEM SET, then pg_reload_conf()".into(),
             help: "a sentence about what this setting does".into(),
+            ..Default::default()
         })
         .collect();
     for series in 0..14 {
