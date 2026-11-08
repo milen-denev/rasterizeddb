@@ -78,6 +78,8 @@ pub type KeyBuf = SmallVec<[u8; 24]>;
 pub(super) type Slots = SmallVec<[u64; 2]>;
 
 const HASH_SHARDS: usize = 64;
+// A shard number fits the byte the hash install deals by.
+const _: () = assert!(HASH_SHARDS <= 256);
 
 /// Threads a hash index's load fills its shards with, at most: the shards
 /// are independent, and past this the deal before them is the bound.
@@ -647,9 +649,35 @@ impl LiveIndex {
                 // the shards then filled in parallel: they share nothing, and
                 // filling 64 of them one after another was the slowest part of
                 // a load (the hash section's install, 0.14 s for 1.5M keys).
-                let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = (0..HASH_SHARDS).map(|_| Vec::new()).collect();
-                for (key, listed) in entries {
-                    dealt[self.shard(&key)].push((key, listed));
+                let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, INSTALL_WORKERS);
+                // Each key's shard first, worked out on every worker: hashing
+                // the keys one after another was the serial half of the
+                // install. Then each shard's vector sized to what it takes, so
+                // dealing moves every entry once and grows nothing.
+                let mut shard_of = vec![0u8; entries.len()];
+                let step = entries.len().div_ceil(workers).max(1);
+                if workers == 1 || entries.len() < 4096 {
+                    for ((key, _), at) in entries.iter().zip(shard_of.iter_mut()) {
+                        *at = self.shard(key) as u8;
+                    }
+                } else {
+                    std::thread::scope(|scope| {
+                        for (part, out) in entries.chunks(step).zip(shard_of.chunks_mut(step)) {
+                            scope.spawn(move || {
+                                for ((key, _), at) in part.iter().zip(out.iter_mut()) {
+                                    *at = self.shard(key) as u8;
+                                }
+                            });
+                        }
+                    });
+                }
+                let mut sizes = [0usize; HASH_SHARDS];
+                for &at in &shard_of {
+                    sizes[at as usize] += 1;
+                }
+                let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
+                for ((key, listed), at) in entries.into_iter().zip(shard_of) {
+                    dealt[at as usize].push((key, listed));
                 }
                 let fill = |pairs: &mut [(&RwLock<HashMap<KeyBuf, Slots, RandomState>>, Vec<(KeyBuf, Slots)>)]| {
                     for (shard, part) in pairs.iter_mut() {
@@ -662,7 +690,6 @@ impl LiveIndex {
                     }
                 };
                 let mut pairs: Vec<_> = shards.iter().zip(dealt).collect();
-                let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, INSTALL_WORKERS);
                 if workers == 1 {
                     fill(&mut pairs);
                 } else {
