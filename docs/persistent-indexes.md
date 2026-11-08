@@ -1255,6 +1255,17 @@ power-loss soak and a real-driver run).
   `check_history` row (`0x9a31_76c2_d6b6_ad91`). Measured: 6-8 bytes an
   entry (1M rows: primary key 7.9 MB, `(tenant_id, id)` 5.8 MB, hash 6.4 MB,
   FILTER 3.4 MB; 23.5 MB in all).
+- **Version 2 (2026-11-08) adds a chunk table** after `PRESENT`: `n_chunks`,
+  then per chunk its first entry, byte offset and key ordinal (each a
+  difference from the chunk before), `n_keys`, the tail's offset, and the
+  table's length as the section's last four bytes. A chunk starts at a
+  restart that is a key's first pair, every `CHUNK_ENTRIES` (65,536) pairs
+  or more, so no key is split between two; the layout check refuses a
+  table whose chunks do not tile the pairs exactly, start off a restart, or
+  hold other key counts than they claim. Version 1 is still read (as one
+  chunk), so an upgrade loads rather than rebuilds. Golden vector pinned by
+  its own row (`0x08f8_e8fe_3eea_a6cc`); 23 chunks add ~210 bytes to a
+  1.5M-pair section.
 - **C3 no longer leans on the gate for presence** (owner's hardening, in
   `core/index`). Both `for_each_sorted` read the presence bits **before**
   the entry sweep and still emit them last. `insert` lists a slot's entries
@@ -1702,6 +1713,58 @@ reopen loads the indexes rather than rebuilding them, 4-5x faster, with
 about half the RSS. `index_storage` stays opt-in (Q3) until the power-loss
 soak and a real-driver run. Proposal 4 and `INDEX_SECTION_VER` 2 are
 recorded here and not scheduled.
+
+**Reopened 2026-11-08 at the owner's request (`feat/index-routes`).** Three
+changes, each its own commit:
+1. **Decode, then install, per index** (`load_now`): each index goes from
+   its read to its install on one thread, so a fast section installs while a
+   slow one decodes. An error still fails the whole load once every thread
+   stops, and `open_indexes` clears what the others installed.
+2. **`INDEX_SECTION_VER` 2** (above): a section's chunks decode on up to
+   eight threads, each **straight into its share of the one vector of
+   entries** (`SortedLoad::assemble`), checked as `push` checks and joined
+   by comparing each chunk's first key with the previous chunk's last. The
+   first build decoded each chunk into a vector of its own and joined them;
+   the join copied every entry again into pages faulted in on one thread,
+   and the open was no faster than serial decoding.
+3. **A loaded B-tree is range shards** (`core/index::Ranged`): a load into
+   an empty B-tree builds one `BTreeMap` per run the stream came as, in
+   parallel and each from its decoded vector in place; reads chain the
+   shards in order, writes go to the shard their key falls in, and an index
+   never loaded keeps one map. `BTreeMap`'s bulk build was the floor once
+   the sections decoded in parallel (~0.1 s for the primary key, ~0.18 s
+   while overlapping the hash section's threads).
+4. **The hash install hashes and deals on every worker**, each worker
+   taking whole runs into buckets of its own, then fills each shard from
+   every worker's bucket for it.
+5. **`malloc_trim(0)` after a load past one chunk**, on a thread of its
+   own once the barrier is down, one at a time: glibc kept what the
+   workers freed in their arenas (settled RSS 753-768 MiB without it).
+
+So the stream (`SortedLoad`) keeps its entries as runs; the earlier
+attempt that decoded every chunk into one shared vector (unsafe, in place)
+is gone with it.
+
+**Measured** (`examples/index_rebuild_bench.rs`, release, the B18 dataset:
+1.5M rows, primary key, `(tenant_id, id)`, hash on `email`; each binary
+seals its own copy, the copy put back before every open, the order rotated
+each round; load average 0.8-1.8; RSS "settled" is 300 ms after ready, the
+figure to compare, since the one at ready precedes the open's other work):
+
+| | open to ready, median (range) | of rebuild | settled RSS |
+|---|---|---|---|
+| tmpfs, warm: before (bd032384) | 0.219 s (0.212-0.243) | 16.6% | 604 MiB |
+| tmpfs, warm: after | **0.104 s** (0.096-0.112) | **7.9%** | 604 MiB |
+| tmpfs, warm: rebuild | 1.31-1.34 s | | 684 MiB |
+| ext4 `/var/tmp`, cold: before | 0.286 s (0.280-0.291) | 18% | 603-663 MiB |
+| ext4, cold: after | **0.167 s** (0.164-0.169) | **10.5%** (10.4-12%) | 589-600 MiB |
+| ext4, cold: rebuild | 1.59 s (1.40-1.71) | | 684 MiB |
+
+Per index after (warm): the primary key and `(tenant_id, id)` each read,
+decode and install in ~0.035 s; the hash section is the critical path,
+~0.03 s to read and check its 39 MB, ~0.015 s to decode, ~0.033 s to
+install. **The gate's 10% holds warm and is at the line cold**: the cold
+remainder is reading the snapshot itself.
 
 ## 5. The filter under the same rule (T4)
 
