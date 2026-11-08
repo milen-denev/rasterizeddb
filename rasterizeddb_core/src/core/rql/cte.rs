@@ -162,7 +162,15 @@ fn item_label(item: &str) -> Option<String> {
     }
     match split_alias(item) {
         (_, Some(alias)) => Some(alias.to_string()),
-        (expression, None) => bare_column(expression),
+        // Otherwise the name PostgreSQL gives the item: a cast's type
+        // (`'x'::text` is `text`), a call's function (`upper`). Only an
+        // item it names `?column?` is left unnamed: refused, and the client
+        // told to alias it. These were all refused, so `WITH c AS (SELECT
+        // 'x'::text) SELECT * FROM c` failed where PostgreSQL answers.
+        (expression, None) => bare_column(expression).or_else(|| {
+            let name = crate::core::rql::join::pg_column_name(expression);
+            (name != "?column?").then_some(name)
+        }),
     }
 }
 
@@ -249,8 +257,23 @@ fn select_list_of(body: &str) -> Option<&str> {
     // and every Rust raw-string query formats across lines. `find_keyword`
     // already respects quoting and nesting, which is what this used to
     // hand-roll.
-    let at = crate::core::rql::join::find_keyword(body, "FROM", start)?;
-    Some(&body[start..at])
+    if let Some(at) = crate::core::rql::join::find_keyword(body, "FROM", start) {
+        return Some(&body[start..at]);
+    }
+    // A `SELECT` with no `FROM` is one row of its items. It was reported as
+    // "must be a SELECT", so any FROM-less body that `constant_body` cannot
+    // read as bare literals was refused: `SELECT 'x'::text AS d`,
+    // `SELECT 1::int AS n`, `SELECT now()::date AS d`. Its list ends at the
+    // first clause that can follow it, or at the end of the body.
+    let end = [
+        "WHERE", "GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "UNION",
+        "INTERSECT", "EXCEPT", "FOR", "INTO",
+    ]
+    .iter()
+    .filter_map(|keyword| crate::core::rql::join::find_keyword(body, keyword, start))
+    .min()
+    .unwrap_or_else(|| body.trim_end().trim_end_matches(';').trim_end().len());
+    (end > start).then(|| &body[start..end])
 }
 
 /// The constant literals a `RETURNING` clause lists, when every item is one.

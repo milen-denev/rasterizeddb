@@ -98,7 +98,16 @@ fn build(list: &str, condition: Option<&str>, limit: Option<&str>, offset: Optio
             label: alias.unwrap_or_else(|| crate::core::rql::join::pg_column_name(&text)),
             // A `timestamp` without time zone is described as one, so it is
             // shown without an offset, as a row expression's is.
-            db_type: if expr::yields_timestamp(&parsed) { DbType::TIMESTAMP } else { expr::static_type(&parsed) },
+            // And a `json` one as `json`, though its value travels as text:
+            // described as `text`, a CTE or derived table of it was built
+            // with a text column, and `->` on that read NULL.
+            db_type: if expr::yields_timestamp(&parsed) {
+                DbType::TIMESTAMP
+            } else if expr::yields_json_text(&parsed) {
+                DbType::JSONTEXT
+            } else {
+                expr::static_type(&parsed)
+            },
             scale: expr::display_scale(&parsed),
             expr: parsed,
         });
