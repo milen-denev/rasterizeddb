@@ -2085,6 +2085,12 @@ impl PartitionedTable {
                 let (pid, r) = owner(self.pinned_range(at)?)?;
                 ReshapePlan { sources: vec![pid], targets: vec![(r.lo, Some(self.location_dir(to)?))] }
             }
+            ReshapeOp::MovePid { pid, to } => {
+                let r = map
+                    .range_of(*pid)
+                    .ok_or_else(|| refuse(format!("partition {pid} is no longer in the map; plan again")))?;
+                ReshapePlan { sources: vec![*pid], targets: vec![(r.lo, Some(self.location_dir(to)?))] }
+            }
             ReshapeOp::IsolateKey { key, to } => {
                 let block = self.pinned_range(key)?;
                 let (pid, r) = owner(block)?;

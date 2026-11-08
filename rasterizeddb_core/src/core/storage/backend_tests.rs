@@ -1488,13 +1488,15 @@ async fn altering_one_size_is_judged_against_the_other() {
 async fn partition_storage_statements_are_refused_not_misread() {
     // `REBALANCE PARTITIONS` used to run a whole-database REBALANCE and report
     // success, and `MOVE PARTITION t …` read as a table named "PARTITION".
+    // REBALANCE PARTITIONS is the partitions' own now (`relocate`): with no
+    // partitioned table it moves nothing, and says so.
     let root = tempfile::tempdir().unwrap();
     let db = open(root.path()).await;
-    for sql in [
-        "STORAGE REBALANCE PARTITIONS",
-        "STORAGE REBALANCE PARTITIONS DRY RUN",
-        "STORAGE MOVE PARTITION t FOR (k = 42) TO '/nonexistent'",
-    ] {
+    for sql in ["STORAGE REBALANCE PARTITIONS", "STORAGE REBALANCE PARTITIONS DRY RUN"] {
+        let lines = super::sql::execute(sql, &db).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert!(format!("{lines:?}").contains("every partition is where"), "{sql}: {lines:?}");
+    }
+    for sql in ["STORAGE MOVE PARTITION t FOR (k = 42) TO '/nonexistent'"] {
         let error = super::sql::execute(sql, &db)
             .await
             .expect_err(&format!("{sql} was accepted"));

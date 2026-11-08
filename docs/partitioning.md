@@ -696,8 +696,29 @@ four reshape tests; targets committed unpinned, with the log's check off,
 fails the pin test.)*
 
 **Not built (phase 5's rest):** the online copy with a write fence and
-range-bounded re-routes (§6.2 steps 2–4, 7); `STORAGE REBALANCE PARTITIONS`
-(§6.3). Conversion is built (below).
+range-bounded re-routes (§6.2 steps 2–4, 7). Conversion and `STORAGE
+REBALANCE PARTITIONS` are built (below).
+
+## REBALANCE PARTITIONS as built
+
+Built on `feat/rebalance` (2026-11-08): `STORAGE REBALANCE PARTITIONS [DRY
+RUN]` (`storage::relocate::rebalance_partitions`). The whole-table
+rebalance's plan over partitions: every partitioned table's materialized
+partitions, with the location and size `SHOW PARTITIONS` reads (read once,
+sorted, so a DRY RUN and the run after it agree). A partition on a location
+that no longer takes tables (disabled, or not primary) is evacuated to the
+roomiest one that does; under the round-robin policy partitions then move,
+smallest first, from the location holding the most to the one holding the
+fewest until no two differ by more than one. Free space is taken off as the
+plan grows; no move takes a location below `MIN_FREE`.
+
+Each move is a MOVE reshape naming its pid (`ReshapeOp::MovePid`), under
+ACCESS EXCLUSIVE on its table, given back after it. **Sequential**, not the
+bounded parallel §6.3 describes: a reshape holds the database's partition
+DDL lock, so moves of one table cannot overlap, and moves of different
+tables would need it per table. The first failure stops the run, the moves
+before it kept; planning again resumes, a moved partition being a new pid.
+Test: `reshape_tests::rebalance_partitions_spreads_them_and_evacuates_a_disabled_location`.
 
 ## Conversion as built
 

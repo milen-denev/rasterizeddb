@@ -306,8 +306,9 @@ async fn unbuilt_partitioning_statements_are_refused_body() {
         "CREATE UNLOGGED TABLE pu_t (k INT NOT NULL) PARTITION BY HASH (k)".to_string(),
         // `STORAGE MOVE PARTITION` is a reshape since P7, refused here for
         // its directory (22023); checked only for being refused. `STORAGE
-        // REBALANCE PARTITIONS` is left out: the STORAGE parser ignores the
-        // trailing word and runs a whole-database REBALANCE.
+        // REBALANCE PARTITIONS` is left out: it is built (`relocate`). The
+        // STORAGE parser once ignored its trailing word and ran a
+        // whole-database REBALANCE.
         "STORAGE MOVE PARTITION pu_part FOR (k = 42) TO '/nonexistent'".to_string(),
     ];
     for table in ["pu_plain", "pu_part"] {

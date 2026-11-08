@@ -23,6 +23,7 @@
 //! STORAGE MOVE TABLE users TO 'kv:archive'   -- ... to any backend, not only a directory
 //! STORAGE MOVE TABLE users TO 'memory:'
 //! STORAGE REBALANCE [DRY RUN]                -- move what the policy would move
+//! STORAGE REBALANCE PARTITIONS [DRY RUN]     -- the same, for partitions
 //!
 //! SHOW STORAGE                               -- one summary line per location and store
 //! SHOW STORAGE STATS                         -- the same facts as (metric, value, detail)
@@ -639,19 +640,19 @@ async fn move_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<S
 
 /// `STORAGE REBALANCE [DRY RUN]`
 async fn rebalance(tokens: &[String], database: &Arc<Database>) -> Result<Vec<String>, String> {
-    // `REBALANCE PARTITIONS` used to run a whole-database rebalance and report
-    // success, the extra word ignored.
+    let dry = tokens
+        .iter()
+        .skip(2)
+        .any(|word| word.eq_ignore_ascii_case("DRY"));
+    // `REBALANCE PARTITIONS`: the partitioned tables' partitions, which the
+    // whole-table rebalance never moves (docs/partitioning.md §6.3).
     if tokens
         .iter()
         .skip(2)
         .any(|word| word.eq_ignore_ascii_case("PARTITIONS") || word.eq_ignore_ascii_case("PARTITION"))
     {
-        return Err("STORAGE REBALANCE PARTITIONS is not supported yet: partitions move with reshaping, in a later version".to_string());
+        return super::relocate::rebalance_partitions(database, dry).await;
     }
-    let dry = tokens
-        .iter()
-        .skip(2)
-        .any(|word| word.eq_ignore_ascii_case("DRY"));
     super::relocate::rebalance(database, dry).await
 }
 

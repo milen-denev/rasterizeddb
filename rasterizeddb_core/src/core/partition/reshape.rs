@@ -295,6 +295,9 @@ pub enum ReshapeOp {
     SplitKey { key: String, into: u32 },
     /// `STORAGE MOVE PARTITION t FOR (…) TO 'dir'`.
     MovePartition { at: String, to: String },
+    /// Partition `pid` moved to `dir`: `STORAGE REBALANCE PARTITIONS`'s
+    /// step, which names partitions as its plan found them.
+    MovePid { pid: u32, to: String },
 }
 
 impl ReshapeOp {
@@ -305,7 +308,7 @@ impl ReshapeOp {
             ReshapeOp::MergePartitions { .. } => "MERGE PARTITIONS",
             ReshapeOp::IsolateKey { .. } => "ISOLATE KEY",
             ReshapeOp::SplitKey { .. } => "SPLIT KEY",
-            ReshapeOp::MovePartition { .. } => "MOVE PARTITION",
+            ReshapeOp::MovePartition { .. } | ReshapeOp::MovePid { .. } => "MOVE PARTITION",
         }
     }
 }

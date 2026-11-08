@@ -316,3 +316,52 @@ async fn move_partition_follows_the_storage_locations() {
     close(&root, db);
 }
 
+
+/// `STORAGE REBALANCE PARTITIONS` (§6.3): under the round-robin policy a new
+/// disk takes partitions until no two locations differ by more than one, a
+/// DRY RUN moves nothing, and every row is where it was for a client; a
+/// disabled location is evacuated. It was refused ("not supported yet"),
+/// and before that ran a whole-table rebalance that never moved one.
+///
+/// Mutation: the planner's round-robin step skipped; nothing moves and the
+/// disk holds no partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebalance_partitions_spreads_them_and_evacuates_a_disabled_location() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root: PathBuf = tmp.path().join("root");
+    let disk: PathBuf = tmp.path().join("disk");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&disk).unwrap();
+    let db = populated(&root).await;
+    let before = fingerprint(&db).await;
+    let uid = db.partitioned_table("pt").unwrap().uid();
+    let materialized = db.partitioned_table("pt").unwrap().materialized_pids().unwrap().len();
+    assert!(materialized >= 3, "{materialized} partitions hold rows");
+    db.storage
+        .add_location(&disk.to_string_lossy(), crate::core::storage::LocationRole::Primary, 1, true)
+        .unwrap();
+    exec(&db, "STORAGE SET POLICY = 'round-robin'").await;
+
+    let plan = String::from_utf8_lossy(&exec(&db, "STORAGE REBALANCE PARTITIONS DRY RUN").await).into_owned();
+    assert!(plan.contains("would move"), "{plan}");
+    assert!(pids_on_disk(&disk, uid).is_empty(), "a DRY RUN moved a partition");
+
+    exec(&db, "STORAGE REBALANCE PARTITIONS").await;
+    let on_disk = pids_on_disk(&disk, uid).len();
+    let in_root = pids_on_disk(&root, uid).len();
+    assert_eq!(on_disk + in_root, materialized, "every partition is somewhere, once");
+    assert!(on_disk.abs_diff(in_root) <= 1, "{in_root} in the root, {on_disk} on the disk");
+    assert_eq!(fingerprint(&db).await, before, "after the rebalance");
+    let again = String::from_utf8_lossy(&exec(&db, "STORAGE REBALANCE PARTITIONS DRY RUN").await).into_owned();
+    assert!(again.contains("nothing to move"), "a second plan: {again}");
+
+    close(&root, db);
+    let db = open(&root).await;
+    assert_eq!(fingerprint(&db).await, before, "after a restart");
+    exec(&db, &format!("STORAGE DISABLE LOCATION '{}'", disk.display())).await;
+    exec(&db, "STORAGE REBALANCE PARTITIONS").await;
+    assert!(pids_on_disk(&disk, uid).is_empty(), "the disabled disk was evacuated");
+    assert_eq!(fingerprint(&db).await, before, "after the evacuation");
+    assert_files_match(&db, &root, "after the evacuation").await;
+    close(&root, db);
+}
