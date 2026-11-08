@@ -1752,3 +1752,76 @@ fn a_map_built_from_runs_reads_as_one_map() {
 fn r_below(r: &mut Rng, n: u64) -> u64 {
     r.below(n)
 }
+
+/// A stream assembled from several runs (a chunked section's load) installs
+/// the index a stream pushed in one piece installs, for a B-tree (built as
+/// one shard per run) and a hash index (dealt by worker groups): the same
+/// capture, the same answer to every key, and after more writes landing
+/// across the shards, still the same as the source given the same writes.
+#[test]
+fn a_load_from_many_runs_installs_what_one_run_installs() {
+    let ticket = test_mint();
+    let proof = Proof::from(&ticket);
+    let mut rng = Rng(0x7e57_c4a1);
+    for method in [Method::BTree, Method::Hash] {
+        let source = index("src", method, &[0]);
+        let key = |ix: &LiveIndex, v: i64| {
+            let bytes = v.to_le_bytes();
+            ix.key_of(|_| Some(&bytes[..]))
+        };
+        let n = 20_000u64;
+        for slot in 0..n {
+            // About three slots a key, and some unkeyed.
+            let k = if slot % 41 == 0 { None } else { key(&source, (rng.below(7000) as i64) - 3500) };
+            source.insert(proof, slot, k);
+        }
+        let c = capture(&source);
+        let mut counts = Vec::new();
+        let mut left = c.entries.len();
+        while left > 0 {
+            let n = (1 + rng.below(900) as usize).min(left);
+            counts.push(n);
+            left -= n;
+        }
+        assert!(counts.len() > 5, "{method:?}: too few runs");
+        let bases: Vec<usize> = counts.iter().scan(0, |at, &n| { let b = *at; *at += n; Some(b) }).collect();
+        let mut load = SortedLoad::<KeyBuf>::assemble(n, &counts, 4, |i, stretch| -> Result<(), SortedReject> {
+            for (k, s) in &c.entries[bases[i]..bases[i] + counts[i]] {
+                stretch.push(k, s)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        load.push(Sorted::Unkeyed(&c.unkeyed)).unwrap();
+        load.push(Sorted::Present(&c.present)).unwrap();
+        let loaded = index("ld", method, &[0]);
+        loaded.load_sorted(proof, load).unwrap();
+        let got = capture(&loaded);
+        assert_eq!(got.entries, c.entries, "{method:?}: entries");
+        assert_eq!((got.unkeyed.clone(), got.present.clone()), (c.unkeyed.clone(), c.present.clone()), "{method:?}");
+        for v in -3600..3600i64 {
+            let k = key(&source, v).unwrap();
+            assert_eq!(loaded.slots_for_key(&k), source.slots_for_key(&k), "{method:?}: key {v}");
+        }
+        // The same writes to both, then the same answers.
+        for _ in 0..3000 {
+            let slot = rng.below(n + 500);
+            let v = (rng.below(7400) as i64) - 3700;
+            if rng.below(3) == 0 {
+                if let Some(k) = key(&source, v) {
+                    source.remove(proof, slot, &k);
+                    loaded.remove(proof, slot, &k);
+                }
+            } else {
+                source.insert(proof, slot, key(&source, v));
+                loaded.insert(proof, slot, key(&loaded, v));
+            }
+        }
+        let (a, b) = (capture(&source), capture(&loaded));
+        assert_eq!(b.entries, a.entries, "{method:?}: entries after writes");
+        for v in -3700..3700i64 {
+            let k = key(&source, v).unwrap();
+            assert_eq!(loaded.slots_for_key(&k), source.slots_for_key(&k), "{method:?}: key {v} after writes");
+        }
+    }
+}

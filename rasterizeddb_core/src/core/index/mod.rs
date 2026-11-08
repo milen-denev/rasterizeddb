@@ -650,57 +650,100 @@ impl LiveIndex {
                 // filling 64 of them one after another was the slowest part of
                 // a load (the hash section's install, 0.14 s for 1.5M keys).
                 let workers = install_workers();
-                // Each key's shard first, worked out on every worker: hashing
-                // the keys one after another was the serial half of the
-                // install. Then each shard's vector sized to what it takes, so
-                // dealing moves every entry once and grows nothing, straight
-                // from the runs the stream came as (never joined first).
-                let runs = segments;
-                let mut shard_of: Vec<Vec<u8>> = runs.iter().map(|r| vec![0u8; r.len()]).collect();
-                let total: usize = runs.iter().map(Vec::len).sum();
-                let step = total.div_ceil(workers).max(4096);
-                let mut pieces: Vec<(&[(KeyBuf, Slots)], &mut [u8])> = Vec::new();
-                for (run, out) in runs.iter().zip(shard_of.iter_mut()) {
-                    pieces.extend(run.chunks(step).zip(out.chunks_mut(step)));
-                }
-                let hash = |pieces: &mut [(&[(KeyBuf, Slots)], &mut [u8])]| {
-                    for (part, out) in pieces.iter_mut() {
-                        for ((key, _), at) in part.iter().zip(out.iter_mut()) {
-                            *at = self.shard(key) as u8;
+                // Hashed and dealt on every worker, each taking whole runs
+                // into buckets of its own sized from its own count (dealing
+                // 1.5M entries on one thread was the install's serial half),
+                // then each shard filled from every worker's bucket for it.
+                // One run (a version 1 section, or one chunk) is hashed in
+                // pieces and dealt on one thread: its entries cannot be moved
+                // from on several without copying the run apart first.
+                let mut runs = segments;
+                let groups: Vec<Vec<Vec<(KeyBuf, Slots)>>> = if runs.len() > 1 && workers > 1 {
+                    let total: usize = runs.iter().map(Vec::len).sum();
+                    let target = total.div_ceil(workers).max(1);
+                    let mut groups: Vec<Vec<Vec<(KeyBuf, Slots)>>> = vec![Vec::new()];
+                    let mut in_group = 0usize;
+                    for run in runs.drain(..) {
+                        if in_group >= target {
+                            groups.push(Vec::new());
+                            in_group = 0;
                         }
+                        in_group += run.len();
+                        groups.last_mut().expect("a group").push(run);
                     }
-                };
-                if workers == 1 || pieces.len() <= 1 {
-                    hash(&mut pieces);
+                    groups
                 } else {
-                    let per = pieces.len().div_ceil(workers);
-                    std::thread::scope(|scope| {
-                        for group in pieces.chunks_mut(per) {
-                            scope.spawn(move || hash(group));
+                    vec![runs]
+                };
+                let deal = |group: Vec<Vec<(KeyBuf, Slots)>>, parallel_hash: bool| -> Vec<Vec<(KeyBuf, Slots)>> {
+                    let mut shard_of: Vec<Vec<u8>> = group.iter().map(|r| vec![0u8; r.len()]).collect();
+                    let hash = |pieces: &mut [(&[(KeyBuf, Slots)], &mut [u8])]| {
+                        for (part, out) in pieces.iter_mut() {
+                            for ((key, _), at) in part.iter().zip(out.iter_mut()) {
+                                *at = self.shard(key) as u8;
+                            }
                         }
-                    });
-                }
-                let mut sizes = [0usize; HASH_SHARDS];
-                for &at in shard_of.iter().flatten() {
-                    sizes[at as usize] += 1;
-                }
-                let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
-                for (run, ids) in runs.into_iter().zip(shard_of) {
-                    for (entry, at) in run.into_iter().zip(ids) {
-                        dealt[at as usize].push(entry);
+                    };
+                    {
+                        let total: usize = group.iter().map(Vec::len).sum();
+                        let step = if parallel_hash { total.div_ceil(workers).max(4096) } else { usize::MAX };
+                        let mut pieces: Vec<(&[(KeyBuf, Slots)], &mut [u8])> = Vec::new();
+                        for (run, out) in group.iter().zip(shard_of.iter_mut()) {
+                            pieces.extend(run.chunks(step.min(run.len().max(1))).zip(out.chunks_mut(step.min(run.len().max(1)))));
+                        }
+                        if !parallel_hash || pieces.len() <= 1 {
+                            hash(&mut pieces);
+                        } else {
+                            let per = pieces.len().div_ceil(workers);
+                            std::thread::scope(|scope| {
+                                for piece in pieces.chunks_mut(per) {
+                                    scope.spawn(move || hash(piece));
+                                }
+                            });
+                        }
+                    }
+                    let mut sizes = [0usize; HASH_SHARDS];
+                    for &at in shard_of.iter().flatten() {
+                        sizes[at as usize] += 1;
+                    }
+                    let mut dealt: Vec<Vec<(KeyBuf, Slots)>> = sizes.iter().map(|&n| Vec::with_capacity(n)).collect();
+                    for (run, ids) in group.into_iter().zip(shard_of) {
+                        for (entry, at) in run.into_iter().zip(ids) {
+                            dealt[at as usize].push(entry);
+                        }
+                    }
+                    dealt
+                };
+                // Per group, then turned into per shard: bucket `s` of every
+                // group, for the worker that fills shard `s`.
+                let per_group: Vec<Vec<Vec<(KeyBuf, Slots)>>> = if groups.len() == 1 {
+                    let group = groups.into_iter().next().expect("a group");
+                    vec![deal(group, workers > 1)]
+                } else {
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = groups.into_iter().map(|g| scope.spawn(move || deal(g, false))).collect();
+                        handles.into_iter().map(|h| h.join().expect("a hash deal panicked")).collect()
+                    })
+                };
+                let mut by_shard: Vec<Vec<Vec<(KeyBuf, Slots)>>> = (0..HASH_SHARDS).map(|_| Vec::new()).collect();
+                for buckets in per_group {
+                    for (s, bucket) in buckets.into_iter().enumerate() {
+                        if !bucket.is_empty() {
+                            by_shard[s].push(bucket);
+                        }
                     }
                 }
-                let fill = |pairs: &mut [(&RwLock<HashMap<KeyBuf, Slots, RandomState>>, Vec<(KeyBuf, Slots)>)]| {
-                    for (shard, part) in pairs.iter_mut() {
-                        let part = std::mem::take(part);
+                let fill = |pairs: &mut [(&RwLock<HashMap<KeyBuf, Slots, RandomState>>, Vec<Vec<(KeyBuf, Slots)>>)]| {
+                    for (shard, parts) in pairs.iter_mut() {
+                        let parts = std::mem::take(parts);
                         let mut shard = shard.write();
-                        shard.reserve(part.len());
-                        for (key, listed) in part {
+                        shard.reserve(parts.iter().map(Vec::len).sum());
+                        for (key, listed) in parts.into_iter().flatten() {
                             merge_sorted(shard.entry(key).or_default(), listed);
                         }
                     }
                 };
-                let mut pairs: Vec<_> = shards.iter().zip(dealt).collect();
+                let mut pairs: Vec<_> = shards.iter().zip(by_shard).collect();
                 if workers == 1 {
                     fill(&mut pairs);
                 } else {
