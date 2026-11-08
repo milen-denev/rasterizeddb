@@ -606,6 +606,63 @@ async fn serve_pgwire(
     Ok(())
 }
 
+/// What a single-relation `SELECT`'s rows are, named and typed as they go
+/// out: its select items when any fills a slot no fetched column occupies (a
+/// constant, an expression, a row value, a window), its aggregate's items, or
+/// else each column under its alias. `column_type` is what a plain column is
+/// advertised as. One function for a table and a catalogue view, so the two
+/// cannot describe the same select list differently.
+fn select_list_fields(
+    parsed: &crate::core::rql::lexer_query::QueryRows,
+    table_fields: &[crate::core::row::schema::SchemaField],
+    column_type: impl Fn(&crate::core::row::schema::SchemaField) -> DbType,
+) -> Vec<(String, DbType)> {
+    use crate::core::rql::aggregate::SelectItem;
+    // The type a select item is *advertised* as.
+    //
+    // A shredded JSON column is stored as a `UUID` pointing at its
+    // shadow table, and `reported_type` is what says `jsonb` instead —
+    // its own doc comment requires every path that describes a column
+    // to agree on that. The branches below used `result_type()`, which
+    // for a plain column is the raw stored type, so a select mixing
+    // such a column with a computed item, a window or an aggregate
+    // advertised it as `uuid` and every typed client refused the row.
+    // A plain `SELECT` of the same column was fine, which made it look
+    // intermittent by query rather than by column.
+    let advertised = |item: &SelectItem| -> DbType {
+        match item {
+            SelectItem::Column { field, .. } => column_type(field),
+            other => other.reported_type(),
+        }
+    };
+    // A select list containing a constant has no fetched column behind
+    // that position, so the metadata comes from the list itself.
+    if parsed.select_items.iter().any(|i| {
+        matches!(
+            i,
+            SelectItem::Literal { .. }
+                | SelectItem::Scalar { .. }
+                // A row expression fills an output slot no fetched
+                // column occupies, so the description has to come from
+                // the select list or the row goes out with more fields
+                // than were announced.
+                | SelectItem::RowExpr { .. }
+                // A window fills an output slot no fetched column
+                // occupies, so its type must come from the select list.
+                | SelectItem::Window { .. }
+        )
+    }) {
+        return parsed.select_items.iter().map(|item| (item.label().to_string(), advertised(item))).collect();
+    }
+    // An aggregate result has no schema fields behind it: its columns
+    // are the select items, named and typed by the plan.
+    if let Some(plan) = &parsed.aggregate {
+        return plan.items.iter().map(|item| (item.label().to_string(), advertised(item))).collect();
+    }
+    // Each column under its alias, as the rows go out.
+    plain_select_fields(parsed, table_fields, column_type)
+}
+
 /// Gives a database the bootstrap role it needs to be reachable at all.
 ///
 /// A no-op under `trust`, where no role is consulted, and a no-op on a database
@@ -4568,38 +4625,14 @@ async fn describe_resolved(
         if let QueryPurpose::QueryRows(_) = &purpose {
             if let Some(schema) = crate::core::rql::catalog_views::synthetic_schema(view) {
                 if let Ok(parsed) = row_fetch_from_select_query(&purpose, &schema) {
-                    // An aggregate's columns are its select items, named and
-                    // typed by the plan — not the fields it happens to read.
-                    // Reading the fetch instead reported `SELECT COUNT(*) AS n
-                    // FROM pg_class c` as a column called `oid`: the view's
-                    // first field, because that is what COUNT was scanning. The
-                    // count was right and its name was another column's.
-                    if let Some(plan) = &parsed.aggregate {
-                        let fields: Vec<(String, DbType)> = plan
-                            .items
-                            .iter()
-                            .map(|item| {
-                                let label: String = item.label().to_string();
-                                (label, item.reported_type())
-                            })
-                            .collect();
-                        if !fields.is_empty() {
-                            return Ok(Some((fields, true)));
-                        }
-                    }
-
-                    let fields: Vec<(String, DbType)> = parsed
-                        .requested_row_fetch
-                        .columns_fetching_data
-                        .iter()
-                        .take(parsed.visible_columns)
-                        .filter_map(|c| {
-                            field_of(&schema, c.schema_id).map(|f| {
-                                let label: String = f.name.clone();
-                                (label, f.literal_type())
-                            })
-                        })
-                        .collect();
+                    // The select list, as a plain table's is described. This
+                    // read the fetched fields, which are what the statement
+                    // *reads*: `SELECT COUNT(*) AS n FROM pg_class c` was a
+                    // column called `oid` (fixed for aggregates alone), `n_live_tup
+                    // AS live` kept its column's name, and `n_live_tup +
+                    // n_dead_tup AS slots` was described as two columns ahead
+                    // of a one-field DataRow, which every driver refuses.
+                    let fields = select_list_fields(&parsed, &schema, |f| f.literal_type());
                     if !fields.is_empty() {
                         return Ok(Some((fields, true)));
                     }
@@ -4769,76 +4802,14 @@ async fn describe_resolved(
                 },
             };
 
-            // NOTE: RowDescription wants &str; we keep names static-ish by leaking.
-            // This is acceptable for a minimal server; statements are small and few.
-            let mut fields = Vec::new();
-
-            // The type a select item is *advertised* as.
-            //
-            // A shredded JSON column is stored as a `UUID` pointing at its
-            // shadow table, and `reported_type` is what says `jsonb` instead —
-            // its own doc comment requires every path that describes a column
-            // to agree on that. The branches below used `result_type()`, which
-            // for a plain column is the raw stored type, so a select mixing
-            // such a column with a computed item, a window or an aggregate
-            // advertised it as `uuid` and every typed client refused the row.
-            // A plain `SELECT` of the same column was fine, which made it look
-            // intermittent by query rather than by column.
-            let advertised = |item: &crate::core::rql::aggregate::SelectItem| -> DbType {
-                match item {
-                    crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
-                        match &real_table {
-                            Some(t) => reported_type(field, t.schema()),
-                            None => field.literal_type(),
-                        }
-                    }
-                    other => other.reported_type(),
-                }
-            };
-
-            // A select list containing a constant has no fetched column behind
-            // that position, so the metadata comes from the list itself.
-            if parsed.select_items.iter().any(|i| {
-                matches!(
-                    i,
-                    crate::core::rql::aggregate::SelectItem::Literal { .. }
-                        | crate::core::rql::aggregate::SelectItem::Scalar { .. }
-                        // A row expression fills an output slot no fetched
-                        // column occupies, so the description has to come from
-                        // the select list or the row goes out with more fields
-                        // than were announced.
-                        | crate::core::rql::aggregate::SelectItem::RowExpr { .. }
-                        // A window fills an output slot no fetched column
-                        // occupies, so its type must come from the select list.
-                        | crate::core::rql::aggregate::SelectItem::Window { .. }
-                )
-            }) {
-                for item in &parsed.select_items {
-                    let label: String = item.label().to_string();
-                    fields.push((label, advertised(item)));
-                }
-                return Ok(Some((fields, true)));
-            }
-
-            // An aggregate result has no schema fields behind it: its columns
-            // are the select items, named and typed by the plan.
-            if let Some(plan) = &parsed.aggregate {
-                for item in &plan.items {
-                    let label: String = item.label().to_string();
-                    fields.push((label, advertised(item)));
-                }
-                return Ok(Some((fields, true)));
-            }
-
-            // Each column under its alias, as the rows go out.
-            fields.extend(plain_select_fields(&parsed, &table_fields, |field| {
+            let fields = select_list_fields(&parsed, &table_fields, |field| {
                 // A catalogue view has no `TableSchema` and no JSON columns, so
                 // the field's own type is what it reports.
                 match &real_table {
                     Some(t) => reported_type(field, t.schema()),
                     None => field.literal_type(),
                 }
-            }));
+            });
             Ok(Some((fields, true)))
         }
         QueryPurpose::InsertRow(ir) => {

@@ -138,6 +138,47 @@ async fn an_explicit_column_list_is_described_as_written() {
     );
 }
 
+/// A select list over a catalogue view is described as a table's is: each
+/// item under its alias, an expression as one column of its own type.
+///
+/// The view's describe arm read the fields the statement *fetches*, so
+/// `n_live_tup AS live` kept its column's name, and `n_live_tup + n_dead_tup
+/// AS slots` was announced as two columns ahead of a one-field DataRow, which
+/// every driver refuses as a protocol error. Only the extended protocol
+/// describes, so `psql` never saw it; sqlx and every ORM did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalogue_select_list_is_described_as_its_items() {
+    let (_server, pool) = server().await;
+    let typed = |rows: &[sqlx::postgres::PgRow]| -> Vec<String> {
+        rows[0]
+            .columns()
+            .iter()
+            .map(|c| format!("{}:{}", c.name(), sqlx::TypeInfo::name(c.type_info())))
+            .collect()
+    };
+    for (sql, expected) in [
+        ("SELECT n_live_tup AS live FROM pg_stat_user_tables WHERE relname = 'docs'", vec!["live:INT8"]),
+        (
+            "SELECT relname AS name, n_live_tup + n_dead_tup AS slots FROM pg_stat_user_tables WHERE relname = 'docs'",
+            vec!["name:TEXT", "slots:INT8"],
+        ),
+        ("SELECT reltuples >= 0 AS counted FROM pg_class WHERE relname = 'docs'", vec!["counted:BOOL"]),
+        ("SELECT COUNT(*) AS n FROM pg_class c", vec!["n:INT8"]),
+    ] {
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql:?} should run: {e}"));
+        assert_eq!(typed(&rows), expected, "for {sql:?}");
+    }
+    let counted: bool = sqlx::query("SELECT reltuples >= 0 AS counted FROM pg_class WHERE relname = 'docs'")
+        .fetch_one(&pool)
+        .await
+        .expect("counted")
+        .get("counted");
+    assert!(counted);
+}
+
 /// "tables" and "columns" are ordinary words, so they are matched only when
 /// qualified. A user relation named `tables` must still be its own table.
 #[tokio::test(flavor = "multi_thread")]
