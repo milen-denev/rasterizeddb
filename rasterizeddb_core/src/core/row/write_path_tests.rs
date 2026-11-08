@@ -4546,3 +4546,36 @@ async fn a_failed_row_bytes_flush_fails_the_insert() {
     // inherits it.
     crate::core::storage_providers::file_sync::forget_directory_failure(location);
 }
+
+/// Finding: a sweep counted the pointers it read against write counters read
+/// after it, so rows inserted once it had read the pointer file's length were
+/// in neither. A table's first sweep runs as soon as it opens, so it raced
+/// the rows its creator inserted next, and an insert-only table is never
+/// swept again: `pg_stat_user_tables` said 0 live and 4 dead for four live
+/// rows, for good (seen as a flaky `partition_shell_sites` under load).
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_inserted_as_a_sweep_ends_are_counted_live() {
+    use crate::core::vacuum::run_once_test_hooks::{AFTER_SCAN, arm};
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "wp_live_tail").await;
+    for i in 0..5u64 {
+        insert(&t, i, 0, "before").await;
+    }
+    let park = arm(&t.data().unwrap().free_space, AFTER_SCAN);
+    let writer = async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), park.parked.notified())
+            .await
+            .expect("the sweep never reached its park point");
+        for i in 5..9u64 {
+            insert(&t, i, 0, "during").await;
+        }
+        park.release.notify_one();
+    };
+    let (report, ()) = tokio::join!(t.vacuum_now(), writer);
+    report.unwrap();
+    let stats = &t.data().unwrap().vacuum_stats;
+    assert_eq!(stats.live_rows(), Some(9), "the rows appended after the scan read the file's length");
+    // Carried forward from there by the writes that follow.
+    insert(&t, 9, 0, "after").await;
+    assert_eq!(stats.live_rows(), Some(10));
+}

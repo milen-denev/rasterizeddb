@@ -986,15 +986,16 @@ impl VacuumStats {
         Some(swept.live.saturating_add(inserted).saturating_sub(deleted))
     }
 
-    /// Stores a complete sweep's live count against the counters as they are
-    /// now. Called the moment the scan ends: see [`ReclaimContext::stats`].
-    fn record_live(&self, live: u64) {
-        let mut swept = self.swept.lock();
-        *swept = Some(SweptLive {
-            live,
-            inserted: self.inserted_rows.load(Ordering::Acquire),
-            deleted: self.deleted_rows.load(Ordering::Acquire),
-        });
+    /// The two write counters as they stand now, for [`Self::record_live`].
+    fn counters(&self) -> (u64, u64) {
+        (self.inserted_rows.load(Ordering::Acquire), self.deleted_rows.load(Ordering::Acquire))
+    }
+
+    /// Stores a complete sweep's live count against `counters`, which were
+    /// read before the last of the pointers it counts: see
+    /// [`count_tail_live`].
+    fn record_live(&self, live: u64, (inserted, deleted): (u64, u64)) {
+        *self.swept.lock() = Some(SweptLive { live, inserted, deleted });
     }
 
     fn record(&self, report: &VacuumReport) {
@@ -1177,6 +1178,46 @@ async fn forget_reclaimed<S: StorageIO>(
 }
 
 /// Reads every pointer record and reports the live and dead extents.
+/// Whether the sweep counts a version it keeps as held: stamped by a deleter
+/// the horizon has not passed, in flight or committed while an older
+/// transaction runs. An aborted deleter below the horizon is a live row and
+/// is not counted, or a table with old aborted deletes would look
+/// permanently due.
+fn is_held(horizon: &VersionHorizon, pointer: &RowPointer) -> bool {
+    horizon.is_versioned() && pointer.xmax != NO_TX && pointer.xmax >= horizon.oldest_active()
+}
+
+/// The live rows, less the held ones, among the pointers past the first
+/// `from` slots: those appended after the sweep last read the file's length,
+/// classified as the sweep classifies. Up to the length as it is now; a
+/// record still being written is past it, and so is its insert's count.
+async fn count_tail_live<S: StorageIO>(io_pointers: &S, from: u64, horizon: &VersionHorizon) -> std::io::Result<u64> {
+    const RECORD: usize = ROW_POINTER_RECORD_LEN;
+    let len = io_pointers.get_len().await;
+    let end = (len - len % RECORD as u64) / RECORD as u64;
+    let mut live = 0u64;
+    let mut at = from;
+    let mut buffer = vec![0u8; RECORD * 256];
+    while at < end {
+        let n = ((end - at) as usize).min(256);
+        let chunk = &mut buffer[..n * RECORD];
+        let mut position = at * RECORD as u64;
+        match io_pointers.read_data_into_buffer(&mut position, chunk).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        for record in chunk.chunks_exact(RECORD) {
+            let pointer = RowPointer::from_slice_unknown(record);
+            if !horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) && !is_held(horizon, &pointer) {
+                live += 1;
+            }
+        }
+        at += n as u64;
+    }
+    Ok(live)
+}
+
 async fn scan_pointers<S: StorageIO>(
     io_pointers: &S,
     free_space: &FreeSpace,
@@ -1258,14 +1299,7 @@ async fn scan_pointers<S: StorageIO>(
                 push_run(&mut result.clear_runs, slot);
             }
         } else {
-            // Stamped by a deleter the horizon has not passed — in flight, or
-            // committed while an older transaction runs. An aborted deleter
-            // below the horizon is a live row and is not counted, or a table
-            // with old aborted deletes would look permanently due.
-            if horizon.is_versioned()
-                && pointer.xmax != NO_TX
-                && pointer.xmax >= horizon.oldest_active()
-            {
+            if is_held(horizon, pointer) {
                 result.held_rows += 1;
                 if result.held_min_xmax == NO_TX || pointer.xmax < result.held_min_xmax {
                     result.held_min_xmax = pointer.xmax;
@@ -1727,8 +1761,21 @@ pub async fn run_once<S: StorageIO>(
     }
     // The scan saw every pointer, so its count stands, deferred or not:
     // deferral is about handing out bytes.
+    //
+    // The counters are read first, and then whatever the pointer file holds
+    // past the scan is counted too. An insert counts itself only once its
+    // pointer is written, so every insert the counters hold is in the scan or
+    // in that tail. Counting the scan alone against counters read after it
+    // lost every row appended once the scan had read the file's length: a
+    // table's first sweep runs as soon as it opens, so it raced the rows its
+    // creator inserted next, and a table only ever inserted into is never
+    // swept again, so it reported those rows dead for good.
     if let Some(stats) = ctx.stats {
-        stats.record_live(scan.live_rows.saturating_sub(scan.held_rows));
+        let counters = stats.counters();
+        match count_tail_live(io_pointers, scan.slots, horizon).await {
+            Ok(tail) => stats.record_live(scan.live_rows.saturating_sub(scan.held_rows) + tail, counters),
+            Err(e) => log::warn!("vacuum: counting the pointers appended during the sweep: {e}; live rows not measured"),
+        }
     }
 
     // Everything below acts on the sweep's decisions as final: fingerprints
