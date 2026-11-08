@@ -426,7 +426,8 @@ fn schema_ddl_on_a_partitioned_table_runs_or_is_refused_before_it_writes() {
             ("ALTER TABLE pd_alt DROP COLUMN k", "partition key column"),
             ("ALTER TABLE pd_alt ADD CONSTRAINT pd_alt_u UNIQUE (n)", "partition key column"),
             ("CREATE UNIQUE INDEX pd_alt_n1 ON pd_alt (n)", "partition key column"),
-            ("ALTER TABLE pd_alt ADD COLUMN j JSON", "shadow tables"),
+            // jsonb shreds into shadow tables; `json` is text, and is added.
+            ("ALTER TABLE pd_alt ADD COLUMN j JSONB", "shadow tables"),
         ] {
             let e = run(&db, sql).await.expect_err(&format!("{sql} was accepted"));
             assert_0a000(sql, &e);

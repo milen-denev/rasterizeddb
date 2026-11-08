@@ -335,7 +335,10 @@ fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
     pair.ok("ALTER TABLE {t} ALTER COLUMN must DROP NOT NULL");
     pair.ok("ALTER TABLE {t} ALTER COLUMN filled DROP NOT NULL");
     pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
-    pair.refused("ALTER TABLE {t} ADD COLUMN doc JSON", "shadow tables");
+    // A shredded jsonb column has shadow tables, refused here; `json` is
+    // text as written, an ordinary column.
+    pair.refused("ALTER TABLE {t} ADD COLUMN doc JSONB", "shadow tables");
+    pair.ok("ALTER TABLE {t} ADD COLUMN doc JSON");
     pair.compare("columns added");
     pair.ok(
         "INSERT INTO {t} (tenant_id, id, n, s, extra, dec, must) VALUES (1, 1, 5, 'a', NULL, 12.34, NULL), \
