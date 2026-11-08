@@ -2558,6 +2558,9 @@ fn needs_evaluator(text: &str) -> bool {
                 quote_at = i;
             }
             b'%' => return true,
+            // `^` (power), which the comparison tokens cannot carry; not
+            // `^@`, which is `starts_with`.
+            b'^' if bytes.get(i + 1) != Some(&b'@') => return true,
             b'|' if bytes.get(i + 1) == Some(&b'|') && (i == 0 || bytes[i - 1] != b'?') => {
                 return true;
             }

@@ -17,6 +17,10 @@ ahash = "0.8"
 hashbrown = { version = "0.16", default-features = false }
 # Bulk scanning of SQL text for the next quote/placeholder byte.
 memchr = "2"
+# NUMERIC exp/ln/log/power (`rql::pg_numeric_math`): their working precision
+# runs past an i128 before the result is rounded back into one.
+num-bigint = "0.4"
+num-traits = "0.2"
 # Shortest round-trip float digits for PostgreSQL's float text (`value_codec::pg_float8_text`);
 # already in the tree through serde_json.
 ryu = "1.0.23"

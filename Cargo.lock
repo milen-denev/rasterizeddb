@@ -4663,6 +4663,8 @@ dependencies = [
  "memchr",
  "memmap2",
  "memory-stats",
+ "num-bigint 0.4.8",
+ "num-traits",
  "once_cell",
  "opool",
  "orx-concurrent-vec",

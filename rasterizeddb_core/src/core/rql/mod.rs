@@ -49,6 +49,7 @@ pub(crate) mod window_join;
 pub mod expr;
 /// PostgreSQL's `numeric` arithmetic with display scales.
 pub(crate) mod pg_numeric;
+pub(crate) mod pg_numeric_math;
 pub mod foreign_key;
 pub mod join;
 pub mod lock_set;

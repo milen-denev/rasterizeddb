@@ -921,7 +921,7 @@ pub(crate) fn looks_like_row_expression(text: &str) -> bool {
                 b'\'' | b'"' => quote = Some(*b),
                 b'(' => depth += 1,
                 b')' => depth -= 1,
-                b'+' | b'*' | b'/' | b'%' if depth == 0 && i > 0 => return true,
+                b'+' | b'*' | b'/' | b'%' | b'^' if depth == 0 && i > 0 => return true,
                 // A `::` cast does too, and it is the only marker for one on a
                 // parenthesised operand: `(id + 1)::bigint` hides its `+` at
                 // depth 1, so without this the item was routed to the column
@@ -2029,7 +2029,7 @@ pub fn row_fetch_from_select_query(
                 t = t[1..t.len() - 1].to_string();
             }
             let t = match t.rsplit_once('.') {
-                Some((q, c)) if !q.contains(['(', ' ', '%', '+', '-', '*', '/']) => c.to_string(),
+                Some((q, c)) if !q.contains(['(', ' ', '%', '+', '-', '*', '/', '^']) => c.to_string(),
                 _ => t,
             };
             t.trim_matches('"').to_string()

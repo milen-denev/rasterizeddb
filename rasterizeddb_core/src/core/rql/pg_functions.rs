@@ -229,8 +229,11 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
                 DbType::F64
             }
         }
-        // NUMERIC in PostgreSQL over a NUMERIC argument (refused when called).
-        Power | Exp | Ln | Log | Log10 if first() == DbType::DECIMAL => DbType::DECIMAL,
+        Power | Exp | Ln | Log | Log10
+            if numeric_call_typed(func, &args.iter().map(crate::core::rql::expr::static_type).collect::<Vec<_>>()) =>
+        {
+            DbType::DECIMAL
+        }
         Power | Cbrt | Exp | Ln | Log | Log10 | Pi | Degrees | Radians | Random => DbType::F64,
         Div => DbType::DECIMAL,
         Gcd | Lcm => match first() {
@@ -402,6 +405,46 @@ fn numeric_value(v: PgNum) -> Value {
 
 fn is_numeric(v: &Value) -> bool {
     matches!(v, Value::Data { db_type: DbType::DECIMAL, .. })
+}
+
+fn is_float(v: &Value) -> bool {
+    matches!(v, Value::Data { db_type: DbType::F32 | DbType::F64, .. })
+}
+
+/// Whether a call to one of the functions PostgreSQL defines over both
+/// `numeric` and `double precision` takes the `numeric` one: any NUMERIC
+/// argument and no float one (a float does not cast to NUMERIC implicitly,
+/// NUMERIC does to a float). Integers alone take `double precision`, except
+/// `log(b, x)`, which has no float form.
+fn numeric_call(func: PgFunc, args: &[Value]) -> bool {
+    !args.iter().any(is_float)
+        && (args.iter().any(is_numeric) || (func == PgFunc::Log && args.len() == 2))
+}
+
+/// The same choice over the arguments' static types, for [`result_type`].
+fn numeric_call_typed(func: PgFunc, types: &[DbType]) -> bool {
+    !types.iter().any(|t| matches!(t, DbType::F32 | DbType::F64))
+        && (types.contains(&DbType::DECIMAL) || (func == PgFunc::Log && types.len() == 2))
+}
+
+/// `dpow`: `x ^ y` over `double precision`, with its two domain errors and
+/// its range check.
+fn float_power(x: f64, y: f64) -> Result<f64, String> {
+    use crate::core::rql::pg_numeric_math::{NEGATIVE_TO_FRACTION, ZERO_TO_NEGATIVE};
+    if x == 0.0 && y < 0.0 {
+        return Err(ZERO_TO_NEGATIVE.to_string());
+    }
+    if x < 0.0 && y.is_finite() && y.floor() != y {
+        return Err(NEGATIVE_TO_FRACTION.to_string());
+    }
+    let r = x.powf(y);
+    if r.is_infinite() && x.is_finite() && y.is_finite() {
+        return Err("value out of range: overflow".to_string());
+    }
+    if r == 0.0 && x != 0.0 && x.is_finite() && y.is_finite() {
+        return Err("value out of range: underflow".to_string());
+    }
+    Ok(r)
 }
 
 /// A NUMERIC argument carrying the display scale its expression has
@@ -578,16 +621,19 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             }
             numeric_value(numeric_sqrt(n)?)
         }
-        // `log(b, x)` exists only over NUMERIC in PostgreSQL, whose result
-        // scale this engine does not compute.
-        Log if args.len() == 2 => {
-            return Err("log(numeric, numeric) is not supported yet: use ln(x) / ln(b) over double precision".to_string())
-        }
-        Power | Exp | Ln | Log | Log10 if args.iter().any(is_numeric) => {
-            return Err(format!(
-                "{}(numeric) is not supported yet: cast the argument to double precision",
-                format!("{func:?}").to_ascii_lowercase()
-            ))
+        // NUMERIC as PostgreSQL resolves them (`numeric_call`), at the scale
+        // numeric.c gives each result (`pg_numeric_math`). `log(b, x)` exists
+        // only over NUMERIC, so integers take it too.
+        Exp | Ln | Log | Log10 | Power if numeric_call(func, args) => {
+            use crate::core::rql::pg_numeric_math as math;
+            let ten = PgNum::int(10);
+            numeric_value(match (func, args.len()) {
+                (Exp, _) => math::exp(numeric_of(&args[0])?)?,
+                (Ln, _) => math::ln(numeric_of(&args[0])?)?,
+                (Log, 2) => math::log(numeric_of(&args[0])?, numeric_of(&args[1])?)?,
+                (Log | Log10, _) => math::log(ten, numeric_of(&args[0])?)?,
+                _ => math::power(numeric_of(&args[0])?, numeric_of(&args[1])?)?,
+            })
         }
         Sqrt | Cbrt | Exp | Ln | Log10 | Degrees | Radians => {
             let x = float_of(&args[0])?;
@@ -602,7 +648,13 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
                 // digit is that library's (3.0000000000000004 in the PG17
                 // container for 27, 3 here).
                 Cbrt => x.cbrt(),
-                Exp => x.exp(),
+                // `dexp`: an infinite or zero result from a finite argument
+                // is out of range, not a value.
+                Exp => match x.exp() {
+                    r if r.is_infinite() && x.is_finite() => return Err("value out of range: overflow".to_string()),
+                    r if r == 0.0 && x.is_finite() => return Err("value out of range: underflow".to_string()),
+                    r => r,
+                },
                 Ln | Log10 if x == 0.0 => return Err("cannot take logarithm of zero".to_string()),
                 Ln | Log10 if x < 0.0 => return Err("cannot take logarithm of a negative number".to_string()),
                 Ln => x.ln(),
@@ -623,7 +675,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
                 float_value(x.ln() / b.ln())
             }
         }
-        Power => float_value(float_of(&args[0])?.powf(float_of(&args[1])?)),
+        Power => float_value(float_power(float_of(&args[0])?, float_of(&args[1])?)?),
         Pi => float_value(std::f64::consts::PI),
         Random => float_value(fastrand::f64()),
         Div => {

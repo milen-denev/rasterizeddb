@@ -977,6 +977,21 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             return Ok(fold_float_literal_into_decimal(Expr::Arith(Box::new(l), op, Box::new(r))));
         }
 
+        // `^` binds tighter than `*` and looser than a unary sign, and groups
+        // left to right, as PostgreSQL's does: `2 * 3 ^ 2` is 18, `-2 ^ 2` is
+        // 4, `2 ^ 3 ^ 2` is 64. It means `power(a, b)`.
+        if let Some(at) = top_level_power(text) {
+            let lhs = text[..at].trim();
+            let rhs = text[at + 1..].trim();
+            if rhs.is_empty() {
+                return Err("'^' has no right operand".to_string());
+            }
+            return Ok(Expr::Call(
+                TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::Power),
+                vec![parse(lhs, schema)?, parse(rhs, schema)?],
+            ));
+        }
+
         // No binary operator is left at the top, so a leading sign is unary:
         // `-n`, `-(a + b)`. It binds looser than a cast, as PostgreSQL's does —
         // `-n::bigint` negates the cast value. `-n` used to reach the column
@@ -4740,6 +4755,29 @@ pub(crate) fn pg_numeric(
                 )),
             }
         }
+        // A function that yields NUMERIC (`sqrt`, `ceil`, `exp`, `power`, …)
+        // over NUMERIC arguments computed here, exactly and at their display
+        // scale. Through the engine `sqrt(1::numeric / 3)` read its argument
+        // at nine places and was wrong from the tenth digit on.
+        Expr::Call(TextFunc::Pg(func), args) if static_type(expr) == DbType::DECIMAL => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                if static_type(arg) != DbType::DECIMAL {
+                    values.push(eval(arg, row, schema)?);
+                    continue;
+                }
+                match pg_numeric(arg, row, schema)? {
+                    None => return Ok(None),
+                    Some(None) => values.push(Value::Null),
+                    Some(Some(v)) => values.push(Value::Data { bytes: v.to_cell(), db_type: DbType::DECIMAL }),
+                }
+            }
+            match crate::core::rql::pg_functions::call(*func, &values)? {
+                Value::Null => Some(None),
+                Value::Data { bytes, db_type: DbType::DECIMAL } => decimal(&bytes, None).map(Some),
+                _ => None,
+            }
+        }
         _ => None,
     })
 }
@@ -5908,6 +5946,25 @@ fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
         }
     }
     None
+}
+
+/// The last top-level `^` (exponentiation) in `text`, which is where a left
+/// to right grouping splits: `a ^ b ^ c` is `(a ^ b) ^ c`. Not `^@`
+/// (`starts_with`), and only after something that can end an operand.
+fn top_level_power(text: &str) -> Option<usize> {
+    let nesting = Nesting::of(text);
+    let bytes = text.as_bytes();
+    let mut found = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'^' || !nesting.top_level(i) || bytes.get(i + 1) == Some(&b'@') {
+            continue;
+        }
+        let prev = bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()).map(|j| bytes[j]);
+        if matches!(prev, Some(p) if p.is_ascii_alphanumeric() || matches!(p, b'_' | b')' | b'"' | b'\'' | b'.')) {
+            found = Some(i);
+        }
+    }
+    found
 }
 
 fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value {

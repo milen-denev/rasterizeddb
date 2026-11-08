@@ -835,7 +835,7 @@ fn operand_start(sql: &str, end: usize) -> Option<usize> {
                 i = open;
                 start = Some(i);
             }
-            b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b':' | b'.' | b'[' | b']' => {
+            b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'|' | b':' | b'.' | b'[' | b']' => {
                 i -= 1;
             }
             c if is_identifier_byte(c) => {

@@ -158,7 +158,8 @@ async fn each_function_answers_as_postgresql_does() {
         ("SELECT split_part(s, ',', 0) FROM t", "22023"),
         ("SELECT substr(s, 1, -1) FROM t", "22011"),
         ("SELECT chr(0) FROM t", "54000"),
-        ("SELECT power(n, 2) FROM t", "0A000"),
+        // exp(123.450) is 54 digits in PostgreSQL, past a NUMERIC here.
+        ("SELECT exp(n * 10) FROM t", "0A000"),
         ("SELECT regexp_replace(s, 'a|b', 'x') FROM t", "0A000"),
     ] {
         assert_eq!(code(&c, sql).await, sqlstate, "{sql}");

@@ -957,8 +957,8 @@ fn exists_used_as_value(sql: &str, start: usize, end: usize) -> bool {
     let after = sql[end..].trim_start();
     let before = sql[..start].trim_end();
     after.starts_with("::")
-        || matches!(after.as_bytes().first(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'|'))
-        || matches!(before.as_bytes().last(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'|'))
+        || matches!(after.as_bytes().first(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'|'))
+        || matches!(before.as_bytes().last(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'|'))
 }
 
 /// The first `[NOT] EXISTS (…)` of `sql` that is not inside another

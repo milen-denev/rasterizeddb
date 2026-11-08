@@ -7600,8 +7600,14 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("null character not permitted") || has("requested character too large") || has("requested length too large") {
         return "54000";
     }
-    if has("cannot take square root of a negative number") {
+    if has("cannot take square root of a negative number")
+        || has("zero raised to a negative power is undefined")
+        || has("raised to a non-integer power yields a complex result")
+    {
         return "2201F";
+    }
+    if has("value overflows numeric format") {
+        return "22003";
     }
     if has("cannot take logarithm of") {
         return "2201E";
