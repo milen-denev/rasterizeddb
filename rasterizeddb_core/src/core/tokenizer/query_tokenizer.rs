@@ -19,6 +19,9 @@ pub enum Token {
         write_order: u64,
         steps: Vec<crate::core::jsonb::Step>,
         as_text: bool,
+        /// The column is `json`, its bytes the text as written
+        /// (`core::json_text`), not a stored document.
+        json_text: bool,
     },
     Number(NumericValue),
     StringLit(String),
@@ -680,6 +683,7 @@ fn tokenize_inner<'a>(
                                 write_order: *write_order,
                                 steps: path.steps,
                                 as_text: path.as_text,
+                                json_text: field.json_text,
                             });
                             continue;
                         }
@@ -1552,6 +1556,7 @@ mod tests {
             name: "field1".to_string(),
             db_type: DbType::F64,
             without_time_zone: false,
+            json_text: false,
             is_deleted: false,
             size: 0,
             offset: 0,
@@ -1564,6 +1569,7 @@ mod tests {
             name: "field2".to_string(),
             db_type: DbType::F64,
             without_time_zone: false,
+            json_text: false,
             is_deleted: false,
             size: 0,
             offset: 0,

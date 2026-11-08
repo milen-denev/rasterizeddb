@@ -1826,6 +1826,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 write_order,
                 steps,
                 as_text,
+                json_text,
             } => {
                 let idx = write_order as usize;
                 if idx >= cols.len() {
@@ -1852,6 +1853,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     steps: std::sync::Arc::new(steps),
                     as_text,
                     cast: cast.clone(),
+                    json_text,
                 };
                 // Resolved once here so the first comparison has a value of the
                 // right width; every row after it goes through
@@ -1885,6 +1887,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                                                 steps: path.steps.clone(),
                                                 as_text: path.as_text,
                                                 cast: Some(target.clone()),
+                                                json_text: path.json_text,
                                             };
                                         let mb = recast
                                             .extract(cols[idx].1.into_slice())

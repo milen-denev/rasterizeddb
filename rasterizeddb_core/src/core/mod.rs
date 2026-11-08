@@ -22,6 +22,7 @@ pub mod hash;
 pub mod helpers;
 pub mod introspect;
 pub mod jsonb;
+pub mod json_text;
 pub mod log_writer;
 /// One-way import of a live PostgreSQL database, behind the `pg_import`
 /// feature.

@@ -7785,6 +7785,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has_raw("\" of relation \"") && has("contains null values") {
         return "23502";
     }
+    // `undefined_object`: an index over a type with no operator class for
+    // the method (`json`).
+    if has("has no default operator class for access method") {
+        return "42704";
+    }
     // `undefined_object`: `ON CONFLICT ON CONSTRAINT` naming no constraint.
     // `DROP CONSTRAINT`'s "of relation" too, ahead of the relation rule.
     if has_raw("constraint \"") && (has_raw("\" for table \"") || has_raw("\" of relation \"")) && has("does not exist") {
@@ -10966,7 +10971,7 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
         // has already been rebuilt from its shadow table, so the bytes are the
         // JSON itself. The type exists to change what the column is *called* on
         // the wire, not how it is written.
-        DbType::STRING | DbType::UNKNOWN | DbType::JSON => {
+        DbType::STRING | DbType::UNKNOWN | DbType::JSON | DbType::JSONTEXT => {
             // Treat as UTF-8 text. Valid text — nearly always — is one
             // validating pass and one copy; only invalid bytes take the lossy
             // path and its replacement characters.

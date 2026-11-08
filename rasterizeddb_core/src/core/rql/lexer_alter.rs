@@ -420,13 +420,18 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             i += 1;
 
             let type_tokens: Vec<&str> = rest[i..].to_vec();
-            // A JSON column is a `UUID` on this side of the mapping; the
-            // shadow table is registered by the executor, as it is for CREATE.
+            // A shredded JSON column is a `UUID` on this side of the mapping;
+            // the shadow table is registered by the executor, as it is for
+            // CREATE. `jsonb` here always is (whatever `json_shadow_tables`
+            // says, unlike CREATE: a known difference, kept so a column added
+            // so far and one added now are the same kind). `json` is the text
+            // it is written as (`DbType::JSONTEXT`), shredded only when the
+            // knob is on, as at CREATE.
             let json = type_tokens
                 .first()
                 .map(|t| {
                     let head = t.split('(').next().unwrap_or(t).to_ascii_uppercase();
-                    head == "JSON" || head == "JSONB"
+                    head == "JSONB" || (head == "JSON" && crate::json_shadow_tables())
                 })
                 .unwrap_or(false);
             let (db_type, used) = if json {
@@ -781,7 +786,10 @@ pub fn parse_column_type(tokens: &[&str]) -> Result<(DbType, usize), String> {
         // A stored document. When `json_shadow_tables` is on, `CREATE TABLE`
         // and `ADD COLUMN` intercept the declaration before it reaches here and
         // build the shredded form instead, so this arm is the stored one.
-        "JSON" | "JSONB" => DbType::JSONB,
+        // `json` keeps its text as written (`DbType::JSONTEXT`); `jsonb` is a
+        // stored document.
+        "JSON" => DbType::JSONTEXT,
+        "JSONB" => DbType::JSONB,
         other => return Err(format!("column type '{}' is not supported yet", other)),
     };
 
@@ -1368,7 +1376,8 @@ mod tests {
     #[test]
     fn json_names_a_stored_type_while_arrays_and_bytes_are_typed() {
         assert_eq!(parse_column_type(&["JSONB"]).unwrap().0, DbType::JSONB);
-        assert_eq!(parse_column_type(&["JSON"]).unwrap().0, DbType::JSONB);
+        // `json` keeps its text as written (`DbType::JSONTEXT`).
+        assert_eq!(parse_column_type(&["JSON"]).unwrap().0, DbType::JSONTEXT);
         assert_eq!(parse_column_type(&["BYTEA"]).unwrap().0, DbType::BYTEA);
         assert_eq!(parse_column_type(&["TEXT[]"]).unwrap().0, DbType::ARRAY);
         assert_eq!(parse_column_type(&["UUID[]"]).unwrap().0, DbType::ARRAY);

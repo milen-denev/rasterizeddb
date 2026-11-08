@@ -28,6 +28,11 @@ const BATCH_SIZE: usize = 100;
 /// `timestamp` (without time zone). See [`SchemaField::without_time_zone`].
 const TIMESTAMP_WITHOUT_TIME_ZONE: u8 = 0x01;
 
+/// Bit 1 of the spare type byte: the column is `json`, text kept as written.
+/// See [`SchemaField::json_text`]. A build that predates it reads the column
+/// as the text it holds.
+const JSON_TEXT: u8 = 0x02;
+
 const TABLE_SIZE: usize = 129 * 2 + 1; // 128 chars for name  + null terminator and primary key + null terminator
 
 /// Opens the incarnation record that follows the header in `_schema.db`.
@@ -102,6 +107,12 @@ pub struct SchemaField {
     /// existed reads as `timestamptz`, which is what it always behaved as, and
     /// an earlier build opening a newer table does the same.
     pub without_time_zone: bool,
+    /// A `STRING` column declared `json`: its bytes are a document as it was
+    /// written, checked to be one when it is ([`DbType::JSONTEXT`],
+    /// [`SchemaField::literal_type`]). Always `false` for any other type.
+    /// Bit 1 of the spare type byte, which an earlier build reads past and so
+    /// reads the column as text.
+    pub json_text: bool,
     pub size: u32,
     pub offset: u64,
     pub write_order: u64,
@@ -161,11 +172,20 @@ impl SchemaField {
         // `DbType::TIMESTAMP` names a `timestamp` column; it is stored as a
         // `DATETIME` that carries the flag.
         let without_time_zone = db_type == DbType::TIMESTAMP;
-        let db_type = if without_time_zone { DbType::DATETIME } else { db_type };
+        // And `DbType::JSONTEXT` a `json` one, stored as the `STRING` it is.
+        let json_text = db_type == DbType::JSONTEXT;
+        let db_type = if without_time_zone {
+            DbType::DATETIME
+        } else if json_text {
+            DbType::STRING
+        } else {
+            db_type
+        };
         SchemaField {
             name,
             db_type,
             without_time_zone,
+            json_text,
             size,
             offset,
             write_order,
@@ -182,6 +202,8 @@ impl SchemaField {
     pub fn literal_type(&self) -> DbType {
         if self.without_time_zone && self.db_type == DbType::DATETIME {
             DbType::TIMESTAMP
+        } else if self.json_text && self.db_type == DbType::STRING {
+            DbType::JSONTEXT
         } else {
             self.db_type.clone()
         }
@@ -217,6 +239,9 @@ impl SchemaField {
         // column ([`SchemaField::without_time_zone`]).
         if self.without_time_zone && self.db_type == DbType::DATETIME {
             vec[130] |= TIMESTAMP_WITHOUT_TIME_ZONE;
+        }
+        if self.json_text && self.db_type == DbType::STRING {
+            vec[130] |= JSON_TEXT;
         }
 
         // Add size at position 131
@@ -261,6 +286,7 @@ impl SchemaField {
         let db_type = DbType::from_byte(vec[129]);
         let without_time_zone =
             db_type == DbType::DATETIME && vec[130] & TIMESTAMP_WITHOUT_TIME_ZONE != 0;
+        let json_text = db_type == DbType::STRING && vec[130] & JSON_TEXT != 0;
 
         // Extract size from position 131
         let size = u32::from_le_bytes([vec[131], vec[132], vec[133], vec[134]]);
@@ -283,6 +309,7 @@ impl SchemaField {
             name,
             db_type,
             without_time_zone,
+            json_text,
             size,
             offset,
             write_order,
@@ -1833,6 +1860,27 @@ mod tests {
                 assert_eq!(back, "é".repeat(64));
             }
         }
+    }
+
+    /// A `json` column's flag rides beside it, bit 1: it reads back, and the
+    /// low byte says `STRING` (14), so an earlier build opens the column as
+    /// the text it holds. On another type the bit means nothing.
+    #[test]
+    fn a_json_column_keeps_its_flag_in_the_record() {
+        let js = SchemaField::new("d".into(), DbType::JSONTEXT, 12, 0, 0, false);
+        assert_eq!((js.db_type.clone(), js.json_text), (DbType::STRING, true));
+        let bytes = js.into_vec();
+        assert_eq!((bytes[129], bytes[130]), (14, 2));
+        let back = SchemaField::from_vec(&bytes).unwrap();
+        assert_eq!((back.db_type.clone(), back.json_text, back.without_time_zone), (DbType::STRING, true, false));
+        assert_eq!(back.literal_type(), DbType::JSONTEXT);
+
+        let text = SchemaField::new("t".into(), DbType::STRING, 12, 0, 0, false).into_vec();
+        assert_eq!(text[130], 0);
+        assert!(!SchemaField::from_vec(&text).unwrap().json_text);
+        let mut other = SchemaField::new("n".into(), DbType::I64, 8, 0, 0, false).into_vec();
+        other[130] = 2;
+        assert!(!SchemaField::from_vec(&other).unwrap().json_text);
     }
 
     /// A `timestamp` column's flag rides in the record's spare type byte: it

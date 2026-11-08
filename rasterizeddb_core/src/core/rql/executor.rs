@@ -16714,6 +16714,18 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
                 .iter()
                 .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column))
             {
+                // PostgreSQL's `json` has no operator class for any index
+                // method (42704); stored as text here, it would be indexed as
+                // text and answer `=`, which `json` does not have.
+                Some(f) if f.json_text => {
+                    let method = match statement.method {
+                        Some(crate::core::index::decl::Method::Hash) => "hash",
+                        _ => "btree",
+                    };
+                    return ddl_error(&format!(
+                        "data type json has no default operator class for access method \"{method}\""
+                    ));
+                }
                 Some(f) => {
                     columns.push(f.write_order as u32);
                     types.push(f.db_type.clone());

@@ -2576,7 +2576,9 @@ pub fn refusal_for_column(field: &crate::core::row::schema::SchemaField, value: 
     {
         return old_numeric_refusal(&double_quoted(text), &field.name);
     }
-    format!("{} for column \"{}\"", refusal_message(&field.db_type, value), field.name)
+    // The declared type: a `json` column's refusal names `json`, not the
+    // text it is stored as.
+    format!("{} for column \"{}\"", refusal_message(&field.literal_type(), value), field.name)
 }
 
 /// A written number as the cell of a column that keeps its own scale
@@ -2697,7 +2699,7 @@ pub fn pg_input_type_name(db_type: &crate::core::db_type::DbType) -> &'static st
         DbType::TIME => "time",
         DbType::TIMETZ => "time with time zone",
         DbType::INTERVAL => "interval",
-        DbType::JSONB | DbType::JSON => "json",
+        DbType::JSONB | DbType::JSON | DbType::JSONTEXT => "json",
         DbType::BYTEA => "bytea",
         DbType::MACADDR => "macaddr",
         DbType::MACADDR8 => "macaddr8",
@@ -4425,4 +4427,13 @@ mod byteain_tests {
             assert!(unescape_e_string(bad).is_err(), "{:?}", bad);
         }
     }
+}
+
+/// Whether `text` is one JSON document, as PostgreSQL's `json_in` accepts it,
+/// with its reason in PostgreSQL's words when not. Leading and trailing
+/// whitespace is allowed and kept by the caller, as `json` keeps it.
+pub fn check_json_text(text: &str) -> Result<(), String> {
+    serde_json::from_str::<serde::de::IgnoredAny>(text)
+        .map(|_| ())
+        .map_err(|e| format!("invalid input syntax for type json: {e}"))
 }

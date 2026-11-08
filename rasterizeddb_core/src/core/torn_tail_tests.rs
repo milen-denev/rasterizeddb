@@ -350,7 +350,9 @@ async fn build_base(dir: &Path) {
              g1 INTEGER GENERATED ALWAYS AS (a + 1) STORED, CHECK (a > 0))",
             "ALTER TABLE t ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES p (id)",
             "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1",
-            "ALTER TABLE t ADD COLUMN j1 JSON",
+            // `jsonb`: an added one is shredded, so it registers itself
+            // (`json` is the text it is written as and registers nothing).
+            "ALTER TABLE t ADD COLUMN j1 JSONB",
             "CREATE INDEX pi1 ON t ((doc->>'k'))",
             "CREATE INDEX i1 ON t (a)",
             "ALTER TABLE t ADD CONSTRAINT u1 UNIQUE (id)",

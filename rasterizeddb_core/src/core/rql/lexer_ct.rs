@@ -475,6 +475,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                     is_deleted: false,
                 });
                 DbType::UUID
+            } else if is_json && declared.split('(').next().unwrap_or(declared).eq_ignore_ascii_case("JSON") {
+                // `json`: the column holds the text as written.
+                DbType::JSONTEXT
             } else if is_json {
                 // Stored: the column holds the document. No sidecar entry, and
                 // that absence is what tells every later reader which of the

@@ -84,6 +84,8 @@ fn class(t: &DbType) -> Class {
         // Reporting-only, as `JSON` is: a `timestamp` column is stored and
         // indexed as the `DATETIME` it is.
         | DbType::TIMESTAMP
+        // Reporting-only too: a `json` column is the `STRING` it is.
+        | DbType::JSONTEXT
         | DbType::JSONB
         | DbType::INTERVAL
         | DbType::MACADDR

@@ -744,6 +744,9 @@ impl SelectItem {
                     // A `timestamp` (without time zone) expression is
                     // described as one, and its values shown bare from that.
                     None if crate::core::rql::expr::yields_timestamp(expr) => DbType::TIMESTAMP,
+                    // And a `json` one (`->` of a `json` column, a cast to
+                    // `json`) as `json`, though it travels as text.
+                    None if crate::core::rql::expr::yields_json_text(expr) => DbType::JSONTEXT,
                     None => self.result_type(),
                 }
             }

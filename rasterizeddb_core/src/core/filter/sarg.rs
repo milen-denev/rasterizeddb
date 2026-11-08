@@ -371,10 +371,13 @@ fn conjunct_to_expr(
     // one, which is what `->>` yields and what the index stores.
     if let (Some(resolve), 3) = (paths, toks.len()) {
         let as_column = |t: &Token| match t {
+            // A stored document's path only: a `json` column has no path
+            // index (`path_index` refuses one).
             Token::JsonPath {
                 write_order,
                 steps,
                 as_text: true,
+                json_text: false,
             } => resolve(*write_order as u32, steps)
                 .map(|wo| Token::Ident((String::new(), DbType::STRING, wo as u64))),
             _ => None,

@@ -840,9 +840,40 @@ pub struct JsonPathRef {
     /// the number `3` and matched nothing, so the type has to travel with the
     /// operand and be applied to the bytes before the comparison sees them.
     pub cast: Option<crate::core::db_type::DbType>,
+    /// The document column is `json`: its bytes are the text as written,
+    /// read by `core::json_text` (a member's own text under `->`), not a
+    /// stored document. Read as one, every comparison on it was false.
+    pub json_text: bool,
 }
 
 impl JsonPathRef {
+    /// [`Self::extract`] over a `json` column's text: the member's own text
+    /// under `->`, a string unescaped under `->>` (a JSON `null` then SQL
+    /// NULL), then the cast if one is written.
+    fn extract_text(&self, document: &[u8]) -> Option<MemoryBlock> {
+        let text = std::str::from_utf8(document).ok()?;
+        let span = crate::core::json_text::get_path(text, &self.steps).ok()??;
+        let found = if self.as_text {
+            crate::core::json_text::as_text(text, span).ok()??
+        } else {
+            text[span].to_string()
+        };
+        let bytes = match &self.cast {
+            None => found.into_bytes(),
+            Some(target) => {
+                let value = crate::core::rql::expr::Value::Data {
+                    bytes: found.into_bytes(),
+                    db_type: crate::core::db_type::DbType::STRING,
+                };
+                match crate::core::rql::expr::coerce_to_public(value, target) {
+                    crate::core::rql::expr::Value::Data { bytes, db_type } if db_type == *target => bytes,
+                    _ => return None,
+                }
+            }
+        };
+        Some(pooled_copy(&bytes))
+    }
+
     /// The value this path reaches in `document`, as the bytes a comparison
     /// should use, or `None` for SQL NULL.
     ///
@@ -854,6 +885,9 @@ impl JsonPathRef {
     /// `->` yields NULL only for an absent path; a JSON `null` there is the
     /// document `null`, a value like any other.
     pub fn extract(&self, document: &[u8]) -> Option<MemoryBlock> {
+        if self.json_text {
+            return self.extract_text(document);
+        }
         let found = crate::core::jsonb::get_path(document, &self.steps)?;
         // The uncast forms run once per row of a `doc->>'k' = 'v'` scan, so
         // they copy once, from the document (or the rendered text) straight
@@ -3062,6 +3096,7 @@ mod json_row_path {
 
     fn text_path(key: &str) -> JsonPathRef {
         JsonPathRef {
+            json_text: false,
             steps: std::sync::Arc::new(vec![crate::core::jsonb::Step::Key(key.to_string())]),
             as_text: true,
             cast: None,
@@ -3098,6 +3133,7 @@ mod json_row_path {
             for steps in &paths {
                 for as_text in [false, true] {
                     let path = JsonPathRef {
+                    json_text: false,
                         steps: std::sync::Arc::new(steps.clone()),
                         as_text,
                         cast: None,
@@ -3184,6 +3220,7 @@ mod json_row_path {
             ("->  object", "meta", false),
         ] {
             let path = JsonPathRef {
+                    json_text: false,
                 steps: std::sync::Arc::new(vec![Step::Key(key.to_string())]),
                 as_text,
                 cast: None,

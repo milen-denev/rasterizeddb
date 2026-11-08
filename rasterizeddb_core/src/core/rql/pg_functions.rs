@@ -68,6 +68,12 @@ pub enum PgFunc {
     JsonBuildObject,
     JsonBuildArray,
     ToJson,
+    /// `json_build_object`, `json_build_array`, `to_json`: the `json`
+    /// builders, whose result is text in PostgreSQL's layout (`{"k" : v}`,
+    /// arguments in order) rather than a stored document.
+    JsonBuildObjectText,
+    JsonBuildArrayText,
+    ToJsonText,
     JsonbArrayLength,
     NumNonnulls,
     NumNulls,
@@ -183,9 +189,12 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "AGE" => (Age, &[1, 2]),
         "ENCODE" => (Encode, &[2]),
         "DECODE" => (Decode, &[2]),
-        "JSON_BUILD_OBJECT" | "JSONB_BUILD_OBJECT" => (JsonBuildObject, &[]),
-        "JSON_BUILD_ARRAY" | "JSONB_BUILD_ARRAY" => (JsonBuildArray, &[]),
-        "TO_JSON" | "TO_JSONB" => (ToJson, &[1]),
+        "JSONB_BUILD_OBJECT" => (JsonBuildObject, &[]),
+        "JSONB_BUILD_ARRAY" => (JsonBuildArray, &[]),
+        "TO_JSONB" => (ToJson, &[1]),
+        "JSON_BUILD_OBJECT" => (JsonBuildObjectText, &[]),
+        "JSON_BUILD_ARRAY" => (JsonBuildArrayText, &[]),
+        "TO_JSON" => (ToJsonText, &[1]),
         "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => (JsonbArrayLength, &[1]),
         "NUM_NONNULLS" => (NumNonnulls, &[]),
         "NUM_NULLS" => (NumNulls, &[]),
@@ -197,12 +206,12 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
     let variadic_ok = match func {
         Concat | Format | NumNonnulls | NumNulls => n >= 1,
         ConcatWs => n >= 2,
-        JsonBuildObject => n % 2 == 0,
-        JsonBuildArray => true,
+        JsonBuildObject | JsonBuildObjectText => n % 2 == 0,
+        JsonBuildArray | JsonBuildArrayText => true,
         _ => counts.contains(&n),
     };
     if !variadic_ok {
-        return Some(Err(if func == JsonBuildObject {
+        return Some(Err(if matches!(func, JsonBuildObject | JsonBuildObjectText) {
             "argument list must have even number of elements".to_string()
         } else if n == 0 {
             format!("function {}() does not exist", upper.to_ascii_lowercase())
@@ -246,9 +255,16 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Age => DbType::INTERVAL,
         Decode => DbType::BYTEA,
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
+        JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
         StringToArray => DbType::ARRAY,
         _ => DbType::STRING,
     }
+}
+
+/// Whether `func` yields `json`, text in PostgreSQL's layout, which travels
+/// as text (`expr::yields_json_text`).
+pub fn yields_json_text(func: PgFunc) -> bool {
+    matches!(func, PgFunc::JsonBuildObjectText | PgFunc::JsonBuildArrayText | PgFunc::ToJsonText)
 }
 
 /// Whether `func` yields a `timestamp` (without time zone), which shows no
@@ -466,7 +482,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | NumNonnulls | NumNulls | ToJson | StringToArray | ArrayToString);
+    let non_strict = matches!(func, Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString);
     if !non_strict && args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -807,6 +823,35 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             let items: Vec<String> = args.iter().map(json_of).collect::<Result<_, _>>()?;
             data(crate::core::jsonb::encode_text(&format!("[{}]", items.join(", ")))?, DbType::JSONB)
         }
+        // The `json` forms: PostgreSQL's text, `"k" : v` with a space each
+        // side of the colon, the arguments in order, a `json` argument as it
+        // was written.
+        JsonBuildObjectText => {
+            let mut out = String::from("{");
+            for (i, pair) in args.chunks(2).enumerate() {
+                if pair[0].is_null() {
+                    return Err("null value not allowed for object key".to_string());
+                }
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&json_string(&text_of(&pair[0])));
+                out.push_str(" : ");
+                out.push_str(&json_of(&pair[1])?);
+            }
+            out.push('}');
+            text_value(out)
+        }
+        JsonBuildArrayText => {
+            let items: Vec<String> = args.iter().map(json_of).collect::<Result<_, _>>()?;
+            text_value(format!("[{}]", items.join(", ")))
+        }
+        ToJsonText => {
+            if args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            text_value(json_of(&args[0])?)
+        }
         ToJson => {
             if args[0].is_null() {
                 return Ok(Value::Null);
@@ -989,6 +1034,8 @@ fn json_of(v: &Value) -> Result<String, String> {
         Value::Null => "null".to_string(),
         Value::Data { bytes, db_type } => match db_type {
             DbType::BOOL => if bytes.first().is_some_and(|b| *b != 0) { "true" } else { "false" }.to_string(),
+            // A `json` argument, marked by the caller: its text as written.
+            DbType::JSONTEXT => String::from_utf8_lossy(bytes).into_owned(),
             DbType::JSONB => {
                 let mut out = Vec::new();
                 crate::core::jsonb::render_text_into(bytes, &mut out)?;

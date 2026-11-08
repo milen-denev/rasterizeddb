@@ -75,6 +75,14 @@ pub enum DbType {
     /// storage: a column declared `JSONB` holds its document rather than a
     /// reference to a table the document was taken apart into.
     JSONB,
+    /// `json`: a document kept as the text it was written as — whitespace,
+    /// key order and duplicate keys included — for *reporting* only, as
+    /// [`DbType::TIMESTAMP`] is. A `json` column is a `STRING` whose field
+    /// carries `json_text` (`SchemaField::json_text`), in the record's spare
+    /// type byte; its bytes are the validated text. What differs from text is
+    /// what it is described as (OID 114), what its operators return, and that
+    /// a write is checked to be one JSON document.
+    JSONTEXT,
     /// A span of time, stored as PostgreSQL's binary layout: `i64` microseconds,
     /// `i32` days, `i32` months, big-endian. The three are kept apart because a
     /// month is not a fixed number of days; see [`crate::core::pg_types`].
@@ -186,6 +194,8 @@ impl DbType {
             | DbType::BPCHAR(_) => DbType::STRING,
             // The same eight bytes as a `timestamptz`.
             DbType::TIMESTAMP => DbType::DATETIME,
+            // The text it was written as.
+            DbType::JSONTEXT => DbType::STRING,
             other => other.clone(),
         }
     }
@@ -196,6 +206,7 @@ impl DbType {
         matches!(
             self,
             DbType::STRING
+                | DbType::JSONTEXT
                 | DbType::BPCHAR(_)
                 | DbType::BYTEA
                 | DbType::ARRAY
@@ -235,6 +246,9 @@ impl DbType {
             // `DATETIME` with its flag in the record's spare type byte
             // (`SchemaField::into_vec`).
             DbType::TIMESTAMP => 46,
+            // Never written to disk either: a `json` field is written as
+            // `STRING` with its flag in the spare type byte.
+            DbType::JSONTEXT => 47,
             DbType::BOOL => 16,
             DbType::UUID => 17,
             DbType::INET => 18,
@@ -304,6 +318,7 @@ impl DbType {
             14 => DbType::STRING,
             15 => DbType::DATETIME,
             46 => DbType::TIMESTAMP,
+            47 => DbType::JSONTEXT,
             16 => DbType::BOOL,
             17 => DbType::UUID,
             18 => DbType::INET,
@@ -360,7 +375,7 @@ impl DbType {
             DbType::F64 => 8,
             DbType::BOOL => 1,
             DbType::CHAR => 4,
-            DbType::STRING | DbType::BPCHAR(_) => 4 + 8,
+            DbType::STRING | DbType::JSONTEXT | DbType::BPCHAR(_) => 4 + 8,
             DbType::UUID => crate::core::value_codec::UUID_LEN as u32,
             DbType::INET => crate::core::value_codec::INET_LEN as u32,
             DbType::DECIMAL => 16,
@@ -422,6 +437,7 @@ impl DbType {
             DbType::BPCHAR(_) => 1042, // bpchar
             DbType::DATETIME => 1184, // timestamptz
             DbType::TIMESTAMP => 1114,
+            DbType::JSONTEXT => 114,
             DbType::UUID => 2950,
             DbType::INET => 869,
             DbType::DECIMAL => 1700, // numeric
@@ -485,7 +501,7 @@ impl DbType {
             DbType::U64 | DbType::I128 | DbType::U128 => -1,
             DbType::F32 => 4,
             DbType::F64 => 8,
-            DbType::STRING => -1,
+            DbType::STRING | DbType::JSONTEXT => -1,
             DbType::DATETIME | DbType::TIMESTAMP => 8,
             DbType::UUID => 16,
             // Postgres models `inet` as a varlena, so its advertised length is

@@ -270,6 +270,20 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
                 None => return None,
             }
         }
+        // `json`: the text as written, checked to be one document
+        // (`json_in` validates and keeps the text, whitespace, key order and
+        // duplicates included).
+        DbType::JSONTEXT => {
+            let stripped = crate::core::value_codec::unquote_sql(value_str);
+            if let Err(e) = crate::core::value_codec::check_json_text(&stripped) {
+                let _ = e;
+                return None;
+            }
+            let b = stripped.as_bytes();
+            let mut mb = MEMORY_POOL.acquire(b.len());
+            mb.into_slice_mut().copy_from_slice(b);
+            mb
+        }
         // See the same arm in `lexer_ir`: a document is validated and encoded
         // here, because this is the last point that can still refuse it.
         DbType::JSONB => {
@@ -828,6 +842,7 @@ mod tests {
                 name: "id".to_string(),
                 db_type: DbType::U64,
                 without_time_zone: false,
+                json_text: false,
                 size: 8,
                 offset: 0,
                 write_order: 0,
@@ -840,6 +855,7 @@ mod tests {
                 name: "name".to_string(),
                 db_type: DbType::STRING,
                 without_time_zone: false,
+                json_text: false,
                 size: 12,
                 offset: 8,
                 write_order: 1,

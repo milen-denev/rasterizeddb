@@ -684,7 +684,8 @@ fn cast_target(name: &str) -> Option<DbType> {
             // `real` IS float4 — mapping it to F64 made the described type float8,
             // and a client decoding the column as f32 then refused the row.
             "REAL" | "FLOAT4" => DbType::F32,
-            "JSON" | "JSONB" => DbType::JSONB,
+            "JSON" => DbType::JSONTEXT,
+            "JSONB" => DbType::JSONB,
             "BYTEA" => DbType::BYTEA,
             "INET" | "CIDR" => DbType::INET,
             "INTERVAL" => DbType::INTERVAL,
@@ -1526,9 +1527,9 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     }
                     Ok(Expr::Call(if upper_name == "RPAD" { TextFunc::Rpad } else { TextFunc::Lpad }, args))
                 }
-                "JSONB_TYPEOF" => {
+                "JSONB_TYPEOF" | "JSON_TYPEOF" => {
                     if args.len() != 1 {
-                        return Err("jsonb_typeof takes exactly one argument".to_string());
+                        return Err(format!("{} takes exactly one argument", upper_name.to_ascii_lowercase()));
                     }
                     Ok(Expr::Call(TextFunc::JsonbTypeof, args))
                 }
@@ -1562,6 +1563,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 // `pg_typeof(x)`: the type `x` is, as PostgreSQL names it.
                 "PG_TYPEOF" if args.len() == 1 => {
                     let name = match static_type(&args[0]) {
+                        _ if yields_json_text(&args[0]) => "json",
                         DbType::DATETIME if yields_timestamp(&args[0]) => "timestamp without time zone",
                         DbType::DATETIME => "timestamp with time zone",
                         DbType::TIMESTAMP => "timestamp without time zone",
@@ -2654,8 +2656,10 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Literal { db_type, .. } => db_type.clone(),
         Expr::Column(field) => field.db_type.clone(),
         // `->>` is text by definition; `->` stays a document.
-        Expr::JsonPath { as_text, .. } => {
-            if *as_text {
+        // Of a `json` column, `->` is the member's text too, typed `json`
+        // (`yields_json_text`).
+        Expr::JsonPath { as_text, column, .. } => {
+            if *as_text || column.json_text {
                 DbType::STRING
             } else {
                 DbType::JSONB
@@ -2673,6 +2677,8 @@ pub fn static_type(expr: &Expr) -> DbType {
         // A `timestamp` is stored as the `DATETIME` it is; `yields_timestamp`
         // says which of the two it is.
         Expr::Cast(_, DbType::TIMESTAMP) => DbType::DATETIME,
+        // A `json` value travels as the text it is (`yields_json_text`).
+        Expr::Cast(_, DbType::JSONTEXT) => DbType::STRING,
         Expr::Cast(_, db_type) => db_type.clone(),
         Expr::NumericCast { .. } => DbType::DECIMAL,
         Expr::TypmodCast { value, .. } => static_type(value),
@@ -5967,6 +5973,20 @@ fn top_level_power(text: &str) -> Option<usize> {
     found
 }
 
+/// Whether `expr` is PostgreSQL's `json`, text kept as written: a `json`
+/// column, a member of one by `->`/`#>`, or a cast to `json`. Its value
+/// travels as the `STRING` it is stored as; this is what says otherwise, for
+/// `pg_typeof` and a describe.
+pub(crate) fn yields_json_text(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(field) => field.json_text,
+        Expr::JsonPath { column, as_text, .. } => column.json_text && !as_text,
+        Expr::Cast(_, DbType::JSONTEXT) => true,
+        Expr::Call(TextFunc::Pg(func), _) => crate::core::rql::pg_functions::yields_json_text(*func),
+        _ => false,
+    }
+}
+
 fn column_value(field: &SchemaField, row: &Row, schema: &[SchemaField]) -> Value {
     // The schema is searched in place. This used to clone it into a SmallVec
     // first — every field and every field's name, once per column reference
@@ -6492,6 +6512,24 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 Value::Data { bytes, .. } => bytes,
                 Value::Null => return Ok(Value::Null),
             };
+            // A `json` column: the text as stored, read where the path leads
+            // (`json_text`): `->` is the member's own text, `->>` a string
+            // unescaped.
+            if column.json_text {
+                let text = String::from_utf8_lossy(&document);
+                let Some(span) = crate::core::json_text::get_path(&text, steps)? else {
+                    return Ok(Value::Null);
+                };
+                let out = if *as_text {
+                    crate::core::json_text::as_text(&text, span)?
+                } else {
+                    Some(text[span].to_string())
+                };
+                return Ok(match out {
+                    Some(t) => Value::Data { bytes: t.into_bytes(), db_type: DbType::STRING },
+                    None => Value::Null,
+                });
+            }
             // A path that resolves to nothing is NULL, and so is a JSON null
             // read as text — both are PostgreSQL's answers, and neither is an
             // error: asking for a key a document does not have is ordinary.
@@ -6583,6 +6621,16 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 for (value, arg) in values.iter_mut().zip(args) {
                     if let Some(scale) = display_scale(arg) {
                         *value = crate::core::rql::pg_functions::shown_at(std::mem::replace(value, Value::Null), scale);
+                    }
+                    // A `json` argument is a document to a JSON builder, not
+                    // a string: its text, marked so for this call only (it
+                    // travels as text everywhere else, `yields_json_text`).
+                    if yields_json_text(arg) {
+                        if let Value::Data { db_type, .. } = value {
+                            if *db_type == DbType::STRING {
+                                *db_type = DbType::JSONTEXT;
+                            }
+                        }
                     }
                 }
             }
@@ -7216,6 +7264,30 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     };
     if db_type == *target {
         return Ok(Value::Data { bytes, db_type });
+    }
+    // To `json`: text checked to be one document and kept as written; a
+    // `jsonb` document as its text. A value travels as the `STRING` a `json`
+    // column stores (`yields_json_text` says what the expression is).
+    if *target == DbType::JSONTEXT {
+        return match db_type {
+            DbType::STRING | DbType::CHAR | DbType::JSON => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                crate::core::value_codec::check_json_text(&text)?;
+                Ok(Value::Data { bytes: text.into_bytes(), db_type: DbType::STRING })
+            }
+            DbType::JSONB => Ok(Value::Data {
+                bytes: {
+                    let mut out = Vec::with_capacity(bytes.len());
+                    crate::core::jsonb::render_text_into(&bytes, &mut out)?;
+                    out
+                },
+                db_type: DbType::STRING,
+            }),
+            other => Err(format!(
+                "cannot cast type {} to json",
+                crate::core::value_codec::pg_input_type_name(&other)
+            )),
+        };
     }
     // To a `timestamp` (without time zone): text is read with its zone
     // discarded; any other value is the `timestamptz` cast, the same
