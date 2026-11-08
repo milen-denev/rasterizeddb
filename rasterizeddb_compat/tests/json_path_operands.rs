@@ -89,7 +89,13 @@ async fn a_qualified_column_starts_a_path_wherever_it_is_written() {
                 "SELECT a.id, coalesce(a.d->>'zz', b.d->>'k') FROM ja a JOIN jb b ON b.a_id = a.id ORDER BY a.id",
                 &["1|bx", "2|by"],
             ),
-            // An inner join on two paths is the filtered cross join it is.
+            // An inner join on two paths is the filtered cross join it is,
+            // not a key: `(b.d->>'k')` was resolved as a column of `(b`.
+            (
+                "SELECT a.id, b.id FROM ja a JOIN jb b ON (b.d->>'k') = ('b' || (a.d->>'k')) ORDER BY a.id",
+                &["1|1", "2|2"],
+            ),
+            ("SELECT a.id, b.id FROM ja a JOIN jb b ON a.d->>'k' = b.d->>'k'", &[]),
             (
                 "SELECT a.id, b.id FROM ja a JOIN jb b ON (a.d->>'n')::int + 4 = (b.d->>'n')::int ORDER BY a.id",
                 &["1|1", "2|2"],
@@ -193,6 +199,7 @@ async fn a_body_with_no_from_materialises_whatever_it_selects() {
             // Unnamed items take PostgreSQL's names for them.
             ("WITH c AS (SELECT 'x'::text) SELECT * FROM c", &["x"]),
             ("WITH c AS (SELECT 1::int, 'y'::varchar) SELECT * FROM c", &["1|y"]),
+            ("WITH c AS (SELECT count(*) FROM ja) SELECT count FROM c", &["2"]),
         ],
     )
     .await;

@@ -45,6 +45,8 @@ const SCHEMA_ONLY: &[&str] = &[
     "statement_visibility",
     "statement_visibility_deferred",
     "cache_generation",
+    // Whether its scans use the query cache: read off the schema's name.
+    "caches_queries",
     "write_generation",
     "visibility_now_for",
     "version_horizon",

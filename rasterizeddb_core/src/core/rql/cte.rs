@@ -168,8 +168,10 @@ fn item_label(item: &str) -> Option<String> {
         // told to alias it. These were all refused, so `WITH c AS (SELECT
         // 'x'::text) SELECT * FROM c` failed where PostgreSQL answers.
         (expression, None) => bare_column(expression).or_else(|| {
+            // A star names no single column; `select_labels` expands it.
+            let star = expression.trim() == "*" || expression.trim().ends_with(".*");
             let name = crate::core::rql::join::pg_column_name(expression);
-            (name != "?column?").then_some(name)
+            (!star && name != "?column?").then_some(name)
         }),
     }
 }
@@ -2134,10 +2136,18 @@ mod tests {
         assert_eq!(item_label("id").as_deref(), Some("id"));
         assert_eq!(item_label("\"id\"").as_deref(), Some("id"));
         assert_eq!(item_label("count(*) AS n").as_deref(), Some("n"));
-        // Unnameable rather than invented: the outer query refers to these by
-        // name, so guessing would bind the wrong column.
-        assert_eq!(item_label("count(*)"), None);
+        // PostgreSQL's own names, not guesses: `WITH c AS (SELECT count(*)
+        // FROM t) SELECT count FROM c` and `SELECT 'x'::text` named `text`
+        // are what it answers. Refused, every such CTE failed there.
+        assert_eq!(item_label("count(*)").as_deref(), Some("count"));
+        assert_eq!(item_label("'x'::text").as_deref(), Some("text"));
+        assert_eq!(item_label("upper(s)").as_deref(), Some("upper"));
+        // Unnameable rather than invented. A star is expanded from the
+        // query's description instead (`select_labels`), and an item
+        // PostgreSQL itself calls `?column?` has no name to refer to.
         assert_eq!(item_label("*"), None);
+        assert_eq!(item_label("t.*"), None);
+        assert_eq!(item_label("1 + 2"), None);
     }
 
     #[test]
