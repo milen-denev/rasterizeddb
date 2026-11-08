@@ -1102,6 +1102,10 @@ pub fn get_path<'a>(bytes: &'a [u8], path: &[Step]) -> Option<&'a [u8]> {
     for step in path {
         current = match step {
             Step::Key(key) => get_key(current, key)?,
+            // A scalar is PostgreSQL's one-element pseudo-array to `->`:
+            // `'5'::jsonb->0` and `->-1` are 5 (and `->1` nothing). Not to
+            // `#>`, which reads `Either` steps, nor to `json`'s `->`.
+            Step::Index(0 | -1) if !matches!(current.first(), Some(&TAG_OBJ) | Some(&TAG_ARR)) => current,
             Step::Index(index) => get_index(current, *index)?,
             Step::Either(text) => match current.first() {
                 Some(&TAG_OBJ) => get_key(current, text)?,
@@ -3324,6 +3328,27 @@ fn strip_outer_parens(text: &str) -> &str {
         }
         current = current[1..current.len() - 1].trim();
     }
+}
+
+/// A path whose column carries a relation qualifier, `t.doc->>'k'`: the
+/// qualifier and the path over the bare column. `None` for anything else,
+/// including an unqualified path, which [`parse_path_expression`] reads.
+///
+/// Kept apart from [`parse_path_expression`], which also reads index keys and
+/// declarations, where a qualifier is never valid. The caller decides what
+/// the qualifier names: dropping it is only right where the expression is
+/// read against one relation, or where the qualified references have already
+/// been rewritten to that relation's own names (a join's layout does this
+/// before it parses).
+pub fn parse_qualified_path_expression(expr: &str) -> Option<(String, PathExpr)> {
+    let text = strip_outer_parens(expr.trim());
+    let (qualifier, rest) = take_identifier(text)?;
+    let rest = rest.strip_prefix('.')?;
+    // A column name follows the dot directly; `t. doc` is not a reference.
+    if rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some((qualifier, parse_path_expression(rest)?))
 }
 
 fn take_identifier(text: &str) -> Option<(String, &str)> {

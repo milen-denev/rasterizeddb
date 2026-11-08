@@ -695,6 +695,12 @@ fn parse_select_items(
                     if crate::core::rql::expr::is_input_error(&e) {
                         return Err(e);
                     }
+                    // A path operator on a column holding no document
+                    // (`text -> unknown`): read on, the item was reported
+                    // as a missing column named after the whole path.
+                    if e.starts_with("operator does not exist") {
+                        return Err(e);
+                    }
                     if let Some(open) = expr.find('(') {
                         let head = expr[..open].trim().to_ascii_uppercase();
                         let known = crate::core::rql::expr::is_function(&head)
@@ -1223,6 +1229,16 @@ pub(crate) fn split_alias(item: &str) -> (&str, Option<String>) {
                 .trim_end(),
             Some(second.trim_matches('"').to_string()),
         ),
+        // Only a name is an alias. `coalesce(b, '{}')->'k'` and
+        // `(doc)->>'a'` were read as the call aliased `->'k'`: the path was
+        // dropped and the whole document returned under that label.
+        (Some(first), None)
+            if tail_start > 0
+                && !first.starts_with('"')
+                && !first.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') =>
+        {
+            (item.trim(), None)
+        }
         // `upper(t) ISNULL` is a test, not `upper(t)` aliased `ISNULL`.
         (Some(first), None) if tail_start > 0 && !is_operator_keyword(first) => {
             // `COUNT(x) total`
@@ -2702,6 +2718,11 @@ pub fn row_fetch_from_select_query(
                 }
             } else {
                 crate::core::rql::expr::parse(&term.token, schema).map_err(|e| {
+                    // PostgreSQL's own refusal, unwrapped, as the select list
+                    // and WHERE report it.
+                    if e.starts_with("operator does not exist") {
+                        return e;
+                    }
                     format!(
                         "ORDER BY term '{}' is not a column and could not be read as an expression: {}",
                         term.token, e

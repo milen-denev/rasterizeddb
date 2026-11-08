@@ -163,6 +163,17 @@ pub enum Expr {
         /// yields its own contents instead of a quoted JSON string.
         as_text: bool,
     },
+    /// A path into a document that is not a column: `('{"a":1}'::jsonb)->'a'`,
+    /// `s::jsonb->>'k'`, `to_jsonb(x)->0`. `base` is `jsonb`, or `json` when
+    /// `yields_json_text` says so (its text read where the path leads). Read
+    /// as anything else, the arrow was taken for a cast's type name
+    /// ("cast to 'jsonb->'a''") or, parenthesised, dropped: the whole
+    /// document came back.
+    PathOf {
+        base: Box<Expr>,
+        steps: Vec<crate::core::jsonb::Step>,
+        as_text: bool,
+    },
 }
 
 /// The modifier of a cast the evaluator applies ([`Expr::TypmodCast`]).
@@ -547,7 +558,9 @@ pub fn needs_evaluation(text: &str) -> bool {
     // A path into a document is an expression, not a column name. Asked
     // structurally rather than by looking for `->`, so `#>` and `#>>` are
     // covered too and a column whose *name* contains an arrow is not.
-    if crate::core::jsonb::parse_path_expression(trimmed).is_some() {
+    if crate::core::jsonb::parse_path_expression(trimmed).is_some()
+        || crate::core::jsonb::parse_qualified_path_expression(trimmed).is_some()
+    {
         return true;
     }
     let upper = trimmed.to_ascii_uppercase();
@@ -904,6 +917,144 @@ pub fn is_function(name: &str) -> bool {
         || crate::core::rql::pg_functions::NAMES.iter().any(|f| f.eq_ignore_ascii_case(name))
 }
 
+/// PostgreSQL's refusal of a path operator on a column that holds no
+/// document: `text -> unknown` does not exist. Read here, the text's bytes
+/// were searched as an encoded document, found nothing, and every row
+/// answered NULL, so `WHERE s->>'a' IS NULL` matched rows it should have
+/// refused.
+///
+/// Only the types that certainly hold no document are refused. A column a
+/// document is stored in under another physical type (`UUID` for a rebuilt
+/// one, `JSON`, a scratch relation's sampled type) is still read.
+pub(crate) fn path_operator_refusal(column: &SchemaField, text: &str) -> Option<String> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    if column.json_text {
+        return None;
+    }
+    let name = match column.db_type {
+        DbType::STRING if matches!(column.text_typmod(), Some(TextTypmod::Varchar(_))) => "character varying",
+        DbType::STRING | DbType::CHAR => "text",
+        DbType::BPCHAR(_) => "character",
+        DbType::I16 => "smallint",
+        DbType::I32 => "integer",
+        DbType::I64 => "bigint",
+        DbType::F32 => "real",
+        DbType::F64 => "double precision",
+        DbType::DECIMAL => "numeric",
+        DbType::BOOL => "boolean",
+        DbType::DATE => "date",
+        DbType::DATETIME => "timestamp with time zone",
+        DbType::TIMESTAMP => "timestamp without time zone",
+        _ => return None,
+    };
+    // The first operator, past the column (which a quoted name may spell
+    // with any character).
+    let after_column = match text.trim_start().strip_prefix('"') {
+        Some(quoted) => quoted.find('"').map_or("", |end| &quoted[end + 1..]),
+        None => text,
+    };
+    let at = after_column.find(['-', '#'])?;
+    let rest = &after_column[at..];
+    let operator = ["#>>", "#>", "->>", "->"].into_iter().find(|op| rest.starts_with(op))?;
+    Some(format!("operator does not exist: {name} {operator} unknown"))
+}
+
+/// `text` as an operand and the path steps after it, when it is a path over
+/// something other than a column: the operand a parenthesised group, a cast
+/// (`x::jsonb`) or a function call, and everything after it path steps.
+/// With the path, its first operator as written, for a refusal to name.
+fn path_over_expression(text: &str) -> Option<(&str, (crate::core::jsonb::PathExpr, &'static str))> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut quote, mut i) = (0usize, None::<u8>, 0usize);
+    let at = loop {
+        let c = *bytes.get(i)?;
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth = depth.checked_sub(1)?,
+                b'-' | b'#' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => break i,
+                _ => {}
+            },
+        }
+        i += 1;
+    };
+    let base = text[..at].trim_end();
+    if base.is_empty() || !is_path_operand(base) {
+        return None;
+    }
+    let operator = ["#>>", "#>", "->>", "->"].into_iter().find(|op| text[at..].starts_with(op))?;
+    // The steps read by the one path parser, over a stand-in column.
+    let path = crate::core::jsonb::parse_path_expression(&format!("x{}", &text[at..]))?;
+    Some((base, (path, operator)))
+}
+
+/// Whether `text` is an operand a path may follow without parentheses being
+/// needed around it: a parenthesised group, a function call, or either of
+/// those, a column or a string constant cast with `::`. A bare column is
+/// not one (a column's own path is read before this), and nor is anything
+/// with an operator at its top level.
+fn is_path_operand(text: &str) -> bool {
+    let text = text.trim();
+    let atom = |a: &str| {
+        let a = a.trim();
+        if a.starts_with('(') {
+            return matching_paren(a, 0) == Some(a.len() - 1);
+        }
+        if a.starts_with('\'') {
+            return a.len() >= 2 && a.ends_with('\'') && !a[1..a.len() - 1].replace("''", "").contains('\'');
+        }
+        let name_end = a.find('(').unwrap_or(a.len());
+        let name = &a[..name_end];
+        let named = !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '"');
+        named && (name_end == a.len() || matching_paren(a, name_end) == Some(a.len() - 1))
+    };
+    match find_top_level_cast(text) {
+        Some(at) => {
+            let target = &text[at + 2..];
+            atom(&text[..at])
+                && !target.trim().is_empty()
+                && target.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ',' | '[' | ']'))
+        }
+        // A call or a group, not a bare name or constant.
+        None => (text.starts_with('(') || text.contains('(')) && atom(text),
+    }
+}
+
+/// The byte offset of the first `::` outside quotes and parentheses.
+fn find_top_level_cast(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut quote) = (0usize, None::<u8>);
+    for i in 0..bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// PostgreSQL's name for the type of `expr`, as an operator refusal names it.
+fn pg_operand_type_name(expr: &Expr) -> String {
+    match static_type(expr) {
+        _ if yields_json_text(expr) => "json".to_string(),
+        DbType::STRING => "text".to_string(),
+        DbType::DATETIME if yields_timestamp(expr) => "timestamp without time zone".to_string(),
+        other => crate::core::value_codec::pg_input_type_name(&other).to_string(),
+    }
+}
+
 /// Parses one expression against `schema`.
 pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     let text = text.trim();
@@ -927,17 +1078,47 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     // postfix on a column, not a binary operator over expressions — so it is
     // recognised first. `parse_path_expression` returns `None` for anything
     // that is not one, which is the usual case.
-    if let Some(path) = crate::core::jsonb::parse_path_expression(text) {
+    //
+    // A qualified column, `t.doc->>'k'`, is read by its bare name, as a
+    // qualified plain column is at the end of this function: the statement
+    // has already checked the qualifier names a relation in its FROM, and a
+    // join rewrites `a.doc` to its layout's own name before parsing, so two
+    // relations' `doc` never meet here under one name. Unread, the whole
+    // `t.doc->>'k'` was looked up as a column ("not found in schema"), which
+    // failed every ORM query reading a document field.
+    let path = crate::core::jsonb::parse_path_expression(text)
+        .or_else(|| crate::core::jsonb::parse_qualified_path_expression(text).map(|(_, path)| path));
+    if let Some(path) = path {
         if let Some(column) = schema
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(&path.column) && !f.is_deleted)
         {
+            if let Some(refused) = path_operator_refusal(column, text) {
+                return Err(refused);
+            }
             return Ok(Expr::JsonPath {
                 column: column.clone(),
                 steps: path.steps,
                 as_text: path.as_text,
             });
         }
+    }
+
+    // A path over a value that is not a column: `(doc)->'a'`,
+    // `'{"a":1}'::jsonb->'a'`, `to_jsonb(x)->>0`. `::` binds tighter than
+    // `->`, so the cast is the operand rather than the arrow being part of
+    // its type name.
+    if let Some((base, path)) = path_over_expression(text) {
+        let base = parse(base, schema)?;
+        let json_text = yields_json_text(&base);
+        if !json_text && static_type(&base) != DbType::JSONB {
+            let operand = match &base {
+                Expr::Literal { db_type: DbType::STRING, .. } => "unknown".to_string(),
+                other => pg_operand_type_name(other),
+            };
+            return Err(format!("operator does not exist: {} {} unknown", operand, path.1));
+        }
+        return Ok(Expr::PathOf { base: Box::new(base), steps: path.0.steps, as_text: path.0.as_text });
     }
 
     // `||` binds looser than arithmetic, so `a || b + 1` concatenates `a` with
@@ -2544,6 +2725,7 @@ pub fn columns_of(expr: &Expr) -> Vec<SchemaField> {
                     out.push(column.clone());
                 }
             }
+            Expr::PathOf { base, .. } => walk(base, out),
             Expr::Concat(a, b) => {
                 walk(a, out);
                 walk(b, out);
@@ -2660,6 +2842,15 @@ pub fn static_type(expr: &Expr) -> DbType {
         // (`yields_json_text`).
         Expr::JsonPath { as_text, column, .. } => {
             if *as_text || column.json_text {
+                DbType::STRING
+            } else {
+                DbType::JSONB
+            }
+        }
+        // As a column's path: `->>` text, `->` the base's own kind, a `json`
+        // one travelling as text (`yields_json_text`).
+        Expr::PathOf { base, as_text, .. } => {
+            if *as_text || yields_json_text(base) {
                 DbType::STRING
             } else {
                 DbType::JSONB
@@ -4855,7 +5046,7 @@ fn numeric_product_or_quotient(expr: &Expr) -> bool {
             whens.iter().any(|(_, r)| numeric_product_or_quotient(r))
                 || otherwise.as_deref().is_some_and(numeric_product_or_quotient)
         }
-        Expr::Column(_) | Expr::Literal { .. } | Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } => false,
+        Expr::Column(_) | Expr::Literal { .. } | Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } => false,
     }
 }
 
@@ -4872,7 +5063,7 @@ fn reads_wide_decimal(expr: &Expr, schema: &[SchemaField]) -> bool {
                 f.db_type == DbType::DECIMAL && f.scale.is_some_and(|s| s > crate::core::value_codec::DECIMAL_SCALE)
             }
             Expr::Literal { .. } => is_wide_literal(expr),
-            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } => false,
+            Expr::Null | Expr::Scalar(_) | Expr::JsonPath { .. } | Expr::PathOf { .. } => false,
             Expr::Concat(a, b) | Expr::NullIf(a, b) | Expr::Mod(a, b) | Expr::Arith(a, _, b) => wide(a) || wide(b),
             Expr::Call(_, args) | Expr::Coalesce(args) | Expr::Least(args) | Expr::Greatest(args) => args.iter().any(wide),
             Expr::Cast(inner, _) => wide(inner),
@@ -5981,6 +6172,7 @@ pub(crate) fn yields_json_text(expr: &Expr) -> bool {
     match expr {
         Expr::Column(field) => field.json_text,
         Expr::JsonPath { column, as_text, .. } => column.json_text && !as_text,
+        Expr::PathOf { base, as_text, .. } => yields_json_text(base) && !as_text,
         Expr::Cast(_, DbType::JSONTEXT) => true,
         Expr::Call(TextFunc::Pg(func), _) => crate::core::rql::pg_functions::yields_json_text(*func),
         _ => false,
@@ -6494,6 +6686,46 @@ fn float_vs_exact(x: f64, e: &NumKey) -> std::cmp::Ordering {
     if xneg { ord.reverse() } else { ord }
 }
 
+/// The value `steps` lead to in `document`: a stored `jsonb` document's
+/// bytes, or a `json` value's text when `json_text`. `->>` (`as_text`) gives
+/// text, `->` a document (`json`'s as the member's own text).
+fn path_value(document: &[u8], steps: &[crate::core::jsonb::Step], as_text: bool, json_text: bool) -> Result<Value, String> {
+    // A `json` value: the text as stored, read where the path leads
+    // (`json_text`): `->` is the member's own text, `->>` a string
+    // unescaped.
+    if json_text {
+        let text = String::from_utf8_lossy(document);
+        let Some(span) = crate::core::json_text::get_path(&text, steps)? else {
+            return Ok(Value::Null);
+        };
+        let out = if as_text {
+            crate::core::json_text::as_text(&text, span)?
+        } else {
+            Some(text[span].to_string())
+        };
+        return Ok(match out {
+            Some(t) => Value::Data { bytes: t.into_bytes(), db_type: DbType::STRING },
+            None => Value::Null,
+        });
+    }
+    // A path that resolves to nothing is NULL, and so is a JSON null read as
+    // text — both are PostgreSQL's answers, and neither is an error: asking
+    // for a key a document does not have is ordinary.
+    let Some(found) = crate::core::jsonb::get_path(document, steps) else {
+        return Ok(Value::Null);
+    };
+    Ok(if as_text {
+        match crate::core::jsonb::as_text(found) {
+            Some(text) => Value::Data { bytes: text.into_bytes(), db_type: DbType::STRING },
+            None => Value::Null,
+        }
+    } else {
+        // `->` yields a document, so the bytes stay encoded and the value can
+        // be reached into again or rendered as JSON.
+        Value::Data { bytes: found.to_vec(), db_type: DbType::JSONB }
+    })
+}
+
 /// Evaluates `expr` for one row.
 pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, String> {
     Ok(match expr {
@@ -6512,46 +6744,15 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 Value::Data { bytes, .. } => bytes,
                 Value::Null => return Ok(Value::Null),
             };
-            // A `json` column: the text as stored, read where the path leads
-            // (`json_text`): `->` is the member's own text, `->>` a string
-            // unescaped.
-            if column.json_text {
-                let text = String::from_utf8_lossy(&document);
-                let Some(span) = crate::core::json_text::get_path(&text, steps)? else {
-                    return Ok(Value::Null);
-                };
-                let out = if *as_text {
-                    crate::core::json_text::as_text(&text, span)?
-                } else {
-                    Some(text[span].to_string())
-                };
-                return Ok(match out {
-                    Some(t) => Value::Data { bytes: t.into_bytes(), db_type: DbType::STRING },
-                    None => Value::Null,
-                });
-            }
-            // A path that resolves to nothing is NULL, and so is a JSON null
-            // read as text — both are PostgreSQL's answers, and neither is an
-            // error: asking for a key a document does not have is ordinary.
-            let Some(found) = crate::core::jsonb::get_path(&document, steps) else {
-                return Ok(Value::Null);
+            path_value(&document, steps, *as_text, column.json_text)?
+        }
+        Expr::PathOf { base, steps, as_text } => {
+            let json_text = yields_json_text(base);
+            let document = match eval(base, row, schema)? {
+                Value::Data { bytes, .. } => bytes,
+                Value::Null => return Ok(Value::Null),
             };
-            if *as_text {
-                match crate::core::jsonb::as_text(found) {
-                    Some(text) => Value::Data {
-                        bytes: text.into_bytes(),
-                        db_type: DbType::STRING,
-                    },
-                    None => Value::Null,
-                }
-            } else {
-                // `->` yields a document, so the bytes stay encoded and the
-                // value can be reached into again or rendered as JSON.
-                Value::Data {
-                    bytes: found.to_vec(),
-                    db_type: DbType::JSONB,
-                }
-            }
+            path_value(&document, steps, *as_text, json_text)?
         }
         Expr::Concat(lhs, rhs) => {
             // A NUMERIC operand is its text at its display scale, as `::text`

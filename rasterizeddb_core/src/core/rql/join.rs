@@ -2162,7 +2162,16 @@ fn split_on_condition(on: &str) -> Result<(String, String, Vec<String>), String>
                 // `extra`, so dropping the double quote here costs nothing.
                 let rhs_is_literal =
                     rhs.starts_with('\'') || rhs.chars().next().is_some_and(|c| c.is_ascii_digit());
-                lq.is_some() && rq.is_some() && !rhs_is_literal
+                // Both sides a column itself, not an expression over one:
+                // `a.doc->>'k' = b.doc->>'k'` splits as the qualifier `a` and
+                // the "column" `doc->>'k'`, which the key resolver then
+                // looked up by that name and refused. As a filter, an inner
+                // join on it is the cross join it is.
+                lq.is_some()
+                    && rq.is_some()
+                    && !rhs_is_literal
+                    && is_column_reference(term[..eq].trim())
+                    && is_column_reference(rhs)
             }
             None => false,
         };
@@ -4476,6 +4485,16 @@ fn build_aggregate_stage(
             let name = raw.trim().split_whitespace().next().unwrap_or("");
             if name.is_empty() {
                 continue;
+            }
+            // A computed key (`a.doc->>'k'`, `upper(a.s)`) is not grouped
+            // over a join. Resolved as a name, it was reported as a missing
+            // column of whatever preceded its last dot.
+            if !is_column_reference(raw.trim()) && name.parse::<usize>().is_err() {
+                return Err(format!(
+                    "GROUP BY {} over a join is not supported yet; group by a column, or by \
+                     the expression's value in a derived table",
+                    raw.trim()
+                ));
             }
             let (rel, field) = resolve(name)?;
             if schemas.get(rel).is_some_and(|schema| {

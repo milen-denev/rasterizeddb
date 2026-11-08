@@ -2573,6 +2573,11 @@ fn needs_evaluator(text: &str) -> bool {
                     return true;
                 }
             }
+            // A path over a group or a call, `(s::jsonb)->>'k'`,
+            // `to_jsonb(x)->0`: only the evaluator reads a path that does
+            // not start at a column. Compiled, the arrow was an unexpected
+            // operator.
+            b')' if path_operator_after(&text[i + 1..]) => return true,
             _ if is_word(c) && (i == 0 || !is_word(bytes[i - 1])) => {
                 let mut end = i;
                 while end < bytes.len() && is_word(bytes[end]) {
@@ -2685,6 +2690,12 @@ fn group_open(bytes: &[u8], close: usize) -> usize {
 /// and a `WHERE` compares: an integer, a NUMERIC, a float, text, a boolean, a
 /// date or a timestamp. The other targets keep the comparison's own per-row
 /// conversion, which renders them correctly.
+/// Whether `after` starts, past whitespace, with a path operator.
+fn path_operator_after(after: &str) -> bool {
+    let after = after.trim_start();
+    after.starts_with("->") || after.starts_with("#>")
+}
+
 fn evaluated_cast_after(after: &str) -> bool {
     let Some(target) = after.trim_start().strip_prefix("::") else {
         return false;
@@ -2694,6 +2705,15 @@ fn evaluated_cast_after(after: &str) -> bool {
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(target.len());
     use crate::core::db_type::DbType;
+    // `s::jsonb->>'k'`: a path over the cast value, which `::` binds tighter
+    // than. The comparison tokens read the arrow as an operator of their own.
+    if matches!(
+        crate::core::rql::expr::db_type_of_cast(&target[..name_end]),
+        Some(DbType::JSONB | DbType::JSONTEXT)
+    ) && path_operator_after(&target[name_end..])
+    {
+        return true;
+    }
     // A type modifier only the evaluator applies (`expr::CastTypmod`):
     // `tm::time(0)`, `iv::interval(0)`, `t::timetz(2)` round, which the
     // comparison's own per-row conversion does not.

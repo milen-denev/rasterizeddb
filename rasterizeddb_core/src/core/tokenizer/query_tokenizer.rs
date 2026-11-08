@@ -670,6 +670,13 @@ fn tokenize_inner<'a>(
                     if let Some(end) = json_path_extent(bytes, i) {
                         let text = unsafe { std::str::from_utf8_unchecked(&bytes[start..end]) };
                         if let Some(path) = crate::core::jsonb::parse_path_expression(text) {
+                            // On a column holding no document: PostgreSQL's
+                            // `text ->> unknown`. Compiled, the text was read
+                            // as an encoded document, matched nothing, and
+                            // `s->>'a' IS NULL` kept every row.
+                            if let Some(refused) = crate::core::rql::expr::path_operator_refusal(field, text) {
+                                return Err(refused);
+                            }
                             i = end;
                             // `->>` is text; `->` yields a document.
                             let result_type = if path.as_text {
