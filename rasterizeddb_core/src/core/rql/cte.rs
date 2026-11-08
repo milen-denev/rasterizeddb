@@ -440,6 +440,8 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::DATETIME => "TIMESTAMPTZ",
         DbType::TIMESTAMP => "TIMESTAMP",
         DbType::STRING => "TEXT",
+        // A `json` value goes in as `json`, its text kept as written.
+        DbType::JSONTEXT => "JSON",
         // A legacy `CHAR` goes into the temporary relation as the text it
         // holds. `CHAR` is `character(1)` now, which an older value of two
         // characters does not fit.

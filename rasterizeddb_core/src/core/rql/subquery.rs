@@ -1267,6 +1267,9 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
 
     Some(match db_type {
         DbType::STRING | DbType::BPCHAR(_) => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
+        // A `json` value is its text as written; quoted, it is read back as
+        // that text again (into a `json` column, checked to be one document).
+        DbType::JSONTEXT => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
         DbType::UUID => value_codec::quote_sql(&value_codec::format_uuid(bytes)),
         DbType::INET => value_codec::quote_sql(&value_codec::format_inet(bytes)?),
         DbType::DATETIME => {

@@ -822,6 +822,8 @@ fn column_info(field: &crate::core::row::schema::SchemaField, schema: &crate::co
         DbType::INET => info("inet", "inet"),
         DbType::BYTEA => info("bytea", "bytea"),
         DbType::JSON | DbType::JSONB => info("jsonb", "jsonb"),
+        // `json`: stored as the text it was written as (`literal_type`).
+        DbType::JSONTEXT => info("json", "json"),
         DbType::ARRAY => info("ARRAY", "_text"),
         DbType::MACADDR => info("macaddr", "macaddr"),
         DbType::MACADDR8 => info("macaddr8", "macaddr8"),

@@ -85,6 +85,11 @@ async fn json_keeps_its_text_and_reads_it_as_postgresql_does() {
         ("SELECT json_build_object('o', json_build_object('i', 1))", &[r#"{"o" : {"i" : 1}}"#]),
         ("SELECT json_build_object('a', d->'a') FROM jt WHERE id = 1", &[r#"{"a" : [1, 2]}"#]),
         ("SELECT pg_typeof(json_build_object('a', 1)), pg_typeof(to_json(1)), pg_typeof(jsonb_build_object('a', 1))", &["json|json|jsonb"]),
+        // Through a CTE, which materialises its rows: still json, as written.
+        ("WITH c AS (SELECT d FROM jt WHERE id = 1) SELECT d, pg_typeof(d), d->'a' FROM c", &[r#"{"b": 1,  "a": [1, 2], "b": 3}|json|[1, 2]"#]),
+        ("SELECT d->'a', pg_typeof(d) FROM (SELECT d FROM jt WHERE id = 1) s", &["[1, 2]|json"]),
+        // information_schema names it as PostgreSQL does.
+        ("SELECT data_type, udt_name FROM information_schema.columns WHERE table_name = 'jt' AND column_name = 'd'", &["json|json"]),
     ];
     let mut wrong = Vec::new();
     for (sql, want) in cases {

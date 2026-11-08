@@ -2804,6 +2804,7 @@ pub fn parse_bool(value: &str) -> Result<bool, String> {
 pub fn sql_type_name(db_type: &DbType) -> &'static str {
     match db_type {
         DbType::JSONB => "JSONB",
+        DbType::JSONTEXT => "JSON",
         DbType::I8 => "TINYINT",
         DbType::I16 => "SMALLINT",
         DbType::I32 => "INTEGER",

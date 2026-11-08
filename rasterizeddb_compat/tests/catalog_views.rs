@@ -253,7 +253,7 @@ async fn information_schema_columns_match_postgresql() {
         "r|timestamp with time zone|timestamptz|NULL|NULL|NULL|NULL|6|YES",
         "s|interval|interval|NULL|NULL|NULL|NULL|6|YES",
         "t|uuid|uuid|NULL|NULL|NULL|NULL|NULL|YES",
-        "u|jsonb|jsonb|NULL|NULL|NULL|NULL|NULL|YES",
+        "u|json|json|NULL|NULL|NULL|NULL|NULL|YES",
         "v|jsonb|jsonb|NULL|NULL|NULL|NULL|NULL|YES",
         "w|bytea|bytea|NULL|NULL|NULL|NULL|NULL|YES",
         "x|inet|inet|NULL|NULL|NULL|NULL|NULL|YES",
