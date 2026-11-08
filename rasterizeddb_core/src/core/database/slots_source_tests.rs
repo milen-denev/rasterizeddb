@@ -72,6 +72,9 @@ const HELD: &[(&str, &str, usize)] = &[
     // (finding L11).
     ("core/rql/column_declarations.rs", "other_foreign_keys", 1),
     ("core/rql/column_declarations.rs", "retarget_parent", 1),
+    // The plain table ALTER ... PARTITION BY converts, under the AE
+    // `run_conversion` took on the name.
+    ("core/database/partitioned_convert.rs", "convert_to_partitioned", 1),
 ];
 
 /// The callers B3b moved off the escape hatches, `(file, fn)`, each with the
@@ -520,6 +523,7 @@ fn every_ddl_mutator_resolves_its_key_first() {
         ("core/database/partitioned_ddl.rs", "reinstall_partitioned"),
         (MOD, "rename_table"),
         ("core/database/partitioned.rs", "drop_partitioned"),
+        ("core/database/partitioned_convert.rs", "convert_to_partitioned"),
     ];
     let mut takers: Vec<(String, String)> = Vec::new();
     let mut unresolved = Vec::new();
