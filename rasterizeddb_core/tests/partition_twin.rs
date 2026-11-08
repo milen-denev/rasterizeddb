@@ -1567,7 +1567,12 @@ impl Gen {
             CatalogTables => {
                 self.simple(kind, "SELECT * FROM information_schema.tables WHERE table_name = '{t}'".into())
             }
-            // The tuple counts are estimates from pointer slots. In spread
+            // The tuple counts are estimates. How a table's slots split into
+            // live and dead is measured by vacuum's sweep (`VacuumStats::
+            // live_rows`), and the two sides are swept at different times —
+            // a partitioned table only once every partition has been, and
+            // `ForgetSweep` sweeps a seeded subset — so the split is never
+            // compared, only its sum, the slot count. In spread
             // mode a table off the root never overwrites in place (its log
             // is not the outcome log's, `write_columns_in_place`), so its
             // UPDATEs append versions that the other side's in-place ones
@@ -1580,14 +1585,14 @@ impl Gen {
                 self.simple(kind, "SELECT relname, relkind FROM pg_class WHERE relname = '{t}'".into())
             }
             CatalogClass => {
-                self.simple(kind, "SELECT relname, relkind, reltuples FROM pg_class WHERE relname = '{t}'".into())
+                self.simple(kind, "SELECT relname, relkind, reltuples >= 0 AS counted FROM pg_class WHERE relname = '{t}'".into())
             }
             CatalogStat if self.spread || self.reshaped => {
                 self.simple(kind, "SELECT schemaname, relname FROM pg_stat_user_tables WHERE relname = '{t}'".into())
             }
             CatalogStat => self.simple(
                 kind,
-                "SELECT schemaname, relname, n_live_tup, n_dead_tup FROM pg_stat_user_tables WHERE relname = '{t}'".into(),
+                "SELECT schemaname, relname, n_live_tup + n_dead_tup AS slots FROM pg_stat_user_tables WHERE relname = '{t}'".into(),
             ),
             CatalogIndexes => self.simple(kind, "SELECT * FROM pg_indexes WHERE tablename = '{t}'".into()),
             Describe => self.ordered(kind, "DESCRIBE {t}".into()),

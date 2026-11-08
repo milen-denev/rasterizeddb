@@ -158,6 +158,23 @@ async fn deletes_are_not_counted_live() {
     run(&pool, "DELETE FROM del_t WHERE id <= 4").await.expect("delete");
     assert_eq!(tuples(&pool, "del_t").await, (6, 4), "four of ten deleted");
     assert_eq!(slots(&pool, "del_t").await, 10);
+
+    // The two shapes `partition_twin` compares, since the split itself
+    // depends on when each side was swept: they must answer, not fail alike.
+    let sum: i64 = sqlx::query(
+        "SELECT n_live_tup + n_dead_tup AS slots FROM pg_stat_user_tables WHERE relname = 'del_t'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("a sum of the two columns")
+    .get("slots");
+    assert_eq!(sum, 10);
+    let counted: bool = sqlx::query("SELECT reltuples >= 0 AS counted FROM pg_class WHERE relname = 'del_t'")
+        .fetch_one(&pool)
+        .await
+        .expect("a comparison on reltuples")
+        .get("counted");
+    assert!(counted);
 }
 
 /// After a sweep, `live` is what it counted, carried forward by the writes

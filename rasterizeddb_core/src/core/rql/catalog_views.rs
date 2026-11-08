@@ -1477,8 +1477,9 @@ async fn totals_of(database: &Arc<Database>, name: &str) -> Result<crate::core::
 ///
 /// It errs by counting deleted rows as live, since their ids were still handed
 /// out. Taking off the deletes this instance has counted narrows that to the
-/// deletes from before it opened, and it stays an upper bound: every deleted
-/// row was handed an id.
+/// deletes from before it opened. It is an upper bound but for one case: a
+/// delete is counted when its statement ends, so one that then rolls back is
+/// taken off a row that is still there, until a sweep measures the table.
 ///
 /// # Once a sweep has run
 ///
