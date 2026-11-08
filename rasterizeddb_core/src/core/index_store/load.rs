@@ -841,9 +841,7 @@ fn release_load_memory(n_slots: u64) {
             return;
         }
         let spawned = std::thread::Builder::new().name("rdb-load-trim".into()).spawn(|| {
-            // SAFETY: `malloc_trim` takes no pointers; it only returns free
-            // pages of glibc's arenas to the kernel.
-            unsafe { libc::malloc_trim(0) };
+            crate::release_freed_memory();
             TRIMMING.store(false, Ordering::Release);
         });
         if spawned.is_err() {

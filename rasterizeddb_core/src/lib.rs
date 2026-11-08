@@ -167,6 +167,20 @@ pub fn set_malloc_arenas(n: usize) -> bool {
     }
 }
 
+/// Returns the free pages of every glibc arena to the kernel
+/// (`malloc_trim(0)`). glibc keeps what a thread frees in that thread's arena,
+/// so work spread over threads that then exit holds its high-water mark; the
+/// index load calls this after a parallel load (`index_store::load`, which
+/// may hold no `unsafe` itself). Elsewhere it does nothing.
+pub fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` takes no pointers and is thread-safe; it only
+    // hands free pages back.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 pub fn tune_allocator() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
