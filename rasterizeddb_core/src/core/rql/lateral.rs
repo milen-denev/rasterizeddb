@@ -433,6 +433,11 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
         None => Vec::new(),
     };
     let mut found: Option<(String, String, Vec<String>)> = None;
+    // An outer alias the body names as a bare word may be bound again in a
+    // nested subquery (`(SELECT … FROM u c WHERE c.n …)`), where `c.n` is
+    // that subquery's own column: substituting the outer value there would
+    // answer another query. Refused rather than guessed.
+    let rebinds = |alias: &str| bare_words(&item.body).iter().any(|w| w.eq_ignore_ascii_case(alias));
     for (qualifier, column) in qualified_references(&item.body) {
         if inner.iter().any(|a| a.eq_ignore_ascii_case(&qualifier)) {
             continue;
@@ -440,6 +445,12 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
         let Some((alias, relation)) = outer.iter().find(|(a, _)| a.eq_ignore_ascii_case(&qualifier)) else {
             continue;
         };
+        if rebinds(alias) {
+            return Err(format!(
+                "a LATERAL item that names its outer alias {alias} inside itself is not supported yet; give the \
+                 inner relation another alias"
+            ));
+        }
         match &mut found {
             None => found = Some((alias.clone(), relation.clone(), vec![column])),
             Some((a, _, columns)) if a.eq_ignore_ascii_case(alias) => {
@@ -455,6 +466,33 @@ pub(crate) fn outer_references(sql: &str, item: &Item) -> Result<Option<(String,
         }
     }
     Ok(found)
+}
+
+/// The words of `body` outside quotes that are not a qualifier (`x.`) or a
+/// qualified name's column (`.x`): where an alias is bound, or a column
+/// named without one.
+fn bare_words(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => i = crate::core::sql_scan::quoted_end(bytes, i, q),
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+                let after_dot = start > 0 && bytes[start - 1] == b'.';
+                let before_dot = bytes.get(i) == Some(&b'.');
+                if !after_dot && !before_dot {
+                    out.push(body[start..i].to_string());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
 }
 
 /// Where the body's top-level `FROM` list ends.
@@ -893,6 +931,12 @@ mod tests {
         let sql = "SELECT 1 FROM t c, LATERAL (SELECT c.n FROM u c) s";
         let item = next_item(sql).unwrap().unwrap();
         assert!(outer_references(sql, &item).unwrap().is_none());
+
+        // Bound again in a nested subquery: refused, not substituted there.
+        let sql = "SELECT 1 FROM t c, LATERAL (SELECT x.a FROM u x WHERE x.k = c.k AND EXISTS \
+                   (SELECT 1 FROM w c WHERE c.n = x.a)) s";
+        let item = next_item(sql).unwrap().unwrap();
+        assert!(outer_references(sql, &item).is_err());
     }
 
     #[test]
