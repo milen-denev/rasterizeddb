@@ -115,7 +115,7 @@ fn class(t: &DbType) -> Class {
     }
 }
 
-const ALL: [DbType; 50] = [
+const ALL: [DbType; 51] = [
     DbType::I8,
     DbType::I16,
     DbType::I32,
@@ -133,6 +133,7 @@ const ALL: [DbType; 50] = [
     DbType::STRING,
     DbType::DATETIME,
     DbType::TIMESTAMP,
+    DbType::JSONTEXT,
     DbType::UUID,
     DbType::INET,
     DbType::BYTEA,
@@ -785,7 +786,7 @@ fn every_type_is_classified_and_covered() {
     let count = |c| ALL.iter().filter(|t| class(t) == c).count();
     assert_eq!(
         (count(Class::Fingerprinted), count(Class::BoundsOnly), count(Class::Excluded)),
-        (18, 1, 31)
+        (18, 1, 32)
     );
 
     let rendered = render();
@@ -1527,4 +1528,5 @@ numeric default `amt = 0.001` -> eq 40420f00000000000000000000000000 zone=0
 numeric s2 `amt > 49.99` -> gt 87130000000000000000000000000000 zone=1
 numeric default `amt > 49.99` -> gt 80dda2a30b0000000000000000000000 zone=0
 excluded TIMESTAMP zonemap=false
+excluded JSONTEXT zonemap=false
 "#;
