@@ -50,8 +50,9 @@
 //!   snapshot (no union, no write let through).
 //! - **Each section** is read alone against its crc32c
 //!   ([`snapshot::read_section`]), decoded ([`index_section::decode`]) into
-//!   a checked stream, and only once every section decoded is any index
-//!   touched: `LiveIndex::load_sorted` per index (hook C9), then
+//!   a checked stream and installed by `LiveIndex::load_sorted` (hook C9),
+//!   each index on its own thread from read to install, so a fast section
+//!   installs while a slow one decodes; then, once every index has,
 //!   `TableIndexes::set_ready_at(epoch)`.
 //! - **Any error** (a read, a crc32c, a section's version or bytes, a
 //!   refused stream, a missing or unexpected section) clears whatever was
@@ -67,8 +68,8 @@
 //!
 //! # Superset
 //!
-//! A load either installs every captured entry of every index, or none and
-//! the build runs. `load_sorted` adds and removes nothing, so beside a
+//! A load either installs every captured entry of every index, or clears
+//! whatever it installed and the build runs. `load_sorted` adds and removes nothing, so beside a
 //! write it is the union (B16), though writes wait. The captured stream
 //! carries a presence bit only for a slot whose entries it carries (C3 reads
 //! the bits before the sweep, B17), so a loaded index holds no slot it
@@ -731,13 +732,23 @@ pub(crate) mod hooks {
         Version(dir.to_path_buf())
     }
 
+    /// A version 2 section's bytes as `ver` would carry them: version 1's
+    /// are version 2's without the chunk table (what a binary before 2
+    /// wrote); any other is the version field alone changed.
+    pub(super) fn as_version(mut bytes: Vec<u8>, ver: u16) -> Vec<u8> {
+        if ver == 1 && bytes.len() >= 4 {
+            let table = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().expect("four bytes")) as usize;
+            bytes.truncate(bytes.len() - 4 - table);
+        }
+        bytes[..2].copy_from_slice(&ver.to_le_bytes());
+        bytes
+    }
+
     pub(super) fn version(dir: &Path) -> Option<u16> {
         VERSION.lock().iter().find(|(d, _)| dir.starts_with(d)).map(|(_, v)| *v)
     }
 }
 
-/// Reads, decodes and installs every section, or none. Returns the time
-/// spent reading and decoding, and installing.
 /// One INDEX section, decoded: entries for an index to load, or a paged
 /// index's reference to its sealed run.
 enum Decoded {
@@ -745,15 +756,20 @@ enum Decoded {
     RunRef(Vec<u8>),
 }
 
+/// Reads, decodes and installs every section, each index on a thread of its
+/// own from its read to its install: the indexes are independent, so one
+/// whose section decodes fast installs while a slower one is still decoding.
+/// An error anywhere fails the whole load, once every thread has stopped,
+/// and the caller clears what the others installed (`TableIndexes::clear`)
+/// before it rebuilds; nothing is ready until `set_ready_at`, so no reader
+/// meets a partly loaded set. Returns the longest read and decode, and the
+/// longest install, of any one index.
 fn load_now(
     o: &OpenIndexes,
     path: &std::path::Path,
     sections: &[SectionEntry],
     proof: Proof<'_>,
 ) -> Result<(Duration, Duration), LoadError> {
-    let started = std::time::Instant::now();
-    // Every section decoded and checked before any index is touched; one
-    // thread per section, as the indexes are independent.
     let n_slots = o.n_slots;
     let decode_one = |e: &SectionEntry| -> Result<_, LoadError> {
         let at = std::time::Instant::now();
@@ -775,39 +791,37 @@ fn load_now(
         );
         Ok(Decoded::Stream(stream))
     };
-    let streams: Vec<_> = std::thread::scope(|scope| {
-        let handles: Vec<_> = sections.iter().map(|e| scope.spawn(move || decode_one(e))).collect();
-        handles.into_iter().map(|h| h.join().expect("a section decode panicked")).collect()
-    });
-    let streams = streams.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let decoded = started.elapsed();
-    // Then each index from its stream, each on its own thread.
-    let installed: Vec<Result<(), LoadError>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = streams
-            .into_iter()
-            .zip(o.indexes.list.iter())
+    let one = |ix: &crate::core::index::LiveIndex, e: &SectionEntry| -> Result<(Duration, Duration), LoadError> {
+        let at = std::time::Instant::now();
+        let stream = decode_one(e)?;
+        let decoded = at.elapsed();
+        let loaded = match stream {
+            Decoded::Stream(stream) => ix.load_sorted(proof, stream).map_err(|r| LoadError::Refused(e.ordinal, r)),
+            Decoded::RunRef(bytes) => ix.adopt_run(proof, &bytes, n_slots).map_err(|r| LoadError::Run(e.ordinal, r)),
+        };
+        let installed = at.elapsed() - decoded;
+        log::debug!("{}: index {} installed in {:.3} s", o.name, ix.decl.name, installed.as_secs_f64());
+        loaded.map(|()| (decoded, installed))
+    };
+    let results: Vec<Result<(Duration, Duration), LoadError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = o
+            .indexes
+            .list
+            .iter()
             .zip(sections)
-            .map(|((stream, ix), e)| {
-                scope.spawn(move || {
-                    let at = std::time::Instant::now();
-                    let loaded = match stream {
-                        Decoded::Stream(stream) => ix.load_sorted(proof, stream).map_err(|r| LoadError::Refused(e.ordinal, r)),
-                        Decoded::RunRef(bytes) => {
-                            ix.adopt_run(proof, &bytes, n_slots).map_err(|r| LoadError::Run(e.ordinal, r))
-                        }
-                    };
-                    log::debug!("{}: index {} installed in {:.3} s", o.name, ix.decl.name, at.elapsed().as_secs_f64());
-                    loaded
-                })
-            })
+            .map(|(ix, e)| scope.spawn(move || one(ix, e)))
             .collect();
         handles.into_iter().map(|h| h.join().expect("an index load panicked")).collect()
     });
-    installed.into_iter().collect::<Result<Vec<()>, _>>()?;
+    let mut longest = (Duration::ZERO, Duration::ZERO);
+    for r in results {
+        let (decoded, installed) = r?;
+        longest = (longest.0.max(decoded), longest.1.max(installed));
+    }
     if !o.indexes.set_ready_at(proof, o.epoch) {
         return Err(LoadError::Renumbered);
     }
-    Ok((decoded, started.elapsed() - decoded))
+    Ok(longest)
 }
 
 /// The indexes of one instance at open: loaded, or built by `rebuild`
@@ -851,8 +865,8 @@ where
                         o.gate.set_vouched(true);
                     }
                     log::info!(
-                        "{}: loaded {} index(es) from the snapshot over {} slots in {:.3} s (read and decode \
-                         {:.3} s, install {:.3} s); no rebuild",
+                        "{}: loaded {} index(es) from the snapshot over {} slots in {:.3} s (longest read and \
+                         decode {:.3} s, longest install {:.3} s); no rebuild",
                         o.name,
                         o.indexes.len(),
                         o.n_slots,
@@ -932,7 +946,7 @@ pub fn capture_sections(indexes: &TableIndexes, gate: &FileGate) -> io::Result<O
             let mut bytes = w.finish().map_err(|r| io::Error::other(format!("index {i}: {r:?}")))?;
             #[cfg(test)]
             if let Some(v) = gate.dir().and_then(hooks::version) {
-                bytes[..2].copy_from_slice(&v.to_le_bytes());
+                bytes = hooks::as_version(bytes, v);
             }
             out.push((SectionKind::Index, i as u16, bytes));
         }
