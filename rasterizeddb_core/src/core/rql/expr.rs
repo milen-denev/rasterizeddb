@@ -7528,9 +7528,9 @@ mod tests {
         // The bug this module exists to prevent: an unparsed expression must
         // never become data.
         assert!(parse("SOME_FUNC(v)", &s).is_err());
-        // `v + 1` used to belong here. Arithmetic is supported now, so the
-        // stand-in is an operator that still is not.
-        assert!(parse("v ^ 1", &s).is_err());
+        // `v + 1` used to belong here, then `v ^ 1`. Both are supported now,
+        // so the stand-in is an operator that still is not.
+        assert!(parse("v ## 1", &s).is_err());
         assert!(parse("v + ", &s).is_err());
     }
 

@@ -70,9 +70,12 @@ async fn computed_relations_answer_as_postgresql_does() {
     c.simple_query("INSERT INTO t SELECT g, g * 10 FROM generate_series(3, 5) g").await.expect("insert select");
     assert_eq!(rows(&c, "SELECT id, n FROM t WHERE id > 2 ORDER BY id").await, ["3|30", "4|40", "5|50"]);
 
+    // Over another item's column: an implicit LATERAL item (`rql::lateral`),
+    // run once per row's value. It was refused (0A000).
+    assert_eq!(rows(&c, "SELECT count(*), sum(g) FROM t, generate_series(1, t.n) g").await, ["125|2569"]);
+
     for (sql, sqlstate) in [
         ("SELECT * FROM generate_series(1, 5, 0)", "22023"),
-        ("SELECT t.id, g FROM t, generate_series(1, t.n) g", "0A000"),
         ("SELECT 1 + generate_series(1, 2)", "0A000"),
         ("SELECT * FROM generate_series(1, 2000000)", "0A000"),
     ] {
