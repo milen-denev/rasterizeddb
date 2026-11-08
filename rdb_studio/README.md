@@ -50,9 +50,15 @@ for a partitioned table) and **STATISTICS**.
   leading column first, and a partition count. A key column is made NOT NULL as
   it is picked, and marking several columns PK makes a composite primary key,
   which a partitioned table usually needs. PARTITIONS lists each partition's
-  slice of the hash space, whether it has files yet, and its size. Partitioned
-  tables cannot yet be altered or indexed — the server refuses both — so the
-  pane does not offer to.
+  slice of the hash space, whether it has files yet, and its size. ADD COLUMN
+  and NEW INDEX work on a partitioned table as on a plain one: the server
+  applies them to every partition. Only the partition key is fixed.
+- A table whose row slots outnumber its live rows ten to one or more — a small
+  table updated in a loop, where each update leaves a dead version behind —
+  says so above its columns, with both counts. The figures are `SHOW TABLE
+  STATS`' `live_rows` and `slots_per_live_row` (RasterizedDB), which read "not
+  measured" until vacuum has swept the table once; STATISTICS lists them with
+  the rest.
 
 Dialogs stay open until the server answers, and show its refusal where the
 form still is.

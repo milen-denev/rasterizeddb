@@ -603,9 +603,45 @@ async fn a_partitioned_table_is_created_and_listed() {
     let share: f64 = partitions.iter().filter_map(|p| p.share()).sum();
     assert!((share - 1.0).abs() < 1e-9, "the ranges tile the hash space: {share}");
 
-    // The pane disables NEW INDEX here because the server refuses it; if that
-    // changes, the button should come back.
-    assert!(session.execute(&format!("CREATE INDEX ON {quoted} (body)")).await.is_err());
+    // The pane offers ADD COLUMN and NEW INDEX on a partitioned table, because
+    // the server applies both to every partition. Sent as the dialogs write
+    // them, and checked by reading back as the pane does.
+    use rdb_studio::app::{NewIndex, add_column_sql, create_index_sql};
+    let mut note = NewColumn::new(Flavor::Rasterized);
+    note.rename("note".into(), Flavor::Rasterized);
+    let sql = add_column_sql(table, &note).unwrap();
+    session.execute(&sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let columns = dialect::parse_columns(
+        &session.query(&dialect::columns_sql(Flavor::Rasterized, table)).await.unwrap(),
+    );
+    assert!(columns.iter().any(|c| c.name == "note"), "ADD COLUMN on a partitioned table: {:?}", columns);
+
+    let form = NewIndex { name: "partition_probe_body".into(), columns: vec!["body".into()], ..NewIndex::new("body".into()) };
+    let sql = create_index_sql(table, &form).unwrap();
+    session.execute(&sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let indexes = dialect::parse_indexes(
+        &session.query(&dialect::indexes_sql(Flavor::Rasterized, table)).await.unwrap(),
+        &[],
+    );
+    assert!(
+        indexes.iter().any(|i| i.name == "partition_probe_body"),
+        "CREATE INDEX on a partitioned table: {:?}",
+        indexes
+    );
+    let both = session
+        .query(&format!("SELECT count(*) FROM {quoted} WHERE body = 'x' AND note IS NULL"))
+        .await
+        .unwrap();
+    assert_eq!(both.rows[0][0].as_deref(), Some("1"), "the new column and index read back: {:?}", both.rows);
+
+    // The amplification note reads these two; before any sweep they say so
+    // rather than claiming a count.
+    let stats = dialect::parse_stats(
+        &session.query(&dialect::table_stats_sql(Flavor::Rasterized, table)).await.unwrap(),
+    );
+    for metric in ["live_rows", "slots_per_live_row"] {
+        assert!(stats.iter().any(|s| s.metric == metric), "SHOW TABLE STATS lacks {metric}");
+    }
 
     session.execute(&format!("DROP TABLE {quoted}")).await.unwrap();
 }

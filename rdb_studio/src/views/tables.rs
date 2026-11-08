@@ -217,13 +217,13 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     );
 
     let partitioned = studio.partition_key().is_some();
-    // Refused by the server until partitioned tables take metadata DDL
-    // (docs/partitioning.md, phase 3); a button that cannot work is not
-    // offered as though it could.
-    let new_index = (!partitioned).then_some(Message::OpenModal(ModalKind::CreateIndex));
+    // Offered for a partitioned table too: the server applies column and
+    // index DDL to every partition (docs/partitioning.md, P8). An older
+    // server that still refuses says so in the dialog, which stays open
+    // with its answer.
     let mut actions = row![
-        small_button("ADD COLUMN", (!partitioned).then_some(Message::OpenModal(ModalKind::AddColumn))),
-        small_button("NEW INDEX", new_index),
+        small_button("ADD COLUMN", Some(Message::OpenModal(ModalKind::AddColumn))),
+        small_button("NEW INDEX", Some(Message::OpenModal(ModalKind::CreateIndex))),
     ]
     .spacing(6);
     if studio.flavor() == crate::model::Flavor::Rasterized {
@@ -247,9 +247,8 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     if partitioned {
         body = body.push(
             text(format!(
-                "Partitioned by hash ({}) · {} partitions, {} with rows. Columns, indexes and the \
-                 key cannot be changed on a partitioned table yet; the server refuses ALTER and \
-                 CREATE INDEX on one.",
+                "Partitioned by hash ({}) · {} partitions, {} with rows. Column and index changes \
+                 apply to every partition; the key itself cannot be changed.",
                 studio.partition_key().unwrap_or_default(),
                 stat(studio, "partitions_declared"),
                 stat(studio, "partitions_materialized"),
@@ -257,6 +256,9 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
             .size(11)
             .color(theme::TEXT_DIM),
         );
+    }
+    if let Some(note) = amplification_note(&studio.table_stats) {
+        body = body.push(text(note).size(11).color(theme::WARN));
     }
     let body = body
         .push(section_label("COLUMNS"))
@@ -268,6 +270,40 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
     container(framed(name.to_uppercase(), None, body.into()))
         .width(Length::Fixed(DETAIL_WIDTH))
         .into()
+}
+
+/// Slots per live row above which a table is worth pointing out. An update
+/// writes a new version and leaves the old slot until vacuum compacts it, so a
+/// small table updated in a loop (a heartbeat, a counter) reaches thousands
+/// of slots per row while its row count stays at one; every scan still walks
+/// each slot.
+const AMPLIFIED: f64 = 10.0;
+
+/// A line for a table whose slots far outnumber its live rows, from
+/// `SHOW TABLE STATS`' `slots_per_live_row` (RasterizedDB, from the sweep that
+/// measures live rows). Nothing before any sweep has measured it ("not
+/// measured"), for an empty table, or from a server that does not report it.
+fn amplification_note(stats: &[Stat]) -> Option<String> {
+    let find = |metric: &str| stats.iter().find(|s| s.metric == metric).map(|s| s.value.trim());
+    let ratio: f64 = find("slots_per_live_row")?.parse().ok()?;
+    if !(ratio >= AMPLIFIED) {
+        return None;
+    }
+    let live = find("live_rows").and_then(|v| v.parse::<u64>().ok());
+    let slots = find("row_slots").and_then(|v| v.parse::<u64>().ok());
+    let counts = match (slots, live) {
+        (Some(slots), Some(live)) => format!(
+            " ({} slots for {} live {})",
+            count(slots),
+            count(live),
+            if live == 1 { "row" } else { "rows" }
+        ),
+        _ => String::new(),
+    };
+    Some(format!(
+        "{ratio:.0} row slots per live row{counts}: every scan walks the dead versions too. \
+         VACUUM FULL compacts the table back toward one slot per row."
+    ))
 }
 
 fn stat<'a>(studio: &'a Studio, metric: &str) -> &'a str {
@@ -808,5 +844,42 @@ mod tests {
         }
         let Some(Modal::CreateTable { partitioning, .. }) = &studio.modal else { panic!() };
         assert_eq!(partitioning.key.len(), 3);
+    }
+
+    fn stats(pairs: &[(&str, &str)]) -> Vec<Stat> {
+        pairs
+            .iter()
+            .map(|(m, v)| Stat { metric: m.to_string(), value: v.to_string(), detail: String::new() })
+            .collect()
+    }
+
+    /// The heartbeat table: one live row over thousands of slots is the case
+    /// this note exists for, and it names both counts.
+    #[test]
+    fn an_amplified_table_is_pointed_out_with_its_counts() {
+        let note = super::amplification_note(&stats(&[
+            ("row_slots", "4753"),
+            ("live_rows", "1"),
+            ("slots_per_live_row", "4753.0"),
+        ]))
+        .expect("4753 slots per row is worth a note");
+        assert!(note.starts_with("4753 row slots per live row"), "{note}");
+        let expected = format!("{} slots for 1 live row)", super::count(4753));
+        assert!(note.contains(&expected), "{note}");
+    }
+
+    /// No note below the threshold, before a sweep has measured it, for an
+    /// empty table, or from a server that does not report the figure.
+    #[test]
+    fn no_note_without_a_measured_amplification() {
+        for value in ["1.0", "9.9", "not measured", "no rows", "no live rows"] {
+            assert_eq!(
+                super::amplification_note(&stats(&[("slots_per_live_row", value)])),
+                None,
+                "{value}"
+            );
+        }
+        assert_eq!(super::amplification_note(&stats(&[("row_slots", "50")])), None);
+        assert!(super::amplification_note(&stats(&[("slots_per_live_row", "10.0")])).is_some());
     }
 }
