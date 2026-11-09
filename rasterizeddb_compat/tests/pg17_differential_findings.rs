@@ -202,3 +202,22 @@ async fn round_12_answers_as_postgresql_17_does() {
     }
     assert!(wrong.is_empty(), "{} of {} differ from PostgreSQL 17:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
 }
+
+/// Round 15 (writes, gen4.py): a second assignment to one column is
+/// PostgreSQL's 42601, in every form of UPDATE. The first used to be written
+/// and the second dropped: `SET a = a - 2, a = a - 5` stored `a - 2`.
+#[tokio::test]
+async fn a_second_assignment_to_one_column_is_refused() {
+    let (_s, c) = server().await;
+    for sql in [
+        "UPDATE p1 SET a = a - 2, a = a - 5 WHERE id = 1",
+        "UPDATE p1 SET a = 1, s = 'x', a = 2 WHERE id = 1",
+        "UPDATE p1 SET a = p2.n, a = 1 FROM p2 WHERE p2.p1_id = p1.id",
+        "INSERT INTO p1 (id, a) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET a = 7, a = 8",
+    ] {
+        let e = c.simple_query(sql).await.expect_err(sql);
+        let db = e.as_db_error().unwrap_or_else(|| panic!("{sql}: {e}"));
+        assert_eq!(db.code().code(), "42601", "{sql}: {}", db.message());
+    }
+    assert_eq!(rows(&c, "SELECT a, s FROM p1 WHERE id = 1").await, ["5|abc"]);
+}

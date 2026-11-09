@@ -585,6 +585,7 @@ fn parse_update_row(
         rejection.replace("syntax error at or near \",\": an assignment is missing".to_string());
         return None;
     }
+    let mut assigned: SmallVec<[&str; 8]> = SmallVec::new();
     for assignment in crate::core::rql::lexer_ct::split_definitions(set_clause) {
         let assignment = assignment.trim();
         if assignment.is_empty() {
@@ -622,6 +623,13 @@ fn parse_update_row(
             rejection.replace(format!("column '{}' does not exist", key));
             return None;
         };
+        // PostgreSQL refuses a second assignment to one column; the first
+        // used to be written and the second dropped.
+        if assigned.iter().any(|n: &&str| n.eq_ignore_ascii_case(&field.name)) {
+            rejection.replace(format!("multiple assignments to same column \"{}\"", field.name));
+            return None;
+        }
+        assigned.push(&field.name);
         let assigns_null = value.eq_ignore_ascii_case("NULL");
 
         // An unquoted number assigned to a text column is its value's text

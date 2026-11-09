@@ -7758,6 +7758,8 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("insert has more expressions than target columns")
         || has("insert has more target columns than expressions")
         || has("values lists must all be the same length")
+        // `SET a = 1, a = 2` (`lexer_ur::parse_update_row`).
+        || has("multiple assignments to same column")
     {
         return "42601";
     }
