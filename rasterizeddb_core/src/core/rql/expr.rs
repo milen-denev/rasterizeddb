@@ -466,6 +466,10 @@ pub enum TextFunc {
     /// `text ILIKE pattern`: [`TextFunc::Like`] with both sides lowered
     /// as the WHERE path's matcher lowers them (Unicode, not only ASCII).
     ILike,
+    /// `doc @> doc` as a value (`jsonb_condition`); `<@` swaps the sides.
+    JsonbContains,
+    /// `doc ? key`: a top-level key, or string element (`jsonb::key_exists`).
+    JsonbHasKey,
     /// `regexp_like` inside a CHECK (`__check_regexp_like`): a value the
     /// answer cannot be vouched for is NULL, and marks the evaluation
     /// uncertain ([`take_check_uncertainty`]), so the check is not judged
@@ -908,7 +912,7 @@ impl Nesting {
 pub(crate) fn case_block_end(text: &str) -> Option<usize> {
     let nesting = Nesting::of(text);
     let (start, _, depth) = *nesting.keywords.first()?;
-    if start != 0 || depth != 0 || !text[..4].eq_ignore_ascii_case("CASE") {
+    if start != 0 || depth != 0 || !text.as_bytes().get(..4).is_some_and(|w| w.eq_ignore_ascii_case(b"CASE")) {
         return None;
     }
     nesting
@@ -2020,6 +2024,15 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
 /// parentheses for grouping. `OR` binds loosest, so it is split first.
 pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
     let text = text.trim();
+    // `s ~ 'x'`, `!~`, `~*`, `!~*`: the `regexp_like` calls they mean, as a
+    // WHERE lowers them; the condition grammar reads no `~`.
+    let lowered;
+    let text = if text.contains('~') {
+        lowered = crate::core::rql::check::lower_regex_operators(text, "regexp_like");
+        lowered.as_str()
+    } else {
+        text
+    };
     // A wholly parenthesised group is just the group.
     if text.starts_with('(') {
         if let Some(close) = matching_paren(text, 0) {
@@ -2048,10 +2061,10 @@ pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
     // plausible wrong branch is not.
     // `NOT` is SQL's three-valued one (`Cond::Not`): negating a two-valued
     // FALSE would take a branch PostgreSQL's NOT does not.
-    if text.len() > 4 && text[..4].eq_ignore_ascii_case("NOT ") {
+    if text.len() > 4 && text.as_bytes()[..4].eq_ignore_ascii_case(b"NOT ") {
         return Ok(Cond::Not(Box::new(parse_cond(&text[4..], schema)?)));
     }
-    if text.len() > 4 && text[..3].eq_ignore_ascii_case("NOT") && text.as_bytes()[3] == b'(' {
+    if text.len() > 4 && text.as_bytes()[..3].eq_ignore_ascii_case(b"NOT") && text.as_bytes()[3] == b'(' {
         return Ok(Cond::Not(Box::new(parse_cond(&text[3..], schema)?)));
     }
     // A row comparison, `(a, b) < (c, d)`, as the comparisons it means,
@@ -2064,6 +2077,9 @@ pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
         }
     }
     if let Some(cond) = quantified_condition(text, schema)? {
+        return Ok(cond);
+    }
+    if let Some(cond) = jsonb_condition(text, schema)? {
         return Ok(cond);
     }
     if let Some(cond) = like_condition(text, schema)? {
@@ -2118,7 +2134,7 @@ fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, Str
                 return Ok(None);
             }
             let inside = rest[1..rest.len() - 1].trim();
-            if inside.len() >= 6 && inside[..6].eq_ignore_ascii_case("SELECT") {
+            if inside.len() >= 6 && inside.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") {
                 return Err(format!("condition '{}' with IN (SELECT …) is not supported here yet", text));
             }
             let items = crate::core::rql::lexer_ct::split_definitions(inside);
@@ -2136,7 +2152,7 @@ fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, Str
     if let Some(at) = find_keyword(text, "BETWEEN", 0) {
         let (left, negated) = negated_left(&text[..at]);
         let rest = text[at + "BETWEEN".len()..].trim();
-        if rest.len() > 9 && rest[..9].eq_ignore_ascii_case("SYMMETRIC") {
+        if rest.len() > 9 && rest.as_bytes()[..9].eq_ignore_ascii_case(b"SYMMETRIC") {
             return Err(format!("condition '{}' with BETWEEN SYMMETRIC is not supported here yet", text));
         }
         let rest = match rest.get(..10) {
@@ -2197,7 +2213,7 @@ fn quantified_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Con
         return Ok(None);
     }
     let inner = arg[1..close].trim();
-    let elements: Vec<String> = if inner.len() > 5 && inner[..5].eq_ignore_ascii_case("ARRAY") && inner[5..].trim_start().starts_with('[') {
+    let elements: Vec<String> = if inner.len() > 5 && inner.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") && inner[5..].trim_start().starts_with('[') {
         let list = inner[5..].trim_start();
         if !list.ends_with(']') {
             return Ok(None);
@@ -2231,6 +2247,46 @@ fn quantified_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Con
         parts.push(Cond::Cmp(parse_condition(&format!("({left}) {op} ({element})"), schema)?));
     }
     Ok(Some(if any { Cond::Or(parts) } else { Cond::And(parts) }))
+}
+
+/// `doc @> x`, `x <@ doc` and `doc ? 'k'` as conditions: the evaluator's
+/// containment and key test (`jsonb::contains`, `jsonb::key_exists`), which
+/// only the WHERE path read before. A literal side is read as a document.
+fn jsonb_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, String> {
+    let nesting = Nesting::of(text);
+    let bytes = text.as_bytes();
+    let found = (0..bytes.len()).find_map(|i| {
+        if !nesting.top_level(i) {
+            return None;
+        }
+        match (bytes[i], bytes.get(i + 1)) {
+            (b'@', Some(b'>')) => Some((i, 2, false)),
+            (b'<', Some(b'@')) => Some((i, 2, true)),
+            (b'?', next) if !matches!(next, Some(b'|' | b'&')) => Some((i, 1, false)),
+            _ => None,
+        }
+    });
+    let Some((at, len, swapped)) = found else {
+        return Ok(None);
+    };
+    let (left, right) = (text[..at].trim(), text[at + len..].trim());
+    if left.is_empty() || right.is_empty() {
+        return Ok(None);
+    }
+    let (left, right) = (parse(left, schema)?, parse(right, schema)?);
+    let call = if len == 1 {
+        Expr::Call(TextFunc::JsonbHasKey, vec![left, right])
+    } else if swapped {
+        Expr::Call(TextFunc::JsonbContains, vec![right, left])
+    } else {
+        Expr::Call(TextFunc::JsonbContains, vec![left, right])
+    };
+    Ok(Some(Cond::Cmp(Condition {
+        left: Box::new(call),
+        cmp: Cmp::Eq,
+        right: Some(Box::new(Expr::Literal { bytes: vec![1], db_type: DbType::BOOL })),
+        wide: Default::default(),
+    })))
 }
 
 /// Splits on the commas outside quotes, parentheses and brackets.
@@ -2274,7 +2330,7 @@ fn like_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, St
     };
     let mut left = text[..at].trim_end();
     let negated = left.len() > 4
-        && left[left.len() - 3..].eq_ignore_ascii_case("NOT")
+        && left.as_bytes()[left.len() - 3..].eq_ignore_ascii_case(b"NOT")
         && left.as_bytes()[left.len() - 4].is_ascii_whitespace();
     if negated {
         left = left[..left.len() - 3].trim_end();
@@ -2343,15 +2399,15 @@ fn distinct_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>
         return Ok(None);
     };
     let mut words = text[at + 2..].trim_start();
-    let negated = words.len() > 4 && words[..4].eq_ignore_ascii_case("NOT ");
+    let negated = words.len() > 4 && words.as_bytes()[..4].eq_ignore_ascii_case(b"NOT ");
     if negated {
         words = words[4..].trim_start();
     }
-    if !(words.len() > 9 && words[..8].eq_ignore_ascii_case("DISTINCT") && words.as_bytes()[8].is_ascii_whitespace()) {
+    if !(words.len() > 9 && words.as_bytes()[..8].eq_ignore_ascii_case(b"DISTINCT") && words.as_bytes()[8].is_ascii_whitespace()) {
         return Ok(None);
     }
     let words = words[9..].trim_start();
-    if !(words.len() > 5 && words[..4].eq_ignore_ascii_case("FROM") && words.as_bytes()[4].is_ascii_whitespace()) {
+    if !(words.len() > 5 && words.as_bytes()[..4].eq_ignore_ascii_case(b"FROM") && words.as_bytes()[4].is_ascii_whitespace()) {
         return Ok(None);
     }
     let (left, right) = (text[..at].trim(), words[5..].trim());
@@ -2480,7 +2536,15 @@ pub fn parse_condition(text: &str, schema: &[SchemaField]) -> Result<Condition, 
     let text = text.trim();
     if let Some(at) = find_keyword(text, "IS", 0) {
         let tail = text[at + 2..].trim().to_ascii_uppercase();
-        let left = Box::new(parse(&text[..at], schema)?);
+        // The operand may itself be a condition, `(s ~ 'x') IS NOT TRUE`,
+        // `(a > 1 OR f) IS FALSE`: its value TRUE, FALSE or NULL.
+        let left = Box::new(match parse(&text[..at], schema) {
+            Ok(expr) => expr,
+            Err(e) => match crate::core::rql::join::comparison_value(&text[..at], schema) {
+                Ok(Some(value)) => value,
+                _ => return Err(e),
+            },
+        });
         if tail == "NULL" {
             return Ok(Condition {
                 left,
@@ -3182,7 +3246,13 @@ pub fn static_type(expr: &Expr) -> DbType {
             }
         }
         Expr::Call(
-            TextFunc::RegexpLike | TextFunc::CheckRegexpLike | TextFunc::CheckRegexpUncertain | TextFunc::Like | TextFunc::ILike,
+            TextFunc::RegexpLike
+            | TextFunc::CheckRegexpLike
+            | TextFunc::CheckRegexpUncertain
+            | TextFunc::Like
+            | TextFunc::ILike
+            | TextFunc::JsonbContains
+            | TextFunc::JsonbHasKey,
             _,
         ) => DbType::BOOL,
         Expr::Call(TextFunc::Pg(func), args) => crate::core::rql::pg_functions::result_type(*func, args),
@@ -3613,6 +3683,21 @@ fn as_jsonb(value: Value) -> Result<Vec<u8>, String> {
     }
 }
 
+/// The values an integer type holds, `None` for any other type.
+fn integer_range(db_type: &DbType) -> Option<std::ops::RangeInclusive<i128>> {
+    Some(match db_type {
+        DbType::I8 => i8::MIN as i128..=i8::MAX as i128,
+        DbType::I16 => i16::MIN as i128..=i16::MAX as i128,
+        DbType::I32 => i32::MIN as i128..=i32::MAX as i128,
+        DbType::I64 => i64::MIN as i128..=i64::MAX as i128,
+        DbType::U8 => 0..=u8::MAX as i128,
+        DbType::U16 => 0..=u16::MAX as i128,
+        DbType::U32 => 0..=u32::MAX as i128,
+        DbType::U64 => 0..=u64::MAX as i128,
+        _ => return None,
+    })
+}
+
 /// A boolean's text as its cast to text gives it.
 fn bool_text(bytes: &[u8]) -> &'static str {
     if bytes.first().copied().unwrap_or(0) != 0 { "true" } else { "false" }
@@ -3716,12 +3801,24 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             | TextFunc::SimilarToEscape
             | TextFunc::Like
             | TextFunc::ILike
+            | TextFunc::JsonbContains
+            | TextFunc::JsonbHasKey
     ) && args.iter().any(|a| a.is_null())
     {
         return Ok(Value::Null);
     }
 
     Ok(match func {
+        TextFunc::JsonbContains => {
+            let (outer, inner) = (as_jsonb(args[0].clone())?, as_jsonb(args[1].clone())?);
+            let found = crate::core::jsonb::contains(&outer, &inner).ok_or("a stored document could not be read")?;
+            Value::Data { bytes: vec![u8::from(found)], db_type: DbType::BOOL }
+        }
+        TextFunc::JsonbHasKey => {
+            let doc = as_jsonb(args[0].clone())?;
+            let found = crate::core::jsonb::key_exists(&doc, &as_text(&args[1])).ok_or("a stored document could not be read")?;
+            Value::Data { bytes: vec![u8::from(found)], db_type: DbType::BOOL }
+        }
         TextFunc::Like | TextFunc::ILike => {
             let (value, pattern) = (as_text(&args[0]), as_text(&args[1]));
             let matched = if func == TextFunc::ILike {
@@ -5305,6 +5402,11 @@ pub(crate) fn pg_numeric(
                 _ => None,
             }
         }
+        // Any other integer-typed value — a cast to an integer, a call
+        // returning one — is that integer exactly, at scale 0. Without this
+        // `(x::int)::numeric / 3` fell back to the engine's nine places,
+        // where PostgreSQL divides at `select_div_scale`'s sixteen or more.
+        other if integer(&static_type(other)) => whole(eval(other, row, schema)?),
         _ => None,
     })
 }
@@ -8024,6 +8126,19 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     if let Value::Data { bytes, .. } = &value {
         if let Some(rendered) = crate::core::rql::subquery::value_to_literal(&db_type, bytes) {
             let unquoted = crate::core::value_codec::unquote_sql(&rendered).to_string();
+            // A number into an integer rounds half away from zero, as
+            // PostgreSQL's `numeric_int4` does (`2.5::int` is 3, and so is a
+            // jsonb `2.5`). Only text is read by the integer input, which has
+            // no fraction; a number's own text must not be.
+            if let Some(range) = integer_range(target) {
+                if let Some(n) = crate::core::rql::pg_numeric::parse_text(unquoted.trim()) {
+                    let whole = n.round_to(0).ok_or_else(|| integer_out_of_range(target))?;
+                    if !range.contains(&whole.m) {
+                        return Err(integer_out_of_range(target));
+                    }
+                    return cast(Value::Data { bytes: (whole.m as i64).to_le_bytes().to_vec(), db_type: DbType::I64 }, target);
+                }
+            }
             return cast(
                 Value::Data {
                     bytes: unquoted.into_bytes(),

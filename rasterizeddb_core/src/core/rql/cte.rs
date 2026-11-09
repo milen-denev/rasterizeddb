@@ -42,7 +42,7 @@ pub struct Materialized {
 fn starts_with_with(sql: &str) -> bool {
     let t = sql.trim_start();
     t.len() >= 4
-        && t[..4].eq_ignore_ascii_case("WITH")
+        && t.as_bytes()[..4].eq_ignore_ascii_case(b"WITH")
         && t[4..]
             .chars()
             .next()
@@ -96,7 +96,7 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
     // Refused by keyword, deliberately before any other check: run as a
     // non-recursive CTE this would return the base case and no error.
     if after_with.len() >= 9
-        && after_with[..9].eq_ignore_ascii_case("RECURSIVE")
+        && after_with.as_bytes()[..9].eq_ignore_ascii_case(b"RECURSIVE")
         && after_with[9..]
             .chars()
             .next()
@@ -125,7 +125,7 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         if after_name.starts_with('(') {
             return Err("a WITH clause that renames its columns is not supported yet".to_string());
         }
-        if after_name.len() < 2 || !after_name[..2].eq_ignore_ascii_case("AS") {
+        if after_name.len() < 2 || !after_name.as_bytes()[..2].eq_ignore_ascii_case(b"AS") {
             return Err(format!("expected AS after the WITH name '{}'", name));
         }
         let after_as = after_name[2..].trim_start();
@@ -197,7 +197,7 @@ pub(crate) fn without_set_quantifier(list: &str) -> &str {
     }
     let rest = trimmed["DISTINCT".len()..].trim_start();
     let on = rest.len() > 2
-        && rest[..2].eq_ignore_ascii_case("ON")
+        && rest.as_bytes()[..2].eq_ignore_ascii_case(b"ON")
         && rest[2..].trim_start().starts_with('(');
     if on {
         let open = rest.len() - rest[2..].trim_start().len();
@@ -1188,7 +1188,7 @@ fn replace_relation_references(sql: &str, from: &str, to: &str) -> String {
 pub fn has_with_clause(sql: &str) -> bool {
     let trimmed = sql.trim_start();
     trimmed.len() >= 4
-        && trimmed[..4].eq_ignore_ascii_case("WITH")
+        && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"WITH")
         && trimmed[4..].starts_with(|c: char| c.is_whitespace() || c == '(')
 }
 

@@ -1259,7 +1259,7 @@ fn timestamp_type_of_literal(sql: &str, start: usize, end: usize) -> Option<bool
     let before = sql[..start].trim_end();
     if let Some(open) = before.strip_suffix('(') {
         let head = open.trim_end();
-        let cast_word = head.len() >= 4 && head[head.len() - 4..].eq_ignore_ascii_case("CAST");
+        let cast_word = head.len() >= 4 && head.as_bytes()[head.len() - 4..].eq_ignore_ascii_case(b"CAST");
         let word_start = head.len().saturating_sub(4);
         let bounded = word_start == 0 || !is_identifier_byte(head.as_bytes()[word_start - 1]);
         if cast_word && bounded {
@@ -1310,7 +1310,7 @@ fn timestamp_type_at(text: &str) -> Option<(bool, usize)> {
             && words[0].eq_ignore_ascii_case(kind)
             && words[1].eq_ignore_ascii_case("time")
             && words[2].len() >= 4
-            && words[2][..4].eq_ignore_ascii_case("zone")
+            && words[2].as_bytes()[..4].eq_ignore_ascii_case(b"zone")
             && words[2].as_bytes().get(4).is_none_or(|b| !is_identifier_byte(*b))
     };
     if zone("with") {

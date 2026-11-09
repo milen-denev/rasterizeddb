@@ -2541,7 +2541,49 @@ fn own_scale_arithmetic(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
 /// [`needs_evaluator`], or arithmetic over a column that keeps each value's
 /// own scale ([`own_scale_arithmetic`]).
 fn evaluated(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
-    needs_evaluator(text) || own_scale_arithmetic(text, schema)
+    needs_evaluator(text) || own_scale_arithmetic(text, schema) || mixed_numeric_columns(text, schema)
+}
+
+/// Whether `text` reads a NUMERIC column and a column of another number type
+/// (`c = a`, `d + a > c`). The scan's comparison meets a NUMERIC only with a
+/// literal or another NUMERIC, and refused the pair ("operand size does not
+/// match the column type being evaluated"); the evaluator compares them as
+/// a select list does. A term with one such column keeps the scan's form.
+fn mixed_numeric_columns(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::db_type::DbType;
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'"';
+    let (mut decimal, mut other) = (false, false);
+    let mut quote = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            quote = !quote;
+            i += 1;
+            continue;
+        }
+        if quote || !(c.is_ascii_alphabetic() || c == b'_' || c == b'"') || (i > 0 && is_word(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        if let Some(field) = resolve_column(&text[i..end], schema)
+            .and_then(|name| schema.iter().find(|f| !f.is_deleted && f.name == name))
+        {
+            match field.db_type {
+                DbType::DECIMAL => decimal = true,
+                DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16
+                | DbType::U32 | DbType::U64 | DbType::F32 | DbType::F64 => other = true,
+                _ => {}
+            }
+        }
+        i = end;
+    }
+    decimal && other
 }
 
 /// Whether `text` holds something only the expression evaluator can compute:
@@ -2579,6 +2621,21 @@ fn needs_evaluator(text: &str) -> bool {
                 quote_at = i;
             }
             b'%' => return true,
+            // A unary minus over a column or a group, `-sm < a`, `-(a + 1)`:
+            // the comparison tokens negate only a number ("expected a number
+            // after '-'"). A sign is unary where no operand precedes it.
+            b'-' if bytes.get(i + 1) != Some(&b'>') && {
+                let before = text[..i].trim_end();
+                let operand_follows = text[i + 1..].trim_start().starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '(' || c == '"');
+                let unary = before.is_empty()
+                    || before.ends_with(['(', ',', '=', '<', '>', '!', '+', '-', '*', '/'])
+                    || ["AND", "OR", "NOT", "WHERE", "BETWEEN", "THEN", "ELSE", "WHEN", "IN"].iter().any(|k| {
+                        before.len() >= k.len()
+                            && before.as_bytes()[before.len() - k.len()..].eq_ignore_ascii_case(k.as_bytes())
+                            && before.as_bytes().get(before.len().wrapping_sub(k.len() + 1)).is_none_or(|b| !is_word(*b))
+                    });
+                unary && operand_follows
+            } => return true,
             // `^` (power), which the comparison tokens cannot carry; not
             // `^@`, which is `starts_with`.
             b'^' if bytes.get(i + 1) != Some(&b'@') => return true,
@@ -2934,7 +2991,7 @@ fn contains_spaced_text_literal(text: &str) -> bool {
     let mut from = 0;
     while let Some(at) = text[from..].find("::").map(|p| p + from) {
         let cast = text[at + 2..].trim_start();
-        if cast.len() >= 4 && cast[..4].eq_ignore_ascii_case("text") && bytes[..at].ends_with(b" '") {
+        if cast.len() >= 4 && cast.as_bytes()[..4].eq_ignore_ascii_case(b"text") && bytes[..at].ends_with(b" '") {
             return true;
         }
         from = at + 2;
@@ -3227,7 +3284,7 @@ fn lift_term(
     }
     let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
         format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
-    } else if quantified_over_array(body) {
+    } else if quantified_over_array(body) || mixed_numeric_columns(body, schema) {
         // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
         // onto the comparison below still leaves an unknown row out.
         let case = format!("CASE WHEN {body} THEN true WHEN NOT ({body}) THEN false END");
@@ -3254,7 +3311,7 @@ fn quantified_over_array(body: &str) -> bool {
         let Some(inner) = after.strip_prefix('(').map(str::trim_start) else {
             return false;
         };
-        if inner.len() > 5 && inner[..5].eq_ignore_ascii_case("ARRAY") && inner[5..].trim_start().starts_with('[') {
+        if inner.len() > 5 && inner.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") && inner[5..].trim_start().starts_with('[') {
             return true;
         }
         if !inner.starts_with('\'') {
@@ -3714,13 +3771,32 @@ fn lift_operand_typed(
     schema: &SmallVec<[SchemaField; 20]>,
 ) -> Result<(String, crate::core::db_type::DbType), String> {
     let trimmed = text.trim();
-    let operand = crate::core::processor::transformer::EvaluatedOperand::new(trimmed, schema)?;
-    let reads: Vec<String> = operand
+    // An operand that is a condition, `(a, b) <> (1, 2) OR f` under an
+    // `IS NOT TRUE`, is its truth value: the expression grammar reads no
+    // condition, the `CASE` form of one it does.
+    let operand = match crate::core::processor::transformer::EvaluatedOperand::new(trimmed, schema) {
+        Ok(operand) => operand,
+        Err(e) => {
+            let case = format!("CASE WHEN {trimmed} THEN true WHEN NOT ({trimmed}) THEN false END");
+            match crate::core::processor::transformer::EvaluatedOperand::new(&case, schema) {
+                Ok(operand) => return Ok((encode_lifted(&case, &operand_reads(&operand, schema)), operand.db_type)),
+                Err(_) => return Err(e),
+            }
+        }
+    };
+    Ok((encode_lifted(trimmed, &operand_reads(&operand, schema)), operand.db_type))
+}
+
+/// The names of the columns a lifted operand reads.
+fn operand_reads(
+    operand: &crate::core::processor::transformer::EvaluatedOperand,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Vec<String> {
+    operand
         .reads
         .iter()
         .filter_map(|(at, _)| schema.iter().find(|f| f.write_order == *at).map(|f| f.name.clone()))
-        .collect();
-    Ok((encode_lifted(trimmed, &reads), operand.db_type))
+        .collect()
 }
 
 /// Every [`Tok::Float`] as the number it is, for the scan's tokenizer — unless

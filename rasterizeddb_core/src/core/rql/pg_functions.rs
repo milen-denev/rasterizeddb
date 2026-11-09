@@ -1310,7 +1310,7 @@ fn template(fmt: &str) -> Vec<Piece> {
     let mut rest = fmt;
     let mut fill = false;
     while !rest.is_empty() {
-        if rest.len() >= 2 && rest[..2].eq_ignore_ascii_case("FM") {
+        if rest.len() >= 2 && rest.as_bytes()[..2].eq_ignore_ascii_case(b"FM") {
             fill = true;
             rest = &rest[2..];
             continue;

@@ -905,7 +905,7 @@ fn outer_relation_names_as_written(sql: &str) -> Vec<String> {
     // correlating with it ran with no outer row and was refused 42P01.
     let trimmed = sql.trim_start();
     let mut names = Vec::new();
-    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("UPDATE") {
+    if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"UPDATE") {
         let Some(set) = find_keyword(sql, "SET", 0) else { return Vec::new() };
         let head = sql[..set].trim();
         let mut words = head.split_whitespace().skip(1);

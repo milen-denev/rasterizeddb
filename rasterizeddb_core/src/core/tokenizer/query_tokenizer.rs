@@ -871,7 +871,45 @@ fn tokenize_inner<'a>(
                 while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
                     k += 1;
                 }
-                let name = unsafe { std::str::from_utf8_unchecked(&bytes[name_start..k]) };
+                // A type named in several words: `::double precision` read
+                // as `double` was "unknown type 'double' in a cast".
+                let mut phrase_name: Option<&str> = None;
+                for phrase in [
+                    "double precision",
+                    "character varying",
+                    "bit varying",
+                    "timestamp with time zone",
+                    "timestamp without time zone",
+                    "time with time zone",
+                    "time without time zone",
+                ] {
+                    let mut at = name_start;
+                    let mut matched = true;
+                    for (n, word) in phrase.split(' ').enumerate() {
+                        if n > 0 {
+                            let gap = bytes[at..].iter().take_while(|b| b.is_ascii_whitespace()).count();
+                            if gap == 0 {
+                                matched = false;
+                                break;
+                            }
+                            at += gap;
+                        }
+                        let end = at + word.len();
+                        if !bytes.get(at..end).is_some_and(|w| w.eq_ignore_ascii_case(word.as_bytes()))
+                            || bytes.get(end).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        {
+                            matched = false;
+                            break;
+                        }
+                        at = end;
+                    }
+                    if matched {
+                        k = at;
+                        phrase_name = Some(phrase);
+                        break;
+                    }
+                }
+                let name = phrase_name.unwrap_or(unsafe { std::str::from_utf8_unchecked(&bytes[name_start..k]) });
                 let Some(db_type) = crate::core::rql::expr::db_type_of_cast(name) else {
                     return Err(format!("unknown type '{}' in a cast", name));
                 };

@@ -40,7 +40,7 @@ use crate::core::rql::join::UnionParts;
 /// out as NULL under the integer's description.
 pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
     let text = branch.trim().trim_start_matches('(').trim_end_matches(')').trim();
-    if text.len() < 7 || !text[..7].eq_ignore_ascii_case("SELECT ") {
+    if text.len() < 7 || !text.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") {
         return None;
     }
     let list = &text[7..];

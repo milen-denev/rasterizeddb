@@ -411,7 +411,7 @@ fn generate_series(args: &[String], alias: &str) -> Result<Computed, String> {
 fn array_argument(text: &str) -> Result<(Vec<Option<String>>, DbType, String), String> {
     let trimmed = text.trim();
     // `ARRAY[a, b, …]`: each element a constant.
-    if trimmed.len() > 6 && trimmed[..5].eq_ignore_ascii_case("ARRAY") && trimmed[5..].trim_start().starts_with('[') {
+    if trimmed.len() > 6 && trimmed.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") && trimmed[5..].trim_start().starts_with('[') {
         let open = trimmed.find('[').expect("checked");
         let close = trimmed.rfind(']').ok_or("an ARRAY constructor is not closed")?;
         let inner = &trimmed[open + 1..close];

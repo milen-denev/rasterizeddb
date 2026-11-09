@@ -230,7 +230,7 @@ pub(crate) fn split_aggregate_filter(item: &str) -> (Option<String>, Option<Stri
             let open = item.len() - trimmed.len();
             if let Some(close) = matching_paren_at(item, open) {
                 let inside = item[open + 1..close].trim();
-                if inside.len() >= 5 && inside[..5].eq_ignore_ascii_case("WHERE") {
+                if inside.len() >= 5 && inside.as_bytes()[..5].eq_ignore_ascii_case(b"WHERE") {
                     // The item with the clause removed, so what follows it — a
                     // cast, an alias — stays attached to the call.
                     let rebuilt = format!("{}{}", item[..start].trim_end(), &item[close + 1..]);

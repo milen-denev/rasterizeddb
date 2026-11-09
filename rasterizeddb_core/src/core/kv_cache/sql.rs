@@ -31,7 +31,7 @@ use crate::memory_pool::MEMORY_POOL;
 /// Whether `sql` is a `KV …` statement.
 pub fn is_kv_statement(sql: &str) -> bool {
     let t = sql.trim_start();
-    t.len() > 3 && t[..2].eq_ignore_ascii_case("KV") && t.as_bytes()[2].is_ascii_whitespace()
+    t.len() > 3 && t.as_bytes()[..2].eq_ignore_ascii_case(b"KV") && t.as_bytes()[2].is_ascii_whitespace()
 }
 
 /// The arguments after `KV`.
