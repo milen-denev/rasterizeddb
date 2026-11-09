@@ -1,0 +1,139 @@
+//! The PostgreSQL 17 differential round of 2026-11-09 (`.claude/reviews/pgdiff`):
+//! random statements run on this engine and on `postgres:17`, results
+//! compared. Each case below answered differently before its fix, most of
+//! them silently: a boolean cast to text was '1', `'x' || true` was 'x',
+//! `c::numeric(12,3) > 1` sent the number, `avg(numeric) OVER ()` had sixteen
+//! places, `'-1' || doc->>'t'` concatenated where `||` and `->>` group left to
+//! right, `(x::int)::numeric / 3` had nine places, `mod()` refused a numeric,
+//! `'-5' < 3` was false, `sum(interval)` was NULL, an interval's epoch took a
+//! year as 360 days and its text dropped the `+` after a negative part, and
+//! `NOT (s IN ('日本', …))` panicked mid-character. Others were refused:
+//! `id = a - 3` over a nullable `a`, `IS DISTINCT FROM` in a select list,
+//! `LIKE` and `ANY (ARRAY[…])` as values, `CASE x WHEN`, a boolean GROUP BY,
+//! `ntile`, `lead`'s default, an outer join's WHERE on the padded side, a
+//! non-equality ON, `smallint - 7 / -4`, a constant beside an aggregate.
+//! Every expected answer is PostgreSQL 17's, read from it beside this engine.
+
+use rasterizeddb_compat::TestServer;
+use tokio_postgres::SimpleQueryMessage;
+
+async fn rows(c: &tokio_postgres::Client, sql: &str) -> Vec<String> {
+    c.simple_query(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .into_iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => {
+                Some((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_string()).collect::<Vec<_>>().join("|"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn server() -> (TestServer, tokio_postgres::Client) {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        r#"CREATE TABLE p1 (id INT PRIMARY KEY, a INT, sm SMALLINT, c NUMERIC(10,2), d DOUBLE PRECISION, s TEXT, f BOOLEAN, j JSONB, iv INTERVAL)"#,
+        r#"INSERT INTO p1 VALUES (1, 5, 32767, 1.25, 2.5, 'abc', true, '{"k": 2, "t": "x"}', '1 day 03:00:00'), (2, NULL, -3, 7.50, NULL, 'Äpfel', false, '{"k": 1.5}', '2 years 3 mons'), (3, -2, 0, NULL, -1, NULL, NULL, '[1, "two"]', '-5 days 01:00:00'), (4, 3, 100, 0.01, 0.25, '日本', true, NULL, NULL)"#,
+        r#"CREATE TABLE p2 (id INT PRIMARY KEY, p1_id INT, n INT)"#,
+        r#"INSERT INTO p2 VALUES (1, 1, 4), (2, 1, NULL), (3, 2, -1), (4, 9, 7)"#,
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    (server, c)
+}
+
+#[tokio::test]
+async fn statements_answer_as_postgresql_17_does() {
+    let (_s, c) = server().await;
+    let cases: &[(&str, &[&str])] = &[
+        (r#"SELECT id, f::text, 'x' || f, length(f::text) FROM p1 ORDER BY id"#, &[r#"1|true|xtrue|4"#, r#"2|false|xfalse|5"#, r#"3|NULL|NULL|NULL"#, r#"4|true|xtrue|4"#]),
+        (r#"SELECT ' 7 '::int, '0x1A'::int, '1_000'::int, 2.5::int, (-2.5)::int, '2.5'::numeric::int"#, &[r#"7|26|1000|3|-3|3"#]),
+        (r#"SELECT id, c::numeric(12,3) > 1, 0 / -4::numeric(12,3) <> 1.5 FROM p1 ORDER BY id"#, &[r#"1|t|t"#, r#"2|t|t"#, r#"3|NULL|t"#, r#"4|f|t"#]),
+        (r#"SELECT id FROM p1 WHERE id = a - 3 ORDER BY id"#, &[]),
+        (r#"SELECT id FROM p1 WHERE id < a + 3 ORDER BY id"#, &[r#"1"#, r#"4"#]),
+        (r#"SELECT id, sm IS DISTINCT FROM a, a IS NOT DISTINCT FROM NULL FROM p1 ORDER BY id"#, &[r#"1|t|f"#, r#"2|t|t"#, r#"3|t|f"#, r#"4|t|f"#]),
+        (r#"SELECT id, avg(c) OVER () FROM p1 ORDER BY id"#, &[r#"1|2.9200000000000000"#, r#"2|2.9200000000000000"#, r#"3|2.9200000000000000"#, r#"4|2.9200000000000000"#]),
+        (r#"SELECT id, '-1' || j->>'t' FROM p1 ORDER BY id"#, &[r#"1|NULL"#, r#"2|NULL"#, r#"3|NULL"#, r#"4|NULL"#]),
+        (r#"SELECT id, (x::int)::numeric / 3 FROM (SELECT id, a AS x FROM p1) s ORDER BY id"#, &[r#"1|1.6666666666666667"#, r#"2|NULL"#, r#"3|-0.66666666666666666667"#, r#"4|1.00000000000000000000"#]),
+        (r#"SELECT id, s LIKE '_bc', s ILIKE 'ä%', s NOT LIKE '%\%%' FROM p1 ORDER BY id"#, &[r#"1|t|f|t"#, r#"2|f|t|t"#, r#"3|NULL|NULL|NULL"#, r#"4|f|f|t"#]),
+        (r#"SELECT id, a = ANY(ARRAY[5, NULL]), a > ALL(ARRAY[0, 4]) FROM p1 ORDER BY id"#, &[r#"1|t|t"#, r#"2|NULL|NULL"#, r#"3|NULL|f"#, r#"4|NULL|f"#]),
+        (r#"SELECT count(*) FROM p1 WHERE a = ANY(ARRAY[5, 3])"#, &[r#"2"#]),
+        (r#"SELECT count(*) FROM p1 WHERE (s LIKE 'a%') IS NOT TRUE"#, &[r#"3"#]),
+        (r#"SELECT id, CASE a WHEN 5 THEN 'five' WHEN 3 THEN 'three' ELSE 'other' END FROM p1 ORDER BY id"#, &[r#"1|five"#, r#"2|other"#, r#"3|other"#, r#"4|three"#]),
+        (r#"SELECT sm > 0, count(*) FROM p1 GROUP BY sm > 0 ORDER BY 1"#, &[r#"f|2"#, r#"t|2"#]),
+        (r#"SELECT id, ntile(3) OVER (ORDER BY id), lead(a, 2, -99) OVER (ORDER BY id) FROM p1 ORDER BY id"#, &[r#"1|1|-2"#, r#"2|1|3"#, r#"3|2|-99"#, r#"4|3|-99"#]),
+        (r#"SELECT width_bucket(5, 0, 10, 4), width_bucket(2.5, 10, 0, 4), factorial(5)"#, &[r#"3|4|120"#]),
+        (r#"SELECT id, mod(c, 3) FROM p1 ORDER BY id"#, &[r#"1|1.25"#, r#"2|1.50"#, r#"3|NULL"#, r#"4|0.01"#]),
+        (r#"SELECT count(*) FROM p1 WHERE mod(c, 3) > 0.5"#, &[r#"2"#]),
+        (r#"SELECT count(*) FROM p1 WHERE sm - 7 / -4 > 0"#, &[r#"3"#]),
+        (r#"SELECT count(*) FROM p1 WHERE c = a OR c < a"#, &[r#"2"#]),
+        (r#"SELECT count(*) FROM p1 WHERE '-5' < 3"#, &[r#"4"#]),
+        (r#"SELECT count(*) FROM p1 WHERE ('-1' >= 10) IS NOT TRUE"#, &[r#"4"#]),
+        (r#"SELECT count(*) FROM p1 WHERE a + 1 > '5'"#, &[r#"1"#]),
+        (r#"SELECT count(*) FROM p1 WHERE -sm < a"#, &[r#"2"#]),
+        (r#"SELECT id, sum(iv) OVER (ORDER BY id), iv * 2, iv / 3, -iv, extract(epoch FROM iv) FROM p1 ORDER BY id"#, &[r#"1|1 day 03:00:00|2 days 06:00:00|09:00:00|-1 days -03:00:00|97200.000000"#, r#"2|2 years 3 mons 1 day 03:00:00|4 years 6 mons|9 mons|-2 years -3 mons|70891200.000000"#, r#"3|2 years 3 mons -4 days +04:00:00|-10 days +02:00:00|-1 days -15:40:00|5 days -01:00:00|-428400.000000"#, r#"4|2 years 3 mons -4 days +04:00:00|NULL|NULL|NULL|NULL"#]),
+        (r#"SELECT sum(iv), avg(iv), justify_hours(interval '50 hours'), justify_interval(interval '-1 mon 40 days') FROM p1"#, &[r#"2 years 3 mons -4 days +04:00:00|9 mons -1 days -06:40:00|2 days 02:00:00|10 days"#]),
+        (r#"SELECT p1.id, p2.id FROM p1 LEFT JOIN p2 ON p1.id = p2.p1_id WHERE p2.n > 0 ORDER BY 1, 2"#, &[r#"1|1"#]),
+        (r#"SELECT p1.id, p2.id FROM p1 LEFT JOIN p2 ON p1.id = p2.p1_id WHERE p2.n IS NULL ORDER BY 1, 2"#, &[r#"1|2"#, r#"3|NULL"#, r#"4|NULL"#]),
+        (r#"SELECT a.id, b.id FROM p1 a JOIN p1 b ON a.f = b.f AND a.id < b.id ORDER BY 1, 2"#, &[r#"1|4"#]),
+        (r#"SELECT n FROM p2 EXCEPT SELECT a FROM p1 WHERE f ORDER BY 1"#, &[r#"-1"#, r#"4"#, r#"7"#, r#"NULL"#]),
+        (r#"SELECT id, NOT (s IN ('日本', 'émile')) FROM p1 ORDER BY id"#, &[r#"1|t"#, r#"2|t"#, r#"3|NULL"#, r#"4|f"#]),
+        (r#"SELECT sum(a), upper('x'), 1 + 2 FROM p1"#, &[r#"6|X|3"#]),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        let got = rows(&c, sql).await;
+        if got != *want {
+            wrong.push(format!("{sql}\n  want {want:?}\n  got  {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// What PostgreSQL refuses, refused: a fraction is not integer input, and an
+/// integer has no `~~`, nor text a `->>`.
+#[tokio::test]
+async fn what_postgresql_refuses_is_refused() {
+    let (_s, c) = server().await;
+    for (sql, code) in [
+        ("SELECT '1.5'::int", "22P02"),
+        ("SELECT count(*) FROM p1 WHERE '2.5' > 2", "22P02"),
+        ("SELECT count(*) FROM p1 WHERE (a LIKE 'x%') IS FALSE", "42883"),
+        ("SELECT s || j->>'t' FROM p1", "42883"),
+    ] {
+        let e = c.simple_query(sql).await.expect_err(sql);
+        let db = e.as_db_error().unwrap_or_else(|| panic!("{sql}: {e}"));
+        assert_eq!(db.code().code(), code, "{sql}: {}", db.message());
+    }
+}
+
+/// Through the extended protocol, as a driver sends it: a select list with a
+/// scalar subquery is described (it answered NoData, then sent rows), and an
+/// untyped parameter beside a text call or another unknown is text.
+#[tokio::test]
+async fn bound_statements_are_described_and_typed_as_postgresql_does() {
+    let (_s, c) = server().await;
+    let sql = "SELECT id, (SELECT max(n) FROM p2) AS mx FROM p1 WHERE id < $1 ORDER BY id";
+    let st = c.prepare(sql).await.expect("prepare");
+    let types: Vec<_> = st.columns().iter().map(|c| c.type_().clone()).collect();
+    assert_eq!(types, vec![tokio_postgres::types::Type::INT4, tokio_postgres::types::Type::INT4], "max(int) is an integer");
+    let got = c
+        .query(sql, &[&3i32])
+        .await
+        .expect("a scalar subquery in the select list is described");
+    let pairs: Vec<(i32, i32)> = got.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(pairs, vec![(1, 7), (2, 7)]);
+    let st = c.prepare("SELECT count(*) FROM p1 WHERE md5(s) = $1").await.expect("prepare");
+    assert_eq!(st.params(), &[tokio_postgres::types::Type::TEXT], "beside md5(), text");
+    let n: i64 = c.query_one(&st, &[&"9"]).await.expect("md5(s) = $1").get(0);
+    assert_eq!(n, 0);
+    let st = c.prepare("SELECT count(*) FROM p1 WHERE 'Abc' >= $1").await.expect("prepare");
+    assert_eq!(st.params(), &[tokio_postgres::types::Type::TEXT], "beside an unknown, text");
+    let n: i64 = c.query_one(&st, &[&"-1"]).await.expect("'Abc' >= $1").get(0);
+    assert_eq!(n, 4, "'Abc' >= '-1' compares text and holds for every row");
+}
+

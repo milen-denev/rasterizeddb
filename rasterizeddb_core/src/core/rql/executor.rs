@@ -335,6 +335,18 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
 /// the outer select list, unaliased: its inner item's name. `None` anywhere
 /// else (a WHERE, an argument, an aliased item), and for an inner list of
 /// more than one item.
+/// Whether the subquery at `start..end` is a whole select item followed by
+/// its alias (`, (SELECT …) AS mx`).
+fn aliased_select_item(sql: &str, start: usize, end: usize) -> bool {
+    if crate::core::rql::join::find_keyword(sql, "FROM", 0).is_some_and(|from| from < start) {
+        return false;
+    }
+    let before = sql[..start].trim_end().to_ascii_uppercase();
+    let opens = before.ends_with(',') || before.ends_with("SELECT") || before.ends_with(" DISTINCT") || before.ends_with(" ALL");
+    let after = sql[end..].trim_start().as_bytes();
+    opens && after.len() > 3 && after[..2].eq_ignore_ascii_case(b"AS") && after[2].is_ascii_whitespace()
+}
+
 fn scalar_subquery_label(sql: &str, start: usize, end: usize, inner: &str) -> Option<String> {
     use crate::core::rql::join::find_keyword;
     let trimmed = sql.trim_start();
@@ -1171,8 +1183,22 @@ pub async fn substitute_in_subqueries(
         // item's (`(SELECT max(x) …)` is `max`, `(SELECT x AS y …)` is `y`,
         // an expression `?column?`). The constant was named after itself
         // (`float8`, `float8 * 2`).
+        // A select item keeps the subquery's integer type: a bare `7` is
+        // described as bigint, where `(SELECT max(n) …)` over an integer is
+        // an integer, and a driver decoding by the description (`i32`)
+        // refused the column. Only an item: in a predicate the cast would be
+        // a cast over a literal there.
+        let typed = |literal: String| -> String {
+            let width = rows.first().and_then(|r| r.columns.first()).map(|c| c.column_type.clone());
+            match width {
+                Some(crate::core::db_type::DbType::I16) if literal != "NULL" => format!("{literal}::smallint"),
+                Some(crate::core::db_type::DbType::I32) if literal != "NULL" => format!("{literal}::integer"),
+                _ => literal,
+            }
+        };
         let literal = match scalar_subquery_label(&current, found.start, found.end, &found.inner_sql) {
-            Some(label) => format!("{literal} AS \"{}\"", label.replace('"', "\"\"")),
+            Some(label) => format!("{} AS \"{}\"", typed(literal), label.replace('"', "\"\"")),
+            None if aliased_select_item(&current, found.start, found.end) => typed(literal),
             None => literal,
         };
         current = format!(

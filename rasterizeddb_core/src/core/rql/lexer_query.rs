@@ -2016,7 +2016,7 @@ pub fn row_fetch_from_select_query(
         (columns_part, false)
     };
 
-    let select_items = parse_select_items(columns_part, schema)?;
+    let mut select_items = parse_select_items(columns_part, schema)?;
 
     // `DISTINCT ON (k, …)`: each key a select item it names or an expression
     // over the row. PostgreSQL's rule that an ORDER BY starts with the keys
@@ -2261,6 +2261,25 @@ pub fn row_fetch_from_select_query(
         })
         .any(|g| determines_its_relation(g, schema));
     if is_grouped {
+        // A row expression that reads no column (`upper('x')`, `now()::date`,
+        // `1 + 2`) is the same for every group, as PostgreSQL allows it
+        // beside an aggregate: evaluated once into a constant. It was refused
+        // as a column that "must appear in GROUP BY".
+        for position in 0..select_items.len() {
+            let SelectItem::RowExpr { expr, label, .. } = &select_items[position] else { continue };
+            if !crate::core::rql::expr::columns_of(expr).is_empty()
+                || computed_group_keys.iter().any(|k| k.item == Some(position))
+            {
+                continue;
+            }
+            let row = crate::core::row::row::Row::default();
+            let (bytes, db_type) = match crate::core::rql::expr::eval(expr, &row, &[])? {
+                crate::core::rql::expr::Value::Data { bytes, db_type } => (bytes, db_type),
+                crate::core::rql::expr::Value::Null => (Vec::new(), crate::core::db_type::DbType::NULL),
+            };
+            let label = label.clone();
+            select_items[position] = SelectItem::Literal { bytes, db_type, label };
+        }
         for (position, item) in select_items.iter().enumerate() {
             match item {
                 SelectItem::Column { field, label } => {

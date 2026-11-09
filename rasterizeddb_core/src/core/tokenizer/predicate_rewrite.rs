@@ -391,6 +391,9 @@ fn parenthesised_truth_test(
             };
             return match lift_operand(&case, schema, true) {
                 Ok(lifted) => Ok(Some((format!("{lifted} = true"), truth_at + 1))),
+                // A type error is the statement's answer (`integer ~~
+                // unknown`, 42883), not a shape this cannot read.
+                Err(e) if e.starts_with("operator does not exist") || crate::core::rql::expr::is_input_error(&e) => Err(e),
                 Err(_) => Err(refused),
             };
         }
