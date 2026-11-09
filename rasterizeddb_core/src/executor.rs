@@ -10518,26 +10518,6 @@ fn identifying_field(
 /// error, never a partial one.
 const MAX_CONFLICT_RETRIES: usize = 12;
 
-/// How long to wait before replaying attempt `n` of a conflicted write.
-///
-/// Doubling, capped per sleep so a late attempt does not stall a request for
-/// seconds on its own. The winner is another task that has to be scheduled,
-/// so backing off beats spinning.
-/// Whether a replayed write's answer reports that it changed nothing.
-///
-/// Either a rows-affected count of zero, or a `RETURNING` answer carrying no
-/// rows.
-fn retry_matched_nothing(response: &[u8]) -> bool {
-    match response.first() {
-        Some(1) if response.len() >= 9 => {
-            let mut n = [0u8; 8];
-            n.copy_from_slice(&response[1..9]);
-            u64::from_le_bytes(n) == 0
-        }
-        Some(2) => response.len() <= 1,
-        _ => false,
-    }
-}
 
 fn conflict_backoff(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_millis((1u64 << attempt.min(8)).min(250))
@@ -10710,20 +10690,14 @@ pub async fn execute_with_sync(
         let conflicted = is_retryable_conflict(&response);
 
         if !conflicted || !retryable || attempt >= MAX_CONFLICT_RETRIES {
-            // A replay that matched nothing reports the original conflict. The
-            // row plainly existed a moment ago, so "no rows" means the retry
-            // lost it, not that it is gone, and an error the caller can retry
-            // beats a quiet lie.
-            if let Some(conflict) = first_conflict.take() {
-                if !conflicted && retry_matched_nothing(&response) {
-                    let wrote = database.transactions.wrote_family(tx);
-                    database.abort_transaction(tx);
-                    if wrote {
-                        let _ = database.transactions.flush();
-                    }
-                    break (tx, conflict);
-                }
-            }
+            // A replay that matches nothing answers that: the row the first
+            // attempt met was changed by the transaction it waited for so the
+            // statement's condition no longer holds, or was deleted, and under
+            // READ COMMITTED PostgreSQL then updates nothing (its EvalPlanQual
+            // re-check). This reported the first conflict instead, a guard
+            // against the concurrent-reader miss fixed on 2026-10-09
+            // (`concurrent_reader_miss` pins it).
+            let _ = first_conflict.take();
             break (tx, response);
         }
 

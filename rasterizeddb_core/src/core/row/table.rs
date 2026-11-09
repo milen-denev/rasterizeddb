@@ -5454,15 +5454,19 @@ impl<S: StorageIO> Table<S> {
                 // pending count up, and the log cannot be checkpointed again
                 // for the life of the process.
                 d.io_pointers.abort_txn(txn).await;
-                return Err(if deleted_count == 0 {
-                    std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        format!("{}{}", e, Self::CONFLICT_RETRYABLE),
-                    )
-                    .into()
-                } else {
-                    e
-                });
+                // Replayable whatever was written before it: a failed
+                // statement's writes never become visible (the storage
+                // transaction is given up above; `a_conflicting_update_
+                // applies_nothing` pins it), so the replay starts clean, as
+                // PostgreSQL's DELETE waits at the row and goes on. Only the
+                // first row's conflict was replayed, and a later row's
+                // reported 40001 at once.
+                let _ = deleted_count;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("{}{}", e, Self::CONFLICT_RETRYABLE),
+                )
+                .into());
             }
 
             if let (Some(marker), Some(fetch)) = (marker.as_ref().filter(|m| m.needed()), &marker_fetch) {
@@ -5985,15 +5989,19 @@ impl<S: StorageIO> Table<S> {
                 // As in the DELETE: an abandoned storage transaction would hold
                 // the log's checkpoint off for good.
                 d.io_pointers.abort_txn(txn).await;
-                return Err(if updated_count == 0 {
-                    std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        format!("{}{}", e, Self::CONFLICT_RETRYABLE),
-                    )
-                    .into()
-                } else {
-                    e
-                });
+                // Replayable whatever was written before it: a failed
+                // statement's writes never become visible (the storage
+                // transaction is given up above; `a_conflicting_update_
+                // applies_nothing` pins it), so the replay starts clean, as
+                // PostgreSQL's UPDATE waits at the row and goes on. Only the
+                // first row's conflict was replayed, and a later row's
+                // reported 40001 at once.
+                let _ = updated_count;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("{}{}", e, Self::CONFLICT_RETRYABLE),
+                )
+                .into());
             }
 
             // Load full row so we can merge updates.
@@ -6269,8 +6277,7 @@ impl<S: StorageIO> Table<S> {
                 // A conflict that *is* replayable is not an error anyone needs
                 // to see, for the same reason the executor logs one at `debug!`
                 // — it is about to be waited out and retried.
-                let retryable =
-                    updated_count == 0 && e.to_string().ends_with(Self::CONFLICT_RETRYABLE);
+                let retryable = e.to_string().ends_with(Self::CONFLICT_RETRYABLE);
                 if retryable {
                     log::debug!("UPDATE replayed for row {}: {}", row_id, e);
                     return Err(e);

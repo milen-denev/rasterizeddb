@@ -18346,21 +18346,6 @@ fn row_locks_in_use(table: &str, what: &str) -> Vec<u8> {
 /// already ended, or a conflict that named none.
 const MAX_CONFLICT_RETRIES: usize = 12;
 
-/// Whether a replayed write's answer reports that it changed nothing.
-///
-/// Either a rows-affected count of zero, or a `RETURNING` answer carrying no
-/// rows.
-fn retry_matched_nothing(response: &[u8]) -> bool {
-    match response.first() {
-        Some(1) if response.len() >= 9 => {
-            let mut n = [0u8; 8];
-            n.copy_from_slice(&response[1..9]);
-            u64::from_le_bytes(n) == 0
-        }
-        Some(2) => response.len() <= 1,
-        _ => false,
-    }
-}
 
 
 /// How much unwritten outcome bitmap is allowed to pile up before a read-only
@@ -18901,21 +18886,14 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         let conflicted = is_retryable_conflict(&response);
 
         if !conflicted || !retryable {
-            // A replay that matched nothing reports the original conflict. The
-            // row plainly existed a moment ago, so "no rows" means the retry
-            // lost it, not that it is gone, and an error the caller can retry
-            // beats a quiet lie.
-            if let Some(conflict) = first_conflict.take() {
-                if !conflicted && retry_matched_nothing(&response) {
-                    let wrote = database.transactions.wrote_family(tx);
-                    crate::core::mvcc::owner::outlive(tx);
-                    database.abort_transaction(tx);
-                    if wrote {
-                        let _ = database.transactions.flush();
-                    }
-                    break (tx, conflict);
-                }
-            }
+            // A replay that matches nothing answers that: the row the first
+            // attempt met was changed by the transaction it waited for so the
+            // statement's condition no longer holds, or was deleted, and under
+            // READ COMMITTED PostgreSQL then updates nothing (its EvalPlanQual
+            // re-check). This reported the first conflict instead, a guard
+            // against the concurrent-reader miss fixed on 2026-10-09
+            // (`concurrent_reader_miss` pins it).
+            let _ = first_conflict.take();
             break (tx, response);
         }
 

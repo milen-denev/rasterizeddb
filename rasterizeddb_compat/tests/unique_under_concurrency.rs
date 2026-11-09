@@ -380,6 +380,10 @@ async fn a_conflicting_update_applies_nothing() {
 
         let writer = server.connect_sqlx().await.expect("connect");
         let mut wtx = writer.begin().await.expect("begin writer");
+        // The holder ends only after this returns, so the writer would wait
+        // for it as long as it lives, as on PostgreSQL: `lock_timeout` ends
+        // the wait, and the statement fails having applied nothing.
+        sqlx::query("SET lock_timeout = '300ms'").execute(&mut *wtx).await.expect("lock_timeout");
         let outcome = sqlx::query(AssertSqlSafe(
             "UPDATE u SET k = k || '!', n = n + 1 WHERE id IN (1,2,3)",
         ))

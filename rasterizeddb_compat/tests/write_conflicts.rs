@@ -130,7 +130,11 @@ async fn a_conflict_never_reports_a_phantom_no_such_row() {
 }
 
 /// Inside an explicit block the client owns the transaction, so a conflict is
-/// its business to resolve — this half is correct today and must stay so.
+/// its business to resolve. Here the one client holds `a` open until `b`
+/// returns, so `b` waits on its own client, which on PostgreSQL waits
+/// forever: `lock_timeout` ends it with 55P03, as it does there. (It used to
+/// end after a fixed 1.5 s with 40001, which also failed every READ
+/// COMMITTED writer whose blocker took longer: `rc_waits`.)
 #[tokio::test]
 async fn a_conflict_inside_an_explicit_block_is_reported() {
     let (_s, pool) = server().await;
@@ -145,8 +149,13 @@ async fn a_conflict_inside_an_explicit_block_is_reported() {
         .expect("first writer wins");
 
     let mut b = pool.begin().await.expect("begin b");
+    b.execute(sqlx::raw_sql("SET lock_timeout = '300ms'")).await.expect("lock_timeout");
     let conflict = b.execute(sqlx::raw_sql("UPDATE t SET n = 2 WHERE id = 1")).await;
-    assert!(conflict.is_err(), "a conflict inside a block must be reported");
+    let code = conflict
+        .err()
+        .and_then(|e| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string())))
+        .expect("a conflict inside a block must be reported");
+    assert_eq!(code, "55P03", "the wait ends at lock_timeout");
     let _ = b.rollback().await;
     a.commit().await.expect("commit a");
 

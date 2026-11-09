@@ -24,16 +24,19 @@
 //! - ended by cancellation (57014) and by the session's `lock_timeout`
 //!   (55P03), as any lock wait.
 //!
-//! **The budget stays.** PostgreSQL waits as long as the blocker lives. Here
-//! a statement's conflict waits are bounded together by
-//! [`CONFLICT_WAIT_BUDGET`] from its first conflict, the bound the blind
-//! back-off had (about 1.5 s), after which the conflict is reported (40001)
-//! as before: a block that conflicts with another block it is itself waited
-//! on by its client (`write_conflicts::a_conflict_inside_an_explicit_block_is_
-//! reported`) would otherwise hang. A wait on a live blocker is not counted
-//! against `MAX_CONFLICT_RETRIES`; a replay whose blocker had already ended
-//! (a `REPEATABLE READ` block replaying against a committed version, a race
-//! with the commit) is, and runs at once; a conflict that named no blocker
+//! **A wait lasts as long as its blocker** (2026-11-09), as PostgreSQL's
+//! does: bounded only by `lock_timeout` (55P03), `statement_timeout` and
+//! cancellation (57014), and the deadlock check. It used to be bounded by a
+//! 1.5 s budget, after which the conflict was reported (40001): under READ
+//! COMMITTED, where PostgreSQL waits and proceeds, any transaction holding a
+//! row longer than that failed its waiters. A client that waits on itself
+//! (a block it will only commit after this statement returns) hangs, as it
+//! does on PostgreSQL; `lock_timeout` is its way out
+//! (`write_conflicts::a_conflict_inside_an_explicit_block_is_reported`).
+//! [`CONFLICT_WAIT_BUDGET`] now bounds only the replays that waited for
+//! nothing, with the retry sites' `MAX_CONFLICT_RETRIES`: a blocker that had already ended
+//! (a `REPEATABLE READ` block replaying against a committed version, which
+//! conflicts again and reports 40001), or a conflict that named none, which
 //! falls back to the blind back-off.
 
 use std::cell::Cell;
@@ -44,9 +47,8 @@ use crate::core::database::Database;
 use crate::core::mvcc::TxId;
 use crate::core::mvcc::transaction::{FROZEN_TX, NO_TX};
 
-/// How long a statement's conflict waits may last together, from its first
-/// conflict: the blind back-off's old total (twelve doublings capped at
-/// 250 ms, 1.5 s).
+/// How long a statement's blind replays (no live blocker to wait on) may go
+/// on, from its first conflict: twelve doublings capped at 250 ms.
 pub(crate) const CONFLICT_WAIT_BUDGET: Duration = Duration::from_millis(1500);
 
 /// How often a wait re-checks its blocker, cancellation and the graph when
@@ -148,12 +150,12 @@ impl Pacing {
         // waiter waits.
         let blocker = blocker.filter(|b| database.row_locks.owner_of(*b) != waiter);
         match blocker {
-            Some(blocker) if live(blocker) => {
-                if since.elapsed() >= CONFLICT_WAIT_BUDGET {
-                    return Pause::GiveUp;
-                }
-                wait_for(database, self.site, waiter, blocker, since).await
-            }
+            // As PostgreSQL's `XactLockTableWait`: for as long as the blocker
+            // lives, bounded only by `lock_timeout`, `statement_timeout`,
+            // cancellation and the deadlock detector. A fixed budget turned
+            // every wait past it into 40001 under READ COMMITTED, where
+            // PostgreSQL waits and proceeds.
+            Some(blocker) if live(blocker) => wait_for(database, self.site, waiter, blocker, since).await,
             known => {
                 self.blind += 1;
                 if self.blind > max_blind || since.elapsed() >= CONFLICT_WAIT_BUDGET {
@@ -207,9 +209,6 @@ async fn wait_for(database: &Database, site: Site, waiter: TxId, blocker: TxId, 
             return Pause::Fail(format!(
                 "canceling statement due to lock timeout (waiting for transaction {blocker})"
             ));
-        }
-        if since.elapsed() >= CONFLICT_WAIT_BUDGET {
-            return Pause::GiveUp;
         }
         if since.elapsed() >= crate::core::mvcc::row_locks::DEADLOCK_TIMEOUT {
             row_locks.set_waiting(waiter, &[blocker]);
