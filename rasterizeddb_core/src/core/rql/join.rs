@@ -6912,19 +6912,25 @@ mod outer_join_reference {
         // The preserved side of a RIGHT JOIN filters its own scan.
         let p = planned("ta a RIGHT JOIN tb b ON b.k = a.k", "b.id > 3").expect("preserved side");
         assert!(!p.relations[1].predicate.is_empty());
-        // The null-supplying side may not.
-        assert!(planned("ta a RIGHT JOIN tb b ON b.k = a.k", "a.id > 3").is_err());
-        assert!(planned("ta a FULL JOIN tb b ON b.k = a.k", "a.id > 3").is_err());
-        assert!(planned("ta a FULL JOIN tb b ON b.k = a.k", "b.id > 3").is_err());
+        // The null-supplying side's terms are not pushed into its scan, which
+        // runs before the join and would change which rows count as
+        // unmatched: they filter the joined rows, as PostgreSQL applies a
+        // WHERE (checked against PostgreSQL 17 in `pg17_differential_findings`).
+        for (from, term) in [
+            ("ta a RIGHT JOIN tb b ON b.k = a.k", "a.id > 3"),
+            ("ta a FULL JOIN tb b ON b.k = a.k", "a.id > 3"),
+            ("ta a FULL JOIN tb b ON b.k = a.k", "b.id > 3"),
+        ] {
+            let p = planned(from, term).expect(term);
+            assert!(p.relations.iter().all(|r| r.predicate.is_empty()), "{from} WHERE {term}: pushed into a scan");
+            assert!(p.post_join.is_some(), "{from} WHERE {term}: not applied after the join");
+        }
         // An anti-join on a non-nullable column is still the one form allowed.
         let p = planned("ta a RIGHT JOIN tb b ON b.k = a.k", "a.id IS NULL").expect("anti-join");
         assert!(p.relations[0].require_unmatched);
         // A later RIGHT JOIN makes an earlier preserved side nullable too.
-        assert!(planned(
-            "ta a LEFT JOIN tb b ON b.k = a.k RIGHT JOIN tc c ON c.bk = b.k",
-            "a.id > 3"
-        )
-        .is_err());
+        let p = planned("ta a LEFT JOIN tb b ON b.k = a.k RIGHT JOIN tc c ON c.bk = b.k", "a.id > 3").expect("later right");
+        assert!(p.relations[0].predicate.is_empty() && p.post_join.is_some());
         // An ON term on a RIGHT JOIN's own relation is a match condition, not
         // a scan predicate.
         let p = planned("ta a RIGHT JOIN tb b ON b.k = a.k AND b.s = 'x'", "").expect("on term");
