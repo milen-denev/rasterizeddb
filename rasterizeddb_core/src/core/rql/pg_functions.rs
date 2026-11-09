@@ -56,6 +56,8 @@ pub enum PgFunc {
     Random,
     Div,
     Gcd,
+    WidthBucket,
+    Factorial,
     Lcm,
     MakeDate,
     MakeTimestamp,
@@ -88,7 +90,7 @@ pub const NAMES: &[&str] = &[
     "LEFT", "RIGHT", "SUBSTR", "SUBSTRING", "STRPOS", "POSITION", "REVERSE", "REPEAT", "CONCAT", "CONCAT_WS",
     "SPLIT_PART", "TRANSLATE", "ASCII", "CHR", "STARTS_WITH", "INITCAP", "MD5", "TO_HEX", "QUOTE_LITERAL",
     "FORMAT", "REGEXP_REPLACE", "CEIL", "CEILING", "FLOOR", "SIGN", "POWER", "POW", "SQRT", "CBRT", "EXP", "LN",
-    "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "MAKE_DATE", "MAKE_TIMESTAMP",
+    "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "MAKE_DATE", "MAKE_TIMESTAMP",
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
@@ -180,6 +182,8 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "RANDOM" => (Random, &[0]),
         "DIV" => (Div, &[2]),
         "GCD" => (Gcd, &[2]),
+        "WIDTH_BUCKET" => (WidthBucket, &[4]),
+        "FACTORIAL" => (Factorial, &[1]),
         "LCM" => (Lcm, &[2]),
         "MAKE_DATE" => (MakeDate, &[3]),
         "MAKE_TIMESTAMP" => (MakeTimestamp, &[6]),
@@ -229,7 +233,8 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
     use PgFunc::*;
     let first = || args.first().map(crate::core::rql::expr::static_type).unwrap_or(DbType::NULL);
     match func {
-        Strpos | Ascii | JsonbArrayLength | NumNonnulls | NumNulls | Cardinality => DbType::I32,
+        Strpos | Ascii | JsonbArrayLength | NumNonnulls | NumNulls | Cardinality | WidthBucket => DbType::I32,
+        Factorial => DbType::DECIMAL,
         StartsWith => DbType::BOOL,
         Ceil | Floor | Sign | Sqrt => {
             if first() == DbType::DECIMAL {
@@ -701,6 +706,52 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             }
             let q = a.div(b).map_err(|e| e.to_string())?.ok_or("numeric out of range")?;
             numeric_value(PgNum::int(q.trunc_places(0).ok_or("numeric out of range")?.m))
+        }
+        // PostgreSQL's `width_bucket(operand, low, high, count)`: 0 below the
+        // range, `count + 1` at or past its end, otherwise which of `count`
+        // equal buckets holds the operand, exactly (each value brought to
+        // one scale, the bucket an integer division of their differences).
+        WidthBucket => {
+            let count = int_of(&args[3], "the count")?;
+            if count <= 0 {
+                return Err("count must be greater than zero".to_string());
+            }
+            let (x, lo, hi) = (numeric_of(&args[0])?, numeric_of(&args[1])?, numeric_of(&args[2])?);
+            let scale = x.s.max(lo.s).max(hi.s);
+            let at = |n: PgNum| n.m.checked_mul(10i128.checked_pow(scale - n.s)?);
+            let (Some(x), Some(lo), Some(hi)) = (at(x), at(lo), at(hi)) else {
+                return Err("numeric out of range".to_string());
+            };
+            if lo == hi {
+                return Err("lower bound cannot equal upper bound".to_string());
+            }
+            let (offset, width, past) = if lo < hi {
+                (x.checked_sub(lo), hi - lo, x >= hi)
+            } else {
+                (lo.checked_sub(x), lo - hi, x <= hi)
+            };
+            let below = if lo < hi { x < lo } else { x > lo };
+            let bucket = if below {
+                0
+            } else if past {
+                count + 1
+            } else {
+                let offset = offset.ok_or("numeric out of range")?;
+                let scaled = offset.checked_mul(count as i128).ok_or("numeric out of range")?;
+                (scaled / width) as i64 + 1
+            };
+            int_value(i32::try_from(bucket).map_err(|_| "integer out of range")? as i64)
+        }
+        Factorial => {
+            let n = int_of(&args[0], "the value")?;
+            if n < 0 {
+                return Err("factorial of a negative number is undefined".to_string());
+            }
+            let mut v: i128 = 1;
+            for k in 2..=n as i128 {
+                v = v.checked_mul(k).ok_or("value overflows numeric format")?;
+            }
+            numeric_value(PgNum::int(v))
         }
         Gcd | Lcm => {
             let (a, b) = (int_of(&args[0], "the value")? as i128, int_of(&args[1], "the value")? as i128);

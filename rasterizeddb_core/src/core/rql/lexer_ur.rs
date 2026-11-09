@@ -670,6 +670,22 @@ fn parse_update_row(
         // neither, so `SET hits = hits + 5` was taken for a literal and refused
         // with "I64 column cannot take the literal \"hits + 5\"". Every
         // endpoint-counter upsert in the application is that shape.
+        // A condition assigned to a boolean column, `SET done = NOT done`,
+        // `SET big = n > 10`: its value, TRUE, FALSE or NULL, built as a
+        // select list builds it. Read as a literal it was "invalid input
+        // syntax for type boolean: \"NOT done\"".
+        if field.db_type == DbType::BOOL {
+            if let Ok(Some(parsed)) = crate::core::rql::join::comparison_value(value, schema) {
+                expressions.push((field.write_order as u32, parsed));
+                updates.push(ColumnWritePayload {
+                    data: MemoryBlock::default(),
+                    write_order: field.write_order as u32,
+                    column_type: field.db_type.physical(),
+                    size: field.size,
+                });
+                continue;
+            }
+        }
         if crate::core::rql::expr::needs_evaluation(value)
             || crate::core::rql::lexer_query::looks_like_row_expression(value)
             || assigns_column

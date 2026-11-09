@@ -2178,9 +2178,17 @@ pub fn row_fetch_from_select_query(
                 // The expression written out in the GROUP BY. When the select
                 // list carries the same expression, the key echoes into that
                 // item's output slot.
-                if crate::core::rql::expr::needs_evaluation(item) || looks_like_row_expression(item)
+                // A condition is a key too, `GROUP BY n > 0`, `GROUP BY (a IS
+                // NULL)`: its value TRUE, FALSE or NULL, built as the select
+                // list builds the same item, so the two still match.
+                let written_key = if crate::core::rql::expr::needs_evaluation(item) || looks_like_row_expression(item) {
+                    crate::core::rql::expr::parse(item, schema).ok()
+                } else {
+                    None
+                }
+                .or_else(|| crate::core::rql::join::comparison_value(item, schema).ok().flatten());
                 {
-                    if let Ok(parsed) = crate::core::rql::expr::parse(item, schema) {
+                    if let Some(parsed) = written_key {
                         // `Expr` has no equality of its own; its Debug form is
                         // structural, which is what matching two parses needs.
                         let written = format!("{:?}", parsed);

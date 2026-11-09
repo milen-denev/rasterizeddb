@@ -1960,12 +1960,10 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     if !first.eq_ignore_ascii_case("WHEN") {
         return Err("CASE has no WHEN".to_string());
     }
-    if !text[4..first_when].trim().is_empty() {
-        return Err(
-            "CASE <expression> WHEN … is not supported yet; use CASE WHEN <condition> …"
-                .to_string(),
-        );
-    }
+    // The simple form, `CASE x WHEN v THEN …`: each arm is `x = v`, so a
+    // NULL `x` takes no arm, as in PostgreSQL. `x` is read once per arm.
+    let subject = text[4..first_when].trim();
+    let subject = (!subject.is_empty()).then_some(subject);
 
     let mut whens: Vec<(Cond, Expr)> = Vec::new();
     let mut otherwise: Option<Box<Expr>> = None;
@@ -1990,7 +1988,12 @@ fn parse_case(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         if !then.eq_ignore_ascii_case("THEN") {
             return Err("CASE WHEN has no THEN".to_string());
         }
-        let condition = parse_cond(&text[after..then_at], schema)?;
+        let condition = match subject {
+            None => parse_cond(&text[after..then_at], schema)?,
+            Some(subject) => {
+                Cond::Cmp(parse_condition(&format!("({subject}) = ({})", text[after..then_at].trim()), schema)?)
+            }
+        };
         whens.push((condition, parse(&text[then_end..until(k + 1)], schema)?));
         k += 2;
     }
@@ -2050,6 +2053,18 @@ pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
     }
     if text.len() > 4 && text[..3].eq_ignore_ascii_case("NOT") && text.as_bytes()[3] == b'(' {
         return Ok(Cond::Not(Box::new(parse_cond(&text[3..], schema)?)));
+    }
+    // A row comparison, `(a, b) < (c, d)`, as the comparisons it means,
+    // which the WHERE path already spells out this way.
+    if text.contains(',') {
+        if let Ok(expanded) = crate::core::tokenizer::predicate_rewrite::expand_row_value_comparisons(text) {
+            if expanded.trim() != text {
+                return parse_cond(&expanded, schema);
+            }
+        }
+    }
+    if let Some(cond) = quantified_condition(text, schema)? {
+        return Ok(cond);
     }
     if let Some(cond) = like_condition(text, schema)? {
         return Ok(cond);
@@ -2153,6 +2168,96 @@ fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, Str
 /// column answering yes there became a computed item, so `SELECT id,
 /// is_active` lost the column. Everything that calls `parse_cond` wants a
 /// condition, so the reading is safe here.
+/// `x op ANY (ARRAY[…])`, `SOME`, `ALL`, also over an array literal
+/// `'{…}'`: the comparison with each element, joined by OR for ANY and by AND
+/// for ALL, whose three values are exactly the quantifiers' (TRUE if any
+/// holds, else UNKNOWN if any is unknown, else FALSE). Over no elements ANY
+/// is FALSE and ALL is TRUE, whatever `x` is. A subquery is not this one's
+/// (`subquery::quantified_predicate`).
+fn quantified_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, String> {
+    use crate::core::rql::join::find_keyword;
+    let found = ["ANY", "SOME", "ALL"]
+        .into_iter()
+        .filter_map(|kw| find_keyword(text, kw, 0).map(|at| (at, kw)))
+        .filter(|(at, kw)| text[at + kw.len()..].trim_start().starts_with('('))
+        .min_by_key(|(at, _)| *at);
+    let Some((at, kw)) = found else {
+        return Ok(None);
+    };
+    let head = text[..at].trim_end();
+    let Some(op) = ["<=", ">=", "<>", "!=", "=", "<", ">"].into_iter().find(|op| head.ends_with(op)) else {
+        return Ok(None);
+    };
+    let left = head[..head.len() - op.len()].trim();
+    let arg = text[at + kw.len()..].trim();
+    let Some(close) = matching_paren(arg, 0) else {
+        return Ok(None);
+    };
+    if left.is_empty() || close != arg.len() - 1 {
+        return Ok(None);
+    }
+    let inner = arg[1..close].trim();
+    let elements: Vec<String> = if inner.len() > 5 && inner[..5].eq_ignore_ascii_case("ARRAY") && inner[5..].trim_start().starts_with('[') {
+        let list = inner[5..].trim_start();
+        if !list.ends_with(']') {
+            return Ok(None);
+        }
+        let body = &list[1..list.len() - 1];
+        if body.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_top_level_commas(body).into_iter().map(|e| e.trim().to_string()).collect()
+        }
+    } else if inner.starts_with('\'') {
+        match crate::core::tokenizer::predicate_rewrite::pg_array_elements(inner) {
+            Some(elements) => elements,
+            None => return Ok(None),
+        }
+    } else {
+        return Ok(None);
+    };
+    let any = kw != "ALL";
+    if elements.is_empty() {
+        let truth = Expr::Literal { bytes: vec![1], db_type: DbType::BOOL };
+        return Ok(Some(Cond::Cmp(Condition {
+            left: Box::new(truth),
+            cmp: Cmp::Eq,
+            right: Some(Box::new(Expr::Literal { bytes: vec![u8::from(!any)], db_type: DbType::BOOL })),
+            wide: Default::default(),
+        })));
+    }
+    let mut parts = Vec::with_capacity(elements.len());
+    for element in &elements {
+        parts.push(Cond::Cmp(parse_condition(&format!("({left}) {op} ({element})"), schema)?));
+    }
+    Ok(Some(if any { Cond::Or(parts) } else { Cond::And(parts) }))
+}
+
+/// Splits on the commas outside quotes, parentheses and brackets.
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let (mut depth, mut quote, mut start) = (0i32, None::<u8>, 0usize);
+    let mut out = Vec::new();
+    for (i, &c) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth -= 1,
+                b',' if depth == 0 => {
+                    out.push(&text[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
 /// `x [NOT] LIKE p [ESCAPE e]` and `x [NOT] ILIKE p …` as a condition,
 /// which the WHERE path answers with its own matcher and nothing else read:
 /// in a select list, a `CASE WHEN` or a join's condition the whole item was

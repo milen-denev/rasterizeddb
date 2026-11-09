@@ -4385,12 +4385,7 @@ pub(crate) async fn describe_query(
     // A parenthesised first branch of a `UNION` is described on its own, as
     // the simple query path plans it.
     let first_branch = match crate::core::rql::join::split_union(stmt) {
-        Some(Ok(parts))
-            if stmt.starts_with('(')
-                || parts.branches.first().is_some_and(|b| crate::core::rql::set_ops::constant_branch(b).is_some()) =>
-        {
-            parts.branches.into_iter().next()
-        }
+        Some(Ok(parts)) => parts.branches.into_iter().next(),
         _ => None,
     };
     match describe_resolved(database, first_branch.as_deref().unwrap_or(stmt), &[]).await? {
@@ -6979,10 +6974,12 @@ fn result_description(
             // A `UNION` is described by its first branch, planned on its own:
             // a parenthesised one, `(SELECT … LIMIT 2) UNION …`, is not a
             // statement the select parser reads whole.
+            // Always the first branch: read whole, the last branch's WHERE
+            // was planned against the first branch's relation, and
+            // `SELECT n FROM t2 EXCEPT SELECT a FROM t1 WHERE f` failed with
+            // "column \"f\" does not exist".
             let first_branch = match crate::core::rql::join::split_union(&qr.query) {
-                Some(Ok(parts)) if qr.query.trim_start().starts_with('(') => {
-                    parts.branches.first().and_then(|b| recognize_query_purpose(b))
-                }
+                Some(Ok(parts)) => parts.branches.first().and_then(|b| recognize_query_purpose(b)),
                 _ => None,
             };
             match row_fetch_from_select_query(first_branch.as_ref().unwrap_or(purpose), &table.schema().fields) {

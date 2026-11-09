@@ -43,6 +43,9 @@ pub enum WindowFunc {
     Lag,
     /// The value `offset` rows later.
     Lead,
+    /// `ntile(n)`: which of `n` nearly equal buckets of the partition, in
+    /// its order, the row falls in, numbered from 1.
+    Ntile,
     /// The first, last or nth value of the frame.
     FirstValue,
     LastValue,
@@ -65,6 +68,7 @@ impl WindowFunc {
             "CUME_DIST" => WindowFunc::CumeDist,
             "LAG" => WindowFunc::Lag,
             "LEAD" => WindowFunc::Lead,
+            "NTILE" => WindowFunc::Ntile,
             "FIRST_VALUE" => WindowFunc::FirstValue,
             "LAST_VALUE" => WindowFunc::LastValue,
             "NTH_VALUE" => WindowFunc::NthValue,
@@ -87,7 +91,8 @@ impl WindowFunc {
             | WindowFunc::CumeDist => (0, 0),
             // `COUNT(*)` takes none and `COUNT(x)` takes one.
             WindowFunc::Count => (0, 1),
-            WindowFunc::Lag | WindowFunc::Lead => (1, 2),
+            // The third, PostgreSQL's default for a row past the partition.
+            WindowFunc::Lag | WindowFunc::Lead => (1, 3),
             WindowFunc::NthValue => (2, 2),
             _ => (1, 1),
         }
@@ -108,6 +113,7 @@ impl WindowFunc {
                 | WindowFunc::CumeDist
                 | WindowFunc::Lag
                 | WindowFunc::Lead
+                | WindowFunc::Ntile
         )
     }
 }
@@ -169,8 +175,12 @@ pub struct WindowSpec {
     /// The column the function reads — `AVG(subtotal)`, `LAG(created_at)`.
     /// `None` for the ranking functions and `COUNT(*)`.
     pub argument: Option<SchemaField>,
-    /// The second argument of `LAG`, `LEAD` and `NTH_VALUE`.
+    /// The second argument of `LAG`, `LEAD` and `NTH_VALUE`, and the bucket
+    /// count of `NTILE`.
     pub offset: i64,
+    /// The third argument of `LAG` and `LEAD`, encoded as the argument's
+    /// type: the value for a row whose offset falls outside the partition.
+    pub default: Option<Vec<u8>>,
     /// Rows are numbered independently within each distinct value of these.
     pub partition_by: Vec<SchemaField>,
     /// The order rows are numbered in, each with its own direction and where
@@ -280,6 +290,7 @@ impl WindowSpec {
             | WindowFunc::DenseRank
             | WindowFunc::Count => DbType::I64,
             WindowFunc::PercentRank | WindowFunc::CumeDist => DbType::F64,
+            WindowFunc::Ntile => DbType::I32,
             // A value function returns whatever it was given.
             WindowFunc::Lag
             | WindowFunc::Lead
@@ -385,6 +396,24 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
         )));
     }
 
+    // `NTILE(n)` reads no column; its argument is the bucket count.
+    if func == WindowFunc::Ntile {
+        let n = match arguments[0].trim().parse::<i64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => return Some(Err("argument of ntile must be greater than zero".to_string())),
+            Err(_) => {
+                return Some(Err(format!(
+                    "the argument of NTILE() must be a constant number, not '{}'",
+                    arguments[0].trim()
+                )));
+            }
+        };
+        let after_over = rest["OVER".len()..].trim_start();
+        let (Some(open), Some(close)) = (after_over.find('('), after_over.rfind(')')) else {
+            return Some(Err(format!("OVER needs a window definition in '{}'", item)));
+        };
+        return Some(build(func, None, n, None, after_over[open + 1..close].trim(), alias, name, schema));
+    }
     let argument = match arguments.first() {
         None => None,
         Some(text) => match resolve_column(text, schema) {
@@ -424,8 +453,31 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
         )));
     }
 
+    // A literal of the argument's type. A NUMERIC argument's cells are at
+    // its column's scale, which a literal is not encoded at; refused.
+    let default = match (arguments.get(2), &argument) {
+        (None, _) | (_, None) => None,
+        (Some(text), Some(field)) => {
+            if field.db_type == DbType::DECIMAL {
+                return Some(Err(format!("a default for {}() over a numeric is not supported yet", name.to_ascii_uppercase())));
+            }
+            let value = crate::core::rql::expr::parse(text, schema).and_then(|e| match e {
+                crate::core::rql::expr::Expr::Literal { bytes, db_type } => {
+                    crate::core::rql::expr::cast(crate::core::rql::expr::Value::Data { bytes, db_type }, &field.db_type)
+                }
+                crate::core::rql::expr::Expr::Null => Ok(crate::core::rql::expr::Value::Null),
+                _ => Err(format!("the default of {}() must be a constant, not '{}'", name.to_ascii_uppercase(), text.trim())),
+            });
+            match value {
+                Ok(crate::core::rql::expr::Value::Data { bytes, .. }) => Some(bytes),
+                Ok(crate::core::rql::expr::Value::Null) => None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    };
+
     let body = after_over[window_open + 1..window_close].trim();
-    Some(build(func, argument, offset, body, alias, name, schema))
+    Some(build(func, argument, offset, default, body, alias, name, schema))
 }
 
 /// Splits a call's arguments on commas that are not inside parentheses.
@@ -473,10 +525,12 @@ fn starts_with_word(text: &str, word: &str) -> bool {
         .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build(
     func: WindowFunc,
     argument: Option<SchemaField>,
     offset: i64,
+    default: Option<Vec<u8>>,
     body: &str,
     alias: Option<String>,
     name: &str,
@@ -569,6 +623,7 @@ fn build(
         func,
         argument,
         offset,
+        default,
         partition_by,
         order_by,
         frame,
@@ -965,6 +1020,15 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
             let (row_number, rank, dense) = ranks[position];
             out[*index] = match spec.func {
                 WindowFunc::RowNumber => Some(row_number.to_le_bytes().to_vec()),
+                // PostgreSQL's split: `count / n` rows a bucket, and the first
+                // `count % n` buckets one more.
+                WindowFunc::Ntile => {
+                    let (n, p) = (spec.offset as usize, position);
+                    let (per, extra) = (count / n, count % n);
+                    let big = extra * (per + 1);
+                    let bucket = if p < big { p / (per + 1) } else { extra + (p - big) / per.max(1) };
+                    Some((bucket as i32 + 1).to_le_bytes().to_vec())
+                }
                 // With no ORDER BY every row ties, which is what makes RANK
                 // and DENSE_RANK 1 for all of them — as in PostgreSQL.
                 WindowFunc::Rank => Some(rank.max(1).to_le_bytes().to_vec()),
@@ -991,7 +1055,7 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                     };
                     let target = position as i64 + step;
                     if target < 0 || target >= count as i64 {
-                        None
+                        spec.default.clone()
                     } else {
                         argument_bytes(rows, members[target as usize], spec)
                     }

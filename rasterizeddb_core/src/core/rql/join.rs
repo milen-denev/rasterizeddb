@@ -5022,8 +5022,9 @@ pub(crate) fn comparison_value(
         // (a = b)`), which is how a quantified subquery is answered
         // (`subquery::quantified_predicate`).
         Err(_)
-            if ["IN", "BETWEEN", "AND", "OR", "NOT", "LIKE", "ILIKE", "DISTINCT"].iter().any(|w| find_keyword(text, w, 0).is_some())
-                || is_parenthesised(text) =>
+            if ["IN", "BETWEEN", "AND", "OR", "NOT", "LIKE", "ILIKE", "DISTINCT", "ANY", "SOME", "ALL"].iter().any(|w| find_keyword(text, w, 0).is_some())
+                || is_parenthesised(text)
+                || text.trim_start().starts_with('(') =>
         {
             let cond = match crate::core::rql::expr::parse_cond(text, schema) {
                 Ok(cond) => cond,

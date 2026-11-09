@@ -264,6 +264,7 @@ fn truth_test(
 fn expand_truth_tests<'c>(
     clause: &'c str,
     schema: &SmallVec<[SchemaField; 20]>,
+    scan: bool,
 ) -> Result<std::borrow::Cow<'c, str>, String> {
     let upper = clause.to_ascii_uppercase();
     let maybe = upper.contains("IS")
@@ -277,7 +278,7 @@ fn expand_truth_tests<'c>(
     let mut i = 0usize;
     while i < toks.len() {
         if matches!(toks[i], Tok::LPar) {
-            if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema)? {
+            if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema, scan)? {
                 out.push(text);
                 i = after;
                 changed = true;
@@ -320,6 +321,7 @@ fn parenthesised_truth_test(
     toks: &[Tok],
     at: usize,
     schema: &SmallVec<[SchemaField; 20]>,
+    scan: bool,
 ) -> Result<Option<(String, usize)>, String> {
     // The group's extent.
     let mut depth = 0usize;
@@ -349,20 +351,39 @@ fn parenthesised_truth_test(
         return Ok(None);
     };
     let inner = &toks[at + 1..close];
-    let tree = TruthParser {
-        toks: inner,
-        pos: 0,
-        schema,
-    }
-    .parse()
-    .map_err(|e| {
-        format!(
-            "IS {}{} over this expression is not supported: {}",
-            if negated { "NOT " } else { "" },
-            truth.to_ascii_uppercase(),
-            e
-        )
-    })?;
+    let tree = match (TruthParser { toks: inner, pos: 0, schema }).parse() {
+        Ok(tree) => tree,
+        Err(e) => {
+            let refused = format!(
+                "IS {}{} over this expression is not supported: {}",
+                if negated { "NOT " } else { "" },
+                truth.to_ascii_uppercase(),
+                e
+            );
+            // What the expansion cannot read — `IN`, `LIKE`, `BETWEEN`, a
+            // call — the evaluator can, as the `CASE` the test means: its
+            // `WHEN` is taken only for TRUE, so NULL and FALSE share the
+            // `ELSE`, and the value is never NULL. Only for a scan, which
+            // reads a lifted operand; the CHECK compiler and the join's
+            // post-filter parse this output and cannot.
+            if !scan || inner.iter().any(|t| matches!(t, Tok::Lifted(_))) {
+                return Err(refused);
+            }
+            let x = inner.iter().map(Tok::render).collect::<Vec<_>>().join(" ");
+            let case = match (truth, negated) {
+                ("true", false) => format!("CASE WHEN {x} THEN true ELSE false END"),
+                ("true", true) => format!("CASE WHEN {x} THEN false ELSE true END"),
+                ("false", false) => format!("CASE WHEN NOT ({x}) THEN true ELSE false END"),
+                ("false", true) => format!("CASE WHEN NOT ({x}) THEN false ELSE true END"),
+                (_, false) => format!("CASE WHEN {x} THEN false WHEN NOT ({x}) THEN false ELSE true END"),
+                (_, true) => format!("CASE WHEN {x} THEN true WHEN NOT ({x}) THEN true ELSE false END"),
+            };
+            return match lift_operand(&case, schema, true) {
+                Ok(lifted) => Ok(Some((format!("{lifted} = true"), truth_at + 1))),
+                Err(_) => Err(refused),
+            };
+        }
+    };
     let text = match (truth, negated) {
         ("true", false) => tree.render(Want::T),
         ("true", true) => tree.render(Want::NT),
@@ -2211,7 +2232,7 @@ fn row_in_list(
 /// Only a parenthesised group holding a top-level comma is touched, and only
 /// when a comparison operator and a group of the same arity follow it, so an
 /// ordinary `(a = 1) AND (b = 2)` and a tuple `IN` list are both left alone.
-fn expand_row_value_comparisons(clause: &str) -> Result<String, String> {
+pub(crate) fn expand_row_value_comparisons(clause: &str) -> Result<String, String> {
     const OPS: &[&str] = &[">=", "<=", "<>", "!=", "=", ">", "<"];
     let mut current = clause.to_string();
 
@@ -2585,6 +2606,8 @@ fn needs_evaluator(text: &str) -> bool {
                 }
                 let word = &text[i..end];
                 if word.eq_ignore_ascii_case("CASE")
+                    // `x = ANY (ARRAY[…])`: the lexer has no `[`.
+                    || word.eq_ignore_ascii_case("ARRAY") && text[end..].trim_start().starts_with('[')
                     || (word.eq_ignore_ascii_case("B") || word.eq_ignore_ascii_case("X"))
                         && bytes.get(end) == Some(&b'\'')
                     || column_cast_at(text, word, end)
@@ -3204,10 +3227,45 @@ fn lift_term(
     }
     let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
         format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
+    } else if quantified_over_array(body) {
+        // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
+        // onto the comparison below still leaves an unknown row out.
+        let case = format!("CASE WHEN {body} THEN true WHEN NOT ({body}) THEN false END");
+        format!("{} = true", lift_operand(&case, schema, true)?)
     } else {
         lift_comparison(body, schema, depth)?
     };
     Ok(format!("{lead}{nots}{lifted}{tail}"))
+}
+
+/// Whether `body` compares with `ANY`/`SOME`/`ALL` over an array the
+/// evaluator expands (`expr::quantified_condition`): an `ARRAY[…]`, or an
+/// array literal under any form but the two the rewrite turns into an `IN`
+/// chain, `col = ANY('{…}')` and `col <> ALL('{…}')`, which stay sargable.
+fn quantified_over_array(body: &str) -> bool {
+    let words = top_level_words(body);
+    words.iter().enumerate().any(|(n, &(s, e))| {
+        let word = &body[s..e];
+        let any = word.eq_ignore_ascii_case("ANY") || word.eq_ignore_ascii_case("SOME");
+        if !(any || word.eq_ignore_ascii_case("ALL")) {
+            return false;
+        }
+        let after = body[e..].trim_start();
+        let Some(inner) = after.strip_prefix('(').map(str::trim_start) else {
+            return false;
+        };
+        if inner.len() > 5 && inner[..5].eq_ignore_ascii_case("ARRAY") && inner[5..].trim_start().starts_with('[') {
+            return true;
+        }
+        if !inner.starts_with('\'') {
+            return false;
+        }
+        let head = body[..s].trim_end();
+        let op = ["<>", "!=", "<=", ">=", "=", "<", ">"].into_iter().find(|op| head.ends_with(op));
+        let column_left = n == 2 || head[..head.len() - op.map_or(0, str::len)].trim().split_whitespace().count() == 1;
+        let in_chain = matches!((op, any), (Some("="), true) | (Some("<>" | "!="), false));
+        !(in_chain && column_left)
+    })
 }
 
 /// The operator a comparison splits at: its offset, its end, and whether it is
@@ -4902,7 +4960,7 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     // `x = NULL` is folded to false: under a truth test a comparison with NULL
     // is *unknown*, not false, and `(a = NULL) IS UNKNOWN` holds for every
     // row. See `parenthesised_truth_test`.
-    let clause = &expand_truth_tests(clause, schema)?;
+    let clause = &expand_truth_tests(clause, schema, scan)?;
 
     // `NOT <condition>` is pushed down to its comparisons, three-valued, and
     // before the NULL fold for the same reason as the truth tests. See
@@ -6014,7 +6072,7 @@ fn any_or_all_expansion(
 ///
 /// `None` when the text is not an array literal, so the caller leaves the
 /// statement alone rather than rewriting something it has misread.
-fn pg_array_elements(literal: &str) -> Option<Vec<String>> {
+pub(crate) fn pg_array_elements(literal: &str) -> Option<Vec<String>> {
     let inner = literal.trim();
     let inner = inner.strip_prefix('\'')?.strip_suffix('\'')?;
     // A doubled quote inside the literal is one quote.
