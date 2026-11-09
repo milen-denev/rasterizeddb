@@ -2385,7 +2385,20 @@ fn like_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, St
         }
         pattern = Expr::Literal { bytes: out.into_bytes(), db_type: DbType::STRING };
     }
-    let call = Expr::Call(func, vec![parse(left, schema)?, pattern]);
+    let left = parse(left, schema)?;
+    // `~~` has no integer, numeric or boolean operand in PostgreSQL:
+    // `a LIKE 'x%'` over an integer is 42883, not a match on its text.
+    if !yields_json_text(&left)
+        && !matches!(static_type(&left), DbType::STRING | DbType::CHAR | DbType::BPCHAR(_) | DbType::NULL)
+        && !matches!(left, Expr::Null)
+    {
+        return Err(format!(
+            "operator does not exist: {} {} unknown",
+            pg_operand_type_name(&left),
+            if func == TextFunc::ILike { "~~*" } else { "~~" }
+        ));
+    }
+    let call = Expr::Call(func, vec![left, pattern]);
     let cond = Cond::Cmp(Condition {
         left: Box::new(call),
         cmp: Cmp::Eq,
@@ -2922,36 +2935,21 @@ fn local_timestamp_text(value: Value) -> Result<Value, String> {
 
 /// Position of a top-level operator, outside quotes and parentheses.
 fn find_operator(text: &str, op: &str) -> Option<usize> {
+    // Outside quotes, parentheses and `CASE` blocks (`Nesting`): the `<` of
+    // `qty > CASE WHEN id < 3 THEN … END` is the block's, and splitting there
+    // read `qty > CASE WHEN id` as an operand.
     let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
+    let nesting = Nesting::of(text);
     let mut i = 0usize;
     while i + op.len() <= bytes.len() {
-        let c = bytes[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
+        // Compared as bytes: `i` steps through every byte, and slicing the
+        // text at one inside a multi-byte character (`naïve`) panicked.
+        if nesting.top_level(i) && bytes[i..].starts_with(op.as_bytes()) {
+            if op == "=" && i > 0 && matches!(bytes[i - 1], b'<' | b'>' | b'!') {
+                i += 1;
+                continue;
             }
-            None => match c {
-                b'\'' | b'"' => quote = Some(c),
-                b'(' => depth += 1,
-                b')' => depth = depth.saturating_sub(1),
-                _ => {
-                    // Compared as bytes: `i` steps through every byte, and
-                    // slicing the text at one inside a multi-byte character
-                    // (`naïve`) panicked.
-                    if depth == 0 && bytes[i..].starts_with(op.as_bytes()) {
-                        // `::` is a cast, not two comparisons.
-                        if op == "=" && i > 0 && matches!(bytes[i - 1], b'<' | b'>' | b'!') {
-                            i += 1;
-                            continue;
-                        }
-                        return Some(i);
-                    }
-                }
-            },
+            return Some(i);
         }
         i += 1;
     }

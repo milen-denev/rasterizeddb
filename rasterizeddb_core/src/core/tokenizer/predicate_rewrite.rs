@@ -366,17 +366,28 @@ fn parenthesised_truth_test(
             // `ELSE`, and the value is never NULL. Only for a scan, which
             // reads a lifted operand; the CHECK compiler and the join's
             // post-filter parse this output and cannot.
-            if !scan || inner.iter().any(|t| matches!(t, Tok::Lifted(_))) {
+            if !scan {
                 return Err(refused);
             }
-            let x = inner.iter().map(Tok::render).collect::<Vec<_>>().join(" ");
+            // A lifted operand is put back as the expression it stands for.
+            let mut parts = Vec::with_capacity(inner.len());
+            for t in inner {
+                match t {
+                    Tok::Lifted(encoded) => match read_lifted(encoded, 0) {
+                        Some((expression, _)) => parts.push(format!("({expression})")),
+                        None => return Err(refused),
+                    },
+                    other => parts.push(other.render()),
+                }
+            }
+            let x = parts.join(" ");
             let case = match (truth, negated) {
-                ("true", false) => format!("CASE WHEN {x} THEN true ELSE false END"),
-                ("true", true) => format!("CASE WHEN {x} THEN false ELSE true END"),
+                ("true", false) => format!("CASE WHEN ({x}) THEN true ELSE false END"),
+                ("true", true) => format!("CASE WHEN ({x}) THEN false ELSE true END"),
                 ("false", false) => format!("CASE WHEN NOT ({x}) THEN true ELSE false END"),
                 ("false", true) => format!("CASE WHEN NOT ({x}) THEN false ELSE true END"),
-                (_, false) => format!("CASE WHEN {x} THEN false WHEN NOT ({x}) THEN false ELSE true END"),
-                (_, true) => format!("CASE WHEN {x} THEN true WHEN NOT ({x}) THEN true ELSE false END"),
+                (_, false) => format!("CASE WHEN ({x}) THEN false WHEN NOT ({x}) THEN false ELSE true END"),
+                (_, true) => format!("CASE WHEN ({x}) THEN true WHEN NOT ({x}) THEN true ELSE false END"),
             };
             return match lift_operand(&case, schema, true) {
                 Ok(lifted) => Ok(Some((format!("{lifted} = true"), truth_at + 1))),
@@ -2700,6 +2711,11 @@ fn constant_mixed_comparison(text: &str) -> bool {
 /// a select list does. A term with one such column keeps the scan's form.
 fn mixed_numeric_columns(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     use crate::core::db_type::DbType;
+    // An IN list resolves its common type its own way (a REAL against
+    // NUMERIC members compares as REAL), which the scan already does.
+    if top_level_words(text).iter().any(|&(s, e)| text[s..e].eq_ignore_ascii_case("IN")) {
+        return false;
+    }
     let bytes = text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'"';
     let (mut decimal, mut other) = (false, false);
@@ -2812,8 +2828,18 @@ fn needs_evaluator(text: &str) -> bool {
                 }
                 let word = &text[i..end];
                 if word.eq_ignore_ascii_case("CASE")
-                    // `x = ANY (ARRAY[…])`: the lexer has no `[`.
-                    || word.eq_ignore_ascii_case("ARRAY") && text[end..].trim_start().starts_with('[')
+                    // `x = ANY (ARRAY[…])`: the lexer has no `[`. Only there:
+                    // `doc ?| array['a']` is the scan's own form.
+                    || word.eq_ignore_ascii_case("ARRAY")
+                        && text[end..].trim_start().starts_with('[')
+                        && text[..i].trim_end().strip_suffix('(').is_some_and(|b| {
+                            let b = b.trim_end().as_bytes();
+                            ["ANY", "SOME", "ALL"].iter().any(|q| {
+                                b.len() >= q.len()
+                                    && b[b.len() - q.len()..].eq_ignore_ascii_case(q.as_bytes())
+                                    && b.get(b.len().wrapping_sub(q.len() + 1)).is_none_or(|c| !is_word(*c))
+                            })
+                        })
                     || (word.eq_ignore_ascii_case("B") || word.eq_ignore_ascii_case("X"))
                         && bytes.get(end) == Some(&b'\'')
                     || column_cast_at(text, word, end)
@@ -3440,7 +3466,7 @@ fn lift_term(
     {
         // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
         // onto the comparison below still leaves an unknown row out.
-        let case = format!("CASE WHEN {body} THEN true WHEN NOT ({body}) THEN false END");
+        let case = format!("CASE WHEN ({body}) THEN true WHEN NOT ({body}) THEN false END");
         format!("{} = true", lift_operand(&case, schema, true)?)
     } else {
         lift_comparison(body, schema, depth)?
@@ -3930,7 +3956,7 @@ fn lift_operand_typed(
     let operand = match crate::core::processor::transformer::EvaluatedOperand::new(trimmed, schema) {
         Ok(operand) => operand,
         Err(e) => {
-            let case = format!("CASE WHEN {trimmed} THEN true WHEN NOT ({trimmed}) THEN false END");
+            let case = format!("CASE WHEN ({trimmed}) THEN true WHEN NOT ({trimmed}) THEN false END");
             match crate::core::processor::transformer::EvaluatedOperand::new(&case, schema) {
                 Ok(operand) => return Ok((encode_lifted(&case, &operand_reads(&operand, schema)), operand.db_type)),
                 Err(_) => return Err(e),

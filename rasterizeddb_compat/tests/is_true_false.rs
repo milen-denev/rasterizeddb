@@ -144,11 +144,28 @@ async fn truth_tests_over_general_expressions() {
     }
     assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
 
-    // What the expansion cannot express is refused, never approximated.
-    for predicate in ["(a IN (1, 2)) IS TRUE", "(a LIKE 'x%') IS FALSE"] {
-        let got = sqlx::query(AssertSqlSafe(format!("SELECT id FROM e WHERE {predicate}")))
+    // What the two-valued expansion cannot express is the evaluator's, as
+    // the `CASE` the test means, three-valued. PostgreSQL 17 on this table.
+    let mut wrong = Vec::new();
+    for (predicate, expected) in [
+        ("(a IN (1, 2)) IS TRUE", vec![1, 4, 5]),
+        ("(a IN (1, 2)) IS NOT TRUE", vec![2, 3]),
+        ("(a IN (1, NULL)) IS NOT FALSE", vec![1, 2, 3, 4, 5]),
+        ("(a::text LIKE '1%') IS FALSE", vec![2, 5]),
+        ("(a::text LIKE '1%') IS UNKNOWN", vec![3]),
+    ] {
+        let got = sqlx::query(AssertSqlSafe(format!("SELECT id FROM e WHERE {predicate} ORDER BY id")))
             .fetch_all(&pool)
-            .await;
-        assert!(got.is_err(), "{predicate} answered {} rows", got.map(|r| r.len()).unwrap_or(0));
+            .await
+            .map(|rows| rows.iter().map(|r| r.get::<i32, _>(0)).collect::<Vec<_>>());
+        match got {
+            Ok(ids) if ids == expected => {}
+            Ok(ids) => wrong.push(format!("{predicate}: got {ids:?}, want {expected:?}")),
+            Err(e) => wrong.push(format!("{predicate}: error {e}")),
+        }
     }
+    assert!(wrong.is_empty(), "{} wrong answers:\n{}", wrong.len(), wrong.join("\n"));
+    // `~~` has no integer operand: refused, as PostgreSQL refuses it (42883).
+    let got = sqlx::query("SELECT id FROM e WHERE (a LIKE 'x%') IS FALSE").fetch_all(&pool).await;
+    assert!(got.is_err(), "an integer LIKE answered {} rows", got.map(|r| r.len()).unwrap_or(0));
 }
