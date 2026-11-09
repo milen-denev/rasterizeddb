@@ -95,7 +95,9 @@ struct Entry {
 
 /// The databases this process serves.
 pub struct DatabaseCatalog {
-    databases: DashMap<String, Entry, ahash::RandomState>,
+    /// Behind a `std` `Arc` so the automatic compaction can hold it weakly
+    /// (`core::auto_compact`) and end with the catalogue.
+    databases: StdArc<DashMap<String, Entry, ahash::RandomState>>,
     /// Root directory, or `None` for an in-memory catalogue.
     root: Option<String>,
     /// The database a connection that names none is given, and the one that
@@ -166,6 +168,10 @@ impl DatabaseCatalog {
             }
         }
 
+        let databases = StdArc::new(databases);
+        crate::core::auto_compact::spawn(StdArc::downgrade(&databases), |map| {
+            map.iter().map(|e| e.database.clone()).collect()
+        });
         let catalogue = Arc::new(Self {
             databases,
             root: root.map(str::to_string),
@@ -194,6 +200,10 @@ impl DatabaseCatalog {
         let name = database.name.clone();
         let databases = DashMap::with_hasher(ahash::RandomState::new());
         databases.insert(name.clone(), Entry::new(database));
+        let databases = StdArc::new(databases);
+        crate::core::auto_compact::spawn(StdArc::downgrade(&databases), |map| {
+            map.iter().map(|e| e.database.clone()).collect()
+        });
         Arc::new(Self {
             databases,
             root: None,

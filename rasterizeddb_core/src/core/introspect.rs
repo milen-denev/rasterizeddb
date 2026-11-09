@@ -1050,6 +1050,17 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
         "offsets currently remembered",
     );
 
+    push(
+        "auto_compactions",
+        crate::core::auto_compact::RUNS.load(Ordering::Relaxed).to_string(),
+        "tables compacted automatically, their slots far past their live rows",
+    );
+    push(
+        "auto_compactions_skipped_busy",
+        crate::core::auto_compact::SKIPPED_BUSY.load(Ordering::Relaxed).to_string(),
+        "due compactions put off because the table was in use",
+    );
+
     let replication = &database.replication;
     push(
         "replication_peers",

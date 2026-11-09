@@ -672,3 +672,27 @@ anyway, for the same reason §9's defaults are pinned — a contract nothing sta
 
 The `WAL commit failed` log line stays alongside the returned error. It is what surfaced the truncation bug from
 a live server, and an operator watching logs should not also have to be reading the client's errors.
+
+## Automatic compaction (2026-11-09)
+
+The reclamation service gives row bytes back but never pointer slots, so a
+table whose rows are updated rather than added to (a heartbeat, a lease, a
+counter) grew its pointer file without bound until someone ran `VACUUM FULL`.
+`core::auto_compact` runs it. Once a minute it looks at every plain table.
+It compacts one whose slots are at least `AUTO_COMPACT_MIN_SLOTS` (20 000)
+and at least `AUTO_COMPACT_RATIO` (8) times its live rows, as the sweep last
+measured them, and no table more often than `AUTO_COMPACT_COOLDOWN_SECS`
+(600). The compaction is the `VACUUM FULL <table>` statement itself, run
+through the executor, so the locking and its interplay with backups and
+replication are an operator's.
+
+Compaction holds ACCESS EXCLUSIVE, so it waits at most 100 ms for the lock.
+A table in use is skipped until the next pass and counted in `SHOW STATS`
+`auto_compactions_skipped_busy`; finished runs are `auto_compactions`. At the
+default floor a run takes about 0.4 s. A database that already holds a
+table far past it (472 k slots on the production node) pays one longer run,
+about 10 s for that table, the first time.
+
+Partitioned tables are not compacted automatically: their `VACUUM FULL`
+compacts every partition and opens closed ones. `AUTO_COMPACT_ENABLED`
+(default on) turns the task off.

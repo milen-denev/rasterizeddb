@@ -355,6 +355,41 @@ pub static JSON_SHADOW_TABLES: OnceLock<bool> = OnceLock::new();
 /// entirely.
 pub static VACUUM_INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
 
+/// Whether tables whose pointer slots far outnumber their live rows are
+/// compacted automatically (`core::auto_compact`). Default: on.
+pub static AUTO_COMPACT_ENABLED: OnceLock<bool> = OnceLock::new();
+/// How often the automatic compaction looks. Default: 60 seconds.
+pub static AUTO_COMPACT_INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
+/// The fewest pointer slots a table has before it is compacted. Default:
+/// 20 000 (a compaction of that many takes about 0.4 s).
+pub static AUTO_COMPACT_MIN_SLOTS: OnceLock<u64> = OnceLock::new();
+/// How many times its live rows a table's slots must be. Default: 8.
+pub static AUTO_COMPACT_RATIO: OnceLock<u64> = OnceLock::new();
+/// The least time between two automatic compactions of one table. Default:
+/// 600 seconds.
+pub static AUTO_COMPACT_COOLDOWN_SECS: OnceLock<u64> = OnceLock::new();
+
+#[inline]
+pub fn auto_compact_enabled() -> bool {
+    *AUTO_COMPACT_ENABLED.get().unwrap_or(&true)
+}
+#[inline]
+pub fn auto_compact_interval_secs() -> u64 {
+    *AUTO_COMPACT_INTERVAL_SECS.get().unwrap_or(&60)
+}
+#[inline]
+pub fn auto_compact_min_slots() -> u64 {
+    *AUTO_COMPACT_MIN_SLOTS.get().unwrap_or(&20_000)
+}
+#[inline]
+pub fn auto_compact_ratio() -> u64 {
+    *AUTO_COMPACT_RATIO.get().unwrap_or(&8)
+}
+#[inline]
+pub fn auto_compact_cooldown_secs() -> u64 {
+    *AUTO_COMPACT_COOLDOWN_SECS.get().unwrap_or(&600)
+}
+
 /// Dead bytes below which a scan does not bother publishing a free list.
 /// Default: 8 MiB. Either this or [`VACUUM_MIN_DEAD_RATIO`] being met is enough.
 pub static VACUUM_MIN_DEAD_BYTES: OnceLock<u64> = OnceLock::new();

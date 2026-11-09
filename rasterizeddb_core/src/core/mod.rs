@@ -1,4 +1,5 @@
 #[cfg(feature = "s3_backup")]
+pub mod auto_compact;
 pub mod backup;
 pub mod bulk_load;
 pub mod cancel;
