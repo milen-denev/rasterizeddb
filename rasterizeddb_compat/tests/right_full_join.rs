@@ -209,12 +209,17 @@ async fn where_on_the_preserved_side_and_the_anti_join() {
         .await,
         sorted(vec![(None, Some(12)), (None, Some(13))])
     );
-    // Filtering the null-supplying side is refused, not pushed into its scan
-    // (which would change which rows count as unmatched).
-    let refused = sqlx::query("SELECT l.id, r.id FROM l RIGHT JOIN r ON r.k = l.k WHERE l.name = 'a'")
-        .fetch_all(&pool)
-        .await;
-    assert!(refused.is_err(), "{:?}", refused.map(|r| r.len()));
+    // Filtering the null-supplying side is not pushed into its scan (which
+    // would change which rows count as unmatched): it filters the joined
+    // rows, as PostgreSQL applies a WHERE. PostgreSQL 17's answers.
+    assert_eq!(
+        pairs(&pool, "SELECT l.id, r.id FROM l RIGHT JOIN r ON r.k = l.k WHERE l.name = 'a'").await,
+        sorted(vec![(Some(1), Some(10)), (Some(1), Some(11))])
+    );
+    assert_eq!(
+        pairs(&pool, "SELECT l.id, r.id FROM l FULL JOIN r ON r.k = l.k WHERE r.n > 150 OR l.name = 'e'").await,
+        sorted(vec![(Some(3), Some(15)), (Some(5), Some(14)), (None, Some(12)), (None, Some(13))])
+    );
 }
 
 #[tokio::test]

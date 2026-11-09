@@ -280,12 +280,13 @@ async fn an_anti_join_on_a_nullable_key() {
         assert_eq!(ids(&mut conn, sql).await.unwrap_or_else(|e| panic!("{sql}: {e}")), want, "{sql}");
     }
     // A FULL join keeps the right side's own NULL-keyed rows *present*, so
-    // `IS NULL` there is not "unmatched". Refused or answered right — never
-    // answered with only the unmatched pool.
-    let sql = "SELECT p.id FROM pool p FULL JOIN task t ON t.pool_id = p.id WHERE t.pool_id IS NULL";
-    if let Ok(got) = ids(&mut conn, sql).await {
-        panic!("{sql}: answered {got:?}; PostgreSQL also returns the three pool-less tasks");
-    }
+    // `IS NULL` there is not "unmatched": never answered with only the
+    // unmatched pool. It filters the joined rows; PostgreSQL 17's answer.
+    let sql = "SELECT coalesce(p.id, 0), coalesce(t.id, 0) FROM pool p FULL JOIN task t ON t.pool_id = p.id \
+               WHERE t.pool_id IS NULL ORDER BY 1, 2";
+    let rows = sqlx::query(AssertSqlSafe(sql.to_string())).fetch_all(&mut conn).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let got: Vec<(i32, i32)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(got, vec![(0, 14), (0, 15), (0, 16), (3, 0)], "{sql}");
 }
 
 /// Every join kind over nullable keys, through a real scan, against the
