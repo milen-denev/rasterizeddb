@@ -3195,20 +3195,40 @@ pub fn plan(
                             relations[left_rel].label
                         )
                     };
-                    let eq = term.find('=').ok_or_else(malformed)?;
-                    // Not `!=`, `>=` or `<=` wearing an `=`.
-                    let lhs = term[..eq].trim();
-                    if lhs.ends_with(['!', '>', '<']) || term[eq + 1..].starts_with('=') {
+                    // An INNER join's condition that is not a key equality
+                    // (`a.id < b.id`) is a filter on the joined pair, the same
+                    // as a WHERE term, so it joins the post-join predicates —
+                    // unless a later RIGHT or FULL join can pad these rows
+                    // with NULLs, after which a filter would drop what the
+                    // ON kept.
+                    let padded_later = relations[i + 1..].iter().any(|later| {
+                        later.join.as_ref().is_some_and(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full))
+                    });
+                    let key_equality = || -> Option<(usize, SchemaField, usize, SchemaField)> {
+                        let eq = term.find('=')?;
+                        let lhs = term[..eq].trim();
+                        if lhs.ends_with(['!', '>', '<']) || term[eq + 1..].starts_with('=') {
+                            return None;
+                        }
+                        let (p_rel, p_field) = resolve(lhs).ok()?;
+                        let (q_rel, q_field) = resolve(term[eq + 1..].trim()).ok()?;
+                        Some((p_rel, p_field, q_rel, q_field))
+                    };
+                    let Some((p_rel, p_field, q_rel, q_field)) = key_equality() else {
+                        if raw.kind == JoinKind::Inner && !padded_later {
+                            expression_joins.push(term.clone());
+                            continue;
+                        }
                         return Err(malformed());
-                    }
-                    let (p_rel, p_field) = resolve(lhs)?;
-                    let (q_rel, q_field) = resolve(term[eq + 1..].trim())?;
+                    };
                     // Order the pair the same way as the primary key: left
                     // relation first, this one second.
                     if p_rel == left_rel && q_rel == i {
                         keys.push((p_field.name.clone(), q_field.name.clone()));
                     } else if q_rel == left_rel && p_rel == i {
                         keys.push((q_field.name.clone(), p_field.name.clone()));
+                    } else if raw.kind == JoinKind::Inner && !padded_later {
+                        expression_joins.push(term.clone());
                     } else {
                         return Err(malformed());
                     }
@@ -3273,7 +3293,12 @@ pub fn plan(
                         AntiJoin::Unmatched => {
                             anti_join[rel] = true;
                         }
-                        AntiJoin::NotApplicable(reason) => return Err(reason),
+                        // Any other term is answered where PostgreSQL answers
+                        // a WHERE: after the join, over the padded rows, so an
+                        // unmatched row's NULLs make it unknown. It was refused
+                        // ("only '<column> IS NULL' is supported there"), and
+                        // `LEFT JOIN … WHERE b.n > 0` is an ordinary query.
+                        AntiJoin::NotApplicable(_) => cross_relation.push(conjunct),
                     }
                 } else {
                     predicates[rel].push(conjunct);

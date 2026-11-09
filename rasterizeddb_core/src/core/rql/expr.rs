@@ -9149,11 +9149,14 @@ mod tests {
             ("('2.5'::real)::smallint", 2),
             ("('2.7'::float8)::int", 3),
             ("('-2.7'::float8)::int", -3),
-            // Not a float: half away, unchanged.
-            ("'2.5'::int", 3),
+            // Not a float: a numeric rounds half away. (Quoted, `'2.5'` is
+            // text, which the integer input refuses, as PostgreSQL's does.)
+            ("2.5::int", 3),
+            ("(-2.5)::int", -3),
         ] {
             assert_eq!(int_of(eval(&parse(sql, &s).unwrap(), &r, &s).unwrap()), want, "{sql}");
         }
+        assert!(eval(&parse("'2.5'::int", &s).unwrap(), &r, &s).is_err());
         // The range check is on the rounded value: 32766.5 rounds to the even
         // 32766, 32767.5 to 32768, which no smallint holds.
         assert_eq!(int_of(eval(&parse("('32766.5'::float8)::smallint", &s).unwrap(), &r, &s).unwrap()), 32766);
