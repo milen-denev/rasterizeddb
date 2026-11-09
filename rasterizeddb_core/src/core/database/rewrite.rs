@@ -214,7 +214,7 @@ pub(crate) struct Backup {
 
 impl Database {
     /// The provider family `name`'s files resolve from.
-    async fn seed_of(&self, name: &str) -> Arc<DbStorageProvider> {
+    pub(super) async fn seed_of(&self, name: &str) -> Arc<DbStorageProvider> {
         seed_in(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, name).await
     }
 

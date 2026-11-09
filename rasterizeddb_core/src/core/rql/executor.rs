@@ -18604,12 +18604,16 @@ fn fk_parent_of_clause(description: &str) -> Option<String> {
 /// A DDL statement of an explicit block, from before it runs to its end
 /// (finding L5, docs/persistent-indexes.md §7 "As built (B5)").
 ///
-/// DDL is not transactional here: what a DDL statement changed is changed
-/// whether the block commits or not. So the ACCESS EXCLUSIVE it took on a
-/// table is not held to the block's end, as PostgreSQL holds it, which
-/// would stop every reader of the table for as long as the block stays
-/// open. At the statement's end each table it newly holds ACCESS EXCLUSIVE
-/// on goes back to what the block needs there:
+/// Only for DDL that is not transactional here, what `database::block_ddl`
+/// does not cover (a DROP, a CREATE INDEX, a partitioned or key/value
+/// table): what such a statement changed is changed whether the block
+/// commits or not. So the ACCESS EXCLUSIVE it took on a table is not held to
+/// the block's end, as PostgreSQL holds it, which would stop every reader of
+/// the table for as long as the block stays open. (A `CREATE TABLE` or
+/// `ALTER TABLE` that rolls back with its block keeps its lock to the end,
+/// as PostgreSQL's does, and never reaches [`BlockDdl::end`].) At the
+/// statement's end each table it newly holds ACCESS EXCLUSIVE on goes back
+/// to what the block needs there:
 /// - **downgraded to ROW EXCLUSIVE** when the block has written the table's
 ///   file set (it holds ROW EXCLUSIVE beside the AE: it wrote the table
 ///   before, or the rewrite carried its versions, `rewrite_rows`). Its

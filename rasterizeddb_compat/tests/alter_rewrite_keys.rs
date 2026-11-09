@@ -5,8 +5,8 @@
 //!
 //! B5 recreates the files and writes every version with its own xmin and
 //! xmax (`Table::insert_version`), with no uniqueness check of its own.
-//! Expected answers are PostgreSQL 17's (which also rolls the ALTER back;
-//! DDL is not transactional here, so only the rows are asserted).
+//! Expected answers are PostgreSQL 17's (which also rolls the ALTER back,
+//! as this engine does now, `ddl_rolls_back`; only the rows are asserted).
 
 use rasterizeddb_compat::TestServer;
 use sqlx::{AssertSqlSafe, Executor, Row};

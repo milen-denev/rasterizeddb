@@ -2260,10 +2260,13 @@ through `table_for`).
 is final and its post-commit work is done (§2 Ticket lifetime); an autocommit
 statement's at its end. AS is held to the end of a block, which matters at
 REPEATABLE READ: a rewrite reinserts only rows visible now
-(`visibility_now_for`), dropping versions an older snapshot still reads. DDL
-is not transactional here, so an AE taken in a block is released when the DDL
-statement ends, and the family keeps what it held before (as built in B5,
-downgraded to ROW EXCLUSIVE where the family wrote the table: finding L5).
+(`visibility_now_for`), dropping versions an older snapshot still reads. A
+block's `CREATE TABLE` or `ALTER TABLE` rolls back with it
+(`database::block_ddl`, 2026-11-09) and keeps its AE to the block's end, as
+PostgreSQL's does. Other DDL is not transactional here, so an AE it takes in a
+block is released when the statement ends, and the family keeps what it held
+before (as built in B5, downgraded to ROW EXCLUSIVE where the family wrote the
+table: finding L5).
 
 **Granting.** PostgreSQL's rule (`ProcSleep` and `ProcLockWakeup`), keyed by
 owner. A request is granted when it conflicts with no mode another owner

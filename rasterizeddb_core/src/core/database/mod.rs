@@ -54,6 +54,9 @@ pub mod slots;
 pub mod table_for;
 pub mod reload;
 pub(crate) mod rewrite;
+pub(crate) mod block_ddl;
+#[cfg(test)]
+mod block_ddl_tests;
 #[cfg(test)]
 mod rewrite_tests;
 #[cfg(test)]
@@ -417,6 +420,13 @@ fn table_name_refusal(name: &str) -> Option<String> {
             "table names beginning with \"{}\" are reserved for the copy a table's files are held in \
              while an ALTER changes them",
             rewrite::BACKUP_PREFIX
+        ));
+    }
+    if name.starts_with(block_ddl::COPY_PREFIX) {
+        return Some(format!(
+            "table names beginning with \"{}\" are reserved for the copy a table's files are held in \
+             while a transaction's DDL may yet roll back",
+            block_ddl::COPY_PREFIX
         ));
     }
     table_stem_refusal(name)
@@ -1335,6 +1345,10 @@ pub struct Database {
     /// `RENAME … TO` refuse them, and no further rename starts meanwhile (it
     /// would overwrite the intent that finishes the job).
     held_names: parking_lot::Mutex<Vec<String>>,
+    /// Each open block's DDL undo steps, by its root transaction
+    /// (`block_ddl`): copies of the tables it changed and the tables it
+    /// created, undone if it aborts.
+    block_ddl: DashMap<crate::core::mvcc::TxId, Vec<block_ddl::Step>, ahash::RandomState>,
 
     /// Held by a rename, plain or partitioned (`rename_partitioned`), from
     /// its check of `held_names` to its last word on the intent: there is one `__rename.intent` (and one
@@ -1595,6 +1609,17 @@ impl Database {
             error!("The transaction status log is not covered by the WAL: {}", e);
         }
         let transactions = StdArc::new(TransactionManager::new(status));
+        // A block's DDL a crash interrupted (`block_ddl`): before any table
+        // opens, the copies of a block that did not commit put back, and the
+        // tables it created named, to drop once the database is open.
+        let block_ddl_drops = if in_memory {
+            Vec::new()
+        } else {
+            block_ddl::recover_files(&io_pointers, &storage, &kv_stores, &seeds, |tx| {
+                transactions.outcome(tx) == crate::core::mvcc::TxOutcome::Committed
+            })
+            .await
+        };
         // No forgetting until every table holding rows is registered: plain
         // tables register (and start their vacuum, which forgets) below,
         // partitioned ones after the database exists, and a forget in the
@@ -1773,6 +1798,7 @@ impl Database {
             kv: kv_stores,
             seeds,
             held_names: parking_lot::Mutex::new(held.into_iter().collect()),
+            block_ddl: DashMap::with_hasher(ahash::RandomState::new()),
             rename_serial: tokio::sync::Mutex::new(()),
             #[cfg(feature = "kv_cache")]
             kv_cache: {
@@ -1785,6 +1811,7 @@ impl Database {
         drop(startup_forget_pause);
         // The plain tables went into the map before the database existed.
         database.rebuild_fk_reverse();
+        database.finish_block_ddl_recovery(block_ddl_drops).await;
         Ok(database)
     }
 

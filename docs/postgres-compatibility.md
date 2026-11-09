@@ -1166,8 +1166,27 @@ sea-orm's nested transactions both work. Rolling back to a savepoint also
 un-poisons a failed block, which is the reason the feature exists: recovering
 from one failed statement without losing the whole transaction.
 
-Not built: blocking-on-conflict (the second updater is told to retry rather than
-made to wait), and write-skew detection under `SERIALIZABLE`. See `docs/mvcc.md`.
+**DDL in a block rolls back with it** for `CREATE TABLE` and `ALTER TABLE` on
+plain tables (`database::block_ddl`): before the statement runs, the tables it
+changes are copied aside and an intent naming the block's transaction is
+written; `COMMIT` discards the copies, and `ROLLBACK`, a failed statement, a
+dropped connection or a crash puts them back and drops the tables the block
+created. `ROLLBACK TO SAVEPOINT` undoes the DDL since the savepoint. So a
+migration that fails part-way leaves the schema as it found it,
+and its retry does not fail on "already exists". As in PostgreSQL, the block
+keeps the statement's ACCESS EXCLUSIVE to its end: another session's reads and
+writes of the table wait for it. Still applied at once, and warned about in the
+log: `DROP TABLE`, `CREATE INDEX`, and DDL on a partitioned table or one on a
+key/value store. The copy costs a pass over the table's files, so an `ALTER`
+of a big table in a block takes that much longer than one outside.
+
+At `READ COMMITTED` a writer that meets a row another transaction is changing
+waits for it, as PostgreSQL's does, then re-reads the row and applies its own
+change to the committed version if the row still qualifies (or skips it).
+`REPEATABLE READ` still raises `40001`. The wait ends at `lock_timeout`
+(`55P03`), `statement_timeout`, a cancel, or a deadlock (`40P01`).
+
+Not built: write-skew detection under `SERIALIZABLE`. See `docs/mvcc.md`.
 
 ### Row locks (`FOR UPDATE`, `FOR SHARE`, `SKIP LOCKED`, `NOWAIT`)
 

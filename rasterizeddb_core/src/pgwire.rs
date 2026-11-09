@@ -1897,6 +1897,7 @@ where
         // `Database::abort_transaction`, not the manager's `abort`: the latter
         // ends the transaction but leaves its row and key locks in the lock
         // table and its replication buffers in the capture map.
+        database.block_ddl_abort(t.id).await;
         t.abort_unless_aborted(database);
         t.owner.release();
     }
@@ -2175,6 +2176,7 @@ where
         state.end_block_settings(&t);
         // What `ROLLBACK` does, row locks and replication buffers included:
         // releasing what the idle block holds is the point of the timeout.
+        database.block_ddl_abort(t.id).await;
         t.abort_unless_aborted(database);
         t.owner.release();
     } else {
@@ -2504,6 +2506,9 @@ struct Savepoint {
     /// `ROLLBACK TO` restores it, as PostgreSQL does: a `SET LOCAL` made after
     /// the savepoint is undone along with the writes it accompanied.
     synchronous_commit: Option<bool>,
+    /// How many DDL steps the block had registered when this was set
+    /// (`database::block_ddl`): `ROLLBACK TO` undoes the ones after.
+    ddl_steps: usize,
 }
 
 /// An open `BEGIN` block.
@@ -5008,6 +5013,8 @@ where
         // only failed, as before: ROLLBACK TO revives it, and the family
         // keeps its locks until then (per-savepoint release is v2).
         if t.savepoints.is_empty() {
+            let database = t.database.clone();
+            database.block_ddl_abort(t.id).await;
             t.abort_now();
         }
     }
@@ -5427,22 +5434,38 @@ where
                     // A block's DDL gives its ACCESS EXCLUSIVE back at its
                     // end (finding L5): see `executor::BlockDdl`.
                     let ddl = crate::core::rql::executor::BlockDdl::begin(database, root, stmt);
+                    // A block's CREATE TABLE and ALTER TABLE roll back with it
+                    // (`database::block_ddl`): its tables kept aside first,
+                    // under the lock the statement takes, which the block
+                    // then keeps to its end.
+                    let mut transactional = false;
                     let result = crate::core::mvcc::owner::under(
                         &transactions,
                         root,
                         crate::core::mvcc::owner::OwnerKind::Block,
-                        crate::core::notice::collect_with(trace_partitions, execute_recorded_inner(
-                            database,
-                            state,
-                            stream,
-                            stmt,
-                            result_formats,
-                            omit_description,
-                            prepared,
-                        )),
+                        crate::core::notice::collect_with(trace_partitions, async {
+                            if ddl.is_some() {
+                                match database.block_ddl_prepare(root, stmt).await {
+                                    Ok(t) => transactional = t,
+                                    Err(e) => return fail_statement(state, stream, "55000", &e).await,
+                                }
+                            }
+                            execute_recorded_inner(
+                                database,
+                                state,
+                                stream,
+                                stmt,
+                                result_formats,
+                                omit_description,
+                                prepared,
+                            )
+                            .await
+                        }),
                     )
                     .await;
-                    if let Some(ddl) = ddl {
+                    if let Some(ddl) = ddl
+                        && !transactional
+                    {
                         ddl.end(database);
                     }
                     result
@@ -6222,8 +6245,10 @@ where
         None => (stmt, false),
     };
 
-    // DDL does not participate in rollback here: an ALTER or DROP applied
-    // inside this block persists even if the block later aborts. Every
+    // DDL outside `database::block_ddl`'s phase 1 does not participate in
+    // rollback here: a DROP, a CREATE INDEX, or an ALTER of a partitioned or
+    // key/value table applied inside this block persists even if the block
+    // later aborts. Every
     // PostgreSQL client assumes the opposite — a migration runner wraps its
     // statements in one transaction precisely to get all-or-nothing — so the
     // divergence is warned when it becomes possible, which is the only moment
@@ -6232,7 +6257,9 @@ where
         let head = stmt.trim_start().to_ascii_uppercase();
         // Not TRUNCATE: it deletes rows in the block's transaction, and
         // rolls back with it (`executor::execute_truncate`).
-        if head.starts_with("CREATE") || head.starts_with("ALTER") || head.starts_with("DROP") {
+        if (head.starts_with("CREATE") || head.starts_with("ALTER") || head.starts_with("DROP"))
+            && !database.block_ddl_covers(stmt)
+        {
             log::warn!(
                 "DDL inside an explicit transaction cannot be rolled back by this engine; if this block aborts, its effects will persist: {}",
                 stmt.chars().take(120).collect::<String>()
@@ -8315,6 +8342,7 @@ async fn commit_block(
 
     if !wrote {
         let family = database.commit_transaction(t.id);
+        database.block_ddl_commit(t.id).await;
         t.owner.release();
         database.publish_transaction(family).await;
         return Ok(());
@@ -8328,6 +8356,7 @@ async fn commit_block(
         Ok(family) => family,
         Err(e) => {
             log::error!("Could not make the block's rows durable: {}", e);
+            database.block_ddl_abort(t.id).await;
             database.abort_transaction(t.id);
             flush_outcomes(database);
             t.owner.release();
@@ -8355,6 +8384,7 @@ async fn commit_block(
     // would have concluded anyway.
     if let Err(e) = database.transactions.flush_deferred() {
         log::error!("Could not record the transaction outcome: {}", e);
+        database.block_ddl_abort(t.id).await;
         database.abort_transaction(t.id);
         t.owner.release();
         return Err((
@@ -8377,6 +8407,7 @@ async fn commit_block(
     if state.synchronous_commit() {
         if let Err(e) = database.sync_own_location() {
             log::error!("Could not make the block's rows durable: {}", e);
+            database.block_ddl_abort(t.id).await;
             database.abort_transaction(t.id);
             flush_outcomes(database);
             t.owner.release();
@@ -8387,8 +8418,10 @@ async fn commit_block(
         }
     }
 
-    // The last durability step is done: the block's table locks go now,
-    // before the reply (finding L4).
+    // The last durability step is done: the block's DDL copies are not
+    // needed any more, and its table locks go now, before the reply
+    // (finding L4).
+    database.block_ddl_commit(t.id).await;
     t.owner.release();
     // Durable, so the block's writes may now go to the other instances.
     // Before the flush they could have been published and then rolled back
@@ -8413,6 +8446,7 @@ where
     };
     state.end_block_settings(&t);
     if t.failed {
+        database.block_ddl_abort(t.id).await;
         t.abort_unless_aborted(database);
         t.owner.release();
         return Ok(());
@@ -8570,6 +8604,7 @@ where
                 // something for it to disown; a block that only read leaves
                 // nothing behind for a restart to misread. A block its error
                 // already aborted (R3) has nothing left to abort.
+                database.block_ddl_abort(t.id).await;
                 t.abort_unless_aborted(database);
                 t.owner.release();
                 send_command_complete(stream, "ROLLBACK").await?;
@@ -8711,6 +8746,7 @@ where
                     name,
                     id,
                     synchronous_commit: established_with,
+                    ddl_steps: database.block_ddl_len(t.id),
                 });
                 send_command_complete(stream, "SAVEPOINT").await?;
             }
@@ -8745,6 +8781,16 @@ where
                         .await?;
                     }
                     Some(index) => {
+                        // DDL since the savepoint first, under the locks the
+                        // block still holds, as a ROLLBACK undoes it. One
+                        // that cannot be undone leaves the block failed
+                        // rather than let it commit over the change.
+                        let ddl_steps = t.savepoints[index].ddl_steps;
+                        if let Err(e) = database.block_ddl_rollback_to(t.id, ddl_steps).await {
+                            t.failed = true;
+                            send_error_response(stream, "XX000", &e).await?;
+                            return Ok(true);
+                        }
                         // Everything after it goes, and so does its own work —
                         // including a `SET LOCAL` made after it. Captured here
                         // and applied once the borrow of `state` ends.
@@ -8760,6 +8806,7 @@ where
                             id: fresh,
                             // Re-established at the value just restored.
                             synchronous_commit: restore_sync.flatten(),
+                            ddl_steps,
                         });
 
                         // The block is usable again: rolling back to a savepoint
@@ -8824,6 +8871,7 @@ where
                 // A block that wrote nothing has no versions to make invisible,
                 // so its aborted record does not have to reach disk either. A
                 // block its error already aborted (R3): a no-op.
+                database.block_ddl_abort(t.id).await;
                 t.abort_unless_aborted(database);
                 t.owner.release();
             }
