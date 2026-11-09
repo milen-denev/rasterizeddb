@@ -3319,6 +3319,10 @@ pub fn static_type(expr: &Expr) -> DbType {
                 DbType::DATETIME
             } else if matches!(ty(lhs), DbType::INTERVAL) && matches!(ty(rhs), DbType::INTERVAL) {
                 DbType::INTERVAL
+            } else if (matches!(ty(lhs), DbType::INTERVAL) || matches!(ty(rhs), DbType::INTERVAL))
+                && matches!(op, ArithOp::Mul | ArithOp::Div)
+            {
+                DbType::INTERVAL
             } else if matches!(ty(lhs), DbType::F32 | DbType::F64)
                 || matches!(ty(rhs), DbType::F32 | DbType::F64)
             {
@@ -3489,16 +3493,52 @@ pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> 
         ) else {
             return Err("an interval could not be read".to_string());
         };
-        let sign = if matches!(op, ArithOp::Add) { 1 } else { -1 };
-        let sum = crate::core::pg_types::Interval {
-            months: x.months + sign * y.months,
-            days: x.days + sign * y.days,
-            micros: x.micros + sign as i64 * y.micros,
+        // Checked, as PostgreSQL's `interval_pl`: past a field's range is
+        // "interval out of range", never a wrapped value.
+        let out = || "interval out of range".to_string();
+        let sum = if matches!(op, ArithOp::Add) {
+            crate::core::pg_types::Interval {
+                months: x.months.checked_add(y.months).ok_or_else(out)?,
+                days: x.days.checked_add(y.days).ok_or_else(out)?,
+                micros: x.micros.checked_add(y.micros).ok_or_else(out)?,
+            }
+        } else {
+            crate::core::pg_types::Interval {
+                months: x.months.checked_sub(y.months).ok_or_else(out)?,
+                days: x.days.checked_sub(y.days).ok_or_else(out)?,
+                micros: x.micros.checked_sub(y.micros).ok_or_else(out)?,
+            }
         };
         return Ok(Value::Data {
             bytes: crate::core::pg_types::encode_interval(sum),
             db_type: DbType::INTERVAL,
         });
+    }
+
+    // `interval * n`, `n * interval`, `interval / n`: PostgreSQL's
+    // `interval_mul` and `interval_div`, a fraction of a month carried into
+    // days and of a day into the time (`pg_types::interval_div`).
+    if (is_interval(a) || is_interval(b)) && matches!(op, ArithOp::Mul | ArithOp::Div) {
+        let (span, number) = if is_interval(a) { (a, b) } else { (b, a) };
+        if is_interval(number) || (matches!(op, ArithOp::Div) && !is_interval(a)) {
+            return Err(format!("operator does not exist: {} {} {}", if is_interval(a) { "interval" } else { "number" }, op.symbol(), "interval"));
+        }
+        let Value::Data { bytes, .. } = span else {
+            return Ok(Value::Null);
+        };
+        let iv = crate::core::pg_types::decode_interval(bytes).ok_or("an interval could not be read")?;
+        let factor = match number {
+            Value::Null => return Ok(Value::Null),
+            Value::Data { bytes, db_type: DbType::DECIMAL } => decimal_value_as_pgnum(bytes)?.to_text().parse::<f64>().map_err(|e| e.to_string())?,
+            other => as_f64(other).ok_or_else(|| format!("'{}' needs a number beside an interval", op.symbol()))?,
+        };
+        let scaled = match op {
+            ArithOp::Div if factor == 0.0 => return Err("division by zero".to_string()),
+            ArithOp::Div => crate::core::pg_types::interval_div(iv, factor),
+            _ => crate::core::pg_types::interval_mul(iv, factor),
+        }
+        .ok_or("interval out of range")?;
+        return Ok(Value::Data { bytes: crate::core::pg_types::encode_interval(scaled), db_type: DbType::INTERVAL });
     }
 
     // A timestamp plus an interval is a timestamp; the difference of two
@@ -6783,7 +6823,13 @@ fn date_field_value(field: &str, value: &Value) -> Result<Option<crate::core::rq
             "DECADE" => PgNum::int(span.months as i128 / 120),
             "CENTURY" => PgNum::int(span.months as i128 / 1200),
             "MILLENNIUM" => PgNum::int(span.months as i128 / 12000),
-            "EPOCH" => at(us + (span.days as i128 + span.months as i128 * 30) * 86_400_000_000)?,
+            // A year is 365.25 days (31 557 600 s) and the months left over
+            // thirty each, as PostgreSQL's `interval_part` counts them: at
+            // twelve thirty-day months, `'2 years 3 mons'` was ten and a half
+            // days short.
+            "EPOCH" => at(us
+                + (span.months / 12) as i128 * 31_557_600_000_000
+                + ((span.months % 12) as i128 * 30 + span.days as i128) * 86_400_000_000)?,
             other => return Err(format!("unit \"{}\" not supported for type interval", other.to_lowercase())),
         }));
     }

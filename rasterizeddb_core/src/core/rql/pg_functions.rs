@@ -58,6 +58,9 @@ pub enum PgFunc {
     Gcd,
     WidthBucket,
     Factorial,
+    JustifyHours,
+    JustifyDays,
+    JustifyInterval,
     Lcm,
     MakeDate,
     MakeTimestamp,
@@ -90,7 +93,7 @@ pub const NAMES: &[&str] = &[
     "LEFT", "RIGHT", "SUBSTR", "SUBSTRING", "STRPOS", "POSITION", "REVERSE", "REPEAT", "CONCAT", "CONCAT_WS",
     "SPLIT_PART", "TRANSLATE", "ASCII", "CHR", "STARTS_WITH", "INITCAP", "MD5", "TO_HEX", "QUOTE_LITERAL",
     "FORMAT", "REGEXP_REPLACE", "CEIL", "CEILING", "FLOOR", "SIGN", "POWER", "POW", "SQRT", "CBRT", "EXP", "LN",
-    "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "MAKE_DATE", "MAKE_TIMESTAMP",
+    "LOG", "LOG10", "PI", "DEGREES", "RADIANS", "RANDOM", "DIV", "GCD", "LCM", "WIDTH_BUCKET", "FACTORIAL", "JUSTIFY_HOURS", "JUSTIFY_DAYS", "JUSTIFY_INTERVAL", "MAKE_DATE", "MAKE_TIMESTAMP",
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
@@ -184,6 +187,9 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "GCD" => (Gcd, &[2]),
         "WIDTH_BUCKET" => (WidthBucket, &[4]),
         "FACTORIAL" => (Factorial, &[1]),
+        "JUSTIFY_HOURS" => (JustifyHours, &[1]),
+        "JUSTIFY_DAYS" => (JustifyDays, &[1]),
+        "JUSTIFY_INTERVAL" => (JustifyInterval, &[1]),
         "LCM" => (Lcm, &[2]),
         "MAKE_DATE" => (MakeDate, &[3]),
         "MAKE_TIMESTAMP" => (MakeTimestamp, &[6]),
@@ -257,7 +263,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         },
         MakeDate | ToDate => DbType::DATE,
         MakeTimestamp | ToTimestamp => DbType::DATETIME,
-        Age => DbType::INTERVAL,
+        Age | JustifyHours | JustifyDays | JustifyInterval => DbType::INTERVAL,
         Decode => DbType::BYTEA,
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
@@ -741,6 +747,48 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
                 (scaled / width) as i64 + 1
             };
             int_value(i32::try_from(bucket).map_err(|_| "integer out of range")? as i64)
+        }
+        // `timestamp.c`'s three: whole days out of the time, whole months
+        // out of the days (thirty each), then the signs made to agree.
+        JustifyHours | JustifyDays | JustifyInterval => {
+            let Value::Data { bytes, db_type: DbType::INTERVAL } = &args[0] else {
+                return Err(format!("function {}(unknown) does not exist", format!("{func:?}").to_lowercase()));
+            };
+            let iv = crate::core::pg_types::decode_interval(bytes).ok_or("an interval could not be read")?;
+            let (mut month, mut day, mut time) = (iv.months as i64, iv.days as i64, iv.micros);
+            const DAY: i64 = 86_400_000_000;
+            if func != JustifyDays {
+                let whole = time / DAY;
+                time -= whole * DAY;
+                day += whole;
+            }
+            if func != JustifyHours {
+                let whole = day / 30;
+                day -= whole * 30;
+                month += whole;
+                if month > 0 && (day < 0 || (func == JustifyInterval && day == 0 && time < 0)) {
+                    day += 30;
+                    month -= 1;
+                } else if month < 0 && (day > 0 || (func == JustifyInterval && day == 0 && time > 0)) {
+                    day -= 30;
+                    month += 1;
+                }
+            }
+            if func != JustifyDays {
+                if day > 0 && time < 0 {
+                    time += DAY;
+                    day -= 1;
+                } else if day < 0 && time > 0 {
+                    time -= DAY;
+                    day += 1;
+                }
+            }
+            let out = crate::core::pg_types::Interval {
+                months: i32::try_from(month).map_err(|_| "interval out of range")?,
+                days: i32::try_from(day).map_err(|_| "interval out of range")?,
+                micros: time,
+            };
+            data(crate::core::pg_types::encode_interval(out), DbType::INTERVAL)
         }
         Factorial => {
             let n = int_of(&args[0], "the value")?;

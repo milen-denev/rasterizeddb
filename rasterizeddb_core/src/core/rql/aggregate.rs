@@ -197,6 +197,7 @@ impl AggFunc {
             AggFunc::Count => DbType::I64,
             AggFunc::Min | AggFunc::Max => arg.cloned().unwrap_or(DbType::I64),
             AggFunc::Sum => match arg {
+                Some(DbType::INTERVAL) => DbType::INTERVAL,
                 Some(DbType::F32) => DbType::F32,
                 Some(DbType::F64) => DbType::F64,
                 Some(
@@ -220,6 +221,7 @@ impl AggFunc {
             | AggFunc::VarSamp
             | AggFunc::VarPop => match arg {
                 Some(DbType::F32) | Some(DbType::F64) => DbType::F64,
+                Some(DbType::INTERVAL) if *self == AggFunc::Avg => DbType::INTERVAL,
                 _ => DbType::DECIMAL,
             },
             AggFunc::StringAgg => DbType::STRING,
@@ -1081,6 +1083,16 @@ pub(crate) enum Acc {
         total: f64,
         n: i64,
     },
+    /// `SUM`/`AVG` over intervals: months, days and microseconds summed
+    /// apart, as PostgreSQL's `interval_pl` adds them. Over an interval the
+    /// exact accumulator read the sixteen bytes as a number and the result
+    /// came back NULL.
+    IntervalSum {
+        months: i64,
+        days: i64,
+        micros: i128,
+        n: i64,
+    },
     /// `stddev`/`variance` over exact values, as PostgreSQL's
     /// `NumericAggState`: the count, sum and sum of squares, exactly. `sum`
     /// stands at `scale` places (the most any value had) and `sum_sq` at
@@ -1226,6 +1238,7 @@ impl Acc {
             },
             AggFunc::Sum | AggFunc::Avg => match arg.map(|f| &f.db_type) {
                 Some(DbType::F32) | Some(DbType::F64) => Acc::FloatSum { total: 0.0, n: 0 },
+                Some(DbType::INTERVAL) => Acc::IntervalSum { months: 0, days: 0, micros: 0, n: 0 },
                 other => {
                     let scaled = matches!(other, Some(DbType::DECIMAL));
                     let declared = arg.and_then(|f| f.scale);
@@ -1388,6 +1401,15 @@ impl Acc {
                     }
                     *n += 1;
                 }
+            }
+            Acc::IntervalSum { months, days, micros, n } => {
+                let Some(iv) = bytes.and_then(crate::core::pg_types::decode_interval) else {
+                    return;
+                };
+                *months += iv.months as i64;
+                *days += iv.days as i64;
+                *micros += iv.micros as i128;
+                *n += 1;
             }
             Acc::FloatSum { total, n } => {
                 let (Some(b), Some(t)) = (bytes, ty) else {
@@ -1587,6 +1609,15 @@ impl Acc {
                 *n += *n2;
             }
             (
+                Acc::IntervalSum { months, days, micros, n },
+                Acc::IntervalSum { months: m2, days: d2, micros: u2, n: n2 },
+            ) => {
+                *months += *m2;
+                *days += *d2;
+                *micros += *u2;
+                *n += *n2;
+            }
+            (
                 Acc::Extreme {
                     best, ty, want_max, ..
                 },
@@ -1637,7 +1668,7 @@ impl Acc {
         match self {
             Acc::Extreme { best: None, .. } => Ok(None),
             // SUM and AVG over no rows at all are NULL in SQL; COUNT is not.
-            Acc::ExactSum { n: 0, .. } | Acc::FloatSum { n: 0, .. }
+            Acc::ExactSum { n: 0, .. } | Acc::FloatSum { n: 0, .. } | Acc::IntervalSum { n: 0, .. }
                 if !matches!(func, AggFunc::Count) =>
             {
                 Ok(None)
@@ -1950,6 +1981,19 @@ impl Acc {
                     }
                     _ => return encode_exact(*total, result_type),
                 }
+            }
+            Acc::IntervalSum { months, days, micros, n } => {
+                let out_of_range = || "interval out of range".to_string();
+                let sum = crate::core::pg_types::Interval {
+                    months: i32::try_from(*months).map_err(|_| out_of_range())?,
+                    days: i32::try_from(*days).map_err(|_| out_of_range())?,
+                    micros: i64::try_from(*micros).map_err(|_| out_of_range())?,
+                };
+                let value = match func {
+                    AggFunc::Avg if *n > 0 => crate::core::pg_types::interval_div(sum, *n as f64).ok_or_else(out_of_range)?,
+                    _ => sum,
+                };
+                crate::core::pg_types::encode_interval(value)
             }
             Acc::FloatSum { total, n } => {
                 let v = match func {

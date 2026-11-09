@@ -326,6 +326,51 @@ pub fn decode_interval(bytes: &[u8]) -> Option<Interval> {
     })
 }
 
+/// PostgreSQL's `interval_div`: each part divided, the months' fraction
+/// carried down into days (thirty a month) and the days' into seconds, each
+/// carry rounded to the microsecond (`TSROUND`), as `avg(interval)` and
+/// `interval / n` compute it. `None` when the result does not fit.
+pub fn interval_div(span: Interval, factor: f64) -> Option<Interval> {
+    if factor == 0.0 || !factor.is_finite() {
+        return None;
+    }
+    interval_scaled(span, |x| x / factor)
+}
+
+/// PostgreSQL's `interval_mul`, `interval * n`: [`interval_div`]'s carries
+/// over each part multiplied.
+pub fn interval_mul(span: Interval, factor: f64) -> Option<Interval> {
+    if !factor.is_finite() {
+        return None;
+    }
+    interval_scaled(span, |x| x * factor)
+}
+
+fn interval_scaled(span: Interval, scale: impl Fn(f64) -> f64) -> Option<Interval> {
+    let tsround = |j: f64| (j * 1_000_000.0).round_ties_even() / 1_000_000.0;
+    let month_q = scale(span.months as f64);
+    let day_q = scale(span.days as f64);
+    let mut months = month_q.trunc();
+    let mut days = day_q.trunc();
+    let month_remainder_days = tsround((month_q - months) * 30.0);
+    let mut sec_remainder = tsround((day_q - days + month_remainder_days - month_remainder_days.trunc()) * 86_400.0);
+    if sec_remainder.abs() >= 86_400.0 {
+        let whole = (sec_remainder / 86_400.0).trunc();
+        days += whole;
+        sec_remainder -= whole * 86_400.0;
+    }
+    days += month_remainder_days.trunc();
+    let micros = (scale(span.micros as f64) + sec_remainder * 1_000_000.0).round_ties_even();
+    if !(i32::MIN as f64..=i32::MAX as f64).contains(&months) || !(i32::MIN as f64..=i32::MAX as f64).contains(&days) {
+        return None;
+    }
+    if !(micros >= i64::MIN as f64 && micros < i64::MAX as f64) {
+        return None;
+    }
+    months = months.trunc();
+    Some(Interval { months: months as i32, days: days as i32, micros: micros as i64 })
+}
+
 /// Moves an instant by an interval, months first and calendar-aware.
 ///
 /// A month is not a fixed number of microseconds — adding one to 31 January
@@ -380,56 +425,51 @@ pub fn interval_sort_key(iv: Interval) -> i128 {
 }
 
 /// PostgreSQL's default (`postgres`) interval output, e.g.
-/// `1 year 2 mons 3 days 04:05:06`.
+/// `1 year 2 mons 3 days 04:05:06`, as its `EncodeInterval` writes it: a unit
+/// is plural unless its value is exactly 1 (`-1 mons`), and a part that is
+/// not negative right after one that is carries a `+` (`-5 days +01:00:00`,
+/// `1 year -2 mons +3 days`). Without the sign the text read back as a
+/// different interval: `-5 days 01:00:00` is minus five days and one hour.
 pub fn format_interval(bytes: &[u8]) -> Option<String> {
     let iv = decode_interval(bytes)?;
-    let mut parts: Vec<String> = Vec::new();
+    let mut out = String::new();
+    let (mut is_zero, mut is_before) = (true, false);
+    let mut part = |value: i64, unit: &str, out: &mut String| {
+        if value == 0 {
+            return;
+        }
+        if !is_zero {
+            out.push(' ');
+        }
+        if is_before && value > 0 {
+            out.push('+');
+        }
+        out.push_str(&format!("{} {}{}", value, unit, if value != 1 { "s" } else { "" }));
+        is_before = value < 0;
+        is_zero = false;
+    };
+    // C's division, toward zero, as `interval2itm` splits the months.
+    part((iv.months / 12) as i64, "year", &mut out);
+    part((iv.months % 12) as i64, "mon", &mut out);
+    part(iv.days as i64, "day", &mut out);
 
-    let years = iv.months / 12;
-    let months = iv.months % 12;
-    if years != 0 {
-        parts.push(format!(
-            "{} year{}",
-            years,
-            if years.abs() == 1 { "" } else { "s" }
-        ));
-    }
-    if months != 0 {
-        parts.push(format!(
-            "{} mon{}",
-            months,
-            if months.abs() == 1 { "" } else { "s" }
-        ));
-    }
-    if iv.days != 0 {
-        parts.push(format!(
-            "{} day{}",
-            iv.days,
-            if iv.days.abs() == 1 { "" } else { "s" }
-        ));
-    }
-
-    if iv.micros != 0 || parts.is_empty() {
+    if is_zero || iv.micros != 0 {
         let negative = iv.micros < 0;
         let magnitude = iv.micros.unsigned_abs();
         let hours = magnitude / 3_600_000_000;
         let minutes = (magnitude % 3_600_000_000) / 60_000_000;
         let seconds = (magnitude % 60_000_000) / 1_000_000;
         let frac = magnitude % 1_000_000;
-        let mut clock = format!(
-            "{}{:02}:{:02}:{:02}",
-            if negative { "-" } else { "" },
-            hours,
-            minutes,
-            seconds
-        );
-        if frac != 0 {
-            clock.push_str(format!(".{:06}", frac).trim_end_matches('0'));
+        if !is_zero {
+            out.push(' ');
         }
-        parts.push(clock);
+        out.push_str(if negative { "-" } else if is_before { "+" } else { "" });
+        out.push_str(&format!("{:02}:{:02}:{:02}", hours, minutes, seconds));
+        if frac != 0 {
+            out.push_str(format!(".{:06}", frac).trim_end_matches('0'));
+        }
     }
-
-    Some(parts.join(" "))
+    Some(out)
 }
 
 // ------------------------------------------------------------- MAC ADDRESS
