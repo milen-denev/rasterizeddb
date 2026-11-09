@@ -2541,7 +2541,49 @@ fn own_scale_arithmetic(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
 /// [`needs_evaluator`], or arithmetic over a column that keeps each value's
 /// own scale ([`own_scale_arithmetic`]).
 fn evaluated(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
-    needs_evaluator(text) || own_scale_arithmetic(text, schema) || mixed_numeric_columns(text, schema)
+    needs_evaluator(text) || own_scale_arithmetic(text, schema) || mixed_numeric_columns(text, schema) || constant_mixed_comparison(text)
+}
+
+/// Whether `text` compares a quoted literal with a number and reads no
+/// column (`'-5' < 3`, `'2.5' > 2`). The quoted side is PostgreSQL's
+/// unknown, which takes the number's type (and refuses what does not read as
+/// one). The scan's comparison fitted it to the number literal's narrow
+/// unsigned width instead, so `'-5' < 3` was false and `'2.5' > 2` true.
+fn constant_mixed_comparison(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let (mut quoted, mut digit, mut comparison) = (false, false, false);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' {
+            quoted = true;
+            i += 1;
+            while i < bytes.len() && !(bytes[i] == b'\'' && bytes.get(i + 1) != Some(&b'\'')) {
+                i += if bytes[i] == b'\'' { 2 } else { 1 };
+            }
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'"' || bytes[i] == b'.') {
+                i += 1;
+            }
+            let word = &text[start..i];
+            if !["AND", "OR", "NOT", "IS", "NULL", "TRUE", "FALSE", "UNKNOWN"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                return false;
+            }
+            continue;
+        }
+        if c.is_ascii_digit() {
+            digit = true;
+        }
+        if matches!(c, b'<' | b'>' | b'=') {
+            comparison = true;
+        }
+        i += 1;
+    }
+    quoted && digit && comparison
 }
 
 /// Whether `text` reads a NUMERIC column and a column of another number type
@@ -3284,7 +3326,7 @@ fn lift_term(
     }
     let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
         format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
-    } else if quantified_over_array(body) || mixed_numeric_columns(body, schema) {
+    } else if quantified_over_array(body) || mixed_numeric_columns(body, schema) || constant_mixed_comparison(body) {
         // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
         // onto the comparison below still leaves an unknown row out.
         let case = format!("CASE WHEN {body} THEN true WHEN NOT ({body}) THEN false END");

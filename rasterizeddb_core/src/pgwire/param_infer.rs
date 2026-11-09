@@ -57,6 +57,8 @@ enum Tok {
     Close,
     Comma,
     Other,
+    /// A quoted literal, PostgreSQL's `unknown`.
+    Str,
 }
 
 impl Tok {
@@ -96,8 +98,9 @@ fn tokenize(sql: &str) -> Vec<Tok> {
             continue;
         }
         if c == b'\'' || (c == b'$' && sql_scan::dollar_tag_len(bytes, i).is_some()) {
+            let quoted = c == b'\'';
             i = sql_scan::skip_quoted(bytes, i).unwrap_or(bytes.len());
-            out.push(Tok::Other);
+            out.push(if quoted { Tok::Str } else { Tok::Other });
             continue;
         }
         if c == b'"' || c == b'_' || c.is_ascii_alphabetic() || c >= 0x80 {
@@ -469,6 +472,23 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
                 set(n, Some(TEXT), &mut oids);
                 continue;
             }
+            // `'x' <op> $n`, `$m <op> $n`: an unknown beside an unknown is
+            // text, as PostgreSQL resolves it. Inlined as a number, `'Abc'
+            // >= $1` bound to -1 compared 'Abc' with an integer.
+            if matches!(before(1), Some(Tok::Op(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">="))
+                && matches!(before(2), Some(Tok::Str | Tok::Param(_)))
+            {
+                set(n, Some(TEXT), &mut oids);
+                continue;
+            }
+        }
+        // `$n <op> 'x'`, `$n <op> $m`, as above.
+        if matches!(toks.get(hi + 1), Some(Tok::Op(op)) if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">="))
+            && matches!(toks.get(hi + 2), Some(Tok::Str | Tok::Param(_)))
+            && !toks.get(hi + 3).is_some_and(|t| t == &Tok::Cast)
+        {
+            set(n, Some(TEXT), &mut oids);
+            continue;
         }
         // `$n <op> col`.
         if toks.get(hi + 1).is_some_and(is_comparison) {
@@ -491,7 +511,7 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
         }
         // `col [NOT] IN (…, $n, …)`: back over the list to its parenthesis.
         let mut k = i;
-        while k > 0 && matches!(toks[k - 1], Tok::Param(_) | Tok::Comma | Tok::Other) {
+        while k > 0 && matches!(toks[k - 1], Tok::Param(_) | Tok::Comma | Tok::Other | Tok::Str) {
             k -= 1;
         }
         if k >= 2 && toks[k - 1] == Tok::Open && toks[k - 2].keyword("IN") {
