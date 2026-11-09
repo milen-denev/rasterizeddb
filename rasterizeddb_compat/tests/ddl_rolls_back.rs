@@ -153,3 +153,42 @@ async fn rolling_back_to_a_savepoint_undoes_the_ddl_after_it() {
     assert!(run(&pool, "SELECT z FROM s0").await.is_err(), "a released savepoint's column outlived the ROLLBACK");
     run(&pool, "SELECT kept FROM s0").await.expect("the committed column");
 }
+
+/// A foreign key added or dropped in a block that rolls back: both tables'
+/// sides of it are as before, on disk and in the engine's map of who
+/// references whom. A rolled-back ADD no longer refuses a parent's delete;
+/// a rolled-back DROP still does.
+#[tokio::test]
+async fn a_rolled_back_foreign_key_change_is_undone_on_both_sides() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE p (id INT PRIMARY KEY)",
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT)",
+        "CREATE TABLE p2 (id INT PRIMARY KEY)",
+        "CREATE TABLE c2 (id INT PRIMARY KEY, pid INT REFERENCES p2 (id))",
+        "INSERT INTO p VALUES (1), (2)",
+        "INSERT INTO c VALUES (1, 1)",
+        "INSERT INTO p2 VALUES (1), (2)",
+        "INSERT INTO c2 VALUES (1, 1)",
+    ] {
+        run(&pool, sql).await.expect(sql);
+    }
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("ALTER TABLE c ADD CONSTRAINT c_pid_fkey FOREIGN KEY (pid) REFERENCES p (id)").await.expect("add fk");
+    assert!(tx.execute("DELETE FROM p WHERE id = 1").await.is_err(), "the added key is enforced inside the block");
+    tx.rollback().await.expect("rollback");
+    run(&pool, "DELETE FROM p WHERE id = 1").await.expect("the rolled-back key still refused the parent's delete");
+    run(&pool, "INSERT INTO c VALUES (2, 99)").await.expect("the rolled-back key still refused a child");
+
+    let constraint: String =
+        sqlx::query("SELECT conname::text FROM pg_constraint WHERE contype = 'f' AND conrelid = 'c2'::regclass")
+            .fetch_one(&pool)
+            .await
+            .map(|r| r.get(0))
+            .unwrap_or_else(|_| "c2_pid_fkey".to_string());
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute(sqlx::raw_sql(AssertSqlSafe(format!("ALTER TABLE c2 DROP CONSTRAINT {constraint}")))).await.expect("drop fk");
+    tx.rollback().await.expect("rollback");
+    assert!(run(&pool, "DELETE FROM p2 WHERE id = 1").await.is_err(), "the key dropped in a rolled-back block is gone");
+    assert!(run(&pool, "INSERT INTO c2 VALUES (2, 99)").await.is_err(), "the key dropped in a rolled-back block is gone");
+}
