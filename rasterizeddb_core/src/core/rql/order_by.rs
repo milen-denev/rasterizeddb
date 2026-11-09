@@ -120,7 +120,9 @@ fn split_term(term: &str) -> (&str, &str) {
 /// arithmetic operator joins its first word to what follows; `None` for a
 /// plain key, which keeps reading the words after it as modifiers.
 fn unparenthesised_expression<'a>(raw: &'a str, first: &str, rest: &str) -> Option<(&'a str, &'a str)> {
-    const OPERATORS: &[char] = &['+', '-', '*', '/', '%', '^', '|'];
+    // Comparisons too: `DISTINCT ON (a > 0) … ORDER BY a > 0, id` sorts by
+    // the boolean `a > 0`.
+    const OPERATORS: &[char] = &['+', '-', '*', '/', '%', '^', '|', '<', '>', '=', '!'];
     if !(rest.starts_with(OPERATORS) || first.ends_with(OPERATORS)) {
         return None;
     }

@@ -3593,11 +3593,7 @@ pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> 
         // report before the type existed.
         if is_timestamp(a) && is_timestamp(b) && matches!(op, ArithOp::Sub) {
             return Ok(Value::Data {
-                bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
-                    months: 0,
-                    days: 0,
-                    micros: value,
-                }),
+                bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::interval_between(value)),
                 db_type: DbType::INTERVAL,
             });
         }

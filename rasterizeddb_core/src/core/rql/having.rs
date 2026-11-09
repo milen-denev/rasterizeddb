@@ -861,6 +861,36 @@ impl Parser<'_, '_> {
             }));
         }
 
+        // A boolean aggregate is a condition on its own: `HAVING bool_or(f)`
+        // keeps the groups where it is true (NULL and false drop them), as
+        // `= true` does.
+        if let Raw::Agg(i) = left {
+            let boolean = matches!(
+                self.aggregates.get(i),
+                Some(SelectItem::Aggregate {
+                    func: crate::core::rql::aggregate::AggFunc::BoolAnd
+                        | crate::core::rql::aggregate::AggFunc::BoolOr
+                        | crate::core::rql::aggregate::AggFunc::Every,
+                    ..
+                })
+            );
+            let ends = match self.peek() {
+                None => true,
+                Some(t) => matches!(t.tk, Tk::RPar) || t.is_word("AND") || t.is_word("OR"),
+            };
+            if boolean && ends {
+                return self.compare(Raw::Agg(i), HavingOp::Eq, Raw::Lit { text: "true".to_string(), quoted: false });
+            }
+            return Err(match self.peek() {
+                Some(t) => format!(
+                    "HAVING must compare an aggregate, as in `HAVING COUNT(*) > 1`; unexpected '{}'",
+                    &self.text[t.start..t.end]
+                ),
+                // Not boolean (a boolean one at the end returned above).
+                None => "argument of HAVING must be type boolean".to_string(),
+            });
+        }
+
         Err(match self.peek() {
             Some(t) => format!(
                 "HAVING must compare an aggregate, as in `HAVING COUNT(*) > 1`; unexpected '{}'",

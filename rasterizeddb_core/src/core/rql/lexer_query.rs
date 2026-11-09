@@ -2068,8 +2068,14 @@ pub fn row_fetch_from_select_query(
             });
             let expr = match named {
                 Some(expr) if !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) => expr,
-                _ => crate::core::rql::expr::parse(key, schema)
-                    .map_err(|e| format!("DISTINCT ON key '{key}' could not be read: {e}"))?,
+                _ => match crate::core::rql::expr::parse(key, schema) {
+                    Ok(expr) => expr,
+                    // A condition is a boolean key: `DISTINCT ON (a > 0)`.
+                    Err(e) => match crate::core::rql::join::comparison_value(key, schema) {
+                        Ok(Some(expr)) => expr,
+                        _ => return Err(format!("DISTINCT ON key '{key}' could not be read: {e}")),
+                    },
+                },
             };
             distinct_on.push(expr);
         }
@@ -2745,17 +2751,31 @@ pub fn row_fetch_from_select_query(
                     _ => return Err(format!("ORDER BY '{}' cannot be sorted here", term.token)),
                 }
             } else {
-                crate::core::rql::expr::parse(&term.token, schema).map_err(|e| {
+                match crate::core::rql::expr::parse(&term.token, schema) {
+                    Ok(expr) => expr,
                     // PostgreSQL's own refusal, unwrapped, as the select list
                     // and WHERE report it.
-                    if e.starts_with("operator does not exist") {
-                        return e;
+                    Err(e) if e.starts_with("operator does not exist") => return Err(e),
+                    Err(e) => {
+                        // A condition sorts as the boolean it is: `ORDER BY
+                        // a > 0` (false before true, NULL last).
+                        let mut inner = term.token.trim();
+                        while inner.starts_with('(')
+                            && crate::core::rql::expr::matching_paren(inner, 0) == Some(inner.len() - 1)
+                        {
+                            inner = inner[1..inner.len() - 1].trim();
+                        }
+                        match crate::core::rql::join::comparison_value(inner, schema) {
+                            Ok(Some(expr)) => expr,
+                            _ => {
+                                return Err(format!(
+                                    "ORDER BY term '{}' is not a column and could not be read as an expression: {}",
+                                    term.token, e
+                                ));
+                            }
+                        }
                     }
-                    format!(
-                        "ORDER BY term '{}' is not a column and could not be read as an expression: {}",
-                        term.token, e
-                    )
-                })?
+                }
             };
             // The columns the key reads (with their NULL companions) ride
             // after the visible ones and are trimmed before the client sees

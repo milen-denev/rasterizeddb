@@ -358,6 +358,12 @@ pub(crate) fn split_call_arguments(text: &str) -> Result<(&str, Option<&str>, Op
 /// call has neither. Refuses what PostgreSQL refuses: `string_agg` without
 /// its delimiter or another aggregate with one (42883), and under DISTINCT an
 /// `ORDER BY` key that is not the argument (42P10).
+///
+/// The key is compared with the argument as written, up to what does not
+/// change an expression: outer parentheses (the ORDER BY parser wraps an
+/// operator expression in them, so `array_agg(DISTINCT x % 3 ORDER BY x % 3)`
+/// compared `(x % 3)` with `x % 3` and was refused), whitespace, and the case
+/// of everything outside quotes.
 pub(crate) fn build_call(
     func: AggFunc,
     argument: &str,
@@ -385,7 +391,7 @@ pub(crate) fn build_call(
     let mut keys = Vec::new();
     if let Some(order) = order {
         for term in crate::core::rql::order_by::parse(order)? {
-            if distinct && !term.token.trim().eq_ignore_ascii_case(argument.trim()) {
+            if distinct && same_expression_text(&term.token) != same_expression_text(argument) {
                 return Err(
                     "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list".to_string(),
                 );
@@ -1127,11 +1133,15 @@ pub(crate) enum Acc {
     /// A fold split across workers cannot add partial results of a DISTINCT
     /// aggregate, since a value two workers both saw counts once; the sets
     /// merge instead, and the function runs over the union at the end. NULL is
-    /// never kept: every aggregate skips it, DISTINCT or not.
+    /// not in the set: every aggregate but the collecting ones skips it. Those
+    /// (`array_agg`, `json_agg`) keep one NULL among the distinct values, as
+    /// PostgreSQL's do, and `null` records that one was seen; `string_agg`
+    /// skips it when it is fed.
     Distinct {
         seen: std::collections::HashSet<Vec<u8>>,
         template: Box<Acc>,
         ty: DbType,
+        null: bool,
     },
     /// `string_agg`, `array_agg`, `json_agg`: every value of the group (NULL
     /// as `None`) with the keys of the call's `ORDER BY`, kept until the
@@ -1178,6 +1188,7 @@ impl Acc {
                 seen: std::collections::HashSet::new(),
                 template: Box::new(plain),
                 ty: field.db_type.clone(),
+                null: false,
             },
             _ => plain,
         }
@@ -1186,7 +1197,7 @@ impl Acc {
     /// The function's own accumulator over the distinct values, for a
     /// [`Acc::Distinct`]; `None` for every other kind.
     fn resolve(&self) -> Option<Acc> {
-        let Acc::Distinct { seen, template, ty } = self else {
+        let Acc::Distinct { seen, template, ty, null } = self else {
             return None;
         };
         let mut acc = (**template).clone();
@@ -1197,6 +1208,11 @@ impl Acc {
         values.sort_by(|a, b| compare_values(a, b, ty));
         for value in values {
             acc.accumulate(Some(value), Some(ty));
+        }
+        // Last, as an ascending sort puts NULL; a descending one reverses
+        // the collected values and so puts it first, as PostgreSQL does.
+        if *null {
+            acc.accumulate(None, Some(ty));
         }
         Some(acc)
     }
@@ -1277,7 +1293,10 @@ impl Acc {
             }
             _ => {}
         }
-        if let Acc::Distinct { seen, ty: own, .. } = self {
+        if let Acc::Distinct { seen, ty: own, template, null } = self {
+            if bytes.is_none() && matches!(**template, Acc::Collect { .. }) {
+                *null = true;
+            }
             if let Some(value) = bytes {
                 // -0.0 and 0.0 are one value to `=`, and so to DISTINCT.
                 let zero = match own {
@@ -1510,8 +1529,11 @@ impl Acc {
     /// Exact totals add checked, as `accumulate` does: an overflow in either
     /// part, or in the sum of the two, is reported by `finish`.
     pub(crate) fn merge(&mut self, other: &Acc) {
-        if let (Acc::Distinct { seen, .. }, Acc::Distinct { seen: theirs, .. }) = (&mut *self, other) {
+        if let (Acc::Distinct { seen, null, .. }, Acc::Distinct { seen: theirs, null: their_null, .. }) =
+            (&mut *self, other)
+        {
             seen.extend(theirs.iter().cloned());
+            *null |= *their_null;
             return;
         }
         match (self, other) {
@@ -6145,4 +6167,55 @@ mod uuidv7_tests {
         let b = uuid_v7_at(5_000_000 + UUIDV7_MIN_STEP_NS);
         assert!(b[..8] > a[..8], "one step advances the 12-bit field");
     }
+}
+
+/// An expression's text as [`build_call`] compares a DISTINCT aggregate's
+/// ORDER BY key with its argument: outer parentheses that enclose the whole
+/// of it dropped, whitespace outside quotes dropped, the rest outside quotes
+/// lowercased.
+fn same_expression_text(text: &str) -> String {
+    let mut t = text.trim();
+    while t.starts_with('(') && t.ends_with(')') && closes_at_end(t) {
+        t = t[1..t.len() - 1].trim();
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut quote: Option<char> = None;
+    for c in t.chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            None if c.is_whitespace() => {}
+            None => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
+/// Whether the parenthesis opening `t` is the one closing it, outside quotes.
+fn closes_at_end(t: &str) -> bool {
+    let (mut depth, mut quote) = (0usize, None::<char>);
+    for (i, c) in t.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '(' => depth += 1,
+            None if c == ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == t.len() - 1;
+                }
+            }
+            None => {}
+        }
+    }
+    false
 }

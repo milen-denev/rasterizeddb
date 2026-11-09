@@ -306,6 +306,18 @@ fn parse_iso_interval(text: &str) -> Option<Interval> {
     Some(out)
 }
 
+/// `timestamp - timestamp`, as PostgreSQL's `timestamp_mi` answers it: the
+/// difference in microseconds, its whole days moved into the day field
+/// (`interval_justify_hours`), so `338 days 09:57:11` rather than
+/// `8121:57:11`. Truncating division leaves both fields with the
+/// difference's sign, as PostgreSQL's do. The comparison is unchanged
+/// ([`interval_sort_key`] counts a day as 24 hours); the text, `extract` and
+/// `justify_*` see the days.
+pub fn interval_between(micros: i64) -> Interval {
+    const DAY: i64 = 86_400_000_000;
+    Interval { months: 0, days: (micros / DAY) as i32, micros: micros % DAY }
+}
+
 /// The 16 bytes PostgreSQL puts on the wire.
 pub fn encode_interval(iv: Interval) -> Vec<u8> {
     let mut out = Vec::with_capacity(INTERVAL_LEN);

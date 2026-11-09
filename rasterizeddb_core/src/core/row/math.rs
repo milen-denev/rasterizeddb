@@ -93,11 +93,7 @@ pub fn perform_math_operation(
             let (Some(a), Some(b)) = (le_i64(input1), le_i64(input2)) else {
                 return Err(EvalError::OperandSizeMismatch);
             };
-            let span = crate::core::pg_types::Interval {
-                months: 0,
-                days: 0,
-                micros: a.checked_sub(b).ok_or(EvalError::UnsupportedType)?,
-            };
+            let span = crate::core::pg_types::interval_between(a.checked_sub(b).ok_or(EvalError::UnsupportedType)?);
             return Ok(block_of(&crate::core::pg_types::encode_interval(span)));
         }
         MathOperation::ShiftForward | MathOperation::ShiftBackward => {

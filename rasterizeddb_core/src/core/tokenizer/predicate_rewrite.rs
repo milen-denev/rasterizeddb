@@ -3050,10 +3050,24 @@ pub fn lift_evaluated_operands(
     if clause.trim().is_empty() {
         return Ok(clause.to_string());
     }
-    if !evaluated(clause, schema) && !char_lift_needed(clause, schema) && !reads_legacy_char(clause, schema) {
+    if !evaluated(clause, schema)
+        && !char_lift_needed(clause, schema)
+        && !reads_legacy_char(clause, schema)
+        && !mentions_distinct_from(clause)
+    {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
+}
+
+/// Whether `text` says `DISTINCT FROM` outside quotes: a clause whose terms
+/// [`distinct_from_expression`] may have to lift, though nothing else in it
+/// needs the evaluator (`(c / 3) IS DISTINCT FROM c`).
+fn mentions_distinct_from(text: &str) -> bool {
+    let words = top_level_words(text);
+    words.windows(2).any(|w| {
+        text[w[0].0..w[0].1].eq_ignore_ascii_case("DISTINCT") && text[w[1].0..w[1].1].eq_ignore_ascii_case("FROM")
+    }) || text.contains('(') && text.to_ascii_uppercase().contains("DISTINCT FROM")
 }
 
 /// Whether `side` is a string literal that ends in a space, cast to `text`
@@ -3446,7 +3460,8 @@ fn lift_term(
     schema: &SmallVec<[SchemaField; 20]>,
     depth: usize,
 ) -> Result<String, String> {
-    if !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema) {
+    let plain = !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema);
+    if plain && !mentions_distinct_from(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -3463,6 +3478,8 @@ fn lift_term(
     let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
         format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
     } else if quantified_over_array(body)
+        || distinct_from_expression(body, schema)
+        || compares_an_interval(body, schema)
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
@@ -3471,10 +3488,58 @@ fn lift_term(
         // onto the comparison below still leaves an unknown row out.
         let case = format!("CASE WHEN ({body}) THEN true WHEN NOT ({body}) THEN false END");
         format!("{} = true", lift_operand(&case, schema, true)?)
+    } else if plain {
+        // Let through for a `DISTINCT FROM` the sugar rewrite reads itself.
+        return Ok(term.to_string());
     } else {
         lift_comparison(body, schema, depth)?
     };
     Ok(format!("{lead}{nots}{lifted}{tail}"))
+}
+
+/// Whether `body` is `x IS [NOT] DISTINCT FROM y` with something other than
+/// a column on the left or a single value on the right: the sugar rewrite
+/// below reads only `column IS [NOT] DISTINCT FROM value`, and took
+/// `(rtrim(v)) IS NOT DISTINCT FROM 'a'` for a column named `(rtrim(v))`.
+/// The evaluator answers the general form (`expr::distinct_condition`).
+fn distinct_from_expression(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    let words = top_level_words(body);
+    let at = |n: usize, kw: &str| words.get(n).is_some_and(|&(s, e)| body[s..e].eq_ignore_ascii_case(kw));
+    let Some(is) = (0..words.len()).find(|&n| {
+        at(n, "IS") && {
+            let d = if at(n + 1, "NOT") { n + 2 } else { n + 1 };
+            at(d, "DISTINCT") && at(d + 1, "FROM")
+        }
+    }) else {
+        return false;
+    };
+    let from = if at(is + 1, "NOT") { is + 3 } else { is + 2 };
+    let left = body[..words[is].0].trim();
+    let right = body[words[from].1..].trim();
+    let one_word = |side: &str| top_level_words(side).len() == 1 && !side.starts_with('(');
+    let column_left = one_word(left) && resolve_column(left, schema).is_some();
+    let simple_right = one_word(right) || right.starts_with('-') && one_word(right[1..].trim_start());
+    !(column_left && simple_right)
+}
+
+/// Whether `body` is a symbol comparison with a side the evaluator types
+/// `interval` (`ts - TIMESTAMP '2024-01-01' > interval '30 days'`): the scan
+/// compares only scalar types (`EvaluatedOperand::new`), and refused it; the
+/// evaluator orders intervals as PostgreSQL does, a day as 24 hours.
+fn compares_an_interval(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    let interval = |side: &str| {
+        let side = side.trim();
+        // A bare interval column the scan compares itself, sargably.
+        !side.is_empty()
+            && crate::core::rql::expr::parse(side, schema).is_ok_and(|e| {
+                !matches!(e, crate::core::rql::expr::Expr::Column(_) | crate::core::rql::expr::Expr::Literal { .. })
+                    && crate::core::rql::expr::static_type(&e) == crate::core::db_type::DbType::INTERVAL
+            })
+    };
+    interval(&body[..at]) || interval(&body[end..])
 }
 
 /// Whether `body` compares with `ANY`/`SOME`/`ALL` over an array the

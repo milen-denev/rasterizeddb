@@ -135,5 +135,70 @@ async fn bound_statements_are_described_and_typed_as_postgresql_does() {
     assert_eq!(st.params(), &[tokio_postgres::types::Type::TEXT], "beside an unknown, text");
     let n: i64 = c.query_one(&st, &[&"-1"]).await.expect("'Abc' >= $1").get(0);
     assert_eq!(n, 4, "'Abc' >= '-1' compares text and holds for every row");
+    // Round 12: a text call in parentheses, a concatenation, and format(),
+    // each beside a parameter; it was described as an integer, and the
+    // statement refused as `text < integer`.
+    for (sql, value, want) in [
+        ("SELECT count(*) FROM p1 WHERE (lower(s)) < $1", "b", 1i64),
+        ("SELECT count(*) FROM p1 WHERE (s || id) >= $1", "abc1", 3),
+        ("SELECT count(*) FROM p1 WHERE (format('%s|%s', s, id)) <> $1", "1", 4),
+    ] {
+        let st = c.prepare(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(st.params(), &[tokio_postgres::types::Type::TEXT], "{sql}");
+        let n: i64 = c.query_one(&st, &[&value]).await.unwrap_or_else(|e| panic!("{sql}: {e}")).get(0);
+        assert_eq!(n, want, "{sql}");
+    }
 }
 
+
+/// Round 12 (2026-11-09, `gen3.py`: the function surface). The one silent
+/// wrong answer was `timestamp - timestamp` reported in hours (`8121:57:11`)
+/// where PostgreSQL justifies whole days out of it (`338 days 08:27:11`),
+/// which `extract(day …)` and `extract(hour …)` read. Refused before:
+/// `array_agg(DISTINCT x % 3 ORDER BY x % 3)` (the key compared as text
+/// with its parentheses), a bare boolean aggregate in HAVING, `DISTINCT ON
+/// (a > 0) … ORDER BY a > 0`, and `IS [NOT] DISTINCT FROM` with an
+/// expression on the left, an interval comparison in WHERE. Lifting the
+/// first then showed `array_agg(DISTINCT …)` dropping its NULL, a column's
+/// as much as an expression's. Every expected answer is PostgreSQL 17's.
+#[tokio::test]
+async fn round_12_answers_as_postgresql_17_does() {
+    let (_s, c) = server().await;
+    for sql in [
+        "CREATE TABLE p3 (id INT PRIMARY KEY, a INT, sm SMALLINT, c NUMERIC(10,2), s TEXT, f BOOLEAN, ts TIMESTAMP)",
+        "INSERT INTO p3 VALUES (1, 5, 4, 1.25, 'abc', true, '2024-12-04 08:27:11'), (2, NULL, -3, 7.50, 'b', false, '2000-06-20 05:43:46'), (3, -2, 7, NULL, NULL, NULL, '2024-01-01 10:00:00'), (4, 3, 4, 0.01, 'a', true, NULL), (5, 3, 5, 2.00, 'b', NULL, '2023-12-31 23:00:00')",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT id, ts - TIMESTAMP '2024-01-01' FROM p3 ORDER BY id", &["1|338 days 08:27:11", "2|-8594 days -18:16:14", "3|10:00:00", "4|NULL", "5|-01:00:00"]),
+        ("SELECT id FROM p3 WHERE ts - TIMESTAMP '2024-01-01' > interval '30 days' ORDER BY id", &["1"]),
+        ("SELECT id, extract(day from ts - TIMESTAMP '2024-01-01'), extract(hour from ts - TIMESTAMP '2024-01-01') FROM p3 ORDER BY id", &["1|338|8", "2|-8594|-18", "3|0|10", "4|NULL|NULL", "5|0|-1"]),
+        ("SELECT array_agg(DISTINCT sm % 3 ORDER BY sm % 3) FROM p3", &["{0,1,2}"]),
+        ("SELECT f, string_agg(DISTINCT upper(s), ',' ORDER BY upper(s)) FROM p3 GROUP BY f ORDER BY f", &["f|B", "t|A,ABC", "NULL|B"]),
+        ("SELECT a > 0 AS k, count(*) FROM p3 GROUP BY 1 HAVING bool_or(f) ORDER BY 1", &["t|3"]),
+        ("SELECT sm % 3 AS k, count(*) FROM p3 GROUP BY 1 HAVING bool_and(f) OR count(*) > 1 ORDER BY 1", &["1|3"]),
+        ("SELECT DISTINCT ON (a > 0) a > 0 AS k, id FROM p3 ORDER BY a > 0, id DESC", &["f|3", "t|5", "NULL|2"]),
+        ("SELECT id FROM p3 WHERE (rtrim(s)) IS NOT DISTINCT FROM 'a' ORDER BY id", &["4"]),
+        ("SELECT id FROM p3 WHERE (c / 3) IS DISTINCT FROM c ORDER BY id", &["1", "2", "4", "5"]),
+        ("SELECT id FROM p3 WHERE upper(s) IS NOT DISTINCT FROM NULL ORDER BY id", &["3"]),
+        // A DISTINCT array_agg or json_agg keeps one NULL, last ascending
+        // and first descending; string_agg and count skip it.
+        ("SELECT array_agg(DISTINCT a), array_agg(DISTINCT a ORDER BY a DESC), string_agg(DISTINCT s, ',' ORDER BY s), count(DISTINCT a) FROM p3", &["{-2,3,5,NULL}|{NULL,5,3,-2}|a,abc,b|3"]),
+        ("SELECT f, array_agg(DISTINCT sm % 3 ORDER BY sm % 3) FROM p3 GROUP BY f ORDER BY f", &["f|{0}", "t|{1}", "NULL|{1,2}"]),
+        ("SELECT json_agg(DISTINCT f) FROM p3", &["[false, true, null]"]),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        match c.simple_query(sql).await {
+            Ok(_) => {
+                let got = rows(&c, sql).await;
+                if got != *want {
+                    wrong.push(format!("{sql}\n  want {want:?}\n  got  {got:?}"));
+                }
+            }
+            Err(e) => wrong.push(format!("{sql}\n  want {want:?}\n  error {e}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{} of {} differ from PostgreSQL 17:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
+}

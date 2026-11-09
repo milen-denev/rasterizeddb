@@ -546,13 +546,61 @@ fn text_call_before(toks: &[Tok], close: usize) -> bool {
         }
         k -= 1;
     }
-    const TEXT_FUNCTIONS: [&str; 22] = [
+    const TEXT_FUNCTIONS: [&str; 30] = [
         "LOWER", "UPPER", "MD5", "TRIM", "LTRIM", "RTRIM", "BTRIM", "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "SUBSTR",
         "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REVERSE", "INITCAP", "REPEAT", "SPLIT_PART", "TRANSLATE", "TO_CHAR",
+        "FORMAT", "CHR", "TO_HEX", "REGEXP_REPLACE", "QUOTE_LITERAL", "QUOTE_IDENT", "OVERLAY", "STRING_AGG",
     ];
-    k.checked_sub(1)
+    if k.checked_sub(1).and_then(|j| toks.get(j)).is_some_and(|t| TEXT_FUNCTIONS.iter().any(|f| t.keyword(f))) {
+        return true;
+    }
+    // A parenthesised group rather than a call: `(lower(s)) < $1` is the
+    // call inside, and `(s || a) < $1` a concatenation, text either way.
+    const CLAUSE_WORDS: [&str; 16] = [
+        "WHERE", "AND", "OR", "NOT", "ON", "HAVING", "SELECT", "WHEN", "THEN", "ELSE", "CASE", "SET", "RETURNING",
+        "BY", "USING", "DISTINCT",
+    ];
+    if k.checked_sub(1)
         .and_then(|j| toks.get(j))
-        .is_some_and(|t| TEXT_FUNCTIONS.iter().any(|f| t.keyword(f)))
+        .is_some_and(|t| matches!(t, Tok::Ident(..)) && !CLAUSE_WORDS.iter().any(|w| t.keyword(w)))
+    {
+        // Another function's call.
+        return false;
+    }
+    let mut depth = 0usize;
+    for t in &toks[k + 1..close] {
+        match t {
+            Tok::Open => depth += 1,
+            Tok::Close => depth = depth.saturating_sub(1),
+            Tok::Op(op) if depth == 0 && op == "||" => return true,
+            _ => {}
+        }
+    }
+    close >= 1
+        && toks.get(close - 1) == Some(&Tok::Close)
+        && matches!(toks.get(k + 1), Some(Tok::Ident(..)))
+        && toks.get(k + 2) == Some(&Tok::Open)
+        && open_of(toks, close - 1) == Some(k + 2)
+        && text_call_before(toks, close - 1)
+}
+
+/// The `(` matching the `)` at `close`.
+fn open_of(toks: &[Tok], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut k = close;
+    loop {
+        match toks.get(k)? {
+            Tok::Close => depth += 1,
+            Tok::Open => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+        k = k.checked_sub(1)?;
+    }
 }
 
 /// For `INSERT INTO t (a, b) VALUES …`: the column names, and the index of the
