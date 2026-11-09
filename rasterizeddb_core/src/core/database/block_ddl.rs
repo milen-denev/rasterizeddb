@@ -189,6 +189,11 @@ impl Database {
     /// Drops a table a block created and then rolled back: the block (or, at
     /// open, nothing else) holds it, so `drop_table`'s lock is there.
     pub(super) async fn drop_table_for_rollback(&self, table: &str) -> io::Result<()> {
+        // Never made: a statement that failed past its prepare by a way
+        // `block_ddl_unmade` did not see (a panic that closed the session).
+        if !(self.has_table(table) || self.is_partitioned(table)) {
+            return Ok(());
+        }
         self.drop_table(table).await.map(|_| ())
     }
 
@@ -310,6 +315,40 @@ impl Database {
     /// now rolls back to.
     pub(crate) fn block_ddl_len(&self, root: TxId) -> usize {
         self.block_ddl.get(&root).map_or(0, |s| s.len())
+    }
+
+    /// The statement that registered block `root`'s steps past `mark`
+    /// failed with `sqlstate`: forgets each table it was to create and did
+    /// not, so neither the block's rollback, a `ROLLBACK TO`, nor the next
+    /// open drops a table the block never made. Run before either undo.
+    ///
+    /// Not made: there is no such table (a read-only refusal, a bad column
+    /// type), or there is and the CREATE found it there (`42P07`): another
+    /// session created it between [`Database::block_ddl_prepare`] and the
+    /// statement's own lock, and its table must outlive this block. One the
+    /// statement made before failing (a `CREATE TABLE AS` whose rows did not
+    /// go in) exists with another code and is still dropped.
+    pub(crate) fn block_ddl_unmade(&self, root: TxId, mark: usize, sqlstate: &str) {
+        let Some(mut steps) = self.block_ddl.get_mut(&root) else { return };
+        if steps.len() <= mark {
+            return;
+        }
+        let tail = steps.split_off(mark);
+        for step in tail {
+            let unmade = match &step.undo {
+                Undo::Drop { table } => {
+                    sqlstate == "42P07" || !(self.has_table(table) || self.is_partitioned(table))
+                }
+                Undo::Restore { .. } => false,
+            };
+            if unmade {
+                if let Some(path) = &step.intent {
+                    let _ = super::rewrite::remove_intent(path);
+                }
+            } else {
+                steps.push(step);
+            }
+        }
     }
 
     /// `ROLLBACK TO` a savepoint set when block `root` had `keep` steps: the

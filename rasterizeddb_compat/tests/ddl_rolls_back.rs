@@ -192,3 +192,56 @@ async fn a_rolled_back_foreign_key_change_is_undone_on_both_sides() {
     assert!(run(&pool, "DELETE FROM p2 WHERE id = 1").await.is_err(), "the key dropped in a rolled-back block is gone");
     assert!(run(&pool, "INSERT INTO c2 VALUES (2, 99)").await.is_err(), "the key dropped in a rolled-back block is gone");
 }
+
+/// A CREATE TABLE that fails leaves nothing for the block's rollback to
+/// drop: the table was never made. Its rollback step used to stay, and the
+/// rollback dropped a table that did not exist without its lock (a panic
+/// that closed the session) or, had another session created the name in
+/// between, that session's table.
+#[tokio::test]
+async fn a_failed_create_table_leaves_nothing_to_roll_back() {
+    let (_s, pool) = server().await;
+    let mut c = pool.acquire().await.expect("connection");
+    // Under a savepoint: ROLLBACK TO revives the block, and what it made
+    // before the failure commits.
+    c.execute("BEGIN").await.expect("begin");
+    c.execute("CREATE TABLE kept (id INT)").await.expect("create");
+    c.execute("SAVEPOINT s").await.expect("savepoint");
+    let failed = c.execute("CREATE TABLE bad (id INT CHECK (nosuchcol > 0))").await;
+    assert!(failed.is_err(), "a CHECK on a missing column is refused");
+    c.execute("ROLLBACK TO SAVEPOINT s").await.expect("rollback to");
+    c.execute("COMMIT").await.expect("commit");
+    assert!(exists(&pool, "kept").await, "the table made before the savepoint was lost");
+    assert!(!exists(&pool, "bad").await);
+
+    // With no savepoint the failure ends the block at once; the session
+    // goes on.
+    c.execute("BEGIN").await.expect("begin");
+    let failed = c.execute("CREATE TABLE bad (id INT CHECK (nosuchcol > 0))").await;
+    assert!(failed.is_err());
+    c.execute("ROLLBACK").await.expect("rollback");
+    c.execute("SELECT 1").await.expect("the session survived the failed block");
+    assert!(exists(&pool, "kept").await);
+}
+
+/// A read-only block's DDL is refused (25006) before it takes anything: its
+/// table is not kept aside, nor locked to the block's end, so other sessions
+/// go on reading it while the block stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_only_blocks_refused_alter_locks_nothing() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE ro (id INT)").await.expect("create");
+    run(&pool, "INSERT INTO ro VALUES (1)").await.expect("insert");
+    let mut c = pool.acquire().await.expect("connection");
+    c.execute("BEGIN READ ONLY").await.expect("begin");
+    // A savepoint keeps the failed block open, with whatever it holds.
+    c.execute("SAVEPOINT s").await.expect("savepoint");
+    let refused = c.execute("ALTER TABLE ro ADD COLUMN extra INT").await.expect_err("refused");
+    assert!(refused.to_string().contains("read-only"), "{refused}");
+
+    let mut other = pool.acquire().await.expect("second connection");
+    other.execute("SET lock_timeout = '300ms'").await.expect("lock_timeout");
+    let read = tokio::time::timeout(Duration::from_secs(5), other.execute("SELECT * FROM ro")).await;
+    assert!(matches!(read, Ok(Ok(_))), "a reader waited on the refused ALTER's lock: {read:?}");
+    c.execute("ROLLBACK").await.expect("rollback");
+}

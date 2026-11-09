@@ -2556,6 +2556,11 @@ struct SessionTransaction {
     /// A stack, because `ROLLBACK TO` names one and discards everything after
     /// it, and `RELEASE` merges one and everything after it into what is below.
     savepoints: Vec<Savepoint>,
+    /// While a statement of the block runs past
+    /// `Database::block_ddl_prepare`: how many DDL steps the block had before
+    /// it. A failure then forgets the tables it was to create and did not
+    /// (`Database::block_ddl_unmade`), before anything is undone.
+    ddl_mark: Option<usize>,
     /// Set once a statement in the block has failed.
     ///
     /// PostgreSQL rejects everything after that until the block is closed, and
@@ -5006,6 +5011,9 @@ where
     state.statement_error = Some(message.to_string());
     if let Some(t) = state.transaction.as_mut() {
         t.failed = true;
+        if let Some(mark) = t.ddl_mark.take() {
+            t.database.block_ddl_unmade(t.id, mark, sqlstate);
+        }
         // R3 (slice B6): with no savepoint open, the error ends the block
         // now, before it is reported: a deadlock's victim gives its locks and
         // keys back here, so the survivor goes on without waiting for the
@@ -5444,13 +5452,20 @@ where
                         root,
                         crate::core::mvcc::owner::OwnerKind::Block,
                         crate::core::notice::collect_with(trace_partitions, async {
-                            if ddl.is_some() {
+                            // A read-only block refuses the statement (25006)
+                            // before it runs: nothing to keep aside or lock.
+                            let read_only = state.transaction.as_ref().is_some_and(|t| t.read_only);
+                            if ddl.is_some() && !read_only {
+                                let mark = database.block_ddl_len(root);
                                 match database.block_ddl_prepare(root, stmt).await {
                                     Ok(t) => transactional = t,
                                     Err(e) => return fail_statement(state, stream, "55000", &e).await,
                                 }
+                                if let Some(t) = state.transaction.as_mut() {
+                                    t.ddl_mark = Some(mark);
+                                }
                             }
-                            execute_recorded_inner(
+                            let result = execute_recorded_inner(
                                 database,
                                 state,
                                 stream,
@@ -5459,7 +5474,11 @@ where
                                 omit_description,
                                 prepared,
                             )
-                            .await
+                            .await;
+                            if let Some(t) = state.transaction.as_mut() {
+                                t.ddl_mark = None;
+                            }
+                            result
                         }),
                     )
                     .await;
@@ -8269,6 +8288,7 @@ fn open_block(
         level,
         read_only,
         savepoints: Vec::new(),
+        ddl_mark: None,
         failed: false,
         implicit: false,
         // The message that opened the block, as PostgreSQL stamps it.
