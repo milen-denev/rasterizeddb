@@ -105,3 +105,49 @@ async fn a_crash_after_a_recorded_commit_keeps_the_blocks_ddl() {
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     shut(db, dir.path());
 }
+
+/// A table on a second storage location: its copy goes beside it (the
+/// placement carried first, as the rewrite's backup does), so the block's
+/// ROLLBACK and a crash before its commit both put back the rows it had,
+/// and nothing of the copy is left in either directory.
+///
+/// Guards against the copy's provider resolved before its placement is
+/// recorded (the copy written to the root, then looked for beside the table).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_on_a_second_location_rolls_back_and_recovers() {
+    for crash in [false, true] {
+        let dir = tempfile::tempdir().expect("dir");
+        let (root_dir, disk) = (dir.path().join("root"), dir.path().join("disk"));
+        std::fs::create_dir_all(&root_dir).expect("root");
+        std::fs::create_dir_all(&disk).expect("disk");
+        let db = Arc::new(open(&root_dir).await);
+        let disk_s = disk.to_string_lossy().into_owned();
+        db.storage.add_location(&disk_s, crate::core::storage::LocationRole::Primary, 1, true).expect("location");
+        db.storage.pin("far", &disk_s).expect("pin");
+        exec(&db, "CREATE TABLE far (id INT PRIMARY KEY, name TEXT)").await.expect("create");
+        exec(&db, "INSERT INTO far (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')").await.expect("insert");
+        assert_eq!(db.storage.location_of("far").as_deref(), Some(disk_s.as_str()), "the table is not on the second location");
+        let root = db.transactions.begin();
+        block_ddl(&db, root, &["ALTER TABLE far ADD COLUMN extra INT DEFAULT 5"]).await;
+        assert!(columns(&db, "far").contains(&"extra".to_string()));
+        let db = if crash {
+            shut(db, &root_dir);
+            Arc::new(open(&root_dir).await)
+        } else {
+            db.block_ddl_abort(root).await;
+            db.abort_transaction(root);
+            db
+        };
+        assert_eq!(columns(&db, "far"), vec!["id".to_string(), "name".to_string()], "crash {crash}: the ALTER stayed");
+        assert_eq!(ids(&db, "far").await, 3, "crash {crash}: the rows from before the block");
+        for d in [&root_dir, &disk] {
+            let leftovers: Vec<String> = std::fs::read_dir(d)
+                .expect("dir")
+                .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
+                .filter(|n| n.starts_with("__txddl_") || n.starts_with(block_ddl::COPY_PREFIX))
+                .collect();
+            assert!(leftovers.is_empty(), "crash {crash}: left behind in {}: {leftovers:?}", d.display());
+        }
+        shut(db, &root_dir);
+    }
+}

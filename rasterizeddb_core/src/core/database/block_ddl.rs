@@ -238,9 +238,12 @@ impl Database {
             let undo = match undo {
                 Undo::Restore { table, .. } => {
                     let copy = format!("{COPY_PREFIX}{root}_{seq}_{table}");
+                    // The copy's placement first, as the rewrite's backup
+                    // (`rewrite.rs`): its files go where the table's are, and
+                    // a crash midway leaves the name pointing at them.
+                    super::pool_rename(&self.storage, &table, &copy);
                     let table_seed = self.seed_of(&table).await;
                     let copy_seed = self.seed_of(&copy).await;
-                    super::pool_rename(&self.storage, &table, &copy);
                     if let Err(e) = copy_files_between(&table_seed, &copy_seed, &table, &copy, RENAMED_SUFFIXES).await {
                         discard_files_in(&copy_seed, &self.storage, self.location.as_deref(), &copy, RENAMED_SUFFIXES).await;
                         return Err(format!("could not keep \"{table}\" aside for the block's rollback: {e}"));
@@ -249,7 +252,13 @@ impl Database {
                 }
                 drop => drop,
             };
-            let intent = match self.location.as_deref() {
+            // No intent for a table a crash does not leave behind: there is
+            // nothing to put back after one.
+            let lasting = match &undo {
+                Undo::Restore { table, .. } => self.survives_a_crash(table),
+                Undo::Drop { .. } => true,
+            };
+            let intent = match self.location.as_deref().filter(|_| lasting) {
                 Some(root_dir) => {
                     let path = intent_path(root_dir, root, seq);
                     super::rewrite::write_intent(&path, &encode(root, &undo))
