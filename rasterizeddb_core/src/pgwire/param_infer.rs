@@ -461,6 +461,14 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
                 set(n, Some(oid), &mut oids);
                 continue;
             }
+            // `f(…) <op> $n` with `f` one that returns text (`md5(v) = $1`,
+            // `lower(s) LIKE $1`): the parameter is text, as PostgreSQL
+            // resolves an unknown beside text. Inlined as the number its
+            // text looked like, it met the text as `text = integer` (42883).
+            if before(2) == Some(&Tok::Close) && text_call_before(&toks, lo - 2) {
+                set(n, Some(TEXT), &mut oids);
+                continue;
+            }
         }
         // `$n <op> col`.
         if toks.get(hi + 1).is_some_and(is_comparison) {
@@ -495,6 +503,36 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
     }
 
     oids
+}
+
+/// Whether the `)` at `close` ends a call of a function returning text.
+fn text_call_before(toks: &[Tok], close: usize) -> bool {
+    let mut depth = 0usize;
+    let mut k = close;
+    loop {
+        match toks.get(k) {
+            Some(Tok::Close) => depth += 1,
+            Some(Tok::Open) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            None => return false,
+            _ => {}
+        }
+        if k == 0 {
+            return false;
+        }
+        k -= 1;
+    }
+    const TEXT_FUNCTIONS: [&str; 22] = [
+        "LOWER", "UPPER", "MD5", "TRIM", "LTRIM", "RTRIM", "BTRIM", "LPAD", "RPAD", "CONCAT", "CONCAT_WS", "SUBSTR",
+        "SUBSTRING", "LEFT", "RIGHT", "REPLACE", "REVERSE", "INITCAP", "REPEAT", "SPLIT_PART", "TRANSLATE", "TO_CHAR",
+    ];
+    k.checked_sub(1)
+        .and_then(|j| toks.get(j))
+        .is_some_and(|t| TEXT_FUNCTIONS.iter().any(|f| t.keyword(f)))
 }
 
 /// For `INSERT INTO t (a, b) VALUES …`: the column names, and the index of the

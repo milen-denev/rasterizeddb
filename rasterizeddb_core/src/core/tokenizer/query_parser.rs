@@ -401,6 +401,80 @@ impl<'a, 'b> QueryParser<'a, 'b> {
     /// `I64` (or `I128` past it) for integers. `NUMERIC` is not handled here; it
     /// has its own scale-aware path. Pairs that are not both plain numbers are
     /// returned unchanged.
+    /// [`Self::promote_numeric`] for arithmetic: an integer literal is an
+    /// `integer` (a `bigint` past it), as PostgreSQL types it, so beside a
+    /// `smallint` column the arithmetic is done in `integer`. Coerced to the
+    /// column's own width, `sm - 7 / -4` over a `sm` of 32767 overflowed
+    /// smallint where PostgreSQL computes 32768. Two columns keep their
+    /// type: `smallint + smallint` is `smallint` there too.
+    fn promote_arithmetic(
+        left: ComparisonOperand,
+        left_type: DbType,
+        right: ComparisonOperand,
+        right_type: DbType,
+    ) -> (ComparisonOperand, ComparisonOperand, DbType, DbType) {
+        let narrow = |t: &DbType| matches!(t, DbType::I8 | DbType::I16 | DbType::U8 | DbType::U16);
+        let small_int_literal = |o: &ComparisonOperand, t: &DbType| {
+            matches!(o, ComparisonOperand::Direct(_))
+                && matches!(t, DbType::I8 | DbType::I16 | DbType::I32 | DbType::U8 | DbType::U16)
+        };
+        let widen = |o: ComparisonOperand, t: DbType| -> (ComparisonOperand, DbType) {
+            match &o {
+                ComparisonOperand::Direct(mb) if t != DbType::I32 => {
+                    match crate::core::value_codec::coerce_literal(mb.into_slice(), &t, &DbType::I32) {
+                        Some(bytes) => {
+                            let mut out = MEMORY_POOL.acquire(bytes.len());
+                            out.into_slice_mut().copy_from_slice(&bytes);
+                            (ComparisonOperand::Direct(out), DbType::I32)
+                        }
+                        None => (o, t),
+                    }
+                }
+                _ => (o, t),
+            }
+        };
+        // The literal is first made the `integer` it is; the ordinary
+        // promotion then widens the narrow side to meet it.
+        let (left, left_type, right, right_type) = if small_int_literal(&left, &left_type) && narrow(&right_type) {
+            let (l, lt) = widen(left, left_type);
+            (l, lt, right, right_type)
+        } else if small_int_literal(&right, &right_type) && narrow(&left_type) {
+            let (r, rt) = widen(right, right_type);
+            (left, left_type, r, rt)
+        } else {
+            (left, left_type, right, right_type)
+        };
+        let column_and_literal = (matches!(left, ComparisonOperand::Direct(_)) && left_type == DbType::I32 && narrow(&right_type))
+            || (matches!(right, ComparisonOperand::Direct(_)) && right_type == DbType::I32 && narrow(&left_type));
+        if column_and_literal {
+            // Not through `promote_numeric`, which would fit the literal back
+            // into the narrow column's type: both sides become `integer`.
+            let to_int = |o: ComparisonOperand, t: DbType| -> ComparisonOperand {
+                if t == DbType::I32 {
+                    return o;
+                }
+                match o {
+                    ComparisonOperand::Direct(mb) => match crate::core::value_codec::coerce_literal(mb.into_slice(), &t, &DbType::I32) {
+                        Some(bytes) => {
+                            let mut out = MEMORY_POOL.acquire(bytes.len());
+                            out.into_slice_mut().copy_from_slice(&bytes);
+                            ComparisonOperand::Direct(out)
+                        }
+                        None => ComparisonOperand::Direct(mb),
+                    },
+                    ComparisonOperand::DirectWithIndex(mb, idx) => ComparisonOperand::CastWithIndex(mb, idx, t, DbType::I32),
+                    ComparisonOperand::Intermediate(idx) => ComparisonOperand::IntermediateCast(idx, t, DbType::I32),
+                    ComparisonOperand::IntermediateCast(idx, original, _) => ComparisonOperand::IntermediateCast(idx, original, DbType::I32),
+                    ComparisonOperand::Evaluated(operand, _) => ComparisonOperand::Evaluated(operand, DbType::I32),
+                    other => other,
+                }
+            };
+            let (l, r) = (to_int(left, left_type), to_int(right, right_type));
+            return (l, r, DbType::I32, DbType::I32);
+        }
+        Self::promote_numeric(left, left_type, right, right_type)
+    }
+
     fn promote_numeric(
         left: ComparisonOperand,
         left_type: DbType,
@@ -1576,7 +1650,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                 Ok((l, r, ls, rs)) => (l, r, Some((ls, rs)), DbType::DECIMAL, DbType::DECIMAL),
                 Err((l, r)) if temporal => (l, r, None, lhs_type.clone(), result_type),
                 Err((l, r)) => {
-                    let (l, r, t, _) = Self::promote_numeric(l, lhs_type.clone(), r, rhs_type.clone());
+                    let (l, r, t, _) = Self::promote_arithmetic(l, lhs_type.clone(), r, rhs_type.clone());
                     (l, r, None, t.clone(), t)
                 }
             };
@@ -1616,7 +1690,7 @@ impl<'a, 'b> QueryParser<'a, 'b> {
                     }
                     Err((l, r)) => {
                         let (l, r, t, _) =
-                            Self::promote_numeric(l, lhs_type.clone(), r, rhs_type.clone());
+                            Self::promote_arithmetic(l, lhs_type.clone(), r, rhs_type.clone());
                         lhs_type = t;
                         (l, r, None)
                     }

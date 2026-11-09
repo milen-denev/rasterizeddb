@@ -4208,6 +4208,28 @@ pub(crate) async fn describe_query(
     // Folded as it runs (`execute_single_statement`).
     let folded = crate::core::sql_scan::fold_core_statement(stmt);
     let stmt = folded.as_ref();
+    // A SELECT's subqueries are replaced by their answers before it runs
+    // (the execute path's `substitute_in_subqueries`), so it is described in
+    // that form too. Described as written, a scalar subquery in the select
+    // list was not a column the parser could type: the portal answered
+    // NoData, Execute sent rows anyway, and a client read "server sent data
+    // without prior row description".
+    let substituted;
+    let stmt = if stmt.as_bytes().get(..6).is_some_and(|w| w.eq_ignore_ascii_case(b"SELECT"))
+        && (crate::core::rql::subquery::find_in_subquery(stmt).is_some()
+            || crate::core::rql::subquery::find_exists(stmt).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(stmt).is_some())
+    {
+        match crate::core::rql::executor::substitute_in_subqueries(stmt, database, crate::core::mvcc::transaction::FROZEN_TX).await {
+            Ok(s) => {
+                substituted = s;
+                substituted.as_str()
+            }
+            Err(_) => stmt,
+        }
+    } else {
+        stmt
+    };
     // Described as it runs: a `DISTINCT ON` the executor rewrites over a
     // derived table (`execute_single_statement`) is described in that form.
     let typed_literals = crate::core::sql_scan::typed_literals_as_casts(stmt);

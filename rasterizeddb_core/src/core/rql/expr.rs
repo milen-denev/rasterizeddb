@@ -1801,10 +1801,16 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         return Err("MOD takes exactly two arguments".to_string());
                     }
                     let mut it = args.into_iter();
-                    Ok(Expr::Mod(
-                        Box::new(it.next().expect("checked")),
-                        Box::new(it.next().expect("checked")),
-                    ))
+                    let (a, b) = (it.next().expect("checked"), it.next().expect("checked"));
+                    // Over a NUMERIC or a float it is the `%` operator's
+                    // remainder, which carries the scale: the integer node
+                    // refused `mod(price, 3)` ("MOD needs integer arguments")
+                    // where `price % 3` answered.
+                    if integer_typed(&a) && integer_typed(&b) {
+                        Ok(Expr::Mod(Box::new(a), Box::new(b)))
+                    } else {
+                        Ok(Expr::Arith(Box::new(a), ArithOp::Rem, Box::new(b)))
+                    }
                 }
                 // `pg_typeof(x)`: the type `x` is, as PostgreSQL names it.
                 "PG_TYPEOF" if args.len() == 1 => {
