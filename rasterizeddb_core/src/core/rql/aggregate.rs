@@ -1771,6 +1771,9 @@ impl Acc {
                 if values.is_empty() {
                     return Ok(None);
                 }
+                // A boolean is `t` or `f` in an array (`boolout`); its own
+                // text is `true`, and `array_agg(f)` printed `{true,false}`.
+                let boolean = matches!(elem.as_ref().map(|f| &f.db_type), Some(DbType::BOOL));
                 let mut text = String::from("{");
                 for (i, (_, v)) in values.iter().enumerate() {
                     if i > 0 {
@@ -1778,7 +1781,15 @@ impl Acc {
                     }
                     match v {
                         None => text.push_str("NULL"),
-                        Some(bytes) => text.push_str(&array_element_text(&element(bytes)?)),
+                        Some(bytes) => {
+                            let value = element(bytes)?;
+                            let value = match value.as_str() {
+                                "true" if boolean => "t".to_string(),
+                                "false" if boolean => "f".to_string(),
+                                _ => value,
+                            };
+                            text.push_str(&array_element_text(&value));
+                        }
                     }
                 }
                 text.push('}');

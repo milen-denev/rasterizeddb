@@ -221,3 +221,28 @@ async fn a_second_assignment_to_one_column_is_refused() {
     }
     assert_eq!(rows(&c, "SELECT a, s FROM p1 WHERE id = 1").await, ["5|abc"]);
 }
+
+/// Round 16 (gen5.py: windows, dates and times, jsonb, arrays). A template
+/// pattern `to_char` did not know was copied as text: `WW` came back as `WW`,
+/// `J` as `J`, `IYYY` as `I` and a 3-digit year, and every all-lower-case
+/// pattern as itself, so `to_date('2024-05-06', 'yyyy-mm-dd')` was
+/// 0001-01-01. A boolean in an array printed `true`, where PostgreSQL
+/// prints `t`. Expected values are PostgreSQL 17's.
+#[tokio::test]
+async fn round_16_answers_as_postgresql_17_does() {
+    let (_s, c) = server().await;
+    for (sql, want) in [
+        (
+            "SELECT to_char(TIMESTAMP '2020-12-31 23:59:59.123456', 'IYYY-IW ID IDDD J WW W CC Y,YYY FF3 SSSS RM DDth')",
+            "2020-53 4 368 2459215 53 5 21 2,020 123 86399 XII  31st",
+        ),
+        ("SELECT to_char(DATE '2021-01-03', 'iyyy-iw yyyy-mm-dd')", "2020-53 2021-01-03"),
+        ("SELECT to_char(DATE '2024-02-29', 'TMMonth|FMMonth|Month|Dy|FMDDth')", "February|February|February |Thu|29th"),
+        ("SELECT to_date('2024-05-06', 'yyyy-mm-dd')", "2024-05-06"),
+        ("SELECT to_timestamp('2024-05-06 01:14:15 pm', 'yyyy-mm-dd hh12:mi:ss am')::timestamp", "2024-05-06 13:14:15"),
+        ("SELECT array_agg(f ORDER BY id) FROM p1", "{t,f,NULL,t}"),
+        ("SELECT array_agg(DISTINCT f) FROM p1", "{f,t,NULL}"),
+    ] {
+        assert_eq!(rows(&c, sql).await, [want], "{sql}");
+    }
+}

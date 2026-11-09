@@ -1441,6 +1441,10 @@ pub fn format_array(raw: &[u8]) -> Option<String> {
     }
 
     let count = be32(12).max(0) as usize;
+    // A boolean element is `t` or `f`, as PostgreSQL's `boolout` writes it
+    // inside an array; the element text kept is the spelling it came in as
+    // (`array_agg(f)` printed `{true,false}`).
+    let boolean = be32(8) == 16;
     let mut at = 20usize;
     let mut parts: Vec<String> = Vec::with_capacity(count);
 
@@ -1458,8 +1462,15 @@ pub fn format_array(raw: &[u8]) -> Option<String> {
         if at + len > raw.len() {
             return None;
         }
-        let value = String::from_utf8_lossy(&raw[at..at + len]).into_owned();
+        let mut value = String::from_utf8_lossy(&raw[at..at + len]).into_owned();
         at += len;
+        if boolean {
+            match value.to_ascii_lowercase().as_str() {
+                "true" | "t" => value = "t".to_string(),
+                "false" | "f" => value = "f".to_string(),
+                _ => {}
+            }
+        }
 
         // Quote when the value could otherwise be misread as syntax.
         let needs_quotes = value.is_empty()

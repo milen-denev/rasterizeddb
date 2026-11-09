@@ -1341,38 +1341,81 @@ const MONTHS: [&str; 12] =
     ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
-/// A template's patterns, longest first so `HH24` is not read as `HH`.
+/// A template's patterns: PostgreSQL's keyword table (`DCH_keywords` in
+/// `formatting.c`), in its order, which puts the longer of two patterns
+/// sharing a start first (`HH24` before `HH`, `IYYY` before `IY`). Each is
+/// spelled in capitals or all lower case (`yyyy-mm-dd` is a template), and a
+/// few in title case; any other spelling is text. Whatever is no pattern is
+/// copied as written, which is why one missing here came back as its own
+/// letters (`to_char(d, 'WW')` was `WW`, `IYYY` was `I` and a 3-digit year).
 const PATTERNS: &[&str] = &[
-    "HH24", "HH12", "YYYY", "MONTH", "Month", "month", "A.M.", "P.M.", "a.m.", "p.m.", "DDD", "YYY", "MON", "Mon", "mon",
-    "DAY", "Day", "day", "HH", "MI", "SS", "MS", "US", "AM", "PM", "am", "pm", "YY", "MM", "DD", "DY", "Dy", "dy", "Y",
-    "D", "Q",
+    "A.D.", "A.M.", "AD", "AM", "B.C.", "BC", "CC", "DAY", "DDD", "DD", "DY", "Day", "Dy", "D", "FF1", "FF2", "FF3",
+    "FF4", "FF5", "FF6", "HH24", "HH12", "HH", "IDDD", "ID", "IW", "IYYY", "IYY", "IY", "I", "J", "MI", "MM", "MONTH",
+    "MON", "MS", "Month", "Mon", "OF", "P.M.", "PM", "Q", "RM", "SSSSS", "SSSS", "SS", "TZH", "TZM", "TZ", "US", "WW",
+    "W", "Y,YYY", "YYYY", "YYY", "YY", "Y", "a.d.", "a.m.", "ad", "am", "b.c.", "bc", "cc", "day", "ddd", "dd", "dy",
+    "d", "ff1", "ff2", "ff3", "ff4", "ff5", "ff6", "hh24", "hh12", "hh", "iddd", "id", "iw", "iyyy", "iyy", "iy", "i",
+    "j", "mi", "mm", "month", "mon", "ms", "of", "p.m.", "pm", "q", "rm", "sssss", "ssss", "ss", "tzh", "tzm", "tz",
+    "us", "ww", "w", "y,yyy", "yyyy", "yyy", "yy", "y",
 ];
 
 enum Piece {
-    Pattern { name: &'static str, fill: bool },
+    /// `name` as written; `ordinal` for a `TH`/`th` suffix (`DDth` is `01st`);
+    /// `tm` for the `TM` prefix, under which a name is not padded.
+    Pattern { name: &'static str, fill: bool, tm: bool, ordinal: Option<bool> },
     Literal(String),
 }
 
 fn template(fmt: &str) -> Vec<Piece> {
     let mut out = Vec::new();
     let mut rest = fmt;
-    let mut fill = false;
+    let (mut fill, mut tm) = (false, false);
     while !rest.is_empty() {
-        if rest.len() >= 2 && rest.as_bytes()[..2].eq_ignore_ascii_case(b"FM") {
-            fill = true;
+        // Prefix modifiers: `FM` drops the padding of the pattern after it,
+        // `TM` a month or day name's (its translation is the C locale's,
+        // the same words); `FX` changes nothing `to_char` prints.
+        if let Some(prefix) = ["FM", "fm", "FX", "fx", "TM", "tm"].iter().find(|p| rest.starts_with(**p)) {
+            fill |= prefix.eq_ignore_ascii_case("FM");
+            tm |= prefix.eq_ignore_ascii_case("TM");
             rest = &rest[2..];
             continue;
         }
         if let Some(stripped) = rest.strip_prefix('"') {
-            let end = stripped.find('"').unwrap_or(stripped.len());
-            out.push(Piece::Literal(stripped[..end].to_string()));
-            rest = stripped.get(end + 1..).unwrap_or("");
+            // Quoted text, `\"` a quote within it.
+            let mut text = String::new();
+            let mut chars = stripped.char_indices();
+            let mut end = stripped.len();
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => {
+                        if let Some((_, next)) = chars.next() {
+                            text.push(next);
+                        }
+                    }
+                    '"' => {
+                        end = i + 1;
+                        break;
+                    }
+                    c => text.push(c),
+                }
+            }
+            out.push(Piece::Literal(text));
+            rest = &stripped[end.min(stripped.len())..];
             continue;
         }
         if let Some(name) = PATTERNS.iter().find(|p| rest.starts_with(**p)) {
-            out.push(Piece::Pattern { name, fill });
-            fill = false;
             rest = &rest[name.len()..];
+            let ordinal = if rest.starts_with("TH") {
+                Some(true)
+            } else if rest.starts_with("th") {
+                Some(false)
+            } else {
+                None
+            };
+            if ordinal.is_some() {
+                rest = &rest[2..];
+            }
+            out.push(Piece::Pattern { name, fill, tm, ordinal });
+            (fill, tm) = (false, false);
             continue;
         }
         let c = rest.chars().next().expect("non-empty");
@@ -1384,11 +1427,37 @@ fn template(fmt: &str) -> Vec<Piece> {
 
 fn cased(name: &str, word: &str) -> String {
     match name {
-        n if n.chars().all(|c| c.is_ascii_uppercase()) => word.to_ascii_uppercase(),
-        n if n.chars().all(|c| c.is_ascii_lowercase()) => word.to_ascii_lowercase(),
+        n if n.chars().all(|c| !c.is_ascii_lowercase()) => word.to_ascii_uppercase(),
+        n if n.chars().all(|c| !c.is_ascii_uppercase()) => word.to_ascii_lowercase(),
         _ => word.to_string(),
     }
 }
+
+/// `n` with its English ordinal suffix, as `TH` (upper) or `th` asks.
+fn with_ordinal(digits: String, n: i64, upper: bool) -> String {
+    let n = n.abs();
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    digits + &if upper { suffix.to_ascii_uppercase() } else { suffix.to_string() }
+}
+
+/// The ISO 8601 week-numbering year of the day `days` since 1970-01-01, its
+/// week (1 to 53) and its weekday (Monday 1 to Sunday 7): the week is the
+/// one holding its Thursday, and the year that Thursday's.
+fn iso_week(days: i64) -> (i64, i64, i64) {
+    let weekday = (days + 3).rem_euclid(7) + 1;
+    let thursday = days + 4 - weekday;
+    let (year, _, _) = crate::core::value_codec::civil_from_days(thursday);
+    let week = (thursday - crate::core::value_codec::days_from_civil(year, 1, 1)) / 7 + 1;
+    (year, week, weekday)
+}
+
+const ROMAN_MONTHS: [&str; 12] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
 
 /// `to_char(value, template)`: a date or timestamp by its fields, a number
 /// by the digit template.
@@ -1402,46 +1471,82 @@ fn to_char(value: &Value, fmt: &str) -> Result<String, String> {
     let f = fields_of(us);
     let days = us.div_euclid(86_400_000_000);
     let weekday = (days + 4).rem_euclid(7) as usize;
+    let day_of_year = days - crate::core::value_codec::days_from_civil(f.year, 1, 1) + 1;
+    let (iso_year, iso_week_no, iso_weekday) = iso_week(days);
+    // PostgreSQL's years: 1 BC is year 0 here, and prints as 1.
+    let (bc, year) = if f.year <= 0 { (true, 1 - f.year) } else { (false, f.year) };
     let mut out = String::new();
     for piece in template(fmt) {
-        let (name, fill) = match piece {
+        let (name, fill, tm, ordinal) = match piece {
             Piece::Literal(text) => {
                 out.push_str(&text);
                 continue;
             }
-            Piece::Pattern { name, fill } => (name, fill),
+            Piece::Pattern { name, fill, tm, ordinal } => (name, fill, tm, ordinal),
         };
-        let num = |v: i64, width: usize| if fill { v.to_string() } else { format!("{v:0width$}") };
+        let num = |v: i64, width: usize| {
+            let digits = if fill { v.to_string() } else { format!("{v:0width$}") };
+            match ordinal {
+                Some(upper) => with_ordinal(digits, v, upper),
+                None => digits,
+            }
+        };
         let word = |w: &str, width: usize| {
             let w = cased(name, w);
-            if fill { w } else { format!("{w:<width$}") }
+            if fill || tm { w } else { format!("{w:<width$}") }
         };
         let hour12 = if f.hour % 12 == 0 { 12 } else { f.hour % 12 };
-        out.push_str(&match name {
-            "YYYY" => num(f.year, 4),
-            "YYY" => num(f.year % 1000, 3),
-            "YY" => num(f.year % 100, 2),
-            "Y" => num(f.year % 10, 1),
+        let upper = name.to_ascii_uppercase();
+        out.push_str(&match upper.as_str() {
+            "YYYY" => num(year, 4),
+            "Y,YYY" => {
+                let digits = format!("{},{:03}", year / 1000, year % 1000);
+                match ordinal {
+                    Some(upper) => with_ordinal(digits, year, upper),
+                    None => digits,
+                }
+            }
+            "YYY" => num(year % 1000, 3),
+            "YY" => num(year % 100, 2),
+            "Y" => num(year % 10, 1),
+            "IYYY" => num(iso_year, 4),
+            "IYY" => num(iso_year % 1000, 3),
+            "IY" => num(iso_year % 100, 2),
+            "I" => num(iso_year % 10, 1),
+            "IW" => num(iso_week_no, 2),
+            "ID" => num(iso_weekday, 1),
+            "IDDD" => num((iso_week_no - 1) * 7 + iso_weekday, 3),
+            "CC" => num(if bc { -((year + 99) / 100) } else { (year + 99) / 100 }, 2),
             "MM" => num(f.month, 2),
             "DD" => num(f.day, 2),
-            "DDD" => num(days - crate::core::value_codec::days_from_civil(f.year, 1, 1) + 1, 3),
-            "D" => (weekday + 1).to_string(),
-            "Q" => ((f.month - 1) / 3 + 1).to_string(),
+            "DDD" => num(day_of_year, 3),
+            "D" => num(weekday as i64 + 1, 1),
+            "W" => num((f.day - 1) / 7 + 1, 1),
+            "WW" => num((day_of_year - 1) / 7 + 1, 2),
+            "Q" => num((f.month - 1) / 3 + 1, 1),
+            "J" => num(days + 2_440_588, 1),
             "HH24" => num(f.hour, 2),
             "HH12" | "HH" => num(hour12, 2),
             "MI" => num(f.minute, 2),
             "SS" => num(f.second, 2),
+            "SSSS" | "SSSSS" => num(f.hour * 3600 + f.minute * 60 + f.second, 1),
             "MS" => num(f.micros / 1000, 3),
             "US" => num(f.micros, 6),
-            "AM" | "PM" => (if f.hour < 12 { "AM" } else { "PM" }).to_string(),
-            "am" | "pm" => (if f.hour < 12 { "am" } else { "pm" }).to_string(),
-            "A.M." | "P.M." => (if f.hour < 12 { "A.M." } else { "P.M." }).to_string(),
-            "a.m." | "p.m." => (if f.hour < 12 { "a.m." } else { "p.m." }).to_string(),
-            "MONTH" | "Month" | "month" => word(MONTHS[f.month as usize - 1], 9),
-            "MON" | "Mon" | "mon" => cased(name, &MONTHS[f.month as usize - 1][..3]),
-            "DAY" | "Day" | "day" => word(DAYS[weekday], 9),
-            "DY" | "Dy" | "dy" => cased(name, &DAYS[weekday][..3]),
-            _ => String::new(),
+            "FF1" | "FF2" | "FF3" | "FF4" | "FF5" | "FF6" => {
+                let places = (upper.as_bytes()[2] - b'0') as u32;
+                num(f.micros / 10i64.pow(6 - places), places as usize)
+            }
+            "AM" | "PM" => cased(name, if f.hour < 12 { "AM" } else { "PM" }),
+            "A.M." | "P.M." => cased(name, if f.hour < 12 { "A.M." } else { "P.M." }),
+            "AD" | "BC" => cased(name, if bc { "BC" } else { "AD" }),
+            "A.D." | "B.C." => cased(name, if bc { "B.C." } else { "A.D." }),
+            "MONTH" => word(MONTHS[f.month as usize - 1], 9),
+            "MON" => cased(name, &MONTHS[f.month as usize - 1][..3]),
+            "DAY" => word(DAYS[weekday], 9),
+            "DY" => cased(name, &DAYS[weekday][..3]),
+            "RM" => word(ROMAN_MONTHS[f.month as usize - 1], 4),
+            // A zone this value does not carry; refused rather than guessed.
+            _ => return Err(format!("the template pattern \"{name}\" is not supported in to_char yet")),
         });
     }
     Ok(out)
@@ -1564,6 +1669,7 @@ fn parse_with_template(text: &str, fmt: &str) -> Result<Parsed, String> {
                 }
             }
             Piece::Pattern { name, .. } => {
+                let upper = name.to_ascii_uppercase();
                 while i < chars.len() && chars[i] == ' ' {
                     i += 1;
                 }
@@ -1577,7 +1683,7 @@ fn parse_with_template(text: &str, fmt: &str) -> Result<Parsed, String> {
                     }
                     chars[start..i].iter().collect::<String>().parse::<i64>().map_err(|_| bad(what))
                 };
-                match name {
+                match upper.as_str() {
                     "YYYY" => p.year = read(4, name)?,
                     "YY" => p.year = 2000 + read(2, name)?,
                     "MM" => p.month = read(2, name)?,
@@ -1587,12 +1693,12 @@ fn parse_with_template(text: &str, fmt: &str) -> Result<Parsed, String> {
                     "SS" => second = read(2, name)?,
                     "MS" => frac = read(3, name)? * 1000,
                     "US" => frac = read(6, name)?,
-                    "AM" | "PM" | "am" | "pm" => {
+                    "AM" | "PM" => {
                         let word: String = chars.iter().skip(i).take(2).collect();
                         pm = Some(word.eq_ignore_ascii_case("PM"));
                         i += 2;
                     }
-                    "MON" | "Mon" | "mon" | "MONTH" | "Month" | "month" => {
+                    "MON" | "MONTH" => {
                         let rest: String = chars[i..].iter().collect::<String>().to_ascii_lowercase();
                         let at = MONTHS
                             .iter()
