@@ -2541,7 +2541,114 @@ fn own_scale_arithmetic(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
 /// [`needs_evaluator`], or arithmetic over a column that keeps each value's
 /// own scale ([`own_scale_arithmetic`]).
 fn evaluated(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
-    needs_evaluator(text) || own_scale_arithmetic(text, schema) || mixed_numeric_columns(text, schema) || constant_mixed_comparison(text)
+    needs_evaluator(text)
+        || own_scale_arithmetic(text, schema)
+        || mixed_numeric_columns(text, schema)
+        || constant_mixed_comparison(text)
+        || quoted_beside_number(text)
+        || quoted_and_arithmetic(text)
+}
+
+/// The gate for [`quoted_against_arithmetic`]: a quoted literal and an
+/// arithmetic operator both outside quotes.
+fn quoted_and_arithmetic(text: &str) -> bool {
+    let (mut quoted, mut arith, mut inside) = (false, false, false);
+    for c in text.bytes() {
+        if c == b'\'' {
+            inside = !inside;
+            quoted = true;
+        } else if !inside && matches!(c, b'+' | b'*' | b'/') {
+            arith = true;
+        }
+    }
+    quoted && arith
+}
+
+/// Whether `body` compares a quoted literal with arithmetic (`a + 1 > '5'`):
+/// the literal is PostgreSQL's unknown and takes the arithmetic's type, which
+/// the evaluator does; the scan's comparison met the computed integer with
+/// the text's bytes ("operand size does not match").
+fn quoted_against_arithmetic(body: &str) -> bool {
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    let (left, right) = (body[..at].trim(), body[end..].trim());
+    let quoted = |t: &str| t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') && !t[1..t.len() - 1].replace("''", "").contains('\'');
+    let arithmetic = |t: &str| {
+        let mut inside = false;
+        t.bytes().any(|c| {
+            if c == b'\'' {
+                inside = !inside;
+            }
+            !inside && matches!(c, b'+' | b'*' | b'/')
+        })
+    };
+    (quoted(left) && arithmetic(right)) || (quoted(right) && arithmetic(left))
+}
+
+/// Whether a quoted literal and a number meet across a comparison anywhere
+/// in `text`, `'-1' > 2` inside `(… AND '-1' > 2)`: the cheap test that sends
+/// the clause through the lift, whose per-term `constant_mixed_comparison`
+/// then decides. Only the gate; a term with a column is not lifted for it.
+fn quoted_beside_number(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let op_at = |i: usize| -> Option<usize> {
+        let rest = &bytes[i..];
+        ["<=", ">=", "<>", "!=", "=", "<", ">"].iter().find(|op| rest.starts_with(op.as_bytes())).map(|op| op.len())
+    };
+    let skip_ws = |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let number_at = |i: usize| {
+        let i = if bytes.get(i) == Some(&b'-') { i + 1 } else { i };
+        bytes.get(i).is_some_and(u8::is_ascii_digit)
+    };
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'\'' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < bytes.len() && !(bytes[i] == b'\'' && bytes.get(i + 1) != Some(&b'\'')) {
+            i += if bytes[i] == b'\'' { 2 } else { 1 };
+        }
+        let end = (i + 1).min(bytes.len());
+        // `'x' <op> 5`
+        let after = skip_ws(end);
+        if let Some(len) = op_at(after.min(bytes.len().saturating_sub(1))).filter(|_| after < bytes.len()) {
+            if number_at(skip_ws(after + len)) {
+                return true;
+            }
+        }
+        // `5 <op> 'x'`
+        let mut b = start;
+        while b > 0 && bytes[b - 1].is_ascii_whitespace() {
+            b -= 1;
+        }
+        let op_start = (b.saturating_sub(2)..b).find(|&k| op_at(k).is_some_and(|len| k + len == b));
+        if let Some(op_start) = op_start {
+            let mut n = op_start;
+            while n > 0 && bytes[n - 1].is_ascii_whitespace() {
+                n -= 1;
+            }
+            if n > 0 && bytes[n - 1].is_ascii_digit() {
+                let mut k = n;
+                while k > 0 && (bytes[k - 1].is_ascii_digit() || bytes[k - 1] == b'.') {
+                    k -= 1;
+                }
+                if k == 0 || !(bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_') {
+                    return true;
+                }
+            }
+        }
+        i = end;
+    }
+    false
 }
 
 /// Whether `text` compares a quoted literal with a number and reads no
@@ -3326,7 +3433,11 @@ fn lift_term(
     }
     let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
         format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
-    } else if quantified_over_array(body) || mixed_numeric_columns(body, schema) || constant_mixed_comparison(body) {
+    } else if quantified_over_array(body)
+        || mixed_numeric_columns(body, schema)
+        || constant_mixed_comparison(body)
+        || quoted_against_arithmetic(body)
+    {
         // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
         // onto the comparison below still leaves an unknown row out.
         let case = format!("CASE WHEN {body} THEN true WHEN NOT ({body}) THEN false END");
