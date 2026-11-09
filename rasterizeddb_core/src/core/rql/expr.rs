@@ -460,6 +460,12 @@ pub enum TextFunc {
     /// `regexp_like(text, pattern [, flags])`: whether a POSIX regular
     /// expression matches, the boolean `~` (and, with flag `i`, `~*`) is.
     RegexpLike,
+    /// `text LIKE pattern` as a value (`like_condition`): the pattern with
+    /// PostgreSQL's default escape, a backslash.
+    Like,
+    /// `text ILIKE pattern`: [`TextFunc::Like`] with both sides lowered
+    /// as the WHERE path's matcher lowers them (Unicode, not only ASCII).
+    ILike,
     /// `regexp_like` inside a CHECK (`__check_regexp_like`): a value the
     /// answer cannot be vouched for is NULL, and marks the evaluation
     /// uncertain ([`take_check_uncertainty`]), so the check is not judged
@@ -753,6 +759,22 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
     // `double` alone names no type in PostgreSQL (`double precision` does).
     if target.trim().eq_ignore_ascii_case("double") {
         return Err("type \"double\" does not exist".to_string());
+    }
+    // Nothing may follow a type modifier but `[]` or a zone clause. The name
+    // is read up to its `(`, so `c::numeric(12,3) > 1` cast to NUMERIC(12,3)
+    // and dropped the comparison: the select list sent the number, where it
+    // only tries an item as a comparison once it is not an expression.
+    if let Some(open) = target.find('(') {
+        let close = matching_paren(target, open)
+            .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
+        let mut rest = target[close + 1..].trim();
+        while let Some(r) = rest.strip_suffix("[]") {
+            rest = r.trim_end();
+        }
+        let words = rest.split_whitespace().map(|w| w.to_ascii_uppercase()).collect::<Vec<_>>().join(" ");
+        if !matches!(words.as_str(), "" | "WITH TIME ZONE" | "WITHOUT TIME ZONE") {
+            return Err(format!("cast to '{}' is not supported yet", target.trim()));
+        }
     }
     let db_type = cast_target(target)
         .ok_or_else(|| format!("cast to '{}' is not supported yet", target.trim()))?;
@@ -1070,6 +1092,45 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         if let Some(close) = matching_paren(text, 0) {
             if close == text.len() - 1 {
                 return parse(&text[1..close], schema);
+            }
+        }
+    }
+
+    // `||` and the path operators are one precedence in PostgreSQL, grouped
+    // left to right, so the last of them at the top is the root. A path
+    // after the last `||` takes everything before it as its base:
+    // `'-1' || doc->>'t'` is `('-1' || doc)->>'t'`, and `s || doc->>'t'` is
+    // a path over text, refused as PostgreSQL refuses it. With no path after
+    // it, the `||` is the root. Read with the path first, both returned the
+    // concatenation PostgreSQL never gives.
+    if let Some(concat_at) = top_level_concat(text) {
+        let nesting = Nesting::of(text);
+        let bytes = text.as_bytes();
+        let path_at = (concat_at + 2..bytes.len().saturating_sub(1))
+            .find(|&i| matches!(bytes[i], b'-' | b'#') && bytes[i + 1] == b'>' && nesting.top_level(i));
+        match path_at {
+            Some(at) => {
+                if let (Some(path), Some(operator)) = (
+                    crate::core::jsonb::parse_path_expression(&format!("x{}", &text[at..])),
+                    ["#>>", "#>", "->>", "->"].into_iter().find(|op| text[at..].starts_with(op)),
+                ) {
+                    let base = parse(text[..at].trim_end(), schema)?;
+                    if !yields_json_text(&base) && static_type(&base) != DbType::JSONB {
+                        return Err(format!(
+                            "operator does not exist: {} {} unknown",
+                            pg_operand_type_name(&base),
+                            operator
+                        ));
+                    }
+                    return Ok(Expr::PathOf { base: Box::new(base), steps: path.steps, as_text: path.as_text });
+                }
+            }
+            None => {
+                let lhs = text[..concat_at].trim();
+                let rhs = text[concat_at + 2..].trim();
+                if !lhs.is_empty() && !rhs.is_empty() {
+                    return Ok(Expr::Concat(Box::new(parse(lhs, schema)?), Box::new(parse(rhs, schema)?)));
+                }
             }
         }
     }
@@ -1990,6 +2051,12 @@ pub fn parse_cond(text: &str, schema: &[SchemaField]) -> Result<Cond, String> {
     if text.len() > 4 && text[..3].eq_ignore_ascii_case("NOT") && text.as_bytes()[3] == b'(' {
         return Ok(Cond::Not(Box::new(parse_cond(&text[3..], schema)?)));
     }
+    if let Some(cond) = like_condition(text, schema)? {
+        return Ok(cond);
+    }
+    if let Some(cond) = distinct_condition(text, schema)? {
+        return Ok(cond);
+    }
     if let Some(cond) = in_or_between(text, schema)? {
         return Ok(cond);
     }
@@ -2086,6 +2153,118 @@ fn in_or_between(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, Str
 /// column answering yes there became a computed item, so `SELECT id,
 /// is_active` lost the column. Everything that calls `parse_cond` wants a
 /// condition, so the reading is safe here.
+/// `x [NOT] LIKE p [ESCAPE e]` and `x [NOT] ILIKE p …` as a condition,
+/// which the WHERE path answers with its own matcher and nothing else read:
+/// in a select list, a `CASE WHEN` or a join's condition the whole item was
+/// refused as an unknown column. Any other escape than the default backslash
+/// is rewritten into it.
+fn like_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, String> {
+    use crate::core::rql::join::find_keyword;
+    let found = [("LIKE", TextFunc::Like), ("ILIKE", TextFunc::ILike)]
+        .into_iter()
+        .filter_map(|(kw, func)| find_keyword(text, kw, 0).map(|at| (at, kw.len(), func)))
+        .min_by_key(|(at, ..)| *at);
+    let Some((at, len, func)) = found else {
+        return Ok(None);
+    };
+    let mut left = text[..at].trim_end();
+    let negated = left.len() > 4
+        && left[left.len() - 3..].eq_ignore_ascii_case("NOT")
+        && left.as_bytes()[left.len() - 4].is_ascii_whitespace();
+    if negated {
+        left = left[..left.len() - 3].trim_end();
+    }
+    let rest = &text[at + len..];
+    let (pattern_text, escape) = match find_keyword(rest, "ESCAPE", 0) {
+        Some(e) => (&rest[..e], Some(rest[e + 6..].trim())),
+        None => (rest, None),
+    };
+    if left.is_empty() || pattern_text.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut pattern = parse(pattern_text, schema)?;
+    if let Some(escape) = escape {
+        let Expr::Literal { bytes, db_type: DbType::STRING } = &pattern else {
+            return Err("LIKE … ESCAPE is supported only over a constant pattern".to_string());
+        };
+        let Ok(Expr::Literal { bytes: esc, db_type: DbType::STRING }) = parse(escape, schema) else {
+            return Err("ESCAPE needs a quoted string".to_string());
+        };
+        let esc = String::from_utf8_lossy(&esc).into_owned();
+        let mut chars = esc.chars();
+        let escape = match (chars.next(), chars.next()) {
+            (None, _) => None,
+            (Some(c), None) => Some(c),
+            _ => return Err("invalid escape string".to_string()),
+        };
+        // Into the backslash form the matcher reads.
+        let mut out = String::new();
+        let source = String::from_utf8_lossy(bytes).into_owned();
+        let mut it = source.chars();
+        while let Some(c) = it.next() {
+            if Some(c) == escape {
+                match it.next() {
+                    Some(n) => {
+                        out.push('\\');
+                        out.push(n);
+                    }
+                    None => return Err("LIKE pattern must not end with escape character".to_string()),
+                }
+            } else if c == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(c);
+            }
+        }
+        pattern = Expr::Literal { bytes: out.into_bytes(), db_type: DbType::STRING };
+    }
+    let call = Expr::Call(func, vec![parse(left, schema)?, pattern]);
+    let cond = Cond::Cmp(Condition {
+        left: Box::new(call),
+        cmp: Cmp::Eq,
+        right: Some(Box::new(Expr::Literal { bytes: vec![1], db_type: DbType::BOOL })),
+        wide: Default::default(),
+    });
+    Ok(Some(if negated { Cond::Not(Box::new(cond)) } else { cond }))
+}
+
+/// `a IS [NOT] DISTINCT FROM b`: the comparison that treats two NULLs as
+/// equal and a NULL as unequal to any value, never UNKNOWN. Built from
+/// conditions the evaluator has: one side NULL and the other not, or both
+/// values and unequal. Refused as "not supported" before.
+fn distinct_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, String> {
+    use crate::core::rql::join::find_keyword;
+    let Some(at) = find_keyword(text, "IS", 0) else {
+        return Ok(None);
+    };
+    let mut words = text[at + 2..].trim_start();
+    let negated = words.len() > 4 && words[..4].eq_ignore_ascii_case("NOT ");
+    if negated {
+        words = words[4..].trim_start();
+    }
+    if !(words.len() > 9 && words[..8].eq_ignore_ascii_case("DISTINCT") && words.as_bytes()[8].is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let words = words[9..].trim_start();
+    if !(words.len() > 5 && words[..4].eq_ignore_ascii_case("FROM") && words.as_bytes()[4].is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let (left, right) = (text[..at].trim(), words[5..].trim());
+    if left.is_empty() || right.is_empty() {
+        return Ok(None);
+    }
+    let null = |side: &str| parse_condition(&format!("({side}) IS NULL"), schema).map(Cond::Cmp);
+    let (left_null, right_null) = (null(left)?, null(right)?);
+    let unequal = Cond::Cmp(parse_condition(&format!("({left}) <> ({right})"), schema)?);
+    let not = |c: &Cond| Cond::Not(Box::new(c.clone()));
+    let distinct = Cond::Or(vec![
+        Cond::And(vec![left_null.clone(), not(&right_null)]),
+        Cond::And(vec![not(&left_null), right_null.clone()]),
+        Cond::And(vec![not(&left_null), not(&right_null), unequal]),
+    ]);
+    Ok(Some(if negated { Cond::Not(Box::new(distinct)) } else { distinct }))
+}
+
 fn bare_boolean(text: &str, schema: &[SchemaField]) -> Option<Condition> {
     let expr = parse(text, schema).ok()?;
     (static_type(&expr) == DbType::BOOL).then(|| Condition {
@@ -2897,7 +3076,10 @@ pub fn static_type(expr: &Expr) -> DbType {
                 DbType::DECIMAL
             }
         }
-        Expr::Call(TextFunc::RegexpLike | TextFunc::CheckRegexpLike | TextFunc::CheckRegexpUncertain, _) => DbType::BOOL,
+        Expr::Call(
+            TextFunc::RegexpLike | TextFunc::CheckRegexpLike | TextFunc::CheckRegexpUncertain | TextFunc::Like | TextFunc::ILike,
+            _,
+        ) => DbType::BOOL,
         Expr::Call(TextFunc::Pg(func), args) => crate::core::rql::pg_functions::result_type(*func, args),
         Expr::Call(_, _) => DbType::STRING,
         // The branches are resolved to one type the way PostgreSQL's
@@ -3326,6 +3508,38 @@ fn as_jsonb(value: Value) -> Result<Vec<u8>, String> {
     }
 }
 
+/// A boolean's text as its cast to text gives it.
+fn bool_text(bytes: &[u8]) -> &'static str {
+    if bytes.first().copied().unwrap_or(0) != 0 { "true" } else { "false" }
+}
+
+/// PostgreSQL's integer input (`pg_strtoint`): surrounding whitespace, an
+/// optional sign, then decimal digits, or `0x`/`0o`/`0b` and digits of that
+/// base, with single underscores between digits. Nothing else: no fraction,
+/// no exponent. `None` when the text is not one, or does not fit an `i128`.
+pub(crate) fn pg_integer_text(text: &str) -> Option<i128> {
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let (radix, digits) = match t.get(..2) {
+        Some("0x") | Some("0X") => (16, &t[2..]),
+        Some("0o") | Some("0O") => (8, &t[2..]),
+        Some("0b") | Some("0B") => (2, &t[2..]),
+        _ => (10, t),
+    };
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') || digits.contains("__") {
+        return None;
+    }
+    let mut value: i128 = 0;
+    for c in digits.chars().filter(|&c| c != '_') {
+        value = value.checked_mul(radix)?.checked_add(c.to_digit(radix as u32)? as i128)?;
+    }
+    Some(if negative { -value } else { value })
+}
+
 pub(crate) fn as_text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -3395,12 +3609,23 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             | TextFunc::RegexpLike
             | TextFunc::CheckRegexpLike
             | TextFunc::SimilarToEscape
+            | TextFunc::Like
+            | TextFunc::ILike
     ) && args.iter().any(|a| a.is_null())
     {
         return Ok(Value::Null);
     }
 
     Ok(match func {
+        TextFunc::Like | TextFunc::ILike => {
+            let (value, pattern) = (as_text(&args[0]), as_text(&args[1]));
+            let matched = if func == TextFunc::ILike {
+                crate::core::row::common::like_match(value.to_lowercase().as_bytes(), pattern.to_lowercase().as_bytes(), false)
+            } else {
+                crate::core::row::common::like_match(value.as_bytes(), pattern.as_bytes(), false)
+            };
+            Value::Data { bytes: vec![u8::from(matched)], db_type: DbType::BOOL }
+        }
         // Answered above, before the strictness checks of this module.
         TextFunc::Pg(func) => return crate::core::rql::pg_functions::call(func, args),
         // NULL arguments: nothing to vouch for (an answer of NULL is exact).
@@ -6790,7 +7015,14 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 // A timestamp's text has the `+00` its `cast` to text has,
                 // except a `timestamp` (without time zone) one's
                 // (`yields_timestamp`).
+                // A boolean is its cast to text, 'true' or 'false', as
+                // PostgreSQL's `anynonarray || text` casts it (`concat()`, by
+                // contrast, uses the output function: 't'). Through `as_text`
+                // it was the stored byte, so `'x' || f` read back as 'x'.
                 let text_of = |e: &Expr, v: &Value| {
+                    if let Value::Data { bytes, db_type: DbType::BOOL } = v {
+                        return bool_text(bytes).to_string();
+                    }
                     let mut text = as_text(v);
                     if matches!(v, Value::Data { db_type: DbType::DATETIME, .. }) && !yields_timestamp(e) {
                         text.push_str("+00");
@@ -7519,35 +7751,19 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     if db_type == DbType::STRING {
         let text = String::from_utf8_lossy(&bytes).to_string();
         let trimmed = text.trim();
-        // A fractional value reaching an integer target ROUNDS, half away
-        // from zero, as PostgreSQL's numeric → integer cast does —
-        // `AVG(bytes)::bigint` hands '1092.75' to this cast, and refusing it
-        // failed the billing rollup outright. The bound check survives: a
-        // rounded value outside the target's range is still an error, not a
-        // wrap.
-        fn rounded(text: &str, min: i128, max: i128) -> Option<i128> {
-            let v = text.parse::<f64>().ok()?;
-            if !v.is_finite() {
-                return None;
-            }
-            let r = v.round();
-            if r < min as f64 || r > max as f64 {
-                return None;
-            }
-            Some(r as i128)
-        }
+        // Text reaching an integer target is read by PostgreSQL's integer
+        // input, which has no fraction: `'1.5'::int` is 22P02, as is
+        // `(doc->>'k')::int` over a "1.5". It rounded, so a filter on such a
+        // cast silently matched rows PostgreSQL refuses to compare. (A
+        // NUMERIC or float source rounds; it does not come through here.)
         fn int_bytes<const N: usize>(
             text: &str,
             min: i128,
             max: i128,
             encode: impl Fn(i128) -> [u8; N],
         ) -> Option<Vec<u8>> {
-            // The exact form first, so a value near the edge is not routed
-            // through a lossy f64; the rounded form only for fractions.
-            if let Ok(v) = text.parse::<i128>() {
-                return (min..=max).contains(&v).then(|| encode(v).to_vec());
-            }
-            rounded(text, min, max).map(|v| encode(v).to_vec())
+            let v = pg_integer_text(text)?;
+            (min..=max).contains(&v).then(|| encode(v).to_vec())
         }
         let parsed: Option<Vec<u8>> = match target {
             DbType::I8 => int_bytes(trimmed, i8::MIN as i128, i8::MAX as i128, |v| {
@@ -7600,6 +7816,12 @@ pub fn cast(value: Value, target: &DbType) -> Result<Value, String> {
     }
 
     // Typed in, text out.
+    // A boolean's text is 'true' or 'false' (PostgreSQL's `booltext`). It
+    // rendered as its SQL literal, '1' or '0', so `f::text = 'true'` matched
+    // nothing and every `bool::text` in a select list sent a digit.
+    if *target == DbType::STRING && db_type == DbType::BOOL {
+        return Ok(Value::Data { bytes: bool_text(&bytes).as_bytes().to_vec(), db_type: DbType::STRING });
+    }
     if *target == DbType::STRING {
         let rendered = crate::core::rql::subquery::value_to_literal(&db_type, &bytes)
             .ok_or_else(|| format!("{:?} cannot be rendered as text", db_type))?;
@@ -8600,38 +8822,25 @@ mod tests {
         };
         assert_eq!(db_type, DbType::F32);
         assert_eq!(f32::from_le_bytes(bytes[..].try_into().unwrap()), 2.5);
-        // A fractional value ROUNDS into an integer target, half away from
-        // zero, as PostgreSQL's numeric cast does — the billing rollup hands
-        // AVG's '1092.75' to ::bigint. Range still checked after rounding.
-        let Value::Data { bytes, .. } =
-            eval(&parse("'1092.75'::bigint", &s).unwrap(), &r, &s).unwrap()
-        else {
-            panic!("null")
-        };
-        assert_eq!(i64::from_le_bytes(bytes[..].try_into().unwrap()), 1093);
-        let Value::Data { bytes, .. } = eval(&parse("'2.5'::int", &s).unwrap(), &r, &s).unwrap()
-        else {
-            panic!("null")
-        };
-        assert_eq!(
-            i32::from_le_bytes(bytes[..].try_into().unwrap()),
-            3,
-            "half away from zero"
-        );
-        let Value::Data { bytes, .. } = eval(&parse("'-2.5'::int", &s).unwrap(), &r, &s).unwrap()
-        else {
-            panic!("null")
-        };
-        assert_eq!(
-            i32::from_le_bytes(bytes[..].try_into().unwrap()),
-            -3,
-            "half away from zero"
-        );
-        assert!(eval(&parse("'32767.4'::smallint", &s).unwrap(), &r, &s).is_ok());
-        assert!(
-            eval(&parse("'32767.6'::smallint", &s).unwrap(), &r, &s).is_err(),
-            "rounds out of range"
-        );
+        // Text into an integer is PostgreSQL's integer input: no fraction,
+        // no exponent (22P02), whereas a NUMERIC rounds half away from zero.
+        // Against PostgreSQL 17: '1092.75'::bigint, '2.5'::int and
+        // '1e2'::int are each "invalid input syntax"; ' 7 '::int is 7,
+        // '0x1A'::int 26, '1_000'::int 1000, '-0b101'::int -5;
+        // '32768'::smallint is out of range; 2.5::int and '2.5'::numeric::int
+        // are 3, (-2.5)::int is -3.
+        for text in ["'1092.75'::bigint", "'2.5'::int", "'1e2'::int", "'1_'::int", "'_1'::int", "'1__0'::int", "'0x'::int", "''::int", "'32768'::smallint"] {
+            assert!(eval(&parse(text, &s).unwrap(), &r, &s).is_err(), "{text} must be refused");
+        }
+        for (text, want) in [("' 7 '::int", 7i64), ("'0x1A'::int", 26), ("'1_000'::int", 1000), ("'-0b101'::int", -5), ("'+0o17'::int", 15), ("2.5::int", 3), ("(-2.5)::int", -3), ("'2.5'::numeric::int", 3), ("'32767'::smallint", 32767)] {
+            let v = eval(&parse(text, &s).unwrap(), &r, &s).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(as_i64(&v), Some(want), "{text}");
+        }
+        // A boolean's text is its cast to text, as PostgreSQL's `booltext`.
+        for (text, want) in [("true::text", "true"), ("false::text", "false"), ("'x' || true", "xtrue"), ("false || 'y'", "falsey")] {
+            let v = eval(&parse(text, &s).unwrap(), &r, &s).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(as_text(&v), want, "{text}");
+        }
         // Booleans read the forms PostgreSQL accepts.
         for (text, want) in [("'t'", 1u8), ("'true'", 1), ("'0'", 0), ("'off'", 0)] {
             let Value::Data { bytes, .. } =

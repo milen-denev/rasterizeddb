@@ -2357,6 +2357,17 @@ fn is_constant_term(term: &str) -> bool {
 /// SQL every ORM emits — `…\nFROM users u` — and a scan that finds no `FROM`
 /// does not report a problem, it reports *no relations*, which surfaces
 /// somewhere else entirely as "EXISTS must correlate…".
+/// Whether the word before `at` is `DISTINCT`: the `FROM` of `a IS [NOT]
+/// DISTINCT FROM b` is part of a comparison, never a clause. A select list
+/// holding one split there, and its right operand was taken for the
+/// relation ("relation does not exist").
+pub(crate) fn follows_distinct(bytes: &[u8], at: usize) -> bool {
+    let before = bytes[..at].trim_ascii_end();
+    before.len() >= 8
+        && before[before.len() - 8..].eq_ignore_ascii_case(b"DISTINCT")
+        && before.len().checked_sub(9).is_none_or(|p| !(before[p].is_ascii_alphanumeric() || before[p] == b'_'))
+}
+
 pub fn find_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
     // The text as uppercase, compared byte by byte in place: the same bytes
     // at the same positions (only ASCII letters change), without a copy of
@@ -2379,6 +2390,7 @@ pub fn find_keyword(sql: &str, keyword: &str, start: usize) -> Option<usize> {
     let is_kw_at = |i: usize| {
         kw.first().is_none_or(|k| bytes[i].to_ascii_uppercase() == *k)
             && bytes[i..i + kw.len()].iter().zip(kw).all(|(b, k)| b.to_ascii_uppercase() == *k)
+            && !(kw.eq_ignore_ascii_case(b"FROM") && follows_distinct(bytes, i))
     };
     let mut quote: Option<u8> = None;
     let mut depth = 0usize;
@@ -5010,7 +5022,7 @@ pub(crate) fn comparison_value(
         // (a = b)`), which is how a quantified subquery is answered
         // (`subquery::quantified_predicate`).
         Err(_)
-            if ["IN", "BETWEEN", "AND", "OR", "NOT"].iter().any(|w| find_keyword(text, w, 0).is_some())
+            if ["IN", "BETWEEN", "AND", "OR", "NOT", "LIKE", "ILIKE", "DISTINCT"].iter().any(|w| find_keyword(text, w, 0).is_some())
                 || is_parenthesised(text) =>
         {
             let cond = match crate::core::rql::expr::parse_cond(text, schema) {

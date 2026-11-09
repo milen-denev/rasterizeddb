@@ -602,6 +602,16 @@ fn window_slot(spec: &WindowSpec, n: usize) -> SchemaField {
         // hands back its cell at the engine's places with no scale of its
         // own: `None` reads it as such a column.
         let unconstrained = spec.argument.as_ref().is_some_and(|a| a.db_type == DbType::DECIMAL && a.scale.is_none());
+        // An exact AVG is a numeric whose scale PostgreSQL picks per value
+        // (`Acc::pg_avg`), so each cell carries its own, as the aggregate's
+        // do (`aggregate_output`). At one fixed scale of sixteen places,
+        // `avg(c) OVER ()` printed 21739149.6117391304347826 for PostgreSQL's
+        // 21739149.611739130435, and 0.0050000000000000 for its twenty places.
+        if spec.func == WindowFunc::Avg && exact_avg(spec) {
+            slot.size = crate::core::value_codec::NUMERIC_OWN_SCALE_SIZE;
+            slot.scale = None;
+            return slot;
+        }
         slot.scale = if unconstrained && spec.func != WindowFunc::Avg {
             None
         } else {
@@ -1235,7 +1245,20 @@ fn numeric_fold(rows: &[Row], frame: &[usize], spec: &WindowSpec) -> Result<Wind
         };
         acc.accumulate(Some(&bytes), Some(&field.db_type));
     }
+    if func == AggFunc::Avg && exact_avg(spec) {
+        if let crate::core::rql::aggregate::Acc::ExactSum { .. } = acc {
+            return Ok(acc
+                .pg_avg()?
+                .map(|(v, scale)| crate::core::value_codec::decimal_cell_with_scale(v, scale)));
+        }
+    }
     acc.finish_nullable(func, &spec.value_type())
+}
+
+/// Whether a window AVG is exact, a numeric (over an integer or a numeric
+/// argument), rather than a float's.
+fn exact_avg(spec: &WindowSpec) -> bool {
+    spec.value_type() == DbType::DECIMAL
 }
 
 /// Splits a trailing alias off a window item.

@@ -5416,7 +5416,16 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
                         operand.push(' ');
                         operand.push_str(&tok.render());
                     }
-                    if nullable::is_nullable(&col, schema) && term_starts_at_value && out.len() >= 2
+                    // Only when the column ends the operand. With arithmetic
+                    // after it, `z = y - 3`, the fragment took `z = y` alone
+                    // and the rest trailed the guard as `( … z = y ) - 3`,
+                    // which no plan reads; the term-start guard below covers
+                    // an operand of any length.
+                    let operand_continues = matches!(toks.get(operand_end), Some(Tok::Sym(_)));
+                    if nullable::is_nullable(&col, schema)
+                        && term_starts_at_value
+                        && !operand_continues
+                        && out.len() >= 2
                     {
                         let op = out.pop().expect("two entries");
                         let lhs = out.pop().expect("two entries");
@@ -6905,6 +6914,17 @@ mod operand_guard_tests {
         assert_eq!(rw("x = y OR id = 1"), "(__null_x = 0 AND (__null_y = 0 AND x = y)) OR id = 1");
     }
 
+    /// A nullable column that starts a longer right operand is guarded
+    /// in front of the whole term. The guard took `z = y` alone and left
+    /// `- 3` after its closing parenthesis, so the plan was refused.
+    #[test]
+    fn a_nullable_column_starting_arithmetic_on_the_right_is_guarded_whole() {
+        assert_eq!(rw("z = y - 3"), "__null_y = 0 AND z = y - 3");
+        assert_eq!(rw("z < y * 2 OR id = 1"), "__null_y = 0 AND z < y * 2 OR id = 1");
+        assert_eq!(rw("z = y"), "(__null_y = 0 AND z = y)");
+        assert_eq!(rw("y - 3 = z"), "(__null_y = 0 AND y - 3 = z)");
+    }
+
     /// A call can turn a NULL into a value, so a column inside one gets no
     /// guard of its own.
     #[test]
@@ -7152,4 +7172,5 @@ mod lifted_operand_tests {
         assert!(e.contains("nested more than"), "{e}");
     }
 }
+
 

@@ -316,9 +316,11 @@ pub fn normalize_pagination(sql: &str) -> Result<String, String> {
 
     // The select list is skipped: a bare `SELECT limit FROM t` names a column,
     // and only what follows `FROM` can open a pagination clause.
-    let from_at = words
-        .iter()
-        .position(|w| w.text.eq_ignore_ascii_case("FROM"));
+    // Not the `FROM` of `a IS [NOT] DISTINCT FROM b`.
+    let from_at = (0..words.len()).find(|&i| {
+        words[i].text.eq_ignore_ascii_case("FROM")
+            && !i.checked_sub(1).is_some_and(|p| words[p].text.eq_ignore_ascii_case("DISTINCT"))
+    });
     let search_from = match from_at {
         Some(i) => i + 1,
         None => return Ok(trimmed.to_string()),

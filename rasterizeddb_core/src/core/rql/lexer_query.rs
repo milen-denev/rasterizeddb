@@ -1698,6 +1698,7 @@ pub fn row_fetch_from_select_query(
                         && sql_bytes
                             .get(i + 4)
                             .is_some_and(|n| n.is_ascii_whitespace())
+                        && !crate::core::rql::join::follows_distinct(sql_bytes, i)
                     {
                         found = Some(i);
                         break;

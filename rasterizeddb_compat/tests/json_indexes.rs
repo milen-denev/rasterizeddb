@@ -144,7 +144,9 @@ fn predicate(r: &mut Lcg) -> String {
                 STATUSES[r.below(5) as usize]
             ),
             39 => format!(
-                "doc->>'status' || doc->>'cat' {}IN ('paid1', 'new2', 'shipped3')",
+                // Parenthesised, as PostgreSQL needs: `||` and `->>` are one
+                // precedence there, so the bare form is a path over text.
+                "(doc->>'status') || (doc->>'cat') {}IN ('paid1', 'new2', 'shipped3')",
                 if r.below(2) == 0 { "NOT " } else { "" }
             ),
             15 => format!(

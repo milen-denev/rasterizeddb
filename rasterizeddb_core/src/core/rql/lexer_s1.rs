@@ -627,7 +627,12 @@ fn recognize_core_statement(query_trimmed: &str, query_bytes: &[u8]) -> Option<Q
             let mut quote: Option<char> = None;
             let mut found = None;
             for (at, token) in tokens.iter().enumerate() {
-                if depth == 0 && quote.is_none() && token.eq_ignore_ascii_case("FROM") {
+                // Not the `FROM` of `a IS [NOT] DISTINCT FROM b`.
+                if depth == 0
+                    && quote.is_none()
+                    && token.eq_ignore_ascii_case("FROM")
+                    && !at.checked_sub(1).is_some_and(|p| tokens[p].eq_ignore_ascii_case("DISTINCT"))
+                {
                     found = Some(at);
                     break;
                 }

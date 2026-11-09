@@ -4143,7 +4143,9 @@ fn value_free_shape(sql: &str) -> Option<ValueFreeShape> {
                 if depth == 0 {
                     if first.is_none() {
                         first = Some(word);
-                    } else if word.eq_ignore_ascii_case("FROM") {
+                    } else if word.eq_ignore_ascii_case("FROM")
+                        && !crate::core::rql::join::follows_distinct(bytes, start)
+                    {
                         seen_from = true;
                     } else if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
                         set_op = true;
