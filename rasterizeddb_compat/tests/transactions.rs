@@ -248,41 +248,65 @@ async fn the_driver_transaction_api_works() {
     assert_eq!(count(&pool, "SELECT id FROM t").await, 1);
 }
 
-/// Two transactions updating the same row must not both succeed. If they did,
-/// each would relocate from the same base version and both replacements would
-/// be visible once committed — the row duplicated, and one update lost.
+/// Two transactions updating the same row must not both succeed as if the
+/// other had not. If they did, each would relocate from the same base
+/// version and both replacements would be visible once committed: the row
+/// duplicated, and one update lost.
+///
+/// At READ COMMITTED (the default) the second updater waits for the first,
+/// as PostgreSQL's does, and then applies its change to the committed row
+/// (`rc_waits`): one row, the second's value. At REPEATABLE READ it is told
+/// to retry once the first commits (40001).
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_updates_to_one_row_do_not_both_win() {
-    let (server, pool) = server().await;
-    table(&pool).await;
-    run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
+    for (level, expect) in [("READ COMMITTED", Some("second")), ("REPEATABLE READ", None)] {
+        let (server, pool) = server().await;
+        table(&pool).await;
+        run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
 
-    let mut first = conn(&server).await;
-    let mut second = conn(&server).await;
+        let mut first = conn(&server).await;
+        let mut second = conn(&server).await;
 
-    exec(&mut first, "BEGIN").await.expect("begin");
-    exec(&mut second, "BEGIN").await.expect("begin");
+        exec(&mut first, "BEGIN").await.expect("begin");
+        exec(&mut second, &format!("BEGIN ISOLATION LEVEL {level}")).await.expect("begin");
+        // The second's snapshot is taken before the first's update.
+        exec(&mut second, "SELECT 1").await.expect("snapshot");
 
-    exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("first update");
-    let conflict = exec(&mut second, "UPDATE t SET name = 'second' WHERE id = 1")
-        .await
-        .expect_err("the second updater must be told to retry");
-    assert!(
-        conflict.to_ascii_lowercase().contains("serialize"),
-        "the error must say why it can be retried: {}",
-        conflict
-    );
+        exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("first update");
+        let waiter = tokio::spawn(async move {
+            let out = exec(&mut second, "UPDATE t SET name = 'second' WHERE id = 1").await;
+            (second, out)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        exec(&mut first, "COMMIT").await.expect("commit");
+        let (mut second, out) = tokio::time::timeout(std::time::Duration::from_secs(20), waiter)
+            .await
+            .unwrap_or_else(|_| panic!("{level}: the second updater never ended"))
+            .expect("join");
+        match expect {
+            Some(_) => {
+                out.unwrap_or_else(|e| panic!("{level}: the second updater failed: {e}"));
+                exec(&mut second, "COMMIT").await.expect("commit");
+            }
+            None => {
+                let conflict = out.expect_err("the second updater must be told to retry");
+                assert!(
+                    conflict.to_ascii_lowercase().contains("serialize"),
+                    "the error must say why it can be retried: {}",
+                    conflict
+                );
+                exec(&mut second, "ROLLBACK").await.expect("rollback");
+            }
+        }
 
-    exec(&mut first, "COMMIT").await.expect("commit");
-    exec(&mut second, "ROLLBACK").await.expect("rollback");
-
-    // Exactly one row, holding the winner's value.
-    let all = sqlx::query("SELECT name FROM t WHERE id = 1")
-        .fetch_all(&pool)
-        .await
-        .expect("select");
-    assert_eq!(all.len(), 1, "the row must not have been duplicated");
-    assert_eq!(all[0].try_get::<String, _>("name").unwrap(), "first");
+        // Exactly one row, holding the value that won.
+        let all = sqlx::query("SELECT name FROM t WHERE id = 1")
+            .fetch_all(&pool)
+            .await
+            .expect("select");
+        assert_eq!(all.len(), 1, "{level}: the row must not have been duplicated");
+        assert_eq!(all[0].try_get::<String, _>("name").unwrap(), expect.unwrap_or("first"), "{level}");
+    }
 }
 
 /// A conflict against a transaction that then aborts is not a conflict: the
@@ -313,26 +337,45 @@ async fn an_aborted_writer_releases_the_row() {
     assert_eq!(all[0].try_get::<String, _>("name").unwrap(), "second");
 }
 
-/// A delete racing an update is the same conflict by another route.
+/// A delete racing an update is the same conflict by another route. At
+/// READ COMMITTED the deleter waits for the updater; the updater rolls back,
+/// so the delete removes the row. At REPEATABLE READ, against an updater
+/// that commits, the deleter is told to retry.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_conflicts_with_a_concurrent_update() {
-    let (server, pool) = server().await;
-    table(&pool).await;
-    run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
+    for (level, first_ends) in [("READ COMMITTED", "ROLLBACK"), ("REPEATABLE READ", "COMMIT")] {
+        let (server, pool) = server().await;
+        table(&pool).await;
+        run(&pool, "INSERT INTO t (id, name) VALUES (1, 'start')").await.expect("insert");
 
-    let mut first = conn(&server).await;
-    let mut second = conn(&server).await;
-    exec(&mut first, "BEGIN").await.expect("begin");
-    exec(&mut second, "BEGIN").await.expect("begin");
+        let mut first = conn(&server).await;
+        let mut second = conn(&server).await;
+        exec(&mut first, "BEGIN").await.expect("begin");
+        exec(&mut second, &format!("BEGIN ISOLATION LEVEL {level}")).await.expect("begin");
+        exec(&mut second, "SELECT 1").await.expect("snapshot");
 
-    exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("update");
-    let conflict = exec(&mut second, "DELETE FROM t WHERE id = 1")
-        .await
-        .expect_err("the deleter must be told to retry");
-    assert!(conflict.to_ascii_lowercase().contains("serialize"), "{}", conflict);
-
-    exec(&mut first, "ROLLBACK").await.expect("rollback");
-    exec(&mut second, "ROLLBACK").await.expect("rollback");
+        exec(&mut first, "UPDATE t SET name = 'first' WHERE id = 1").await.expect("update");
+        let waiter = tokio::spawn(async move {
+            let out = exec(&mut second, "DELETE FROM t WHERE id = 1").await;
+            (second, out)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        exec(&mut first, first_ends).await.expect("first ends");
+        let (mut second, out) = tokio::time::timeout(std::time::Duration::from_secs(20), waiter)
+            .await
+            .unwrap_or_else(|_| panic!("{level}: the deleter never ended"))
+            .expect("join");
+        if first_ends == "ROLLBACK" {
+            out.unwrap_or_else(|e| panic!("{level}: the delete failed: {e}"));
+            exec(&mut second, "COMMIT").await.expect("commit");
+            assert_eq!(count(&pool, "SELECT id FROM t").await, 0, "{level}: the delete did not land");
+        } else {
+            let conflict = out.expect_err("the deleter must be told to retry");
+            assert!(conflict.to_ascii_lowercase().contains("serialize"), "{}", conflict);
+            exec(&mut second, "ROLLBACK").await.expect("rollback");
+            assert_eq!(count(&pool, "SELECT id FROM t").await, 1, "{level}");
+        }
+    }
 }
 
 /// The default is `READ COMMITTED`: a statement sees whatever has committed by
