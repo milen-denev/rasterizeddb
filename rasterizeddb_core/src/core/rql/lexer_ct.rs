@@ -1285,11 +1285,12 @@ pub(crate) fn split_definitions(body: &str) -> Vec<String> {
                     quote = Some(c);
                     current.push(c);
                 }
-                '(' => {
+                // Brackets too: `ARRAY[a, b]` is one argument, as `f(a, b)` is.
+                '(' | '[' => {
                     depth += 1;
                     current.push(c);
                 }
-                ')' => {
+                ')' | ']' => {
                     depth = depth.saturating_sub(1);
                     current.push(c);
                 }

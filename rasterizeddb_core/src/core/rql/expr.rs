@@ -551,6 +551,16 @@ pub fn needs_evaluation(text: &str) -> bool {
     if trimmed.contains("::") {
         return true;
     }
+    // `ARRAY[a, b]`, and any expression over one or subscripting one.
+    if trimmed.len() >= 6
+        && trimmed.as_bytes().windows(6).enumerate().any(|(i, w)| {
+            w[..5].eq_ignore_ascii_case(b"ARRAY")
+                && (w[5] == b'[' || w[5].is_ascii_whitespace())
+                && (i == 0 || !(trimmed.as_bytes()[i - 1].is_ascii_alphanumeric() || trimmed.as_bytes()[i - 1] == b'_'))
+        })
+    {
+        return true;
+    }
     // A wholly parenthesised item is the expression inside it. Without this
     // `SELECT (n - 1) AS less` reached the select list's call branch, which
     // read the leading `(` as a call whose name is the empty string and
@@ -1081,6 +1091,22 @@ fn pg_operand_type_name(expr: &Expr) -> String {
     }
 }
 
+/// The inside of `ARRAY[…]` when `text` is exactly one, else `None`.
+pub(crate) fn array_constructor_body(text: &str) -> Option<&str> {
+    let t = text.trim();
+    // Bytes, not `t[..5]`: a name of multi-byte characters has no character
+    // boundary at five (`SELECT "имя" …` panicked here).
+    if t.len() < 7 || !t.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") {
+        return None;
+    }
+    let open = 5 + (t[5..].len() - t[5..].trim_start().len());
+    if t.as_bytes().get(open) != Some(&b'[') {
+        return None;
+    }
+    let close = crate::core::sql_scan::matching_close(t, open)?;
+    (close == t.len() - 1).then(|| &t[open + 1..close])
+}
+
 /// Parses one expression against `schema`.
 pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     let text = text.trim();
@@ -1098,6 +1124,30 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 return parse(&text[1..close], schema);
             }
         }
+    }
+
+    // `ARRAY[]::integer[]`: an empty array has no type of its own, so it is
+    // only one with a cast saying what it is an array of.
+    if let Some(rest) = text.strip_prefix("ARRAY[]").or_else(|| text.strip_prefix("array[]"))
+        && let Some(target) = rest.trim_start().strip_prefix("::")
+        && target.trim_end().ends_with("[]")
+    {
+        return Ok(Expr::Literal {
+            bytes: crate::core::value_codec::parse_array_literal("{}").expect("an empty array"),
+            db_type: DbType::ARRAY,
+        });
+    }
+    // `ARRAY[e, …]`: the array constructor, when it is the whole expression.
+    if let Some(body) = array_constructor_body(text) {
+        if body.trim().is_empty() {
+            return Err("cannot determine type of empty array".to_string());
+        }
+        let elements = crate::core::sql_scan::split_top_level(body, b',');
+        if elements.iter().any(|e| array_constructor_body(e).is_some() || e.starts_with('[')) {
+            return Err("multidimensional arrays are not supported yet".to_string());
+        }
+        let args = elements.iter().map(|e| parse(e, schema)).collect::<Result<Vec<_>, _>>()?;
+        return Ok(Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCtor), args));
     }
 
     // `||` and the path operators are one precedence in PostgreSQL, grouped

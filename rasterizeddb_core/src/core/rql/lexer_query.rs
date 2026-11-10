@@ -1514,8 +1514,9 @@ fn split_select_items(list: &str) -> Vec<String> {
             }
             None => match b {
                 b'\'' | b'"' => quote = Some(b),
-                b'(' => depth += 1,
-                b')' => depth = depth.saturating_sub(1),
+                // `ARRAY[a, b]` is one item, as `f(a, b)` is.
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
                 b',' if depth == 0 => {
                     out.push(list[start..i].to_string());
                     start = i + 1;

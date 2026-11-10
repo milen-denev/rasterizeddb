@@ -148,6 +148,17 @@ async fn a_typed_array_reads_back_in_binary_as_text_array() {
     let b: Vec<Option<String>> = row.try_get(1).expect("boolean[] as text[] in binary");
     assert_eq!(i, ["1", "2"]);
     assert_eq!(b, [Some("t".to_string()), None]);
+    // sqlx reads text elements under any element OID, so the OID itself is
+    // checked: `text[]`'s binary form names text (25) whatever the column's
+    // element type, or a client that checks it (tokio-postgres, JDBC)
+    // refuses the column or decodes text as integers.
+    use sqlx::ValueRef;
+    for at in 0..2 {
+        let raw = row.try_get_raw(at).expect("raw");
+        assert!(!raw.is_null());
+        let bytes = raw.as_bytes().expect("binary bytes");
+        assert_eq!(&bytes[8..12], &25i32.to_be_bytes(), "column {at}'s element OID");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

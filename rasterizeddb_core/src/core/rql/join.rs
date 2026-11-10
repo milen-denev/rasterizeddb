@@ -1953,8 +1953,9 @@ fn find_top_level_comma(text: &str) -> Option<usize> {
             }
             None => match *c {
                 b'\'' | b'"' => quote = Some(*c),
-                b'(' => depth += 1,
-                b')' => depth = depth.saturating_sub(1),
+                // `ARRAY[a, b]` is one item, as `f(a, b)` is.
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
                 b',' if depth == 0 => return Some(i),
                 _ => {}
             },
@@ -5118,6 +5119,10 @@ fn figure_column_name(text: &str) -> Option<(String, u8)> {
         && crate::core::rql::expr::matching_paren(text, 0) == Some(text.len() - 1)
     {
         return figure_column_name(&text[1..text.len() - 1]);
+    }
+    // `ARRAY[…]` is named `array`, as PostgreSQL's `FigureColname` names it.
+    if crate::core::rql::expr::array_constructor_body(text).is_some() {
+        return Some(("array".to_string(), 2));
     }
     if let Some((operand, type_name)) = crate::core::rql::expr::trailing_cast(text) {
         // `a + b::int` casts `b` alone, so the item is the sum and unnamed.

@@ -21,6 +21,9 @@ use crate::core::rql::pg_numeric::{self as pgn, PgNum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgFunc {
+    /// `ARRAY[e, …]`, the array constructor (`expr::parse` reads it; no
+    /// function of this name can be called).
+    ArrayCtor,
     Left,
     Right,
     Substr,
@@ -267,7 +270,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Decode => DbType::BYTEA,
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
-        StringToArray => DbType::ARRAY,
+        StringToArray | ArrayCtor => DbType::ARRAY,
         _ => DbType::STRING,
     }
 }
@@ -493,7 +496,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString);
+    let non_strict = matches!(func, ArrayCtor | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString);
     if !non_strict && args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -970,6 +973,29 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         NumNonnulls => int_value(args.iter().filter(|a| !a.is_null()).count() as i64),
         NumNulls => int_value(args.iter().filter(|a| a.is_null()).count() as i64),
+        ArrayCtor => {
+            // Each element as its type prints it, NULL as the null element,
+            // under the elements' type OID when they share one, so the array
+            // orders as that type's does (`value_codec::array_order`).
+            let mut literal = String::from("{");
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    literal.push(',');
+                }
+                if a.is_null() {
+                    literal.push_str("NULL");
+                } else {
+                    literal.push_str(&array_element(&text_of(a)));
+                }
+            }
+            literal.push('}');
+            let oid = array_ctor_oid(args);
+            data(
+                crate::core::value_codec::parse_array_literal_as(&literal, oid)
+                    .ok_or_else(|| format!("could not build the array {literal}"))?,
+                DbType::ARRAY,
+            )
+        }
         StringToArray => {
             if args[0].is_null() {
                 return Ok(Value::Null);
@@ -1157,6 +1183,16 @@ fn json_string(text: &str) -> String {
 }
 
 /// One element of an array's text as `array_out` writes it.
+/// The element OID of `ARRAY[…]` over `args`: their type when every
+/// non-NULL one shares it (integers of any width as `bigint`, which orders
+/// them alike), text's otherwise.
+fn array_ctor_oid(args: &[Value]) -> i32 {
+    let int = |t: &DbType| matches!(t, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32);
+    let mut types = args.iter().filter_map(Value::db_type).map(|t| if int(t) { DbType::I64 } else { t.clone() });
+    let Some(first) = types.next() else { return 25 };
+    if types.all(|t| t == first) { crate::core::value_codec::array_oid_for(&first) } else { 25 }
+}
+
 fn array_element(text: &str) -> String {
     let quote = text.is_empty()
         || text.eq_ignore_ascii_case("NULL")
