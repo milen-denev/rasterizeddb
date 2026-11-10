@@ -403,6 +403,17 @@ pub fn assign_bytes(field: &crate::core::row::schema::SchemaField, bytes: &[u8])
         let held = crate::core::value_codec::legacy_char_assign(text)?;
         return Ok((held.as_slice() != bytes).then(|| held.to_vec()));
     }
+    // An untyped array column (`text[]`, or one declared before element
+    // types were kept) holds its arrays as text: an array built under
+    // another element OID (`array_agg` of integers) is relabelled text's, so
+    // it orders as the column's other values do.
+    if field.db_type == crate::core::db_type::DbType::ARRAY
+        && !matches!(field.text_typmod(), Some(TextTypmod::Element(_)))
+    {
+        return Ok(crate::core::value_codec::array_element_type(bytes)
+            .is_some()
+            .then(|| crate::core::value_codec::as_text_array(bytes)));
+    }
     let Some(typmod) = field.text_typmod() else { return Ok(None) };
     if let TextTypmod::Element(code) = typmod {
         if field.db_type != crate::core::db_type::DbType::ARRAY {

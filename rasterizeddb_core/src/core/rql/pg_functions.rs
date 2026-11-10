@@ -24,6 +24,18 @@ pub enum PgFunc {
     /// `ARRAY[e, …]`, the array constructor (`expr::parse` reads it; no
     /// function of this name can be called).
     ArrayCtor,
+    /// `a[i]` (`expr::parse` reads it): its arguments are the array, the
+    /// index, and the element type's byte code as a one-byte string (empty
+    /// for text), fixed when it was parsed so the value is of the type the
+    /// statement was described with.
+    ArraySubscript,
+    /// `a[lo:hi]`, either bound NULL when it was left out.
+    ArraySlice,
+    /// `x op ANY (array)` / `ALL`, over an array the row computes: the
+    /// value, the array, the operator and `ANY` or `ALL`, as text
+    /// (`expr::quantified_condition`). TRUE, FALSE, or NULL when no element
+    /// decided it and one was unknown, as PostgreSQL's quantifiers are.
+    QuantifiedCmp,
     Left,
     Right,
     Substr,
@@ -270,7 +282,9 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Decode => DbType::BYTEA,
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
-        StringToArray | ArrayCtor => DbType::ARRAY,
+        StringToArray | ArrayCtor | ArraySlice => DbType::ARRAY,
+        QuantifiedCmp => DbType::BOOL,
+        ArraySubscript => subscript_type(args),
         _ => DbType::STRING,
     }
 }
@@ -496,7 +510,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, ArrayCtor | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString);
+    let non_strict = matches!(func, ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString);
     if !non_strict && args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -973,6 +987,102 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         NumNonnulls => int_value(args.iter().filter(|a| !a.is_null()).count() as i64),
         NumNulls => int_value(args.iter().filter(|a| a.is_null()).count() as i64),
+        ArraySubscript => {
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let Value::Data { bytes, .. } = &args[0] else { return Ok(Value::Null) };
+            let index = crate::core::rql::expr::as_i64(&args[1]).ok_or_else(|| "array subscript must have type integer".to_string())?;
+            let Some(element) = crate::core::value_codec::array_element_at(bytes, index) else {
+                return Err("cannot subscript a value that is not an array".to_string());
+            };
+            let Some(text) = element else { return Ok(Value::Null) };
+            let text = String::from_utf8_lossy(&text).into_owned();
+            match tag_type(&args[2]) {
+                None => text_value(text),
+                Some(t) => match crate::core::value_codec::encode_element(&t, &text) {
+                    Some(b) => data(b, t),
+                    // An element its array's type would not read (none can
+                    // be in a typed column): as the text it is.
+                    None => text_value(text),
+                },
+            }
+        }
+        QuantifiedCmp => {
+            let all = text_of(&args[3]) == "ALL";
+            let op = text_of(&args[2]);
+            let Value::Data { bytes, .. } = &args[1] else { return Ok(Value::Null) };
+            let Some((oid, elements)) = crate::core::value_codec::decode_array(bytes) else {
+                return Err("op ANY/ALL (array) requires array on right side".to_string());
+            };
+            let truth = |b: bool| data(vec![u8::from(b)], DbType::BOOL);
+            if elements.is_empty() {
+                return Ok(truth(all));
+            }
+            if args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let typed = crate::core::value_codec::array_element_type(bytes);
+            let left_type = args[0].db_type().cloned();
+            let mut unknown = false;
+            for e in elements {
+                let Some(text) = e else {
+                    unknown = true;
+                    continue;
+                };
+                let text = String::from_utf8_lossy(text).into_owned();
+                // The element as its array's type; an untyped array's as the
+                // value's, as an untyped literal's would be (`'{1,5}'`).
+                let as_type = typed.clone().or_else(|| left_type.clone().filter(|t| *t != DbType::STRING));
+                let element = match as_type.and_then(|t| Some((crate::core::value_codec::encode_element(&t, &text)?, t))) {
+                    Some((b, t)) => data(b, t),
+                    None => text_value(text),
+                };
+                let Some(order) = crate::core::rql::expr::compare(&args[0], &element) else {
+                    unknown = true;
+                    continue;
+                };
+                use std::cmp::Ordering::*;
+                let holds = match op.as_str() {
+                    "=" => order == Equal,
+                    "<>" | "!=" => order != Equal,
+                    "<" => order == Less,
+                    "<=" => order != Greater,
+                    ">" => order == Greater,
+                    ">=" => order != Less,
+                    other => return Err(format!("operator {other} is not supported with ANY/ALL")),
+                };
+                if holds != all {
+                    return Ok(truth(!all));
+                }
+            }
+            let _ = oid;
+            if unknown { Value::Null } else { truth(all) }
+        }
+        ArraySlice => {
+            if args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let Value::Data { bytes, .. } = &args[0] else { return Ok(Value::Null) };
+            let bound = |v: &Value, open: i64| -> Result<Option<i64>, String> {
+                match v {
+                    Value::Null => Ok(Some(open)),
+                    v => crate::core::rql::expr::as_i64(v)
+                        .map(Some)
+                        .ok_or_else(|| "array subscript must have type integer".to_string()),
+                }
+            };
+            // An omitted bound is the array's own; a NULL one makes the
+            // slice NULL (`expr::parse` passes an omitted one as NULL and a
+            // written one as itself, so a written NULL arrives typed).
+            let (Some(lo), Some(hi)) = (bound(&args[1], i64::MIN)?, bound(&args[2], i64::MAX)?) else {
+                return Ok(Value::Null);
+            };
+            match crate::core::value_codec::array_slice(bytes, lo, hi) {
+                Some(b) => data(b, DbType::ARRAY),
+                None => return Err("cannot subscript a value that is not an array".to_string()),
+            }
+        }
         ArrayCtor => {
             // Each element as its type prints it, NULL as the null element,
             // under the elements' type OID when they share one, so the array
@@ -1183,6 +1293,22 @@ fn json_string(text: &str) -> String {
 }
 
 /// One element of an array's text as `array_out` writes it.
+/// The element type `a[i]`'s tag argument names; `None` for text.
+fn tag_type(tag: &Value) -> Option<DbType> {
+    match tag {
+        Value::Data { bytes, .. } if bytes.len() == 1 => Some(DbType::from_byte(bytes[0])),
+        _ => None,
+    }
+}
+
+/// The type `a[i]` is described as: its tag's.
+fn subscript_type(args: &[crate::core::rql::expr::Expr]) -> DbType {
+    match args.get(2) {
+        Some(crate::core::rql::expr::Expr::Literal { bytes, .. }) if bytes.len() == 1 => DbType::from_byte(bytes[0]),
+        _ => DbType::STRING,
+    }
+}
+
 /// The element OID of `ARRAY[…]` over `args`: their type when every
 /// non-NULL one shares it (integers of any width as `bigint`, which orders
 /// them alike), text's otherwise.

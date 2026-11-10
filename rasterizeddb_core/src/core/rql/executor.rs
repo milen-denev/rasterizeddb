@@ -14177,6 +14177,102 @@ async fn retire_tombstoned_name<S: crate::core::storage_providers::traits::Stora
     }
 }
 
+/// Whether `using` is the column `name` itself, bare or cast to an array type
+/// (`c`, `c::integer[]`, `CAST(c AS integer[])`, quoted or not).
+fn using_is_the_column(using: &str, name: &str) -> bool {
+    let u = using.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    let bare = |t: &str| t.trim().trim_matches('"').eq_ignore_ascii_case(name);
+    if bare(u) {
+        return true;
+    }
+    if let Some((left, ty)) = u.split_once("::") {
+        return bare(left) && ty.trim_end().ends_with("[]");
+    }
+    let upper = u.to_ascii_uppercase();
+    if let Some(inner) = upper.strip_prefix("CAST").map(str::trim_start).and_then(|r| r.strip_prefix('(')) {
+        let inner_text = &u[u.len() - inner.len()..];
+        if let Some(at) = crate::core::rql::join::find_keyword(inner_text, "AS", 0) {
+            return bare(&inner_text[..at]) && inner_text[at + 2..].trim_end_matches(')').trim_end().ends_with("[]");
+        }
+    }
+    false
+}
+
+/// `ALTER COLUMN c TYPE <element>[]` on an array column that holds rows,
+/// as PostgreSQL converts it: every element read again as the new element
+/// type, refused as that type refuses it (22P02, 22003) before anything
+/// changes; then the new type recorded and every row rewritten in it (its
+/// canonical text, under its OID, so it orders as the new type does).
+///
+/// From an untyped array (`text[]`, or a column declared before element
+/// types were kept) PostgreSQL has no automatic cast and asks for `USING`
+/// (42804); `using` says one was given. To `text[]` every element is kept as
+/// its text.
+///
+/// It was refused (0A000), and before that recorded without converting the
+/// rows, which kept the old order and held arrays the new type refuses.
+async fn retype_array(
+    database: &Arc<Database>,
+    table_name: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    field: &crate::core::row::schema::SchemaField,
+    declared: &str,
+    using: bool,
+    tx: TxId,
+) -> Result<(), String> {
+    use crate::core::rql::type_modifier::{self, TextTypmod};
+    let wanted = type_modifier::parse_array_element(declared);
+    let had = field.text_typmod().filter(|t| matches!(t, TextTypmod::Element(_)));
+    if wanted == had {
+        return Ok(());
+    }
+    if had.is_none() && wanted.is_some() && !using {
+        return Err(format!(
+            "column \"{}\" cannot be cast automatically to type {}",
+            field.name,
+            wanted.map_or_else(|| declared.trim().to_ascii_lowercase(), |t| t.type_name())
+        ));
+    }
+    let column = format!("\"{}\"", field.name.replace('"', "\"\""));
+    let table = format!("\"{}\"", table_name.replace('"', "\"\""));
+    // Every stored array read as the new type first: the column's ACCESS
+    // EXCLUSIVE keeps any other writer out until the rewrite below is done.
+    if let Some(TextTypmod::Element(code)) = wanted {
+        let element = type_modifier::element_db_type(code).ok_or_else(|| format!("unknown element type {code}"))?;
+        let (rows, _) = Box::pin(run_query_rows_scaled(&format!("SELECT {column} FROM {table}"), database, tx)).await?;
+        for row in &rows {
+            let Some(cell) = row.columns.first() else { continue };
+            if cell.column_type == crate::core::db_type::DbType::NULL {
+                continue;
+            }
+            crate::core::value_codec::hold_array_elements(cell.data.into_slice(), &element)?;
+        }
+    }
+    let markers = type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers);
+    if let Err(failure) = database
+        .reload_atomic(table_name, |old| async move {
+            let io = old.io_schema.clone();
+            let mut writes = crate::core::torn_tail::SidecarWrites::default();
+            for entry in markers.iter() {
+                type_modifier::stage(&*io, &mut writes, entry).map_err(|e| e.to_string())?;
+            }
+            writes.commit(&*io).await.map_err(|e| e.to_string())
+        })
+        .await
+    {
+        return Err(format!("could not change the type of column \"{}\": {failure:?}", field.name));
+    }
+    // Every row written again under the new type (`assign_bytes`): its
+    // elements' canonical text and the type's OID, or text's for `text[]`.
+    let sql = format!("UPDATE {table} SET {column} = {column}");
+    let purpose = recognize_query_purpose(&sql).ok_or_else(|| format!("could not convert column \"{}\"", field.name))?;
+    let response = Box::pin(execute_in_txn(purpose, database.clone(), tx)).await;
+    if response.first() == Some(&3) {
+        return Err(String::from_utf8_lossy(&response[1..]).to_string());
+    }
+    Ok(())
+}
+
 /// What `ALTER COLUMN column TYPE declared` changes about a text column's
 /// declared length (`type_modifier::TextTypmod`), which shares text's
 /// storage: the marker records to write, after the stored values have been
@@ -14249,17 +14345,7 @@ async fn text_type_change(
         if wanted == had {
             return Ok(Vec::new());
         }
-        if row_count > 0 {
-            let target = declared.trim().to_ascii_lowercase();
-            return Err(if had.is_none() {
-                format!("column \"{}\" cannot be cast automatically to type {target}", field.name)
-            } else {
-                format!(
-                    "changing the element type of array column \"{}\" that holds rows is not supported yet",
-                    field.name
-                )
-            });
-        }
+        // A table with rows is converted by `retype_array` before this.
         return Ok(type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers));
     }
     if field.db_type != DbType::STRING {
@@ -16219,6 +16305,26 @@ async fn execute_alter_table_action(
                         return ddl_error("syntax error at end of input: USING needs an expression");
                     }
                     return match crate::core::rql::lexer_alter::parse_column_type(&type_tokens) {
+                        // An array column to another array type, `USING` the
+                        // column itself (`c::integer[]`): every element read
+                        // again as the new element type (`retype_array`). The
+                        // way an untyped array column is given a type.
+                        Ok((crate::core::db_type::DbType::ARRAY, _))
+                            if field.db_type == crate::core::db_type::DbType::ARRAY =>
+                        {
+                            if !using_is_the_column(using, &field.name) {
+                                return ddl_error(&format!(
+                                    "USING on an array column is supported only as the column itself, cast to the \
+                                     new array type (USING {}::{}); not supported yet: {using}",
+                                    field.name,
+                                    type_tokens.join(" ")
+                                ));
+                            }
+                            match retype_array(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), true, tx).await {
+                                Ok(()) => ddl_ok(0),
+                                Err(e) => ddl_error(&e),
+                            }
+                        }
                         Ok((db_type, _)) => {
                             match retype_using(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), db_type, using, tx).await {
                                 Ok(()) => ddl_ok(0),
@@ -16325,6 +16431,22 @@ async fn execute_alter_table_action(
                             && numeric_retype_needed(&schema, &field, &type_tokens.join(" ")) =>
                     {
                         match retype_numeric(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), tx).await {
+                            Ok(()) => ddl_ok(0),
+                            Err(e) => ddl_error(&e),
+                        }
+                    }
+                    // An array column to another array type: its element type
+                    // changes, and every stored array is read again as it
+                    // (`retype_array`).
+                    Ok((crate::core::db_type::DbType::ARRAY, _))
+                        if field.db_type == crate::core::db_type::DbType::ARRAY
+                            && row_count > 0
+                            && crate::core::rql::type_modifier::parse_array_element(&type_tokens.join(" "))
+                                != field.text_typmod().filter(|t| {
+                                    matches!(t, crate::core::rql::type_modifier::TextTypmod::Element(_))
+                                }) =>
+                    {
+                        match retype_array(&database, &plan.table_name, &schema, &field, &type_tokens.join(" "), false, tx).await {
                             Ok(()) => ddl_ok(0),
                             Err(e) => ddl_error(&e),
                         }

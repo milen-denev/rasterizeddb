@@ -3770,7 +3770,9 @@ impl<S: StorageIO> Table<S> {
         legacy_char: bool,
     ) -> std::result::Result<(), String> {
         for field in self.schema.fields.iter() {
-            let held = field.text_typmod().is_some() || (legacy_char && field.db_type == DbType::CHAR);
+            let held = field.text_typmod().is_some()
+                || field.db_type == DbType::ARRAY
+                || (legacy_char && field.db_type == DbType::CHAR);
             if !held || field.is_deleted || !columns(field.write_order as u32) {
                 continue;
             }

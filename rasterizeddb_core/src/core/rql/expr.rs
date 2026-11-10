@@ -551,6 +551,10 @@ pub fn needs_evaluation(text: &str) -> bool {
     if trimmed.contains("::") {
         return true;
     }
+    // `a[1]`, `a[1] + 1`: a subscript (no unquoted name holds a bracket).
+    if trimmed.contains('[') && !trimmed.ends_with("[]") {
+        return true;
+    }
     // `ARRAY[a, b]`, and any expression over one or subscripting one.
     if trimmed.len() >= 6
         && trimmed.as_bytes().windows(6).enumerate().any(|(i, w)| {
@@ -868,11 +872,13 @@ impl Nesting {
             }
             match c {
                 b'\'' | b'"' => quote = Some(c),
-                b'(' => {
+                // Brackets nest as parentheses do: the `+` of `a[i + 1]` is
+                // the subscript's.
+                b'(' | b'[' => {
                     depth[i] = Some(level);
                     level += 1;
                 }
-                b')' => {
+                b')' | b']' => {
                     level = level.saturating_sub(1);
                     depth[i] = Some(level);
                 }
@@ -1088,6 +1094,104 @@ fn pg_operand_type_name(expr: &Expr) -> String {
         DbType::STRING => "text".to_string(),
         DbType::DATETIME if yields_timestamp(expr) => "timestamp without time zone".to_string(),
         other => crate::core::value_codec::pg_input_type_name(&other).to_string(),
+    }
+}
+
+/// `base[i]` or `base[lo:hi]` when `text` ends in a subscript, parsed;
+/// `None` when it does not (`int[]` in a cast is no subscript).
+fn parse_subscript(text: &str, schema: &[SchemaField]) -> Result<Option<Expr>, String> {
+    use crate::core::rql::pg_functions::PgFunc;
+    if !text.ends_with(']') || array_constructor_body(text).is_some() {
+        return Ok(None);
+    }
+    let bytes = text.as_bytes();
+    let Some(open) = (1..bytes.len()).find(|&i| {
+        bytes[i] == b'[' && crate::core::sql_scan::matching_close(text, i) == Some(text.len() - 1) && {
+            let nesting = Nesting::of(text);
+            nesting.top_level(i)
+        }
+    }) else {
+        return Ok(None);
+    };
+    let base_text = text[..open].trim_end();
+    let inside = text[open + 1..text.len() - 1].trim();
+    if base_text.is_empty() || inside.is_empty() || base_text.ends_with("::") || base_text.contains("::") && !base_text.ends_with(')') {
+        return Ok(None);
+    }
+    // `ARRAY[1,2][1]` is a syntax error in PostgreSQL: the constructor is
+    // subscripted only in parentheses.
+    if array_constructor_body(base_text).is_some() {
+        return Err("syntax error at or near \"[\"".to_string());
+    }
+    let base = parse(base_text, schema)?;
+    if static_type(&base) != DbType::ARRAY {
+        return Err(format!("cannot subscript type {} because it does not support subscripting", pg_operand_type_name(&base)));
+    }
+    // One `:` at the top (not `::`): a slice.
+    let ib = inside.as_bytes();
+    let nesting = Nesting::of(inside);
+    let colon = (0..ib.len()).find(|&i| {
+        ib[i] == b':' && nesting.top_level(i) && ib.get(i + 1) != Some(&b':') && (i == 0 || ib[i - 1] != b':')
+    });
+    if let Some(at) = colon {
+        let bound = |t: &str| -> Result<Expr, String> { if t.trim().is_empty() { Ok(Expr::Null) } else { parse(t.trim(), schema) } };
+        let (lo, hi) = (bound(&inside[..at])?, bound(&inside[at + 1..])?);
+        // A written NULL bound is a NULL slice; an omitted one is open.
+        let written_null = |t: &str| t.trim().eq_ignore_ascii_case("NULL");
+        if written_null(&inside[..at]) || written_null(&inside[at + 1..]) {
+            return Ok(Some(Expr::Null));
+        }
+        return Ok(Some(Expr::Call(TextFunc::Pg(PgFunc::ArraySlice), vec![base, lo, hi])));
+    }
+    let index = parse(inside, schema)?;
+    let tag = match subscript_element(&base) {
+        Some(t) => vec![t.to_byte()],
+        None => Vec::new(),
+    };
+    Ok(Some(Expr::Call(
+        TextFunc::Pg(PgFunc::ArraySubscript),
+        vec![base, index, Expr::Literal { bytes: tag, db_type: DbType::STRING }],
+    )))
+}
+
+/// The type an element of the array `base` evaluates to is read back as:
+/// a typed array column's element type, or `ARRAY[…]`'s elements' shared
+/// one; `None` (text) for anything else, whose elements are text.
+fn subscript_element(base: &Expr) -> Option<DbType> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    match base {
+        Expr::Column(f) => match f.text_typmod() {
+            Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::element_db_type(code)
+                .and_then(|t| crate::core::value_codec::element_read_type(&t)),
+            _ => None,
+        },
+        Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCtor), elements) => {
+            let int = |t: &DbType| is_integer_type(t);
+            let mut types = elements
+                .iter()
+                .filter(|e| !matches!(e, Expr::Null))
+                .map(static_type)
+                .map(|t| if int(&t) { DbType::I64 } else { t });
+            let first = types.next()?;
+            if types.all(|t| t == first) { crate::core::value_codec::element_read_type(&first) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// The element type code of an array expression that keeps one: a typed
+/// array column, or a slice of one (`a[2:3]`). `None` for any other.
+pub(crate) fn typed_array_element(expr: &Expr) -> Option<u8> {
+    use crate::core::rql::type_modifier::TextTypmod;
+    match expr {
+        Expr::Column(f) if f.db_type == DbType::ARRAY => match f.text_typmod() {
+            Some(TextTypmod::Element(code)) => u8::try_from(code).ok(),
+            _ => None,
+        },
+        Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArraySlice), args) => {
+            args.first().and_then(typed_array_element)
+        }
+        _ => None,
     }
 }
 
@@ -1455,6 +1559,12 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             "INTERVAL needs a quoted value, as in `INTERVAL '1 day'`; got '{}'",
             text
         ));
+    }
+
+    // `a[i]`, `a[lo:hi]`, `(ARRAY[…])[i]`: a subscript binds tightest, so it
+    // is read here, once the operators around it have been split off.
+    if let Some(expr) = parse_subscript(text, schema)? {
+        return Ok(expr);
     }
 
     // A function call.
@@ -2286,7 +2396,25 @@ fn quantified_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Con
             None => return Ok(None),
         }
     } else {
-        return Ok(None);
+        // An array the row computes (`5 = ANY(tags)`): compared element by
+        // element as each row is read (`PgFunc::QuantifiedCmp`). Refused as
+        // "unsupported keyword 'ANY'" before.
+        let array = parse(inner, schema)?;
+        if static_type(&array) != DbType::ARRAY {
+            return Ok(None);
+        }
+        let left = parse(left, schema)?;
+        let tag = |t: &str| Expr::Literal { bytes: t.as_bytes().to_vec(), db_type: DbType::STRING };
+        let call = Expr::Call(
+            TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::QuantifiedCmp),
+            vec![left, array, tag(op), tag(if kw == "ALL" { "ALL" } else { "ANY" })],
+        );
+        return Ok(Some(Cond::Cmp(Condition {
+            left: Box::new(call),
+            cmp: Cmp::Eq,
+            right: Some(Box::new(Expr::Literal { bytes: vec![1], db_type: DbType::BOOL })),
+            wide: Default::default(),
+        })));
     };
     let any = kw != "ALL";
     if elements.is_empty() {
@@ -6650,6 +6778,7 @@ fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
                         if b.is_ascii_alphanumeric()
                             || b == b'_'
                             || b == b')'
+                            || b == b']'
                             || b == b'"'
                             || b == b'\''
                             || b == b'.');
@@ -6679,7 +6808,7 @@ fn top_level_power(text: &str) -> Option<usize> {
             continue;
         }
         let prev = bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()).map(|j| bytes[j]);
-        if matches!(prev, Some(p) if p.is_ascii_alphanumeric() || matches!(p, b'_' | b')' | b'"' | b'\'' | b'.')) {
+        if matches!(prev, Some(p) if p.is_ascii_alphanumeric() || matches!(p, b'_' | b')' | b']' | b'"' | b'\'' | b'.')) {
             found = Some(i);
         }
     }

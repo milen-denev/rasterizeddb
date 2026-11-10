@@ -1450,6 +1450,38 @@ pub fn array_element_type(raw: &[u8]) -> Option<crate::core::db_type::DbType> {
     element_type_of_oid(oid)
 }
 
+/// The type an element of an array of `element` values is read back as
+/// (`a[1]`): the type its OID names, so `smallint` and the engine's one-byte
+/// integer alike come back as `smallint`; `None` (text) for one whose OID
+/// names none.
+pub fn element_read_type(element: &crate::core::db_type::DbType) -> Option<crate::core::db_type::DbType> {
+    element_type_of_oid(array_oid_for(element))
+}
+
+/// An array's element `index` (1-based, as PostgreSQL's arrays here
+/// always are): `Some(None)` for a NULL element or one past either end,
+/// `None` for bytes that are not an array.
+pub fn array_element_at(raw: &[u8], index: i64) -> Option<Option<Vec<u8>>> {
+    let (_, elements) = decode_array(raw)?;
+    if index < 1 || index as u64 > elements.len() as u64 {
+        return Some(None);
+    }
+    Some(elements[(index - 1) as usize].map(<[u8]>::to_vec))
+}
+
+/// `raw[lo:hi]`, clamped to the array, as PostgreSQL slices one: empty
+/// when nothing is left. Under the array's own element OID.
+pub fn array_slice(raw: &[u8], lo: i64, hi: i64) -> Option<Vec<u8>> {
+    let (oid, elements) = decode_array(raw)?;
+    let lo = lo.max(1);
+    let hi = hi.min(elements.len() as i64);
+    if lo > hi {
+        return parse_array_literal("{}");
+    }
+    let part = &elements[(lo - 1) as usize..hi as usize];
+    Some(build_array(if oid == 0 { OID_TEXT } else { oid }, part.iter().copied()))
+}
+
 /// The element type an array's element OID names, for ordering its elements
 /// as that type; `None` for text, and for an OID no column type here has.
 fn element_type_of_oid(oid: i32) -> Option<crate::core::db_type::DbType> {

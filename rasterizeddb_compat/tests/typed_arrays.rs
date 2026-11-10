@@ -232,11 +232,58 @@ async fn the_element_type_follows_the_column_through_ddl() {
     refused(&pool, "INSERT INTO em VALUES ('{1.5}')", "22P02", "invalid input syntax for type bigint").await;
     ok(&pool, "ALTER TABLE em ALTER COLUMN x TYPE TEXT[]").await;
     ok(&pool, "INSERT INTO em VALUES ('{1.5}')").await;
-    // A typed column holding rows is refused rather than relabelled.
-    ok(&pool, "CREATE TABLE fu (x INT[])").await;
-    ok(&pool, "INSERT INTO fu VALUES ('{3}')").await;
-    refused(&pool, "ALTER TABLE fu ALTER COLUMN x TYPE TEXT[]", "0A000", "not supported yet").await;
-    refused(&pool, "INSERT INTO fu VALUES ('{y}')", "22P02", "invalid input syntax for type integer").await;
+}
+
+/// `ALTER COLUMN … TYPE` between array types on a table with rows, as
+/// PostgreSQL 17 converts it: every element read again as the new type, all
+/// or nothing, and the column ordered as the new type afterwards. It was
+/// refused (0A000), and before that recorded without converting the rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_array_column_with_rows_converts_to_another_element_type() {
+    let (_s, pool) = server().await;
+    ok(&pool, "CREATE TABLE r1 (x INT[])").await;
+    ok(&pool, "INSERT INTO r1 VALUES ('{10}'), ('{9}'), ('{1,2}')").await;
+    ok(&pool, "ALTER TABLE r1 ALTER COLUMN x TYPE BIGINT[]").await;
+    assert_eq!(column(&pool, "SELECT x FROM r1 ORDER BY x").await, ["{1,2}", "{9}", "{10}"]);
+    let wide: (Vec<i64>,) = sqlx::query_as("SELECT x FROM r1 ORDER BY x LIMIT 1").fetch_one(&pool).await.expect("bigint[]");
+    assert_eq!(wide.0, [1, 2]);
+    // To text[]: the same text, ordered as text now.
+    ok(&pool, "ALTER TABLE r1 ALTER COLUMN x TYPE TEXT[]").await;
+    assert_eq!(column(&pool, "SELECT x FROM r1 ORDER BY x").await, ["{1,2}", "{10}", "{9}"]);
+    ok(&pool, "INSERT INTO r1 VALUES ('{y}')").await;
+
+    // From untyped: PostgreSQL asks for USING, and converts with it.
+    ok(&pool, "CREATE TABLE r2 (t TEXT[])").await;
+    ok(&pool, "INSERT INTO r2 VALUES ('{10}'), ('{09}'), ('{+3}')").await;
+    refused(&pool, "ALTER TABLE r2 ALTER COLUMN t TYPE INT[]", "42804", "cannot be cast automatically to type integer[]").await;
+    ok(&pool, "ALTER TABLE r2 ALTER COLUMN t TYPE INT[] USING t::int[]").await;
+    assert_eq!(column(&pool, "SELECT t FROM r2 ORDER BY t").await, ["{3}", "{9}", "{10}"]);
+    refused(&pool, "INSERT INTO r2 VALUES ('{z}')", "22P02", "invalid input syntax for type integer: \"z\"").await;
+
+    // An element the new type refuses refuses the whole change.
+    ok(&pool, "CREATE TABLE r3 (t TEXT[])").await;
+    ok(&pool, "INSERT INTO r3 VALUES ('{1,x}')").await;
+    refused(&pool, "ALTER TABLE r3 ALTER COLUMN t TYPE INT[] USING t::int[]", "22P02", "invalid input syntax for type integer: \"x\"").await;
+    assert_eq!(column(&pool, "SELECT t FROM r3").await, ["{1,x}"]);
+    ok(&pool, "INSERT INTO r3 VALUES ('{still,text}')").await;
+    ok(&pool, "CREATE TABLE r4 (b BIGINT[])").await;
+    ok(&pool, "INSERT INTO r4 VALUES ('{99999999999}')").await;
+    refused(&pool, "ALTER TABLE r4 ALTER COLUMN b TYPE INT[]", "22003", "out of range for type integer").await;
+    assert_eq!(column(&pool, "SELECT b FROM r4").await, ["{99999999999}"]);
+    // A USING that computes is not supported for arrays yet, and says so.
+    refused(&pool, "ALTER TABLE r3 ALTER COLUMN t TYPE INT[] USING ARRAY[1]", "0A000", "not supported yet").await;
+}
+
+/// An untyped array column holds text: an array of integers written into it
+/// (`array_agg`) is relabelled text's and orders as text, as `text[]` does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untyped_array_column_orders_what_it_holds_as_text() {
+    let (_s, pool) = server().await;
+    ok(&pool, "CREATE TABLE src (k INT, v INT)").await;
+    ok(&pool, "INSERT INTO src VALUES (1, 10), (2, 9)").await;
+    ok(&pool, "CREATE TABLE tx (t TEXT[])").await;
+    ok(&pool, "INSERT INTO tx SELECT array_agg(v) FROM src GROUP BY k").await;
+    assert_eq!(column(&pool, "SELECT t FROM tx ORDER BY t").await, ["{10}", "{9}"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

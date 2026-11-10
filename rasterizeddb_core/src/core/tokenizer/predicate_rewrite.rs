@@ -2556,6 +2556,7 @@ fn own_scale_arithmetic(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
 /// own scale ([`own_scale_arithmetic`]).
 fn evaluated(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     needs_evaluator(text)
+        || quantified_over_expression_anywhere(text)
         || own_scale_arithmetic(text, schema)
         || mixed_numeric_columns(text, schema)
         || constant_mixed_comparison(text)
@@ -2789,6 +2790,16 @@ fn needs_evaluator(text: &str) -> bool {
                 quote_at = i;
             }
             b'%' => return true,
+            // A subscript, `a[1]` or `(…)[1]`: the evaluator's
+            // (`expr::parse_subscript`). Not `ARRAY[…]`, whose `= ANY` form
+            // the rewrite above reads itself.
+            b'[' if i > 0 && (is_word(bytes[i - 1]) || bytes[i - 1] == b')') && {
+                let word_start = text[..i].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |at| at + 1);
+                !text[word_start..i].eq_ignore_ascii_case("ARRAY")
+            } =>
+            {
+                return true;
+            }
             // A unary minus over a column or a group, `-sm < a`, `-(a + 1)`:
             // the comparison tokens negate only a number ("expected a number
             // after '-'"). A sign is unary where no operand precedes it.
@@ -3478,6 +3489,7 @@ fn lift_term(
     let lifted = if body.starts_with('(') && matching_paren_at(body, 0) == Some(body.len() - 1) {
         format!("({})", lift_condition(&body[1..body.len() - 1], schema, depth + 1)?)
     } else if quantified_over_array(body)
+        || quantified_over_expression(body)
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
         || mixed_numeric_columns(body, schema)
@@ -3546,6 +3558,61 @@ fn compares_an_interval(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
 /// evaluator expands (`expr::quantified_condition`): an `ARRAY[…]`, or an
 /// array literal under any form but the two the rewrite turns into an `IN`
 /// chain, `col = ANY('{…}')` and `col <> ALL('{…}')`, which stay sargable.
+/// Whether `body` holds `x op ANY (…)` or `ALL (…)` over an array the row
+/// computes — a column, a slice, a call — rather than an `ARRAY[…]`, a
+/// literal or a subquery, which have readings of their own. The evaluator
+/// compares it element by element (`PgFunc::QuantifiedCmp`); the predicate
+/// tokenizer refused it as "unsupported keyword 'ANY'".
+fn quantified_over_expression(body: &str) -> bool {
+    let words = top_level_words(body);
+    words.iter().any(|&(s, e)| {
+        let word = &body[s..e];
+        if !["ANY", "SOME", "ALL"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+            return false;
+        }
+        let head = body[..s].trim_end();
+        if !["<>", "!=", "<=", ">=", "=", "<", ">"].iter().any(|op| head.ends_with(op)) {
+            return false;
+        }
+        let Some(inner) = body[e..].trim_start().strip_prefix('(').map(str::trim_start) else {
+            return false;
+        };
+        let starts = |kw: &str| {
+            inner.len() >= kw.len()
+                && inner.as_bytes()[..kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+                && inner.as_bytes().get(kw.len()).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+        };
+        let array_ctor =
+            inner.len() > 5 && inner.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") && inner[5..].trim_start().starts_with('[');
+        !(array_ctor || inner.starts_with('\'') || inner.starts_with('(') || starts("SELECT") || starts("WITH") || starts("VALUES"))
+    })
+}
+
+/// [`quantified_over_expression`] at any depth, outside quotes: `NOT (5 =
+/// ANY(tags))` has its quantifier inside a group, and left unlifted the
+/// `NOT` was pushed onto it as `<> ALL`, which the tokenizer cannot read.
+fn quantified_over_expression_anywhere(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b'(' => {
+                // The group's inside, up to its partner.
+                if let Some(close) = crate::core::sql_scan::matching_close(text, i) {
+                    if quantified_over_expression(&text[i + 1..close]) {
+                        return true;
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    quantified_over_expression(text)
+}
+
 fn quantified_over_array(body: &str) -> bool {
     let words = top_level_words(body);
     words.iter().enumerate().any(|(n, &(s, e))| {

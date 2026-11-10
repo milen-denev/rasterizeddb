@@ -755,6 +755,11 @@ impl SelectItem {
                     // And a `json` one (`->` of a `json` column, a cast to
                     // `json`) as `json`, though it travels as text.
                     None if crate::core::rql::expr::yields_json_text(expr) => DbType::JSONTEXT,
+                    // A slice of a typed array column is an array of its
+                    // element type, described and sent as one.
+                    None if crate::core::rql::expr::typed_array_element(expr).is_some() => {
+                        DbType::ARRAYOF(crate::core::rql::expr::typed_array_element(expr).expect("checked"))
+                    }
                     None => self.result_type(),
                 }
             }
