@@ -7781,6 +7781,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("filter is not implemented for non-aggregate window functions") {
         return "0A000";
     }
+    // `array_subscript_error`: inner arrays of different shapes.
+    if has("multidimensional arrays must have array expressions with matching dimensions") {
+        return "2202E";
+    }
     // A RANGE offset over a type with no distance (PostgreSQL's 42883).
     if has("range with offset preceding/following is not supported for column type") {
         return "42883";
@@ -10683,7 +10687,7 @@ mod serialized_result_tests {
 /// `text[]`'s instead.
 pub(crate) fn typed_array_binary(bytes: &[u8], code: u8) -> Vec<u8> {
     let element = DbType::from_byte(code);
-    let Some((_, elements)) = crate::core::value_codec::decode_array(bytes) else {
+    let Some((_, dims, elements)) = crate::core::value_codec::decode_array_dims(bytes) else {
         return crate::core::value_codec::as_text_array(bytes);
     };
     let mut binary: Vec<Option<Vec<u8>>> = Vec::with_capacity(elements.len());
@@ -10709,7 +10713,7 @@ pub(crate) fn typed_array_binary(bytes: &[u8], code: u8) -> Vec<u8> {
             }
         }
     }
-    crate::core::value_codec::build_array_pub(element.pg_oid() as i32, binary.iter().map(|e| e.as_deref()))
+    crate::core::value_codec::build_array_dims(element.pg_oid() as i32, &dims, binary.iter().map(|e| e.as_deref()))
 }
 
 /// A `numeric` element's cell at the places its text shows (`1.50` at two),

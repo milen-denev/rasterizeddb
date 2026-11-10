@@ -988,17 +988,20 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         NumNonnulls => int_value(args.iter().filter(|a| !a.is_null()).count() as i64),
         NumNulls => int_value(args.iter().filter(|a| a.is_null()).count() as i64),
         ArraySubscript => {
-            if args[0].is_null() || args[1].is_null() {
+            if args[0].is_null() || args[2..].iter().any(Value::is_null) {
                 return Ok(Value::Null);
             }
             let Value::Data { bytes, .. } = &args[0] else { return Ok(Value::Null) };
-            let index = crate::core::rql::expr::as_i64(&args[1]).ok_or_else(|| "array subscript must have type integer".to_string())?;
-            let Some(element) = crate::core::value_codec::array_element_at(bytes, index) else {
+            let indexes = args[2..]
+                .iter()
+                .map(|a| crate::core::rql::expr::as_i64(a).ok_or_else(|| "array subscript must have type integer".to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let Some(element) = crate::core::value_codec::array_element_at_all(bytes, &indexes) else {
                 return Err("cannot subscript a value that is not an array".to_string());
             };
             let Some(text) = element else { return Ok(Value::Null) };
             let text = String::from_utf8_lossy(&text).into_owned();
-            match tag_type(&args[2]) {
+            match tag_type(&args[1]) {
                 None => text_value(text),
                 Some(t) => match crate::core::value_codec::encode_element(&t, &text) {
                     Some(b) => data(b, t),
@@ -1080,8 +1083,43 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             };
             match crate::core::value_codec::array_slice(bytes, lo, hi) {
                 Some(b) => data(b, DbType::ARRAY),
-                None => return Err("cannot subscript a value that is not an array".to_string()),
+                None => return Err("slicing a multidimensional array is not supported yet".to_string()),
             }
+        }
+        // `ARRAY[ARRAY[1,2], ARRAY[3,4]]`: the inner arrays, all of one
+        // shape, as the rows of one more dimension.
+        ArrayCtor if args.iter().any(|a| matches!(a, Value::Data { db_type: DbType::ARRAY, .. })) => {
+            let mut dims: Option<Vec<usize>> = None;
+            let mut oid = 0i32;
+            let mut elements: Vec<Option<Vec<u8>>> = Vec::new();
+            for a in args {
+                let Value::Data { bytes, db_type: DbType::ARRAY } = a else {
+                    return Err("multidimensional arrays must have array expressions with matching dimensions".to_string());
+                };
+                let (o, d, e) = crate::core::value_codec::decode_array_dims(bytes)
+                    .ok_or_else(|| "could not read an inner array".to_string())?;
+                match &dims {
+                    Some(have) if *have != d => {
+                        return Err("multidimensional arrays must have array expressions with matching dimensions".to_string())
+                    }
+                    Some(_) => {}
+                    None => {
+                        dims = Some(d.clone());
+                        oid = o;
+                    }
+                }
+                elements.extend(e.into_iter().map(|x| x.map(<[u8]>::to_vec)));
+            }
+            let inner = dims.unwrap_or_default();
+            if inner.is_empty() {
+                return Ok(data(crate::core::value_codec::parse_array_literal("{}").expect("empty"), DbType::ARRAY));
+            }
+            let mut all = vec![args.len()];
+            all.extend(inner);
+            data(
+                crate::core::value_codec::build_array_dims(if oid == 0 { 25 } else { oid }, &all, elements.iter().map(|e| e.as_deref())),
+                DbType::ARRAY,
+            )
         }
         ArrayCtor => {
             // Each element as its type prints it, NULL as the null element,
@@ -1303,7 +1341,7 @@ fn tag_type(tag: &Value) -> Option<DbType> {
 
 /// The type `a[i]` is described as: its tag's.
 fn subscript_type(args: &[crate::core::rql::expr::Expr]) -> DbType {
-    match args.get(2) {
+    match args.get(1) {
         Some(crate::core::rql::expr::Expr::Literal { bytes, .. }) if bytes.len() == 1 => DbType::from_byte(bytes[0]),
         _ => DbType::STRING,
     }
@@ -1336,55 +1374,12 @@ pub fn array_elements_of(text: &str) -> Result<Vec<Option<String>>, String> {
 
 /// The elements of a one-dimensional array's text, `None` for a NULL.
 fn array_elements(text: &str) -> Result<Vec<Option<String>>, String> {
-    let inner = text
-        .trim()
-        .strip_prefix('{')
-        .and_then(|t| t.strip_suffix('}'))
-        .ok_or_else(|| format!("malformed array literal: \"{text}\""))?;
-    let mut out = Vec::new();
-    if inner.trim().is_empty() {
-        return Ok(out);
-    }
-    let chars: Vec<char> = inner.chars().collect();
-    let mut i = 0;
-    loop {
-        while i < chars.len() && chars[i] == ' ' {
-            i += 1;
-        }
-        if chars.get(i) == Some(&'{') {
-            return Err("a multidimensional array is not supported here".to_string());
-        }
-        if chars.get(i) == Some(&'"') {
-            i += 1;
-            let mut e = String::new();
-            while i < chars.len() && chars[i] != '"' {
-                if chars[i] == '\\' {
-                    i += 1;
-                }
-                if let Some(c) = chars.get(i) {
-                    e.push(*c);
-                }
-                i += 1;
-            }
-            i += 1;
-            out.push(Some(e));
-        } else {
-            let start = i;
-            while i < chars.len() && chars[i] != ',' {
-                i += 1;
-            }
-            let raw: String = chars[start..i].iter().collect::<String>().trim().to_string();
-            out.push(if raw.eq_ignore_ascii_case("NULL") { None } else { Some(raw) });
-        }
-        while i < chars.len() && chars[i] != ',' {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        i += 1;
-    }
-    Ok(out)
+    // Every element, in row-major order, however many dimensions it has:
+    // `cardinality`, `array_to_string` and `unnest` read a multidimensional
+    // array flat, as PostgreSQL's do.
+    crate::core::value_codec::parse_nested_array(text)
+        .map(|parsed| parsed.elements)
+        .ok_or_else(|| format!("malformed array literal: \"{text}\""))
 }
 
 /// Days since 1970-01-01 of a calendar date, refusing one that is not.

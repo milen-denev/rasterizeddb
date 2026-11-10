@@ -415,6 +415,31 @@ fn array_argument(text: &str) -> Result<(Vec<Option<String>>, DbType, String), S
         let open = trimmed.find('[').expect("checked");
         let close = trimmed.rfind(']').ok_or("an ARRAY constructor is not closed")?;
         let inner = &trimmed[open + 1..close];
+        // `ARRAY[ARRAY[1,2],ARRAY[3,4]]`: one multidimensional array, whose
+        // elements are unnested flat, as PostgreSQL's `unnest` reads one.
+        // Taken element by element, each inner array was one text element.
+        if crate::core::sql_scan::split_top_level(inner, b',').iter().any(|e| {
+            let e = e.trim();
+            e.len() > 5 && e.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") && e[5..].trim_start().starts_with('[')
+        }) {
+            let Value::Data { bytes, db_type: DbType::ARRAY } = constant(trimmed, "unnest")? else {
+                return Err("unnest needs an array".to_string());
+            };
+            let ty = crate::core::value_codec::array_element_type(&bytes).unwrap_or(DbType::STRING);
+            let (_, flat) = crate::core::value_codec::decode_array(&bytes).ok_or("unnest needs an array")?;
+            let quoted = !matches!(ty, DbType::I16 | DbType::I32 | DbType::I64 | DbType::DECIMAL | DbType::F32 | DbType::F64 | DbType::BOOL);
+            let elements = flat
+                .into_iter()
+                .map(|e| {
+                    e.map(|b| {
+                        let text = String::from_utf8_lossy(b).into_owned();
+                        if quoted { crate::core::value_codec::quote_sql(&text) } else { text }
+                    })
+                })
+                .collect();
+            let sql = sql_type(&ty, None, true);
+            return Ok((elements, ty, sql));
+        }
         let mut elements = Vec::new();
         let mut types: Vec<DbType> = Vec::new();
         let mut scale = 0u32;

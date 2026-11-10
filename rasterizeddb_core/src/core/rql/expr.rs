@@ -1101,23 +1101,35 @@ fn pg_operand_type_name(expr: &Expr) -> String {
 /// `None` when it does not (`int[]` in a cast is no subscript).
 fn parse_subscript(text: &str, schema: &[SchemaField]) -> Result<Option<Expr>, String> {
     use crate::core::rql::pg_functions::PgFunc;
-    if !text.ends_with(']') || array_constructor_body(text).is_some() {
-        return Ok(None);
-    }
-    let bytes = text.as_bytes();
-    let Some(open) = (1..bytes.len()).find(|&i| {
-        bytes[i] == b'[' && crate::core::sql_scan::matching_close(text, i) == Some(text.len() - 1) && {
-            let nesting = Nesting::of(text);
-            nesting.top_level(i)
+    // Every trailing `[…]` group, right to left: `a[1][2]` is one access with
+    // two indexes, as a two-dimensional array is read.
+    let mut base_text = text;
+    let mut groups: Vec<&str> = Vec::new();
+    loop {
+        if !base_text.ends_with(']') || array_constructor_body(base_text).is_some() {
+            break;
         }
-    }) else {
-        return Ok(None);
-    };
-    let base_text = text[..open].trim_end();
-    let inside = text[open + 1..text.len() - 1].trim();
-    if base_text.is_empty() || inside.is_empty() || base_text.ends_with("::") || base_text.contains("::") && !base_text.ends_with(')') {
+        let bytes = base_text.as_bytes();
+        let nesting = Nesting::of(base_text);
+        let Some(open) = (1..bytes.len()).find(|&i| {
+            bytes[i] == b'['
+                && crate::core::sql_scan::matching_close(base_text, i) == Some(base_text.len() - 1)
+                && nesting.top_level(i)
+        }) else {
+            break;
+        };
+        let inside = base_text[open + 1..base_text.len() - 1].trim();
+        let before = base_text[..open].trim_end();
+        if inside.is_empty() || before.is_empty() || before.ends_with("::") || (before.contains("::") && !before.ends_with(')') && !before.ends_with(']')) {
+            break;
+        }
+        groups.push(inside);
+        base_text = before;
+    }
+    if groups.is_empty() {
         return Ok(None);
     }
+    groups.reverse();
     // `ARRAY[1,2][1]` is a syntax error in PostgreSQL: the constructor is
     // subscripted only in parentheses.
     if array_constructor_body(base_text).is_some() {
@@ -1128,12 +1140,19 @@ fn parse_subscript(text: &str, schema: &[SchemaField]) -> Result<Option<Expr>, S
         return Err(format!("cannot subscript type {} because it does not support subscripting", pg_operand_type_name(&base)));
     }
     // One `:` at the top (not `::`): a slice.
-    let ib = inside.as_bytes();
-    let nesting = Nesting::of(inside);
-    let colon = (0..ib.len()).find(|&i| {
-        ib[i] == b':' && nesting.top_level(i) && ib.get(i + 1) != Some(&b':') && (i == 0 || ib[i - 1] != b':')
-    });
-    if let Some(at) = colon {
+    let colon_of = |inside: &str| {
+        let ib = inside.as_bytes();
+        let nesting = Nesting::of(inside);
+        (0..ib.len()).find(|&i| {
+            ib[i] == b':' && nesting.top_level(i) && ib.get(i + 1) != Some(&b':') && (i == 0 || ib[i - 1] != b':')
+        })
+    };
+    if groups.iter().any(|g| colon_of(g).is_some()) {
+        if groups.len() > 1 {
+            return Err("slicing a multidimensional array is not supported yet".to_string());
+        }
+        let inside = groups[0];
+        let at = colon_of(inside).expect("found");
         let bound = |t: &str| -> Result<Expr, String> { if t.trim().is_empty() { Ok(Expr::Null) } else { parse(t.trim(), schema) } };
         let (lo, hi) = (bound(&inside[..at])?, bound(&inside[at + 1..])?);
         // A written NULL bound is a NULL slice; an omitted one is open.
@@ -1143,15 +1162,15 @@ fn parse_subscript(text: &str, schema: &[SchemaField]) -> Result<Option<Expr>, S
         }
         return Ok(Some(Expr::Call(TextFunc::Pg(PgFunc::ArraySlice), vec![base, lo, hi])));
     }
-    let index = parse(inside, schema)?;
     let tag = match subscript_element(&base) {
         Some(t) => vec![t.to_byte()],
         None => Vec::new(),
     };
-    Ok(Some(Expr::Call(
-        TextFunc::Pg(PgFunc::ArraySubscript),
-        vec![base, index, Expr::Literal { bytes: tag, db_type: DbType::STRING }],
-    )))
+    let mut args = vec![base, Expr::Literal { bytes: tag, db_type: DbType::STRING }];
+    for g in groups {
+        args.push(parse(g, schema)?);
+    }
+    Ok(Some(Expr::Call(TextFunc::Pg(PgFunc::ArraySubscript), args)))
 }
 
 /// The type an element of the array `base` evaluates to is read back as:
@@ -1247,8 +1266,9 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             return Err("cannot determine type of empty array".to_string());
         }
         let elements = crate::core::sql_scan::split_top_level(body, b',');
-        if elements.iter().any(|e| array_constructor_body(e).is_some() || e.starts_with('[')) {
-            return Err("multidimensional arrays are not supported yet".to_string());
+        // `ARRAY[[1,2],[3,4]]`, the bracket form of a nested constructor.
+        if elements.iter().any(|e| e.starts_with('[')) {
+            return Err("ARRAY[[…]] is not supported yet; write the inner arrays as ARRAY[…]".to_string());
         }
         let args = elements.iter().map(|e| parse(e, schema)).collect::<Result<Vec<_>, _>>()?;
         return Ok(Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCtor), args));
@@ -4245,22 +4265,14 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                 return Ok(Value::Null);
             };
             let dimension = as_text(&args[1]).trim().parse::<i32>().unwrap_or(1);
-            if dimension != 1 {
-                // One storage type covers every element type, and it records
-                // one dimension. A higher dimension is unknown rather than
-                // zero.
-                return Ok(Value::Null);
-            }
-            let Some(text) = crate::core::value_codec::format_array(bytes) else {
+            // The dimension's length, NULL past the array's dimensions and
+            // for an empty array, as PostgreSQL's.
+            let Some((_, dims, _)) = crate::core::value_codec::decode_array_dims(bytes) else {
                 return Ok(Value::Null);
             };
-            let count = array_element_count(&text);
-            if count == 0 {
-                return Ok(Value::Null);
-            }
-            Value::Data {
-                bytes: (count as i32).to_le_bytes().to_vec(),
-                db_type: DbType::I32,
+            match usize::try_from(dimension).ok().and_then(|d| d.checked_sub(1)).and_then(|d| dims.get(d)) {
+                Some(len) => Value::Data { bytes: (*len as i32).to_le_bytes().to_vec(), db_type: DbType::I32 },
+                None => return Ok(Value::Null),
             }
         }
         // Always one: the array storage carries a flat element list, so a
@@ -4417,12 +4429,11 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             let Value::Data { bytes, .. } = &args[0] else {
                 return Ok(Value::Null);
             };
-            if bytes.is_empty() {
-                return Ok(Value::Null);
-            }
-            Value::Data {
-                bytes: 1i32.to_le_bytes().to_vec(),
-                db_type: DbType::I32,
+            match crate::core::value_codec::decode_array_dims(bytes) {
+                Some((_, dims, _)) if !dims.is_empty() => {
+                    Value::Data { bytes: (dims.len() as i32).to_le_bytes().to_vec(), db_type: DbType::I32 }
+                }
+                _ => return Ok(Value::Null),
             }
         }
         // `pg_column_size(v)` is the stored width of one value. Given a whole

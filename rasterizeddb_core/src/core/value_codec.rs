@@ -1349,13 +1349,228 @@ pub fn parse_array_literal(text: &str) -> Option<Vec<u8>> {
 /// (`array_agg` of an integer column) is built as, so it orders as that type
 /// does ([`array_order`]).
 pub fn parse_array_literal_as(text: &str, oid: i32) -> Option<Vec<u8>> {
-    let elements = parse_array_elements(text)?;
-    Some(build_array(oid, elements.iter().map(|e| e.as_deref().map(str::as_bytes))))
+    let parsed = parse_nested_array(text)?;
+    Some(build_array_dims(oid, &parsed.dims, parsed.elements.iter().map(|e| e.as_deref().map(str::as_bytes))))
 }
 
-/// [`build_array`], for the wire layer's typed binary arrays.
-pub fn build_array_pub<'a>(oid: i32, elements: impl ExactSizeIterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
-    build_array(oid, elements)
+/// An array literal read: its dimensions' lengths, outermost first (none
+/// for an empty array), and its elements in row-major order (`None` a
+/// NULL).
+pub struct NestedArray {
+    pub dims: Vec<usize>,
+    pub elements: Vec<Option<String>>,
+}
+
+/// One level of a literal: sub-arrays, or elements.
+enum Level {
+    Arrays(Vec<Level>),
+    Elements(Vec<Option<String>>),
+}
+
+/// `{a,"b,c",NULL}`, `{{1,2},{3,4}}`: PostgreSQL's array input, as many
+/// dimensions as it nests, each level's sub-arrays all of one shape.
+/// `None` for anything else — a ragged nesting (`{{1},{2,3}}`), elements
+/// beside sub-arrays, an unbalanced brace or quote.
+///
+/// The nesting was not read: `'{{a,b},{c,d}}'` in a `text[]` column was
+/// stored as four elements `{a`, `b}`, `{c`, `d}`, and printed back as
+/// `{"{a","b}","{c","d}"}`.
+pub fn parse_nested_array(text: &str) -> Option<NestedArray> {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut at = 0usize;
+    let level = parse_level(&chars, &mut at)?;
+    if chars[at..].iter().any(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let mut dims = Vec::new();
+    let mut elements = Vec::new();
+    if !flatten_level(&level, 0, &mut dims, &mut elements) {
+        return None;
+    }
+    // Any empty level makes the whole array empty, as PostgreSQL reads
+    // `{{}}`.
+    if dims.contains(&0) {
+        return Some(NestedArray { dims: Vec::new(), elements: Vec::new() });
+    }
+    Some(NestedArray { dims, elements })
+}
+
+fn parse_level(chars: &[char], at: &mut usize) -> Option<Level> {
+    while *at < chars.len() && chars[*at].is_whitespace() {
+        *at += 1;
+    }
+    if chars.get(*at) != Some(&'{') {
+        return None;
+    }
+    *at += 1;
+    let mut arrays: Vec<Level> = Vec::new();
+    let mut elements: Vec<Option<String>> = Vec::new();
+    loop {
+        while *at < chars.len() && chars[*at].is_whitespace() {
+            *at += 1;
+        }
+        match chars.get(*at)? {
+            '}' if arrays.is_empty() && elements.is_empty() => {
+                *at += 1;
+                return Some(Level::Elements(Vec::new()));
+            }
+            '{' => {
+                if !elements.is_empty() {
+                    return None;
+                }
+                arrays.push(parse_level(chars, at)?);
+            }
+            _ => {
+                if !arrays.is_empty() {
+                    return None;
+                }
+                elements.push(parse_scalar(chars, at)?);
+            }
+        }
+        while *at < chars.len() && chars[*at].is_whitespace() {
+            *at += 1;
+        }
+        match chars.get(*at)? {
+            ',' => *at += 1,
+            '}' => {
+                *at += 1;
+                return Some(if arrays.is_empty() { Level::Elements(elements) } else { Level::Arrays(arrays) });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// One element: quoted (exact, `\` escaping), or unquoted up to a `,` or
+/// `}` (trimmed; an unquoted `NULL` is the null element).
+fn parse_scalar(chars: &[char], at: &mut usize) -> Option<Option<String>> {
+    let mut out = String::new();
+    if chars.get(*at) == Some(&'"') {
+        *at += 1;
+        loop {
+            match chars.get(*at)? {
+                '\\' => {
+                    *at += 1;
+                    out.push(*chars.get(*at)?);
+                }
+                '"' => {
+                    *at += 1;
+                    return Some(Some(out));
+                }
+                c => out.push(*c),
+            }
+            *at += 1;
+        }
+    }
+    while let Some(c) = chars.get(*at) {
+        match c {
+            ',' | '}' => break,
+            '{' | '"' => return None,
+            '\\' => {
+                *at += 1;
+                out.push(*chars.get(*at)?);
+            }
+            c => out.push(*c),
+        }
+        *at += 1;
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(if trimmed.eq_ignore_ascii_case("NULL") { None } else { Some(trimmed.to_string()) })
+}
+
+/// Flattens `level` at `depth`, recording each depth's length the first
+/// time and checking every later sub-array against it.
+fn flatten_level(level: &Level, depth: usize, dims: &mut Vec<usize>, out: &mut Vec<Option<String>>) -> bool {
+    let len = match level {
+        Level::Arrays(a) => a.len(),
+        Level::Elements(e) => e.len(),
+    };
+    match dims.get(depth) {
+        Some(&d) if d != len => return false,
+        Some(_) => {}
+        None => dims.push(len),
+    }
+    match level {
+        Level::Elements(e) => {
+            // Elements only at the innermost depth.
+            if dims.len() != depth + 1 && len > 0 {
+                return false;
+            }
+            out.extend(e.iter().cloned());
+            true
+        }
+        Level::Arrays(a) => a.iter().all(|sub| flatten_level(sub, depth + 1, dims, out)),
+    }
+}
+
+/// [`build_array`] with each dimension's length (lower bounds 1); no
+/// dimensions is the empty array.
+pub fn build_array_dims<'a>(oid: i32, dims: &[usize], elements: impl Iterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
+    if dims.is_empty() {
+        let mut out = Vec::with_capacity(12);
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&oid.to_be_bytes());
+        return out;
+    }
+    let has_null = elements.clone().any(|e| e.is_none());
+    let mut out = Vec::with_capacity(12 + dims.len() * 8);
+    out.extend_from_slice(&(dims.len() as i32).to_be_bytes());
+    out.extend_from_slice(&i32::from(has_null).to_be_bytes());
+    out.extend_from_slice(&oid.to_be_bytes());
+    for d in dims {
+        out.extend_from_slice(&(*d as i32).to_be_bytes());
+        out.extend_from_slice(&1i32.to_be_bytes());
+    }
+    for element in elements {
+        match element {
+            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            Some(value) => {
+                out.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                out.extend_from_slice(value);
+            }
+        }
+    }
+    out
+}
+
+/// A stored array's element OID, dimensions and elements (row-major); `None`
+/// for bytes that are not one.
+pub fn decode_array_dims(raw: &[u8]) -> Option<(i32, Vec<usize>, Vec<Option<&[u8]>>)> {
+    if raw.is_empty() {
+        return Some((0, Vec::new(), Vec::new()));
+    }
+    let be32 = |at: usize| -> Option<i32> { Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?)) };
+    let ndim = usize::try_from(be32(0)?).ok()?;
+    let oid = be32(8)?;
+    if ndim == 0 {
+        return Some((oid, Vec::new(), Vec::new()));
+    }
+    if ndim > 6 {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        dims.push(usize::try_from(be32(12 + d * 8)?).ok()?);
+    }
+    let count = dims.iter().try_fold(1usize, |acc, d| acc.checked_mul(*d))?;
+    let mut at = 12 + ndim * 8;
+    let mut out = Vec::with_capacity(count.min(raw.len() / 4));
+    for _ in 0..count {
+        let len = be32(at)?;
+        at += 4;
+        if len < 0 {
+            out.push(None);
+            continue;
+        }
+        let end = at.checked_add(len as usize)?;
+        out.push(Some(raw.get(at..end)?));
+        at = end;
+    }
+    Some((oid, dims, out))
 }
 
 /// A one-dimensional binary array of `elements` (`None` a NULL) under `oid`.
@@ -1384,37 +1599,9 @@ fn build_array<'a>(oid: i32, elements: impl ExactSizeIterator<Item = Option<&'a 
 /// NULL); an empty array is OID 0 and no elements. `None` for bytes that are
 /// not one, or that have more than one dimension.
 pub fn decode_array(raw: &[u8]) -> Option<(i32, Vec<Option<&[u8]>>)> {
-    if raw.is_empty() {
-        return Some((0, Vec::new()));
-    }
-    if raw.len() < 12 {
-        return None;
-    }
-    let be32 = |at: usize| -> Option<i32> { Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?)) };
-    let ndim = be32(0)?;
-    if ndim == 0 {
-        return Some((be32(8)?, Vec::new()));
-    }
-    if ndim != 1 || raw.len() < 20 {
-        return None;
-    }
-    let oid = be32(8)?;
-    let count = usize::try_from(be32(12)?).ok()?;
-    let mut at = 20usize;
-    let mut out = Vec::with_capacity(count.min(raw.len() / 4));
-    for _ in 0..count {
-        let len = be32(at)?;
-        at += 4;
-        if len < 0 {
-            out.push(None);
-            continue;
-        }
-        let end = at.checked_add(len as usize)?;
-        out.push(Some(raw.get(at..end)?));
-        at = end;
-    }
-    Some((oid, out))
+    decode_array_dims(raw).map(|(oid, _, elements)| (oid, elements))
 }
+
 
 /// A stored array as `text[]`'s binary form: its bytes, with the element OID
 /// set to text's. Elements are always stored as text; the OID a typed
@@ -1462,17 +1649,36 @@ pub fn element_read_type(element: &crate::core::db_type::DbType) -> Option<crate
 /// always are): `Some(None)` for a NULL element or one past either end,
 /// `None` for bytes that are not an array.
 pub fn array_element_at(raw: &[u8], index: i64) -> Option<Option<Vec<u8>>> {
-    let (_, elements) = decode_array(raw)?;
-    if index < 1 || index as u64 > elements.len() as u64 {
+    array_element_at_all(raw, &[index])
+}
+
+/// `raw[i][j]…`, one index per dimension (1-based): `Some(None)` for a
+/// NULL element, an index past either end, or a count of indexes other
+/// than the array's dimensions (PostgreSQL's NULL there too).
+pub fn array_element_at_all(raw: &[u8], indexes: &[i64]) -> Option<Option<Vec<u8>>> {
+    let (_, dims, elements) = decode_array_dims(raw)?;
+    if indexes.len() != dims.len() {
         return Some(None);
     }
-    Some(elements[(index - 1) as usize].map(<[u8]>::to_vec))
+    let mut flat = 0usize;
+    for (i, d) in indexes.iter().zip(&dims) {
+        if *i < 1 || *i as u64 > *d as u64 {
+            return Some(None);
+        }
+        flat = flat * d + (*i - 1) as usize;
+    }
+    Some(elements.get(flat).copied().flatten().map(<[u8]>::to_vec))
 }
 
 /// `raw[lo:hi]`, clamped to the array, as PostgreSQL slices one: empty
 /// when nothing is left. Under the array's own element OID.
 pub fn array_slice(raw: &[u8], lo: i64, hi: i64) -> Option<Vec<u8>> {
-    let (oid, elements) = decode_array(raw)?;
+    let (oid, dims, elements) = decode_array_dims(raw)?;
+    // A slice of a multidimensional array is not read here (the caller
+    // refuses it).
+    if dims.len() > 1 {
+        return None;
+    }
     let lo = lo.max(1);
     let hi = hi.min(elements.len() as i64);
     if lo > hi {
@@ -1522,7 +1728,7 @@ fn element_type_of_oid(oid: i32) -> Option<crate::core::db_type::DbType> {
 /// column, `{01,2}` sorted after `{10}`, and `max` compared text.
 pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -> Result<Option<Vec<u8>>, String> {
     use crate::core::db_type::DbType;
-    let Some((oid, elements)) = decode_array(raw) else { return Ok(None) };
+    let Some((oid, dims, elements)) = decode_array_dims(raw) else { return Ok(None) };
     if elements.is_empty() {
         return Ok(None);
     }
@@ -1555,7 +1761,7 @@ pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -
         }
         held.push(Some(canonical.into_bytes()));
     }
-    let rebuilt = build_array(target, held.iter().map(|e| e.as_deref()));
+    let rebuilt = build_array_dims(target, &dims, held.iter().map(|e| e.as_deref()));
     Ok((rebuilt != raw || oid != target).then_some(rebuilt))
 }
 
@@ -1654,7 +1860,13 @@ pub fn array_order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
             return order;
         }
     }
-    ea.len().cmp(&eb.len())
+    // Equal as far as both go: the one with fewer elements first, then by
+    // their dimensions, as PostgreSQL's `array_cmp` does.
+    ea.len().cmp(&eb.len()).then_with(|| {
+        let da = decode_array_dims(a).map(|(_, d, _)| d).unwrap_or_default();
+        let db = decode_array_dims(b).map(|(_, d, _)| d).unwrap_or_default();
+        da.len().cmp(&db.len()).then_with(|| da.cmp(&db))
+    })
 }
 
 /// Two elements' text, as `typed` orders them when both read as it, else as
@@ -1671,6 +1883,14 @@ fn element_order(typed: Option<&crate::core::db_type::DbType>, x: &[u8], y: &[u8
 
 /// Splits `{a,"b,c",NULL}` into its elements. `None` is an unquoted `NULL`.
 fn parse_array_elements(text: &str) -> Option<Vec<Option<String>>> {
+    if let Some(parsed) = parse_nested_array(text) {
+        return Some(parsed.elements);
+    }
+    parse_array_elements_flat(text)
+}
+
+/// The one-level reading [`parse_array_elements`] falls back to.
+fn parse_array_elements_flat(text: &str) -> Option<Vec<Option<String>>> {
     let trimmed = text.trim();
     let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
     if inner.trim().is_empty() {
@@ -1724,72 +1944,62 @@ fn finish_array_element(raw: &str, was_quoted: bool) -> Option<String> {
     })
 }
 
-/// Renders the binary array representation back to `{a,b,NULL}`.
+/// Renders the binary array representation back to `{a,b,NULL}`, nested as
+/// it has dimensions (`{{1,2},{3,4}}`).
 pub fn format_array(raw: &[u8]) -> Option<String> {
-    if raw.is_empty() {
+    let (oid, dims, elements) = decode_array_dims(raw)?;
+    if dims.is_empty() {
         return Some("{}".to_string());
     }
-    if raw.len() < 20 {
-        return None;
-    }
-
-    let be32 =
-        |at: usize| -> i32 { i32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]) };
-
-    let ndim = be32(0);
-    if ndim == 0 {
-        return Some("{}".to_string());
-    }
-    if ndim != 1 {
-        // Multi-dimensional arrays round-trip as stored but are not rendered.
-        return None;
-    }
-
-    let count = be32(12).max(0) as usize;
     // A boolean element is `t` or `f`, as PostgreSQL's `boolout` writes it
     // inside an array; the element text kept is the spelling it came in as
     // (`array_agg(f)` printed `{true,false}`).
-    let boolean = be32(8) == 16;
-    let mut at = 20usize;
-    let mut parts: Vec<String> = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        if at + 4 > raw.len() {
-            return None;
-        }
-        let len = be32(at);
-        at += 4;
-        if len < 0 {
-            parts.push("NULL".to_string());
-            continue;
-        }
-        let len = len as usize;
-        if at + len > raw.len() {
-            return None;
-        }
-        let mut value = String::from_utf8_lossy(&raw[at..at + len]).into_owned();
-        at += len;
-        if boolean {
-            match value.to_ascii_lowercase().as_str() {
-                "true" | "t" => value = "t".to_string(),
-                "false" | "f" => value = "f".to_string(),
-                _ => {}
+    let boolean = oid == 16;
+    let rendered: Vec<String> = elements
+        .iter()
+        .map(|e| match e {
+            None => "NULL".to_string(),
+            Some(bytes) => {
+                let mut value = String::from_utf8_lossy(bytes).into_owned();
+                if boolean {
+                    match value.to_ascii_lowercase().as_str() {
+                        "true" | "t" => value = "t".to_string(),
+                        "false" | "f" => value = "f".to_string(),
+                        _ => {}
+                    }
+                }
+                // Quote when the value could otherwise be misread as syntax.
+                let needs_quotes = value.is_empty()
+                    || value.eq_ignore_ascii_case("NULL")
+                    || value.contains([',', '{', '}', '"', '\\', ' ']);
+                if needs_quotes {
+                    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                } else {
+                    value
+                }
             }
-        }
+        })
+        .collect();
+    let mut out = String::new();
+    write_nested(&dims, &rendered, &mut out);
+    Some(out)
+}
 
-        // Quote when the value could otherwise be misread as syntax.
-        let needs_quotes = value.is_empty()
-            || value.eq_ignore_ascii_case("NULL")
-            || value.contains([',', '{', '}', '"', '\\', ' ']);
-        if needs_quotes {
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            parts.push(format!("\"{}\"", escaped));
-        } else {
-            parts.push(value);
+/// `{…}` for the first dimension of `dims` over `items`, nesting the rest.
+fn write_nested(dims: &[usize], items: &[String], out: &mut String) {
+    out.push('{');
+    if dims.len() <= 1 {
+        out.push_str(&items.join(","));
+    } else {
+        let stride = items.len() / dims[0].max(1);
+        for (n, chunk) in items.chunks(stride.max(1)).enumerate() {
+            if n > 0 {
+                out.push(',');
+            }
+            write_nested(&dims[1..], chunk, out);
         }
     }
-
-    Some(format!("{{{}}}", parts.join(",")))
+    out.push('}');
 }
 
 /// Decodes a `bytea` value's text form: [`byteain`], with the reason dropped.
