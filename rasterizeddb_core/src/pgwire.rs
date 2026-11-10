@@ -7033,7 +7033,9 @@ fn result_description(
                 // A refusal with a code of its own keeps it (a window frame's
                 // 42P20, FILTER's 0A000); anything else is the statement's
                 // syntax.
-                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
+                // Read with the statement's own texts blanked
+                // (`sqlstate_in`): a quoted name can hold an engine's words.
+                Err(e) => return Err((match sqlstate_in(&e, &qr.query) { "XX000" => "42601", code => code }, e)),
             }
         }
         QueryPurpose::QueryRows(qr) => {
@@ -7130,7 +7132,9 @@ fn result_description(
                 // A refusal with a code of its own keeps it (a window frame's
                 // 42P20, FILTER's 0A000); anything else is the statement's
                 // syntax.
-                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
+                // Read with the statement's own texts blanked
+                // (`sqlstate_in`): a quoted name can hold an engine's words.
+                Err(e) => return Err((match sqlstate_in(&e, &qr.query) { "XX000" => "42601", code => code }, e)),
             }
         }
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
