@@ -30,7 +30,7 @@ async fn count(pool: &sqlx::PgPool, sql: &str) -> usize {
 
 /// Builds a parent and a child related by `action`.
 async fn with_action(pool: &sqlx::PgPool, suffix: &str, action: &str) {
-    run(pool, &format!("CREATE TABLE p{} (id INT NOT NULL, name TEXT NOT NULL)", suffix))
+    run(pool, &format!("CREATE TABLE p{} (id INT PRIMARY KEY, name TEXT NOT NULL)", suffix))
         .await
         .expect("parent");
     run(
@@ -135,7 +135,7 @@ async fn on_delete_set_null_clears_the_reference() {
 async fn on_delete_set_default_restores_the_declared_default() {
     let (_s, pool) = server().await;
 
-    run(&pool, "CREATE TABLE p_sd (id INT NOT NULL)").await.expect("parent");
+    run(&pool, "CREATE TABLE p_sd (id INT PRIMARY KEY)").await.expect("parent");
     run(
         &pool,
         "CREATE TABLE c_sd (id INT NOT NULL, pid INT DEFAULT 9, \
@@ -179,10 +179,10 @@ async fn set_default_without_a_default_clears_the_reference() {
 async fn a_cascade_propagates_through_a_chain() {
     let (_s, pool) = server().await;
 
-    run(&pool, "CREATE TABLE a1 (id INT NOT NULL)").await.expect("a1");
+    run(&pool, "CREATE TABLE a1 (id INT PRIMARY KEY)").await.expect("a1");
     run(
         &pool,
-        "CREATE TABLE b1 (id INT NOT NULL, aid INT, \
+        "CREATE TABLE b1 (id INT PRIMARY KEY, aid INT, \
          CONSTRAINT fk_b1 FOREIGN KEY (aid) REFERENCES a1 (id) ON DELETE CASCADE)",
     )
     .await
@@ -208,7 +208,7 @@ async fn a_cascade_propagates_through_a_chain() {
 async fn a_constraint_added_later_is_enforced_and_can_be_dropped() {
     let (_s, pool) = server().await;
 
-    run(&pool, "CREATE TABLE p_alt (id INT NOT NULL)").await.expect("parent");
+    run(&pool, "CREATE TABLE p_alt (id INT PRIMARY KEY)").await.expect("parent");
     run(&pool, "CREATE TABLE c_alt (id INT NOT NULL, pid INT)").await.expect("child");
     run(&pool, "INSERT INTO p_alt (id) VALUES (1)").await.expect("parent row");
 

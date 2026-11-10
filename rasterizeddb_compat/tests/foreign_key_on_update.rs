@@ -163,7 +163,7 @@ async fn a_cascade_propagates_through_a_chain() {
     exec(&mut conn, "CREATE TABLE a (id INT PRIMARY KEY)").await.expect("a");
     exec(
         &mut conn,
-        "CREATE TABLE b (id INT PRIMARY KEY, aid INT, \
+        "CREATE TABLE b (id INT PRIMARY KEY, aid INT UNIQUE, \
          CONSTRAINT fk_b FOREIGN KEY (aid) REFERENCES a (id) ON UPDATE CASCADE)",
     )
     .await

@@ -2991,13 +2991,14 @@ pub(crate) fn compare_bytes_as_type(
     use crate::core::db_type::DbType;
 
     match db_type {
-        // Variable-width values order by their bytes. For an array that is not
-        // a meaningful order, but it is stable, which is what a sort needs.
+        // Variable-width values order by their bytes.
         // `JSON` is reporting-only and never reaches storage, but a match has
         // to be exhaustive and a byte compare is the safe answer.
+        // An array element by element, as PostgreSQL orders one
+        // (`value_codec::array_order`).
+        DbType::ARRAY => crate::core::value_codec::array_order(a, b),
         DbType::STRING
         | DbType::BYTEA
-        | DbType::ARRAY
         | DbType::UNKNOWN
         | DbType::START
         | DbType::END

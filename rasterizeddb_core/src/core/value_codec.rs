@@ -1341,27 +1341,295 @@ const OID_TEXT: i32 = 25;
 /// by its bytes — with length `-1` marking `NULL`. Carrying the element OID in
 /// the value is what lets one storage type serve arrays of anything.
 pub fn parse_array_literal(text: &str) -> Option<Vec<u8>> {
+    parse_array_literal_as(text, OID_TEXT)
+}
+
+/// [`parse_array_literal`], its elements' text kept as written, under element
+/// OID `oid`: what an array whose elements are known to be of one type
+/// (`array_agg` of an integer column) is built as, so it orders as that type
+/// does ([`array_order`]).
+pub fn parse_array_literal_as(text: &str, oid: i32) -> Option<Vec<u8>> {
     let elements = parse_array_elements(text)?;
+    Some(build_array(oid, elements.iter().map(|e| e.as_deref().map(str::as_bytes))))
+}
 
-    let mut out = Vec::with_capacity(20 + elements.len() * 8);
+/// A one-dimensional binary array of `elements` (`None` a NULL) under `oid`.
+fn build_array<'a>(oid: i32, elements: impl ExactSizeIterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
+    let count = elements.len();
+    let mut out = Vec::with_capacity(20 + count * 8);
     out.extend_from_slice(&1i32.to_be_bytes()); // one dimension
-    let has_null = elements.iter().any(Option::is_none);
+    let has_null = elements.clone().any(|e| e.is_none());
     out.extend_from_slice(&i32::from(has_null).to_be_bytes());
-    out.extend_from_slice(&OID_TEXT.to_be_bytes());
-    out.extend_from_slice(&(elements.len() as i32).to_be_bytes());
+    out.extend_from_slice(&oid.to_be_bytes());
+    out.extend_from_slice(&(count as i32).to_be_bytes());
     out.extend_from_slice(&1i32.to_be_bytes()); // lower bound, as Postgres uses
-
-    for element in &elements {
+    for element in elements {
         match element {
             None => out.extend_from_slice(&(-1i32).to_be_bytes()),
             Some(value) => {
                 out.extend_from_slice(&(value.len() as i32).to_be_bytes());
-                out.extend_from_slice(value.as_bytes());
+                out.extend_from_slice(value);
             }
         }
     }
+    out
+}
 
-    Some(out)
+/// A stored one-dimensional array's element OID and elements (`None` a
+/// NULL); an empty array is OID 0 and no elements. `None` for bytes that are
+/// not one, or that have more than one dimension.
+pub fn decode_array(raw: &[u8]) -> Option<(i32, Vec<Option<&[u8]>>)> {
+    if raw.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    if raw.len() < 12 {
+        return None;
+    }
+    let be32 = |at: usize| -> Option<i32> { Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?)) };
+    let ndim = be32(0)?;
+    if ndim == 0 {
+        return Some((be32(8)?, Vec::new()));
+    }
+    if ndim != 1 || raw.len() < 20 {
+        return None;
+    }
+    let oid = be32(8)?;
+    let count = usize::try_from(be32(12)?).ok()?;
+    let mut at = 20usize;
+    let mut out = Vec::with_capacity(count.min(raw.len() / 4));
+    for _ in 0..count {
+        let len = be32(at)?;
+        at += 4;
+        if len < 0 {
+            out.push(None);
+            continue;
+        }
+        let end = at.checked_add(len as usize)?;
+        out.push(Some(raw.get(at..end)?));
+        at = end;
+    }
+    Some((oid, out))
+}
+
+/// A stored array as `text[]`'s binary form: its bytes, with the element OID
+/// set to text's. Elements are always stored as text; the OID a typed
+/// column's arrays carry is for ordering them ([`array_order`]).
+pub fn as_text_array(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    push_text_array(raw, &mut out);
+    out
+}
+
+/// [`as_text_array`], appended to `out`. Bytes that are not an array are
+/// appended as they are.
+pub fn push_text_array(raw: &[u8], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(raw);
+    if raw.len() >= 12 && decode_array(raw).is_some() {
+        out[start + 8..start + 12].copy_from_slice(&OID_TEXT.to_be_bytes());
+    }
+}
+
+/// The element OID an array of `element` values is built under, so it
+/// orders as that type does ([`array_order`]); text's for any type whose
+/// elements order as text.
+pub fn array_oid_for(element: &crate::core::db_type::DbType) -> i32 {
+    let oid = element.pg_oid() as i32;
+    if element_type_of_oid(oid).is_some() { oid } else { OID_TEXT }
+}
+
+/// The element type a stored array's element OID names; `None` for text and
+/// for an OID no column type here has.
+pub fn array_element_type(raw: &[u8]) -> Option<crate::core::db_type::DbType> {
+    let (oid, _) = decode_array(raw)?;
+    element_type_of_oid(oid)
+}
+
+/// The element type an array's element OID names, for ordering its elements
+/// as that type; `None` for text, and for an OID no column type here has.
+fn element_type_of_oid(oid: i32) -> Option<crate::core::db_type::DbType> {
+    use crate::core::db_type::DbType;
+    Some(match oid {
+        16 => DbType::BOOL,
+        20 => DbType::I64,
+        21 => DbType::I16,
+        23 => DbType::I32,
+        700 => DbType::F32,
+        701 => DbType::F64,
+        1700 => DbType::DECIMAL,
+        2950 => DbType::UUID,
+        869 => DbType::INET,
+        1082 => DbType::DATE,
+        1083 => DbType::TIME,
+        1266 => DbType::TIMETZ,
+        1114 => DbType::TIMESTAMP,
+        1184 => DbType::DATETIME,
+        1186 => DbType::INTERVAL,
+        829 => DbType::MACADDR,
+        774 => DbType::MACADDR8,
+        1560 => DbType::BIT,
+        1562 => DbType::VARBIT,
+        _ => return None,
+    })
+}
+
+/// An array value assigned to a column of element type `element`
+/// (`type_modifier::TextTypmod::Element`), as PostgreSQL's `array_in` reads
+/// it: every element read as that type, refused as the type refuses it
+/// (`'{1,x}'` into `integer[]`: 22P02), and kept in the type's own text
+/// (`'{01,+2}'` is `{1,2}`, `'{yes,off}'` is `{t,f}`), under the type's
+/// OID. `Ok(None)` when the bytes are already that; bytes that are not a
+/// one-dimensional array are left alone.
+///
+/// Every array column was untyped text: `'{1,x}'` was stored in an `INT[]`
+/// column, `{01,2}` sorted after `{10}`, and `max` compared text.
+pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -> Result<Option<Vec<u8>>, String> {
+    use crate::core::db_type::DbType;
+    let Some((oid, elements)) = decode_array(raw) else { return Ok(None) };
+    if elements.is_empty() {
+        return Ok(None);
+    }
+    let target = element.pg_oid() as i32;
+    let mut held: Vec<Option<Vec<u8>>> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        let Some(bytes) = e else {
+            held.push(None);
+            continue;
+        };
+        let text = std::str::from_utf8(bytes).map_err(|_| refusal_message(element, &String::from_utf8_lossy(bytes)))?;
+        let encoded = encode_element(element, text).ok_or_else(|| refusal_message(element, text))?;
+        let mut canonical =
+            crate::pgwire::format_column_text_scaled(element.clone(), &encoded, None).unwrap_or_else(|| text.to_string());
+        // A `numeric` keeps the places it was written with, as PostgreSQL's
+        // does (`1.50` stays `1.50`, `01.0` is `1.0`); the formatter drops
+        // trailing zeros.
+        if *element == DbType::DECIMAL
+            && !text.contains(['e', 'E'])
+            && let Some((_, frac)) = text.trim().split_once('.')
+        {
+            let written = frac.trim_end().len();
+            let shown = canonical.split_once('.').map_or(0, |(_, f)| f.len());
+            if written > shown {
+                if shown == 0 {
+                    canonical.push('.');
+                }
+                canonical.extend(std::iter::repeat_n('0', written - shown));
+            }
+        }
+        held.push(Some(canonical.into_bytes()));
+    }
+    let rebuilt = build_array(target, held.iter().map(|e| e.as_deref()));
+    Ok((rebuilt != raw || oid != target).then_some(rebuilt))
+}
+
+/// One array element's text read as `element`, as that type's input function
+/// reads it, into the bytes a column of the type stores; `None` when the type
+/// refuses it. The numbers and `boolean` are read here (`encode_literal`
+/// leaves them to the tokenizer, which never sees an element); every other
+/// type as [`encode_literal`] reads a literal.
+pub fn encode_element(element: &crate::core::db_type::DbType, text: &str) -> Option<Vec<u8>> {
+    use crate::core::db_type::DbType;
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    fn integer(t: &str) -> Option<i128> {
+        let (negative, digits) = match t.as_bytes().first()? {
+            b'-' => (true, &t[1..]),
+            b'+' => (false, &t[1..]),
+            _ => (false, t),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.len() > 38 {
+            return None;
+        }
+        let v: i128 = digits.parse().ok()?;
+        Some(if negative { -v } else { v })
+    }
+    Some(match element {
+        DbType::I8 => i8::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I16 => i16::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I32 => i32::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I64 => i64::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::I128 => integer(t)?.to_le_bytes().to_vec(),
+        DbType::U8 => u8::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U16 => u16::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U32 => u32::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U64 => u64::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::U128 => u128::try_from(integer(t)?).ok()?.to_le_bytes().to_vec(),
+        DbType::F32 | DbType::F64 => {
+            // Rust reads `inf`, `infinity` and `nan` in any case, as
+            // PostgreSQL's `float8in` does; neither takes hex or a bare `.`.
+            if t.is_empty() || t.starts_with("0x") || t == "." {
+                return None;
+            }
+            let v: f64 = t.parse().ok()?;
+            if *element == DbType::F32 {
+                let narrowed = v as f32;
+                if narrowed.is_infinite() && v.is_finite() {
+                    return None;
+                }
+                narrowed.to_le_bytes().to_vec()
+            } else {
+                v.to_le_bytes().to_vec()
+            }
+        }
+        DbType::BOOL => {
+            // `boolin`: a unique prefix of true/yes/false/no, `on`/`off`
+            // (two letters at least), `1` or `0`, in any case.
+            let l = t.to_ascii_lowercase();
+            let is = |word: &str, at_least: usize| l.len() >= at_least && word.starts_with(l.as_str());
+            let value = if is("true", 1) || is("yes", 1) || is("on", 2) || l == "1" {
+                true
+            } else if is("false", 1) || is("no", 1) || is("off", 2) || l == "0" {
+                false
+            } else {
+                return None;
+            };
+            vec![u8::from(value)]
+        }
+        _ => return encode_literal(element, text),
+    })
+}
+
+/// PostgreSQL's array order (`array_cmp`): element by element, each pair as
+/// the elements' type orders it (an untyped array's elements as text), a
+/// NULL element after every value; then the shorter array first. Bytes that
+/// are not a one-dimensional array sort after every array, by their bytes,
+/// so the order stays total for a sort.
+///
+/// Arrays were ordered by their stored bytes, which put the element count
+/// first: `'{z}'` sorted before `'{a,b}'`, and `{10}` after `{9}` as text.
+pub fn array_order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (Some((oid_a, ea)), Some((oid_b, eb))) = (decode_array(a), decode_array(b)) else {
+        return match (decode_array(a).is_some(), decode_array(b).is_some()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => a.cmp(b),
+        };
+    };
+    let typed = element_type_of_oid(oid_a).or_else(|| element_type_of_oid(oid_b));
+    for (x, y) in ea.iter().zip(eb.iter()) {
+        let order = match (x, y) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(x), Some(y)) => element_order(typed.as_ref(), x, y),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    ea.len().cmp(&eb.len())
+}
+
+/// Two elements' text, as `typed` orders them when both read as it, else as
+/// text.
+fn element_order(typed: Option<&crate::core::db_type::DbType>, x: &[u8], y: &[u8]) -> std::cmp::Ordering {
+    if let Some(t) = typed
+        && let (Ok(xs), Ok(ys)) = (std::str::from_utf8(x), std::str::from_utf8(y))
+        && let (Some(xe), Some(ye)) = (encode_element(t, xs), encode_element(t, ys))
+    {
+        return crate::core::processor::concurrent_processor::compare_bytes_as_type(t.clone(), &xe, &ye);
+    }
+    x.cmp(y)
 }
 
 /// Splits `{a,"b,c",NULL}` into its elements. `None` is an unquoted `NULL`.
@@ -4447,4 +4715,57 @@ pub fn check_json_text(text: &str) -> Result<(), String> {
     serde_json::from_str::<serde::de::IgnoredAny>(text)
         .map(|_| ())
         .map_err(|e| format!("invalid input syntax for type json: {e}"))
+}
+
+#[cfg(test)]
+mod typed_array_tests {
+    use super::*;
+    use crate::core::db_type::DbType;
+
+    #[test]
+    fn elements_read_as_their_type_does() {
+        for (t, ok, bad) in [
+            (DbType::I32, vec!["1", " +2 ", "-007", "2147483647"], vec!["x", "1.5", "", "2147483648", "1 2"]),
+            (DbType::I16, vec!["32767"], vec!["32768"]),
+            (DbType::BOOL, vec!["t", "TRUE", "yes", "y", "on", "1", "f", "no", "off", "0", " tr "], vec!["maybe", "o", "2", "yess"]),
+            (DbType::F64, vec!["1.5", "1e20", "-0", "NaN", "Infinity", "-inf"], vec!["x", ".", "0x10", ""]),
+        ] {
+            for v in ok {
+                assert!(encode_element(&t, v).is_some(), "{t:?} must read {v:?}");
+            }
+            for v in bad {
+                assert!(encode_element(&t, v).is_none(), "{t:?} must refuse {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_array_is_canonical_and_typed() {
+        let raw = parse_array_literal("{01,+2,NULL}").unwrap();
+        let held = hold_array_elements(&raw, &DbType::I32).unwrap().expect("changed");
+        assert_eq!(format_array(&held).unwrap(), "{1,2,NULL}");
+        assert_eq!(array_element_type(&held), Some(DbType::I32));
+        // Already held: nothing to do.
+        assert_eq!(hold_array_elements(&held, &DbType::I32).unwrap(), None);
+        let e = hold_array_elements(&parse_array_literal("{1,x}").unwrap(), &DbType::I32).unwrap_err();
+        assert!(e.contains("invalid input syntax for type integer: \"x\""), "{e}");
+        // `text[]` in binary: the stored bytes under the text OID.
+        assert_eq!(array_element_type(&as_text_array(&held)), None);
+        assert_eq!(format_array(&as_text_array(&held)).unwrap(), "{1,2,NULL}");
+    }
+
+    #[test]
+    fn arrays_order_as_postgresql_orders_them() {
+        use std::cmp::Ordering::*;
+        let int = |t: &str| hold_array_elements(&parse_array_literal(t).unwrap(), &DbType::I32).unwrap().unwrap_or_else(|| parse_array_literal(t).unwrap());
+        let text = |t: &str| parse_array_literal(t).unwrap();
+        assert_eq!(array_order(&int("{9}"), &int("{10}")), Less);
+        assert_eq!(array_order(&int("{9,1}"), &int("{10}")), Less);
+        assert_eq!(array_order(&int("{9}"), &int("{9,1}")), Less);
+        assert_eq!(array_order(&int("{NULL}"), &int("{100}")), Greater);
+        assert_eq!(array_order(&int("{}"), &int("{-3}")), Less);
+        assert_eq!(array_order(&text("{z}"), &text("{a,b}")), Greater);
+        assert_eq!(array_order(&text("{10}"), &text("{9}")), Less);
+        assert_eq!(array_order(&int("{1,2}"), &int("{01,2}")), Equal);
+    }
 }

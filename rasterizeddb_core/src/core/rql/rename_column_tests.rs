@@ -493,7 +493,7 @@ async fn a_foreign_key_follows_a_renamed_column_on_either_side() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path()).await;
 
-    ok(&db, "CREATE TABLE p (id INT, v INT)").await;
+    ok(&db, "CREATE TABLE p (id INT PRIMARY KEY, v INT)").await;
     ok(&db, "CREATE TABLE ch (id INT, pid INT REFERENCES p(id))").await;
     ok(&db, "INSERT INTO p (id, v) VALUES (1, 0)").await;
     ok(&db, "INSERT INTO p (id, v) VALUES (2, 0)").await;
@@ -777,7 +777,7 @@ async fn a_dropped_constraint_stays_dropped_across_a_restart() {
         ok(&db, "INSERT INTO v (a, b) VALUES (1, 1)").await;
         ok(&db, "ALTER TABLE v DROP CONSTRAINT v_a_key").await;
 
-        ok(&db, "CREATE TABLE p (id INT)").await;
+        ok(&db, "CREATE TABLE p (id INT PRIMARY KEY)").await;
         ok(
             &db,
             "CREATE TABLE ch (id INT, pid INT, CONSTRAINT fk_ch FOREIGN KEY (pid) REFERENCES p(id))",

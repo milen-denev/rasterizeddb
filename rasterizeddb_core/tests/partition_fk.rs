@@ -359,17 +359,17 @@ fn a_partitioned_parent_is_referenced_by_its_partition_key_only() {
         c.ok("ALTER TABLE rc ADD FOREIGN KEY (x) REFERENCES rp (id)");
         c.ok("DROP TABLE rc");
     }
-    // A plain table's key naming a table not created yet is accepted, as it
-    // always was; a partitioned table then created under that name must be
-    // referenced by its partition key.
-    c.ok("CREATE TABLE early (cid BIGINT NOT NULL PRIMARY KEY, x BIGINT REFERENCES later (alt))");
-    // No table has the name yet, so nothing depends on it.
-    c.ok("DROP TABLE IF EXISTS later");
+    // A key naming a table not created yet is refused, as PostgreSQL refuses
+    // it (it was accepted, and every insert then failed naming the missing
+    // table). A partitioned table created under a name a key already names
+    // (one left by a dropped parent) is held to that key in the lib tests
+    // (`partitioned_names_are_guarded`).
     let e = c
-        .simple("CREATE TABLE later (id BIGINT NOT NULL PRIMARY KEY, alt BIGINT NOT NULL) PARTITION BY HASH (id)")
-        .expect_err("later");
-    assert_eq!(e.code, "42830", "{e}");
+        .simple("CREATE TABLE early (cid BIGINT NOT NULL PRIMARY KEY, x BIGINT REFERENCES later (alt))")
+        .expect_err("a key to a missing table");
+    assert_eq!(e.code, "42P01", "{e}");
     c.ok("CREATE TABLE later (alt BIGINT NOT NULL PRIMARY KEY) PARTITION BY HASH (alt) PARTITIONS 4");
+    c.ok("CREATE TABLE early (cid BIGINT NOT NULL PRIMARY KEY, x BIGINT REFERENCES later (alt))");
     c.ok("INSERT INTO later (alt) VALUES (5)");
     c.ok("INSERT INTO early (cid, x) VALUES (1, 5)");
     assert_eq!(c.simple("INSERT INTO early (cid, x) VALUES (2, 6)").unwrap_err().code, "23503");

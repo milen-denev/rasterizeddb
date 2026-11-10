@@ -442,6 +442,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             };
             match crate::core::rql::type_modifier::parse_text_typmod(&full_type)
                 .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&full_type))
+                .or_else(|| crate::core::rql::type_modifier::parse_array_element(&full_type).map(Ok))
             {
                 Some(Ok(typmod)) => type_modifiers.push(typmod.marker(&name)),
                 Some(Err(reason)) => {

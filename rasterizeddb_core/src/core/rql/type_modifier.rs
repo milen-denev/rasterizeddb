@@ -164,6 +164,60 @@ pub const VARCHAR_MARKER: &str = "\u{1}varchar:";
 /// `p` fractional digits, stored as `p + 1` as the lengths are.
 pub const PRECISION_MARKER: &str = "\u{1}precision:";
 
+/// The prefix of a record giving an array column its element type
+/// ([`TextTypmod::Element`]), the type's byte code plus one. A binary that
+/// predates it never reads it, and the column is the untyped array it was
+/// there.
+pub const ELEMENT_MARKER: &str = "\u{1}element:";
+
+/// The element type `INTEGER[]`, `int4[]`, `boolean ARRAY` or
+/// `numeric(10,2)[]` declares, as a [`TextTypmod::Element`]; `None` for a type
+/// that is not an array, and for an array of text (`text[]`, `varchar(n)[]`),
+/// of `json`/`jsonb`, or of a type this cannot read, which stay the untyped
+/// array of text elements every array once was.
+pub fn parse_array_element(declared: &str) -> Option<TextTypmod> {
+    use crate::core::db_type::DbType;
+    let trimmed = declared.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let base = if let Some(base) = upper.strip_suffix("[]") {
+        base.trim_end()
+    } else if let Some(base) = upper.strip_suffix(" ARRAY") {
+        base.trim_end()
+    } else {
+        return None;
+    };
+    // A bound written inside the brackets (`int[3]`) is not supported here;
+    // nor is a second dimension.
+    if base.is_empty() || base.contains('[') {
+        return None;
+    }
+    // `numeric(10,2)` and `varchar(5)`: the element's own modifier is not
+    // kept, its type is.
+    let without_modifier = match base.find('(') {
+        Some(at) => base[..at].trim_end(),
+        None => base,
+    };
+    let tokens: Vec<&str> = without_modifier.split_whitespace().collect();
+    let (db_type, used) = crate::core::rql::lexer_alter::parse_column_type(&tokens).ok()?;
+    if used != tokens.len() {
+        return None;
+    }
+    match db_type {
+        DbType::ARRAY | DbType::STRING | DbType::JSONTEXT | DbType::JSON | DbType::JSONB | DbType::CHAR => None,
+        t => Some(TextTypmod::Element(u32::from(t.to_byte()))),
+    }
+}
+
+/// The element type a [`TextTypmod::Element`] code names.
+pub fn element_db_type(code: u32) -> Option<crate::core::db_type::DbType> {
+    u8::try_from(code).ok().map(crate::core::db_type::DbType::from_byte)
+}
+
+/// An element type's name as PostgreSQL writes it (`integer`), for errors.
+fn element_type_name(code: u32) -> &'static str {
+    element_db_type(code).map_or("unknown", |t| crate::core::value_codec::pg_input_type_name(&t))
+}
+
 /// The stored length of a bare `bpchar` column, which has none.
 pub const BPCHAR_UNBOUNDED: u32 = u32::MAX;
 
@@ -191,6 +245,14 @@ pub enum TextTypmod {
     /// `time(p)`, `timetz(p)` or `interval(p)` (0 to 5; six is the type's
     /// own and needs no record): a value assigned is rounded to them.
     Precision(u32),
+    /// The element type of an array column (`integer[]`), as its
+    /// [`DbType::to_byte`](crate::core::db_type::DbType::to_byte) code.
+    /// Every element written is read as that type, refused as it refuses
+    /// one, and stored in its canonical text under the type's OID
+    /// ([`crate::core::value_codec::hold_array_elements`]). A column with
+    /// none is the untyped array every array once was: text elements, as
+    /// written.
+    Element(u32),
 }
 
 /// A [`TextTypmod`] in four bytes, as a `SchemaField` carries it: the kind in
@@ -207,6 +269,7 @@ impl PackedTypmod {
             TextTypmod::Bpchar(n) => (0u32, n),
             TextTypmod::Varchar(n) => (1, n),
             TextTypmod::Precision(p) => (2, p),
+            TextTypmod::Element(b) => (3, b),
         };
         // Lengths are at most `MAX_TEXT_LENGTH`, far below the 30 bits.
         let value = n.checked_add(1).filter(|v| *v <= Self::VALUE)?;
@@ -219,7 +282,8 @@ impl PackedTypmod {
         match raw >> 30 {
             0 => TextTypmod::Bpchar(n),
             1 => TextTypmod::Varchar(n),
-            _ => TextTypmod::Precision(n),
+            2 => TextTypmod::Precision(n),
+            _ => TextTypmod::Element(n),
         }
     }
 }
@@ -233,13 +297,14 @@ impl TextTypmod {
             TextTypmod::Varchar(0) => "character varying".to_string(),
             TextTypmod::Varchar(n) => format!("character varying({n})"),
             TextTypmod::Precision(p) => format!("precision({p})"),
+            TextTypmod::Element(b) => format!("{}[]", element_type_name(*b)),
         }
     }
 
     /// The declared length, when there is one.
     pub fn length(&self) -> Option<u32> {
         match self {
-            TextTypmod::Bpchar(0) | TextTypmod::Varchar(0) | TextTypmod::Precision(_) => None,
+            TextTypmod::Bpchar(0) | TextTypmod::Varchar(0) | TextTypmod::Precision(_) | TextTypmod::Element(_) => None,
             TextTypmod::Bpchar(n) | TextTypmod::Varchar(n) => Some(*n),
         }
     }
@@ -262,7 +327,7 @@ impl TextTypmod {
                 }
                 Ok(stripped)
             }
-            TextTypmod::Varchar(0) | TextTypmod::Precision(_) => Ok(text),
+            TextTypmod::Varchar(0) | TextTypmod::Precision(_) | TextTypmod::Element(_) => Ok(text),
             TextTypmod::Varchar(n) => match char_boundary(text, n) {
                 None => Ok(text),
                 Some(at) if text[at..].bytes().all(|b| b == b' ') => Ok(&text[..at]),
@@ -281,7 +346,7 @@ impl TextTypmod {
         };
         match self {
             TextTypmod::Bpchar(_) => cut.trim_end_matches(' '),
-            TextTypmod::Varchar(_) | TextTypmod::Precision(_) => cut,
+            TextTypmod::Varchar(_) | TextTypmod::Precision(_) | TextTypmod::Element(_) => cut,
         }
     }
 
@@ -303,6 +368,8 @@ impl TextTypmod {
             TextTypmod::Varchar(n) => (VARCHAR_MARKER, n),
             // Plus one, so `(0)` is a record and not the zeros of none.
             TextTypmod::Precision(p) => (PRECISION_MARKER, p + 1),
+            // Plus one too: no type's code is relied on to be non-zero.
+            TextTypmod::Element(b) => (ELEMENT_MARKER, b + 1),
         };
         TypeModifier {
             column: format!("{prefix}{column}"),
@@ -337,6 +404,13 @@ pub fn assign_bytes(field: &crate::core::row::schema::SchemaField, bytes: &[u8])
         return Ok((held.as_slice() != bytes).then(|| held.to_vec()));
     }
     let Some(typmod) = field.text_typmod() else { return Ok(None) };
+    if let TextTypmod::Element(code) = typmod {
+        if field.db_type != crate::core::db_type::DbType::ARRAY {
+            return Ok(None);
+        }
+        let Some(element) = element_db_type(code) else { return Ok(None) };
+        return crate::core::value_codec::hold_array_elements(bytes, &element);
+    }
     if let TextTypmod::Precision(p) = typmod {
         // A time value assigned to a column of declared precision is rounded
         // to it, as PostgreSQL's assignment does.
@@ -574,6 +648,10 @@ fn live_marker<'a>(prefix: &str, column: &str, modifiers: &'a [TypeModifier]) ->
 /// one this engine enforces. A `character(n)` column an older binary created
 /// has none (see [`is_legacy_bpchar`]).
 pub fn text_typmod_of(column: &str, modifiers: &[TypeModifier]) -> Option<TextTypmod> {
+    if let Some(m) = live_marker(ELEMENT_MARKER, column, modifiers) {
+        let stored = u32::from(m.precision) | (u32::from(m.scale) << 16);
+        return stored.checked_sub(1).map(TextTypmod::Element);
+    }
     if let Some(m) = live_marker(BPCHAR_MARKER, column, modifiers) {
         return marker_length(m).map(TextTypmod::Bpchar);
     }
@@ -617,6 +695,10 @@ pub fn text_typmod_records(column: &str, typmod: Option<TextTypmod>, modifiers: 
     let bpchar_now = matches!(typmod, Some(TextTypmod::Bpchar(_)));
     let varchar_now = matches!(typmod, Some(TextTypmod::Varchar(_)));
     let precision_now = matches!(typmod, Some(TextTypmod::Precision(_)));
+    let element_now = matches!(typmod, Some(TextTypmod::Element(_)));
+    if !element_now && live_marker(ELEMENT_MARKER, column, modifiers).is_some() {
+        out.push(TypeModifier { column: format!("{ELEMENT_MARKER}{column}"), precision: 0, scale: 0, is_deleted: true });
+    }
     if !bpchar_now && live_marker(BPCHAR_MARKER, column, modifiers).is_some() {
         out.push(bpchar_marker_retired(column));
     }

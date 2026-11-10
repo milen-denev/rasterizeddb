@@ -491,6 +491,18 @@ fn varchar_key(column: &str) -> String {
     format!("{}{}", type_modifier::VARCHAR_MARKER, column)
 }
 
+/// The keys of `column`'s other per-column type records: its declared
+/// fractional-second precision and its array element type. Both were missed
+/// here, so a renamed `timestamp(0)` column stopped rounding, a renamed
+/// `integer[]` column stopped checking its elements, and a dropped column's
+/// record held a column added later under its name.
+fn other_marker_keys(column: &str) -> [String; 2] {
+    [
+        format!("{}{}", type_modifier::PRECISION_MARKER, column),
+        format!("{}{}", type_modifier::ELEMENT_MARKER, column),
+    ]
+}
+
 /// The last-wins sidecars of one table.
 struct Declarations {
     defaults: Keyed<column_default::ColumnDefault>,
@@ -544,6 +556,9 @@ impl Declarations {
         // And its `character varying(n)` length: left behind, a column added
         // under the name was held to it.
         self.modifiers.retire(&varchar_key(name));
+        for key in other_marker_keys(name) {
+            self.modifiers.retire(&key);
+        }
         self.json.retire(name);
         self.retire_constraints(table, name, fields);
     }
@@ -839,6 +854,9 @@ pub(crate) async fn rename_column(
     decl.modifiers.move_key(&bpchar_key(from), &bpchar_key(to));
     // And its declared `character varying(n)` length.
     decl.modifiers.move_key(&varchar_key(from), &varchar_key(to));
+    for (old, new) in other_marker_keys(from).into_iter().zip(other_marker_keys(to)) {
+        decl.modifiers.move_key(&old, &new);
+    }
     decl.json.move_key(from, to);
 
     // Everything else that mentions it is rewritten. A partial index's

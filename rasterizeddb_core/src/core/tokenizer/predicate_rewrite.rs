@@ -3111,7 +3111,7 @@ fn char_lift_needed(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
         match typmod.unpack() {
             TextTypmod::Bpchar(_) => padded = true,
             TextTypmod::Varchar(_) => varying = true,
-            TextTypmod::Precision(_) => {}
+            TextTypmod::Precision(_) | TextTypmod::Element(_) => {}
         }
     }
     if !padded && !cast {

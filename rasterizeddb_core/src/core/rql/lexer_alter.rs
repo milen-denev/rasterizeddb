@@ -458,6 +458,7 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             };
             let text_typmod = match crate::core::rql::type_modifier::parse_text_typmod(&declared)
                 .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&declared))
+                .or_else(|| crate::core::rql::type_modifier::parse_array_element(&declared).map(Ok))
             {
                 Some(Ok(t)) if !json => Some(t),
                 Some(Err(reason)) => return Err(reason),

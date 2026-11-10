@@ -419,8 +419,14 @@ pub(super) fn encode_cell_binary(
 ) -> bool {
     match db_type {
         DbType::NULL | DbType::START | DbType::END => false,
-        DbType::STRING | DbType::UNKNOWN | DbType::BYTEA | DbType::ARRAY => {
+        DbType::STRING | DbType::UNKNOWN | DbType::BYTEA => {
             out.extend_from_slice(bytes);
+            true
+        }
+        // `text[]`'s binary form: the stored array under the text OID
+        // (`value_codec::as_text_array`).
+        DbType::ARRAY => {
+            crate::core::value_codec::push_text_array(bytes, out);
             true
         }
         // `bpcharsend` is the padded text, as the text form is.

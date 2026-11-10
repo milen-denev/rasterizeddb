@@ -155,6 +155,9 @@ impl ForeignKey {
     /// where it is read (`unique_key::stored_name`), as every constraint
     /// name is, so it always fits.
     pub fn storable(&self) -> Result<(), String> {
+        if self.parent_column.is_empty() {
+            return Err(format!("there is no primary key for referenced table \"{}\"", self.parent_table));
+        }
         for (what, name) in [
             ("column", &self.column),
             ("referenced table", &self.parent_table),
@@ -394,11 +397,19 @@ pub fn parse_clause(
     let target = tail[..actions_at].trim();
 
     let (parent_table, parent_column) = match target.find('(') {
+        // No column list: the parent's primary key, as in PostgreSQL. Left
+        // empty here, where no schema is in reach, and filled in by the
+        // statement under its lock on the parent
+        // (`Database::default_referenced_column`); `storable` refuses a key
+        // still empty, so a path that missed it cannot store one.
+        // The relation is the first name; what follows (`MATCH SIMPLE`,
+        // `DEFERRABLE`) is not part of it.
         None => {
-            return Err(format!(
-                "REFERENCES {} must name the referenced column",
-                target
-            ));
+            let name = match target.strip_prefix('"') {
+                Some(rest) => rest.split('"').next().unwrap_or(""),
+                None => target.split_whitespace().next().unwrap_or(""),
+            };
+            (name.split('.').next_back().unwrap_or("").trim_matches('"').to_string(), String::new())
         }
         Some(open) => {
             let close = target[open..]
@@ -424,8 +435,8 @@ pub fn parse_clause(
             )
         }
     };
-    if parent_table.is_empty() || parent_column.is_empty() {
-        return Err("REFERENCES names no relation or column".to_string());
+    if parent_table.is_empty() {
+        return Err("REFERENCES names no relation".to_string());
     }
 
     let actions = &tail[actions_at..];
@@ -493,11 +504,11 @@ impl<'a> ReferencedSide<'a> {
 ///   every check of the key then routes by it: one that could not would
 ///   have to read every partition (phase 3 P4).
 ///
-/// A **plain** parent's column need not be unique: the plain path has always
-/// accepted that, unlike PostgreSQL, and phase 3 P4 leaves it as it was
-/// (docs/partitioning.md, "Phase 3 P4 as built", divergences). A delete of
-/// one of two parent rows sharing the value then acts on children the other
-/// still covers.
+/// A plain parent's column must be unique too, as in PostgreSQL. It once
+/// need not be (docs/partitioning.md, "Phase 3 P4 as built", divergences),
+/// and a delete of one of two parent rows sharing the value then acted on
+/// children the other still covered. Keys declared then stay on disk and are
+/// enforced as they were; only a new declaration is refused.
 pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> Option<String> {
     let column = fk.parent_column.as_str();
     let Some(&(_, _, flagged)) = parent
@@ -518,10 +529,10 @@ pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> O
             parent.table
         )
     };
+    if !unique {
+        return Some(not_unique());
+    }
     if let Some(key) = &parent.partition_key {
-        if !unique {
-            return Some(not_unique());
-        }
         if !(key.len() == 1 && key[0].eq_ignore_ascii_case(column)) {
             return Some(format!(
                 "{}: partitioned table \"{}\" is partitioned by ({}), and a foreign key must reference its whole \
@@ -752,7 +763,14 @@ mod tests {
     #[test]
     fn malformed_clauses_name_the_problem() {
         assert!(parse_clause("FOREIGN KEY (a)", "t", None, None).is_err());
-        assert!(parse_clause("FOREIGN KEY (a) REFERENCES t", "t", None, None).is_err());
+        // No referenced column: the parent's primary key, filled in later;
+        // until then the key cannot be stored.
+        let open = parse_clause("FOREIGN KEY (a) REFERENCES t", "t", None, None).unwrap();
+        assert_eq!((open.parent_table.as_str(), open.parent_column.as_str()), ("t", ""));
+        assert!(open.storable().unwrap_err().contains("no primary key"));
+        for clause in ["FOREIGN KEY (a) REFERENCES t MATCH SIMPLE", "FOREIGN KEY (a) REFERENCES public.t DEFERRABLE", "FOREIGN KEY (a) REFERENCES \"t\""] {
+            assert_eq!(parse_clause(clause, "c", None, None).unwrap().parent_table, "t", "{clause}");
+        }
         assert!(
             parse_clause(
                 "FOREIGN KEY (a) REFERENCES t (b) ON DELETE SET SOMETHING",

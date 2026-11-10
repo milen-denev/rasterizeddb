@@ -1793,7 +1793,13 @@ impl Acc {
                     }
                 }
                 text.push('}');
-                crate::core::value_codec::parse_array_literal(&text)
+                // Under the argument's element OID, so the array orders as
+                // PostgreSQL's `array_agg` of that type does (`{10}` after
+                // `{9}` for integers; `value_codec::array_order`).
+                let oid = elem
+                    .as_ref()
+                    .map_or(25, |f| crate::core::value_codec::array_oid_for(&f.literal_type()));
+                crate::core::value_codec::parse_array_literal_as(&text, oid)
                     .map(Some)
                     .ok_or_else(|| format!("array_agg could not build the array {text}"))
             }

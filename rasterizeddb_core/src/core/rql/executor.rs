@@ -10360,6 +10360,36 @@ fn supply_generated_values(
     }))
 }
 
+/// Fills in each `REFERENCES parent` written with no column list: the
+/// parent's primary key (`Database::default_referenced_column`). After the
+/// CREATE's locks, so the parent's key cannot change before it is checked.
+fn resolve_default_referenced_columns(
+    database: &Database,
+    create_table: &mut crate::core::rql::lexer_ct::CreateTable,
+) -> Result<(), String> {
+    let own_table = create_table.table_name.clone();
+    let own_key = create_table.primary_key.clone();
+    let own_unique = create_table.unique_keys.clone();
+    for fk in create_table.foreign_keys.iter_mut().filter(|fk| fk.parent_column.is_empty()) {
+        fk.parent_column = database.default_referenced_column(fk, &own_table, own_key.as_deref(), &own_unique)?;
+    }
+    Ok(())
+}
+
+/// A `CREATE TABLE` naming one column twice, refused as PostgreSQL does
+/// (42701). It was accepted: the schema held two fields of one name and every
+/// statement resolved the name to the first, so the second could never be
+/// read or written.
+fn validate_column_names(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::with_capacity(create_table.columns.len());
+    for column in &create_table.columns {
+        if !seen.insert(column.name.as_str()) {
+            return Err(format!("column \"{}\" specified more than once", column.name));
+        }
+    }
+    Ok(())
+}
+
 /// PostgreSQL's refusals of a `CREATE TABLE`'s generation expressions; see
 /// `generated::validate`. Its own function so its locals stay out of
 /// `execute_with_context`'s frame.
@@ -11524,6 +11554,12 @@ async fn add_foreign_key(
         .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))
     {
         return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", fk.column));
+    }
+    if fk.parent_column.is_empty() {
+        match database.default_referenced_column(&fk, table_name, schema.primary_key.as_deref(), &schema.unique_keys) {
+            Ok(column) => fk.parent_column = column,
+            Err(e) => return ddl_error(&e),
+        }
     }
     if named.is_some() {
         if constraint_name_taken(schema, table_name, &fk.name) {
@@ -14198,6 +14234,31 @@ async fn text_type_change(
             if response.first() == Some(&3) {
                 return Err(String::from_utf8_lossy(&response[1..]).to_string());
             }
+        }
+        return Ok(type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers));
+    }
+    // An array column's element type (`TextTypmod::Element`). On an empty
+    // table only the record changes. With rows, the stored arrays would have
+    // to be read again as the new type: from untyped (`text[]`) PostgreSQL
+    // refuses that without `USING` (42804), and every other change is not
+    // supported yet. Recording it without converting them labelled arrays
+    // the new type would refuse, and kept their old order.
+    if field.db_type == DbType::ARRAY {
+        let wanted = type_modifier::parse_array_element(declared);
+        let had = field.text_typmod().filter(|t| matches!(t, TextTypmod::Element(_)));
+        if wanted == had {
+            return Ok(Vec::new());
+        }
+        if row_count > 0 {
+            let target = declared.trim().to_ascii_lowercase();
+            return Err(if had.is_none() {
+                format!("column \"{}\" cannot be cast automatically to type {target}", field.name)
+            } else {
+                format!(
+                    "changing the element type of array column \"{}\" that holds rows is not supported yet",
+                    field.name
+                )
+            });
         }
         return Ok(type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers));
     }
@@ -20006,9 +20067,9 @@ pub(crate) async fn execute_with_need(
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
             }
-            if let Err(reason) =
-                parsed.as_ref().map_or(Ok(()), |ct| validate_generated(ct).and_then(|()| validate_checks(ct)))
-            {
+            if let Err(reason) = parsed.as_ref().map_or(Ok(()), |ct| {
+                validate_column_names(ct).and_then(|()| validate_generated(ct)).and_then(|()| validate_checks(ct))
+            }) {
                 error!("Cannot create table: {}", reason);
                 return ddl_error(&reason);
             }
@@ -20036,6 +20097,10 @@ pub(crate) async fn execute_with_need(
                 // table. Anything new in this function belongs behind a call.
                 if create_table_already_satisfied(&create_table, &database) {
                     return ddl_ok(0);
+                }
+                let mut create_table = create_table;
+                if let Err(e) = resolve_default_referenced_columns(&database, &mut create_table) {
+                    return ddl_error(&e);
                 }
                 if let Some(clause) = partition {
                     return Box::pin(execute_create_partitioned(

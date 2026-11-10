@@ -16,10 +16,12 @@ impl Database {
     /// of the table's constraints (42710), and a name too long to store
     /// (0A000).
     ///
-    /// A parent that does not exist yet is accepted, as the plain path always
-    /// accepted it (PostgreSQL refuses it, 42P01): each insert's check then
-    /// names it. A partitioned table later created under that name is held
-    /// to the keys naming it (below), so their checks route.
+    /// A parent that does not exist is refused, as PostgreSQL refuses it
+    /// (42P01, "relation … does not exist"). It was accepted, and every insert
+    /// into the child then failed naming the missing table. Keys naming a
+    /// table that does not exist can still be on disk (written before this
+    /// check); a partitioned table later created under that name is held to
+    /// them (below), so their checks route.
     ///
     /// Called under the CREATE's locks: ACCESS EXCLUSIVE on the name and
     /// SHARE on every parent (`lock_create_target`), so no parent's keys
@@ -111,10 +113,45 @@ impl Database {
         if fk.parent_table.eq_ignore_ascii_case(table) {
             return referenced_key_refusal(fk, &own());
         }
-        if self.schema_view(&fk.parent_table).is_none() {
-            return None;
-        }
         self.existing_parent_refusal(fk)
+    }
+
+    /// The column a `REFERENCES parent` with no column list names: the
+    /// parent's primary key, as in PostgreSQL. `own_table` and `own_key` are
+    /// the declaring table's name and primary key, for a key on itself
+    /// (`CREATE TABLE`'s own declaration, which no schema holds yet).
+    ///
+    /// Refused as PostgreSQL refuses it: a missing parent (42P01), one with
+    /// no primary key (42830), and here also a composite one, since this
+    /// engine's foreign keys are one column. Called under the statement's
+    /// lock on the parent, so the key read is the key enforced.
+    pub(crate) fn default_referenced_column(
+        &self,
+        fk: &ForeignKey,
+        own_table: &str,
+        own_key: Option<&str>,
+        own_unique_keys: &[crate::core::rql::unique_key::UniqueKey],
+    ) -> Result<String, String> {
+        // A one-column primary key is the header's; a composite one is only
+        // a unique key, under the primary key's default name.
+        let (key, composite) = if fk.parent_table.eq_ignore_ascii_case(own_table) {
+            (own_key.map(str::to_string), composite_primary_key(own_table, own_unique_keys))
+        } else {
+            let view = self
+                .schema_view(&fk.parent_table)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", fk.parent_table))?;
+            let schema = view.schema();
+            (schema.primary_key.clone(), composite_primary_key(&fk.parent_table, &schema.unique_keys))
+        };
+        if let Some(key) = key.map(|k| k.trim().trim_matches('"').to_string()).filter(|k| !k.is_empty()) {
+            return Ok(key);
+        }
+        if composite {
+            // PostgreSQL's words for one referencing column against a
+            // composite key (42830).
+            return Err("number of referencing and referenced columns for foreign key disagree".to_string());
+        }
+        Err(format!("there is no primary key for referenced table \"{}\"", fk.parent_table))
     }
 
     /// The declared type of `table`'s live column `column`, if both exist.
@@ -146,4 +183,11 @@ impl Database {
         };
         referenced_key_refusal(fk, &ReferencedSide::of_schema(view.schema(), &fk.parent_table, partition_key))
     }
+}
+
+/// Whether `table`'s unique keys hold a live composite primary key (one
+/// declared `PRIMARY KEY (a, b)` without a name of its own).
+fn composite_primary_key(table: &str, keys: &[crate::core::rql::unique_key::UniqueKey]) -> bool {
+    let name = crate::core::rql::unique_key::pkey_name(table);
+    keys.iter().any(|k| !k.is_deleted && k.columns.len() > 1 && k.name.eq_ignore_ascii_case(&name))
 }

@@ -331,9 +331,17 @@ async fn judge(db: &Arc<Database>) -> Result<String, String> {
             wrong.push(format!("the DEFAULT gave {got:?}"));
         }
     }
-    // UNIQUE (a, b): row 2 holds (3, 1).
+    // UNIQUE (a, b): row 2 holds (3, 1). `a` is unique on its own too (the
+    // child's foreign key needs it to be), so the composite is read from the
+    // schema as well: it has to name the column under its new name.
     if !is_error(&run(db, &format!("INSERT INTO {TABLE} (id, {name}, b, k) VALUES (12, 3, 1, 12)")).await) {
         wrong.push("the composite UNIQUE was not enforced".into());
+    }
+    let keys = db.table_for_tests(TABLE).map(|t| t.schema.unique_keys.clone()).unwrap_or_default();
+    if !keys.iter().any(|k| {
+        !k.is_deleted && k.columns.len() == 2 && k.columns[0].eq_ignore_ascii_case(name) && k.columns[1].eq_ignore_ascii_case("b")
+    }) {
+        wrong.push(format!("the composite UNIQUE does not name {name}: {keys:?}"));
     }
     // The child's foreign key on a: row 2 is referenced.
     if !is_error(&run(db, &format!("DELETE FROM {TABLE} WHERE id = 2")).await) {
@@ -405,7 +413,7 @@ async fn a_power_cut_inside_rename_column_leaves_it_undone_or_done() {
     let base = tempfile::tempdir().unwrap();
     let setup = vec![
         format!(
-            "CREATE TABLE {TABLE} (id INT, a INT DEFAULT 7, b INT, k INT, CHECK (a > 0), \
+            "CREATE TABLE {TABLE} (id INT, a INT DEFAULT 7 UNIQUE, b INT, k INT, CHECK (a > 0), \
              UNIQUE (a, b))"
         ),
         format!("CREATE TABLE {CHILD} (id INT, ra INT REFERENCES {TABLE}(a))"),

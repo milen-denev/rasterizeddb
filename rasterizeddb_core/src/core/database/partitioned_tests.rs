@@ -561,19 +561,28 @@ async fn partitioned_names_are_guarded() {
     child.foreign_keys.push(fk("acct"));
     let e = db.add_table(child).await.unwrap_err();
     assert!(e.to_string().contains("there is no unique constraint matching given keys"), "{e}");
-    // A partitioned child of a plain parent is accepted (a plain parent's
-    // column need not be unique, as on the plain path).
-    db.add_table(acct("parent")).await.unwrap();
+    // A partitioned child of a plain parent is accepted when the parent's
+    // column is unique, as PostgreSQL requires of every parent.
+    let mut parent = acct("parent");
+    parent.unique_columns.push("n".into());
+    db.add_table(parent).await.unwrap();
     let mut pchild = acct("pchild");
     pchild.foreign_keys.push(fk("parent"));
     db.create_partitioned_table(pchild, &["tenant_id"], 4).await.unwrap();
     // Dropped again, so the catalogue below holds the rows it held before.
     assert!(db.drop_table("pchild").await.unwrap());
     // A partitioned table under a name a plain FK already points at, by a
-    // column that is not its partition key: its checks could not route.
+    // column that is not its partition key: its checks could not route. A
+    // key to a table that does not exist is refused when it is declared
+    // (42P01) now, so the dangling one is left the way one still can be:
+    // its parent dropped from under it (or declared by an older build).
+    let mut ghost = acct("ghost");
+    ghost.unique_columns.push("n".into());
+    db.add_table(ghost).await.unwrap();
     let mut orphan = acct("orphan_child");
     orphan.foreign_keys.push(fk("ghost"));
     db.add_table(orphan).await.unwrap();
+    assert!(db.drop_table("ghost").await.unwrap());
     let e = db.create_partitioned_table(acct("ghost"), &["tenant_id"], 4).await.unwrap_err();
     assert!(e.to_string().contains("there is no unique constraint matching given keys"), "{e}");
 

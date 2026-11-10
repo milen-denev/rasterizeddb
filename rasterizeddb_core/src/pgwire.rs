@@ -7821,8 +7821,15 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // relation rule, which the quoted names could reach:
     // `invalid_foreign_key` for a referenced column no unique key is
     // exactly, `undefined_column` for a column it names that is not there.
-    if has("there is no unique constraint matching given keys for referenced table") {
+    if has("there is no unique constraint matching given keys for referenced table")
+        || has("number of referencing and referenced columns for foreign key disagree")
+    {
         return "42830";
+    }
+    // `undefined_object`: `REFERENCES parent` with no column list, on a
+    // parent with no primary key.
+    if has("there is no primary key for referenced table") {
+        return "42704";
     }
     if has("referenced in foreign key constraint does not exist") {
         return "42703";
@@ -10729,7 +10736,13 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
         // the binary form is the stored bytes unchanged.
         // Both are stored in the representation Postgres uses on the wire, so
         // the binary form is the stored bytes unchanged.
-        DbType::BYTEA | DbType::ARRAY => Some(bytes.to_vec()),
+        DbType::BYTEA => Some(bytes.to_vec()),
+        // Advertised as `text[]`, and every element is kept as text, so the
+        // binary form is the stored bytes under the text OID: a typed
+        // column's array carries its element type's OID
+        // (`value_codec::hold_array_elements`), which over text elements
+        // a client would decode as that type's binary form.
+        DbType::ARRAY => Some(crate::core::value_codec::as_text_array(bytes)),
         // Postgres sends a UUID as its 16 raw octets, which is exactly how it
         // is stored.
         DbType::UUID => {

@@ -557,12 +557,25 @@ async fn relation_columns(
     // A bare `character varying` column keeps that type in the relation, so
     // it compares blank-padded with a `character(n)` one there as it does in
     // its table; declared TEXT, `WHERE a = b` over a CTE compared exactly.
+    let declared_fields = declared_fields_among(query, labels, database, &[]);
     let varying: Vec<Option<u32>> = {
         use crate::core::rql::type_modifier::TextTypmod;
-        declared_fields_among(query, labels, database, &[])
-            .into_iter()
+        declared_fields
+            .iter()
             .map(|f| match f.as_ref().and_then(|f| (f.db_type == DbType::STRING).then(|| f.text_typmod()).flatten()) {
                 Some(TextTypmod::Varchar(n)) => Some(n),
+                _ => None,
+            })
+            .collect()
+    };
+    // A bare typed-array column's element type, which holds with no rows to
+    // sample (`CREATE TABLE … AS SELECT xs FROM t` of an empty `t`).
+    let elements: Vec<Option<DbType>> = {
+        use crate::core::rql::type_modifier::TextTypmod;
+        declared_fields
+            .iter()
+            .map(|f| match f.as_ref().filter(|f| f.db_type == DbType::ARRAY).and_then(|f| f.text_typmod()) {
+                Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::element_db_type(code),
                 _ => None,
             })
             .collect()
@@ -608,6 +621,17 @@ async fn relation_columns(
                 _ => "NUMERIC".to_string(),
             },
             Some(DbType::BPCHAR(n)) if *n > 0 => format!("CHAR({n})"),
+            // An array whose cells all carry one element type (a typed
+            // column's, an `array_agg` of one) is declared of it, so the
+            // relation's arrays order as that type, as the source's did.
+            // Through an untyped `ARRAY` they were re-read as text and
+            // `ORDER BY` over a derived table sorted `{10}` before `{9}`.
+            Some(DbType::ARRAY)
+                if elements.get(index).cloned().flatten().or_else(|| array_cells_element(rows, index)).as_ref().and_then(sql_type_of).is_some() =>
+            {
+                let element = elements.get(index).cloned().flatten().or_else(|| array_cells_element(rows, index)).expect("checked");
+                format!("{}[]", sql_type_of(&element).expect("checked"))
+            }
             Some(DbType::STRING) if varying.get(index).copied().flatten().is_some() => {
                 match varying[index] {
                     Some(0) | None => "VARCHAR".to_string(),
@@ -624,6 +648,30 @@ async fn relation_columns(
         });
     }
     Ok(columns)
+}
+
+/// The element type every non-empty array cell of column `index` carries,
+/// when they all carry the same one and it is not text.
+fn array_cells_element(rows: &[crate::core::row::row::Row], index: usize) -> Option<DbType> {
+    let mut found: Option<DbType> = None;
+    for row in rows {
+        let Some(cell) = row.columns.get(index) else { continue };
+        if cell.column_type == DbType::NULL {
+            continue;
+        }
+        let raw = cell.data.into_slice();
+        let Some((_, elements)) = crate::core::value_codec::decode_array(raw) else { return None };
+        if elements.is_empty() {
+            continue;
+        }
+        let element = crate::core::value_codec::array_element_type(raw)?;
+        match &found {
+            Some(f) if *f != element => return None,
+            Some(_) => {}
+            None => found = Some(element),
+        }
+    }
+    found
 }
 
 /// The scale a `DECIMAL` column has to be declared at to hold every cell of

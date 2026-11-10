@@ -2485,6 +2485,17 @@ fn keep_few_open(db: &rclite::Arc<rasterizeddb_core::core::database::Database>) 
 /// every id so far, settles, sweeps every plain table and the partitions
 /// `pick`'s bits choose (bit `pid % 64`), and forgets. Returns the swept and
 /// the unswept pids, and the forgotten horizon.
+/// `fut`, failing the test with `what` if it has not finished within five
+/// minutes. A forget sweep here once never woke (2026-11-09, seed 0x5eedf1a1
+/// with PART_TWIN_SPREAD): every worker parked and the run sat for twelve
+/// hours with nothing to say which await it was in. Bounded, it names it.
+async fn bounded<T>(what: String, fut: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(300), fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("{what} did not finish within 300 s: a forget sweep never woke"),
+    }
+}
+
 fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, pick: u64) -> (Vec<u32>, Vec<u32>, u64) {
     let db = db.clone();
     block_on_big(async move {
@@ -2498,7 +2509,9 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
             if let Some(t) = db.table_for_tests(&name)
                 && t.io_rows().is_ok()
             {
-                t.neutralize_aborted_now().await.expect("a plain table's forget sweep");
+                bounded(format!("neutralize_aborted_now on \"{name}\""), t.neutralize_aborted_now())
+                    .await
+                    .expect("a plain table's forget sweep");
             }
         }
         // Every other partitioned table (the partitioned side's `{k}`) whole.
@@ -2506,7 +2519,9 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
             if name != PART
                 && let Some(other) = db.partitioned_table(&name)
             {
-                other.sweep_pins_now().await.expect("another partitioned table's forget sweeps");
+                bounded(format!("sweep_pins_now on \"{name}\""), other.sweep_pins_now())
+                    .await
+                    .expect("another partitioned table's forget sweeps");
             }
         }
         let (mut swept, mut left) = (Vec::new(), Vec::new());
@@ -2515,7 +2530,9 @@ fn force_forget(db: &rclite::Arc<rasterizeddb_core::core::database::Database>, p
             // closes it again after.
             for pid in pt.materialized_pids().expect("its partitions") {
                 if (pick >> (pid % 64)) & 1 == 1 {
-                    pt.sweep_pin_now(pid).await.expect("a partition's forget sweep");
+                    bounded(format!("sweep_pin_now of partition {pid}"), pt.sweep_pin_now(pid))
+                        .await
+                        .expect("a partition's forget sweep");
                     swept.push(pid);
                 } else {
                     left.push(pid);
