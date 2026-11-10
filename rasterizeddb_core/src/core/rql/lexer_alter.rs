@@ -434,28 +434,20 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
                     head == "JSONB" || (head == "JSON" && crate::json_shadow_tables())
                 })
                 .unwrap_or(false);
-            let (db_type, used) = if json {
-                (DbType::UUID, 1)
+            // The type as written, its array suffix and a modifier however
+            // it is spaced included, and refused when what follows it is no
+            // constraint, as at CREATE (`lexer_ct::column_type_span`).
+            let (phrase, written, used) =
+                crate::core::rql::lexer_ct::column_type_span(&type_tokens)?.ok_or("ADD COLUMN names no type")?;
+            let db_type = if json {
+                DbType::UUID
             } else {
-                parse_column_type(&type_tokens)?
+                parse_column_type(&phrase.split_whitespace().collect::<Vec<_>>())?.0
             };
             let constraints = rest_upper[i + used..].join(" ");
             let nullable =
                 !(constraints.contains("NOT NULL") || constraints.contains("PRIMARY KEY"));
-            // The declared type as written, across the tokens `NUMERIC(12, 3)`
-            // was split into.
-            // A multi-word name is all of its words (`character varying(3)`).
-            let declared = {
-                let used = used.clamp(1, type_tokens.len().max(1));
-                let mut joined = type_tokens[..used.min(type_tokens.len())].join(" ");
-                let mut next = used;
-                while joined.matches('(').count() > joined.matches(')').count() && next < type_tokens.len() {
-                    joined.push(' ');
-                    joined.push_str(type_tokens[next]);
-                    next += 1;
-                }
-                joined
-            };
+            let declared = written;
             let text_typmod = match crate::core::rql::type_modifier::parse_text_typmod(&declared)
                 .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&declared))
                 .or_else(|| crate::core::rql::type_modifier::parse_array_element(&declared).map(Ok))

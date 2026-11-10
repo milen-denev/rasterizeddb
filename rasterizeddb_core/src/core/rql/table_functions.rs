@@ -225,6 +225,9 @@ fn literal_of(value: &Value) -> Result<String, String> {
 /// The SQL type a column of `db_type` is declared with in the temporary.
 fn sql_type(db_type: &DbType, scale: Option<u32>, timestamp: bool) -> String {
     match db_type {
+        DbType::I16 => "SMALLINT".into(),
+        DbType::F32 => "REAL".into(),
+        DbType::TIMESTAMP => "TIMESTAMP".into(),
         DbType::I32 => "INTEGER".into(),
         DbType::I64 => "BIGINT".into(),
         DbType::DECIMAL => match scale {
@@ -410,11 +413,10 @@ fn generate_series(args: &[String], alias: &str) -> Result<Computed, String> {
 /// An array argument's elements as literals, and the element SQL type.
 fn array_argument(text: &str) -> Result<(Vec<Option<String>>, DbType, String), String> {
     let trimmed = text.trim();
-    // `ARRAY[a, b, …]`: each element a constant.
-    if trimmed.len() > 6 && trimmed.as_bytes()[..5].eq_ignore_ascii_case(b"ARRAY") && trimmed[5..].trim_start().starts_with('[') {
-        let open = trimmed.find('[').expect("checked");
-        let close = trimmed.rfind(']').ok_or("an ARRAY constructor is not closed")?;
-        let inner = &trimmed[open + 1..close];
+    // `ARRAY[a, b, …]`, the whole argument: each element a constant.
+    // (`ARRAY[1,2]::text[]` is a cast of one, read below as any array
+    // value is; taken here, its `]` was the cast's.)
+    if let Some(inner) = crate::core::rql::expr::array_constructor_body(trimmed) {
         // `ARRAY[ARRAY[1,2],ARRAY[3,4]]`: one multidimensional array, whose
         // elements are unnested flat, as PostgreSQL's `unnest` reads one.
         // Taken element by element, each inner array was one text element.
@@ -464,33 +466,45 @@ fn array_argument(text: &str) -> Result<(Vec<Option<String>>, DbType, String), S
         let sql = sql_type(&ty, Some(scale), true);
         return Ok((elements, ty, sql));
     }
-    // An array value: `'{1,2}'::int[]`, a constant expression.
-    let (body, element_type) = match trimmed.rfind("::") {
-        Some(at) => (&trimmed[..at], trimmed[at + 2..].trim().to_ascii_lowercase()),
-        None => (trimmed, "text[]".to_string()),
+    // An array value: `'{1,2}'::int[]`, `CAST(… AS float8[])`, a constant
+    // expression. Its elements are of the type its cast gave it, which the
+    // array's header carries; text when it has none.
+    let value = constant(trimmed, "unnest")?;
+    let (text, ty) = match &value {
+        Value::Null => (None, DbType::STRING),
+        Value::Data { bytes, db_type: DbType::ARRAY } => (
+            Some(crate::core::value_codec::format_array(bytes).unwrap_or_default()),
+            crate::core::value_codec::array_element_type(bytes).unwrap_or(DbType::STRING),
+        ),
+        other => (Some(crate::core::rql::expr::as_text(other)), DbType::STRING),
     };
-    let element_type = element_type.trim_end_matches("[]").to_string();
-    let (ty, sql) = match element_type.as_str() {
-        "int" | "int4" | "integer" => (DbType::I32, "INTEGER"),
-        "int8" | "bigint" => (DbType::I64, "BIGINT"),
-        "numeric" | "decimal" => (DbType::DECIMAL, "NUMERIC"),
-        "float8" | "double precision" => (DbType::F64, "DOUBLE PRECISION"),
-        "bool" | "boolean" => (DbType::BOOL, "BOOLEAN"),
-        "date" => (DbType::DATE, "DATE"),
-        "uuid" => (DbType::UUID, "UUID"),
-        _ => (DbType::STRING, "TEXT"),
-    };
-    let value = constant(body, "unnest")?;
-    let text = match &value {
-        Value::Null => return Ok((Vec::new(), ty, sql.into())),
-        Value::Data { bytes, db_type: DbType::ARRAY } => crate::core::value_codec::format_array(bytes).unwrap_or_default(),
-        other => crate::core::rql::expr::as_text(other),
-    };
+    // `false`: a `timestamptz` element is one (`DATETIME`); a `timestamp`
+    // one is its own type.
+    let sql = sql_type(&ty, None, false);
+    // A type `sql_type` has no name for is a text column, and its elements
+    // text.
+    let ty = if sql == "TEXT" { DbType::STRING } else { ty };
+    let Some(text) = text else { return Ok((Vec::new(), ty, sql)) };
     let elements = crate::core::rql::pg_functions::array_elements_of(&text)?
         .into_iter()
-        .map(|e| e.map(|v| if matches!(ty, DbType::I32 | DbType::I64 | DbType::DECIMAL | DbType::F64 | DbType::BOOL) { v } else { crate::core::value_codec::quote_sql(&v) }))
+        .map(|e| e.map(|v| element_literal(&ty, v)))
         .collect();
-    Ok((elements, ty, sql.into()))
+    Ok((elements, ty, sql))
+}
+
+/// An element's text as the SQL constant its relation's row is written
+/// with: a number bare, a boolean as `TRUE`/`FALSE`, anything else quoted.
+fn element_literal(ty: &DbType, text: String) -> String {
+    match ty {
+        DbType::I16 | DbType::I32 | DbType::I64 | DbType::DECIMAL => text,
+        DbType::F32 | DbType::F64 if text.parse::<f64>().is_ok_and(f64::is_finite) => text,
+        DbType::BOOL => match text.to_ascii_lowercase().as_str() {
+            "t" | "true" | "yes" | "on" | "1" => "TRUE".to_string(),
+            "f" | "false" | "no" | "off" | "0" => "FALSE".to_string(),
+            _ => crate::core::value_codec::quote_sql(&text),
+        },
+        _ => crate::core::value_codec::quote_sql(&text),
+    }
 }
 
 /// The type PostgreSQL resolves a set of constants to: integers widen to

@@ -177,20 +177,8 @@ pub const ELEMENT_MARKER: &str = "\u{1}element:";
 /// array of text elements every array once was.
 pub fn parse_array_element(declared: &str) -> Option<TextTypmod> {
     use crate::core::db_type::DbType;
-    let trimmed = declared.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    let base = if let Some(base) = upper.strip_suffix("[]") {
-        base.trim_end()
-    } else if let Some(base) = upper.strip_suffix(" ARRAY") {
-        base.trim_end()
-    } else {
-        return None;
-    };
-    // A bound written inside the brackets (`int[3]`) is not supported here;
-    // nor is a second dimension.
-    if base.is_empty() || base.contains('[') {
-        return None;
-    }
+    let upper = declared.trim().to_ascii_uppercase();
+    let base = array_base(&upper)?;
     // `numeric(10,2)` and `varchar(5)`: the element's own modifier is not
     // kept, its type is.
     let without_modifier = match base.find('(') {
@@ -206,6 +194,37 @@ pub fn parse_array_element(declared: &str) -> Option<TextTypmod> {
         DbType::ARRAY | DbType::STRING | DbType::JSONTEXT | DbType::JSON | DbType::JSONB | DbType::CHAR => None,
         t => Some(TextTypmod::Element(u32::from(t.to_byte()))),
     }
+}
+
+/// The element type's name in an array type's (`integer[]`, `float8[][]`,
+/// `int[3]`, `int ARRAY`, `int ARRAY[3]`); `None` when `declared` names no
+/// array. PostgreSQL ignores both a declared bound and the number of
+/// brackets — `float8[][]` and `float8[]` are one type, whose values may
+/// have any number of dimensions — so every one of these names the same
+/// array of its element type.
+pub fn array_base(declared: &str) -> Option<&str> {
+    let mut rest = declared.trim_end();
+    let mut groups = 0usize;
+    // Trailing `[]` / `[n]` groups.
+    while let Some(open) = rest.strip_suffix(']').and_then(|r| r.rfind('[')) {
+        let bound = rest[open + 1..rest.len() - 1].trim();
+        if !bound.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        rest = rest[..open].trim_end();
+        groups += 1;
+    }
+    // `ARRAY`, after which only one group may come.
+    let word = rest.len().checked_sub(5).filter(|&at| rest.get(at..).is_some_and(|w| w.eq_ignore_ascii_case("ARRAY")));
+    if let Some(at) = word.filter(|&at| at > 0 && rest.as_bytes()[at - 1].is_ascii_whitespace()) {
+        if groups > 1 {
+            return None;
+        }
+        rest = rest[..at].trim_end();
+    } else if groups == 0 {
+        return None;
+    }
+    (!rest.is_empty() && !rest.contains(['[', ']'])).then_some(rest)
 }
 
 /// The element type a [`TextTypmod::Element`] code names.
@@ -861,6 +880,19 @@ pub fn parse_numeric_modifier(declared: &str) -> Option<Result<(u16, u16), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_array_spelling_names_its_element_type() {
+        for spelled in ["integer[]", "integer[][]", "integer [3]", "integer[3][4]", "integer ARRAY", "integer array[3]", "INTEGER ARRAY [ ]"] {
+            assert!(array_base(spelled).is_some_and(|b| b.trim().eq_ignore_ascii_case("integer")), "{spelled}");
+            assert_eq!(parse_array_element(spelled), parse_array_element("int[]"), "{spelled}");
+        }
+        assert_eq!(array_base("numeric(10,2)[]"), Some("numeric(10,2)"));
+        assert_eq!(array_base("double precision[][]"), Some("double precision"));
+        for not_one in ["integer", "integer[x]", "ARRAY", "[]", "integer ARRAY[][]", "integerARRAY", "int[-1]"] {
+            assert_eq!(array_base(not_one), None, "{not_one}");
+        }
+    }
 
     #[test]
     fn a_record_round_trips() {

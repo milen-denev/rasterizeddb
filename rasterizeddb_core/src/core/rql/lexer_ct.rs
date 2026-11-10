@@ -355,7 +355,14 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 // a nullability companion.
                 return None;
             }
-            let (type_phrase, tokens_used) = parse_type_phrase(&tokens[1..])?;
+            let (type_phrase, full_type, tokens_used) = match column_type_span(&tokens[1..]) {
+                Ok(Some(span)) => span,
+                Ok(None) => return None,
+                Err(reason) => {
+                    rejection.replace(reason);
+                    return None;
+                }
+            };
             // `SERIAL` is not a type but a shorthand: an integer column, `NOT
             // NULL`, defaulting to the next value of a sequence made with the
             // table. It is expanded here so everything downstream sees an
@@ -390,56 +397,11 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 "JSON" | "JSONB"
             );
 
-            // `NUMERIC(38, 16)` says how many digits the column keeps. Read
-            // from the *raw* tokens: `parse_type_phrase` strips the parentheses,
-            // so by the time it returns the modifier is already gone. A space
-            // inside them splits the type across tokens, so they are rejoined
-            // until the parentheses balance.
-            let raw_type = {
-                let mut joined = String::new();
-                for token in &tokens[1..] {
-                    joined.push_str(token);
-                    let opens = joined.matches('(').count();
-                    let closes = joined.matches(')').count();
-                    if opens == 0 || opens == closes {
-                        break;
-                    }
-                    joined.push(' ');
-                }
-                joined
-            };
             // `character(n)` and `character varying(n)`: the length is
             // recorded (`type_modifier::TextTypmod`), so every write is held
             // to it and a `character(n)` value is stored, compared and keyed
-            // without its trailing spaces. The whole written type, a
-            // multi-word one included (`character varying(3)`).
-            let full_type = {
-                let mut joined = tokens[1..1 + tokens_used].join(" ");
-                let mut next = 1 + tokens_used;
-                while joined.matches('(').count() > joined.matches(')').count() && next < tokens.len() {
-                    joined.push(' ');
-                    joined.push_str(tokens[next]);
-                    next += 1;
-                }
-                // `interval hour to minute`, `interval day to second(0)`: the
-                // fields are part of the type (`parse_time_precision`).
-                if joined.eq_ignore_ascii_case("interval") {
-                    while let Some(token) = tokens.get(next) {
-                        let word = token.split('(').next().unwrap_or("");
-                        let field = ["year", "month", "day", "hour", "minute", "second", "to"]
-                            .iter()
-                            .any(|f| word.eq_ignore_ascii_case(f));
-                        let digits = word.is_empty() && token.starts_with('(') && joined.to_ascii_lowercase().ends_with("second");
-                        if !field && !digits {
-                            break;
-                        }
-                        joined.push(' ');
-                        joined.push_str(token);
-                        next += 1;
-                    }
-                }
-                joined
-            };
+            // without its trailing spaces. Read from the whole written type
+            // (`column_type_span`).
             match crate::core::rql::type_modifier::parse_text_typmod(&full_type)
                 .or_else(|| crate::core::rql::type_modifier::parse_time_precision(&full_type))
                 .or_else(|| crate::core::rql::type_modifier::parse_array_element(&full_type).map(Ok))
@@ -451,7 +413,12 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 }
                 None => {}
             }
-            match crate::core::rql::type_modifier::parse_numeric_modifier(&raw_type) {
+            // `NUMERIC(38, 16)` says how many digits the column keeps: read
+            // from the type as written, which `numeric (5, 2)` is all of. A
+            // reading that stopped at the first token whose parentheses
+            // balanced took `numeric` alone from it, and kept every value at
+            // the default scale.
+            match crate::core::rql::type_modifier::parse_numeric_modifier(&full_type) {
                 Some(Ok((precision, scale))) => {
                     type_modifiers.push(crate::core::rql::type_modifier::TypeModifier {
                         column: name.clone(),
@@ -1412,6 +1379,73 @@ fn normalize_token_upper(token: &str) -> String {
     token.to_ascii_uppercase()
 }
 
+/// A column definition's type, from its first token: the phrase
+/// [`parse_column_type`](crate::core::rql::lexer_alter::parse_column_type)
+/// reads, the type as written (a modifier however it was spaced, an
+/// interval's fields, an array suffix), which the modifiers are read from,
+/// and how many tokens that takes. `None` for no tokens.
+///
+/// Refused as PostgreSQL's grammar refuses it when what follows is no
+/// constraint: `a int foo`, `a int ARRAY[]`. Constraints are matched by
+/// substring (`parse_constraints`), so such a word was dropped and the column
+/// created as if it had not been written — `text ARRAY` as `text`. What
+/// follows a spaced modifier's type, and `WITH`/`WITHOUT`, are left as they
+/// were read.
+pub(crate) fn column_type_span(tokens: &[&str]) -> Result<Option<(String, String, usize)>, String> {
+    let Some((phrase, used)) = parse_type_phrase(tokens) else { return Ok(None) };
+    let mut joined = tokens[..used].join(" ");
+    let mut next = used;
+    // `interval hour to minute`, `interval day to second(0)`: the fields are
+    // part of the type (`parse_time_precision`).
+    if joined.eq_ignore_ascii_case("interval") {
+        while let Some(token) = tokens.get(next) {
+            let word = token.split('(').next().unwrap_or("");
+            let field =
+                ["year", "month", "day", "hour", "minute", "second", "to"].iter().any(|f| word.eq_ignore_ascii_case(f));
+            let digits = word.is_empty() && token.starts_with('(') && joined.to_ascii_lowercase().ends_with("second");
+            if !field && !digits {
+                break;
+            }
+            joined.push(' ');
+            joined.push_str(token);
+            next += 1;
+        }
+    }
+    if let Some(word) = tokens.get(next) {
+        const STARTS: &[&str] = &[
+            "NOT", "NULL", "PRIMARY", "UNIQUE", "REFERENCES", "CONSTRAINT", "COLLATE", "DEFERRABLE", "INITIALLY",
+            "GENERATED", "STORAGE", "COMPRESSION", "CHECK", "DEFAULT", "WITH", "WITHOUT",
+        ];
+        let bare = word.split(['(', ',', '[']).next().unwrap_or(word);
+        let refused = word.starts_with(['[', ']'])
+            || (!bare.is_empty()
+                && bare.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && !STARTS.iter().any(|s| s.eq_ignore_ascii_case(bare)));
+        if refused {
+            // Where PostgreSQL's parser stops: at a bracket, else the word.
+            let near = if word.starts_with(['[', ']']) {
+                // An empty group stops at its `]`, a second one at its `[`,
+                // one holding no number at what it holds.
+                let rest = tokens[next..].concat();
+                let inside: String = rest[1..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                if rest.starts_with("[]") {
+                    "]".to_string()
+                } else if !inside.is_empty() && !inside.bytes().all(|b| b.is_ascii_digit()) {
+                    inside
+                } else {
+                    "[".to_string()
+                }
+            } else if let Some(rest) = word.get(bare.len()..).filter(|r| r.starts_with('[')) {
+                if rest.starts_with("[]") { "]".to_string() } else { "[".to_string() }
+            } else {
+                bare.to_string()
+            };
+            return Err(format!("syntax error at or near \"{near}\""));
+        }
+    }
+    Ok(Some((phrase, joined, next)))
+}
+
 /// Parses a SQL type phrase from a token stream that begins at the type.
 /// Returns the normalized uppercase type phrase and number of tokens consumed.
 fn parse_type_phrase(tokens: &[&str]) -> Option<(String, usize)> {
@@ -1461,30 +1495,137 @@ fn parse_type_phrase(tokens: &[&str]) -> Option<(String, usize)> {
         (&["BIT", "VARYING"], "BIT VARYING"),
     ];
 
-    for (words, canonical) in PHRASES {
-        if tokens.len() < words.len() {
-            continue;
-        }
-        if words.iter().enumerate().all(|(i, w)| base(tokens[i]) == *w) {
+    let (mut phrase, used) = PHRASES
+        .iter()
+        .find(|(words, _)| tokens.len() >= words.len() && words.iter().enumerate().all(|(i, w)| base(tokens[i]) == *w))
+        .map(|(words, canonical)| {
             // The brackets may sit on any word of the phrase, and are carried
             // onto the canonical form so the caller sees an array.
             let array = tokens[..words.len()].iter().any(|t| has_brackets(t));
-            let phrase = if array {
-                format!("{}[]", canonical)
-            } else {
-                canonical.to_string()
-            };
-            return Some((phrase, words.len()));
+            let phrase = if array { format!("{}[]", canonical) } else { canonical.to_string() };
+            (phrase, words.len())
+        })
+        .unwrap_or_else(|| (normalize_token_upper(tokens[0]), 1));
+    // A modifier whose parentheses a space split (`numeric(10, 2)`), or
+    // written apart (`varchar (5)`), is the type's: the array suffix comes
+    // after it.
+    let mut used = used;
+    let balanced = |n: usize| {
+        let t = tokens[..n].concat();
+        t.matches('(').count() <= t.matches(')').count()
+    };
+    while used < tokens.len() && !balanced(used) {
+        used += 1;
+    }
+    if tokens.get(used).is_some_and(|t| t.starts_with('(')) {
+        used += 1;
+        while used < tokens.len() && !balanced(used) {
+            used += 1;
         }
     }
+    // `timestamp (3) with time zone`: the zone clause after a modifier
+    // written apart is the type's too. Left to be read as constraint words,
+    // the column was a `timestamp` without one.
+    if matches!(base(tokens[0]).as_str(), "TIMESTAMP" | "TIME")
+        && !phrase.contains(' ')
+        && let [w, t, z, ..] = &tokens[used.min(tokens.len())..]
+        && (base(w) == "WITH" || base(w) == "WITHOUT")
+        && base(t) == "TIME"
+        && base(z) == "ZONE"
+    {
+        let array = has_brackets(z) || phrase.ends_with("[]");
+        phrase = format!("{} {} TIME ZONE{}", base(tokens[0]), base(w), if array { "[]" } else { "" });
+        used += 3;
+    }
+    // The array spellings written apart from the type: `integer ARRAY`,
+    // `integer ARRAY[4]`, `integer [ ]`, `integer [4]`. They were read as
+    // constraint words, which are matched by substring, so the column was
+    // created as a scalar `integer` and the create succeeded.
+    match array_suffix(&tokens[used..]) {
+        0 => Some((phrase, used)),
+        n => Some((format!("{}[]", phrase.trim_end_matches("[]")), used + n)),
+    }
+}
 
-    let token = normalize_token_upper(tokens[0]);
-    Some((token, 1))
+/// How many of `tokens` an array suffix written after a type takes: `ARRAY`,
+/// `ARRAY[n]` or `ARRAY [ n ]` (one bound, as PostgreSQL's grammar has it),
+/// or any number of `[]` / `[n]` groups however they are spaced. 0 when they
+/// begin with neither. A group that is not `[]` or `[n]` is not taken, and is
+/// left to be refused as the word it is.
+fn array_suffix(tokens: &[&str]) -> usize {
+    // The groups at the start of `tokens`, at most `limit`: the tokens they
+    // take, 0 at the first that is not one.
+    fn groups(tokens: &[&str], limit: usize) -> usize {
+        let text_of = |n: usize| tokens[..n].concat();
+        let mut taken = 0;
+        let mut found = 0;
+        while found < limit && taken < tokens.len() && tokens[taken].starts_with('[') {
+            // The fewest tokens that close every bracket they open.
+            let Some(n) = (taken + 1..=tokens.len()).find(|&n| {
+                let t = text_of(n);
+                t[text_of(taken).len()..].matches('[').count() == t[text_of(taken).len()..].matches(']').count()
+            }) else {
+                break;
+            };
+            let group = text_of(n)[text_of(taken).len()..].to_string();
+            let count = group.matches('[').count();
+            let well_formed = group.split('[').skip(1).all(|g| {
+                g.strip_suffix(']').is_some_and(|inside| inside.bytes().all(|b| b.is_ascii_digit()))
+            });
+            if !well_formed || found + count > limit {
+                break;
+            }
+            taken = n;
+            found += count;
+        }
+        taken
+    }
+    let Some(first) = tokens.first() else { return 0 };
+    let word = first.split('[').next().unwrap_or(first);
+    if word.eq_ignore_ascii_case("ARRAY") {
+        // `ARRAY[4]` in one token, or `ARRAY` and then at most one `[n]`
+        // whose bound is written (`ARRAY[]` is a syntax error there).
+        let attached = &first[word.len()..];
+        if attached.is_empty() {
+            let after = groups(&tokens[1..], 1);
+            let bound = tokens[1..1 + after].concat().bytes().any(|b| b.is_ascii_digit());
+            return 1 + if bound { after } else { 0 };
+        }
+        let one = attached.matches('[').count() == 1
+            && attached.strip_prefix('[').and_then(|a| a.strip_suffix(']')).is_some_and(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()));
+        return usize::from(one);
+    }
+    groups(tokens, usize::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_column_type_is_read_whole_and_what_follows_must_be_a_constraint() {
+        let span = |t: &str| column_type_span(&t.split_whitespace().collect::<Vec<_>>());
+        let read = |t: &str| span(t).unwrap().map(|(phrase, written, used)| (phrase, written, used)).unwrap();
+        assert_eq!(read("int ARRAY NOT NULL"), ("INT[]".into(), "int ARRAY".into(), 2));
+        assert_eq!(read("int ARRAY[3]"), ("INT[]".into(), "int ARRAY[3]".into(), 2));
+        assert_eq!(read("int ARRAY [ 3 ]"), ("INT[]".into(), "int ARRAY [ 3 ]".into(), 5));
+        assert_eq!(read("int [ ] UNIQUE"), ("INT[]".into(), "int [ ]".into(), 3));
+        assert_eq!(read("int[3][4]"), ("INT[3][4]".into(), "int[3][4]".into(), 1));
+        let (phrase, written, used) = read("numeric(10, 2) [ 3 ] NOT NULL");
+        assert!(phrase.starts_with("NUMERIC") && phrase.ends_with("[]"), "{phrase}");
+        assert_eq!((written.as_str(), used), ("numeric(10, 2) [ 3 ]", 5));
+        assert_eq!(read("numeric (5, 2)"), ("NUMERIC".into(), "numeric (5, 2)".into(), 3));
+        assert_eq!(read("double precision ARRAY"), ("DOUBLE PRECISION[]".into(), "double precision ARRAY".into(), 3));
+        assert_eq!(
+            read("timestamp (0) with time zone"),
+            ("TIMESTAMP WITH TIME ZONE".into(), "timestamp (0) with time zone".into(), 5)
+        );
+        assert_eq!(read("interval hour to minute"), ("INTERVAL".into(), "interval hour to minute".into(), 4));
+        assert_eq!(read("text COLLATE \"C\"").2, 1);
+        for (bad, near) in [("int foo", "foo"), ("int ARRAY[]", "]"), ("int ARRAY[3][4]", "["), ("int ARRAY [ ]", "]"), ("int [x]", "x")] {
+            assert_eq!(span(bad).unwrap_err(), format!("syntax error at or near \"{near}\""), "{bad}");
+        }
+    }
 
     /// The columns the user declared, with the engine's nullability companions
     /// filtered out. Every column here is nullable by default — Postgres'

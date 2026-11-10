@@ -778,6 +778,27 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
     if target.trim().eq_ignore_ascii_case("double") {
         return Err("type \"double\" does not exist".to_string());
     }
+    // `x::integer[]`, `CAST(x AS float8[][])`: an array of the element type,
+    // each element read as a typed array column holds it.
+    if let Some(base) = crate::core::rql::type_modifier::array_base(target.trim()) {
+        if base.trim().eq_ignore_ascii_case("double") || cast_target(base).is_none() {
+            return Err(format!("type \"{}[]\" does not exist", base.trim().to_ascii_lowercase()));
+        }
+        // The element's own modifier is not applied to each element (as a
+        // typed array column does not keep it): `'{1.234}'::numeric(5,2)[]`
+        // would keep 1.234 where PostgreSQL rounds it to 1.23.
+        if base.contains('(') {
+            return Err(format!("a cast to an array of {} is not supported yet", base.trim().to_ascii_lowercase()));
+        }
+        let tag = match crate::core::rql::type_modifier::parse_array_element(target) {
+            Some(crate::core::rql::type_modifier::TextTypmod::Element(code)) => u8::try_from(code).map(|c| vec![c]).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        return Ok(Expr::Call(
+            TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCast),
+            vec![inner, Expr::Literal { bytes: tag, db_type: DbType::STRING }],
+        ));
+    }
     // Nothing may follow a type modifier but `[]` or a zone clause. The name
     // is read up to its `(`, so `c::numeric(12,3) > 1` cast to NUMERIC(12,3)
     // and dropped the comparison: the select list sent the number, where it
@@ -1194,6 +1215,9 @@ fn subscript_element(base: &Expr) -> Option<DbType> {
             let first = types.next()?;
             if types.all(|t| t == first) { crate::core::value_codec::element_read_type(&first) } else { None }
         }
+        Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCast), _) => typed_array_element(base)
+            .map(DbType::from_byte)
+            .and_then(|t| crate::core::value_codec::element_read_type(&t)),
         _ => None,
     }
 }
@@ -1210,6 +1234,10 @@ pub(crate) fn typed_array_element(expr: &Expr) -> Option<u8> {
         Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArraySlice), args) => {
             args.first().and_then(typed_array_element)
         }
+        Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCast), args) => match args.get(1) {
+            Some(Expr::Literal { bytes, .. }) if bytes.len() == 1 => Some(bytes[0]),
+            _ => None,
+        },
         _ => None,
     }
 }

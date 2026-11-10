@@ -127,16 +127,12 @@ async fn spatial_network_join_runs() {
     run_named("spatial_network_join").await.unwrap_or_else(|e| panic!("{}", e));
 }
 
-/// Needs `LATERAL unnest(...) WITH ORDINALITY` and multi-dimensional array
-/// subscripting.
-///
-/// `array_length` and `array_ndims` already work — see `text_search.rs` — and
-/// `array_ndims` answers 1 here rather than PostgreSQL's 2, because the array
-/// storage is flat.
+/// `LATERAL unnest(…) WITH ORDINALITY` over a bare column, `array_ndims` of
+/// a `float8[][]` column and a two-index subscript: PostgreSQL 17 answers it
+/// with two rows (the 80.5 and 90.25 readings).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "LATERAL … WITH ORDINALITY and array subscripts are not implemented"]
 async fn array_ndims_and_ordinality_runs() {
-    run_named("array_ndims_and_ordinality").await.unwrap_or_else(|e| panic!("{}", e));
+    assert_eq!(run_named("array_ndims_and_ordinality").await.unwrap_or_else(|e| panic!("{}", e)), 2);
 }
 
 /// Needs function calls inside a `WHERE` clause, and the `jsonb_path_query`

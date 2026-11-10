@@ -84,14 +84,11 @@ async fn array_length_counts_elements_and_is_null_for_none() {
     );
 }
 
-/// The engine's arrays are flat, so `array_ndims` answers 1 where PostgreSQL
-/// would answer 2 for a column declared `DOUBLE PRECISION[][]`.
-///
-/// Pinned as a test rather than left undocumented: the declaration is accepted
-/// and the values round-trip, but the second dimension is not modelled, and a
-/// query that branches on the dimension count would branch differently here.
+/// `array_ndims` counts the dimensions of the value, as PostgreSQL does: both
+/// seeded matrices are two-dimensional literals (`{{1.0,2.0},{3.0,4.0}}` and
+/// `{{5.0,6.0}}`), so both rows answer 2.
 #[tokio::test(flavor = "multi_thread")]
-async fn array_ndims_reports_one_dimension() {
+async fn array_ndims_counts_the_value_dimensions() {
     let (_s, pool) = seeded().await;
     let out = rows(
         &pool,
@@ -99,5 +96,7 @@ async fn array_ndims_reports_one_dimension() {
          FROM test_iot_telemetry ORDER BY firmware_version",
     )
     .await;
-    assert_eq!(out[0].1, "1");
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].1, "2");
+    assert_eq!(out[1].1, "2");
 }

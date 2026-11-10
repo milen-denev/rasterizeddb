@@ -31,6 +31,13 @@ pub enum PgFunc {
     ArraySubscript,
     /// `a[lo:hi]`, either bound NULL when it was left out.
     ArraySlice,
+    /// `x::T[]` / `CAST(x AS T[])` (`expr::parse` reads it): the value and
+    /// the element type's byte code as a one-byte string (empty for text),
+    /// as [`ArraySubscript`](Self::ArraySubscript) carries it. The value's
+    /// text is read as an array literal (an array's own text when it is one)
+    /// and each element as the element type reads it, as a typed column
+    /// holds them.
+    ArrayCast,
     /// `x op ANY (array)` / `ALL`, over an array the row computes: the
     /// value, the array, the operator and `ANY` or `ALL`, as text
     /// (`expr::quantified_condition`). TRUE, FALSE, or NULL when no element
@@ -282,7 +289,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         Decode => DbType::BYTEA,
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
-        StringToArray | ArrayCtor | ArraySlice => DbType::ARRAY,
+        StringToArray | ArrayCtor | ArraySlice | ArrayCast => DbType::ARRAY,
         QuantifiedCmp => DbType::BOOL,
         ArraySubscript => subscript_type(args),
         _ => DbType::STRING,
@@ -987,6 +994,56 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         NumNonnulls => int_value(args.iter().filter(|a| !a.is_null()).count() as i64),
         NumNulls => int_value(args.iter().filter(|a| a.is_null()).count() as i64),
+        ArrayCast => {
+            if args[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let text = match &args[0] {
+                Value::Data { bytes, db_type: DbType::ARRAY } => crate::core::value_codec::format_array(bytes)
+                    .ok_or_else(|| "could not read an array".to_string())?,
+                other => text_of(other),
+            };
+            let mut raw = crate::core::value_codec::parse_array_literal_as(&text, crate::core::value_codec::OID_TEXT)
+                .ok_or_else(|| format!("malformed array literal: \"{text}\""))?;
+            // An array of another type converts element by element, as that
+            // type's cast does (`ARRAY[1.5, 2.25]::int[]` is `{2,2}`); its
+            // text read as the new type's input would refuse `1.5`. To text,
+            // only a boolean's differs from the text kept: `t` is `true`.
+            let tag = tag_type(&args[1]);
+            if let Value::Data { bytes, db_type: DbType::ARRAY } = &args[0]
+                && let Some(source) = crate::core::value_codec::array_element_type(bytes)
+                && let Some(target) = tag.clone().or_else(|| (source == DbType::BOOL).then_some(DbType::STRING))
+                && source != target
+                && let Some((_, dims, elements)) = crate::core::value_codec::decode_array_dims(bytes)
+            {
+                let mut cast: Vec<Option<Vec<u8>>> = Vec::with_capacity(elements.len());
+                for e in elements {
+                    let Some(e) = e else {
+                        cast.push(None);
+                        continue;
+                    };
+                    let text = String::from_utf8_lossy(e);
+                    let value = match crate::core::value_codec::encode_element(&source, &text) {
+                        Some(b) => Value::Data { bytes: b, db_type: source.clone() },
+                        None => text_value(text.into_owned()),
+                    };
+                    let converted = crate::core::rql::expr::cast(value, &target)?;
+                    cast.push((!converted.is_null()).then(|| text_of(&converted).into_bytes()));
+                }
+                raw = crate::core::value_codec::build_array_dims(
+                    crate::core::value_codec::OID_TEXT,
+                    &dims,
+                    cast.iter().map(|e| e.as_deref()),
+                );
+            }
+            match tag {
+                None => data(raw, DbType::ARRAY),
+                Some(element) => {
+                    let held = crate::core::value_codec::hold_array_elements(&raw, &element)?;
+                    data(held.unwrap_or(raw), DbType::ARRAY)
+                }
+            }
+        }
         ArraySubscript => {
             if args[0].is_null() || args[2..].iter().any(Value::is_null) {
                 return Ok(Value::Null);

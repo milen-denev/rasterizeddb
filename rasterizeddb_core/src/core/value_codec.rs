@@ -1331,7 +1331,7 @@ fn encode_pg_numeric_scaled_legacy(unscaled: i128, scale: u32) -> Vec<u8> {
 // ----------------------------------------------------------- ARRAY / BYTEA
 
 /// Element OID written into an array whose elements came from a text literal.
-const OID_TEXT: i32 = 25;
+pub(crate) const OID_TEXT: i32 = 25;
 
 /// Encodes a Postgres array literal (`{a,b,NULL}`) into the binary array
 /// representation.

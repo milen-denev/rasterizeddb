@@ -4322,6 +4322,10 @@ pub(crate) async fn describe_query(
                 described_all = false;
                 break;
             };
+            let Ok(item) = crate::core::rql::lateral::qualify_outer_columns(&text, &item, database).await else {
+                described_all = false;
+                break;
+            };
             let body = match crate::core::rql::lateral::outer_references(&text, &item) {
                 Ok(Some(outer)) => crate::core::rql::lateral::null_body(database, &item, &outer).await.ok(),
                 Ok(None) => Some(item.body.clone()),
@@ -7587,11 +7591,12 @@ pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
 /// The code a failed CTE body or derived table is reported under, given the
 /// code of its own failure: see [`materialize_sqlstate`].
 fn materialize_class(code: &'static str) -> &'static str {
-    // A body naming a relation or column that is not there is the client's
-    // mistake, as it is outside a CTE (42P01, 42703), not a missing feature.
+    // A body naming a relation or column that is not there, or a column two
+    // relations have, is the client's mistake, as it is outside a CTE
+    // (42P01, 42703, 42702), not a missing feature.
     // `21`: a scalar subquery inside it that gave more than one row (a
     // correlated one runs as a derived relation), the data's, not a feature.
-    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703"].iter().any(|class| code.starts_with(class)) {
+    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702"].iter().any(|class| code.starts_with(class)) {
         code
     } else {
         "0A000"
@@ -7856,7 +7861,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `ambiguous_column`: a bare name more than one relation has.
     // The join planner's own words for it too ("column 'x' is ambiguous;
     // qualify it …"), which fell through to 42601.
-    if (has("column reference \"") && has("\" is ambiguous")) || (has("column ") && has(" is ambiguous; qualify")) {
+    // Anchored on the raw message: the name is quoted, and the quoted text
+    // is what `m` leaves out, so `column reference "` never matched in it
+    // and the message answered XX000 (0A000 from a derived table).
+    if (raw.starts_with("column reference \"") && raw.ends_with("\" is ambiguous"))
+        || (has("column ") && has(" is ambiguous; qualify"))
+    {
         return "42702";
     }
     if has("SELECT DISTINCT ON expressions must match initial ORDER BY expressions")

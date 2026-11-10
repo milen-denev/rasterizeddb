@@ -71,6 +71,11 @@ pub(crate) struct Item {
     pub columns: Option<Vec<String>>,
     /// `Inner` and `Left`: the condition after `ON`, and where it ends.
     pub on: Option<(String, usize)>,
+    /// A function call's or `VALUES` list's arguments, as a span of `body`:
+    /// text with no relation of its own, where a bare name can only be an
+    /// earlier item's column ([`qualify_outer_columns`]). `None` for a
+    /// subquery.
+    pub args: Option<(usize, usize)>,
 }
 
 const NOT_ALIASES: &[&str] = &[
@@ -215,8 +220,15 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
     let unsupported = |what: &str| Err(format!("{what} is not supported yet"));
     // What joins it: `,`, or the words of a JOIN.
     let before = sql[..at].trim_end();
+    let mut first = false;
     let (form, start) = if before.ends_with(',') {
         (Form::Comma, before.len() - 1)
+    } else if word_before(sql, at).is_some_and(|(w, _)| w == "FROM") {
+        // Nothing before it to read. Written so, or marked so (`FROM
+        // unnest(r)`, whose argument is no constant): what it names is no
+        // relation's (below).
+        first = true;
+        (Form::Comma, at)
     } else {
         match word_before(sql, at) {
             Some((w, join_at)) if w == "JOIN" => match word_before(sql, join_at) {
@@ -236,6 +248,8 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
 
     // The item: `( SELECT … )`, `( VALUES … )` or `name(args)`.
     let mut i = skip_ws(sql, at + "LATERAL".len());
+    // The arguments' span within `body_text`.
+    let mut args_span: Option<(usize, usize)> = None;
     let (body_text, kind) = if sql.as_bytes().get(i) == Some(&b'(') {
         let close = matching_paren(sql, i).ok_or("LATERAL: unbalanced parentheses")?;
         let inner = sql[i + 1..close].trim().to_string();
@@ -243,7 +257,10 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
         let head = inner.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
         match head.as_str() {
             "SELECT" | "WITH" => (inner, 's'),
-            "VALUES" => (inner, 'v'),
+            "VALUES" => {
+                args_span = Some((0, inner.len()));
+                (inner, 'v')
+            }
             _ => return unsupported("this LATERAL item"),
         }
     } else {
@@ -263,6 +280,7 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
             }
         }
         let call = sql[i..call_end].to_string();
+        args_span = Some((open + 1 - i, close - i));
         i = call_end;
         (call, 'f')
     };
@@ -304,14 +322,130 @@ fn parse_item(sql: &str, at: usize) -> Result<Item, String> {
     };
 
     let alias_list = columns.as_ref().map(|c| format!("({})", c.join(", "))).unwrap_or_default();
-    let body = match kind {
-        's' => body_text,
-        'v' => format!("SELECT * FROM ({body_text}) AS {alias}{alias_list}"),
-        _ => format!("SELECT * FROM {body_text} AS {alias}{alias_list}"),
+    let (body, prefix) = match kind {
+        's' => (body_text, 0),
+        'v' => (format!("SELECT * FROM ({body_text}) AS {alias}{alias_list}"), "SELECT * FROM (".len()),
+        _ => (format!("SELECT * FROM {body_text} AS {alias}{alias_list}"), "SELECT * FROM ".len()),
     };
+    let args = args_span.map(|(a, b)| (a + prefix, b + prefix));
+    if first {
+        // PostgreSQL's answer for the name no relation has.
+        let arguments = args.map(|(a, b)| &body[a..b]).unwrap_or_default();
+        return Err(match (bare_names(arguments).into_iter().next(), qualified_references(arguments).into_iter().next()) {
+            (Some((name, _)), _) => format!("column \"{name}\" does not exist"),
+            (None, Some((qualifier, _))) => format!("missing FROM-clause entry for table \"{qualifier}\""),
+            (None, None) => "LATERAL as the first FROM item is not supported yet".to_string(),
+        });
+    }
     // The renaming is in the body's own text for the computed forms.
     let columns = if kind == 's' { columns } else { None };
-    Ok(Item { form, start, end, body, alias, columns, on })
+    Ok(Item { form, start, end, body, alias, columns, on, args })
+}
+
+/// The names in `args` (a function's arguments, a `VALUES` list) that can
+/// only be columns: bare words outside quotes, not qualified (`x.c`) or a
+/// qualifier, not a call (`f(`), not a cast's or a typed literal's type
+/// (`::int`, `AS int`, `DATE '…'`), not a keyword. Each with its offset.
+fn bare_names(args: &str) -> Vec<(String, usize)> {
+    const KEYWORDS: &[&str] = &[
+        "AND", "OR", "NOT", "NULL", "TRUE", "FALSE", "IS", "IN", "AS", "CASE", "WHEN", "THEN", "ELSE", "END", "ARRAY",
+        "CAST", "DISTINCT", "BETWEEN", "LIKE", "ILIKE", "SIMILAR", "ESCAPE", "ANY", "ALL", "SOME", "VALUES", "WITH",
+        "ORDINALITY", "INTERVAL", "COLLATE", "AT", "ZONE", "UNKNOWN", "FROM", "FOR", "SYMMETRIC", "ISNULL", "NOTNULL",
+        "LOCAL", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER",
+        "SESSION_USER", "USER", "DEFAULT", "OVERLAPS", "EXISTS", "ROW",
+    ];
+    let bytes = args.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    // Inside a cast's type: after `::`, or `AS` within `CAST(`.
+    let mut in_type = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, q);
+                in_type = false;
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                in_type = true;
+                i += 2;
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+                let word = &args[start..i];
+                let after = skip_ws(args, i);
+                let qualified = (start > 0 && bytes[start - 1] == b'.') || bytes.get(i) == Some(&b'.');
+                let called = bytes.get(after) == Some(&b'(');
+                let typed_literal = bytes.get(after) == Some(&b'\'');
+                let preceded_by_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+                if word.eq_ignore_ascii_case("AS") {
+                    in_type = true;
+                } else if !(in_type
+                    || qualified
+                    || called
+                    || typed_literal
+                    || preceded_by_digit
+                    || KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(word)))
+                {
+                    out.push((word.to_string(), start));
+                }
+            }
+            b if b.is_ascii_whitespace() || b == b'[' || b == b']' || b.is_ascii_digit() => i += 1,
+            b'(' if in_type => {
+                // A type modifier: `numeric(10, 2)`.
+                i = matching_paren(args, i).map_or(bytes.len(), |c| c + 1);
+            }
+            _ => {
+                in_type = false;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `item` with each bare name in its arguments ([`Item::args`]) that is a
+/// column of exactly one earlier `FROM` item written `alias.name`, as
+/// PostgreSQL resolves it: a function's arguments and a `VALUES` list have no
+/// relation of their own, so the name can only be one of those. A name two
+/// earlier items have is ambiguous, as there. `item` as it was when it has no
+/// arguments, or reads nothing bare.
+pub(crate) async fn qualify_outer_columns(sql: &str, item: &Item, database: &Arc<Database>) -> Result<Item, String> {
+    let Some((a, b)) = item.args else { return Ok(item.clone()) };
+    let names = bare_names(&item.body[a..b]);
+    if names.is_empty() {
+        return Ok(item.clone());
+    }
+    let mut outer_columns: Vec<(String, Vec<String>)> = Vec::new();
+    for (alias, relation) in items_before(sql, item.start) {
+        let probe = format!("SELECT * FROM {relation} {alias}");
+        if let Ok(Some((fields, _))) = Box::pin(crate::pgwire::describe_query(database, &probe)).await {
+            outer_columns.push((alias, fields.into_iter().map(|(name, _)| name).collect()));
+        }
+    }
+    let mut body = item.body.clone();
+    let mut shift = 0usize;
+    for (name, offset) in names {
+        let owners: Vec<&String> = outer_columns
+            .iter()
+            .filter(|(_, columns)| columns.iter().any(|c| c.eq_ignore_ascii_case(&name)))
+            .map(|(alias, _)| alias)
+            .collect();
+        match owners.as_slice() {
+            [] => {}
+            [alias] => {
+                let at = a + offset + shift;
+                let qualifier = format!("{alias}.");
+                body.insert_str(at, &qualifier);
+                shift += qualifier.len();
+            }
+            _ => return Err(format!("column reference \"{name}\" is ambiguous")),
+        }
+    }
+    let args = Some((a, b + shift));
+    Ok(Item { body, args, ..item.clone() })
 }
 
 /// The `FROM` items before `upto`: each alias (or bare relation name) and the
@@ -580,12 +714,22 @@ async fn column_types(
     described
         .0
         .iter()
-        .map(|(_, ty)| {
-            crate::core::rql::cte::sql_type_name(ty)
-                .map(str::to_string)
-                .ok_or_else(|| format!("LATERAL: a {ty:?} outer column is not supported yet"))
-        })
+        .map(|(_, ty)| cast_type_name(ty).ok_or_else(|| format!("LATERAL: a {ty:?} outer column is not supported yet")))
         .collect()
+}
+
+/// The name a `CAST(… AS name)` reads `ty` back as. Not
+/// [`cte::sql_type_name`](crate::core::rql::cte::sql_type_name)'s, which
+/// declares a column: `DOUBLE` and `ARRAY` declare one, and no cast takes
+/// either (`type "double" does not exist`).
+fn cast_type_name(ty: &crate::core::db_type::DbType) -> Option<String> {
+    use crate::core::db_type::DbType;
+    match ty {
+        DbType::F64 => Some("DOUBLE PRECISION".to_string()),
+        DbType::ARRAY => Some("TEXT[]".to_string()),
+        DbType::ARRAYOF(code) => cast_type_name(&DbType::from_byte(*code)).map(|e| format!("{e}[]")),
+        other => crate::core::rql::cte::sql_type_name(other).map(str::to_string),
+    }
 }
 
 /// The body with each outer reference a NULL of its type: what the item's
@@ -710,7 +854,7 @@ pub(crate) async fn materialize(
     let mut found = false;
     for index in 0..16usize {
         let Some(item) = next_item(&current) else { break };
-        let item = item?;
+        let item = qualify_outer_columns(&current, &item?, database).await?;
         found = true;
         let outer = outer_references(&current, &item)?;
         if outer.is_some() && selects_star(&current, &item) {
@@ -898,6 +1042,36 @@ async fn rename_columns(item: &Item, built: &str, database: &Arc<Database>, tx: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_names_are_the_words_that_can_only_be_columns() {
+        let names = |t: &str| bare_names(t).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert_eq!(names("r"), ["r"]);
+        assert_eq!(names("1, s"), ["s"]);
+        assert_eq!(names("t.r, x.y"), Vec::<String>::new());
+        assert_eq!(names("ARRAY[f, f * 2]"), ["f", "f"]);
+        assert_eq!(names("CAST(s AS double precision), n"), ["s", "n"]);
+        assert_eq!(names("s::numeric(10, 2) + n"), ["s", "n"]);
+        assert_eq!(names("lower(name), DATE '2026-01-01', 'lit', \"q\""), ["name"]);
+        assert_eq!(names("VALUES (a), (b IS NULL)"), ["a", "b"]);
+        assert_eq!(names("1e5, 2"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_function_item_knows_its_arguments_span() {
+        let sql = "SELECT id, v FROM tl, LATERAL unnest(r) WITH ORDINALITY AS a(v, n)";
+        let item = next_item(sql).unwrap().unwrap();
+        let (a, b) = item.args.unwrap();
+        assert_eq!(&item.body[a..b], "r");
+        let sql = "SELECT x FROM tf, LATERAL (VALUES (f), (s)) v(x)";
+        let item = next_item(sql).unwrap().unwrap();
+        let (a, b) = item.args.unwrap();
+        assert_eq!(&item.body[a..b], "VALUES (f), (s)");
+        let sql = "SELECT x FROM tf CROSS JOIN LATERAL (SELECT f AS x) s";
+        assert!(next_item(sql).unwrap().unwrap().args.is_none());
+        // First in FROM, nothing before it has the name.
+        assert_eq!(next_item("SELECT * FROM LATERAL unnest(r) g").unwrap().unwrap_err(), "column \"r\" does not exist");
+    }
 
     #[test]
     fn each_form_is_read_with_its_alias() {
