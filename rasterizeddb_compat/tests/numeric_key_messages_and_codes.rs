@@ -80,19 +80,33 @@ async fn returning_over_the_from_list_is_unsupported_not_undefined() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_correlated_scalar_subquery_is_unsupported_not_a_syntax_error() {
+async fn a_correlated_scalar_subquery_is_answered_not_a_syntax_error() {
     let server = TestServer::start().await.expect("server");
     let c = client(&server).await;
     run(&c, "CREATE TABLE u1 (id INT PRIMARY KEY, v INT)").await;
     run(&c, "CREATE TABLE u2 (id INT PRIMARY KEY, z INT)").await;
     run(&c, "INSERT INTO u1 VALUES (1, 10), (2, 20)").await;
     run(&c, "INSERT INTO u2 VALUES (1, 0), (2, 1)").await;
-    for sql in [
-        "SELECT id, (SELECT z FROM u2 WHERE u2.id = u1.id) FROM u1 ORDER BY id",
-        "SELECT id, (SELECT max(z) FROM u2 WHERE u2.id = u1.id) AS m FROM u1 ORDER BY id",
-        "SELECT id FROM u1 WHERE v > (SELECT z FROM u2 WHERE u2.id = u1.id) ORDER BY id",
+    // Answered now, as PostgreSQL answers them (`rql::correlated`); they
+    // were refused (0A000), and before that called syntax errors.
+    for (sql, want) in [
+        ("SELECT id, (SELECT z FROM u2 WHERE u2.id = u1.id) FROM u1 ORDER BY id", vec!["1|0", "2|1"]),
+        ("SELECT id, (SELECT max(z) FROM u2 WHERE u2.id = u1.id) AS m FROM u1 ORDER BY id", vec!["1|0", "2|1"]),
+        ("SELECT id FROM u1 WHERE v > (SELECT z FROM u2 WHERE u2.id = u1.id) ORDER BY id", vec!["1", "2"]),
     ] {
-        assert_eq!(refusal(&c, sql).await.0, "0A000", "{sql}");
+        let got: Vec<String> = c
+            .simple_query(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    Some((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_string()).collect::<Vec<_>>().join("|"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, want, "{sql}");
     }
     // An uncorrelated one is still answered, a schema-qualified name
     // included (`pg_catalog.count`, `public.u2.z` were taken for outer

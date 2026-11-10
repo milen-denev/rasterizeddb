@@ -3299,7 +3299,7 @@ pub fn plan(
                         // unmatched row's NULLs make it unknown. It was refused
                         // ("only '<column> IS NULL' is supported there"), and
                         // `LEFT JOIN … WHERE b.n > 0` is an ordinary query.
-                        AntiJoin::NotApplicable(_) => cross_relation.push(conjunct),
+                        AntiJoin::NotApplicable(_) => cross_relation.push(qualify_bare(&conjunct, &relations, &schemas)),
                     }
                 } else {
                     predicates[rel].push(conjunct);
@@ -3327,7 +3327,7 @@ pub fn plan(
                 // combined. Pushing it into either scan would run it *before*
                 // the join and change which rows pair up rather than which
                 // pairs survive.
-                cross_relation.push(conjunct);
+                cross_relation.push(qualify_bare(&conjunct, &relations, &schemas));
             }
         }
     }
@@ -5477,6 +5477,52 @@ fn on_segments(from_text: &str) -> Vec<&str> {
 }
 
 /// Which relations a `WHERE` conjunct refers to.
+/// `conjunct` with each bare word that is a column of exactly one relation
+/// qualified by that relation's label (`v > b.z` → `u1.v > b.z`), outside
+/// quotes and never a call's name or a cast's type. The post-join filter
+/// names the combined row's columns by relation, so a bare name found
+/// nothing ("'v' is neither a column nor a value") though PostgreSQL reads
+/// it as the one column it can be.
+fn qualify_bare(conjunct: &str, relations: &[RelationRef], schemas: &[SmallVec<[SchemaField; 20]>]) -> String {
+    let bytes = conjunct.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut out = String::with_capacity(conjunct.len() + 16);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' || c == b'"' {
+            let end = crate::core::sql_scan::quoted_end(bytes, i, c).min(bytes.len());
+            out.push_str(&conjunct[i..end]);
+            i = end.max(i + 1);
+            continue;
+        }
+        if is_word(c) && (i == 0 || !(is_word(bytes[i - 1]) || bytes[i - 1] == b'.')) && !c.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && is_word(bytes[i]) {
+                i += 1;
+            }
+            let word = &conjunct[start..i];
+            let next = conjunct[i..].trim_start();
+            let after_cast = conjunct[..start].trim_end().ends_with("::");
+            let qualified_next = bytes.get(i) == Some(&b'.');
+            let owners: Vec<usize> = (0..relations.len())
+                .filter(|&r| schemas[r].iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(word)))
+                .collect();
+            if owners.len() == 1 && !next.starts_with('(') && !after_cast && !qualified_next {
+                out.push_str(&format!("{}.{}", relations[owners[0]].label, word));
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+        // A whole character, so a multi-byte one is copied intact.
+        let ch = conjunct[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn relations_referenced(
     conjunct: &str,
     relations: &[RelationRef],

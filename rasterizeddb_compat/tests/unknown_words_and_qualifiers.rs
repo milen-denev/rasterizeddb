@@ -218,8 +218,6 @@ async fn joins_join_writes_returning_and_upserts_check_their_qualifiers() {
         (r#"SELECT "T".id FROM t"#, "42P01"),
         ("SELECT id FROM t WHERE id=1AND v=10", "42601"),
         ("UPDATE t SET v = 0, WHERE id = 1", "42601"),
-        ("UPDATE t SET v = (SELECT w FROM u WHERE u.tid = t.id)", "0A000"),
-        ("INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = (SELECT w FROM u WHERE u.tid = t.id)", "0A000"),
     ];
     // Every case is run and every wrong answer listed.
     let mut wrong: Vec<String> = Vec::new();
@@ -504,4 +502,28 @@ async fn a_correlated_cast_with_a_type_modifier_answers_as_postgresql() {
         .map(|r| (r.get(0), r.get(1)))
         .collect();
     assert_eq!(got, vec![(1, 1), (2, 1), (3, 1)], "a rolled-back statement changed a row, or a placed one the wrong rows");
+}
+
+/// A correlated subquery in an UPDATE's SET, and in an upsert's DO UPDATE,
+/// is answered as PostgreSQL 17 answers it (both were refused, 0A000).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_subquery_in_set_reads_the_row_it_updates() {
+    let server = TestServer::start().await.expect("server");
+    let pool = server.connect_sqlx().await.expect("connect");
+    pool.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1, 10), (2, 20), (3, 30); \
+         CREATE TABLE u (id INT PRIMARY KEY, tid INT, w INT); INSERT INTO u VALUES (1, 2, 100), (2, 1, 200)",
+    )
+    .await
+    .expect("setup");
+    pool.execute("INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET v = (SELECT w FROM u WHERE u.tid = t.id)")
+        .await
+        .expect("upsert");
+    let after: Vec<(i32, Option<i32>)> =
+        sqlx::query_as("SELECT id, v FROM t ORDER BY id").fetch_all(&pool).await.expect("read");
+    assert_eq!(after, [(1, Some(200)), (2, Some(20)), (3, Some(30))]);
+    pool.execute("UPDATE t SET v = (SELECT w FROM u WHERE u.tid = t.id)").await.expect("update");
+    let after: Vec<(i32, Option<i32>)> =
+        sqlx::query_as("SELECT id, v FROM t ORDER BY id").fetch_all(&pool).await.expect("read");
+    assert_eq!(after, [(1, Some(200)), (2, Some(100)), (3, None)]);
 }
