@@ -786,6 +786,23 @@ pub(crate) async fn materialize(
                     temps,
                 )
                 .await?;
+                // A correlated scalar subquery's item (`rql::correlated`): one
+                // row at most per outer value, or PostgreSQL's 21000.
+                if item.alias.starts_with(crate::core::rql::correlated::ALIAS_PREFIX) {
+                    let keys = (1..=columns.len()).map(|n| format!("__lat_k{n}")).collect::<Vec<_>>().join(" || '|' || ");
+                    let counts = text_rows(
+                        &format!("SELECT count(*), count(DISTINCT {keys}) FROM {temp}"),
+                        2,
+                        database,
+                        tx,
+                    )
+                    .await?;
+                    if let Some([Some(all), Some(distinct)]) = counts.first().map(|r| [r[0].clone(), r[1].clone()]) {
+                        if all != distinct {
+                            return Err("more than one row returned by a subquery used as an expression".to_string());
+                        }
+                    }
+                }
                 current = rewrite(&current, &item, &temp, Some(alias), columns);
                 // The keys are expressions over the outer item, which a join
                 // takes as a derived column (`join_on`). The executor's own

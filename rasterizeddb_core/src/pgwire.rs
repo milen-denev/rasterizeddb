@@ -4218,6 +4218,15 @@ pub(crate) async fn describe_query(
     // Folded as it runs (`execute_single_statement`).
     let folded = crate::core::sql_scan::fold_core_statement(stmt);
     let stmt = folded.as_ref();
+    // And a correlated scalar subquery as the `LATERAL` join it runs as.
+    let correlated;
+    let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
+        Some(Ok(rewritten)) => {
+            correlated = rewritten;
+            correlated.as_str()
+        }
+        _ => stmt,
+    };
     // A SELECT's subqueries are replaced by their answers before it runs
     // (the execute path's `substitute_in_subqueries`), so it is described in
     // that form too. Described as written, a scalar subquery in the select
@@ -6327,6 +6336,23 @@ where
     }
     let stmt = folded_where.as_str();
 
+    // A correlated scalar subquery (`(SELECT max(v) FROM u WHERE u.k =
+    // t.k)`), as the `LATERAL` join it means (`rql::correlated`), before the
+    // passes that materialise such joins.
+    let correlated;
+    let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
+        Some(Ok(rewritten)) => {
+            crate::core::rql::prepared::note_rewritten();
+            correlated = rewritten;
+            correlated.as_str()
+        }
+        Some(Err(e)) => {
+            fail_statement(state, stream, if e.contains("only one column") { "42601" } else { "0A000" }, &e).await?;
+            return Ok(());
+        }
+        None => stmt,
+    };
+
     // A statement with CTE bodies or derived tables runs parts of itself
     // before the engine sees its outer statement, so its whole known table
     // set is taken here, at once and in name order, before any part runs
@@ -7004,7 +7030,10 @@ fn result_description(
                 // `ambiguous_column`. Not every planner message through
                 // `sqlstate_for`: a quoted name in it would choose the class.
                 Err(e) if e.contains(" is ambiguous; qualify") => return Err(("42702", e)),
-                Err(e) => return Err(("42601", e)),
+                // A refusal with a code of its own keeps it (a window frame's
+                // 42P20, FILTER's 0A000); anything else is the statement's
+                // syntax.
+                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
             }
         }
         QueryPurpose::QueryRows(qr) => {
@@ -7098,7 +7127,10 @@ fn result_description(
                 // `ambiguous_column`. Not every planner message through
                 // `sqlstate_for`: a quoted name in it would choose the class.
                 Err(e) if e.contains(" is ambiguous; qualify") => return Err(("42702", e)),
-                Err(e) => return Err(("42601", e)),
+                // A refusal with a code of its own keeps it (a window frame's
+                // 42P20, FILTER's 0A000); anything else is the statement's
+                // syntax.
+                Err(e) => return Err((match sqlstate_for(&e) { "XX000" => "42601", code => code }, e)),
             }
         }
         QueryPurpose::UpdateRow(sql) | QueryPurpose::DeleteRow(sql) => {
@@ -7553,7 +7585,9 @@ pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
 fn materialize_class(code: &'static str) -> &'static str {
     // A body naming a relation or column that is not there is the client's
     // mistake, as it is outside a CTE (42P01, 42703), not a missing feature.
-    if ["23", "22", "40", "57", "55", "53", "58", "42P01", "42703"].iter().any(|class| code.starts_with(class)) {
+    // `21`: a scalar subquery inside it that gave more than one row (a
+    // correlated one runs as a derived relation), the data's, not a feature.
+    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703"].iter().any(|class| code.starts_with(class)) {
         code
     } else {
         "0A000"
@@ -7683,6 +7717,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // reserved (`TransactionManager::check_ids_reserved`). Decided first: the
     // message quotes an operating-system error, whose words could steer the
     // branches below. `disk_full` when the disk is, `io_error` otherwise.
+    // `cardinality_violation`: a scalar subquery (a correlated one run as a
+    // `LATERAL` join included) that gave more than one row.
+    if has("more than one row returned by a subquery used as an expression") {
+        return "21000";
+    }
     if has("could not reserve transaction ids") {
         return if has("(the disk is full)") { "53100" } else { "58030" };
     }
@@ -7731,8 +7770,20 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("aggregate functions are not allowed in transform expressions") {
         return "42803";
     }
-    if has("window functions are not allowed in transform expressions") {
+    if has("window functions are not allowed in transform expressions")
+        || has("groups mode requires an order by clause")
+        || has("requires exactly one order by column")
+        || has("frame start cannot be unbounded following")
+        || has("frame end cannot be unbounded preceding")
+    {
         return "42P20";
+    }
+    if has("filter is not implemented for non-aggregate window functions") {
+        return "0A000";
+    }
+    // A RANGE offset over a type with no distance (PostgreSQL's 42883).
+    if has("range with offset preceding/following is not supported for column type") {
+        return "42883";
     }
     if has("cannot use subquery in transform expression") {
         return "0A000";

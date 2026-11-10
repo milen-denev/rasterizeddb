@@ -132,8 +132,22 @@ pub enum FrameBound {
 pub enum FrameMode {
     /// Counts rows.
     Rows,
-    /// Counts *peer groups* — rows equal on the `ORDER BY` key.
+    /// Peers move together, and an offset is a distance in the `ORDER BY`
+    /// key's own value (`RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING`).
     Range,
+    /// Counts *peer groups* — rows equal on the `ORDER BY` key.
+    Groups,
+}
+
+/// The frame's `EXCLUDE` clause: rows it takes back out of the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exclude {
+    NoOthers,
+    CurrentRow,
+    /// The current row and its peers.
+    Group,
+    /// The current row's peers, the row itself kept.
+    Ties,
 }
 
 /// Which rows around the current one the function sees.
@@ -142,6 +156,7 @@ pub struct Frame {
     pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
+    pub exclude: Exclude,
 }
 
 impl Frame {
@@ -157,12 +172,14 @@ impl Frame {
                 mode: FrameMode::Range,
                 start: FrameBound::UnboundedPreceding,
                 end: FrameBound::CurrentRow,
+                exclude: Exclude::NoOthers,
             }
         } else {
             Frame {
                 mode: FrameMode::Range,
                 start: FrameBound::UnboundedPreceding,
                 end: FrameBound::UnboundedFollowing,
+                exclude: Exclude::NoOthers,
             }
         }
     }
@@ -189,6 +206,9 @@ pub struct WindowSpec {
     /// for `ASC` and first for `DESC`, as in PostgreSQL.
     pub order_by: Vec<(SchemaField, bool, bool)>,
     pub frame: Frame,
+    /// `FILTER (WHERE …)` of an aggregate window call: the rows it rejects
+    /// are left out of every frame, with the schema it was read against.
+    pub filter: Option<(crate::core::rql::expr::Cond, Vec<SchemaField>)>,
     pub label: String,
     /// An expression around the window call — `revenue - LAG(revenue) OVER
     /// (…)`, `ROW_NUMBER() OVER () + 100` — evaluated per row once the
@@ -234,6 +254,19 @@ impl WindowSpec {
         if let Some(argument) = &self.argument {
             if !out.iter().any(|f| f.name == argument.name) {
                 out.push(argument.clone());
+            }
+        }
+        // What `FILTER (WHERE …)` reads, with the NULL companions: left
+        // unfetched, `count(*) FILTER (WHERE v > 6) OVER ()` read no `v` and
+        // counted nothing.
+        if let Some((cond, schema)) = &self.filter {
+            for field in crate::core::rql::expr::cond_columns(cond) {
+                let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
+                for f in flag.into_iter().chain(std::iter::once(field)) {
+                    if !out.iter().any(|o| o.name == f.name) {
+                        out.push(f);
+                    }
+                }
             }
         }
         // What the expression around the call reads, with the NULL
@@ -351,7 +384,31 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
         None => return Some(Err(format!("unterminated call in '{}'", item))),
     };
 
-    let rest = expr[close + 1..].trim();
+    // `FILTER (WHERE …)` between the call and its OVER clause.
+    let (filter_text, rest) = match filter_end(expr, close + 1) {
+        Some(end) => {
+            let clause = expr[close + 1..end].trim();
+            let inner = clause["FILTER".len()..].trim_start();
+            let inner = inner[1..inner.len() - 1].trim();
+            let Some(condition) = inner.get(..5).filter(|w| w.eq_ignore_ascii_case("WHERE")).map(|_| inner[5..].trim()) else {
+                return Some(Err(format!("syntax error in FILTER clause '{clause}'")));
+            };
+            (Some(condition.to_string()), expr[end..].trim())
+        }
+        None => (None, expr[close + 1..].trim()),
+    };
+    if filter_text.is_some() && !matches!(func, WindowFunc::Sum | WindowFunc::Avg | WindowFunc::Count | WindowFunc::Min | WindowFunc::Max) {
+        if starts_with_word(rest, "OVER") {
+            return Some(Err("FILTER is not implemented for non-aggregate window functions".to_string()));
+        }
+    }
+    let filter = match &filter_text {
+        Some(text) if starts_with_word(rest, "OVER") => match crate::core::rql::expr::parse_cond(text, schema) {
+            Ok(cond) => Some((cond, schema.to_vec())),
+            Err(e) => return Some(Err(e)),
+        },
+        _ => None,
+    };
     if !starts_with_word(rest, "OVER") {
         // Not a window call at all — a plain `AVG(x)` is an aggregate, and
         // saying so is the aggregate path's job, not this one's. Only the
@@ -477,7 +534,25 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
     };
 
     let body = after_over[window_open + 1..window_close].trim();
-    Some(build(func, argument, offset, default, body, alias, name, schema))
+    Some(build(func, argument, offset, default, body, alias, name, schema).map(|mut spec| {
+        spec.filter = filter;
+        spec
+    }))
+}
+
+/// Where a `FILTER (…)` clause starting at `from` (after whitespace) ends,
+/// past its closing parenthesis; `None` when none starts there.
+fn filter_end(expr: &str, from: usize) -> Option<usize> {
+    let at = from + (expr[from..].len() - expr[from..].trim_start().len());
+    if !starts_with_word(&expr[at..], "FILTER") {
+        return None;
+    }
+    let after = at + "FILTER".len();
+    let open = after + (expr[after..].len() - expr[after..].trim_start().len());
+    if !expr[open..].starts_with('(') {
+        return None;
+    }
+    matching_paren(expr, open).map(|close| close + 1)
 }
 
 /// Splits a call's arguments on commas that are not inside parentheses.
@@ -539,7 +614,9 @@ fn build(
     let upper = body.to_ascii_uppercase();
     let partition_at = find_word(&upper, "PARTITION BY");
     let order_at = find_word(&upper, "ORDER BY");
-    let frame_at = find_word(&upper, "ROWS").or_else(|| find_word(&upper, "RANGE"));
+    let frame_at = find_word(&upper, "ROWS")
+        .or_else(|| find_word(&upper, "RANGE"))
+        .or_else(|| find_word(&upper, "GROUPS"));
 
     let resolve = |list: &str| -> Result<Vec<(SchemaField, bool, bool)>, String> {
         let mut out = Vec::new();
@@ -618,6 +695,16 @@ fn build(
         None => Frame::default_for(!order_by.is_empty()),
         Some(at) => parse_frame(&body[at..])?,
     };
+    // PostgreSQL's refusals of a frame its ORDER BY cannot carry (42P20).
+    if frame.mode == FrameMode::Groups && order_by.is_empty() {
+        return Err("GROUPS mode requires an ORDER BY clause".to_string());
+    }
+    if frame.mode == FrameMode::Range
+        && [frame.start, frame.end].iter().any(|b| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_)))
+        && order_by.len() != 1
+    {
+        return Err("RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column".to_string());
+    }
 
     Ok(WindowSpec {
         func,
@@ -627,6 +714,7 @@ fn build(
         partition_by,
         order_by,
         frame,
+        filter: None,
         label: alias.unwrap_or_else(|| name.to_ascii_lowercase()),
         around: None,
     })
@@ -740,6 +828,7 @@ fn window_calls(expr: &str) -> Vec<(usize, usize)> {
                 continue;
             }
             let Some(close) = matching_paren(expr, open) else { continue };
+            let close = filter_end(expr, close + 1).map_or(close, |end| end - 1);
             let after = &expr[close + 1..];
             let over_at = close + 1 + (after.len() - after.trim_start().len());
             if !starts_with_word(&expr[over_at..], "OVER") {
@@ -814,6 +903,7 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
     let mode = match words.first().map(String::as_str) {
         Some("ROWS") => FrameMode::Rows,
         Some("RANGE") => FrameMode::Range,
+        Some("GROUPS") => FrameMode::Groups,
         _ => return Err(format!("'{}' is not a window frame", text.trim())),
     };
     let mut at = 1usize;
@@ -834,32 +924,29 @@ fn parse_frame(text: &str) -> Result<Frame, String> {
         FrameBound::CurrentRow
     };
 
-    // `EXCLUDE` changes which rows the frame drops and is not implemented.
-    // Refused rather than ignored: silently including the current row where the
-    // query said to exclude it changes the number, not the shape.
-    if words.get(at).is_some() {
-        return Err(format!(
-            "'{}' is not part of a window frame",
-            words[at..].join(" ")
-        ));
+    // `EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`.
+    let rest: Vec<&str> = words[at..].iter().map(String::as_str).collect();
+    let exclude = match rest.as_slice() {
+        [] => Exclude::NoOthers,
+        ["EXCLUDE", "CURRENT", "ROW"] => Exclude::CurrentRow,
+        ["EXCLUDE", "GROUP"] => Exclude::Group,
+        ["EXCLUDE", "TIES"] => Exclude::Ties,
+        ["EXCLUDE", "NO", "OTHERS"] => Exclude::NoOthers,
+        _ => {
+            return Err(format!(
+                "'{}' is not part of a window frame",
+                words[at..].join(" ")
+            ))
+        }
+    };
+    // PostgreSQL's own refusals of a frame that cannot be read (42P20).
+    if start == FrameBound::UnboundedFollowing {
+        return Err("frame start cannot be UNBOUNDED FOLLOWING".to_string());
     }
-
-    // A `RANGE` frame with an offset compares *values*, not row counts, and
-    // needs the ORDER BY column's own arithmetic. Only the peer-based forms are
-    // implemented; an offset is refused rather than answered as though it
-    // counted rows, which would be a different set of rows and no error.
-    if mode == FrameMode::Range
-        && [start, end]
-            .iter()
-            .any(|b| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_)))
-    {
-        return Err(
-            "a RANGE frame with an offset is not supported yet; use ROWS, or a frame              bounded by UNBOUNDED/CURRENT ROW"
-                .to_string(),
-        );
+    if end == FrameBound::UnboundedPreceding {
+        return Err("frame end cannot be UNBOUNDED PRECEDING".to_string());
     }
-
-    Ok(Frame { mode, start, end })
+    Ok(Frame { mode, start, end, exclude })
 }
 
 fn parse_bound(words: &[String], at: &mut usize) -> Result<FrameBound, String> {
@@ -973,6 +1060,15 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
     }
 
     let mut out: Vec<WindowValue> = vec![None; rows.len()];
+    // `FILTER (WHERE …)`: whether each row of the input passes it, once.
+    let passes: Option<Vec<bool>> = match &spec.filter {
+        None => None,
+        Some((cond, schema)) => Some(
+            rows.iter()
+                .map(|row| crate::core::rql::expr::eval_cond(cond, row, schema))
+                .collect::<Result<Vec<_>, String>>()?,
+        ),
+    };
     for (_, mut members) in partitions {
         // A stable sort, so rows equal on every key keep the order they were
         // scanned in rather than an arbitrary one that could differ per run.
@@ -1015,6 +1111,21 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                 }
             }
         }
+
+        // The `ORDER BY` key's value at each position, for a `RANGE` frame
+        // with an offset (`n PRECEDING` measured in the key's own units).
+        let keys: Option<Vec<Option<RangeKey>>> = if spec.frame.mode == FrameMode::Range
+            && [spec.frame.start, spec.frame.end]
+                .iter()
+                .any(|b| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_)))
+        {
+            let (field, _, _) = spec.order_by.first().ok_or_else(|| {
+                "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column".to_string()
+            })?;
+            Some(members.iter().map(|&m| range_key(&rows[m], field)).collect::<Result<Vec<_>, String>>()?)
+        } else {
+            None
+        };
 
         for (position, index) in members.iter().enumerate() {
             let (row_number, rank, dense) = ranks[position];
@@ -1061,15 +1172,36 @@ pub fn assign(rows: &[Row], spec: &WindowSpec) -> Result<Vec<WindowValue>, Strin
                     }
                 }
                 _ => {
-                    let (lo, hi) = frame_range(spec, position, count, &peers_with_previous);
-                    if lo > hi {
+                    let ctx = FrameCtx { ranks: &ranks, peer_end: &peer_end, keys: keys.as_deref() };
+                    let (lo, hi) = frame_range(spec, position, count, &peers_with_previous, &ctx)?;
+                    // `EXCLUDE`: the current row, its peers, or both, taken
+                    // back out of the frame.
+                    let peer_lo = (ranks[position].1 - 1).max(0) as usize;
+                    let peer_hi = peer_end[position].saturating_sub(1);
+                    let excluded = |p: usize| match spec.frame.exclude {
+                        Exclude::NoOthers => false,
+                        Exclude::CurrentRow => p == position,
+                        Exclude::Group => (peer_lo..=peer_hi).contains(&p),
+                        Exclude::Ties => p != position && (peer_lo..=peer_hi).contains(&p),
+                    };
+                    let mut frame: Vec<usize> = if lo > hi {
+                        Vec::new()
+                    } else if spec.frame.exclude == Exclude::NoOthers || !spec.func.honours_frame() {
+                        members[lo..=hi].to_vec()
+                    } else {
+                        (lo..=hi).filter(|p| !excluded(*p)).map(|p| members[p]).collect()
+                    };
+                    if let Some(passes) = &passes {
+                        frame.retain(|m| passes[*m]);
+                    }
+                    if frame.is_empty() {
                         // An empty frame: every aggregate but COUNT is NULL.
                         match spec.func {
                             WindowFunc::Count => Some(0i64.to_le_bytes().to_vec()),
                             _ => None,
                         }
                     } else {
-                        evaluate_over(rows, &members[lo..=hi], spec)?
+                        evaluate_over(rows, &frame, spec)?
                     }
                 }
             };
@@ -1134,6 +1266,90 @@ fn compare_by_order(
     std::cmp::Ordering::Equal
 }
 
+/// What a frame bound needs beyond the row's position: each position's
+/// `(row_number, rank, dense_rank)`, the end (exclusive) of each position's
+/// peer group, and, for a `RANGE` frame with an offset, each position's key.
+struct FrameCtx<'a> {
+    ranks: &'a [(i64, i64, i64)],
+    peer_end: &'a [usize],
+    keys: Option<&'a [Option<RangeKey>]>,
+}
+
+/// An `ORDER BY` key's value, for a `RANGE` offset: exact for integers and
+/// `numeric` (at the column's scale), a double for floats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RangeKey {
+    Exact(i128, u32),
+    Float(f64),
+}
+
+impl RangeKey {
+    /// `self + delta` (in whole units of the key), as the same kind.
+    fn shifted(self, delta: i128) -> RangeKey {
+        match self {
+            RangeKey::Exact(v, s) => RangeKey::Exact(v.saturating_add(delta.saturating_mul(10i128.saturating_pow(s))), s),
+            RangeKey::Float(f) => RangeKey::Float(f + delta as f64),
+        }
+    }
+
+    fn cmp(&self, other: &RangeKey) -> std::cmp::Ordering {
+        match (self, other) {
+            (RangeKey::Exact(a, _), RangeKey::Exact(b, _)) => a.cmp(b),
+            (RangeKey::Float(a), RangeKey::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+/// `row`'s key on `field` for a `RANGE` offset; `None` for NULL. Refused for
+/// a type with no `+` an offset could use, as PostgreSQL refuses it.
+fn range_key(row: &Row, field: &SchemaField) -> Result<Option<RangeKey>, String> {
+    let Some(col) = row
+        .columns
+        .iter()
+        .find(|c| u64::from(c.schema_id) == field.write_order)
+        .filter(|c| c.column_type != DbType::NULL)
+    else {
+        return Ok(None);
+    };
+    let b = col.data.into_slice();
+    let int = |n: usize| -> Option<i128> {
+        let mut buf = [0u8; 16];
+        buf[..n].copy_from_slice(b.get(..n)?);
+        // Sign-extend.
+        if n < 16 && b[n - 1] & 0x80 != 0 && !matches!(field.db_type, DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64) {
+            for x in &mut buf[n..] {
+                *x = 0xFF;
+            }
+        }
+        Some(i128::from_le_bytes(buf))
+    };
+    let key = match field.db_type {
+        DbType::I8 | DbType::U8 => int(1).map(|v| RangeKey::Exact(v, 0)),
+        DbType::I16 | DbType::U16 => int(2).map(|v| RangeKey::Exact(v, 0)),
+        DbType::I32 | DbType::U32 => int(4).map(|v| RangeKey::Exact(v, 0)),
+        DbType::I64 | DbType::U64 => int(8).map(|v| RangeKey::Exact(v, 0)),
+        DbType::I128 => int(16).map(|v| RangeKey::Exact(v, 0)),
+        DbType::F32 => b.get(..4).map(|x| RangeKey::Float(f32::from_le_bytes(x.try_into().expect("four")) as f64)),
+        DbType::F64 => b.get(..8).map(|x| RangeKey::Float(f64::from_le_bytes(x.try_into().expect("eight")))),
+        DbType::DECIMAL => {
+            let scale = field.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE);
+            crate::core::value_codec::split_decimal_cell(b).map(|(v, own)| {
+                let own = own.unwrap_or(scale);
+                let v = if own <= scale { v.saturating_mul(10i128.pow(scale - own)) } else { v / 10i128.pow(own - scale) };
+                RangeKey::Exact(v, scale)
+            })
+        }
+        ref other => {
+            return Err(format!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                crate::core::value_codec::pg_input_type_name(other)
+            ))
+        }
+    };
+    Ok(key)
+}
+
 /// The frame's row range within the sorted partition, as inclusive positions.
 ///
 /// `lo > hi` means the frame is empty, which is a real outcome — `ROWS BETWEEN
@@ -1143,15 +1359,20 @@ fn frame_range(
     position: usize,
     count: usize,
     peers_with_previous: &dyn Fn(usize) -> bool,
-) -> (usize, usize) {
+    ctx: &FrameCtx<'_>,
+) -> Result<(usize, usize), String> {
     if !spec.func.honours_frame() {
-        return (0, count.saturating_sub(1));
+        return Ok((0, count.saturating_sub(1)));
     }
+    if count == 0 {
+        return Ok((1, 0));
+    }
+    let last = count - 1;
 
-    // In RANGE mode a bound at the current row reaches the ends of its peer
-    // group: the rows that tie with it on the ORDER BY key are part of the
-    // same step. That is the difference between a running total that jumps at
-    // each distinct value and one that jumps at each row.
+    // In RANGE and GROUPS mode a bound at the current row reaches the ends
+    // of its peer group: the rows that tie with it on the ORDER BY key are
+    // part of the same step. That is the difference between a running total
+    // that jumps at each distinct value and one that jumps at each row.
     let peer_start = |from: usize| -> usize {
         let mut at = from;
         while at > 0 && peers_with_previous(at) {
@@ -1159,45 +1380,104 @@ fn frame_range(
         }
         at
     };
-    let peer_finish = |from: usize| -> usize {
-        let mut at = from;
-        while at + 1 < count && peers_with_previous(at + 1) {
-            at += 1;
+    let peer_finish = |from: usize| -> usize { ctx.peer_end[from].saturating_sub(1).max(from) };
+
+    // GROUPS: the peer groups, each as its first and last position.
+    let group_of = |p: usize| (ctx.ranks[p].2 - 1).max(0) as usize;
+    let groups = (spec.frame.mode == FrameMode::Groups).then(|| {
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        for p in 0..count {
+            let g = group_of(p);
+            if g == bounds.len() {
+                bounds.push((p, p));
+            } else if let Some(b) = bounds.get_mut(g) {
+                b.1 = p;
+            }
         }
-        at
+        bounds
+    });
+
+    // RANGE with an offset: the first position at or past a value, and the
+    // last at or before one, in the key's sort direction. A NULL current key
+    // frames its NULL peers, as PostgreSQL's does.
+    let descending = spec.order_by.first().is_some_and(|(_, d, _)| *d);
+    let range_bound = |offset: i128, is_start: bool| -> (usize, usize) {
+        let keys = ctx.keys.expect("computed for an offset");
+        let Some(current) = keys[position] else {
+            return (peer_start(position), peer_finish(position));
+        };
+        // A value `offset` along the sort order from the current one.
+        let target = current.shifted(if descending { -offset } else { offset });
+        let after = |k: &RangeKey| {
+            let o = k.cmp(&target);
+            if descending { o.reverse() } else { o }
+        };
+        if is_start {
+            let lo = (0..count)
+                .find(|&p| keys[p].as_ref().is_some_and(|k| after(k) != std::cmp::Ordering::Less))
+                .unwrap_or(count);
+            (lo, lo)
+        } else {
+            let hi = (0..count)
+                .rev()
+                .find(|&p| keys[p].as_ref().is_some_and(|k| after(k) != std::cmp::Ordering::Greater));
+            match hi {
+                Some(h) => (h, h),
+                None => (1, 0),
+            }
+        }
     };
 
     let lo = match spec.frame.start {
         FrameBound::UnboundedPreceding => 0,
-        FrameBound::Preceding(n) => position.saturating_sub(n as usize),
         FrameBound::CurrentRow => match spec.frame.mode {
             FrameMode::Rows => position,
-            FrameMode::Range => peer_start(position),
+            FrameMode::Range | FrameMode::Groups => peer_start(position),
         },
-        FrameBound::Following(n) => position.saturating_add(n as usize),
+        FrameBound::Preceding(n) => match (spec.frame.mode, &groups) {
+            (FrameMode::Groups, Some(g)) => g[group_of(position).saturating_sub(n as usize)].0,
+            (FrameMode::Range, _) => range_bound(-(n as i128), true).0,
+            _ => position.saturating_sub(n as usize),
+        },
+        FrameBound::Following(n) => match (spec.frame.mode, &groups) {
+            (FrameMode::Groups, Some(g)) => match g.get(group_of(position) + n as usize) {
+                Some(b) => b.0,
+                None => count,
+            },
+            (FrameMode::Range, _) => range_bound(n as i128, true).0,
+            _ => position.saturating_add(n as usize),
+        },
         FrameBound::UnboundedFollowing => count,
     };
-    let hi = match spec.frame.end {
-        FrameBound::UnboundedPreceding => 0usize.wrapping_sub(1),
-        FrameBound::Preceding(n) => {
-            if n as usize > position {
-                // Every row before the frame's end precedes the partition.
-                return (1, 0);
-            }
-            position - n as usize
-        }
-        FrameBound::CurrentRow => match spec.frame.mode {
+    let hi: Option<usize> = match spec.frame.end {
+        FrameBound::UnboundedPreceding => None,
+        FrameBound::CurrentRow => Some(match spec.frame.mode {
             FrameMode::Rows => position,
-            FrameMode::Range => peer_finish(position),
+            FrameMode::Range | FrameMode::Groups => peer_finish(position),
+        }),
+        FrameBound::Preceding(n) => match (spec.frame.mode, &groups) {
+            (FrameMode::Groups, Some(g)) => group_of(position).checked_sub(n as usize).map(|i| g[i].1),
+            (FrameMode::Range, _) => {
+                let (a, b) = range_bound(-(n as i128), false);
+                (a <= b).then_some(a)
+            }
+            _ => position.checked_sub(n as usize),
         },
-        FrameBound::Following(n) => (position + n as usize).min(count.saturating_sub(1)),
-        FrameBound::UnboundedFollowing => count.saturating_sub(1),
+        FrameBound::Following(n) => match (spec.frame.mode, &groups) {
+            (FrameMode::Groups, Some(g)) => Some(g[(group_of(position) + n as usize).min(g.len() - 1)].1),
+            (FrameMode::Range, _) => {
+                let (a, b) = range_bound(n as i128, false);
+                (a <= b).then_some(a)
+            }
+            _ => Some((position + n as usize).min(last)),
+        },
+        FrameBound::UnboundedFollowing => Some(last),
     };
-
-    if count == 0 || lo >= count {
-        return (1, 0);
+    let Some(hi) = hi else { return Ok((1, 0)) };
+    if lo >= count {
+        return Ok((1, 0));
     }
-    (lo, hi.min(count.saturating_sub(1)))
+    Ok((lo, hi.min(last)))
 }
 
 /// The argument column's bytes for one row, or `None` when it holds nothing.

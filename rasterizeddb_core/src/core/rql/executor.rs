@@ -20538,13 +20538,23 @@ pub(crate) async fn execute_with_need(
                 // reached the assignment as a value (22P02, naming the
                 // subquery), and a DO UPDATE's, stripped of its qualifier,
                 // read the inner table's own column and stored NULL.
+                // As `UPDATE … FROM` over a SELECT computing each row's
+                // values, keyed by the target's identifying key
+                // (`rql::correlated`).
                 if crate::core::rql::subquery::find_correlated_scalar_subquery(sql).is_some()
                 {
-                    return ddl_error(
-                        "a correlated subquery in UPDATE is not supported: one that reads \
-                         the row being updated has a value per row, which this cannot evaluate; \
-                         write it as UPDATE … FROM",
-                    );
+                    let target = sql.split_whitespace().nth(1).unwrap_or("").trim_matches('"').to_string();
+                    let key: Vec<String> = match database.schema_view(&target) {
+                        Some(view) => identifying_key(view.schema())
+                            .map(|k| k.fields.iter().map(|f| f.name.clone()).collect())
+                            .unwrap_or_default(),
+                        None => return ddl_error(&format!("relation \"{target}\" does not exist")),
+                    };
+                    return match crate::core::rql::correlated::rewrite_update(sql, &key) {
+                        Some(Ok(rewritten)) => Box::pin(execute_update_from(&rewritten, &database, depth, tx)).await,
+                        Some(Err(e)) => ddl_error(&e),
+                        None => ddl_error("a correlated subquery in UPDATE could not be read"),
+                    };
                 }
                 // A row another transaction holds `FOR UPDATE` may not be
                 // written underneath it.

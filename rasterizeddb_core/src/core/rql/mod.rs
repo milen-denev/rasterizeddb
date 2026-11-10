@@ -43,6 +43,7 @@ pub(crate) mod ctas;
 pub(crate) mod distinct_on;
 pub(crate) mod join_on;
 pub(crate) mod lateral;
+pub(crate) mod correlated;
 pub mod truncate;
 pub mod pg_functions;
 pub mod table_functions;
