@@ -2793,10 +2793,14 @@ fn needs_evaluator(text: &str) -> bool {
             // A subscript, `a[1]` or `(…)[1]`: the evaluator's
             // (`expr::parse_subscript`). Not `ARRAY[…]`, whose `= ANY` form
             // the rewrite above reads itself.
-            b'[' if i > 0 && (is_word(bytes[i - 1]) || bytes[i - 1] == b')') && {
-                let word_start = text[..i].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |at| at + 1);
-                !text[word_start..i].eq_ignore_ascii_case("ARRAY")
-            } =>
+            // `[]` is a type's array suffix (`::text[]`), never a subscript.
+            b'[' if i > 0
+                && (is_word(bytes[i - 1]) || bytes[i - 1] == b')')
+                && bytes.get(i + 1) != Some(&b']')
+                && {
+                    let word_start = text[..i].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |at| at + 1);
+                    !text[word_start..i].eq_ignore_ascii_case("ARRAY")
+                } =>
             {
                 return true;
             }
