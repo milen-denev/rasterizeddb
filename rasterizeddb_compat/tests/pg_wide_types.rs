@@ -211,9 +211,10 @@ async fn a_multi_word_type_carrying_array_brackets_is_an_array() {
     // `DOUBLE PRECISION[][]` failed the two-word test, fell back to `DOUBLE`,
     // and left `PRECISION[][]` to be read as a constraint — so the column
     // became a scalar and the array-ness was lost with nothing reported.
+    // It is `float8[]`, its elements held as float8s print, as PostgreSQL's.
     assert_eq!(
         round_trip(&pool, "m1", "DOUBLE PRECISION[][]", "'{1.0,2.0}'").await,
-        "{1.0,2.0}"
+        "{1,2}"
     );
     assert_eq!(round_trip(&pool, "m2", "REAL[]", "'{80.5,90.25}'").await, "{80.5,90.25}");
     assert_eq!(round_trip(&pool, "m3", "TEXT[]", "'{express,gift}'").await, "{express,gift}");
