@@ -79,6 +79,14 @@ async fn casts_to_an_array_type_read_each_element_as_that_type() {
         ("SELECT ARRAY[true,false]::text[]", "{true,false}"),
         ("SELECT '{t,f}'::bool[]::text[]", "{true,false}"),
         ("SELECT ARRAY[1.50]::text[]", "{1.50}"),
+        // Each element held to the modifier: a numeric rounded to its scale,
+        // a text cut to its length (a cast cuts where an assignment refuses).
+        ("SELECT '{1.234,2}'::numeric(5,2)[]", "{1.23,2.00}"),
+        ("SELECT ARRAY[1,2]::numeric(5,2)[]", "{1.00,2.00}"),
+        ("SELECT ARRAY['abcdef','ab']::varchar(3)[]", "{abc,ab}"),
+        ("SELECT ARRAY[123]::varchar(2)[]", "{12}"),
+        ("SELECT '{\"2026-01-01 10:00:00.6\"}'::timestamp(0)[]", "{\"2026-01-01 10:00:01\"}"),
+        ("SELECT ('{1.5}'::numeric(5,2)[])[1]", "1.50"),
     ];
     for (sql, want) in cases {
         assert_eq!(rows(&pool, sql).await, vec![want.to_string()], "{sql}");
@@ -96,10 +104,11 @@ async fn a_bad_array_cast_fails_as_postgresql_fails_it() {
         ("SELECT '{1,2}'::foo[]", "42704", "type \"foo[]\" does not exist"),
         ("SELECT '{1,2}'::double[]", "42704", "type \"double[]\" does not exist"),
         ("SELECT ARRAY[70000]::smallint[]", "22003", "smallint out of range"),
-        // PostgreSQL rounds and cuts each element to the modifier; kept as
-        // written here, it is refused rather than answered wrong.
-        ("SELECT '{1.234}'::numeric(5,2)[]", "0A000", "a cast to an array of numeric(5,2) is not supported yet"),
-        ("SELECT '{abcdef}'::varchar(3)[]", "0A000", "a cast to an array of varchar(3) is not supported yet"),
+        (
+            "SELECT '{1234.5}'::numeric(5,2)[]",
+            "22003",
+            "numeric field overflow: a field with precision 5, scale 2 must round to an absolute value less than 10^3",
+        ),
     ];
     for (sql, code, message) in cases {
         assert_eq!(error_of(&pool, sql).await, (code.to_string(), message.to_string()), "{sql}");

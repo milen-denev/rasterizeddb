@@ -1727,6 +1727,19 @@ fn element_type_of_oid(oid: i32) -> Option<crate::core::db_type::DbType> {
 /// Every array column was untyped text: `'{1,x}'` was stored in an `INT[]`
 /// column, `{01,2}` sorted after `{10}`, and `max` compared text.
 pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -> Result<Option<Vec<u8>>, String> {
+    hold_array_elements_to(raw, element, None, false)
+}
+
+/// [`hold_array_elements`], each element also held to the column's element
+/// modifier (`numeric(10,2)[]`: rounded to two places and refused past ten
+/// digits), as [`crate::core::rql::type_modifier::hold_element`] does it;
+/// `explicit` for a cast.
+pub fn hold_array_elements_to(
+    raw: &[u8],
+    element: &crate::core::db_type::DbType,
+    modifier: Option<crate::core::rql::type_modifier::ElementModifier>,
+    explicit: bool,
+) -> Result<Option<Vec<u8>>, String> {
     use crate::core::db_type::DbType;
     let Some((oid, dims, elements)) = decode_array_dims(raw) else { return Ok(None) };
     if elements.is_empty() {
@@ -1759,6 +1772,9 @@ pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -
                 canonical.extend(std::iter::repeat_n('0', written - shown));
             }
         }
+        if let Some(modifier) = modifier {
+            canonical = crate::core::rql::type_modifier::hold_element(element, &encoded, canonical, modifier, explicit)?;
+        }
         held.push(Some(canonical.into_bytes()));
     }
     let rebuilt = build_array_dims(target, &dims, held.iter().map(|e| e.as_deref()));
@@ -1772,6 +1788,11 @@ pub fn hold_array_elements(raw: &[u8], element: &crate::core::db_type::DbType) -
 /// type as [`encode_literal`] reads a literal.
 pub fn encode_element(element: &crate::core::db_type::DbType, text: &str) -> Option<Vec<u8>> {
     use crate::core::db_type::DbType;
+    // Text, as it is: its spaces are its own (`varchar(3)[]`'s elements,
+    // held to a length).
+    if *element == DbType::STRING {
+        return Some(text.as_bytes().to_vec());
+    }
     let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
     fn integer(t: &str) -> Option<i128> {
         let (negative, digits) = match t.as_bytes().first()? {

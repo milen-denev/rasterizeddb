@@ -10163,7 +10163,7 @@ fn reported_type_of(
         // A typed array column (`integer[]`): described as its element
         // type's array, and its binary cells in that type's form, from this
         // one type as `character(n)` is above.
-        u8::try_from(code).map_or(DbType::ARRAY, DbType::ARRAYOF)
+        crate::core::rql::type_modifier::described_element(code).map_or(DbType::ARRAY, DbType::ARRAYOF)
     } else {
         // `literal_type`: a `timestamp` (without time zone) column is
         // described as `timestamp` and its values formatted with no `+00`,

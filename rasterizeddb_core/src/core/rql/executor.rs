@@ -14226,7 +14226,10 @@ async fn retype_array(
     if wanted == had {
         return Ok(());
     }
-    if had.is_none() && wanted.is_some() && !using {
+    // To `varchar(n)[]` (text elements held to a length) text casts
+    // implicitly, as PostgreSQL's `text` to `varchar` does.
+    let to_text = matches!(wanted, Some(TextTypmod::Element(code)) if type_modifier::described_element(code).is_none());
+    if had.is_none() && wanted.is_some() && !using && !to_text {
         return Err(format!(
             "column \"{}\" cannot be cast automatically to type {}",
             field.name,
@@ -14245,7 +14248,12 @@ async fn retype_array(
             if cell.column_type == crate::core::db_type::DbType::NULL {
                 continue;
             }
-            crate::core::value_codec::hold_array_elements(cell.data.into_slice(), &element)?;
+            crate::core::value_codec::hold_array_elements_to(
+                cell.data.into_slice(),
+                &element,
+                type_modifier::element_modifier(code),
+                false,
+            )?;
         }
     }
     let markers = type_modifier::text_typmod_records(&field.name, wanted, &schema.type_modifiers);

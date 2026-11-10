@@ -1009,7 +1009,17 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             // type's cast does (`ARRAY[1.5, 2.25]::int[]` is `{2,2}`); its
             // text read as the new type's input would refuse `1.5`. To text,
             // only a boolean's differs from the text kept: `t` is `true`.
-            let tag = tag_type(&args[1]);
+            // The element type, and the modifier when the tag carries one
+            // (`expr::cast_to`).
+            let (tag, modifier) = match &args[1] {
+                Value::Data { bytes, .. } if bytes.len() == 5 => (
+                    Some(DbType::from_byte(bytes[0])),
+                    crate::core::rql::type_modifier::element_modifier(u32::from_le_bytes(
+                        bytes[1..5].try_into().expect("four bytes"),
+                    )),
+                ),
+                other => (tag_type(other), None),
+            };
             if let Value::Data { bytes, db_type: DbType::ARRAY } = &args[0]
                 && let Some(source) = crate::core::value_codec::array_element_type(bytes)
                 && let Some(target) = tag.clone().or_else(|| (source == DbType::BOOL).then_some(DbType::STRING))
@@ -1039,7 +1049,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             match tag {
                 None => data(raw, DbType::ARRAY),
                 Some(element) => {
-                    let held = crate::core::value_codec::hold_array_elements(&raw, &element)?;
+                    let held = crate::core::value_codec::hold_array_elements_to(&raw, &element, modifier, true)?;
                     data(held.unwrap_or(raw), DbType::ARRAY)
                 }
             }
@@ -1060,6 +1070,12 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             let text = String::from_utf8_lossy(&text).into_owned();
             match tag_type(&args[1]) {
                 None => text_value(text),
+                // A numeric element at the places it holds (`{2.00}`'s is
+                // 2.00, as PostgreSQL's): read into the engine's own scale it
+                // was 2, and `a[1] + 1` was 3 where PostgreSQL's is 3.00.
+                Some(DbType::DECIMAL) if pgn::parse_text(&text).is_some() => {
+                    numeric_value(pgn::parse_text(&text).expect("checked"))
+                }
                 Some(t) => match crate::core::value_codec::encode_element(&t, &text) {
                     Some(b) => data(b, t),
                     // An element its array's type would not read (none can

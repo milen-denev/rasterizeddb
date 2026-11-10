@@ -784,14 +784,22 @@ fn cast_to(inner: Expr, target: &str) -> Result<Expr, String> {
         if base.trim().eq_ignore_ascii_case("double") || cast_target(base).is_none() {
             return Err(format!("type \"{}[]\" does not exist", base.trim().to_ascii_lowercase()));
         }
-        // The element's own modifier is not applied to each element (as a
-        // typed array column does not keep it): `'{1.234}'::numeric(5,2)[]`
-        // would keep 1.234 where PostgreSQL rounds it to 1.23.
-        if base.contains('(') {
-            return Err(format!("a cast to an array of {} is not supported yet", base.trim().to_ascii_lowercase()));
-        }
+        // The tag: the element type's code, then the whole element value
+        // when it holds a modifier (`'{1.234}'::numeric(5,2)[]` is {1.23},
+        // `'{abcdef}'::varchar(3)[]` is {abc}); empty for text.
         let tag = match crate::core::rql::type_modifier::parse_array_element(target) {
-            Some(crate::core::rql::type_modifier::TextTypmod::Element(code)) => u8::try_from(code).map(|c| vec![c]).unwrap_or_default(),
+            Some(crate::core::rql::type_modifier::TextTypmod::Element(raw)) => {
+                let mut tag = vec![crate::core::rql::type_modifier::element_code(raw)];
+                if crate::core::rql::type_modifier::element_modifier(raw).is_some() {
+                    tag.extend_from_slice(&raw.to_le_bytes());
+                }
+                tag
+            }
+            // A modified type with no array form here (`varchar(n)` past
+            // what an element value holds): refused, not cast unheld.
+            None if base.contains('(') => {
+                return Err(format!("a cast to an array of {} is not supported yet", base.trim().to_ascii_lowercase()))
+            }
             _ => Vec::new(),
         };
         return Ok(Expr::Call(
@@ -1201,7 +1209,8 @@ fn subscript_element(base: &Expr) -> Option<DbType> {
     use crate::core::rql::type_modifier::TextTypmod;
     match base {
         Expr::Column(f) => match f.text_typmod() {
-            Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::element_db_type(code)
+            Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::described_element(code)
+                .map(DbType::from_byte)
                 .and_then(|t| crate::core::value_codec::element_read_type(&t)),
             _ => None,
         },
@@ -1228,14 +1237,16 @@ pub(crate) fn typed_array_element(expr: &Expr) -> Option<u8> {
     use crate::core::rql::type_modifier::TextTypmod;
     match expr {
         Expr::Column(f) if f.db_type == DbType::ARRAY => match f.text_typmod() {
-            Some(TextTypmod::Element(code)) => u8::try_from(code).ok(),
+            Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::described_element(code),
             _ => None,
         },
         Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArraySlice), args) => {
             args.first().and_then(typed_array_element)
         }
         Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCast), args) => match args.get(1) {
-            Some(Expr::Literal { bytes, .. }) if bytes.len() == 1 => Some(bytes[0]),
+            Some(Expr::Literal { bytes, .. }) if !bytes.is_empty() => {
+                crate::core::rql::type_modifier::described_element(u32::from(bytes[0]))
+            }
             _ => None,
         },
         _ => None,

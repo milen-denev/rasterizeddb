@@ -781,7 +781,8 @@ impl SelectItem {
                 if field.db_type == DbType::ARRAY && matches!(field.text_typmod(), Some(TextTypmod::Element(_))) =>
             {
                 match field.text_typmod() {
-                    Some(TextTypmod::Element(code)) => u8::try_from(code).map_or(DbType::ARRAY, DbType::ARRAYOF),
+                    Some(TextTypmod::Element(code)) => crate::core::rql::type_modifier::described_element(code)
+                        .map_or(DbType::ARRAY, DbType::ARRAYOF),
                     _ => self.result_type(),
                 }
             }

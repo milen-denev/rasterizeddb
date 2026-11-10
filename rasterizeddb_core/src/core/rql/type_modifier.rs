@@ -179,20 +179,167 @@ pub fn parse_array_element(declared: &str) -> Option<TextTypmod> {
     use crate::core::db_type::DbType;
     let upper = declared.trim().to_ascii_uppercase();
     let base = array_base(&upper)?;
-    // `numeric(10,2)` and `varchar(5)`: the element's own modifier is not
-    // kept, its type is.
-    let without_modifier = match base.find('(') {
-        Some(at) => base[..at].trim_end(),
-        None => base,
-    };
+    // The element's type without its modifier: every parenthesised group
+    // out, so `TIMESTAMP(3) WITH TIME ZONE` is still the zoned type. Cut at
+    // the `(`, it was a `timestamp` without one.
+    let mut without_modifier = String::with_capacity(base.len());
+    let mut depth = 0usize;
+    for c in base.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if depth == 0 => without_modifier.push(c),
+            _ => {}
+        }
+    }
     let tokens: Vec<&str> = without_modifier.split_whitespace().collect();
     let (db_type, used) = crate::core::rql::lexer_alter::parse_column_type(&tokens).ok()?;
     if used != tokens.len() {
         return None;
     }
+    // The element's modifier, applied to every element as the column's own
+    // would be to a value (`ElementModifier`).
+    let modifier = match &db_type {
+        DbType::DECIMAL => match parse_numeric_modifier(base) {
+            Some(Ok((precision, scale))) => {
+                Some(ElementModifier::Numeric { precision: u32::from(precision), scale: u32::from(scale) })
+            }
+            _ => None,
+        },
+        DbType::STRING | DbType::CHAR => match parse_text_typmod(base) {
+            Some(Ok(TextTypmod::Varchar(n))) if n > 0 => Some(ElementModifier::Varchar(n)),
+            Some(Ok(TextTypmod::Bpchar(n))) if n > 0 => Some(ElementModifier::Bpchar(n)),
+            _ => None,
+        },
+        _ => match parse_time_precision(base) {
+            Some(Ok(TextTypmod::Precision(p))) => Some(ElementModifier::Precision(p)),
+            _ => None,
+        },
+    };
     match db_type {
-        DbType::ARRAY | DbType::STRING | DbType::JSONTEXT | DbType::JSON | DbType::JSONB | DbType::CHAR => None,
-        t => Some(TextTypmod::Element(u32::from(t.to_byte()))),
+        DbType::ARRAY | DbType::JSONTEXT | DbType::JSON | DbType::JSONB => None,
+        // Text elements are kept as written, the untyped array every array
+        // once was, unless a length holds them (`varchar(5)[]`).
+        DbType::STRING | DbType::CHAR => match modifier {
+            Some(m) => element_typmod(DbType::STRING.to_byte(), Some(m)),
+            None => None,
+        },
+        t => element_typmod(t.to_byte(), modifier).or_else(|| element_typmod(t.to_byte(), None)),
+    }
+}
+
+/// An array column's element modifier (`numeric(10,2)[]`, `varchar(5)[]`,
+/// `timestamp(0)[]`), applied to each element written as the column's own
+/// modifier is to a value: a numeric rounded to its scale and refused past
+/// its precision (22003), a text longer than its length refused (22001), a
+/// time rounded to its fractional digits. Kept in the
+/// [`TextTypmod::Element`] value above the type's code
+/// ([`element_typmod`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ElementModifier {
+    Numeric { precision: u32, scale: u32 },
+    Varchar(u32),
+    /// The length is held; the element is not blank-padded, as an element
+    /// read back (`a[1]`) is text here, not `character(n)`, and would then
+    /// compare unequal to its own unpadded spelling.
+    Bpchar(u32),
+    Precision(u32),
+}
+
+/// [`TextTypmod::Element`]'s value: the element type's code in the low
+/// eight bits, a modifier's kind in the next three and its value in the
+/// nineteen above. A binary that predates modifiers reads a value past a
+/// byte as no type it knows, and the column as the untyped array it was.
+const ELEMENT_KIND_SHIFT: u32 = 8;
+const ELEMENT_VALUE_SHIFT: u32 = 11;
+/// Below `PackedTypmod::VALUE` with the one it adds.
+const ELEMENT_VALUE_MAX: u32 = (1 << 19) - 2;
+
+/// The [`TextTypmod::Element`] for an array of the type `code` names, with
+/// `modifier`; `None` when the modifier's value does not fit (a
+/// `varchar(n)` past half a million characters).
+pub fn element_typmod(code: u8, modifier: Option<ElementModifier>) -> Option<TextTypmod> {
+    let (kind, value) = match modifier {
+        None => (0u32, 0u32),
+        // A precision is at most 1000 and a scale at most 38 here.
+        Some(ElementModifier::Numeric { precision, scale }) => {
+            if precision > 1023 || scale > 63 {
+                return None;
+            }
+            (1, (precision << 6) | scale)
+        }
+        Some(ElementModifier::Varchar(n)) => (2, n),
+        Some(ElementModifier::Bpchar(n)) => (3, n),
+        Some(ElementModifier::Precision(p)) => (4, p),
+    };
+    if value > ELEMENT_VALUE_MAX {
+        return None;
+    }
+    Some(TextTypmod::Element(u32::from(code) | (kind << ELEMENT_KIND_SHIFT) | (value << ELEMENT_VALUE_SHIFT)))
+}
+
+/// The element type's code a [`TextTypmod::Element`] value holds.
+pub fn element_code(raw: u32) -> u8 {
+    (raw & 0xFF) as u8
+}
+
+/// The element type a typed array column is described and sent as, by its
+/// code: `None` for text elements (`varchar(5)[]`, typed only to hold their
+/// length), which go out as the untyped `text[]` they always were.
+pub fn described_element(raw: u32) -> Option<u8> {
+    let code = element_code(raw);
+    (code != crate::core::db_type::DbType::STRING.to_byte()).then_some(code)
+}
+
+/// The element modifier a [`TextTypmod::Element`] value holds.
+pub fn element_modifier(raw: u32) -> Option<ElementModifier> {
+    let value = raw >> ELEMENT_VALUE_SHIFT;
+    match (raw >> ELEMENT_KIND_SHIFT) & 0b111 {
+        1 => Some(ElementModifier::Numeric { precision: value >> 6, scale: value & 0x3F }),
+        2 => Some(ElementModifier::Varchar(value)),
+        3 => Some(ElementModifier::Bpchar(value)),
+        4 => Some(ElementModifier::Precision(value)),
+        _ => None,
+    }
+}
+
+/// One element's canonical text held to `modifier`: `Err` as the column's
+/// own type refuses a value (22003, 22001). `explicit` for a cast
+/// (`::varchar(3)[]`), which cuts a text to its length where an
+/// assignment refuses it, as PostgreSQL's do.
+pub fn hold_element(
+    element: &crate::core::db_type::DbType,
+    encoded: &[u8],
+    canonical: String,
+    modifier: ElementModifier,
+    explicit: bool,
+) -> Result<String, String> {
+    use crate::core::value_codec as vc;
+    match modifier {
+        ElementModifier::Numeric { precision, scale } => {
+            // `NaN` holds in any `numeric(p, s)`; the infinities do not.
+            if canonical.eq_ignore_ascii_case("nan") {
+                return Ok(canonical);
+            }
+            if canonical.to_ascii_lowercase().contains("infinity") {
+                return Err(
+                    "numeric field overflow: a field with a declared precision and scale cannot hold an infinite value"
+                        .to_string(),
+                );
+            }
+            let unscaled = vc::parse_decimal_rounded(&canonical, scale)
+                .ok_or_else(|| format!("numeric field overflow: {} does not fit", vc::double_quoted(&canonical)))?;
+            vc::check_numeric_precision(unscaled, precision, scale)?;
+            Ok(vc::format_decimal_scaled(unscaled, scale))
+        }
+        ElementModifier::Varchar(n) if explicit => Ok(TextTypmod::Varchar(n).cast(&canonical).to_string()),
+        ElementModifier::Bpchar(n) if explicit => Ok(TextTypmod::Varchar(n).cast(&canonical).to_string()),
+        ElementModifier::Varchar(n) => TextTypmod::Varchar(n).assign(&canonical).map(str::to_string),
+        ElementModifier::Bpchar(n) => TextTypmod::Bpchar(n).assign(&canonical).map(str::to_string),
+        ElementModifier::Precision(p) => Ok(match round_time_bytes(element, encoded, p) {
+            Some(rounded) => crate::pgwire::format_column_text_scaled(element.clone(), &rounded, None).unwrap_or(canonical),
+            None => canonical,
+        }),
     }
 }
 
@@ -229,7 +376,7 @@ pub fn array_base(declared: &str) -> Option<&str> {
 
 /// The element type a [`TextTypmod::Element`] code names.
 pub fn element_db_type(code: u32) -> Option<crate::core::db_type::DbType> {
-    u8::try_from(code).ok().map(crate::core::db_type::DbType::from_byte)
+    Some(crate::core::db_type::DbType::from_byte(element_code(code)))
 }
 
 /// An element type's name as PostgreSQL writes it (`integer`), for errors.
@@ -316,7 +463,13 @@ impl TextTypmod {
             TextTypmod::Varchar(0) => "character varying".to_string(),
             TextTypmod::Varchar(n) => format!("character varying({n})"),
             TextTypmod::Precision(p) => format!("precision({p})"),
-            TextTypmod::Element(b) => format!("{}[]", element_type_name(*b)),
+            TextTypmod::Element(b) => match element_modifier(*b) {
+                Some(ElementModifier::Numeric { precision, scale }) => format!("numeric({precision},{scale})[]"),
+                Some(ElementModifier::Varchar(n)) => format!("character varying({n})[]"),
+                Some(ElementModifier::Bpchar(n)) => format!("character({n})[]"),
+                Some(ElementModifier::Precision(p)) => format!("{}({p})[]", element_type_name(*b)),
+                None => format!("{}[]", element_type_name(*b)),
+            },
         }
     }
 
@@ -439,7 +592,7 @@ pub fn assign_bytes(field: &crate::core::row::schema::SchemaField, bytes: &[u8])
             return Ok(None);
         }
         let Some(element) = element_db_type(code) else { return Ok(None) };
-        return crate::core::value_codec::hold_array_elements(bytes, &element);
+        return crate::core::value_codec::hold_array_elements_to(bytes, &element, element_modifier(code), false);
     }
     if let TextTypmod::Precision(p) = typmod {
         // A time value assigned to a column of declared precision is rounded
@@ -479,7 +632,9 @@ pub fn round_micros(micros: i64, precision: u32) -> i64 {
 pub fn round_time_bytes(db_type: &crate::core::db_type::DbType, bytes: &[u8], precision: u32) -> Option<Vec<u8>> {
     use crate::core::db_type::DbType;
     match db_type {
-        DbType::DATETIME => {
+        // `timestamp`, one storage type with `timestamptz` (an array's
+        // `timestamp(0)[]` elements are typed so; a column is `DATETIME`).
+        DbType::DATETIME | DbType::TIMESTAMP => {
             let raw = <[u8; 8]>::try_from(bytes).ok()?;
             let offset = crate::core::value_codec::PG_EPOCH_OFFSET_US;
             let pg = i64::from_le_bytes(raw).wrapping_sub(offset);
@@ -590,6 +745,12 @@ fn restrict_interval_fields(iv: &mut crate::core::pg_types::Interval, range: u32
 /// six or more (the type's own precision, nothing to round).
 pub fn parse_time_precision(declared: &str) -> Option<Result<TextTypmod, String>> {
     let text = declared.trim();
+    // `timestamp(0)[]` is an array, whose element type and modifier
+    // `parse_array_element` reads. Claimed here first, the column took the
+    // scalar's precision and was left an untyped array of text.
+    if array_base(text).is_some() {
+        return None;
+    }
     if let Some(fields) = parse_interval_fields(text) {
         return Some(fields);
     }
@@ -880,6 +1041,37 @@ pub fn parse_numeric_modifier(declared: &str) -> Option<Result<(u16, u16), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_element_modifier_round_trips_through_its_typmod() {
+        use crate::core::db_type::DbType;
+        let element = |t: &str| match parse_array_element(t) {
+            Some(TextTypmod::Element(raw)) => (DbType::from_byte(element_code(raw)), element_modifier(raw)),
+            other => panic!("{t}: {other:?}"),
+        };
+        assert_eq!(element("numeric(10,2)[]"), (DbType::DECIMAL, Some(ElementModifier::Numeric { precision: 10, scale: 2 })));
+        assert_eq!(element("numeric(1000,30)[]"), (DbType::DECIMAL, Some(ElementModifier::Numeric { precision: 1000, scale: 30 })));
+        assert_eq!(element("decimal(4)[]"), (DbType::DECIMAL, Some(ElementModifier::Numeric { precision: 4, scale: 0 })));
+        assert_eq!(element("varchar(5)[]"), (DbType::STRING, Some(ElementModifier::Varchar(5))));
+        assert_eq!(element("character(3) ARRAY"), (DbType::STRING, Some(ElementModifier::Bpchar(3))));
+        assert_eq!(element("timestamp(0)[]").1, Some(ElementModifier::Precision(0)));
+        assert_eq!(element("timestamp(3) with time zone[]"), (DbType::DATETIME, Some(ElementModifier::Precision(3))));
+        assert_eq!(element("int[]"), (DbType::I32, None));
+        // The code alone, as every array typed before modifiers were kept.
+        assert!(matches!(parse_array_element("int[]"), Some(TextTypmod::Element(c)) if c == u32::from(DbType::I32.to_byte())));
+        // Text with no length stays the untyped array.
+        assert_eq!(parse_array_element("text[]"), None);
+        assert_eq!(parse_array_element("varchar[]"), None);
+        // And every typmod still packs into a field's four bytes.
+        for t in ["numeric(1000,30)[]", "varchar(524286)[]", "timestamp(5)[]"] {
+            let typmod = parse_array_element(t).unwrap();
+            assert_eq!(PackedTypmod::pack(typmod).map(PackedTypmod::unpack), Some(typmod), "{t}");
+        }
+        // Past what the value holds: no modifier kept, so no typed column.
+        assert_eq!(parse_array_element("varchar(600000)[]"), None);
+        // `timestamp(0)[]` is the array's, not a scalar precision.
+        assert!(parse_time_precision("timestamp(0)[]").is_none());
+    }
 
     #[test]
     fn every_array_spelling_names_its_element_type() {
