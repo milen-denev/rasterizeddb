@@ -2492,7 +2492,17 @@ fn keep_few_open(db: &rclite::Arc<rasterizeddb_core::core::database::Database>) 
 async fn bounded<T>(what: String, fut: impl std::future::Future<Output = T>) -> T {
     match tokio::time::timeout(std::time::Duration::from_secs(300), fut).await {
         Ok(v) => v,
-        Err(_) => panic!("{what} did not finish within 300 s: a forget sweep never woke"),
+        Err(_) => {
+            // The process-wide sweep slots: all held with nothing running is
+            // the lost-permit hang (`SweepScheduler::acquire`).
+            let s = rasterizeddb_core::core::vacuum::sweep_scheduler();
+            panic!(
+                "{what} did not finish within 300 s: a forget sweep never woke (sweep slots: {} running, {} queued, peak {})",
+                s.running(),
+                s.queued(),
+                s.peak()
+            )
+        }
     }
 }
 

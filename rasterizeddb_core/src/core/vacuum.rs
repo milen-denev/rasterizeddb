@@ -2890,8 +2890,17 @@ impl SweepScheduler {
 
     /// Waits for a permit. `None` if `alive` goes false while waiting — the
     /// table was dropped and its service is stopping.
+    ///
+    /// Cancel-safe: dropped while waiting, it leaves the queue, and a slot
+    /// already handed to it is handed on. It was not: a grant `release` had
+    /// sent to a waiter whose future was then dropped (a partition's service
+    /// stopped as the open budget closed it) was never turned into a permit,
+    /// so never released, and the process had one sweep slot fewer for good.
+    /// With two, two such losses stopped every forget sweep in every
+    /// database, waiting on a slot nobody held (the `partition_twin` hang,
+    /// 2026-11-09).
     pub async fn acquire(&self, priority: f64, alive: &AtomicBool) -> Option<SweepPermit<'_>> {
-        let (seq, mut wake) = {
+        let (seq, wake) = {
             let mut state = self.inner.lock();
             if state.running < self.max && state.queue.is_empty() {
                 state.running += 1;
@@ -2904,29 +2913,25 @@ impl SweepScheduler {
             state.queue.push((priority, seq, tx));
             (seq, rx)
         };
+        let mut waiting = Waiting { scheduler: self, seq, wake: Some(wake) };
         loop {
+            let wake = waiting.wake.as_mut().expect("waiting");
             tokio::select! {
-                granted = &mut wake => {
+                granted = wake => {
                     // A sender is only dropped unsent by `release` when it
                     // failed to send, which needs this receiver gone; so here
                     // it was sent.
                     let _ = granted;
+                    waiting.wake = None;
                     return Some(SweepPermit { scheduler: self });
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     if alive.load(Ordering::Acquire) {
                         continue;
                     }
-                    let mut state = self.inner.lock();
-                    if let Some(at) = state.queue.iter().position(|(_, s, _)| *s == seq) {
-                        state.queue.remove(at);
-                        return None;
-                    }
-                    drop(state);
-                    // Granted in the meantime: take it and give it straight back.
-                    if wake.try_recv().is_ok() {
-                        drop(SweepPermit { scheduler: self });
-                    }
+                    // Leaves the queue, or hands a slot granted meanwhile on
+                    // (`Waiting`'s drop).
+                    drop(waiting);
                     return None;
                 }
             }
@@ -2985,6 +2990,35 @@ impl SweepScheduler {
 impl Drop for SweepPermit<'_> {
     fn drop(&mut self) {
         self.scheduler.release();
+    }
+}
+
+/// A waiter's place in the queue, until it holds a permit. Dropped first
+/// (cancelled, or given up as its table stops), it takes its entry out of
+/// the queue; if `release` had already granted it the slot, it releases it,
+/// so the slot reaches the next waiter rather than being lost.
+struct Waiting<'a> {
+    scheduler: &'a SweepScheduler,
+    seq: u64,
+    /// `None` once it has turned into a permit.
+    wake: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let Some(mut wake) = self.wake.take() else { return };
+        let mut state = self.scheduler.inner.lock();
+        if let Some(at) = state.queue.iter().position(|(_, s, _)| *s == self.seq) {
+            state.queue.remove(at);
+            return;
+        }
+        drop(state);
+        // Not queued: `release` sent this waiter the slot. Closing the
+        // receiver first makes the outcome final; a grant in it is passed on.
+        wake.close();
+        if wake.try_recv().is_ok() {
+            self.scheduler.release();
+        }
     }
 }
 
@@ -4014,5 +4048,45 @@ mod push_run_tests {
             "a run spanned a gap, which clears the live slots inside it"
         );
         assert_eq!(runs_of(&[5, 7, 9]), vec![(5, 1), (7, 1), (9, 1)]);
+    }
+}
+
+#[cfg(test)]
+mod sweep_scheduler_tests {
+    use super::*;
+    use futures::FutureExt;
+
+    /// A waiter handed the slot and then dropped before it ran gives the
+    /// slot on. It kept it: one slot fewer for good, and with them all lost
+    /// no sweep anywhere ever ran again.
+    #[tokio::test]
+    async fn a_waiter_dropped_after_its_grant_gives_the_slot_back() {
+        let scheduler = SweepScheduler::new(1);
+        let alive = AtomicBool::new(true);
+        let held = scheduler.acquire(1.0, &alive).await.expect("the free slot");
+        let mut waiter = Box::pin(scheduler.acquire(1.0, &alive));
+        assert!((&mut waiter).now_or_never().is_none(), "queued behind the holder");
+        assert_eq!(scheduler.queued(), 1);
+        drop(held); // granted to the waiter, which has not run since
+        assert_eq!(scheduler.running(), 1);
+        drop(waiter);
+        assert_eq!(scheduler.running(), 0, "the slot granted to a dropped waiter was lost");
+        // And the next one gets it.
+        let next = scheduler.acquire(1.0, &alive).now_or_never();
+        assert!(matches!(next, Some(Some(_))));
+    }
+
+    /// A waiter dropped while still queued leaves the queue.
+    #[tokio::test]
+    async fn a_waiter_dropped_while_queued_leaves_the_queue() {
+        let scheduler = SweepScheduler::new(1);
+        let alive = AtomicBool::new(true);
+        let held = scheduler.acquire(1.0, &alive).await.expect("the free slot");
+        let mut waiter = Box::pin(scheduler.acquire(1.0, &alive));
+        assert!((&mut waiter).now_or_never().is_none());
+        drop(waiter);
+        assert_eq!(scheduler.queued(), 0);
+        drop(held);
+        assert_eq!(scheduler.running(), 0);
     }
 }
