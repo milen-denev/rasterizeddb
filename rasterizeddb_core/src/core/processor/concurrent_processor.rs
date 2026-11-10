@@ -2996,7 +2996,7 @@ pub(crate) fn compare_bytes_as_type(
         // to be exhaustive and a byte compare is the safe answer.
         // An array element by element, as PostgreSQL orders one
         // (`value_codec::array_order`).
-        DbType::ARRAY => crate::core::value_codec::array_order(a, b),
+        DbType::ARRAY | DbType::ARRAYOF(_) => crate::core::value_codec::array_order(a, b),
         DbType::STRING
         | DbType::BYTEA
         | DbType::UNKNOWN

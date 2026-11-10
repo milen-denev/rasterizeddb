@@ -483,6 +483,8 @@ mod tests {
                     $(DbType::$v)|* => {}
                     // The one variant with a payload: reporting-only.
                     DbType::BPCHAR(_) => {}
+                    // Reporting-only too: stored, it is an `ARRAY`.
+                    DbType::ARRAYOF(_) => {}
                 }
             }
             let _ = exhaustive;

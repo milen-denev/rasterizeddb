@@ -81,6 +81,8 @@ fn class(t: &DbType) -> Class {
         | DbType::ARRAY
         | DbType::JSON
         | DbType::BPCHAR(_)
+        // Reporting-only: a typed array column is the `ARRAY` it is stored as.
+        | DbType::ARRAYOF(_)
         // Reporting-only, as `JSON` is: a `timestamp` column is stored and
         // indexed as the `DATETIME` it is.
         | DbType::TIMESTAMP

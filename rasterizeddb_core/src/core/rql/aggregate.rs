@@ -769,6 +769,17 @@ impl SelectItem {
                     _ => self.result_type(),
                 }
             }
+            // `MIN`/`MAX` of a typed array column is that array type, as the
+            // column is (`integer[]`), and its cells go out in that type's
+            // binary form from this one type.
+            SelectItem::Aggregate { func: AggFunc::Min | AggFunc::Max, arg: Some(field), arg_expr: None, .. }
+                if field.db_type == DbType::ARRAY && matches!(field.text_typmod(), Some(TextTypmod::Element(_))) =>
+            {
+                match field.text_typmod() {
+                    Some(TextTypmod::Element(code)) => u8::try_from(code).map_or(DbType::ARRAY, DbType::ARRAYOF),
+                    _ => self.result_type(),
+                }
+            }
             // `MIN`/`MAX` of a `timestamp` (without time zone) column is a
             // `timestamp`, as the column is. Its result type is the column's
             // storage type, `timestamptz`'s; described from that, the value

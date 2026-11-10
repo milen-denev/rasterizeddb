@@ -138,27 +138,43 @@ async fn array_agg_orders_as_its_element_type() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_typed_array_reads_back_in_binary_as_text_array() {
+async fn a_typed_array_is_described_and_sent_as_its_type() {
     let (_s, pool) = server().await;
     table(&pool).await;
-    ok(&pool, "INSERT INTO ta (id, i, b) VALUES (1, '{01,2}', '{yes,NULL}')").await;
-    // sqlx asks for binary results; the column is described as `text[]`.
-    let row = sqlx::query("SELECT i, b FROM ta WHERE id = 1").fetch_one(&pool).await.expect("select");
-    let i: Vec<String> = row.try_get(0).expect("int[] as text[] in binary");
-    let b: Vec<Option<String>> = row.try_get(1).expect("boolean[] as text[] in binary");
-    assert_eq!(i, ["1", "2"]);
-    assert_eq!(b, [Some("t".to_string()), None]);
-    // sqlx reads text elements under any element OID, so the OID itself is
-    // checked: `text[]`'s binary form names text (25) whatever the column's
-    // element type, or a client that checks it (tokio-postgres, JDBC)
-    // refuses the column or decodes text as integers.
+    ok(&pool, "INSERT INTO ta (id, i, b, n, t) VALUES (1, '{01,2}', '{yes,NULL}', '{1.50,-2}', '{x,NULL}')").await;
+    // sqlx asks for binary results and checks each column's described type
+    // against the Rust type: `integer[]` decodes as Vec<i32>, and so on.
+    let row = sqlx::query("SELECT i, b, n, t FROM ta WHERE id = 1").fetch_one(&pool).await.expect("select");
+    let i: Vec<i32> = row.try_get(0).expect("integer[] as Vec<i32>");
+    let b: Vec<Option<bool>> = row.try_get(1).expect("boolean[] as Vec<Option<bool>>");
+    let n: Vec<rust_decimal::Decimal> = row.try_get(2).expect("numeric[] as Vec<Decimal>");
+    let t: Vec<Option<String>> = row.try_get(3).expect("text[] as Vec<Option<String>>");
+    assert_eq!(i, [1, 2]);
+    assert_eq!(b, [Some(true), None]);
+    assert_eq!(n.iter().map(|d| d.to_string()).collect::<Vec<_>>(), ["1.50", "-2"]);
+    assert_eq!(t, [Some("x".to_string()), None]);
+    // The element OID in the bytes is the described type's.
     use sqlx::ValueRef;
-    for at in 0..2 {
+    for (at, oid) in [(0usize, 23i32), (1, 16), (2, 1700), (3, 25)] {
         let raw = row.try_get_raw(at).expect("raw");
-        assert!(!raw.is_null());
         let bytes = raw.as_bytes().expect("binary bytes");
-        assert_eq!(&bytes[8..12], &25i32.to_be_bytes(), "column {at}'s element OID");
+        assert_eq!(&bytes[8..12], &oid.to_be_bytes(), "column {at}'s element OID");
     }
+    // The same column through a join, RETURNING and a derived table.
+    ok(&pool, "CREATE TABLE other (id INT, label TEXT)").await;
+    ok(&pool, "INSERT INTO other VALUES (1, 'one')").await;
+    let joined: (Vec<i32>, String) =
+        sqlx::query_as("SELECT ta.i, other.label FROM ta JOIN other ON ta.id = other.id").fetch_one(&pool).await.expect("join");
+    assert_eq!(joined, (vec![1, 2], "one".to_string()));
+    let returned: (Vec<i32>,) = sqlx::query_as("UPDATE ta SET i = '{7,8}' WHERE id = 1 RETURNING i").fetch_one(&pool).await.expect("returning");
+    assert_eq!(returned.0, [7, 8]);
+    let derived: (Vec<i32>,) = sqlx::query_as("SELECT x FROM (SELECT i AS x FROM ta) s").fetch_one(&pool).await.expect("derived");
+    assert_eq!(derived.0, [7, 8]);
+    // A parameter bound as integer[] in binary.
+    ok(&pool, "CREATE TABLE pb (xs INT[])").await;
+    sqlx::query("INSERT INTO pb VALUES ($1)").bind(vec![3i32, 4]).execute(&pool).await.expect("bind int[]");
+    let back: (Vec<i32>,) = sqlx::query_as("SELECT xs FROM pb").fetch_one(&pool).await.expect("read back");
+    assert_eq!(back.0, [3, 4]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -241,4 +257,64 @@ async fn a_renamed_column_keeps_its_precision() {
     ok(&pool, "ALTER TABLE pr RENAME COLUMN ts TO t2").await;
     ok(&pool, "INSERT INTO pr VALUES ('2020-01-01 00:00:05.7')").await;
     assert_eq!(column(&pool, "SELECT t2 FROM pr").await, ["2020-01-01 00:00:06"]);
+}
+
+/// Every shape a typed array column is read through, in binary: the
+/// description (`integer[]`) and the cells come from two computations on the
+/// extended protocol, and where they disagreed a client decoded the stored
+/// text elements as integers (`{7,8}` read as `[55, 56]`) — no error, wrong
+/// numbers. Each shape is decoded as Vec<i32> and compared.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_query_shape_sends_a_typed_array_as_described() {
+    let (_s, pool) = server().await;
+    ok(&pool, "CREATE TABLE sh (id INT PRIMARY KEY, i INT[], g INT)").await;
+    ok(&pool, "INSERT INTO sh VALUES (1, '{7,8}', 1), (2, '{9}', 1), (3, '{10,0}', 2)").await;
+    ok(&pool, "CREATE TABLE sh2 (id INT, label TEXT)").await;
+    ok(&pool, "INSERT INTO sh2 VALUES (1, 'one')").await;
+    let one = |v: &[i32]| vec![v.to_vec()];
+    let cases: Vec<(&str, Vec<Vec<i32>>)> = vec![
+        ("SELECT i FROM sh WHERE id = 1", one(&[7, 8])),
+        ("SELECT i FROM sh ORDER BY i", vec![vec![7, 8], vec![9], vec![10, 0]]),
+        ("SELECT i FROM sh ORDER BY id LIMIT 1", one(&[7, 8])),
+        ("SELECT i AS renamed FROM sh WHERE id = 2", one(&[9])),
+        ("SELECT id, i FROM sh WHERE id = 3", one(&[10, 0])),
+        ("SELECT max(i) FROM sh", one(&[10, 0])),
+        ("SELECT min(i) FROM sh WHERE g = 1", one(&[7, 8])),
+        ("SELECT i FROM sh GROUP BY i ORDER BY i DESC LIMIT 1", one(&[10, 0])),
+        ("SELECT DISTINCT i FROM sh WHERE id = 1", one(&[7, 8])),
+        ("SELECT sh.i FROM sh JOIN sh2 ON sh.id = sh2.id", one(&[7, 8])),
+        ("SELECT s.i FROM sh2 JOIN sh s ON s.id = sh2.id", one(&[7, 8])),
+        ("WITH c AS (SELECT i FROM sh WHERE id = 1) SELECT i FROM c", one(&[7, 8])),
+        ("SELECT x FROM (SELECT i AS x FROM sh WHERE id = 2) s", one(&[9])),
+        ("SELECT i FROM sh WHERE id = 1 UNION ALL SELECT i FROM sh WHERE id = 2", vec![vec![7, 8], vec![9]]),
+        ("SELECT i FROM sh WHERE id IN (SELECT id FROM sh2)", one(&[7, 8])),
+        ("UPDATE sh SET g = 5 WHERE id = 1 RETURNING i", one(&[7, 8])),
+        ("INSERT INTO sh VALUES (4, '{4}', 3) RETURNING i", one(&[4])),
+        ("DELETE FROM sh WHERE id = 4 RETURNING i", one(&[4])),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in cases {
+        let rows = match sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_all(&pool).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                wrong.push(format!("{sql}: {e}"));
+                continue;
+            }
+        };
+        let col = if sql.starts_with("SELECT id, i") { 1 } else { 0 };
+        let got: Result<Vec<Vec<i32>>, String> =
+            rows.iter().map(|r| r.try_get::<Vec<i32>, _>(col).map_err(|e| e.to_string())).collect();
+        match got {
+            Ok(got) if got == want => {}
+            Ok(got) => wrong.push(format!("{sql}: got {got:?}, want {want:?}")),
+            Err(e) => wrong.push(format!("{sql}: {e}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // An expression over one has no element type here: described `text[]`
+    // (PostgreSQL says `integer[]`), and sent as `text[]` to match, so a
+    // client asking for integers is refused rather than misled.
+    let row = sqlx::query("SELECT COALESCE(i, '{}') FROM sh WHERE id = 2").fetch_one(&pool).await.expect("coalesce");
+    assert!(row.try_get::<Vec<i32>, _>(0).is_err());
+    assert_eq!(row.try_get::<Vec<String>, _>(0).expect("as text[]"), ["9"]);
 }

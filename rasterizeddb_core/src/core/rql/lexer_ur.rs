@@ -233,6 +233,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // alongside `BYTEA` and `ARRAY` rather than given an arm each, because
         // they all reach the same encoder — see `lexer_ir`'s matching arm.
         DbType::ARRAY
+        | DbType::ARRAYOF(_)
         | DbType::INTERVAL
         | DbType::MACADDR
         | DbType::MACADDR8

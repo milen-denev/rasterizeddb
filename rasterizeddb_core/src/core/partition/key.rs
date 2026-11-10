@@ -75,7 +75,7 @@ pub fn family_of(t: &DbType) -> Result<KeyFamily, String> {
         DbType::DECIMAL => "NUMERIC bytes depend on the scale, and parsing a literal truncates it",
         DbType::JSON | DbType::JSONB => "its = is not PostgreSQL's, and is not property-tested",
         DbType::JSONTEXT => "json has no equality operator in PostgreSQL",
-        DbType::BPCHAR(_) => "it is a reporting type, never a column's",
+        DbType::BPCHAR(_) | DbType::ARRAYOF(_) => "it is a reporting type, never a column's",
         DbType::CHAR => "CHAR is blank-padded in PostgreSQL and is not on the allowlist; use TEXT or VARCHAR",
         DbType::INTERVAL
         | DbType::TIMETZ

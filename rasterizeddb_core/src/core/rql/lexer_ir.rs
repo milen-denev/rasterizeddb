@@ -389,6 +389,7 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
         // one encoder so the `INSERT` and `UPDATE` paths cannot disagree about
         // what they accept.
         DbType::ARRAY
+        | DbType::ARRAYOF(_)
         | DbType::INTERVAL
         | DbType::MACADDR
         | DbType::MACADDR8

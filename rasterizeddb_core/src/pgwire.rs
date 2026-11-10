@@ -10088,6 +10088,13 @@ fn reported_type_of(
         // `bpchar` with its length and formatted padded to it — the one type
         // here both the description and the value are taken from.
         DbType::bpchar(n)
+    } else if let (DbType::ARRAY, Some(crate::core::rql::type_modifier::TextTypmod::Element(code))) =
+        (&field.db_type, field.text_typmod())
+    {
+        // A typed array column (`integer[]`): described as its element
+        // type's array, and its binary cells in that type's form, from this
+        // one type as `character(n)` is above.
+        u8::try_from(code).map_or(DbType::ARRAY, DbType::ARRAYOF)
     } else {
         // `literal_type`: a `timestamp` (without time zone) column is
         // described as `timestamp` and its values formatted with no `+00`,
@@ -10617,6 +10624,59 @@ mod serialized_result_tests {
     }
 }
 
+/// A stored array (elements as text) in the binary form of an array of the
+/// element type `code` names: each element read as that type
+/// (`value_codec::encode_element`) and sent in its binary form, under its
+/// OID. An element that does not read as the type (none can: a typed
+/// column's elements are held to it as they are written) sends the array as
+/// `text[]`'s instead.
+pub(crate) fn typed_array_binary(bytes: &[u8], code: u8) -> Vec<u8> {
+    let element = DbType::from_byte(code);
+    let Some((_, elements)) = crate::core::value_codec::decode_array(bytes) else {
+        return crate::core::value_codec::as_text_array(bytes);
+    };
+    let mut binary: Vec<Option<Vec<u8>>> = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match e {
+            None => binary.push(None),
+            Some(text) => {
+                let converted = std::str::from_utf8(text)
+                    .ok()
+                    .and_then(|t| Some((t, crate::core::value_codec::encode_element(&element, t)?)))
+                    .map(|(t, engine)| match element {
+                        // A `numeric` element keeps the places it was written
+                        // with (`1.50`), as its text form does: a cell carrying
+                        // its own display scale.
+                        DbType::DECIMAL => numeric_element_cell(t, engine),
+                        _ => engine,
+                    })
+                    .and_then(|engine| format_column_binary(element.clone(), &engine, None));
+                match converted {
+                    Some(b) => binary.push(Some(b)),
+                    None => return crate::core::value_codec::as_text_array(bytes),
+                }
+            }
+        }
+    }
+    crate::core::value_codec::build_array_pub(element.pg_oid() as i32, binary.iter().map(|e| e.as_deref()))
+}
+
+/// A `numeric` element's cell at the places its text shows (`1.50` at two),
+/// from the engine-scale cell `engine` it was read into.
+fn numeric_element_cell(text: &str, engine: Vec<u8>) -> Vec<u8> {
+    let places = match text.trim().split_once('.') {
+        Some((_, frac)) if !text.contains(['e', 'E']) => frac.len() as u32,
+        _ => 0,
+    };
+    let engine_scale = crate::core::value_codec::DECIMAL_SCALE;
+    match crate::core::value_codec::split_decimal_cell(&engine) {
+        Some((v, None)) if places <= engine_scale => {
+            crate::core::value_codec::decimal_cell_with_scale(v / 10i128.pow(engine_scale - places), places)
+        }
+        _ => engine,
+    }
+}
+
 fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Option<Vec<u8>> {
     if matches!(db_type, DbType::NULL | DbType::START | DbType::END) {
         return None;
@@ -10743,6 +10803,9 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
         // (`value_codec::hold_array_elements`), which over text elements
         // a client would decode as that type's binary form.
         DbType::ARRAY => Some(crate::core::value_codec::as_text_array(bytes)),
+        // A typed array column, described as its element type's array
+        // (`integer[]`): each element in that type's binary form.
+        DbType::ARRAYOF(code) => Some(typed_array_binary(bytes, code)),
         // Postgres sends a UUID as its 16 raw octets, which is exactly how it
         // is stored.
         DbType::UUID => {
@@ -11132,7 +11195,7 @@ fn format_column_text_inner(db_type: DbType, bytes: &[u8]) -> Option<String> {
 
         DbType::BYTEA => crate::core::value_codec::format_bytea(bytes),
 
-        DbType::ARRAY => match crate::core::value_codec::format_array(bytes) {
+        DbType::ARRAY | DbType::ARRAYOF(_) => match crate::core::value_codec::format_array(bytes) {
             Some(s) => s,
             None => return None,
         },

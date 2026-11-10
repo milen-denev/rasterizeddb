@@ -1353,6 +1353,11 @@ pub fn parse_array_literal_as(text: &str, oid: i32) -> Option<Vec<u8>> {
     Some(build_array(oid, elements.iter().map(|e| e.as_deref().map(str::as_bytes))))
 }
 
+/// [`build_array`], for the wire layer's typed binary arrays.
+pub fn build_array_pub<'a>(oid: i32, elements: impl ExactSizeIterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
+    build_array(oid, elements)
+}
+
 /// A one-dimensional binary array of `elements` (`None` a NULL) under `oid`.
 fn build_array<'a>(oid: i32, elements: impl ExactSizeIterator<Item = Option<&'a [u8]>> + Clone) -> Vec<u8> {
     let count = elements.len();

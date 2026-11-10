@@ -148,6 +148,14 @@ pub enum DbType {
     /// 10485760, is reported as `bpchar` with none ([`DbType::bpchar`]) and
     /// shown as stored, unpadded.
     BPCHAR(u16),
+    /// Reporting only, as [`DbType::BPCHAR`] is: an array column of a declared
+    /// element type (`type_modifier::TextTypmod::Element`), the element's
+    /// [`DbType::to_byte`] code. The wire layer substitutes it when
+    /// describing one (`integer[]`, OID 1007), formats the cell's text as an
+    /// array's, and its binary form with each element in its type's binary
+    /// form, so the description and the value come from the one place.
+    /// Stored, it is an [`DbType::ARRAY`].
+    ARRAYOF(u8),
     /// Sentinel / UNKNOWN type. Used for forward-compat and internal meta records.
     UNKNOWN,
     NULL,
@@ -191,6 +199,7 @@ impl DbType {
             | DbType::TSRANGE
             | DbType::TSTZRANGE
             | DbType::DATERANGE
+            | DbType::ARRAYOF(_)
             | DbType::BPCHAR(_) => DbType::STRING,
             // The same eight bytes as a `timestamptz`.
             DbType::TIMESTAMP => DbType::DATETIME,
@@ -292,6 +301,8 @@ impl DbType {
             // Never written to disk either; its length does not survive the
             // byte (45 reads back as a `bpchar` with none, shown as stored).
             DbType::BPCHAR(_) => 45,
+            // Never written either: it is an `ARRAY` stored.
+            DbType::ARRAYOF(_) => 21,
             DbType::NULL => 253,
             DbType::START => 254,
             DbType::END => 255,
@@ -383,6 +394,7 @@ impl DbType {
             // length live in the row, and the bytes themselves follow it.
             DbType::BYTEA
             | DbType::ARRAY
+            | DbType::ARRAYOF(_)
             | DbType::JSONB
             | DbType::BIT
             | DbType::VARBIT
@@ -435,6 +447,7 @@ impl DbType {
             DbType::F64 => 701,
             DbType::STRING => 25,     // TEXT
             DbType::BPCHAR(_) => 1042, // bpchar
+            DbType::ARRAYOF(code) => array_oid_of(DbType::from_byte(*code).pg_oid()),
             DbType::DATETIME => 1184, // timestamptz
             DbType::TIMESTAMP => 1114,
             DbType::JSONTEXT => 114,
@@ -508,7 +521,7 @@ impl DbType {
             // variable even though we store it fixed-width.
             DbType::INET => -1,
             DbType::DECIMAL => -1,
-            DbType::BYTEA | DbType::ARRAY => -1,
+            DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_) => -1,
             DbType::INTERVAL => crate::core::pg_types::INTERVAL_LEN as i16,
             DbType::MACADDR => crate::core::pg_types::MACADDR_LEN as i16,
             DbType::MACADDR8 => crate::core::pg_types::MACADDR8_LEN as i16,
@@ -520,5 +533,34 @@ impl DbType {
             DbType::LINE | DbType::CIRCLE => crate::core::pg_types::LINE_LEN as i16,
             _ => -1,
         }
+    }
+}
+
+/// PostgreSQL's array type of the element type `oid` (`_int4` for `int4`);
+/// `text[]` for one with none listed here.
+pub fn array_oid_of(oid: u32) -> u32 {
+    match oid {
+        16 => 1000,
+        17 => 1001,
+        20 => 1016,
+        21 => 1005,
+        23 => 1007,
+        25 => 1009,
+        700 => 1021,
+        701 => 1022,
+        869 => 1041,
+        829 => 1040,
+        774 => 775,
+        1082 => 1182,
+        1083 => 1183,
+        1114 => 1115,
+        1184 => 1185,
+        1186 => 1187,
+        1266 => 1270,
+        1560 => 1561,
+        1562 => 1563,
+        1700 => 1231,
+        2950 => 2951,
+        _ => 1009,
     }
 }

@@ -429,6 +429,10 @@ pub(super) fn encode_cell_binary(
             crate::core::value_codec::push_text_array(bytes, out);
             true
         }
+        DbType::ARRAYOF(code) => {
+            out.extend_from_slice(&super::typed_array_binary(bytes, *code));
+            true
+        }
         // `bpcharsend` is the padded text, as the text form is.
         DbType::BPCHAR(n) => {
             push_bpchar(bytes, *n, out);
@@ -727,6 +731,8 @@ mod cell_tests {
     fn all_types() -> Vec<DbType> {
         let mut types: Vec<DbType> = (1..=44u8).chain(252..=255).map(DbType::from_byte).collect();
         types.extend([DbType::NULL, DbType::START, DbType::END, DbType::UNKNOWN, DbType::TIMESTAMP]);
+        // Typed arrays, as a typed array column reports its cells.
+        types.extend([DbType::I32, DbType::BOOL, DbType::DECIMAL, DbType::DATE].iter().map(|t| DbType::ARRAYOF(t.to_byte())));
         types.sort();
         types.dedup();
         types

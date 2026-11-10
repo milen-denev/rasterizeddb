@@ -504,7 +504,7 @@ fn sql_type_of(db_type: &DbType) -> Option<&'static str> {
         DbType::JSONB | DbType::JSON => "JSONB",
         DbType::INET => "INET",
         DbType::BYTEA => "BYTEA",
-        DbType::ARRAY => "ARRAY",
+        DbType::ARRAY | DbType::ARRAYOF(_) => "ARRAY",
         // `character(n)` keeps its type through the relation: compared
         // without trailing spaces, and shown padded (`relation_columns`
         // declares it with its length).
@@ -552,6 +552,20 @@ async fn relation_columns(
         }
         _ => Vec::new(),
     };
+    // A typed array is described as `DbType::ARRAYOF`, the wire's word for
+    // it: here it is the `ARRAY` it is stored as, of that element type. Left
+    // as it was, no relation type matched it and the column became `TEXT`,
+    // whose rows went out as the array's stored bytes under the array type
+    // the statement was described as.
+    let described_elements: Vec<Option<DbType>> = described
+        .iter()
+        .map(|t| match t {
+            DbType::ARRAYOF(code) => Some(DbType::from_byte(*code)),
+            _ => None,
+        })
+        .collect();
+    let described: Vec<DbType> =
+        described.into_iter().map(|t| if matches!(t, DbType::ARRAYOF(_)) { DbType::ARRAY } else { t }).collect();
     let sampled_wide = declared_wide_types(query, labels, database);
     let engine = crate::core::value_codec::DECIMAL_SCALE;
     // A bare `character varying` column keeps that type in the relation, so
@@ -581,6 +595,14 @@ async fn relation_columns(
             .collect()
     };
 
+    let element_of = |index: usize| -> Option<DbType> {
+        elements
+            .get(index)
+            .cloned()
+            .flatten()
+            .or_else(|| described_elements.get(index).cloned().flatten())
+            .or_else(|| array_cells_element(rows, index))
+    };
     let mut columns = Vec::with_capacity(labels.len());
     for index in 0..labels.len() {
         // The first row that has a value here: a NULL is the absence of a
@@ -627,9 +649,9 @@ async fn relation_columns(
             // Through an untyped `ARRAY` they were re-read as text and
             // `ORDER BY` over a derived table sorted `{10}` before `{9}`.
             Some(DbType::ARRAY)
-                if elements.get(index).cloned().flatten().or_else(|| array_cells_element(rows, index)).as_ref().and_then(sql_type_of).is_some() =>
+                if element_of(index).as_ref().and_then(sql_type_of).is_some() =>
             {
-                let element = elements.get(index).cloned().flatten().or_else(|| array_cells_element(rows, index)).expect("checked");
+                let element = element_of(index).expect("checked");
                 format!("{}[]", sql_type_of(&element).expect("checked"))
             }
             Some(DbType::STRING) if varying.get(index).copied().flatten().is_some() => {
