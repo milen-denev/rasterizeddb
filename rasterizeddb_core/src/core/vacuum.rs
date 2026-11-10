@@ -619,6 +619,32 @@ impl VersionHorizon {
         self.manager.is_some()
     }
 
+    /// Whether `tx` has committed. `FROZEN_TX` and `NO_TX` are no
+    /// transactions to ask about.
+    #[inline]
+    pub(crate) fn committed(&self, tx: TxId) -> bool {
+        tx != FROZEN_TX
+            && tx != NO_TX
+            && self.manager.as_ref().is_some_and(|m| m.outcome(tx) == TxOutcome::Committed)
+    }
+
+    /// Whether `tx` is still running.
+    #[inline]
+    pub(crate) fn in_progress(&self, tx: TxId) -> bool {
+        tx != FROZEN_TX
+            && tx != NO_TX
+            && self.manager.as_ref().is_some_and(|m| m.outcome(tx) == TxOutcome::InProgress)
+    }
+
+    /// Whether `tx` is known to have aborted. `FROZEN_TX` and `NO_TX` are no
+    /// transactions to ask about.
+    #[inline]
+    pub(crate) fn aborted(&self, tx: TxId) -> bool {
+        tx != FROZEN_TX
+            && tx != NO_TX
+            && self.manager.as_ref().is_some_and(|m| m.outcome(tx) == TxOutcome::Aborted)
+    }
+
     /// The bound this horizon was taken at. Diagnostics only.
     #[inline]
     pub fn oldest_active(&self) -> TxId {
@@ -948,6 +974,16 @@ pub struct VacuumStats {
     /// statement's tombstones are durable. An `UPDATE` moves neither counter:
     /// its row is still one row. Monotonic.
     pub deleted_rows: AtomicU64,
+    /// The transaction system of a versioned table, which settles
+    /// [`Self::pending`] (`attach`).
+    resolver: Resolver,
+    /// Each running transaction's inserts and deletes, `(tx, inserted,
+    /// deleted)`: counted into the two counters once it commits, dropped if
+    /// it aborts. Counted when written, a rolled-back `DELETE` took its rows
+    /// off the live count until the next sweep, and a table not written
+    /// again is not swept again: four live rows read 0 live, 4 dead, for
+    /// good (`partition_shell_sites` S8).
+    pending: Mutex<Vec<(TxId, u64, u64)>>,
     /// What the last complete sweep counted live, and the two counters as
     /// they stood when it did. `None` until a sweep of this instance has seen
     /// every pointer.
@@ -962,7 +998,70 @@ struct SweptLive {
     deleted: u64,
 }
 
+/// The manager [`VacuumStats`] settles its pending counts against.
+#[derive(Default)]
+struct Resolver(std::sync::OnceLock<std::sync::Arc<TransactionManager>>);
+
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() { "Resolver(attached)" } else { "Resolver(none)" })
+    }
+}
+
 impl VacuumStats {
+    /// Counts the table's writes by their transactions' outcomes from here
+    /// on: a versioned table's.
+    pub(crate) fn attach(&self, manager: std::sync::Arc<TransactionManager>) {
+        let _ = self.resolver.0.set(manager);
+    }
+
+    /// `n` rows inserted by `tx`.
+    pub(crate) fn note_inserted(&self, tx: TxId, n: u64) {
+        self.note(tx, n, 0);
+    }
+
+    /// `n` rows deleted by `tx`.
+    pub(crate) fn note_deleted(&self, tx: TxId, n: u64) {
+        self.note(tx, 0, n);
+    }
+
+    fn note(&self, tx: TxId, inserted: u64, deleted: u64) {
+        if self.resolver.0.get().is_none() || tx == NO_TX || tx == FROZEN_TX {
+            self.inserted_rows.fetch_add(inserted, Ordering::AcqRel);
+            self.deleted_rows.fetch_add(deleted, Ordering::AcqRel);
+            return;
+        }
+        let mut pending = self.pending.lock();
+        match pending.iter_mut().find(|(t, _, _)| *t == tx) {
+            Some(entry) => {
+                entry.1 += inserted;
+                entry.2 += deleted;
+            }
+            None => pending.push((tx, inserted, deleted)),
+        }
+        drop(pending);
+        self.settle();
+    }
+
+    /// Counts the pending writes of every transaction that has committed,
+    /// and drops those of every one that aborted.
+    fn settle(&self) {
+        let Some(manager) = self.resolver.0.get() else { return };
+        let mut pending = self.pending.lock();
+        if pending.is_empty() {
+            return;
+        }
+        pending.retain(|&(tx, inserted, deleted)| match manager.outcome(tx) {
+            TxOutcome::Committed => {
+                self.inserted_rows.fetch_add(inserted, Ordering::AcqRel);
+                self.deleted_rows.fetch_add(deleted, Ordering::AcqRel);
+                false
+            }
+            TxOutcome::Aborted => false,
+            TxOutcome::InProgress => true,
+        });
+    }
+
     /// The table's live rows as last measured: the count a complete sweep
     /// took, plus the rows inserted since and minus the rows deleted since.
     /// `None` until a sweep of this instance has run: what writes alone
@@ -980,6 +1079,7 @@ impl VacuumStats {
     /// rolled back since (counted when written, not when committed). The next
     /// sweep replaces it. Callers clamp it to the slot count.
     pub fn live_rows(&self) -> Option<u64> {
+        self.settle();
         let swept = (*self.swept.lock())?;
         let inserted = self.inserted_rows.load(Ordering::Acquire).wrapping_sub(swept.inserted);
         let deleted = self.deleted_rows.load(Ordering::Acquire).wrapping_sub(swept.deleted);
@@ -988,6 +1088,7 @@ impl VacuumStats {
 
     /// The two write counters as they stand now, for [`Self::record_live`].
     fn counters(&self) -> (u64, u64) {
+        self.settle();
         (self.inserted_rows.load(Ordering::Acquire), self.deleted_rows.load(Ordering::Acquire))
     }
 
@@ -1044,6 +1145,8 @@ struct ScanResult {
     live_rows: u64,
     dead_rows: u64,
     held_rows: u64,
+    /// Kept versions left out of the live count ([`uncounted`]).
+    uncounted_rows: u64,
     held_min_xmax: TxId,
     live_bytes: u64,
     live: Vec<Extent>,
@@ -1180,11 +1283,32 @@ async fn forget_reclaimed<S: StorageIO>(
 /// Reads every pointer record and reports the live and dead extents.
 /// Whether the sweep counts a version it keeps as held: stamped by a deleter
 /// the horizon has not passed, in flight or committed while an older
-/// transaction runs. An aborted deleter below the horizon is a live row and
-/// is not counted, or a table with old aborted deletes would look
-/// permanently due.
+/// transaction runs. A deleter that aborted deleted nothing, wherever it is:
+/// the row is live and is not counted. Counted held above the horizon, every
+/// row a rolled-back `UPDATE` or `DELETE` had stamped read as dead to a sweep
+/// right after it, and a table not written again was never swept again, so
+/// `pg_stat_user_tables` said 0 live and 4 dead for four live rows for good
+/// (`partition_shell_sites` S8, the twin side).
 fn is_held(horizon: &VersionHorizon, pointer: &RowPointer) -> bool {
-    horizon.is_versioned() && pointer.xmax != NO_TX && pointer.xmax >= horizon.oldest_active()
+    horizon.is_versioned()
+        && pointer.xmax != NO_TX
+        && pointer.xmax >= horizon.oldest_active()
+        && !horizon.aborted(pointer.xmax)
+}
+
+/// Whether a version the sweep keeps is left out of its live count: deleted
+/// by a transaction that committed (held for an older snapshot), or written
+/// by one still running. The live count is committed rows: a running
+/// transaction's insert is counted when it commits, and a row it deletes
+/// stays live until then (`VacuumStats::pending`). An in-flight delete
+/// counted held, and a rollback never gave the row back.
+fn uncounted(horizon: &VersionHorizon, pointer: &RowPointer) -> bool {
+    if !horizon.is_versioned() {
+        return false;
+    }
+    let deleted = pointer.xmax != NO_TX && horizon.committed(pointer.xmax);
+    let unborn = horizon.in_progress(pointer.xmin);
+    deleted || unborn
 }
 
 /// The live rows, less the held ones, among the pointers past the first
@@ -1209,7 +1333,7 @@ async fn count_tail_live<S: StorageIO>(io_pointers: &S, from: u64, horizon: &Ver
         }
         for record in chunk.chunks_exact(RECORD) {
             let pointer = RowPointer::from_slice_unknown(record);
-            if !horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) && !is_held(horizon, &pointer) {
+            if !horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) && !uncounted(horizon, &pointer) {
                 live += 1;
             }
         }
@@ -1232,6 +1356,7 @@ async fn scan_pointers<S: StorageIO>(
         live_rows: 0,
         dead_rows: 0,
         held_rows: 0,
+        uncounted_rows: 0,
         held_min_xmax: NO_TX,
         live_bytes: 0,
         live: Vec::new(),
@@ -1304,6 +1429,9 @@ async fn scan_pointers<S: StorageIO>(
                 if result.held_min_xmax == NO_TX || pointer.xmax < result.held_min_xmax {
                     result.held_min_xmax = pointer.xmax;
                 }
+            }
+            if uncounted(horizon, pointer) {
+                result.uncounted_rows += 1;
             }
             result.live_rows += 1;
             result.live_bytes += pointer.length as u64;
@@ -1773,7 +1901,7 @@ pub async fn run_once<S: StorageIO>(
     if let Some(stats) = ctx.stats {
         let counters = stats.counters();
         match count_tail_live(io_pointers, scan.slots, horizon).await {
-            Ok(tail) => stats.record_live(scan.live_rows.saturating_sub(scan.held_rows) + tail, counters),
+            Ok(tail) => stats.record_live(scan.live_rows.saturating_sub(scan.uncounted_rows) + tail, counters),
             Err(e) => log::warn!("vacuum: counting the pointers appended during the sweep: {e}; live rows not measured"),
         }
     }

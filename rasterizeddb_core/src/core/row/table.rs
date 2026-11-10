@@ -2153,6 +2153,9 @@ impl<S: StorageIO> Table<S> {
         if !self.is_shell() && self.watch.is_none() {
             let _ = self.forget.set(manager.register_table());
         }
+        if let Ok(d) = self.data() {
+            d.vacuum_stats.attach(manager.clone());
+        }
         self.versions.store(Some(manager));
     }
 
@@ -4709,7 +4712,7 @@ impl<S: StorageIO> Table<S> {
             error!("Failed to insert row: {}", e);
             std::io::Error::from(e)
         })?;
-        d.vacuum_stats.inserted_rows.fetch_add(1, AtomicOrdering::Relaxed);
+        d.vacuum_stats.note_inserted(written_by, 1);
 
         // Index the new slot. The pointer record position IS the slot address
         // (dense fixed-stride file), so no mapping is needed.
@@ -4789,7 +4792,7 @@ impl<S: StorageIO> Table<S> {
                 .await
                 .map_err(std::io::Error::from)?;
         } else {
-            d.vacuum_stats.inserted_rows.fetch_add(1, AtomicOrdering::Relaxed);
+            d.vacuum_stats.note_inserted(xmin, 1);
         }
 
         let slot = record_pos / ROW_POINTER_RECORD_LEN as u64;
@@ -5552,9 +5555,7 @@ impl<S: StorageIO> Table<S> {
         // sees a generation that already accounts for everything above.
         self.dead_stamps
             .fetch_add(deleted_count, AtomicOrdering::Relaxed);
-        d.vacuum_stats
-            .deleted_rows
-            .fetch_add(deleted_count, AtomicOrdering::Relaxed);
+        d.vacuum_stats.note_deleted(deleted_by, deleted_count);
         self.write_generation.fetch_add(1, AtomicOrdering::AcqRel);
 
         if deleted_count > 0 {

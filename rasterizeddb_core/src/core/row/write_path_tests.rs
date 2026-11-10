@@ -4553,6 +4553,51 @@ async fn a_failed_row_bytes_flush_fails_the_insert() {
 /// the rows its creator inserted next, and an insert-only table is never
 /// swept again: `pg_stat_user_tables` said 0 live and 4 dead for four live
 /// rows, for good (seen as a flaky `partition_shell_sites` under load).
+/// A row a rolled-back `DELETE` stamped is live: swept while an older
+/// transaction still runs, its aborted deleter is above the horizon, and it
+/// was counted held (dead) — 0 live and 4 dead for four live rows, for good,
+/// on a table nothing wrote again (`partition_shell_sites` S8, the twin).
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_a_rolled_back_delete_stamped_are_counted_live() {
+    use crate::core::mvcc::TransactionManager;
+    use crate::core::mvcc::status::StatusLog;
+    use std::sync::Arc as StdArc;
+    let dir = tempfile::tempdir().unwrap();
+    let status_path = dir.path().join("status.log");
+    let t = open_table(dir.path(), "wp_live_abort").await;
+    for i in 0..4u64 {
+        insert(&t, i, i as i32, "live").await;
+    }
+    let manager = StdArc::new(TransactionManager::new(StatusLog::open(&status_path).expect("status log")));
+    t.enable_versioning(manager.clone());
+    // Older than the deleter, and still running when the sweep runs: the
+    // horizon stays below the deleter's id.
+    let older = manager.begin();
+    let deleter = manager.begin();
+    let n = t.delete_rows_in_txn("cat < 100", full_fetch(&t.schema.fields), None, deleter).await.unwrap();
+    assert_eq!(n, 4);
+    manager.abort(deleter);
+    t.vacuum_now().await.unwrap();
+    let stats = &t.data().unwrap().vacuum_stats;
+    assert_eq!(stats.live_rows(), Some(4), "a rolled-back delete's rows are live");
+    // After a sweep, a delete counts once it commits, and not if it rolls
+    // back: counted when written, the rolled-back one read 0 live until the
+    // next sweep, which a table nothing writes again never gets.
+    let rolled_back = manager.begin();
+    t.delete_rows_in_txn("cat < 100", full_fetch(&t.schema.fields), None, rolled_back).await.unwrap();
+    assert_eq!(stats.live_rows(), Some(4), "an uncommitted delete");
+    manager.abort(rolled_back);
+    assert_eq!(stats.live_rows(), Some(4), "a rolled-back delete");
+    // In flight while a sweep runs: still live, until it commits.
+    let committing = manager.begin();
+    t.delete_rows_in_txn("cat < 2", full_fetch(&t.schema.fields), None, committing).await.unwrap();
+    t.vacuum_now().await.unwrap();
+    assert_eq!(stats.live_rows(), Some(4), "a delete in flight during the sweep");
+    manager.commit(committing);
+    assert_eq!(stats.live_rows(), Some(2), "the committed delete");
+    manager.commit(older);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_inserted_as_a_sweep_ends_are_counted_live() {
     use crate::core::vacuum::run_once_test_hooks::{AFTER_SCAN, arm};
