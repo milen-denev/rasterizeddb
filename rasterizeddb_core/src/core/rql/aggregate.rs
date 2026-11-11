@@ -2702,6 +2702,12 @@ impl<'p> Folder<'p> {
             }
             return self.new_group(Some(cell), 0);
         }
+        // No grouping key: every row is the one group. Hashing the empty key
+        // and comparing it against itself per row was a fifth of an ungrouped
+        // `sum`/`min`/`max` over a million rows.
+        if self.key_sources.is_empty() && !self.keys.is_empty() {
+            return 0;
+        }
         let hash = self.state.hash_one(self.key.as_slice());
         let keys = &self.keys;
         let key = self.key.as_slice();
