@@ -31,9 +31,18 @@
 //!
 //! Phase 1 covers `CREATE TABLE` and `ALTER TABLE` on plain tables (and the
 //! table an `ALTER … REFERENCES` names); a table that does not outlive the
-//! process is copied in memory and has no crash intent. Other DDL in
-//! a block, a partitioned table, and a table on a key/value store stay as
-//! before: applied at once, with the warning that says so.
+//! process is copied in memory and has no crash intent.
+//!
+//! `DROP TABLE` of such tables is not copied: it is **deferred** (2026-11-11,
+//! `Undo::DropAtCommit`, `pgwire::deferred_drops`). It is checked and takes
+//! its ACCESS EXCLUSIVE when issued, and runs as the block's last statement
+//! at COMMIT, so a ROLLBACK, or a crash before COMMIT, never touched the
+//! table. A `CREATE TABLE` of the name later in the block runs the pending
+//! drop first, and that one is then not undone (the client is warned).
+//!
+//! Other DDL in a block, a partitioned table, and a table on a key/value
+//! store stay as before: applied at once, with the warning that says so,
+//! now to the client as well as the log.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,6 +65,11 @@ pub(crate) enum Undo {
     Restore { table: String, copy: String },
     /// Drop `table`: the block created it.
     Drop { table: String },
+    /// A `DROP TABLE` the block ran, deferred to its commit (`sql`, the
+    /// single-table drop): nothing to undo, the table was never touched.
+    /// Never written as an intent — the drop happens inside the block, at
+    /// its commit, so a crash before then leaves the table as it was.
+    DropAtCommit { table: String, sql: String },
 }
 
 /// A registered step and its intent file (none in memory).
@@ -74,6 +88,7 @@ fn encode(tx: TxId, undo: &Undo) -> String {
     let body = match undo {
         Undo::Restore { table, copy } => format!("{tx}\nrestore\t{table}\t{copy}"),
         Undo::Drop { table } => format!("{tx}\ndrop\t{table}"),
+        Undo::DropAtCommit { table, .. } => format!("{tx}\ndropcommit\t{table}"),
     };
     format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body))
 }
@@ -165,7 +180,7 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<String>, Ve
 
 impl Database {
     /// Whether `table` is one phase 1 can copy and put back.
-    fn block_copyable(&self, table: &str) -> bool {
+    pub(crate) fn block_copyable(&self, table: &str) -> bool {
         use super::Relation;
         // A table that does not outlive the process is copied too (in
         // memory): only its crash intent is skipped, which `prepare` does.
@@ -201,6 +216,19 @@ impl Database {
     /// [`Database::block_ddl_prepare`] would take on), for the warning about
     /// the DDL that does not.
     pub(crate) fn block_ddl_covers(&self, sql: &str) -> bool {
+        // A DROP TABLE of tables this covers is deferred to the commit
+        // (`pgwire::deferred_drops`).
+        let mut words = sql.split_whitespace();
+        if words.next().is_some_and(|w| w.eq_ignore_ascii_case("DROP")) && words.next().is_some_and(|w| w.eq_ignore_ascii_case("TABLE")) {
+            use crate::core::rql::lexer_alter::{expand_multi_drop, parse_drop_table};
+            let trimmed = sql.trim().trim_end_matches(';').trim_end();
+            let each = expand_multi_drop(trimmed).unwrap_or_else(|| vec![trimmed.to_string()]);
+            return each.iter().all(|one| {
+                parse_drop_table(one).is_ok_and(|(name, _)| {
+                    !(self.has_table(&name) || self.is_partitioned(&name)) || self.block_copyable(&name)
+                })
+            });
+        }
         targets(self, sql).is_some_and(|(existing, _)| existing.iter().all(|t| self.block_copyable(t)))
     }
 
@@ -262,6 +290,7 @@ impl Database {
             let lasting = match &undo {
                 Undo::Restore { table, .. } => self.survives_a_crash(table),
                 Undo::Drop { .. } => true,
+                Undo::DropAtCommit { .. } => false,
             };
             let intent = match self.location.as_deref().filter(|_| lasting) {
                 Some(root_dir) => {
@@ -275,6 +304,66 @@ impl Database {
             self.block_ddl.entry(root).or_default().push(Step { undo, intent });
         }
         Ok(true)
+    }
+
+    /// A block's `DROP TABLE`, deferred to its commit: each table locked
+    /// ACCESS EXCLUSIVE to the block's end, as PostgreSQL's drop holds it,
+    /// and registered with the single-table drop that runs at commit
+    /// ([`Database::block_drops_take`]). A `ROLLBACK` (to a savepoint before
+    /// it too) then leaves the table as it was; dropped at once, a rolled-back
+    /// drop destroyed the table and its rows.
+    pub(crate) async fn block_drop_defer(&self, root: TxId, drops: Vec<(String, String)>) -> Result<(), String> {
+        for (table, _) in &drops {
+            self.relation_for(
+                table,
+                crate::core::mvcc::owner::current(),
+                crate::core::mvcc::table_locks::TableMode::AccessExclusive,
+            )
+            .await?;
+            // The block's own row locks on it would outlive the table, keyed
+            // by a name the next table could take: refused now, as the drop
+            // itself refuses it (55006), not at the commit.
+            if crate::core::mvcc::owner::current().is_some_and(|o| self.row_locks.txn_holds_rows_on(table, o.owner.id())) {
+                return Err(format!(
+                    "cannot DROP TABLE on \"{table}\" because it is being used by active queries in this session: the \
+                     transaction holds row locks on the table, which this would orphan; end the transaction first"
+                ));
+            }
+        }
+        let mut steps = self.block_ddl.entry(root).or_default();
+        for (table, sql) in drops {
+            steps.push(Step { undo: Undo::DropAtCommit { table, sql }, intent: None });
+        }
+        Ok(())
+    }
+
+    /// The tables block `root` has a deferred drop pending for.
+    pub(crate) fn block_drops_pending(&self, root: TxId) -> Vec<String> {
+        self.block_ddl.get(&root).map_or_else(Vec::new, |steps| {
+            steps
+                .iter()
+                .filter_map(|s| match &s.undo {
+                    Undo::DropAtCommit { table, .. } => Some(table.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    /// Block `root`'s deferred drops, taken out to run (`None`: every one;
+    /// `Some(table)`: that table's, which a `CREATE TABLE` of its name in the
+    /// block needs gone first), as `(table, sql)`, oldest first.
+    pub(crate) fn block_drops_take(&self, root: TxId, only: Option<&str>) -> Vec<(String, String)> {
+        let Some(mut steps) = self.block_ddl.get_mut(&root) else { return Vec::new() };
+        let mut taken = Vec::new();
+        steps.retain(|s| match &s.undo {
+            Undo::DropAtCommit { table, sql } if only.is_none_or(|o| o.eq_ignore_ascii_case(table)) => {
+                taken.push((table.clone(), sql.clone()));
+                false
+            }
+            _ => true,
+        });
+        taken
     }
 
     /// Whether block `root` has DDL that rolls back with it.
@@ -339,7 +428,7 @@ impl Database {
                 Undo::Drop { table } => {
                     sqlstate == "42P07" || !(self.has_table(table) || self.is_partitioned(table))
                 }
-                Undo::Restore { .. } => false,
+                Undo::Restore { .. } | Undo::DropAtCommit { .. } => false,
             };
             if unmade {
                 if let Some(path) = &step.intent {
@@ -368,7 +457,7 @@ impl Database {
         let tables: Vec<String> = failed
             .iter()
             .map(|s| match &s.undo {
-                Undo::Restore { table, .. } | Undo::Drop { table } => table.clone(),
+                Undo::Restore { table, .. } | Undo::Drop { table } | Undo::DropAtCommit { table, .. } => table.clone(),
             })
             .collect();
         self.block_ddl.entry(root).or_default().extend(failed);
@@ -404,6 +493,8 @@ impl Database {
                         }
                     }
                 }
+                // The table was never touched: nothing to undo.
+                Undo::DropAtCommit { .. } => true,
                 Undo::Drop { table } => match self.drop_table_for_rollback(table).await {
                     Ok(()) => true,
                     Err(e) => {
@@ -471,6 +562,8 @@ pub(super) async fn recover_files(
                 discard_files_in(&seed, pool, Some(&root), copy, RENAMED_SUFFIXES).await
             }
             (Undo::Drop { .. }, true) => true,
+            // Never written as an intent; nothing to finish.
+            (Undo::DropAtCommit { .. }, _) => true,
             (Undo::Restore { table, copy }, false) => {
                 info!("Restoring \"{table}\": DDL of transaction {tx} did not commit before a crash");
                 let table_seed = super::seed_in(io_pointers, pool, kv, seeds, table).await;

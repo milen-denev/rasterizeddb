@@ -5468,6 +5468,46 @@ where
                             // A read-only block refuses the statement (25006)
                             // before it runs: nothing to keep aside or lock.
                             let read_only = state.transaction.as_ref().is_some_and(|t| t.read_only);
+                            // A DROP TABLE runs at the block's commit, so a
+                            // ROLLBACK keeps the table (`deferred_drops`).
+                            if ddl.is_some() && !read_only {
+                                match deferred_drops(database, root, stmt) {
+                                    Some(Err((code, message))) => return fail_statement(state, stream, code, &message).await,
+                                    Some(Ok(drops)) => {
+                                        if let Err(e) = database.block_drop_defer(root, drops).await {
+                                            return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+                                        }
+                                        transactional = true;
+                                        return send_command_complete(stream, "DROP TABLE").await;
+                                    }
+                                    None => {}
+                                }
+                                // A table created under a name the block's
+                                // pending drop holds: that drop runs first.
+                                if let Some(name) = created_over_pending_drop(database, root, stmt) {
+                                    let tx = state.current_tx().unwrap_or(root);
+                                    for (_, sql) in database.block_drops_take(root, Some(&name)) {
+                                        let resp = crate::core::rql::executor::execute_in_txn(
+                                            QueryPurpose::DropTable(sql),
+                                            database.clone(),
+                                            tx,
+                                        )
+                                        .await;
+                                        if resp.first() == Some(&3) {
+                                            let message = String::from_utf8_lossy(&resp[1..]).into_owned();
+                                            return fail_statement(state, stream, sqlstate_for(&message), &message).await;
+                                        }
+                                    }
+                                    crate::core::notice::push(
+                                        "WARNING",
+                                        "01000",
+                                        format!(
+                                            "table \"{name}\" was dropped earlier in this transaction and is created again: a \
+                                             ROLLBACK will not bring the dropped table back"
+                                        ),
+                                    );
+                                }
+                            }
                             if ddl.is_some() && !read_only {
                                 let mark = database.block_ddl_len(root);
                                 match database.block_ddl_prepare(root, stmt).await {
@@ -6295,6 +6335,13 @@ where
             log::warn!(
                 "DDL inside an explicit transaction cannot be rolled back by this engine; if this block aborts, its effects will persist: {}",
                 stmt.chars().take(120).collect::<String>()
+            );
+            // To the client too, which is the one that can act on it: in the
+            // log alone a migration runner never saw it.
+            crate::core::notice::push(
+                "WARNING",
+                "01000",
+                "this statement is applied at once and will not be undone if the transaction rolls back",
             );
         }
     }
@@ -8451,6 +8498,23 @@ async fn commit_block(
     // without touching the disk at all. This is the runtime answer, not the
     // `READ ONLY` the session may have declared — a block that declared
     // nothing and wrote nothing gets the same saving.
+    // The block's deferred drops (`deferred_drops`) are its last statements,
+    // run under its locks before it commits: a ROLLBACK, or a crash before
+    // here, never touched the tables.
+    for (table, sql) in database.block_drops_take(t.id, None) {
+        let resp = crate::core::rql::executor::execute_in_txn(QueryPurpose::DropTable(sql), database.clone(), t.id).await;
+        if resp.first() == Some(&3) {
+            let message = format!(
+                "could not commit: dropping \"{table}\" failed ({}); the transaction has been rolled back",
+                String::from_utf8_lossy(&resp[1..])
+            );
+            database.block_ddl_abort(t.id).await;
+            database.abort_transaction(t.id);
+            t.owner.release();
+            return Err((sqlstate_for(&message), message));
+        }
+    }
+
     let wrote = database.transactions.wrote_family(t.id);
 
     if !wrote {
@@ -8541,6 +8605,99 @@ async fn commit_block(
     // here.
     database.publish_transaction(family).await;
     Ok(())
+}
+
+/// A block's `DROP TABLE [IF EXISTS] a, … [CASCADE]` as the single-table
+/// drops to run at its commit, `(table, sql)`; `None` for any other
+/// statement, and for a drop of a table the block's DDL rollback does not
+/// cover (partitioned, on a key/value store), which runs at once as before.
+///
+/// Checked now, as the drop would check them: a missing table (one this
+/// block's earlier drop is pending for counts as missing) without `IF
+/// EXISTS` is 42P01, a foreign key from a table outside the list without
+/// `CASCADE` 2BP01. A table some listed table's key references is dropped
+/// with `CASCADE`, which takes only that key.
+///
+/// Dropped at once, a rolled-back `DROP TABLE` destroyed the table and its
+/// rows; the only warning went to the server log.
+fn deferred_drops(
+    database: &Database,
+    root: crate::core::mvcc::TxId,
+    stmt: &str,
+) -> Option<Result<Vec<(String, String)>, (&'static str, String)>> {
+    use crate::core::rql::lexer_alter::{expand_multi_drop, parse_drop_table};
+    let mut words = stmt.split_whitespace();
+    let (first, second) = (words.next()?, words.next()?);
+    if !first.eq_ignore_ascii_case("DROP") || !second.eq_ignore_ascii_case("TABLE") {
+        return None;
+    }
+    let trimmed = stmt.trim().trim_end_matches(';').trim_end();
+    let each = expand_multi_drop(trimmed).unwrap_or_else(|| vec![trimmed.to_string()]);
+    let several = each.len() > 1;
+    let cascade = trimmed.split_whitespace().next_back().is_some_and(|w| w.eq_ignore_ascii_case("CASCADE"));
+    let pending = database.block_drops_pending(root);
+    let mut present: Vec<String> = Vec::new();
+    for one in &each {
+        let (name, if_exists) = parse_drop_table(one).ok()?;
+        let dropped = pending.iter().any(|p| p.eq_ignore_ascii_case(&name));
+        if !dropped && (database.has_table(&name) || database.is_partitioned(&name)) {
+            if !database.block_copyable(&name) {
+                return None;
+            }
+            if !present.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
+                present.push(name);
+            }
+        } else if !if_exists {
+            return Some(Err(("42P01", format!("table \"{name}\" does not exist"))));
+        }
+    }
+    if !cascade {
+        for table in &present {
+            for child in database.fk_children(table) {
+                if !child.eq_ignore_ascii_case(table) && !present.iter().any(|p| p.eq_ignore_ascii_case(&child)) {
+                    let message = if several {
+                        format!(
+                            "cannot drop desired object(s) because other objects depend on them: a foreign key on \
+                             table {child} references {table} (HINT: use DROP ... CASCADE to drop the dependent objects too)"
+                        )
+                    } else {
+                        format!(
+                            "cannot drop table {table} because other objects depend on it: a foreign key on table \
+                             {child} references it (HINT: use DROP ... CASCADE to drop the dependent objects too)"
+                        )
+                    };
+                    return Some(Err(("2BP01", message)));
+                }
+            }
+        }
+    }
+    Some(Ok(present
+        .into_iter()
+        .map(|table| {
+            let keyed = database.fk_children(&table).iter().any(|c| !c.eq_ignore_ascii_case(&table));
+            let quoted = crate::core::rql::ctas::quote_ident(&table);
+            let sql = if cascade || keyed { format!("DROP TABLE {quoted} CASCADE") } else { format!("DROP TABLE {quoted}") };
+            (table, sql)
+        })
+        .collect()))
+}
+
+/// The table a block's `CREATE TABLE` creates, when the block has a drop of
+/// that name pending.
+fn created_over_pending_drop(database: &Database, root: crate::core::mvcc::TxId, stmt: &str) -> Option<String> {
+    let mut words = stmt.split_whitespace();
+    let (first, second) = (words.next()?, words.next()?);
+    if !first.eq_ignore_ascii_case("CREATE") || !second.eq_ignore_ascii_case("TABLE") {
+        return None;
+    }
+    let pending = database.block_drops_pending(root);
+    if pending.is_empty() {
+        return None;
+    }
+    let created = crate::core::rql::lexer_ct::create_table_with_reason(&QueryPurpose::CreateTable(stmt.to_string()))
+        .0?
+        .table_name;
+    pending.into_iter().find(|p| p.eq_ignore_ascii_case(&created))
 }
 
 /// Ends the implicit block open at a batch's end, if one is: committed, or,
