@@ -402,6 +402,132 @@ pub fn matches(vector: &str, query: &str) -> bool {
     compiled.evaluate(&compiled.root, &found)
 }
 
+/// PostgreSQL's default `ts_rank` weights, for weight classes D, C, B, A.
+pub const DEFAULT_RANK_WEIGHTS: [f32; 4] = [0.1, 0.2, 0.4, 1.0];
+
+/// `ts_rank([weights,] vector, query [, normalization])`, as PostgreSQL's
+/// `calc_rank` computes it (`tsrank.c`), in the same single- and
+/// double-precision steps, so the `real` it returns prints the same digits.
+/// A position here carries no weight class, so each is class D.
+pub fn ts_rank(weights: [f32; 4], vector: &str, query: &str, method: i32) -> f32 {
+    // The vector's lexemes, in order, with their positions.
+    let mut lexemes: Vec<(String, Vec<i32>)> = Vec::new();
+    for entry in vector.split_whitespace() {
+        let Some(body) = entry.strip_prefix('\'') else { continue };
+        let Some(close) = body.rfind('\'') else { continue };
+        let lexeme = body[..close].replace("''", "'");
+        let positions = body[close + 1..]
+            .strip_prefix(':')
+            .map(|p| p.split(',').filter_map(|n| n.trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse().ok()).collect())
+            .unwrap_or_default();
+        lexemes.push((lexeme, positions));
+    }
+    let Ok(Some(root)) = parse_query("simple", query) else { return 0.0 };
+    if lexemes.is_empty() {
+        return 0.0;
+    }
+    // The query's operands, sorted bytewise and each once (`SortAndUniqItems`).
+    let mut items: Vec<(String, bool)> = Vec::new();
+    fn collect(node: &Node, out: &mut Vec<(String, bool)>) {
+        match node {
+            Node::Term(t) => out.push((t.clone(), false)),
+            Node::Prefix(t) => out.push((t.clone(), true)),
+            Node::Not(n) => collect(n, out),
+            Node::And(a, b) | Node::Or(a, b) | Node::Followed(a, b, _) => {
+                collect(a, out);
+                collect(b, out);
+            }
+        }
+    }
+    collect(&root, &mut items);
+    items.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    items.dedup_by(|a, b| a.0 == b.0);
+    // The vector's entries an operand finds: the one equal to it, or for a
+    // prefix every one it begins.
+    let found = |item: &(String, bool)| -> Vec<&Vec<i32>> {
+        lexemes
+            .iter()
+            .filter(|(l, _)| if item.1 { l.starts_with(item.0.as_str()) } else { *l == item.0 })
+            .map(|(_, p)| p)
+            .collect()
+    };
+    // Every position is class D.
+    let wpos = weights[0];
+
+    let and = matches!(root, Node::And(..) | Node::Followed(..));
+    let mut res: f32 = if and && items.len() >= 2 {
+        // `calc_rank_and`.
+        fn word_distance(w: i32) -> f32 {
+            if w > 100 {
+                return 1e-30;
+            }
+            (1.0f64 / (1.005 + 0.05 * ((w as f32) as f64 / 1.5 - 2.0).exp())) as f32
+        }
+        let mut res: f32 = -1.0;
+        let mut pos: Vec<Option<&Vec<i32>>> = vec![None; items.len()];
+        for i in 0..items.len() {
+            for entry in found(&items[i]) {
+                pos[i] = Some(entry);
+                for k in 0..i {
+                    let Some(ct) = pos[k] else { continue };
+                    for &l in entry {
+                        for &p in ct {
+                            let dist = (l - p).abs();
+                            if dist != 0 {
+                                let curw = ((wpos * wpos * word_distance(dist)) as f64).sqrt() as f32;
+                                res = if res < 0.0 { curw } else { (1.0 - (1.0 - res as f64) * (1.0 - curw as f64)) as f32 };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        res
+    } else {
+        // `calc_rank_or`.
+        let mut res: f32 = 0.0;
+        for item in &items {
+            for entry in found(item) {
+                let (mut resj, mut wjm, mut jm): (f32, f32, i32) = (0.0, -1.0, 0);
+                for j in 0..entry.len() as i32 {
+                    resj += wpos / ((j + 1) * (j + 1)) as f32;
+                    if wpos > wjm {
+                        wjm = wpos;
+                        jm = j;
+                    }
+                }
+                let inner: f32 = wjm + resj - wjm / ((jm + 1) * (jm + 1)) as f32;
+                res = (res as f64 + inner as f64 / 1.64493406685) as f32;
+            }
+        }
+        if !items.is_empty() {
+            res /= items.len() as f32;
+        }
+        res
+    };
+    if res < 0.0 {
+        res = 1e-20;
+    }
+    let length: i32 = lexemes.iter().map(|(_, p)| (p.len() as i32).max(1)).sum();
+    let size = lexemes.len() as i32;
+    if method & 0x01 != 0 && size > 0 {
+        res = (res as f64 / (((length + 1) as f64).ln() / 2f64.ln())) as f32;
+    }
+    if method & 0x02 != 0 && length > 0 {
+        res /= length as f32;
+    }
+    if method & 0x08 != 0 && size > 0 {
+        res /= size as f32;
+    }
+    if method & 0x10 != 0 && size > 0 {
+        res = (res as f64 / (((size + 1) as f64).ln() / 2f64.ln())) as f32;
+    }
+    if method & 0x20 != 0 {
+        res /= res + 1.0;
+    }
+    res
+}
+
 /// A tsquery parsed once: its distinct terms, numbered, and the tree over
 /// those numbers.
 #[derive(Debug)]
@@ -1292,6 +1418,22 @@ mod tests {
         assert_eq!(phraseto_tsquery("english", "quick the brown fox"), "'quick' <2> 'brown' <-> 'fox'");
         assert_eq!(to_tsquery("english", "!the & fox").unwrap(), "'fox'");
         assert!(to_tsquery("english", "fox:A").is_err());
+    }
+
+    /// Values PostgreSQL 17 printed for these; the arithmetic is its, in
+    /// float and double where it uses each, so they agree to the last digit.
+    #[test]
+    fn ts_rank_is_postgresqls_to_the_last_digit() {
+        let v = |d: &str| to_tsvector("english", d);
+        let q = |t: &str| to_tsquery("english", t).unwrap();
+        let w = DEFAULT_RANK_WEIGHTS;
+        let doc = "The quick brown fox jumps over the lazy dog";
+        assert_eq!(ts_rank(w, &v(doc), &q("fox"), 0).to_string(), "0.06079271");
+        assert_eq!(ts_rank(w, &v(doc), &q("quick & fox"), 0).to_string(), "0.098500855");
+        assert_eq!(ts_rank(w, &v("fox fox fox quick quick dog"), &q("quick & fox"), 0).to_string(), "0.46028033");
+        assert_eq!(ts_rank(w, &v("nothing to see here"), &q("quick & fox"), 0), 1e-20);
+        assert_eq!(ts_rank(w, &v("nothing to see here"), &q("fox"), 0), 0.0);
+        assert_eq!(ts_rank(w, &v(doc), &q("quick <-> brown"), 1).to_string(), "0.03530128");
     }
 
     #[test]

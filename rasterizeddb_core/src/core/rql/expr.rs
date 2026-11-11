@@ -420,6 +420,9 @@ pub enum TextFunc {
     PhraseToTsQuery,
     /// `websearch_to_tsquery(config, text)` — the search-box syntax.
     WebsearchToTsQuery,
+    /// `ts_rank(weights, vector, query, normalization)`, its omitted
+    /// arguments filled in at parse (`text_search::ts_rank`).
+    TsRank,
     /// `@@`, as PostgreSQL's `ts_match_vq(tsvector, tsquery)`,
     /// `ts_match_tq(text, tsquery)` and `ts_match_tt(text, text)`: a vector
     /// and a query are both carried as their text here, so which each side
@@ -992,7 +995,7 @@ pub const FUNCTIONS: &[&str] = &[
     "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "TRUNC", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
     "TO_TSVECTOR", "TO_TSQUERY", "PLAINTO_TSQUERY", "PHRASETO_TSQUERY", "WEBSEARCH_TO_TSQUERY", "TS_MATCH_VQ",
-    "TS_MATCH_TQ", "TS_MATCH_TT",
+    "TS_MATCH_TQ", "TS_MATCH_TT", "TS_RANK",
 ];
 
 /// Whether `name` (any case) is a function this evaluator calls: one of
@@ -1988,6 +1991,31 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     };
                     Ok(Expr::Call(func, args))
                 }
+                "TS_RANK" => {
+                    // `(v, q)`, `(w, v, q)`, `(v, q, n)` or `(w, v, q, n)`;
+                    // with three, an array first is the weights.
+                    let mut args = args;
+                    // An untyped `'{0.1,0.2,0.4,1.0}'` is the `real[]` it
+                    // resolves to.
+                    let weights_first = args.first().is_some_and(|a| {
+                        static_type(a) == DbType::ARRAY
+                            || matches!(a, Expr::Literal { bytes, db_type: DbType::STRING } if bytes.first() == Some(&b'{'))
+                    });
+                    match (args.len(), weights_first) {
+                        (2, _) | (3, false) => args.insert(0, Expr::Null),
+                        (3, true) | (4, _) => {}
+                        (n, _) => return Err(format!("function ts_rank() does not take {n} arguments")),
+                    }
+                    if args.len() == 3 {
+                        args.push(Expr::Literal { bytes: 0i32.to_le_bytes().to_vec(), db_type: DbType::I32 });
+                    }
+                    // No column holds a vector here: only `to_tsvector` makes one.
+                    if !matches!(args[1], Expr::Call(TextFunc::ToTsVector, _)) {
+                        return Err("function ts_rank(text, tsquery) does not exist".to_string());
+                    }
+                    Ok(Expr::Call(TextFunc::TsRank, args))
+                }
+                "TS_RANK_CD" => Err("ts_rank_cd is not supported yet; ts_rank is".to_string()),
                 "TS_MATCH_VQ" | "TS_MATCH_TQ" | "TS_MATCH_TT" => {
                     if args.len() != 2 {
                         return Err(format!("function {}() takes two arguments", upper_name.to_ascii_lowercase()));
@@ -3601,6 +3629,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         // `integer`, as PostgreSQL's length family returns.
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
         Expr::Call(TextFunc::TsMatchVq | TextFunc::TsMatchTq | TextFunc::TsMatchTt, _) => DbType::BOOL,
+        Expr::Call(TextFunc::TsRank, _) => DbType::F32,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
         // `round(numeric)` and `round(…, places)` are NUMERIC; `round` of an
@@ -4416,24 +4445,67 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         )),
         TextFunc::ToTsQuery => {
             match crate::core::text_search::to_tsquery(&as_text(&args[0]), &as_text(&args[1])) {
-                Ok(query) => string(query),
+                Ok(query) => string(empty_query_notice(query)),
                 // A malformed query is reported rather than silently matching
                 // nothing, which is what PostgreSQL does too.
                 Err(reason) => return Err(reason),
             }
         }
-        TextFunc::PlainToTsQuery => string(crate::core::text_search::plainto_tsquery(
+        TextFunc::PlainToTsQuery => string(empty_query_notice(crate::core::text_search::plainto_tsquery(
             &as_text(&args[0]),
             &as_text(&args[1]),
-        )),
-        TextFunc::PhraseToTsQuery => string(crate::core::text_search::phraseto_tsquery(
+        ))),
+        TextFunc::PhraseToTsQuery => string(empty_query_notice(crate::core::text_search::phraseto_tsquery(
             &as_text(&args[0]),
             &as_text(&args[1]),
-        )),
-        TextFunc::WebsearchToTsQuery => string(crate::core::text_search::websearch_to_tsquery(
+        ))),
+        TextFunc::WebsearchToTsQuery => string(empty_query_notice(crate::core::text_search::websearch_to_tsquery(
             &as_text(&args[0]),
             &as_text(&args[1]),
-        )),
+        ))),
+        TextFunc::TsRank => {
+            use crate::core::text_search as ts;
+            if args[1].is_null() || args[2].is_null() || args[3].is_null() {
+                return Ok(Value::Null);
+            }
+            let mut weights = ts::DEFAULT_RANK_WEIGHTS;
+            if let Value::Data { bytes, db_type } = &args[0] {
+                let parsed;
+                let bytes = if *db_type == DbType::STRING {
+                    parsed = crate::core::value_codec::parse_array_literal(&String::from_utf8_lossy(bytes))
+                        .ok_or("array of weight must be one-dimensional")?;
+                    &parsed
+                } else {
+                    bytes
+                };
+                let Some((_, dims, elements)) = crate::core::value_codec::decode_array_dims(bytes) else {
+                    return Err("array of weight must be one-dimensional".to_string());
+                };
+                if dims.len() != 1 {
+                    return Err("array of weight must be one-dimensional".to_string());
+                }
+                if elements.len() < 4 {
+                    return Err("array of weight is too short".to_string());
+                }
+                for (slot, element) in weights.iter_mut().zip(&elements) {
+                    let text = element.ok_or("array of weight must not contain nulls")?;
+                    let value: f32 = std::str::from_utf8(text)
+                        .ok()
+                        .and_then(|t| t.trim().parse().ok())
+                        .ok_or("array of weight must hold numbers")?;
+                    if value > 1.0 {
+                        return Err("weight out of range".to_string());
+                    }
+                    // A negative weight is the default's, as PostgreSQL reads it.
+                    if value >= 0.0 {
+                        *slot = value;
+                    }
+                }
+            }
+            let method = as_i64(&args[3]).unwrap_or(0) as i32;
+            let rank = ts::ts_rank(weights, &as_text(&args[1]), &as_text(&args[2]), method);
+            Value::Data { bytes: rank.to_le_bytes().to_vec(), db_type: DbType::F32 }
+        }
         TextFunc::TsMatchVq | TextFunc::TsMatchTq | TextFunc::TsMatchTt => {
             use crate::core::text_search as ts;
             let left = as_text(&args[0]);
@@ -4676,6 +4748,18 @@ pub(crate) fn top_level_bitwise(text: &str) -> Option<(usize, &'static str)> {
         i += 1;
     }
     found
+}
+
+/// A query its stop words left empty, with PostgreSQL's NOTICE saying so.
+fn empty_query_notice(query: String) -> String {
+    if query.is_empty() {
+        crate::core::notice::push(
+            "NOTICE",
+            "00000",
+            "text-search query contains only stop words or doesn't contain lexemes, ignored",
+        );
+    }
+    query
 }
 
 /// `left @@ right` as the `ts_match_*` PostgreSQL resolves it to, from what

@@ -7910,6 +7910,16 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if raw.starts_with("table \"") && raw.ends_with("\" does not exist") {
         return "42P01";
     }
+    // `ts_rank`'s weights, with PostgreSQL's codes.
+    if raw == "array of weight must be one-dimensional" || raw == "array of weight is too short" {
+        return "2202E";
+    }
+    if raw == "array of weight must not contain nulls" {
+        return "22004";
+    }
+    if raw == "weight out of range" {
+        return "22023";
+    }
     // `string_data_length_mismatch`: `B'10' & B'1'`.
     if raw.starts_with("cannot and bit strings of different sizes")
         || raw.starts_with("cannot or bit strings of different sizes")
