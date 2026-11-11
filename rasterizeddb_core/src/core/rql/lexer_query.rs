@@ -1908,8 +1908,8 @@ pub fn row_fetch_from_select_query(
                     let bare = column.rsplit('.').next().unwrap_or(column).trim_matches('"');
                     if !plain.iter().any(|f| f.name.eq_ignore_ascii_case(bare)) {
                         return Err(format!(
-                            "column '{}' must appear in GROUP BY or be used in an aggregate function",
-                            column
+                            "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                            column.trim_matches('"')
                         ));
                     }
                 }
@@ -2296,6 +2296,40 @@ pub fn row_fetch_from_select_query(
             let label = label.clone();
             select_items[position] = SelectItem::Literal { bytes, db_type, label };
         }
+        // An expression over grouping keys only (`r * 3`, `upper(name)` with
+        // `GROUP BY r, name`) has one value per group, as PostgreSQL allows:
+        // it becomes a key of its own, which groups nothing finer and is
+        // echoed into its slot. It was refused as a column that "must appear
+        // in GROUP BY", the commonest shape of a grouped report.
+        let mut next_virtual = group_by
+            .iter()
+            .map(|g| g.write_order)
+            .chain(schema.iter().map(|f| f.write_order))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for position in 0..select_items.len() {
+            let SelectItem::RowExpr { expr, db_type, label } = &select_items[position] else { continue };
+            if computed_group_keys.iter().any(|k| k.item == Some(position)) {
+                continue;
+            }
+            let reads = crate::core::rql::expr::columns_of(expr);
+            let grouped = |f: &SchemaField| {
+                group_by.iter().any(|g| g.write_order == f.write_order || g.name.eq_ignore_ascii_case(&f.name))
+            };
+            if reads.is_empty() || !(reads.iter().all(grouped) || determined_by_key) {
+                continue;
+            }
+            let field = SchemaField::new(label.clone(), db_type.clone(), db_type.get_size(), 0, next_virtual, false);
+            next_virtual += 1;
+            computed_group_keys.push(crate::core::rql::aggregate::ComputedKey {
+                write_order: field.write_order,
+                expr: expr.clone(),
+                schema: expr_reads(expr, schema),
+                item: Some(position),
+            });
+            group_by.push(field);
+        }
         for (position, item) in select_items.iter().enumerate() {
             match item {
                 SelectItem::Column { field, label } => {
@@ -2305,8 +2339,8 @@ pub fn row_fetch_from_select_query(
                             continue;
                         }
                         return Err(format!(
-                            "column '{}' must appear in GROUP BY or be used in an aggregate",
-                            label
+                            "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                            field.name
                         ));
                     }
                 }
@@ -2314,11 +2348,16 @@ pub fn row_fetch_from_select_query(
                 // grouped query it is only determined when it is itself a
                 // grouping key. Refused rather than emitted empty: an empty
                 // value here is a silent wrong answer.
-                SelectItem::RowExpr { label, .. } => {
+                SelectItem::RowExpr { expr, label, .. } => {
                     if !computed_group_keys.iter().any(|k| k.item == Some(position)) {
+                        // The first column it reads that is no key, as
+                        // PostgreSQL names it.
+                        let column = crate::core::rql::expr::columns_of(expr)
+                            .into_iter()
+                            .find(|f| !group_by.iter().any(|g| g.write_order == f.write_order || g.name.eq_ignore_ascii_case(&f.name)))
+                            .map_or_else(|| label.clone(), |f| f.name);
                         return Err(format!(
-                            "column '{}' must appear in GROUP BY or be used in an aggregate",
-                            label
+                            "column \"{column}\" must appear in the GROUP BY clause or be used in an aggregate function"
                         ));
                     }
                 }

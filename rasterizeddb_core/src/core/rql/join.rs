@@ -4954,7 +4954,7 @@ fn build_aggregate_stage(
                 .any(|g| g.write_order == synthetic.write_order)
             {
                 return Err(format!(
-                    "column '{}' must appear in GROUP BY or be used in an aggregate",
+                    "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
                     label
                 ));
             }
