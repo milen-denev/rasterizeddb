@@ -3940,7 +3940,12 @@ impl<S: StorageIO> Table<S> {
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
         use crate::core::filter::zonemap::SargOp;
 
-        let mut iterator = RowPointerIterator::new(d.io_pointers.clone())
+        // Deferred: an index or a narrow filter answers by slot below and
+        // never walks the pointer file, and the eager constructor acquired a
+        // 320 KB chunk buffer (past the pool's reuse cap, so a fresh
+        // allocation) and loaded the first chunk before any of that was
+        // known — a tenth of a single-row INSERT, once per unique column.
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
             .await
             .map_err(std::io::Error::from)?;
 
