@@ -38,6 +38,15 @@ pub enum PgFunc {
     /// and each element as the element type reads it, as a typed column
     /// holds them.
     ArrayCast,
+    /// `a & b`, `a | b`, `a # b`, `a << n`, `a >> n` and `~a` (`expr::parse`
+    /// reads them): over integers, as the wider operand's type (a shift as
+    /// its left operand's), and over bit strings of one length, as `bit`.
+    BitAnd,
+    BitOr,
+    BitXor,
+    ShiftLeft,
+    ShiftRight,
+    BitNot,
     /// `x op ANY (array)` / `ALL`, over an array the row computes: the
     /// value, the array, the operator and `ANY` or `ALL`, as text
     /// (`expr::quantified_condition`). TRUE, FALSE, or NULL when no element
@@ -290,6 +299,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
         StringToArray | ArrayCtor | ArraySlice | ArrayCast => DbType::ARRAY,
+        BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise_type(func, args),
         QuantifiedCmp => DbType::BOOL,
         ArraySubscript => subscript_type(args),
         _ => DbType::STRING,
@@ -371,6 +381,199 @@ pub fn standard_syntax(upper: &str, args: &str) -> Option<(String, String)> {
 
 fn data(bytes: Vec<u8>, db_type: DbType) -> Value {
     Value::Data { bytes, db_type }
+}
+
+/// The integer type PostgreSQL resolves a bitwise operand of `t` to: its
+/// own for `smallint`, `integer` and `bigint`, the engine's narrower ones
+/// widened, `None` for anything else.
+fn bitwise_integer(t: &DbType) -> Option<DbType> {
+    match t {
+        DbType::I16 | DbType::I32 | DbType::I64 => Some(t.clone()),
+        DbType::I8 | DbType::U8 => Some(DbType::I16),
+        DbType::U16 => Some(DbType::I32),
+        DbType::U32 => Some(DbType::I64),
+        _ => None,
+    }
+}
+
+fn integer_width(t: &DbType) -> u8 {
+    match t {
+        DbType::I16 => 2,
+        DbType::I32 => 4,
+        _ => 8,
+    }
+}
+
+/// A bitwise operator's result type from its operands' static types.
+fn bitwise_type(func: PgFunc, args: &[Expr]) -> DbType {
+    let types: Vec<DbType> = args.iter().map(crate::core::rql::expr::static_type).collect();
+    // `<<` / `>>` between networks: containment.
+    if types.iter().any(|t| *t == DbType::INET) {
+        return DbType::BOOL;
+    }
+    if types.iter().any(|t| matches!(t, DbType::BIT | DbType::VARBIT)) {
+        return DbType::BIT;
+    }
+    let ints: Vec<DbType> = types.iter().filter_map(bitwise_integer).collect();
+    match func {
+        PgFunc::ShiftLeft | PgFunc::ShiftRight | PgFunc::BitNot => ints.first().cloned().unwrap_or(DbType::I32),
+        _ => ints.into_iter().max_by_key(integer_width).unwrap_or(DbType::I32),
+    }
+}
+
+fn integer_of(v: i64, t: &DbType) -> Value {
+    match t {
+        DbType::I16 => data((v as i16).to_le_bytes().to_vec(), DbType::I16),
+        DbType::I32 => data((v as i32).to_le_bytes().to_vec(), DbType::I32),
+        _ => data(v.to_le_bytes().to_vec(), DbType::I64),
+    }
+}
+
+/// An operand's integer and the type it is read as. An untyped string
+/// literal is read as an integer, as PostgreSQL resolves `'5' & 1`.
+fn bitwise_operand(v: &Value, op: &str, other: Option<&Value>) -> Result<(i64, DbType), String> {
+    let t = v.db_type().cloned().unwrap_or(DbType::NULL);
+    if let Some(int) = bitwise_integer(&t) {
+        return Ok((crate::core::rql::expr::as_i64(v).ok_or("an integer could not be read")?, int));
+    }
+    if t == DbType::STRING {
+        let text = text_of(v);
+        return text
+            .trim()
+            .parse::<i32>()
+            .map(|n| (i64::from(n), DbType::I32))
+            .map_err(|_| format!("invalid input syntax for type integer: \"{text}\""));
+    }
+    let name = |v: &Value| v.db_type().map_or("unknown", crate::core::value_codec::pg_input_type_name);
+    Err(match other {
+        Some(o) => format!("operator does not exist: {} {op} {}", name(v), name(o)),
+        None => format!("operator does not exist: {op} {}", name(v)),
+    })
+}
+
+/// A bit string's length and its bits, MSB first.
+fn bits_of(bytes: &[u8]) -> Option<(usize, Vec<bool>)> {
+    let len = usize::try_from(i32::from_be_bytes(bytes.get(..4)?.try_into().ok()?)).ok()?;
+    let packed = bytes.get(4..)?;
+    let bits = (0..len).map(|i| packed.get(i / 8).is_some_and(|b| (b >> (7 - i % 8)) & 1 == 1)).collect();
+    Some((len, bits))
+}
+
+fn bit_value(bits: &[bool]) -> Value {
+    let mut out = (bits.len() as i32).to_be_bytes().to_vec();
+    out.extend(bits.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |b, (i, &on)| b | (u8::from(on) << (7 - i)))));
+    data(out, DbType::BIT)
+}
+
+fn is_bit(v: &Value) -> bool {
+    matches!(v, Value::Data { db_type: DbType::BIT | DbType::VARBIT, .. })
+}
+
+/// `&`, `|`, `#`, `<<`, `>>` and `~` over their evaluated operands.
+fn bitwise(func: PgFunc, args: &[Value]) -> Result<Value, String> {
+    use PgFunc::*;
+    let symbol = match func {
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "#",
+        ShiftLeft => "<<",
+        ShiftRight => ">>",
+        _ => "~",
+    };
+    if func == BitNot {
+        if let Value::Data { bytes, .. } = &args[0]
+            && is_bit(&args[0])
+        {
+            let (_, bits) = bits_of(bytes).ok_or("could not read a bit string")?;
+            return Ok(bit_value(&bits.iter().map(|b| !b).collect::<Vec<_>>()));
+        }
+        let (v, t) = bitwise_operand(&args[0], symbol, None)?;
+        return Ok(integer_of(!v, &t));
+    }
+    let (a, b) = (&args[0], &args[1]);
+    // `<<` / `>>` between networks are containment, the operators PostgreSQL
+    // spells the same (a `WHERE` reads them as such between a column and a
+    // value; a group reaches them here).
+    if let (Value::Data { bytes: l, db_type: DbType::INET }, Value::Data { bytes: r, db_type: DbType::INET }) = (a, b)
+        && matches!(func, ShiftLeft | ShiftRight)
+    {
+        let op = if func == ShiftLeft {
+            crate::core::pg_ops::PgOp::NetContainedBy
+        } else {
+            crate::core::pg_ops::PgOp::NetContains
+        };
+        return crate::core::pg_ops::evaluate(op, &DbType::INET, l, &DbType::INET, r)
+            .map(|v| data(vec![u8::from(v)], DbType::BOOL))
+            .ok_or_else(|| "could not compare the networks".to_string());
+    }
+    let name = |v: &Value| v.db_type().map_or("unknown", crate::core::value_codec::pg_input_type_name);
+    let mismatch = || Err(format!("operator does not exist: {} {symbol} {}", name(a), name(b)));
+    // A bit string with anything but a bit string (or a shift's count).
+    if is_bit(a) != is_bit(b) && !(is_bit(a) && matches!(func, ShiftLeft | ShiftRight)) {
+        return mismatch();
+    }
+    if let (Value::Data { bytes, .. }, true) = (a, is_bit(a)) {
+        let (len, bits) = bits_of(bytes).ok_or("could not read a bit string")?;
+        if matches!(func, ShiftLeft | ShiftRight) {
+            let (n, _) = bitwise_operand(b, symbol, Some(a))?;
+            // A negative shift goes the other way, as PostgreSQL's does.
+            let left = (func == ShiftLeft) == (n >= 0);
+            let n = usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX).min(len);
+            let shifted: Vec<bool> = if left {
+                bits[n..].iter().copied().chain(std::iter::repeat_n(false, n)).collect()
+            } else {
+                std::iter::repeat_n(false, n).chain(bits[..len - n].iter().copied()).collect()
+            };
+            return Ok(bit_value(&shifted));
+        }
+        let Value::Data { bytes: other, .. } = b else { return Ok(Value::Null) };
+        let (other_len, other_bits) = bits_of(other).ok_or("could not read a bit string")?;
+        if other_len != len {
+            let verb = match func {
+                BitAnd => "AND",
+                BitOr => "OR",
+                _ => "XOR",
+            };
+            return Err(format!("cannot {verb} bit strings of different sizes"));
+        }
+        let combined: Vec<bool> = bits
+            .iter()
+            .zip(&other_bits)
+            .map(|(x, y)| match func {
+                BitAnd => *x && *y,
+                BitOr => *x || *y,
+                _ => x != y,
+            })
+            .collect();
+        return Ok(bit_value(&combined));
+    }
+    let (x, xt) = bitwise_operand(a, symbol, Some(b))?;
+    let (y, yt) = bitwise_operand(b, symbol, Some(a))?;
+    Ok(match func {
+        // A shift keeps its left operand's type and width; past the width it
+        // wraps as the C shift PostgreSQL compiles to does on x86.
+        ShiftLeft | ShiftRight => {
+            let n = y as u32;
+            let v = match (&xt, func) {
+                (DbType::I16, ShiftLeft) => i64::from((x as i16).wrapping_shl(n)),
+                (DbType::I16, _) => i64::from((x as i16).wrapping_shr(n)),
+                (DbType::I32, ShiftLeft) => i64::from((x as i32).wrapping_shl(n)),
+                (DbType::I32, _) => i64::from((x as i32).wrapping_shr(n)),
+                (_, ShiftLeft) => x.wrapping_shl(n),
+                _ => x.wrapping_shr(n),
+            };
+            integer_of(v, &xt)
+        }
+        _ => {
+            let t = if integer_width(&xt) >= integer_width(&yt) { xt } else { yt };
+            let v = match func {
+                BitAnd => x & y,
+                BitOr => x | y,
+                _ => x ^ y,
+            };
+            integer_of(v, &t)
+        }
+    })
 }
 
 fn text_value(text: String) -> Value {
@@ -994,6 +1197,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         NumNonnulls => int_value(args.iter().filter(|a| !a.is_null()).count() as i64),
         NumNulls => int_value(args.iter().filter(|a| a.is_null()).count() as i64),
+        BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise(func, args)?,
         ArrayCast => {
             if args[0].is_null() {
                 return Ok(Value::Null);

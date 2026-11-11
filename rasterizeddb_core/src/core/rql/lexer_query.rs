@@ -904,6 +904,14 @@ fn rewrite_row_size(item: &str, schema: &SmallVec<[SchemaField; 20]>) -> String 
 /// `needs_evaluation` only recognises calls and casts, so a bare `a + b` needs
 /// its own test: an operator at the top level is one.
 pub(crate) fn looks_like_row_expression(text: &str) -> bool {
+    // A bitwise operator, `flags & 1`, `~flags`, `1 << n`: read whole by the
+    // expression parser (`expr::top_level_bitwise`), which tells them from
+    // the operators they are part of. Taken for a column name before.
+    if crate::core::rql::expr::top_level_bitwise(text.trim()).is_some()
+        || text.trim_start().strip_prefix('~').is_some_and(|r| !r.starts_with(['*', '~', '=']) && !r.trim().is_empty())
+    {
+        return true;
+    }
     // A leading minus on anything but a number is unary negation — `-n`,
     // `-(a + b)` — which no operator test below can see, since nothing
     // precedes it. It was handed to the column resolver as the name `-n`.

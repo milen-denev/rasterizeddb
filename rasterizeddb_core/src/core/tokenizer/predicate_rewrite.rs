@@ -2759,7 +2759,80 @@ fn mixed_numeric_columns(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bo
 /// a `CASE`, `||`, `%`, a bit-string literal, or a cast over a column (see
 /// [`column_cast_at`]). Outside quotes, and `?|` is the JSONB operator, not
 /// half a concatenation.
+/// Whether `text` holds a bitwise operator the evaluator has to read
+/// ([`needs_evaluator`]): `&`, `|`, `#` or a prefix `~` anywhere outside
+/// quotes, as `expr::top_level_bitwise` tells them at each depth; `<<` or
+/// `>>` only beside a number or inside parentheses.
+fn bitwise_term(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    // A prefix `~` (bitwise NOT): one with no operand before it, which a
+    // regular-expression `~` always has (`~flags = -6`, `a = ~b`).
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b'~' && !matches!(bytes.get(i + 1), Some(b'*' | b'~' | b'=')) => {
+                let before = text[..i].trim_end();
+                let word = before.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("");
+                let unary = before.is_empty()
+                    || before.ends_with(['(', ',', '=', '<', '>'])
+                    || ["AND", "OR", "NOT", "WHERE"].iter().any(|k| word.eq_ignore_ascii_case(k));
+                if unary && !before.ends_with('!') {
+                    return true;
+                }
+            }
+            None => {}
+        }
+    }
+    // `&`, `|`, `#` anywhere outside quotes; `<<` / `>>` beside a number or
+    // inside parentheses. One pass, whatever the nesting: a scan per group
+    // was quadratic in it.
+    let mut quote: Option<u8> = None;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ => match crate::core::rql::expr::bitwise_operator_at(bytes, i) {
+                    Some("<<" | ">>") => {
+                        let after = text[i + 2..].trim_start();
+                        let before = text[..i].trim_end();
+                        if depth > 0
+                            || after.starts_with(|c: char| c.is_ascii_digit())
+                            || before.ends_with(|c: char| c.is_ascii_digit())
+                        {
+                            return true;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    Some(_) => return true,
+                    None => {}
+                },
+            },
+        }
+        i += 1;
+    }
+    false
+}
+
 fn needs_evaluator(text: &str) -> bool {
+    // A bitwise operator, which the comparison tokens have no form for:
+    // `(flags & 1) = 1` was "neither a column nor a value". `<<` and `>>`
+    // are also network containment, which the planner reads between a
+    // column and a value; they are a shift only beside a number, or inside
+    // a group the comparison is made of.
+    if bitwise_term(text) {
+        return true;
+    }
     let bytes = text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
     let mut quote: Option<u8> = None;
@@ -3673,6 +3746,10 @@ fn comparison_operator(body: &str) -> Option<(usize, usize, bool)> {
             break;
         }
     }
+    // Where the last top-level plain comparison (`=`, `<`, `>`, `!=` …, not
+    // a structural operator) is, worked out once, the first time a `<<` or
+    // `>>` asks.
+    let mut plain_comparison_after: Option<usize> = None;
     let mut i = 0usize;
     while i < bytes.len() {
         if keyword.is_some_and(|(s, _)| i >= s) {
@@ -3691,6 +3768,20 @@ fn comparison_operator(body: &str) -> Option<(usize, usize, bool)> {
             continue;
         }
         if let Some(sym) = PG_OPERATORS.iter().find(|s| here.starts_with(s.as_bytes())) {
+            // `<<` / `>>` as a shift, part of an operand (`flags >> 1 = 3`,
+            // `b << s > 10`): beside a number, or with a comparison after it.
+            // Network containment has neither: its operands are a column
+            // and a network.
+            if matches!(*sym, "<<" | ">>") {
+                let after = &body[i + 2..];
+                let beside_number = after.trim_start().starts_with(|c: char| c.is_ascii_digit())
+                    || body[..i].trim_end().ends_with(|c: char| c.is_ascii_digit());
+                let compared_after = *plain_comparison_after.get_or_insert_with(|| last_plain_comparison(body, &nesting)) > i + 2;
+                if beside_number || compared_after {
+                    i += 2;
+                    continue;
+                }
+            }
             return Some((i, i + sym.len(), false));
         }
         if matches!(bytes[i], b'<' | b'>' | b'=' | b'!') {
@@ -3703,6 +3794,35 @@ fn comparison_operator(body: &str) -> Option<(usize, usize, bool)> {
         i += 1;
     }
     keyword.map(|(s, e)| (s, e, true))
+}
+
+/// The offset just past the last top-level plain comparison operator in
+/// `body` (`=`, `<`, `>`, `<=`, `>=`, `<>`, `!=`), 0 when it has none; a
+/// structural one (`<<`, `@>` …) and a path arrow are not plain.
+fn last_plain_comparison(body: &str, nesting: &crate::core::rql::expr::Nesting) -> usize {
+    let bytes = body.as_bytes();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !nesting.top_level(i) {
+            i += 1;
+            continue;
+        }
+        let here = &bytes[i..];
+        if here.starts_with(b"->") || here.starts_with(b"#>") {
+            i += if here.get(2) == Some(&b'>') { 3 } else { 2 };
+            continue;
+        }
+        if let Some(sym) = PG_OPERATORS.iter().find(|s| here.starts_with(s.as_bytes())) {
+            i += sym.len();
+            continue;
+        }
+        if matches!(bytes[i], b'<' | b'>' | b'=' | b'!') {
+            last = i + 1;
+        }
+        i += 1;
+    }
+    last
 }
 
 /// One comparison, with each side that needs the evaluator lifted.

@@ -711,6 +711,18 @@ pub(crate) fn lower_regex_operators(text: &str, function: &str) -> String {
             }
             if bytes[i] == b'~' && bytes.get(i + 1) != Some(&b'~') && (i == 0 || bytes[i - 1] != b'~') {
                 let negated = i > 0 && bytes[i - 1] == b'!';
+                // A prefix `~` is bitwise NOT (`~flags = -6`), and `~=` is
+                // no match: neither has an operand a match needs before it.
+                let before = out[..i].trim_end();
+                let word = before.rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).next().unwrap_or("");
+                let unary = !negated
+                    && (before.is_empty()
+                        || before.ends_with(['(', ',', '=', '<', '>'])
+                        || ["AND", "OR", "NOT", "WHERE", "WHEN", "THEN", "ELSE"].iter().any(|k| word.eq_ignore_ascii_case(k)));
+                if unary || bytes.get(i + 1) == Some(&b'=') {
+                    i += 1;
+                    continue;
+                }
                 let start = if negated { i - 1 } else { i };
                 let starred = bytes.get(i + 1) == Some(&b'*');
                 let end = i + 1 + usize::from(starred);
@@ -1059,6 +1071,16 @@ fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prefix_tilde_is_not_a_match() {
+        assert_eq!(lower_regex_operators("~flags = -6", "m"), "~flags = -6");
+        assert_eq!(lower_regex_operators("id > 0 AND ~flags = -7", "m"), "id > 0 AND ~flags = -7");
+        assert_eq!(lower_regex_operators("-7 = ~flags", "m"), "-7 = ~flags");
+        assert_eq!(lower_regex_operators("p ~= q", "m"), "p ~= q");
+        assert_eq!(lower_regex_operators("~a = 1 AND s ~ 'x'", "m"), "~a = 1 AND (m(s, 'x') = TRUE)");
+        assert_eq!(lower_regex_operators("s !~ 'x'", "m"), "(m(s, 'x') = FALSE)");
+    }
 
     #[test]
     fn a_character_n_column_is_cast_where_a_check_reads_it() {

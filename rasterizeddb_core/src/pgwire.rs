@@ -7858,6 +7858,13 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("operator does not exist") || (has("function ") && has(") does not exist")) {
         return "42883";
     }
+    // `string_data_length_mismatch`: `B'10' & B'1'`.
+    if raw.starts_with("cannot and bit strings of different sizes")
+        || raw.starts_with("cannot or bit strings of different sizes")
+        || raw.starts_with("cannot xor bit strings of different sizes")
+    {
+        return "22026";
+    }
     // `ambiguous_column`: a bare name more than one relation has.
     // The join planner's own words for it too ("column 'x' is ambiguous;
     // qualify it …"), which fell through to 42601.

@@ -1399,6 +1399,31 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         return Ok(Expr::PathOf { base: Box::new(base), steps: path.0.steps, as_text: path.0.as_text });
     }
 
+    // `&`, `|`, `#`, `<<` and `>>` are PostgreSQL's "other operators", one
+    // precedence with `||`, looser than arithmetic and grouped left to
+    // right: the rightmost of them all splits first (`1 | 2 || 'x'` is
+    // `(1 | 2) || 'x'`, `1 << 2 + 1` is 8). They were not read at all, so
+    // `flags & 1` was looked up as a column.
+    if !is_case_block(text)
+        && let Some((at, op)) = top_level_bitwise(text)
+        && top_level_concat(text).is_none_or(|c| c < at)
+    {
+        let lhs = text[..at].trim();
+        let rhs = text[at + op.len()..].trim();
+        if rhs.is_empty() {
+            return Err(format!("'{op}' has no right operand"));
+        }
+        use crate::core::rql::pg_functions::PgFunc;
+        let func = match op {
+            "&" => PgFunc::BitAnd,
+            "|" => PgFunc::BitOr,
+            "#" => PgFunc::BitXor,
+            "<<" => PgFunc::ShiftLeft,
+            _ => PgFunc::ShiftRight,
+        };
+        return Ok(Expr::Call(TextFunc::Pg(func), vec![parse(lhs, schema)?, parse(rhs, schema)?]));
+    }
+
     // `||` binds looser than arithmetic, so `a || b + 1` concatenates `a` with
     // `b + 1` rather than adding 1 to a concatenation.
     if let Some(at) = top_level_concat(text) {
@@ -1410,6 +1435,19 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 Box::new(parse(rhs, schema)?),
             ));
         }
+    }
+
+    // A prefix `~` (bitwise NOT) is an "other operator" too, so it takes the
+    // arithmetic after it: `~1 + 1` is `~2`, -3, as PostgreSQL's. Not `~*`
+    // or `~~`, which are matches and need a left operand anyway.
+    if let Some(rest) = text.strip_prefix('~')
+        && !rest.starts_with(['*', '~', '='])
+        && !rest.trim().is_empty()
+    {
+        return Ok(Expr::Call(
+            TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::BitNot),
+            vec![parse(rest.trim(), schema)?],
+        ));
     }
 
     // Arithmetic binds loosest of all — looser than a cast, so `a::INT + 1`
@@ -3186,6 +3224,13 @@ fn find_operator(text: &str, op: &str) -> Option<usize> {
                 i += 1;
                 continue;
             }
+            // `<` and `>` of a shift (`a << 2 > 3`), and the `>` of a path
+            // arrow, are not comparisons.
+            let doubled = |c: u8| bytes.get(i + 1) == Some(&c) || (i > 0 && bytes[i - 1] == c);
+            if (op == "<" && doubled(b'<')) || (op == ">" && (doubled(b'>') || (i > 0 && matches!(bytes[i - 1], b'-' | b'#')))) {
+                i += 1;
+                continue;
+            }
             return Some(i);
         }
         i += 1;
@@ -4504,6 +4549,61 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             }
         }
     })
+}
+
+/// The rightmost top-level bitwise operator (`&`, `|`, `#`, `<<`, `>>`)
+/// after something that can end an operand, and which it is. Not the
+/// operators they are part of: `&&`, `?&`, `&<`, `&>`, `||`, `?|`, `|>>`,
+/// `<<|`, `|/`, `|&>`, `#>`, `#>>`, `#-`, `##`, `<<=`, `>>=`, `->>`, `<->`,
+/// `<<->>`.
+pub(crate) fn top_level_bitwise(text: &str) -> Option<(usize, &'static str)> {
+    let bytes = text.as_bytes();
+    let nesting = Nesting::of(text);
+    let mut found = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !nesting.top_level(i) {
+            i += 1;
+            continue;
+        }
+        if let Some(op) = bitwise_operator_at(bytes, i) {
+            found = Some((i, op));
+            i += op.len();
+            continue;
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The bitwise operator (`&`, `|`, `#`, `<<`, `>>`) starting at `i`, after
+/// something that can end an operand; `None` there for any other byte and
+/// for the operators these are part of ([`top_level_bitwise`]). Says nothing
+/// of quotes or depth.
+pub(crate) fn bitwise_operator_at(bytes: &[u8], i: usize) -> Option<&'static str> {
+    let at = |i: usize| bytes.get(i).copied();
+    let before = |i: usize| i.checked_sub(1).and_then(at);
+    let op: &'static str = match bytes[i] {
+        b'&' if !matches!(before(i), Some(b'&' | b'?' | b'|')) && !matches!(at(i + 1), Some(b'&' | b'<' | b'>')) => "&",
+        b'|' if !matches!(before(i), Some(b'|' | b'?' | b'<')) && !matches!(at(i + 1), Some(b'|' | b'>' | b'/' | b'&')) => "|",
+        b'#' if !matches!(before(i), Some(b'#')) && !matches!(at(i + 1), Some(b'>' | b'-' | b'#')) => "#",
+        b'<' if at(i + 1) == Some(b'<')
+            && !matches!(before(i), Some(b'<'))
+            && !matches!(at(i + 2), Some(b'=' | b'|' | b'<' | b'-')) =>
+        {
+            "<<"
+        }
+        b'>' if at(i + 1) == Some(b'>')
+            && !matches!(before(i), Some(b'>' | b'-' | b'#' | b'|'))
+            && !matches!(at(i + 2), Some(b'=' | b'>')) =>
+        {
+            ">>"
+        }
+        _ => return None,
+    };
+    // The nearest byte before it that is not a space ends an operand.
+    let prev = bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()).map(|j| bytes[j]);
+    matches!(prev, Some(p) if p.is_ascii_alphanumeric() || matches!(p, b'_' | b')' | b']' | b'"' | b'\'' | b'.')).then_some(op)
 }
 
 /// Offset of a top-level `||`, ignoring quotes, parentheses and the arms of
@@ -9959,6 +10059,16 @@ mod case_nesting_tests {
         let concat = "'<' || CASE WHEN a THEN 'x' || 'y' END || '>'";
         assert_eq!(top_level_concat(concat), Some(concat.rfind("||").unwrap()));
         assert_eq!(case_block_end("CASE WHEN a THEN 'end' END x"), Some(26));
+        assert_eq!(top_level_bitwise("a & 1"), Some((2, "&")));
+        assert_eq!(top_level_bitwise("a & b | c"), Some((6, "|")));
+        assert_eq!(top_level_bitwise("1 << 2 + 1"), Some((2, "<<")));
+        assert_eq!(top_level_bitwise("x >> 1"), Some((2, ">>")));
+        for not_bitwise in [
+            "a && b", "d ?& k", "d ?| k", "a || b", "d #> '{a}'", "d #>> '{a}'", "d #- '{a}'", "d->>'k'", "a <<= b",
+            "a >>= b", "a <<| b", "a |>> b", "|/ 4", "a &< b", "a &> b", "p <-> q", "(a & b)", "'a & b'", "~5",
+        ] {
+            assert_eq!(top_level_bitwise(not_bitwise), None, "{not_bitwise}");
+        }
         assert_eq!(top_level_cast("CASE WHEN a THEN 1::text END"), None);
         assert_eq!(top_level_cast("(CASE WHEN a THEN 1 END)::text"), Some(24));
     }

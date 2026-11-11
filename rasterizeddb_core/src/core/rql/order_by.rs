@@ -122,7 +122,7 @@ fn split_term(term: &str) -> (&str, &str) {
 fn unparenthesised_expression<'a>(raw: &'a str, first: &str, rest: &str) -> Option<(&'a str, &'a str)> {
     // Comparisons too: `DISTINCT ON (a > 0) … ORDER BY a > 0, id` sorts by
     // the boolean `a > 0`.
-    const OPERATORS: &[char] = &['+', '-', '*', '/', '%', '^', '|', '<', '>', '=', '!'];
+    const OPERATORS: &[char] = &['+', '-', '*', '/', '%', '^', '|', '<', '>', '=', '!', '&', '#'];
     if !(rest.starts_with(OPERATORS) || first.ends_with(OPERATORS)) {
         return None;
     }
