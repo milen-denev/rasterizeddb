@@ -520,6 +520,8 @@ const TYPED_LITERAL_TYPES: &[(&[&str], &str)] = &[
     (&["TIMESTAMP", "WITH", "TIME", "ZONE"], "timestamptz"),
     (&["TIMESTAMP", "WITHOUT", "TIME", "ZONE"], "timestamp"),
     (&["TIME", "WITHOUT", "TIME", "ZONE"], "time"),
+    (&["TIME", "WITH", "TIME", "ZONE"], "timetz"),
+    (&["BIT", "VARYING"], "varbit"),
     (&["DOUBLE", "PRECISION"], "float8"),
     (&["TIMESTAMPTZ"], "timestamptz"),
     (&["TIMESTAMP"], "timestamp"),
@@ -545,6 +547,29 @@ const TYPED_LITERAL_TYPES: &[(&[&str], &str)] = &[
     (&["UUID"], "uuid"),
     (&["JSON"], "json"),
     (&["JSONB"], "jsonb"),
+    // The network, geometric, range and binary types: `inet '10.0.0.5'`,
+    // `point '(1,2)'`, `int4range '[1,5)'` were read as a column of that
+    // name ("column \"inet '10.0.0.5'\" does not exist").
+    (&["TIMETZ"], "timetz"),
+    (&["INET"], "inet"),
+    (&["CIDR"], "cidr"),
+    (&["MACADDR8"], "macaddr8"),
+    (&["MACADDR"], "macaddr"),
+    (&["POINT"], "point"),
+    (&["LINE"], "line"),
+    (&["LSEG"], "lseg"),
+    (&["BOX"], "box"),
+    (&["PATH"], "path"),
+    (&["POLYGON"], "polygon"),
+    (&["CIRCLE"], "circle"),
+    (&["INT4RANGE"], "int4range"),
+    (&["INT8RANGE"], "int8range"),
+    (&["NUMRANGE"], "numrange"),
+    (&["DATERANGE"], "daterange"),
+    (&["TSRANGE"], "tsrange"),
+    (&["TSTZRANGE"], "tstzrange"),
+    (&["BYTEA"], "bytea"),
+    (&["VARBIT"], "varbit"),
 ];
 
 /// SQL's typed literal — `DATE '2024-01-02'`, `NUMERIC '1.50'`, `TIMESTAMP

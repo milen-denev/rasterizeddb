@@ -908,6 +908,7 @@ pub(crate) fn looks_like_row_expression(text: &str) -> bool {
     // expression parser (`expr::top_level_bitwise`), which tells them from
     // the operators they are part of. Taken for a column name before.
     if crate::core::rql::expr::top_level_bitwise(text.trim()).is_some()
+        || crate::core::rql::expr::top_level_structural(text.trim()).is_some()
         || text.trim_start().strip_prefix('~').is_some_and(|r| !r.starts_with(['*', '~', '=']) && !r.trim().is_empty())
     {
         return true;

@@ -1332,9 +1332,34 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     // right: the rightmost of them all splits first (`1 | 2 || 'x'` is
     // `(1 | 2) || 'x'`, `1 << 2 + 1` is 8). They were not read at all, so
     // `flags & 1` was looked up as a column.
+    // The structural operators share that precedence: `@>`, `<@`, `&&`,
+    // `?`, `?|`, `?&`, `<<=`, `>>=` (`<<` and `>>` are the shifts' above,
+    // containment for two networks). A `WHERE` reads them between a column
+    // and a value itself; here they are over what a row computes, which the
+    // select list could not read at all.
+    if !is_case_block(text)
+        && let Some((at, op)) = top_level_structural(text)
+        && top_level_bitwise(text).is_none_or(|(b, _)| b < at)
+        && top_level_concat(text).is_none_or(|c| c < at)
+    {
+        let lhs = text[..at].trim();
+        let rhs = text[at + op.len()..].trim();
+        if rhs.is_empty() {
+            return Err(format!("'{op}' has no right operand"));
+        }
+        return Ok(Expr::Call(
+            TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::StructOp),
+            vec![
+                parse(lhs, schema)?,
+                parse(rhs, schema)?,
+                Expr::Literal { bytes: op.as_bytes().to_vec(), db_type: DbType::STRING },
+            ],
+        ));
+    }
     if !is_case_block(text)
         && let Some((at, op)) = top_level_bitwise(text)
         && top_level_concat(text).is_none_or(|c| c < at)
+        && top_level_structural(text).is_none_or(|(s, _)| s < at)
     {
         let lhs = text[..at].trim();
         let rhs = text[at + op.len()..].trim();
@@ -4676,6 +4701,38 @@ pub(crate) fn text_match(left: Expr, right: Expr) -> Expr {
         (false, false) => TextFunc::TsMatchTt,
     };
     Expr::Call(func, vec![left, right])
+}
+
+/// The rightmost top-level structural operator (`@>`, `<@`, `&&`, `?`,
+/// `?|`, `?&`, `<<=`, `>>=`) after something that can end an operand.
+pub(crate) fn top_level_structural(text: &str) -> Option<(usize, &'static str)> {
+    let bytes = text.as_bytes();
+    let nesting = Nesting::of(text);
+    let mut found = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !nesting.top_level(i) {
+            i += 1;
+            continue;
+        }
+        let here = &bytes[i..];
+        let op: Option<&'static str> = ["<<=", ">>=", "@>", "<@", "&&", "?|", "?&"]
+            .into_iter()
+            .find(|s| here.starts_with(s.as_bytes()))
+            .or_else(|| (here.first() == Some(&b'?')).then_some("?"));
+        // Not `@@`'s second `@`, not a path's `#>`/`->`.
+        let op = op.filter(|o| !(*o == "<@" && i > 0 && bytes[i - 1] == b'<'));
+        if let Some(op) = op {
+            let prev = bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()).map(|j| bytes[j]);
+            if matches!(prev, Some(p) if p.is_ascii_alphanumeric() || matches!(p, b'_' | b')' | b']' | b'"' | b'\'' | b'.')) {
+                found = Some((i, op));
+            }
+            i += op.len();
+            continue;
+        }
+        i += 1;
+    }
+    found
 }
 
 /// The bitwise operator (`&`, `|`, `#`, `<<`, `>>`) starting at `i`, after
@@ -10163,6 +10220,15 @@ mod case_nesting_tests {
         let concat = "'<' || CASE WHEN a THEN 'x' || 'y' END || '>'";
         assert_eq!(top_level_concat(concat), Some(concat.rfind("||").unwrap()));
         assert_eq!(case_block_end("CASE WHEN a THEN 'end' END x"), Some(26));
+        assert_eq!(top_level_structural("d ? 'a'"), Some((2, "?")));
+        assert_eq!(top_level_structural("d ?| ARRAY['a']"), Some((2, "?|")));
+        assert_eq!(top_level_structural("r @> 3"), Some((2, "@>")));
+        assert_eq!(top_level_structural("3 <@ r"), Some((2, "<@")));
+        assert_eq!(top_level_structural("a && b"), Some((2, "&&")));
+        assert_eq!(top_level_structural("ip <<= n"), Some((3, "<<=")));
+        assert_eq!(top_level_structural("(d ? 'a')"), None);
+        assert_eq!(top_level_structural("'a ? b'"), None);
+        assert_eq!(top_level_structural("a << b"), None);
         assert_eq!(top_level_bitwise("a & 1"), Some((2, "&")));
         assert_eq!(top_level_bitwise("a & b | c"), Some((6, "|")));
         assert_eq!(top_level_bitwise("1 << 2 + 1"), Some((2, "<<")));

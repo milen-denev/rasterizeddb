@@ -1448,12 +1448,21 @@ pub fn format_range(db_type: &DbType, bytes: &[u8]) -> Option<String> {
     if range.empty {
         return Some("empty".to_string());
     }
+    // A `tstzrange`'s bounds are `timestamptz`s and print with their zone,
+    // as one does anywhere else (`2026-01-01 08:00:00+00`). Printed bare, a
+    // client read the UTC instant as its local time.
+    let zoned = |text: String| -> String {
+        match (db_type, text.strip_suffix('"')) {
+            (DbType::TSTZRANGE, Some(inner)) => format!("{inner}+00\""),
+            _ => text,
+        }
+    };
     let lower = match &range.lower {
-        Some(b) => format_range_element(&element, b)?,
+        Some(b) => zoned(format_range_element(&element, b)?),
         None => String::new(),
     };
     let upper = match &range.upper {
-        Some(b) => format_range_element(&element, b)?,
+        Some(b) => zoned(format_range_element(&element, b)?),
         None => String::new(),
     };
     Some(format!(

@@ -47,6 +47,10 @@ pub enum PgFunc {
     ShiftLeft,
     ShiftRight,
     BitNot,
+    /// `@>`, `<@`, `&&`, `?`, `?|`, `?&`, `<<=`, `>>=` over the values a row
+    /// computes (`expr::parse`): the left, the right and the symbol, answered
+    /// by `pg_ops::evaluate` as a `WHERE` between a column and a value is.
+    StructOp,
     /// `x op ANY (array)` / `ALL`, over an array the row computes: the
     /// value, the array, the operator and `ANY` or `ALL`, as text
     /// (`expr::quantified_condition`). TRUE, FALSE, or NULL when no element
@@ -300,6 +304,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
         StringToArray | ArrayCtor | ArraySlice | ArrayCast => DbType::ARRAY,
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise_type(func, args),
+        StructOp => DbType::BOOL,
         QuantifiedCmp => DbType::BOOL,
         ArraySubscript => subscript_type(args),
         _ => DbType::STRING,
@@ -459,6 +464,58 @@ fn bit_value(bits: &[bool]) -> Value {
 
 fn is_bit(v: &Value) -> bool {
     matches!(v, Value::Data { db_type: DbType::BIT | DbType::VARBIT, .. })
+}
+
+/// A structural operator (`PgFunc::StructOp`) over its evaluated operands.
+fn structural(args: &[Value]) -> Result<Value, String> {
+    use crate::core::pg_ops::PgOp;
+    let symbol = text_of(&args[2]);
+    let op = PgOp::from_symbol(&symbol).ok_or_else(|| format!("operator {symbol} is not supported yet"))?;
+    let (Value::Data { bytes: left, db_type: left_type }, Value::Data { bytes: right, db_type: right_type }) = (&args[0], &args[1])
+    else {
+        return Ok(Value::Null);
+    };
+    let name = |t: &DbType| crate::core::value_codec::pg_input_type_name(t);
+    // `element <@ container` (`3 <@ int4range '[1,5)'`, `point <@ box`) is
+    // the container's `@>` of the element.
+    if op == PgOp::ContainedBy && !op.applies_to(left_type) && op.applies_to(right_type) {
+        let swapped = [args[1].clone(), args[0].clone(), text_value("@>".to_string())];
+        return structural(&swapped);
+    }
+    if !op.applies_to(left_type) {
+        return Err(format!("operator does not exist: {} {symbol} {}", name(left_type), name(right_type)));
+    }
+    // A key list as an array (`?| ARRAY['a', 'b']`): its text, the form the
+    // key reader takes.
+    let array_text;
+    let (right, right_type): (&[u8], DbType) = if *right_type == DbType::ARRAY && op.takes_text_operand() {
+        array_text = crate::core::value_codec::format_array(right).unwrap_or_default().into_bytes();
+        (&array_text, DbType::STRING)
+    } else {
+        (right, right_type.clone())
+    };
+    // A text right operand at the left's type, as the planner reads one
+    // (`doc @> '{"a":1}'` is a document, `tags @> '{gift}'` an array).
+    let encoded;
+    let (right, right_type): (&[u8], DbType) = match (&right_type, op.takes_text_operand()) {
+        (DbType::STRING, false) if *left_type != DbType::STRING => {
+            let text = String::from_utf8_lossy(right).into_owned();
+            match crate::core::value_codec::encode_literal(left_type, &text) {
+                Some(bytes) => {
+                    encoded = bytes;
+                    (&encoded, left_type.clone())
+                }
+                None if *left_type == DbType::JSONB => {
+                    return Err(format!("invalid input syntax for type json: {}", crate::core::value_codec::quote_sql(&text)));
+                }
+                None => (right, right_type),
+            }
+        }
+        _ => (right, right_type),
+    };
+    crate::core::pg_ops::evaluate(op, left_type, left, &right_type, right)
+        .map(|v| data(vec![u8::from(v)], DbType::BOOL))
+        .ok_or_else(|| format!("operator does not exist: {} {symbol} {}", name(left_type), name(&right_type)))
 }
 
 /// `&`, `|`, `#`, `<<`, `>>` and `~` over their evaluated operands.
@@ -1190,6 +1247,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         NumNonnulls => int_value(args.iter().filter(|a| !a.is_null()).count() as i64),
         NumNulls => int_value(args.iter().filter(|a| a.is_null()).count() as i64),
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise(func, args)?,
+        StructOp => structural(args)?,
         ArrayCast => {
             if args[0].is_null() {
                 return Ok(Value::Null);
