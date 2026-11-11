@@ -76,6 +76,11 @@ async fn a_match_filters_rows_as_postgresql_does() {
         ("SELECT id FROM ft WHERE to_tsvector('english', body) @@ to_tsquery('english', 'fox') AND id > 1 ORDER BY id", &["3"]),
         ("SELECT count(*) FROM ft WHERE NOT (to_tsvector('english', body) @@ to_tsquery('english', 'fox'))", &["1"]),
         ("SELECT id, body @@ to_tsquery('english', 'fox') FROM ft ORDER BY id", &["1|t", "2|f", "3|t"]),
+        // In a select list too, a query on the left is read the other way round.
+        (
+            "SELECT id, to_tsquery('english', 'fox') @@ to_tsvector('english', body) FROM ft ORDER BY id",
+            &["1|t", "2|f", "3|t"],
+        ),
     ];
     for (sql, want) in cases {
         assert_eq!(rows(&pool, sql).await, want.to_vec(), "{sql}");

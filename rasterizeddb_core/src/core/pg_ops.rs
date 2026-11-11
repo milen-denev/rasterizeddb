@@ -561,6 +561,23 @@ fn array_elements(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A text column against a literal: `to_tsvector(text) @@
+    /// plainto_tsquery(literal)`, as PostgreSQL's `ts_match_tt` reads it. The
+    /// column's raw text was read as an already-made vector and matched
+    /// nothing.
+    #[test]
+    fn a_text_match_reads_both_sides_as_text() {
+        let m = |text: &str, query: &str| {
+            evaluate(PgOp::TextMatch, &DbType::STRING, text.as_bytes(), &DbType::STRING, query.as_bytes())
+        };
+        assert_eq!(m("urgent delivery", "urgent"), Some(true));
+        assert_eq!(m("The quick brown fox", "foxes"), Some(true));
+        // plainto's reading: operators are words, so `urgent & !fragile` is
+        // 'urgent' & 'fragil'.
+        assert_eq!(m("fragile urgent", "urgent & !fragile"), Some(true));
+        assert_eq!(m("urgent delivery", "urgent & !fragile"), Some(false));
+    }
+
     fn inet(text: &str) -> Vec<u8> {
         crate::core::value_codec::parse_inet(text).unwrap().to_vec()
     }
