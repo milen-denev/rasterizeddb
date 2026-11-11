@@ -1034,6 +1034,238 @@ fn always_build_right() -> bool {
     *RIGHT.get_or_init(|| std::env::var_os("RDB_JOIN_BUILD_RIGHT").is_some_and(|v| v == "1"))
 }
 
+/// The most distinct key values one scanned relation hands a neighbour's scan.
+/// Past it the neighbour is scanned by its own predicate alone, as before.
+pub const KEY_PUSHDOWN_MAX: usize = 128;
+
+/// 0: not decided yet (the environment is asked), 1: on, 2: off.
+static KEY_PUSHDOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Scans that ran restricted to a neighbour's keys, since the process began.
+static KEY_PUSHDOWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a scanned relation's join keys restrict its neighbours' scans
+/// ([`key_restriction`]). On, unless the server was started with
+/// `RDB_JOIN_KEY_PUSHDOWN=0`: every relation is then scanned in the order
+/// written, by its own predicate, as it was before.
+pub fn key_pushdown() -> bool {
+    use std::sync::atomic::Ordering;
+    match KEY_PUSHDOWN.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RDB_JOIN_KEY_PUSHDOWN").is_none_or(|v| v != "0");
+            KEY_PUSHDOWN.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Turns [`key_pushdown`] on or off for the whole process: for a test that
+/// runs one join both ways and compares.
+#[doc(hidden)]
+pub fn set_key_pushdown(on: bool) {
+    KEY_PUSHDOWN.store(if on { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many relation scans have run restricted to a neighbour's keys.
+#[doc(hidden)]
+pub fn key_pushdowns() -> u64 {
+    KEY_PUSHDOWNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Counts one restricted scan.
+pub(crate) fn note_key_pushdown() {
+    KEY_PUSHDOWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A scan term restricting relation `target` to the join keys its
+/// already-scanned neighbours hold — `id = 7`, `cust IN (3, 9, 12)` — or
+/// `None` when no neighbour is both scanned and small enough.
+///
+/// A point lookup joined to its parent scanned the parent whole: each relation
+/// was read by its own share of the `WHERE` and nothing else, so `orders o JOIN
+/// cust c ON c.id = o.cust WHERE o.id = $1` read one order and every customer.
+/// With the order in hand its `cust` names the only customer that can pair.
+///
+/// The term may only remove rows that reach no output tuple, which is the
+/// rule `plan` already follows when it drops NULL keys at the scan:
+///
+/// * `target` is attached by an INNER or LEFT join and its left relation is
+///   scanned: a row of `target` enters a tuple only by matching a key there;
+/// * a scanned relation is attached to `target` by an INNER join: every tuple
+///   whose `target` row has no partner in it is dropped at that step, and a
+///   row removed from the scan yields no tuple, or one with that side absent,
+///   which the step drops alike.
+///
+/// Never the preserved side of an outer join. Only integer keys: the join
+/// matches integers of any two widths by value (`key_numbers`), which is what
+/// an integer literal in the scan's comparison means too. A key the reader
+/// cannot decode abandons its term rather than being skipped — a skipped key
+/// would be a partner the scan never returns. NULL keys are skipped: they
+/// match nothing.
+///
+/// Composite keys give one term per column, a superset of the pairs that
+/// match on all of them. A neighbour with no key at all gives `1 = 0`: nothing
+/// in `target` can pair with it.
+pub fn key_restriction(plan: &JoinPlan, target: usize, scanned: &[Option<RowSet>]) -> Option<String> {
+    let relation = plan.relations.get(target)?;
+    // (the scanned relation, its key column, `target`'s key column)
+    let mut edges: Vec<(usize, &str, &str)> = Vec::new();
+    if let Some(join) = relation.join.as_ref() {
+        if matches!(join.kind, JoinKind::Inner | JoinKind::Left)
+            && scanned.get(join.left_rel).is_some_and(Option::is_some)
+        {
+            for (left, right) in &join.keys {
+                edges.push((join.left_rel, left, right));
+            }
+        }
+    }
+    for (other, attached) in plan.relations.iter().enumerate() {
+        let Some(join) = attached.join.as_ref() else { continue };
+        if join.left_rel == target
+            && join.kind == JoinKind::Inner
+            && other != target
+            && scanned.get(other).is_some_and(Option::is_some)
+        {
+            for (left, right) in &join.keys {
+                edges.push((other, right, left));
+            }
+        }
+    }
+
+    let integer = |t: &DbType| {
+        matches!(t, DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64)
+    };
+    let key_field = |rel: &'_ Relation, name: &str| -> Option<SchemaField> {
+        rel.fetch_columns
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
+            .cloned()
+    };
+    let mut terms: Vec<String> = Vec::new();
+    for (source, source_column, target_column) in edges {
+        let source_relation = &plan.relations[source];
+        let Some(set) = scanned[source].as_ref() else { continue };
+        // Bounded before any row is read: more rows than this could still
+        // hold few distinct keys, but reading them all to find out is the
+        // cost this exists to avoid paying on a large relation.
+        if set.len() > KEY_PUSHDOWN_MAX * 8 {
+            continue;
+        }
+        let (Some(from), Some(to)) = (key_field(source_relation, source_column), key_field(relation, target_column)) else {
+            continue;
+        };
+        if !integer(&from.db_type) || !integer(&to.db_type) {
+            continue;
+        }
+        // Written bare into the scan's clause, so only a name that reads as
+        // one identifier there.
+        if to.name.is_empty()
+            || !to.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || to.name.as_bytes()[0].is_ascii_digit()
+        {
+            continue;
+        }
+        let flag = source_relation
+            .fetch_columns
+            .iter()
+            .find(|f| !f.is_deleted && crate::core::rql::nullable::is_flag_name_of(&f.name, &from.name))
+            .map(|f| f.write_order);
+        let mut values: Vec<i128> = Vec::with_capacity(set.len());
+        let mut readable = true;
+        for r in 0..set.len() {
+            let Some(row) = set.get(r) else {
+                readable = false;
+                break;
+            };
+            let Some((bytes, ty)) = row.column(from.write_order) else {
+                readable = false;
+                break;
+            };
+            if ty == DbType::NULL
+                || flag.is_some_and(|flag| {
+                    row.column(flag).is_some_and(|(b, _)| crate::core::rql::nullable::flag_is_set(b))
+                })
+            {
+                continue;
+            }
+            let value: Option<i128> = match (&from.db_type, bytes.len()) {
+                (DbType::I8, 1) => Some(bytes[0] as i8 as i128),
+                (DbType::I16, 2) => Some(i16::from_le_bytes([bytes[0], bytes[1]]) as i128),
+                (DbType::I32, 4) => bytes.try_into().ok().map(|b| i32::from_le_bytes(b) as i128),
+                (DbType::I64, 8) => bytes.try_into().ok().map(|b| i64::from_le_bytes(b) as i128),
+                (DbType::U8, 1) => Some(bytes[0] as i128),
+                (DbType::U16, 2) => Some(u16::from_le_bytes([bytes[0], bytes[1]]) as i128),
+                (DbType::U32, 4) => bytes.try_into().ok().map(|b| u32::from_le_bytes(b) as i128),
+                (DbType::U64, 8) => bytes.try_into().ok().map(|b| u64::from_le_bytes(b) as i128),
+                _ => None,
+            };
+            match value {
+                Some(v) => values.push(v),
+                None => {
+                    readable = false;
+                    break;
+                }
+            }
+        }
+        if !readable {
+            continue;
+        }
+        values.sort_unstable();
+        values.dedup();
+        if values.len() > KEY_PUSHDOWN_MAX {
+            continue;
+        }
+        terms.push(match values.as_slice() {
+            [] => "1 = 0".to_string(),
+            [one] => format!("{} = {}", to.name, one),
+            many => format!(
+                "{} IN ({})",
+                to.name,
+                many.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
+    if terms.is_empty() {
+        return None;
+    }
+    // One `1 = 0` decides the whole restriction.
+    if terms.iter().any(|t| t == "1 = 0") {
+        return Some("1 = 0".to_string());
+    }
+    terms.dedup();
+    Some(terms.join(" AND "))
+}
+
+/// Which relation of a join to scan next, and the key term to scan it with.
+///
+/// A relation a scanned neighbour can restrict goes first, then one with a
+/// `WHERE` share of its own — the likeliest to come back small enough to
+/// restrict the rest — then declaration order. A predicate that is only the
+/// planner's own NULL-key terms (`__null_k = 0`) is no share of the `WHERE`.
+/// `None` when every relation is scanned.
+pub fn next_to_scan(plan: &JoinPlan, scanned: &[Option<RowSet>]) -> Option<(usize, Option<String>)> {
+    let pending = || (0..plan.relations.len()).filter(|i| scanned.get(*i).is_some_and(Option::is_none));
+    if !key_pushdown() {
+        return pending().next().map(|i| (i, None));
+    }
+    for idx in pending() {
+        if let Some(term) = key_restriction(plan, idx, scanned) {
+            return Some((idx, Some(term)));
+        }
+    }
+    let own_share = |predicate: &str| {
+        predicate.split(" AND ").any(|term| {
+            let term = term.trim();
+            !term.is_empty() && !term.starts_with(crate::core::rql::nullable::NULL_FLAG_PREFIX)
+        })
+    };
+    pending()
+        .find(|i| own_share(&plan.relations[*i].predicate))
+        .or_else(|| pending().next())
+        .map(|i| (i, None))
+}
+
 /// Executes the join over already-scanned per-relation rows.
 ///
 /// `scanned[i]` holds the rows of `plan.relations[i]`. Relations must be joined

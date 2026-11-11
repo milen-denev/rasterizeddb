@@ -72,15 +72,28 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
     // ~1.5 KB whatever it holds. `RDB_JOIN_ROWS=1` scans into `Vec<Row>`
     // instead, the path this replaced, for A/B measurement.
     let legacy_rows = legacy_join_rows();
-    let mut scanned: Vec<crate::core::rql::join::RowSet> =
-        Vec::with_capacity(plan.relations.len());
+    //
+    // Scanned in the order `next_to_scan` gives, not the order written: a
+    // relation that comes back small hands its join keys to the scan of the
+    // one it joins, which then reads those rows through an index rather than
+    // the whole relation (`join::key_restriction`).
+    let mut sets: Vec<Option<crate::core::rql::join::RowSet>> =
+        plan.relations.iter().map(|_| None).collect();
     // Every relation is read under one snapshot, the statement's. A snapshot
     // per scan let a transaction that committed between two of them show in
     // one relation and not the other: a transfer between two tables joined
     // to half of itself. All versioned tables share one transaction manager,
     // so the first one's snapshot is valid for the rest.
     let mut statement_snapshot: Option<crate::core::mvcc::Visibility> = None;
-    for relation in &plan.relations {
+    while let Some((index, key_term)) = crate::core::rql::join::next_to_scan(&plan, &sets) {
+        let relation = &plan.relations[index];
+        // No row of this relation can pair with anything: its neighbour came
+        // back without a single key.
+        if key_term.as_deref() == Some("1 = 0") {
+            crate::core::rql::join::note_key_pushdown();
+            sets[index] = Some(crate::core::rql::join::RowSet::Rows(Vec::new()));
+            continue;
+        }
         // A partitioned table's rows are in its partitions; `tables` holds
         // only its shell under this name (§3.3). Cloned out, so no map guard
         // spans the scan below.
@@ -98,11 +111,34 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
         let schema = &source.schema().fields;
         let requested = crate::core::rql::join::fetch_for(&relation.fetch_columns, schema);
 
+        // The neighbour's keys join the predicate only when an index or the
+        // filter narrows the scan by them: a term the scan would evaluate row
+        // by row over the whole relation costs more than the rows it saves.
+        // Asking is the test — `build_candidates` is what the scan itself asks
+        // — and the statement's keys are its own, so the result is not cached.
+        let mut predicate = std::borrow::Cow::Borrowed(relation.predicate.as_str());
+        let mut cache = true;
+        if let (Some(term), crate::core::database::Relation::Plain(table)) = (key_term.as_ref(), &source) {
+            if let Ok(term) = crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(term, schema) {
+                let restricted = if relation.predicate.is_empty() {
+                    term
+                } else {
+                    format!("({}) AND {}", relation.predicate, term)
+                };
+                if matches!(table.build_candidates(&restricted, None).await, Ok(Some(_))) {
+                    crate::core::rql::join::note_key_pushdown();
+                    predicate = std::borrow::Cow::Owned(restricted);
+                    cache = false;
+                }
+            }
+        }
+        let predicate: &str = &predicate;
+
         // The scan needs whatever the predicate reads, which may be columns the
         // join itself never looks at.
         let mut predicate_fields: Vec<crate::core::row::schema::SchemaField> = Vec::new();
         for name in
-            crate::core::rql::lexer_query::extract_where_columns(&relation.predicate, schema)
+            crate::core::rql::lexer_query::extract_where_columns(predicate, schema)
         {
             if let Some(f) = schema.iter().find(|f| f.name == name) {
                 predicate_fields.push(f.clone());
@@ -122,7 +158,7 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
                 if legacy_rows {
                     table
                         .query_row_with_visibility(
-                            &relation.predicate,
+                            predicate,
                             &schema,
                             query_fetch,
                             requested,
@@ -136,14 +172,14 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
                 } else {
                     table
                         .query_row_bytes_with_visibility(
-                            &relation.predicate,
+                            predicate,
                             &schema,
                             query_fetch,
                             requested,
                             None,
                             None,
                             visibility,
-                            true,
+                            cache,
                         )
                         .await
                         .map_err(|e| e.to_string())
@@ -180,13 +216,14 @@ async fn execute_join(sql: &str, database: Arc<Database>, tx: TxId) -> Vec<u8> {
             }
         };
         match set {
-            Ok(set) => scanned.push(set),
+            Ok(set) => sets[index] = Some(set),
             Err(e) => {
                 error!("Failed to scan '{}' for join: {}", relation.table, e);
                 return error(&e);
             }
         }
     }
+    let scanned: Vec<crate::core::rql::join::RowSet> = sets.into_iter().flatten().collect();
 
     let combined = match crate::core::rql::join::combine(&plan, &scanned) {
         Ok(rows) => rows,
