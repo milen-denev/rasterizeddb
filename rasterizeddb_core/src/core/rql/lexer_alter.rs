@@ -810,6 +810,46 @@ pub fn declared_width(token: &str) -> Option<u32> {
         .ok()
 }
 
+/// `DROP TABLE [IF EXISTS] a, b, … [CASCADE | RESTRICT]` as one `DROP
+/// TABLE` per relation, each with the statement's `IF EXISTS` and trailing
+/// option; `None` for a statement that is not a drop of several. Run in one
+/// transaction (the simple protocol's implicit block), they drop all or none,
+/// as PostgreSQL's one statement does.
+pub fn expand_multi_drop(sql: &str) -> Option<Vec<String>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    trimmed.get(..10).filter(|h| h.eq_ignore_ascii_case("DROP TABLE"))?;
+    let mut rest = trimmed[10..].trim_start();
+    if !trimmed[10..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut prefix = String::from("DROP TABLE ");
+    if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("IF EXISTS") && rest[9..].starts_with(char::is_whitespace) {
+        prefix.push_str("IF EXISTS ");
+        rest = rest[9..].trim_start();
+    }
+    // A trailing `CASCADE` / `RESTRICT` applies to every relation.
+    let mut suffix = "";
+    for option in ["CASCADE", "RESTRICT"] {
+        if rest.len() > option.len()
+            && rest[rest.len() - option.len()..].eq_ignore_ascii_case(option)
+            && rest[..rest.len() - option.len()].ends_with(char::is_whitespace)
+        {
+            suffix = option;
+            rest = rest[..rest.len() - option.len()].trim_end();
+        }
+    }
+    let names: Vec<&str> = crate::core::sql_scan::split_top_level(rest, b',').into_iter().map(str::trim).collect();
+    if names.len() < 2 || names.iter().any(|n| n.is_empty()) {
+        return None;
+    }
+    Some(
+        names
+            .iter()
+            .map(|name| if suffix.is_empty() { format!("{prefix}{name}") } else { format!("{prefix}{name} {suffix}") })
+            .collect(),
+    )
+}
+
 /// The relation a `DROP TABLE` names, or `None` when the statement is malformed.
 pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
     let sql = sql.trim().trim_end_matches(';');
@@ -827,7 +867,9 @@ pub fn parse_drop_table(sql: &str) -> Result<(String, bool), String> {
         token = tokens.next().ok_or("DROP TABLE names no relation")?;
     }
 
-    if sql.matches(',').count() > 0 {
+    // Several names are `expand_multi_drop`'s; a comma inside a quoted name
+    // is the name's.
+    if crate::core::sql_scan::split_top_level(sql, b',').len() > 1 {
         return Err("dropping several tables in one statement is not supported yet".to_string());
     }
 
@@ -1387,6 +1429,15 @@ mod tests {
             ("users".into(), true)
         );
         assert!(parse_drop_table("DROP TABLE a, b").is_err());
+        assert_eq!(parse_drop_table(r#"DROP TABLE "a,b""#).unwrap(), ("a,b".to_string(), false));
+        assert_eq!(
+            expand_multi_drop(r#"DROP TABLE IF EXISTS a, "b,c", s.d CASCADE;"#).unwrap(),
+            vec!["DROP TABLE IF EXISTS a CASCADE", r#"DROP TABLE IF EXISTS "b,c" CASCADE"#, "DROP TABLE IF EXISTS s.d CASCADE"]
+        );
+        assert_eq!(expand_multi_drop("DROP TABLE a, b RESTRICT").unwrap(), vec!["DROP TABLE a RESTRICT", "DROP TABLE b RESTRICT"]);
+        assert_eq!(expand_multi_drop("DROP TABLE a"), None);
+        assert_eq!(expand_multi_drop(r#"DROP TABLE "a,b""#), None);
+        assert_eq!(expand_multi_drop("DROP TABLESPACE a, b"), None);
     }
 
     /// An index over plain columns is a real B-tree or hash index (see

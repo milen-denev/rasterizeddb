@@ -7858,6 +7858,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("operator does not exist") || (has("function ") && has(") does not exist")) {
         return "42883";
     }
+    // `undefined_table`: `DROP TABLE a, missing` names a table that is not
+    // there, as PostgreSQL words it.
+    if raw.starts_with("table \"") && raw.ends_with("\" does not exist") {
+        return "42P01";
+    }
     // `string_data_length_mismatch`: `B'10' & B'1'`.
     if raw.starts_with("cannot and bit strings of different sizes")
         || raw.starts_with("cannot or bit strings of different sizes")
@@ -7923,7 +7928,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `dependent_objects_still_exist`: DROP TABLE of a table other tables'
     // foreign keys reference, without CASCADE; DROP COLUMN of a referenced
     // column. Early: the message quotes table and constraint names.
-    if has("because other objects depend on it") || (has("because constraint") && has("depends on it")) {
+    if has("because other objects depend on it")
+        || has("because other objects depend on them")
+        || (has("because constraint") && has("depends on it"))
+    {
         return "2BP01";
     }
     // `invalid_table_definition`: a second PRIMARY KEY. Early: the message

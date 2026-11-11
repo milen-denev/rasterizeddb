@@ -12731,6 +12731,66 @@ async fn sequences_owned_by_dropped(sql: &str, database: &Arc<Database>) -> Resu
     ))
 }
 
+/// `DROP TABLE [IF EXISTS] a, b, … [CASCADE]`, PostgreSQL's one statement:
+/// every name is checked before anything is dropped — a missing one (without
+/// `IF EXISTS`) and a foreign key from a table outside the list (without
+/// `CASCADE`) fail it whole — and then each is dropped as its own `DROP TABLE
+/// … CASCADE`: a key between two of the listed tables goes with them, as
+/// PostgreSQL drops a set whose members depend on each other. Each drop also
+/// takes its owned sequences and is logged as the single drop it is.
+///
+/// It was refused ("dropping several tables in one statement is not
+/// supported yet"); a migration's `DROP TABLE IF EXISTS a, b` failed.
+async fn drop_several_tables(sql: &str, each: &[String], database: &Arc<Database>, tx: TxId, depth: usize) -> Vec<u8> {
+    use crate::core::rql::lexer_alter::parse_drop_table;
+    let cascade = drop_table_cascades(sql);
+    let mut names: Vec<(String, bool)> = Vec::with_capacity(each.len());
+    for one in each {
+        match parse_drop_table(one) {
+            Ok(parsed) => names.push(parsed),
+            Err(e) => return ddl_error(&e),
+        }
+    }
+    let exists = |name: &str| database.has_table(name) || database.is_partitioned(name);
+    let mut present: Vec<String> = Vec::new();
+    for (name, if_exists) in &names {
+        if exists(name) {
+            if !present.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+                present.push(name.clone());
+            }
+        } else if !if_exists {
+            return ddl_error(&format!("table \"{name}\" does not exist"));
+        }
+    }
+    if !cascade {
+        for table in &present {
+            for child in database.fk_children(table) {
+                if !child.eq_ignore_ascii_case(table) && !present.iter().any(|p| p.eq_ignore_ascii_case(&child)) {
+                    return ddl_error(&format!(
+                        "cannot drop desired object(s) because other objects depend on them: a foreign key on table \
+                         {child} references {table} (HINT: use DROP ... CASCADE to drop the dependent objects too)"
+                    ));
+                }
+            }
+        }
+    }
+    for table in &present {
+        let one = format!("DROP TABLE {} CASCADE", crate::core::rql::ctas::quote_ident(table));
+        let owned = match Box::pin(sequences_owned_by_dropped(&one, database)).await {
+            Ok(owned) => owned,
+            Err(e) => return ddl_error(&e),
+        };
+        let response = Box::pin(execute_drop_table(&one, database)).await;
+        if response.first() == Some(&3) {
+            return response;
+        }
+        crate::core::rql::sequence::forget(database.id, &owned);
+        crate::core::rql::sequence::forget_table_floors(database.id, table);
+        note_write(database, tx, depth, &one, None);
+    }
+    ddl_ok(0)
+}
+
 async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     use crate::core::rql::lexer_alter;
 
@@ -20313,6 +20373,10 @@ pub(crate) async fn execute_with_need(
         // Each of these is boxed for the same reason: keeping a branch's
         // locals out of the enclosing future.
         QueryPurpose::DropTable(sql) => {
+            // `DROP TABLE a, b`: one statement over several tables.
+            if let Some(each) = crate::core::rql::lexer_alter::expand_multi_drop(sql) {
+                return Box::pin(drop_several_tables(sql, &each, &database, tx, depth)).await;
+            }
             // Which sequences the table owns, read before the drop takes the
             // schema that says so.
             let owned = match Box::pin(sequences_owned_by_dropped(sql, &database)).await {
