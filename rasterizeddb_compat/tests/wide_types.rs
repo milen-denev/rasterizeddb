@@ -144,7 +144,7 @@ async fn array_ndims_and_ordinality_runs() {
 /// scan's comparison path takes column bytes and literals, and has nowhere to
 /// evaluate an expression per row.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "function calls in a WHERE clause are not implemented"]
+#[ignore = "jsonb_path_query and jsonb_path_query_array are not implemented"]
 async fn fulltext_jsonpath_and_subquery_runs() {
     run_named("fulltext_jsonpath_and_subquery").await.unwrap_or_else(|e| panic!("{}", e));
 }

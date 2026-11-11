@@ -2505,6 +2505,7 @@ pub fn rewrite_scan_where(
     // `s ~ 'x'`, `s ~* 'x'`, `!~`, `!~*`: the `regexp_like` comparison
     // they mean, which the evaluator answers.
     let lowered = crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
+    let lowered = crate::core::rql::check::lower_text_match(&lowered);
     let expanded = expand_row_value_comparisons(&lowered)?;
     let lifted = lift_evaluated_operands(&expanded, schema)?;
     rewrite_where_in(&lifted, schema, true)
@@ -5465,6 +5466,7 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     // The regular-expression operators as `regexp_like` (a no-op once
     // `rewrite_scan_where` has done it).
     let clause = &crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
+    let clause = &crate::core::rql::check::lower_text_match(clause);
     // Row-value comparisons become their boolean form first, so everything
     // downstream — the NULL fold, the guards, the tokenizer — sees only shapes
     // it already understands.

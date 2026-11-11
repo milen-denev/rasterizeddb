@@ -415,6 +415,18 @@ pub enum TextFunc {
     ToTsQuery,
     /// `plainto_tsquery(config, text)` — every word of the text, `AND`ed.
     PlainToTsQuery,
+    /// `phraseto_tsquery(config, text)` — every word, each followed by the
+    /// next.
+    PhraseToTsQuery,
+    /// `websearch_to_tsquery(config, text)` — the search-box syntax.
+    WebsearchToTsQuery,
+    /// `@@`, as PostgreSQL's `ts_match_vq(tsvector, tsquery)`,
+    /// `ts_match_tq(text, tsquery)` and `ts_match_tt(text, text)`: a vector
+    /// and a query are both carried as their text here, so which each side
+    /// is comes from the expression that made it (`expr::text_match`).
+    TsMatchVq,
+    TsMatchTq,
+    TsMatchTt,
     /// `array_length(array, dimension)` — how many elements it holds.
     ArrayLength,
     /// `array_ndims(array)` — how many dimensions it has.
@@ -979,6 +991,8 @@ pub const FUNCTIONS: &[&str] = &[
     "CHARACTER_LENGTH", "OCTET_LENGTH", "DATE_TRUNC", "REPLACE", "ARRAY_LENGTH", "ARRAY_NDIMS",
     "UUID_EXTRACT_TIMESTAMP", "UUID_EXTRACT_VERSION", "ABS", "ROUND", "TRUNC", "DATE_PART", "MOD", "BTRIM", "LTRIM", "RTRIM", "RPAD", "LPAD", "JSONB_TYPEOF",
     "REGEXP_LIKE", "SIMILAR_TO_ESCAPE", "__CHECK_REGEXP_LIKE", "__CHECK_REGEXP_UNCERTAIN",
+    "TO_TSVECTOR", "TO_TSQUERY", "PLAINTO_TSQUERY", "PHRASETO_TSQUERY", "WEBSEARCH_TO_TSQUERY", "TS_MATCH_VQ",
+    "TS_MATCH_TQ", "TS_MATCH_TT",
 ];
 
 /// Whether `name` (any case) is a function this evaluator calls: one of
@@ -1328,6 +1342,9 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             return Err(format!("'{op}' has no right operand"));
         }
         use crate::core::rql::pg_functions::PgFunc;
+        if op == "@@" {
+            return Ok(text_match(parse(lhs, schema)?, parse(rhs, schema)?));
+        }
         let func = match op {
             "&" => PgFunc::BitAnd,
             "|" => PgFunc::BitOr,
@@ -1921,18 +1938,39 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 // reads `default_text_search_config` — a setting this server
                 // does not have, so asking for it explicitly is the honest
                 // spelling rather than one that silently assumes English.
-                "TO_TSVECTOR" | "TO_TSQUERY" | "PLAINTO_TSQUERY" => {
-                    if args.len() != 2 {
-                        return Err(format!(
-                            "{} takes a configuration and a text argument, as in                              {}('english', notes)",
-                            upper_name.to_ascii_lowercase(),
-                            upper_name.to_ascii_lowercase()
-                        ));
+                // One argument reads `default_text_search_config`, which
+                // initdb sets to `english` for English and C locales; that is
+                // this server's.
+                "TO_TSVECTOR" | "TO_TSQUERY" | "PLAINTO_TSQUERY" | "PHRASETO_TSQUERY" | "WEBSEARCH_TO_TSQUERY" => {
+                    let mut args = args;
+                    match args.len() {
+                        1 => args.insert(0, Expr::Literal { bytes: b"english".to_vec(), db_type: DbType::STRING }),
+                        2 => {}
+                        n => {
+                            return Err(format!(
+                                "function {}({}) does not exist",
+                                upper_name.to_ascii_lowercase(),
+                                vec!["unknown"; n].join(", ")
+                            ))
+                        }
                     }
                     let func = match upper_name.as_str() {
                         "TO_TSVECTOR" => TextFunc::ToTsVector,
                         "TO_TSQUERY" => TextFunc::ToTsQuery,
-                        _ => TextFunc::PlainToTsQuery,
+                        "PLAINTO_TSQUERY" => TextFunc::PlainToTsQuery,
+                        "PHRASETO_TSQUERY" => TextFunc::PhraseToTsQuery,
+                        _ => TextFunc::WebsearchToTsQuery,
+                    };
+                    Ok(Expr::Call(func, args))
+                }
+                "TS_MATCH_VQ" | "TS_MATCH_TQ" | "TS_MATCH_TT" => {
+                    if args.len() != 2 {
+                        return Err(format!("function {}() takes two arguments", upper_name.to_ascii_lowercase()));
+                    }
+                    let func = match upper_name.as_str() {
+                        "TS_MATCH_VQ" => TextFunc::TsMatchVq,
+                        "TS_MATCH_TQ" => TextFunc::TsMatchTq,
+                        _ => TextFunc::TsMatchTt,
                     };
                     Ok(Expr::Call(func, args))
                 }
@@ -3537,6 +3575,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::UuidExtractVersion, _) => DbType::I16,
         // `integer`, as PostgreSQL's length family returns.
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
+        Expr::Call(TextFunc::TsMatchVq | TextFunc::TsMatchTq | TextFunc::TsMatchTt, _) => DbType::BOOL,
         // The argument's own type, as PostgreSQL's `abs` family returns.
         Expr::Call(TextFunc::Abs, args) => args.first().map(static_type).unwrap_or(DbType::I32),
         // `round(numeric)` and `round(…, places)` are NUMERIC; `round` of an
@@ -4122,6 +4161,11 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             | TextFunc::ToTsVector
             | TextFunc::ToTsQuery
             | TextFunc::PlainToTsQuery
+            | TextFunc::PhraseToTsQuery
+            | TextFunc::WebsearchToTsQuery
+            | TextFunc::TsMatchVq
+            | TextFunc::TsMatchTq
+            | TextFunc::TsMatchTt
     ) && args.iter().any(|a| a.is_null())
     {
         return Ok(Value::Null);
@@ -4357,6 +4401,22 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             &as_text(&args[0]),
             &as_text(&args[1]),
         )),
+        TextFunc::PhraseToTsQuery => string(crate::core::text_search::phraseto_tsquery(
+            &as_text(&args[0]),
+            &as_text(&args[1]),
+        )),
+        TextFunc::WebsearchToTsQuery => string(crate::core::text_search::websearch_to_tsquery(
+            &as_text(&args[0]),
+            &as_text(&args[1]),
+        )),
+        TextFunc::TsMatchVq | TextFunc::TsMatchTq | TextFunc::TsMatchTt => {
+            use crate::core::text_search as ts;
+            let left = as_text(&args[0]);
+            let right = as_text(&args[1]);
+            let vector = if func == TextFunc::TsMatchVq { left } else { ts::to_tsvector("english", &left) };
+            let query = if func == TextFunc::TsMatchTt { ts::plainto_tsquery("english", &right) } else { right };
+            Value::Data { bytes: vec![u8::from(ts::matches(&vector, &query))], db_type: DbType::BOOL }
+        }
 
         // `array_length(a, 1)` is NULL for an empty array, as in PostgreSQL —
         // not zero, which is the guess that makes an emptiness test read the
@@ -4593,6 +4653,31 @@ pub(crate) fn top_level_bitwise(text: &str) -> Option<(usize, &'static str)> {
     found
 }
 
+/// `left @@ right` as the `ts_match_*` PostgreSQL resolves it to, from what
+/// each side is: a `to_tsvector` call a vector, a `to_tsquery`-family call a
+/// query, anything else text (no column here holds a vector). `tsquery @@
+/// tsvector` is read the other way round; a vector against text reads the
+/// text as a query.
+pub(crate) fn text_match(left: Expr, right: Expr) -> Expr {
+    let vector = |e: &Expr| matches!(e, Expr::Call(TextFunc::ToTsVector, _));
+    let query = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Call(
+                TextFunc::ToTsQuery | TextFunc::PlainToTsQuery | TextFunc::PhraseToTsQuery | TextFunc::WebsearchToTsQuery,
+                _
+            )
+        )
+    };
+    let (left, right) = if query(&left) && !query(&right) { (right, left) } else { (left, right) };
+    let func = match (vector(&left), query(&right)) {
+        (true, _) => TextFunc::TsMatchVq,
+        (false, true) => TextFunc::TsMatchTq,
+        (false, false) => TextFunc::TsMatchTt,
+    };
+    Expr::Call(func, vec![left, right])
+}
+
 /// The bitwise operator (`&`, `|`, `#`, `<<`, `>>`) starting at `i`, after
 /// something that can end an operand; `None` there for any other byte and
 /// for the operators these are part of ([`top_level_bitwise`]). Says nothing
@@ -4604,6 +4689,8 @@ pub(crate) fn bitwise_operator_at(bytes: &[u8], i: usize) -> Option<&'static str
         b'&' if !matches!(before(i), Some(b'&' | b'?' | b'|')) && !matches!(at(i + 1), Some(b'&' | b'<' | b'>')) => "&",
         b'|' if !matches!(before(i), Some(b'|' | b'?' | b'<')) && !matches!(at(i + 1), Some(b'|' | b'>' | b'/' | b'&')) => "|",
         b'#' if !matches!(before(i), Some(b'#')) && !matches!(at(i + 1), Some(b'>' | b'-' | b'#')) => "#",
+        // `@@`, the text match, one precedence with these (not `@@@`).
+        b'@' if at(i + 1) == Some(b'@') && before(i) != Some(b'@') && at(i + 2) != Some(b'@') => "@@",
         b'<' if at(i + 1) == Some(b'<')
             && !matches!(before(i), Some(b'<'))
             && !matches!(at(i + 2), Some(b'=' | b'|' | b'<' | b'-')) =>

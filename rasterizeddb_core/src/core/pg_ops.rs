@@ -513,19 +513,19 @@ fn inet_relation(inner: &[u8], outer: &[u8], _strict: bool, or_equal: bool) -> O
     Some(true)
 }
 
-/// `tsvector @@ tsquery`.
-///
-/// Both sides arrive as the text [`to_tsvector`] and [`to_tsquery`] produced,
-/// which is a normalised lexeme list and a boolean expression over lexemes —
-/// see [`crate::core::text_search`].
-fn text_match(vector: &[u8], query: &[u8]) -> bool {
-    let Ok(vector) = std::str::from_utf8(vector) else {
+/// `text @@ text`, a column against a literal: PostgreSQL's `ts_match_tt`,
+/// `to_tsvector(column) @@ plainto_tsquery(literal)` under the default
+/// configuration. No column holds a vector here, so the column is text; it
+/// was read as an already-made vector and matched nothing.
+fn text_match(text: &[u8], query: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(text) else {
         return false;
     };
     let Ok(query) = std::str::from_utf8(query) else {
         return false;
     };
-    crate::core::text_search::matches(vector, query)
+    let ts = |t| crate::core::text_search::to_tsvector("english", t);
+    crate::core::text_search::matches(&ts(text), &crate::core::text_search::plainto_tsquery("english", query))
 }
 
 /// The elements of an array's text form, `{a,b,"c d"}`.

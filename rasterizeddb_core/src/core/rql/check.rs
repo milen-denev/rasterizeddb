@@ -748,6 +748,55 @@ pub(crate) fn lower_regex_operators(text: &str, function: &str) -> String {
     out
 }
 
+/// `a @@ b` (outside quotes) as the comparison `(ts_match_xx(a, b) =
+/// TRUE)` the evaluator answers, `xx` from what each operand is as written
+/// (`expr::text_match`'s reading): a `to_tsvector(…)` call a vector, a
+/// `to_tsquery`-family call a query, anything else text. The planner's own
+/// `@@` read a column's text as an already-made vector and matched nothing,
+/// and could not take a call on either side at all.
+pub(crate) fn lower_text_match(text: &str) -> String {
+    if !text.contains("@@") {
+        return text.to_string();
+    }
+    let call = |operand: &str, names: &[&str]| {
+        let t = operand.trim_start().to_ascii_lowercase();
+        names.iter().any(|n| t.starts_with(n) && t[n.len()..].trim_start().starts_with('('))
+    };
+    let vector = |o: &str| call(o, &["to_tsvector"]);
+    let query = |o: &str| call(o, &["to_tsquery", "plainto_tsquery", "phraseto_tsquery", "websearch_to_tsquery"]);
+    let mut out = text.to_string();
+    // Bounded: each pass removes one operator.
+    for _ in 0..64 {
+        let bytes = out.as_bytes();
+        let mut found = None;
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'\'' {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            if bytes[i] == b'@' && bytes[i + 1] == b'@' && bytes.get(i + 2) != Some(&b'@') && (i == 0 || bytes[i - 1] != b'@') {
+                found = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let Some(at) = found else { break };
+        let (Some(left), Some(right)) = (operand_before(&out, at), operand_after(&out, at + 2)) else { break };
+        let (mut l, mut r) = (out[left..at].trim().to_string(), out[at + 2..right].trim().to_string());
+        if query(&l) && !query(&r) {
+            std::mem::swap(&mut l, &mut r);
+        }
+        let func = match (vector(&l), query(&r)) {
+            (true, _) => "ts_match_vq",
+            (false, true) => "ts_match_tq",
+            (false, false) => "ts_match_tt",
+        };
+        out = format!("{}({func}({l}, {r}) = TRUE){}", &out[..left], &out[right..]);
+    }
+    out
+}
+
 /// `(__check_regexp_like(…) = TRUE)` as the call, and `= FALSE)` as `(NOT
 /// call)`: the form the condition reader takes (see `compile_check`).
 pub fn bare_regex_calls(text: &str) -> String {
@@ -1071,6 +1120,18 @@ fn find_keyword(upper: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_text_match_is_lowered_to_the_call_its_operands_mean() {
+        assert_eq!(
+            lower_text_match("to_tsvector('english', b) @@ to_tsquery('english', 'x')"),
+            "(ts_match_vq(to_tsvector('english', b), to_tsquery('english', 'x')) = TRUE)"
+        );
+        assert_eq!(lower_text_match("b @@ to_tsquery('x')"), "(ts_match_tq(b, to_tsquery('x')) = TRUE)");
+        assert_eq!(lower_text_match("b @@ 'x'"), "(ts_match_tt(b, 'x') = TRUE)");
+        assert_eq!(lower_text_match("to_tsquery('x') @@ b AND id > 1"), "(ts_match_tq(b, to_tsquery('x')) = TRUE) AND id > 1");
+        assert_eq!(lower_text_match("s = '@@'"), "s = '@@'");
+    }
 
     #[test]
     fn a_prefix_tilde_is_not_a_match() {

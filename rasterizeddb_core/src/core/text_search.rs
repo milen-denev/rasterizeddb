@@ -17,13 +17,14 @@
 //!
 //! # Where this differs from PostgreSQL
 //!
-//! The stemmer is the classic Porter algorithm. PostgreSQL's `english`
-//! configuration uses Snowball's Porter2, which differs from it on a minority
-//! of words — `'generously'` stems to `'generous'` under Porter2 and to
-//! `'gener'` here. Common vocabulary agrees. The stop-word list is
-//! PostgreSQL's `english.stop`. A configuration name other than `english` or
-//! `simple` is accepted and treated as `english`, because refusing it would
-//! fail a query over a distinction this cannot yet act on.
+//! The stemmer is Snowball's English (Porter2), as PostgreSQL's `english`
+//! configuration's is; it agrees with PostgreSQL 17 on every word of a
+//! 63,748-word dictionary. The stop-word list is PostgreSQL's
+//! `english.stop`. The word splitter is simpler than PostgreSQL's parser,
+//! which also emits a hyphenated word's parts and splits at an apostrophe.
+//! A configuration name other than `english` or `simple` is accepted and
+//! treated as `english`, because refusing it would fail a query over a
+//! distinction this cannot yet act on.
 
 /// PostgreSQL's `english.stop`, the words dropped from both sides.
 const STOP_WORDS: &[&str] = &[
@@ -193,7 +194,9 @@ pub fn to_tsvector(configuration: &str, document: &str) -> String {
     for word in words(document) {
         position += 1;
         let lower = word.to_lowercase();
-        if is_stop_word(&lower) {
+        // `simple` has no stop words: `to_tsvector('simple', 'the fox')`
+        // keeps `the`.
+        if stem_it && is_stop_word(&lower) {
             continue;
         }
         let text = if stem_it { stem(&lower) } else { lower };
@@ -238,24 +241,128 @@ pub fn to_tsvector(configuration: &str, document: &str) -> String {
 /// rather than quietly matching nothing.
 pub fn to_tsquery(configuration: &str, query: &str) -> Result<String, String> {
     let node = parse_query(configuration, query)?;
-    Ok(render(&node))
+    Ok(node.map(|n| render(&n)).unwrap_or_default())
+}
+
+/// The words of `text` normalised as a configuration does them, each with
+/// its position (one-based, a stop word still counting one): `None` for a
+/// stop word, which `english` drops and `simple` keeps.
+fn normalised_words(configuration: &str, text: &str) -> Vec<Option<String>> {
+    let stem_it = stems(configuration);
+    words(text)
+        .into_iter()
+        .map(|w| w.to_lowercase())
+        .map(|w| {
+            if stem_it && is_stop_word(&w) {
+                None
+            } else if stem_it {
+                Some(stem(&w)).filter(|s| !s.is_empty())
+            } else {
+                Some(w)
+            }
+        })
+        .collect()
 }
 
 /// `plainto_tsquery`: every word, `AND`ed, with no operator syntax.
 pub fn plainto_tsquery(configuration: &str, text: &str) -> String {
-    let stem_it = stems(configuration);
-    let terms: Vec<String> = words(text)
-        .into_iter()
-        .map(|w| w.to_lowercase())
-        .filter(|w| !is_stop_word(w))
-        .map(|w| if stem_it { stem(&w) } else { w })
-        .filter(|w| !w.is_empty())
-        .collect();
-    terms
-        .iter()
-        .map(|t| format!("'{}'", t))
-        .collect::<Vec<_>>()
-        .join(" & ")
+    let terms: Vec<Node> = normalised_words(configuration, text).into_iter().flatten().map(Node::Term).collect();
+    terms.into_iter().reduce(|a, b| Node::And(Box::new(a), Box::new(b))).map(|n| render(&n)).unwrap_or_default()
+}
+
+/// `phraseto_tsquery`: every word, in order, each `<N>` the next, `N` the
+/// distance between them (a stop word in between counts, as PostgreSQL's
+/// does: `quick the fox` is `'quick' <2> 'fox'`).
+pub fn phraseto_tsquery(configuration: &str, text: &str) -> String {
+    phrase_of(normalised_words(configuration, text)).map(|n| render(&n)).unwrap_or_default()
+}
+
+/// The phrase over `words` (a stop word `None`), as [`phraseto_tsquery`]
+/// builds it.
+fn phrase_of(words: Vec<Option<String>>) -> Option<Node> {
+    let mut out: Option<Node> = None;
+    let mut gap = 0u16;
+    for word in words {
+        match word {
+            None => gap = gap.saturating_add(1),
+            Some(term) => {
+                out = Some(match out {
+                    None => Node::Term(term),
+                    Some(left) => Node::Followed(Box::new(left), Box::new(Node::Term(term)), gap + 1),
+                });
+                gap = 0;
+            }
+        }
+    }
+    out
+}
+
+/// `websearch_to_tsquery`: the search-box syntax. Words are `AND`ed, a
+/// quoted run is a phrase, `or` between two parts is `|`, and a leading `-`
+/// negates what it is written on; other punctuation is only a separator.
+pub fn websearch_to_tsquery(configuration: &str, text: &str) -> String {
+    // The parts, in order: (negated, the part), and `or` between them.
+    enum Piece {
+        Part(bool, Option<Node>),
+        Or,
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let negated = c == '-' && chars.get(i + 1).is_some_and(|n| !n.is_whitespace());
+        if negated {
+            i += 1;
+        }
+        if chars.get(i) == Some(&'"') {
+            let start = i + 1;
+            let end = (start..chars.len()).find(|&j| chars[j] == '"').unwrap_or(chars.len());
+            let quoted: String = chars[start..end].iter().collect();
+            pieces.push(Piece::Part(negated, phrase_of(normalised_words(configuration, &quoted))));
+            i = end + 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '"' {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        if !negated && word.eq_ignore_ascii_case("or") {
+            pieces.push(Piece::Or);
+            continue;
+        }
+        // Punctuation splits a word into parts that are a phrase, as a
+        // hyphenated word's are.
+        pieces.push(Piece::Part(negated, phrase_of(normalised_words(configuration, &word))));
+    }
+    // `&` binds tighter than `|`: runs of parts joined by `or`.
+    let mut alternatives: Vec<Node> = Vec::new();
+    let mut current: Option<Node> = None;
+    let mut pending_or = false;
+    for piece in pieces {
+        match piece {
+            Piece::Or => pending_or = current.is_some(),
+            Piece::Part(negated, Some(node)) => {
+                let node = if negated { Node::Not(Box::new(node)) } else { node };
+                if pending_or {
+                    alternatives.extend(current.take());
+                    pending_or = false;
+                }
+                current = Some(match current {
+                    None => node,
+                    Some(left) => Node::And(Box::new(left), Box::new(node)),
+                });
+            }
+            Piece::Part(_, None) => {}
+        }
+    }
+    alternatives.extend(current);
+    alternatives.into_iter().reduce(|a, b| Node::Or(Box::new(a), Box::new(b))).map(|n| render(&n)).unwrap_or_default()
 }
 
 /// `tsvector @@ tsquery`.
@@ -263,18 +370,18 @@ pub fn plainto_tsquery(configuration: &str, text: &str) -> String {
 /// Both operands are the canonical text the functions above produce. A query
 /// that cannot be parsed matches nothing rather than erroring, because by the
 /// time the two meet the query has already been through [`to_tsquery`], which
-/// is where a malformed one is reported.
+/// is where a malformed one is reported. An empty query (only stop words)
+/// matches nothing, as PostgreSQL's does.
 pub fn matches(vector: &str, query: &str) -> bool {
     // The query is compiled once and reused for every row of the statement:
     // it used to be tokenized and parsed again per row.
     let Some(compiled) = compiled_query(query) else {
         return false;
     };
-    // One pass over the vector marks which of the query's terms occur. The
-    // vector used to be copied into a `Vec<String>` per row and each term
-    // searched for linearly.
-    let mut present: smallvec::SmallVec<[bool; 16]> =
-        smallvec::smallvec![false; compiled.terms.len()];
+    // One pass over the vector collects where each of the query's terms
+    // occurs: the positions a phrase (`<->`) is tested against.
+    let mut found: smallvec::SmallVec<[smallvec::SmallVec<[u32; 4]>; 16]> =
+        smallvec::smallvec![smallvec::SmallVec::new(); compiled.terms.len()];
     for entry in vector.split_whitespace() {
         let entry = entry.trim();
         let Some(body) = entry.strip_prefix('\'') else {
@@ -284,21 +391,24 @@ pub fn matches(vector: &str, query: &str) -> bool {
             continue;
         };
         let lexeme = &body[..close];
-        if lexeme.contains("''") {
-            compiled.mark(&lexeme.replace("''", "'"), &mut present);
-        } else {
-            compiled.mark(lexeme, &mut present);
-        }
+        // `:1,3` (a weight letter after a position is ignored here).
+        let positions: smallvec::SmallVec<[u32; 4]> = body[close + 1..]
+            .strip_prefix(':')
+            .map(|p| p.split(',').filter_map(|n| n.trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse().ok()).collect())
+            .unwrap_or_default();
+        let lexeme = if lexeme.contains("''") { std::borrow::Cow::Owned(lexeme.replace("''", "'")) } else { std::borrow::Cow::Borrowed(lexeme) };
+        compiled.mark(&lexeme, &positions, &mut found);
     }
-    compiled.evaluate(&compiled.root, &present)
+    compiled.evaluate(&compiled.root, &found)
 }
 
 /// A tsquery parsed once: its distinct terms, numbered, and the tree over
 /// those numbers.
 #[derive(Debug)]
 struct CompiledQuery {
-    terms: Vec<String>,
-    /// Term to number, for a query too long to search linearly.
+    /// Each term, and whether it is a prefix (`'qui':*`).
+    terms: Vec<(String, bool)>,
+    /// Exact term to number, for a query too long to search linearly.
     index: Option<ahash::HashMap<String, usize>>,
     root: CNode,
 }
@@ -309,70 +419,116 @@ enum CNode {
     Not(Box<CNode>),
     And(Box<CNode>, Box<CNode>),
     Or(Box<CNode>, Box<CNode>),
+    /// `a <N> b`: `b` starting `N` positions after `a` ends.
+    Followed(Box<CNode>, Box<CNode>, u16),
 }
 
 impl CompiledQuery {
     fn compile(node: &Node) -> CompiledQuery {
-        fn walk(node: &Node, terms: &mut Vec<String>) -> CNode {
-            match node {
-                Node::Term(t) => match terms.iter().position(|x| x == t) {
-                    Some(at) => CNode::Term(at),
-                    None => {
-                        terms.push(t.clone());
-                        CNode::Term(terms.len() - 1)
-                    }
-                },
-                Node::Not(inner) => CNode::Not(Box::new(walk(inner, terms))),
-                // `<->` is matched as `AND`; see `Node::Followed`.
-                Node::And(a, b) | Node::Followed(a, b) => {
-                    CNode::And(Box::new(walk(a, terms)), Box::new(walk(b, terms)))
+        fn walk(node: &Node, terms: &mut Vec<(String, bool)>) -> CNode {
+            let mut term = |t: &String, prefix: bool| match terms.iter().position(|(x, p)| x == t && *p == prefix) {
+                Some(at) => CNode::Term(at),
+                None => {
+                    terms.push((t.clone(), prefix));
+                    CNode::Term(terms.len() - 1)
                 }
+            };
+            match node {
+                Node::Term(t) => term(t, false),
+                Node::Prefix(t) => term(t, true),
+                Node::Not(inner) => CNode::Not(Box::new(walk(inner, terms))),
+                Node::And(a, b) => CNode::And(Box::new(walk(a, terms)), Box::new(walk(b, terms))),
                 Node::Or(a, b) => CNode::Or(Box::new(walk(a, terms)), Box::new(walk(b, terms))),
+                Node::Followed(a, b, d) => CNode::Followed(Box::new(walk(a, terms)), Box::new(walk(b, terms)), *d),
             }
         }
         let mut terms = Vec::new();
         let root = walk(node, &mut terms);
         let index = (terms.len() > 8).then(|| {
-            terms
-                .iter()
-                .enumerate()
-                .map(|(i, t)| (t.clone(), i))
-                .collect()
+            terms.iter().enumerate().filter(|(_, (_, p))| !p).map(|(i, (t, _))| (t.clone(), i)).collect()
         });
         CompiledQuery { terms, index, root }
     }
 
     #[inline]
-    fn mark(&self, lexeme: &str, present: &mut [bool]) {
+    fn mark(&self, lexeme: &str, positions: &[u32], found: &mut [smallvec::SmallVec<[u32; 4]>]) {
+        // A lexeme with no positions still occurs: it holds position 0, which
+        // no phrase can follow from but presence reads.
+        let mut add = |at: usize| {
+            if positions.is_empty() {
+                found[at].push(0);
+            } else {
+                found[at].extend_from_slice(positions);
+            }
+        };
         match &self.index {
             Some(index) => {
                 if let Some(&at) = index.get(lexeme) {
-                    present[at] = true;
+                    add(at);
                 }
             }
-            None => {
-                for (at, t) in self.terms.iter().enumerate() {
-                    if t == lexeme {
-                        present[at] = true;
-                    }
-                }
+            None => {}
+        }
+        for (at, (t, prefix)) in self.terms.iter().enumerate() {
+            if (*prefix && lexeme.starts_with(t.as_str())) || (!prefix && self.index.is_none() && t == lexeme) {
+                add(at);
             }
         }
     }
 
-    fn evaluate(&self, node: &CNode, present: &[bool]) -> bool {
+    fn evaluate(&self, node: &CNode, found: &[smallvec::SmallVec<[u32; 4]>]) -> bool {
         match node {
-            CNode::Term(at) => present[*at],
-            CNode::Not(inner) => !self.evaluate(inner, present),
-            CNode::And(a, b) => self.evaluate(a, present) && self.evaluate(b, present),
-            CNode::Or(a, b) => self.evaluate(a, present) || self.evaluate(b, present),
+            CNode::Term(at) => !found[*at].is_empty(),
+            CNode::Not(inner) => !self.evaluate(inner, found),
+            CNode::And(a, b) => self.evaluate(a, found) && self.evaluate(b, found),
+            CNode::Or(a, b) => self.evaluate(a, found) || self.evaluate(b, found),
+            CNode::Followed(..) => match self.spans(node, found) {
+                Some(spans) => !spans.is_empty(),
+                // A phrase over `&` or `!`, which this does not place: both
+                // sides present, weaker than PostgreSQL's test.
+                None => self.both_present(node, found),
+            },
         }
+    }
+
+    fn both_present(&self, node: &CNode, found: &[smallvec::SmallVec<[u32; 4]>]) -> bool {
+        match node {
+            CNode::Followed(a, b, _) => self.evaluate(a, found) && self.evaluate(b, found),
+            other => self.evaluate(other, found),
+        }
+    }
+
+    /// The (first, last) positions where `node` occurs, for a phrase: `None`
+    /// for a node this does not place (`&`, `!`).
+    fn spans(&self, node: &CNode, found: &[smallvec::SmallVec<[u32; 4]>]) -> Option<Vec<(u32, u32)>> {
+        Some(match node {
+            CNode::Term(at) => found[*at].iter().filter(|&&p| p > 0).map(|&p| (p, p)).collect(),
+            CNode::Or(a, b) => {
+                let mut all = self.spans(a, found)?;
+                all.extend(self.spans(b, found)?);
+                all
+            }
+            CNode::Followed(a, b, d) => {
+                let (left, right) = (self.spans(a, found)?, self.spans(b, found)?);
+                let mut out = Vec::new();
+                for &(ls, le) in &left {
+                    for &(rs, re) in &right {
+                        if rs == le + u32::from(*d) {
+                            out.push((ls, re));
+                        }
+                    }
+                }
+                out
+            }
+            CNode::And(..) | CNode::Not(..) => return None,
+        })
     }
 }
 
 /// The compiled form of a query text, from a per-thread cache keyed by the
 /// text itself — never by its address, which a freed and reissued buffer can
-/// share with a different query. `None` for a query that does not parse.
+/// share with a different query. `None` for a query that does not parse, or
+/// that is empty.
 ///
 /// The query text is already normalised, so it is parsed with the `simple`
 /// configuration: stemming it a second time would turn `'fragil'` into
@@ -393,6 +549,7 @@ fn compiled_query(query: &str) -> Option<std::rc::Rc<CompiledQuery>> {
         }
         let compiled = parse_query("simple", query)
             .ok()
+            .flatten()
             .map(|node| Rc::new(CompiledQuery::compile(&node)));
         let mut cache = cache.borrow_mut();
         if cache.len() >= CAPACITY {
@@ -408,43 +565,61 @@ fn compiled_query(query: &str) -> Option<std::rc::Rc<CompiledQuery>> {
 #[derive(Debug, Clone, PartialEq)]
 enum Node {
     Term(String),
+    /// `'qui':*`: any lexeme beginning with it.
+    Prefix(String),
     Not(Box<Node>),
     And(Box<Node>, Box<Node>),
     Or(Box<Node>, Box<Node>),
-    /// `<->`, the phrase operator. Matched as an `AND` here: the positions a
-    /// phrase search needs are in the vector, but the distance test is not
-    /// implemented, so this is *weaker* than PostgreSQL rather than wrong in
-    /// the dangerous direction — it can return a row PostgreSQL would not, and
-    /// never drops one it would return.
-    Followed(Box<Node>, Box<Node>),
+    /// `a <N> b` (`<->` is `<1>`): `b` begins `N` positions after `a` ends.
+    Followed(Box<Node>, Box<Node>, u16),
 }
 
 /// The per-row evaluation as it was, kept as the reference for the
-/// differential test.
+/// differential test (a phrase as both sides present).
 #[cfg(test)]
 fn evaluate(node: &Node, present: &[String]) -> bool {
     match node {
         Node::Term(t) => present.iter().any(|p| p == t),
+        Node::Prefix(t) => present.iter().any(|p| p.starts_with(t.as_str())),
         Node::Not(inner) => !evaluate(inner, present),
-        Node::And(a, b) | Node::Followed(a, b) => evaluate(a, present) && evaluate(b, present),
+        Node::And(a, b) | Node::Followed(a, b, _) => evaluate(a, present) && evaluate(b, present),
         Node::Or(a, b) => evaluate(a, present) || evaluate(b, present),
     }
 }
 
+/// A query as PostgreSQL prints it: an operand in parentheses only where
+/// its operator binds looser than the one over it (`!` tightest, then the
+/// phrase operators, `&`, `|`), and a phrase on a phrase's right, which
+/// does not regroup.
 fn render(node: &Node) -> String {
+    fn priority(node: &Node) -> u8 {
+        match node {
+            Node::Term(_) | Node::Prefix(_) => 5,
+            Node::Not(_) => 4,
+            Node::Followed(..) => 3,
+            Node::And(..) => 2,
+            Node::Or(..) => 1,
+        }
+    }
+    fn child(parent: &Node, node: &Node, right_of_phrase: bool) -> String {
+        let text = render(node);
+        let phrase_right = right_of_phrase && matches!(node, Node::Followed(..));
+        if priority(node) < priority(parent) || phrase_right {
+            format!("( {text} )")
+        } else {
+            text
+        }
+    }
     match node {
         Node::Term(t) => format!("'{}'", t.replace('\'', "''")),
-        Node::Not(inner) => format!("!{}", render_nested(inner)),
-        Node::And(a, b) => format!("{} & {}", render_nested(a), render_nested(b)),
-        Node::Or(a, b) => format!("{} | {}", render_nested(a), render_nested(b)),
-        Node::Followed(a, b) => format!("{} <-> {}", render_nested(a), render_nested(b)),
-    }
-}
-
-fn render_nested(node: &Node) -> String {
-    match node {
-        Node::Term(_) | Node::Not(_) => render(node),
-        _ => format!("( {} )", render(node)),
+        Node::Prefix(t) => format!("'{}':*", t.replace('\'', "''")),
+        Node::Not(inner) => format!("!{}", child(node, inner, false)),
+        Node::And(a, b) => format!("{} & {}", child(node, a, false), child(node, b, false)),
+        Node::Or(a, b) => format!("{} | {}", child(node, a, false), child(node, b, false)),
+        Node::Followed(a, b, d) => {
+            let op = if *d == 1 { "<->".to_string() } else { format!("<{d}>") };
+            format!("{} {op} {}", child(node, a, false), child(node, b, true))
+        }
     }
 }
 
@@ -454,7 +629,9 @@ struct Parser<'a> {
     configuration: &'a str,
 }
 
-fn parse_query(configuration: &str, query: &str) -> Result<Node, String> {
+/// A parsed query with its stop words taken out (`Ok(None)` when nothing is
+/// left), or why it does not parse.
+fn parse_query(configuration: &str, query: &str) -> Result<Option<Node>, String> {
     let mut parser = Parser {
         tokens: tokenize_query(query),
         at: 0,
@@ -464,7 +641,57 @@ fn parse_query(configuration: &str, query: &str) -> Result<Node, String> {
     if parser.at != parser.tokens.len() {
         return Err(format!("syntax error in tsquery: '{}'", query));
     }
-    Ok(node)
+    Ok(simplify(node).node)
+}
+
+/// A node with its stop words out, and what a phrase around it must still
+/// count for them: the positions before its first word (`lead`) and after
+/// its last (`trail`), or, when nothing is left, how many it spans.
+struct Simplified {
+    node: Option<Node>,
+    lead: u16,
+    trail: u16,
+}
+
+/// The parse's stand-in for a stop word.
+const STOP: &str = "\u{0}stop";
+
+fn simplify(node: Node) -> Simplified {
+    let some = |node: Node| Simplified { node: Some(node), lead: 0, trail: 0 };
+    let none = |span: u16| Simplified { node: None, lead: span, trail: span };
+    match node {
+        Node::Term(t) if t == STOP => none(0),
+        Node::Term(_) | Node::Prefix(_) => some(node),
+        Node::Not(inner) => match simplify(*inner).node {
+            Some(n) => some(Node::Not(Box::new(n))),
+            None => none(0),
+        },
+        Node::And(a, b) => match (simplify(*a).node, simplify(*b).node) {
+            (Some(x), Some(y)) => some(Node::And(Box::new(x), Box::new(y))),
+            (Some(x), None) | (None, Some(x)) => some(x),
+            (None, None) => none(0),
+        },
+        Node::Or(a, b) => match (simplify(*a).node, simplify(*b).node) {
+            (Some(x), Some(y)) => some(Node::Or(Box::new(x), Box::new(y))),
+            (Some(x), None) | (None, Some(x)) => some(x),
+            (None, None) => none(0),
+        },
+        // A stop word in a phrase still holds its place: `quick <-> the <->
+        // fox` is `'quick' <2> 'fox'`.
+        Node::Followed(a, b, d) => {
+            let (l, r) = (simplify(*a), simplify(*b));
+            match (l.node, r.node) {
+                (Some(x), Some(y)) => Simplified {
+                    node: Some(Node::Followed(Box::new(x), Box::new(y), l.trail + d + r.lead)),
+                    lead: l.lead,
+                    trail: r.trail,
+                },
+                (Some(x), None) => Simplified { node: Some(x), lead: l.lead, trail: l.trail + d + r.lead },
+                (None, Some(y)) => Simplified { node: Some(y), lead: l.lead + d + r.lead, trail: r.trail },
+                (None, None) => none(l.lead + d + r.lead),
+            }
+        }
+    }
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -492,10 +719,26 @@ fn tokenize_query(query: &str) -> Vec<String> {
                 text.push(bytes[i]);
                 i += 1;
             }
-            out.push(format!("'{}", text));
-        } else if c == '<' && bytes.get(i + 1) == Some(&'-') && bytes.get(i + 2) == Some(&'>') {
-            out.push("<->".to_string());
-            i += 3;
+            // Its `:*` / weights, which follow the closing quote.
+            let mut suffix = String::new();
+            if bytes.get(i) == Some(&':') {
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j] == '*' || bytes[j].is_ascii_alphabetic()) {
+                    j += 1;
+                }
+                suffix = bytes[i..j].iter().collect();
+                i = j;
+            }
+            out.push(format!("'{}{}", text, if suffix.is_empty() { String::new() } else { format!("\u{0}{suffix}") }));
+        } else if c == '<'
+            && let Some(close) = (i + 1..bytes.len()).find(|&j| bytes[j] == '>')
+            && {
+                let inside: String = bytes[i + 1..close].iter().collect();
+                inside == "-" || (!inside.is_empty() && inside.bytes().all(|b| b.is_ascii_digit()))
+            }
+        {
+            out.push(bytes[i..=close].iter().collect());
+            i = close + 1;
         } else if matches!(c, '&' | '|' | '!' | '(' | ')') {
             out.push(c.to_string());
             i += 1;
@@ -503,7 +746,7 @@ fn tokenize_query(query: &str) -> Vec<String> {
             let start = i;
             while i < bytes.len()
                 && !bytes[i].is_whitespace()
-                && !matches!(bytes[i], '&' | '|' | '!' | '(' | ')')
+                && !matches!(bytes[i], '&' | '|' | '!' | '(' | ')' | '<')
             {
                 i += 1;
             }
@@ -511,6 +754,15 @@ fn tokenize_query(query: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// A phrase operator token's distance: `<->` is 1, `<N>` is `N`.
+fn phrase_distance(token: &str) -> Option<u16> {
+    let inside = token.strip_prefix('<')?.strip_suffix('>')?;
+    if inside == "-" {
+        return Some(1);
+    }
+    inside.parse().ok()
 }
 
 impl Parser<'_> {
@@ -529,21 +781,22 @@ impl Parser<'_> {
     }
 
     fn parse_and(&mut self) -> Result<Node, String> {
+        let mut left = self.parse_phrase()?;
+        while self.peek() == Some("&") {
+            self.at += 1;
+            let right = self.parse_phrase()?;
+            left = Node::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    /// `<->` and `<N>` bind tighter than `&`, as PostgreSQL's do.
+    fn parse_phrase(&mut self) -> Result<Node, String> {
         let mut left = self.parse_not()?;
-        loop {
-            match self.peek() {
-                Some("&") => {
-                    self.at += 1;
-                    let right = self.parse_not()?;
-                    left = Node::And(Box::new(left), Box::new(right));
-                }
-                Some("<->") => {
-                    self.at += 1;
-                    let right = self.parse_not()?;
-                    left = Node::Followed(Box::new(left), Box::new(right));
-                }
-                _ => break,
-            }
+        while let Some(d) = self.peek().and_then(phrase_distance) {
+            self.at += 1;
+            let right = self.parse_not()?;
+            left = Node::Followed(Box::new(left), Box::new(right), d);
         }
         Ok(left)
     }
@@ -570,21 +823,39 @@ impl Parser<'_> {
             Some(token) => {
                 let token = token.to_string();
                 self.at += 1;
-                if matches!(token.as_str(), "&" | "|" | ")" | "<->") {
+                if matches!(token.as_str(), "&" | "|" | ")") || phrase_distance(&token).is_some() {
                     return Err(format!("tsquery operator '{}' has no operand", token));
                 }
-                // A token the tokenizer quoted is already a lexeme.
-                let (raw, quoted) = match token.strip_prefix('\'') {
-                    Some(rest) => (rest.to_string(), true),
-                    None => (token, false),
+                // A token the tokenizer quoted is already a lexeme; its
+                // suffix (`:*`, weights) rides after a NUL.
+                let (raw, quoted, suffix) = match token.strip_prefix('\'') {
+                    Some(rest) => match rest.split_once('\u{0}') {
+                        Some((text, suffix)) => (text.to_string(), true, suffix.to_string()),
+                        None => (rest.to_string(), true, String::new()),
+                    },
+                    None => match token.rfind(':') {
+                        Some(at) if token[at + 1..].chars().all(|c| c == '*' || c.is_ascii_alphabetic()) && at > 0 => {
+                            (token[..at].to_string(), false, token[at..].to_string())
+                        }
+                        _ => (token, false, String::new()),
+                    },
                 };
+                let prefix = suffix.contains('*');
+                if suffix.chars().any(|c| c.is_ascii_alphabetic()) {
+                    return Err(format!("tsquery weights ('{suffix}') are not supported yet"));
+                }
                 let lower = raw.to_lowercase();
-                let text = if quoted || !stems(self.configuration) {
+                let text = if quoted {
                     lower
+                } else if !stems(self.configuration) {
+                    lower
+                } else if is_stop_word(&lower) {
+                    // Taken out after the parse, its place in a phrase kept.
+                    STOP.to_string()
                 } else {
                     stem(&lower)
                 };
-                Ok(Node::Term(text))
+                Ok(if prefix && text != STOP { Node::Prefix(text) } else { Node::Term(text) })
             }
             None => Err("tsquery ended where a term was expected".to_string()),
         }
@@ -609,492 +880,245 @@ fn words(text: &str) -> Vec<String> {
     out
 }
 
-// ------------------------------------------------------------- Porter stemmer
+// ---------------------------------------------------- Snowball English stemmer
 
-fn is_vowel(chars: &[char], i: usize) -> bool {
-    match chars[i] {
-        'a' | 'e' | 'i' | 'o' | 'u' => true,
-        // A `y` is a vowel only when what precedes it is not.
-        'y' => i > 0 && !is_vowel(chars, i - 1),
-        _ => false,
-    }
-}
-
-/// The `m` of the Porter algorithm: how many vowel-consonant pairs the word has.
-fn measure(chars: &[char]) -> usize {
-    let mut count = 0;
-    let mut previous_vowel = false;
-    for i in 0..chars.len() {
-        let vowel = is_vowel(chars, i);
-        if i > 0 && previous_vowel && !vowel {
-            count += 1;
-        }
-        previous_vowel = vowel;
-    }
-    count
-}
-
-fn contains_vowel(chars: &[char]) -> bool {
-    (0..chars.len()).any(|i| is_vowel(chars, i))
-}
-
-fn ends_double_consonant(chars: &[char]) -> bool {
-    let n = chars.len();
-    n >= 2 && chars[n - 1] == chars[n - 2] && !is_vowel(chars, n - 1)
-}
-
-/// Consonant–vowel–consonant where the final consonant is not `w`, `x` or `y`.
-fn ends_cvc(chars: &[char]) -> bool {
-    let n = chars.len();
-    if n < 3 {
-        return false;
-    }
-    !is_vowel(chars, n - 3)
-        && is_vowel(chars, n - 2)
-        && !is_vowel(chars, n - 1)
-        && !matches!(chars[n - 1], 'w' | 'x' | 'y')
-}
-
-/// Reduces a lowercase word to its stem.
+/// Snowball's English stemmer (Porter2), as PostgreSQL's `english`
+/// configuration runs it (`english_stem`, from `english.sbl`).
 ///
-/// A word with a digit in it, or shorter than three letters, is returned
-/// unchanged — stemming those produces noise rather than a stem, and
-/// PostgreSQL leaves them alone too.
+/// It was the classic Porter algorithm, which PostgreSQL does not use: `day`
+/// stemmed to `dai` where PostgreSQL's is `day`, `generously` to `gener` where
+/// its is `generous`. A vector built here then held lexemes a query built by
+/// PostgreSQL (or a client that stems as it does) never names.
 ///
-/// Works in one reusable per-thread buffer, editing suffixes in place and
-/// testing them against the buffer's tail without copying. It used to collect
-/// every suffix into a fresh `Vec<char>` for each test, copy the stem for each
-/// measure, and sort step 4's list on every call — which made it most of
-/// `to_tsvector`'s cost. The stems are byte-identical to that version's
-/// (`stem_reference`, and the differential test beside it).
+/// A word with a digit in it is returned unchanged: PostgreSQL's parser makes
+/// it a `numword`, which `english` does not stem.
 pub fn stem(word: &str) -> String {
-    if word.len() <= 2 || word.chars().any(|c| c.is_numeric()) {
+    if word.chars().any(|c| c.is_numeric()) {
         return word.to_string();
     }
-    thread_local! {
-        static BUFFER: std::cell::RefCell<Vec<char>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    BUFFER.with(|buffer| {
-        let mut chars = buffer.borrow_mut();
-        chars.clear();
-        chars.extend(word.chars());
-
-        step_1a(&mut chars);
-        step_1b(&mut chars);
-        step_1c(&mut chars);
-        step_2(&mut chars);
-        step_3(&mut chars);
-        step_4(&mut chars);
-        step_5(&mut chars);
-
-        chars.iter().collect()
-    })
+    porter2::stem(word)
 }
 
-/// Whether the word ends with the ASCII `suffix`, without allocating.
-#[inline]
-fn ends_with(chars: &[char], suffix: &str) -> bool {
-    let s = suffix.as_bytes();
-    chars.len() >= s.len()
-        && chars[chars.len() - s.len()..]
-            .iter()
-            .zip(s)
-            .all(|(c, b)| *c == *b as char)
-}
-
-/// The word without its last `n` characters.
-#[inline]
-fn without(chars: &[char], n: usize) -> &[char] {
-    &chars[..chars.len() - n]
-}
-
-/// Replaces the ASCII `suffix` the word ends with by `with`, in place.
-#[inline]
-fn replace_suffix(chars: &mut Vec<char>, suffix: &str, with: &str) {
-    chars.truncate(chars.len() - suffix.len());
-    chars.extend(with.bytes().map(char::from));
-}
-
-fn step_1a(chars: &mut Vec<char>) {
-    if ends_with(chars, "sses") {
-        replace_suffix(chars, "sses", "ss");
-    } else if ends_with(chars, "ies") {
-        replace_suffix(chars, "ies", "i");
-    } else if ends_with(chars, "ss") {
-        // Unchanged.
-    } else if ends_with(chars, "s") {
-        replace_suffix(chars, "s", "");
-    }
-}
-
-fn step_1b(chars: &mut Vec<char>) {
-    let mut second_pass = false;
-    if ends_with(chars, "eed") {
-        if measure(without(chars, 3)) > 0 {
-            replace_suffix(chars, "eed", "ee");
-        }
-    } else if ends_with(chars, "ed") {
-        if contains_vowel(without(chars, 2)) {
-            replace_suffix(chars, "ed", "");
-            second_pass = true;
-        }
-    } else if ends_with(chars, "ing") {
-        if contains_vowel(without(chars, 3)) {
-            replace_suffix(chars, "ing", "");
-            second_pass = true;
-        }
+mod porter2 {
+    fn is_vowel(c: char) -> bool {
+        matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')
     }
 
-    if second_pass {
-        if ends_with(chars, "at") {
-            replace_suffix(chars, "at", "ate");
-        } else if ends_with(chars, "bl") {
-            replace_suffix(chars, "bl", "ble");
-        } else if ends_with(chars, "iz") {
-            replace_suffix(chars, "iz", "ize");
-        } else if ends_double_consonant(chars) && !matches!(chars[chars.len() - 1], 'l' | 's' | 'z')
-        {
-            chars.pop();
-        } else if measure(chars) == 1 && ends_cvc(chars) {
-            chars.push('e');
-        }
-    }
-}
-
-fn step_1c(chars: &mut Vec<char>) {
-    if ends_with(chars, "y") && contains_vowel(without(chars, 1)) {
-        replace_suffix(chars, "y", "i");
-    }
-}
-
-/// Applies the first matching suffix rule whose stem has measure above `min`.
-fn apply_rules(chars: &mut Vec<char>, rules: &[(&str, &str)], min: usize) {
-    for (suffix, with) in rules {
-        if ends_with(chars, suffix) {
-            if measure(without(chars, suffix.len())) > min {
-                replace_suffix(chars, suffix, with);
-            }
-            return;
-        }
-    }
-}
-
-fn step_2(chars: &mut Vec<char>) {
-    const RULES: &[(&str, &str)] = &[
-        ("ational", "ate"),
-        ("tional", "tion"),
-        ("enci", "ence"),
-        ("anci", "ance"),
-        ("izer", "ize"),
-        ("bli", "ble"),
-        ("alli", "al"),
-        ("entli", "ent"),
-        ("eli", "e"),
-        ("ousli", "ous"),
-        ("ization", "ize"),
-        ("ation", "ate"),
-        ("ator", "ate"),
-        ("alism", "al"),
-        ("iveness", "ive"),
-        ("fulness", "ful"),
-        ("ousness", "ous"),
-        ("aliti", "al"),
-        ("iviti", "ive"),
-        ("biliti", "ble"),
-        ("logi", "log"),
-    ];
-    apply_rules(chars, RULES, 0);
-}
-
-fn step_3(chars: &mut Vec<char>) {
-    const RULES: &[(&str, &str)] = &[
-        ("icate", "ic"),
-        ("ative", ""),
-        ("alize", "al"),
-        ("iciti", "ic"),
-        ("ical", "ic"),
-        ("ful", ""),
-        ("ness", ""),
-    ];
-    apply_rules(chars, RULES, 0);
-}
-
-fn step_4(chars: &mut Vec<char>) {
-    // Longest first, so `ement` is not cut as `ent`. Ties keep the order of
-    // the list they were sorted from (a stable sort, which the previous
-    // version ran on every call): `ance` before `ence`, `able` before `ible`.
-    const ORDERED: &[&str] = &[
-        "ement", "ance", "ence", "able", "ible", "ment", "ant", "ent", "ism", "ate", "iti",
-        "ous", "ive", "ize", "al", "er", "ic", "ou",
-    ];
-    for suffix in ORDERED {
-        if !ends_with(chars, suffix) {
-            continue;
-        }
-        if measure(without(chars, suffix.len())) > 1 {
-            replace_suffix(chars, suffix, "");
-        }
-        return;
-    }
-    // `ion` only survives after `s` or `t`.
-    if ends_with(chars, "ion") {
-        let stem = without(chars, 3);
-        if measure(stem) > 1 && matches!(stem.last(), Some('s') | Some('t')) {
-            replace_suffix(chars, "ion", "");
-        }
-    }
-}
-
-fn step_5(chars: &mut Vec<char>) {
-    if ends_with(chars, "e") {
-        let stem = without(chars, 1);
-        let m = measure(stem);
-        if m > 1 || (m == 1 && !ends_cvc(stem)) {
-            chars.pop();
-        }
-    }
-    if ends_with(chars, "ll") && measure(chars) > 1 {
-        chars.pop();
-    }
-}
-
-/// The stemmer as it was before the in-place rewrite, kept verbatim as the
-/// reference for the differential test.
-#[cfg(test)]
-mod stem_reference {
-    fn is_vowel(chars: &[char], i: usize) -> bool {
-        match chars[i] {
-            'a' | 'e' | 'i' | 'o' | 'u' => true,
-            // A `y` is a vowel only when what precedes it is not.
-            'y' => i > 0 && !is_vowel(chars, i - 1),
-            _ => false,
-        }
-    }
-
-    /// The `m` of the Porter algorithm: how many vowel-consonant pairs the word has.
-    fn measure(chars: &[char]) -> usize {
-        let mut count = 0;
-        let mut previous_vowel = false;
-        let mut started = false;
-        for i in 0..chars.len() {
-            let vowel = is_vowel(chars, i);
-            if started && previous_vowel && !vowel {
-                count += 1;
-            }
-            if !started {
-                started = true;
-            }
-            previous_vowel = vowel;
-        }
-        count
-    }
-
-    fn contains_vowel(chars: &[char]) -> bool {
-        (0..chars.len()).any(|i| is_vowel(chars, i))
-    }
-
-    fn ends_double_consonant(chars: &[char]) -> bool {
-        let n = chars.len();
-        n >= 2 && chars[n - 1] == chars[n - 2] && !is_vowel(chars, n - 1)
-    }
-
-    /// Consonant–vowel–consonant where the final consonant is not `w`, `x` or `y`.
-    fn ends_cvc(chars: &[char]) -> bool {
-        let n = chars.len();
-        if n < 3 {
-            return false;
-        }
-        !is_vowel(chars, n - 3)
-            && is_vowel(chars, n - 2)
-            && !is_vowel(chars, n - 1)
-            && !matches!(chars[n - 1], 'w' | 'x' | 'y')
-    }
-
-    /// Reduces a lowercase word to its stem.
-    ///
-    /// A word with a digit in it, or shorter than three letters, is returned
-    /// unchanged — stemming those produces noise rather than a stem, and
-    /// PostgreSQL leaves them alone too.
-    pub(super) fn stem(word: &str) -> String {
-        if word.len() <= 2 || word.chars().any(|c| c.is_numeric()) {
-            return word.to_string();
-        }
-        let mut chars: Vec<char> = word.chars().collect();
-
-        step_1a(&mut chars);
-        step_1b(&mut chars);
-        step_1c(&mut chars);
-        step_2(&mut chars);
-        step_3(&mut chars);
-        step_4(&mut chars);
-        step_5(&mut chars);
-
-        chars.into_iter().collect()
-    }
-
-    fn ends_with(chars: &[char], suffix: &str) -> bool {
+    fn ends(w: &[char], suffix: &str) -> bool {
         let s: Vec<char> = suffix.chars().collect();
-        chars.len() >= s.len() && chars[chars.len() - s.len()..] == s[..]
+        w.len() >= s.len() && w[w.len() - s.len()..] == s[..]
     }
 
-    fn replace_suffix(chars: &mut Vec<char>, suffix: &str, with: &str) {
-        let n = suffix.chars().count();
-        chars.truncate(chars.len() - n);
-        chars.extend(with.chars());
+    /// The longest of `suffixes` `w` ends with.
+    fn longest<'a>(w: &[char], suffixes: &[&'a str]) -> Option<&'a str> {
+        suffixes.iter().copied().filter(|s| ends(w, s)).max_by_key(|s| s.chars().count())
     }
 
-    fn step_1a(chars: &mut Vec<char>) {
-        if ends_with(chars, "sses") {
-            replace_suffix(chars, "sses", "ss");
-        } else if ends_with(chars, "ies") {
-            replace_suffix(chars, "ies", "i");
-        } else if ends_with(chars, "ss") {
-            // Unchanged.
-        } else if ends_with(chars, "s") {
-            replace_suffix(chars, "s", "");
+    fn replace(w: &mut Vec<char>, suffix: &str, with: &str) {
+        w.truncate(w.len() - suffix.chars().count());
+        w.extend(with.chars());
+    }
+
+    /// Whether `w[..end]` ends in a short syllable: a vowel between two
+    /// non-vowels, the last not `w`, `x` or `Y`; or, as the whole word, a
+    /// vowel then a non-vowel.
+    fn short_syllable(w: &[char], end: usize) -> bool {
+        (end >= 3
+            && !is_vowel(w[end - 3])
+            && is_vowel(w[end - 2])
+            && !is_vowel(w[end - 1])
+            && !matches!(w[end - 1], 'w' | 'x' | 'Y'))
+            || (end == 2 && is_vowel(w[0]) && !is_vowel(w[1]))
+    }
+
+    /// Where the region after the first non-vowel following a vowel, at or
+    /// after `from`, begins; the word's length when there is none.
+    fn region_after(w: &[char], from: usize) -> usize {
+        (from + 1..w.len()).find(|&i| is_vowel(w[i - 1]) && !is_vowel(w[i])).map_or(w.len(), |i| i + 1)
+    }
+
+    pub(super) fn stem(word: &str) -> String {
+        // Exceptional forms, whole words.
+        match word {
+            "skis" => return "ski".into(),
+            "skies" => return "sky".into(),
+            "dying" => return "die".into(),
+            "lying" => return "lie".into(),
+            "tying" => return "tie".into(),
+            "idly" => return "idl".into(),
+            "gently" => return "gentl".into(),
+            "ugly" => return "ugli".into(),
+            "early" => return "earli".into(),
+            "only" => return "onli".into(),
+            "singly" => return "singl".into(),
+            "sky" | "news" | "howe" | "atlas" | "cosmos" | "bias" | "andes" => return word.into(),
+            _ => {}
         }
-    }
-
-    fn step_1b(chars: &mut Vec<char>) {
-        let mut second_pass = false;
-        if ends_with(chars, "eed") {
-            let stem: Vec<char> = chars[..chars.len() - 3].to_vec();
-            if measure(&stem) > 0 {
-                replace_suffix(chars, "eed", "ee");
-            }
-        } else if ends_with(chars, "ed") {
-            let stem: Vec<char> = chars[..chars.len() - 2].to_vec();
-            if contains_vowel(&stem) {
-                replace_suffix(chars, "ed", "");
-                second_pass = true;
-            }
-        } else if ends_with(chars, "ing") {
-            let stem: Vec<char> = chars[..chars.len() - 3].to_vec();
-            if contains_vowel(&stem) {
-                replace_suffix(chars, "ing", "");
-                second_pass = true;
-            }
+        let mut w: Vec<char> = word.chars().collect();
+        if w.len() < 3 {
+            return word.into();
         }
-
-        if second_pass {
-            if ends_with(chars, "at") {
-                replace_suffix(chars, "at", "ate");
-            } else if ends_with(chars, "bl") {
-                replace_suffix(chars, "bl", "ble");
-            } else if ends_with(chars, "iz") {
-                replace_suffix(chars, "iz", "ize");
-            } else if ends_double_consonant(chars) && !matches!(chars[chars.len() - 1], 'l' | 's' | 'z')
-            {
-                chars.pop();
-            } else if measure(chars) == 1 && ends_cvc(chars) {
-                chars.push('e');
-            }
+        // Prelude: an initial apostrophe goes; a `y` that begins the word or
+        // follows a vowel is a consonant, `Y`.
+        if w.first() == Some(&'\'') {
+            w.remove(0);
         }
-    }
-
-    fn step_1c(chars: &mut Vec<char>) {
-        if ends_with(chars, "y") {
-            let stem: Vec<char> = chars[..chars.len() - 1].to_vec();
-            if contains_vowel(&stem) {
-                replace_suffix(chars, "y", "i");
+        for i in 0..w.len() {
+            if w[i] == 'y' && (i == 0 || is_vowel(w[i - 1])) {
+                w[i] = 'Y';
             }
         }
-    }
+        // The regions.
+        let lower: String = w.iter().collect();
+        let p1 = ["gener", "commun", "arsen"]
+            .iter()
+            .find(|p| lower.starts_with(*p))
+            .map_or_else(|| region_after(&w, 0), |p| p.len());
+        let p2 = region_after(&w, p1);
+        let in_r1 = |w: &Vec<char>, suffix: &str| w.len() - suffix.chars().count() >= p1;
+        let in_r2 = |w: &Vec<char>, suffix: &str| w.len() - suffix.chars().count() >= p2;
 
-    /// Applies the first matching suffix rule whose stem has measure above `min`.
-    fn apply_rules(chars: &mut Vec<char>, rules: &[(&str, &str)], min: usize) {
-        for (suffix, with) in rules {
-            if ends_with(chars, suffix) {
-                let stem: Vec<char> = chars[..chars.len() - suffix.chars().count()].to_vec();
-                if measure(&stem) > min {
-                    replace_suffix(chars, suffix, with);
+        // Step 1a.
+        if let Some(s) = longest(&w, &["'s'", "'s", "'"]) {
+            replace(&mut w, s, "");
+        }
+        match longest(&w, &["sses", "ied", "ies", "s", "us", "ss"]) {
+            Some("sses") => replace(&mut w, "sses", "ss"),
+            Some(s @ ("ied" | "ies")) => {
+                let with = if w.len() - 3 > 1 { "i" } else { "ie" };
+                replace(&mut w, s, with);
+            }
+            Some("s") => {
+                // Deleted when a vowel comes before the letter before it.
+                if w.len() >= 2 && w[..w.len() - 2].iter().any(|&c| is_vowel(c)) {
+                    w.pop();
                 }
-                return;
+            }
+            _ => {}
+        }
+        let now: String = w.iter().collect();
+        if !matches!(
+            now.as_str(),
+            "inning" | "outing" | "canning" | "herring" | "earring" | "proceed" | "exceed" | "succeed"
+        ) {
+            // Step 1b.
+            match longest(&w, &["eed", "eedly", "ed", "edly", "ing", "ingly"]) {
+                Some(s @ ("eed" | "eedly")) => {
+                    if in_r1(&w, s) {
+                        replace(&mut w, s, "ee");
+                    }
+                }
+                Some(s) => {
+                    let stem_len = w.len() - s.chars().count();
+                    if w[..stem_len].iter().any(|&c| is_vowel(c)) {
+                        w.truncate(stem_len);
+                        if ends(&w, "at") || ends(&w, "bl") || ends(&w, "iz") {
+                            w.push('e');
+                        } else if ["bb", "dd", "ff", "gg", "mm", "nn", "pp", "rr", "tt"].iter().any(|d| ends(&w, d)) {
+                            w.pop();
+                        } else if w.len() == p1 && short_syllable(&w, w.len()) {
+                            w.push('e');
+                        }
+                    }
+                }
+                None => {}
+            }
+            // Step 1c.
+            let n = w.len();
+            if n >= 3 && matches!(w[n - 1], 'y' | 'Y') && !is_vowel(w[n - 2]) {
+                w[n - 1] = 'i';
+            }
+            // Step 2.
+            const STEP_2: &[(&str, &str)] = &[
+                ("tional", "tion"),
+                ("enci", "ence"),
+                ("anci", "ance"),
+                ("abli", "able"),
+                ("entli", "ent"),
+                ("izer", "ize"),
+                ("ization", "ize"),
+                ("ational", "ate"),
+                ("ation", "ate"),
+                ("ator", "ate"),
+                ("alism", "al"),
+                ("aliti", "al"),
+                ("alli", "al"),
+                ("fulness", "ful"),
+                ("ousli", "ous"),
+                ("ousness", "ous"),
+                ("iveness", "ive"),
+                ("iviti", "ive"),
+                ("biliti", "ble"),
+                ("bli", "ble"),
+                ("ogi", "og"),
+                ("fulli", "ful"),
+                ("lessli", "less"),
+                ("li", ""),
+            ];
+            let suffixes: Vec<&str> = STEP_2.iter().map(|(s, _)| *s).collect();
+            if let Some(s) = longest(&w, &suffixes)
+                && in_r1(&w, s)
+            {
+                let before = w.len() - s.chars().count();
+                let preceding = before.checked_sub(1).map(|i| w[i]);
+                let with = STEP_2.iter().find(|(x, _)| *x == s).map(|(_, r)| *r).unwrap_or("");
+                match s {
+                    "ogi" if preceding == Some('l') => replace(&mut w, s, with),
+                    "ogi" => {}
+                    "li" if matches!(preceding, Some('c' | 'd' | 'e' | 'g' | 'h' | 'k' | 'm' | 'n' | 'r' | 't')) => {
+                        replace(&mut w, s, "")
+                    }
+                    "li" => {}
+                    _ => replace(&mut w, s, with),
+                }
+            }
+            // Step 3.
+            const STEP_3: &[(&str, &str)] = &[
+                ("tional", "tion"),
+                ("ational", "ate"),
+                ("alize", "al"),
+                ("icate", "ic"),
+                ("iciti", "ic"),
+                ("ical", "ic"),
+                ("ful", ""),
+                ("ness", ""),
+                ("ative", ""),
+            ];
+            let suffixes: Vec<&str> = STEP_3.iter().map(|(s, _)| *s).collect();
+            if let Some(s) = longest(&w, &suffixes)
+                && in_r1(&w, s)
+            {
+                let with = STEP_3.iter().find(|(x, _)| *x == s).map(|(_, r)| *r).unwrap_or("");
+                if s != "ative" || in_r2(&w, s) {
+                    replace(&mut w, s, with);
+                }
+            }
+            // Step 4.
+            const STEP_4: &[&str] = &[
+                "al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent", "ism", "ate", "iti", "ous",
+                "ive", "ize", "ion",
+            ];
+            if let Some(s) = longest(&w, STEP_4)
+                && in_r2(&w, s)
+            {
+                let before = w.len() - s.chars().count();
+                if s != "ion" || before.checked_sub(1).is_some_and(|i| matches!(w[i], 's' | 't')) {
+                    replace(&mut w, s, "");
+                }
+            }
+            // Step 5.
+            if ends(&w, "e") {
+                let end = w.len() - 1;
+                if in_r2(&w, "e") || (in_r1(&w, "e") && !short_syllable(&w, end)) {
+                    w.pop();
+                }
+            } else if ends(&w, "l") && in_r2(&w, "l") && w.len() >= 2 && w[w.len() - 2] == 'l' {
+                w.pop();
             }
         }
+        // Postlude.
+        w.iter().map(|&c| if c == 'Y' { 'y' } else { c }).collect()
     }
-
-    fn step_2(chars: &mut Vec<char>) {
-        const RULES: &[(&str, &str)] = &[
-            ("ational", "ate"),
-            ("tional", "tion"),
-            ("enci", "ence"),
-            ("anci", "ance"),
-            ("izer", "ize"),
-            ("bli", "ble"),
-            ("alli", "al"),
-            ("entli", "ent"),
-            ("eli", "e"),
-            ("ousli", "ous"),
-            ("ization", "ize"),
-            ("ation", "ate"),
-            ("ator", "ate"),
-            ("alism", "al"),
-            ("iveness", "ive"),
-            ("fulness", "ful"),
-            ("ousness", "ous"),
-            ("aliti", "al"),
-            ("iviti", "ive"),
-            ("biliti", "ble"),
-            ("logi", "log"),
-        ];
-        apply_rules(chars, RULES, 0);
-    }
-
-    fn step_3(chars: &mut Vec<char>) {
-        const RULES: &[(&str, &str)] = &[
-            ("icate", "ic"),
-            ("ative", ""),
-            ("alize", "al"),
-            ("iciti", "ic"),
-            ("ical", "ic"),
-            ("ful", ""),
-            ("ness", ""),
-        ];
-        apply_rules(chars, RULES, 0);
-    }
-
-    fn step_4(chars: &mut Vec<char>) {
-        const SUFFIXES: &[&str] = &[
-            "al", "ance", "ence", "er", "ic", "able", "ible", "ant", "ement", "ment", "ent", "ou",
-            "ism", "ate", "iti", "ous", "ive", "ize",
-        ];
-        // Longest first, so `ement` is not cut as `ent`.
-        let mut ordered: Vec<&&str> = SUFFIXES.iter().collect();
-        ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
-
-        for suffix in ordered {
-            if !ends_with(chars, suffix) {
-                continue;
-            }
-            let stem: Vec<char> = chars[..chars.len() - suffix.chars().count()].to_vec();
-            if measure(&stem) > 1 {
-                // `ion` only survives after `s` or `t`.
-                replace_suffix(chars, suffix, "");
-            }
-            return;
-        }
-        if ends_with(chars, "ion") {
-            let stem: Vec<char> = chars[..chars.len() - 3].to_vec();
-            if measure(&stem) > 1 && matches!(stem.last(), Some('s') | Some('t')) {
-                replace_suffix(chars, "ion", "");
-            }
-        }
-    }
-
-    fn step_5(chars: &mut Vec<char>) {
-        if ends_with(chars, "e") {
-            let stem: Vec<char> = chars[..chars.len() - 1].to_vec();
-            let m = measure(&stem);
-            if m > 1 || (m == 1 && !ends_cvc(&stem)) {
-                chars.pop();
-            }
-        }
-        if ends_with(chars, "ll") && measure(chars) > 1 {
-            chars.pop();
-        }
-    }
-
 }
 
 #[cfg(test)]
@@ -1186,8 +1210,11 @@ mod tests {
     }
 
     #[test]
-    fn the_stemmer_agrees_with_porter_on_common_words() {
+    fn the_stemmer_agrees_with_postgresql_on_common_words() {
         for (word, expected) in [
+            // Where the classic Porter stemmer this replaced differed.
+            ("day", "day"),
+            ("generously", "generous"),
             ("caresses", "caress"),
             ("ponies", "poni"),
             ("cats", "cat"),
@@ -1206,6 +1233,65 @@ mod tests {
         ] {
             assert_eq!(stem(word), expected, "{}", word);
         }
+    }
+
+    /// The stemmer against PostgreSQL 17's `to_tsvector('english', w)`:
+    /// `text_search_pg17_stems.tsv` holds every twentieth word of
+    /// `/usr/share/dict/words` (lowercase letters only) and the stemmer's
+    /// exceptional forms, as `word<TAB>lexeme` (`\N` for a stop word), the way
+    /// `\copy (SELECT w, (SELECT string_agg(lexeme, ' ') FROM
+    /// unnest(to_tsvector('english', w))) FROM words) TO …` writes it.
+    /// `RDB_PG_STEMS` names a whole such file instead: all 63,748 dictionary
+    /// words agreed when this was written.
+    #[test]
+    fn the_stemmer_agrees_with_postgresql_over_a_dictionary() {
+        let text = match std::env::var("RDB_PG_STEMS") {
+            Ok(path) => std::fs::read_to_string(path).expect("the stems file"),
+            Err(_) => include_str!("text_search_pg17_stems.tsv").to_string(),
+        };
+        let mut wrong = Vec::new();
+        let mut checked = 0;
+        for line in text.lines() {
+            let Some((word, lexeme)) = line.split_once('\t') else { continue };
+            if lexeme == "\\N" {
+                continue;
+            }
+            checked += 1;
+            let ours = stem(word);
+            if ours != lexeme {
+                wrong.push(format!("{word}: ours {ours}, postgres {lexeme}"));
+            }
+        }
+        assert!(checked > 3_000, "only {checked} words read");
+        println!("{checked} words agree with PostgreSQL");
+        assert!(wrong.is_empty(), "{} of {checked} differ:\n{}", wrong.len(), wrong.iter().take(60).cloned().collect::<Vec<_>>().join("\n"));
+    }
+
+    #[test]
+    fn a_phrase_is_matched_by_position() {
+        let v = to_tsvector("english", "The quick brown fox jumps");
+        let q = |t: &str| to_tsquery("english", t).unwrap();
+        assert!(matches(&v, &q("quick <-> brown")));
+        assert!(!matches(&v, &q("brown <-> quick")));
+        assert!(matches(&v, &q("quick <2> fox")));
+        assert!(!matches(&v, &q("quick <-> fox")));
+        assert!(matches(&v, &q("quick <-> ( brown | red )")));
+        assert!(matches(&v, &q("quick <-> brown <-> fox")));
+        assert!(matches(&v, &phraseto_tsquery("english", "quick the brown")) == false);
+        assert!(matches(&v, &q("qui:* & jum:*")));
+        assert!(!matches(&v, &q("cat:*")));
+        // Only stop words: an empty query, matching nothing.
+        assert_eq!(q("the & a"), "");
+        assert!(!matches(&v, &q("the")));
+    }
+
+    #[test]
+    fn stop_words_keep_their_place_in_a_phrase() {
+        assert_eq!(to_tsquery("english", "quick <-> the <-> fox").unwrap(), "'quick' <2> 'fox'");
+        assert_eq!(to_tsquery("english", "the <-> quick").unwrap(), "'quick'");
+        assert_eq!(phraseto_tsquery("english", "quick the brown fox"), "'quick' <2> 'brown' <-> 'fox'");
+        assert_eq!(to_tsquery("english", "!the & fox").unwrap(), "'fox'");
+        assert!(to_tsquery("english", "fox:A").is_err());
     }
 
     #[test]
@@ -1229,11 +1315,11 @@ mod reference {
         for word in words(document) {
             position += 1;
             let lower = word.to_lowercase();
-            if STOP_WORDS.contains(&lower.as_str()) {
+            if stem_it && STOP_WORDS.contains(&lower.as_str()) {
                 continue;
             }
             let text = if stem_it {
-                super::stem_reference::stem(&lower)
+                super::stem(&lower)
             } else {
                 lower
             };
@@ -1276,7 +1362,7 @@ mod reference {
                 Some(body[..close].replace("''", "'"))
             })
             .collect();
-        let Ok(node) = parse_query("simple", query) else {
+        let Ok(Some(node)) = parse_query("simple", query) else {
             return false;
         };
         evaluate(&node, &present)
@@ -1336,7 +1422,7 @@ mod differential {
             1 => format!("{} | {}", query(rng, depth - 1), query(rng, depth - 1)),
             2 => format!("!{}", query(rng, depth - 1)),
             3 => format!("( {} )", query(rng, depth - 1)),
-            4 => format!("{} <-> {}", query(rng, depth - 1), query(rng, depth - 1)),
+            4 => format!("{} & {}", query(rng, depth - 1), query(rng, depth - 1)),
             // Malformed now and then: both must answer "no match".
             _ => format!("{} &", query(rng, depth - 1)),
         }
@@ -1370,59 +1456,6 @@ mod differential {
         }
         // Only worth something if both answers occur.
         assert!(matched > 300, "only {matched} matches");
-    }
-
-    /// The in-place stemmer against the one it replaced, over a large word
-    /// list: every word the document generator uses, a dictionary-like set
-    /// built from roots and the suffixes every Porter step tests, random
-    /// letter strings, and Unicode.
-    #[test]
-    fn the_in_place_stemmer_is_byte_identical() {
-        let roots = [
-            "relat", "condition", "nation", "connect", "general", "hope", "sing", "run",
-            "plaster", "agre", "feed", "bled", "motor", "size", "fil", "fail", "troubl",
-            "happ", "sky", "cr", "formal", "sensit", "electr", "adjust", "depend",
-            "valen", "hesit", "digit", "effect", "posit", "bomb", "gyroscop", "communism",
-            "irrit", "homolog", "analog", "control", "roll", "fall", "cease", "tann",
-            "rate", "probat", "trav", "convey", "employ", "boy", "say", "y", "yy", "ay",
-            "über", "naïv", "café", "straß", "ünï", "日本", "ðe", "æsthet", "yo", "ye",
-        ];
-        let suffixes = [
-            "", "s", "es", "sses", "ies", "ss", "eed", "ed", "ing", "at", "bl", "iz", "y",
-            "ational", "tional", "enci", "anci", "izer", "bli", "alli", "entli", "eli",
-            "ousli", "ization", "ation", "ator", "alism", "iveness", "fulness", "ousness",
-            "aliti", "iviti", "biliti", "logi", "icate", "ative", "alize", "iciti", "ical",
-            "ful", "ness", "al", "ance", "ence", "er", "ic", "able", "ible", "ant",
-            "ement", "ment", "ent", "ou", "ism", "ate", "iti", "ous", "ive", "ize", "ion",
-            "sion", "tion", "e", "ll", "ly", "ings", "edly", "ingly", "ers",
-        ];
-        let mut words: Vec<String> = Vec::new();
-        for r in roots {
-            for a in suffixes {
-                words.push(format!("{r}{a}"));
-                for b in ["", "s", "ed", "ing", "e", "y", "ness", "al"] {
-                    words.push(format!("{r}{a}{b}"));
-                }
-            }
-        }
-        for w in VOCAB {
-            words.push(w.to_lowercase());
-        }
-        let mut rng = Lcg(0xabc);
-        let letters = ['a', 'e', 'i', 'o', 'u', 'y', 's', 't', 'n', 'l', 'b', 'z', 'c', 'd', 'g', 'w', 'x', 'é', 'ß'];
-        for _ in 0..100_000 {
-            let n = 1 + (rng.next() % 12) as usize;
-            words.push((0..n).map(|_| letters[(rng.next() as usize) % letters.len()]).collect());
-        }
-        for _ in 0..2000 {
-            for w in words_of(&document(&mut rng)) {
-                words.push(w);
-            }
-        }
-        assert!(words.len() > 150_000, "{}", words.len());
-        for w in &words {
-            assert_eq!(stem(w), stem_reference::stem(w), "{w:?}");
-        }
     }
 
     fn words_of(doc: &str) -> Vec<String> {
