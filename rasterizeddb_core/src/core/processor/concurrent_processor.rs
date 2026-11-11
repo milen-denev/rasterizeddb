@@ -1021,6 +1021,10 @@ impl ConcurrentProcessor {
                 // Key-only rows plus the pointer to read the payload back from,
                 // used in place of `acc_rows` while a top-N is deferring it.
                 let mut acc_pairs: Vec<(Row, RowPointer)> = Vec::new();
+                // The top-N's comparator, and whether `acc_pairs` has been
+                // trimmed yet — see `keep_for_top_n`.
+                let mut top_sort: Option<PreparedSort> = None;
+                let mut top_bounded = false;
 
                 while let Ok(pointers) = work_rx.recv().await {
                     // Asked before the batch rather than after: the point is not
@@ -1146,8 +1150,16 @@ impl ConcurrentProcessor {
 
                             if likely(bytes_mode) {
                                 buffer.row.extend_serialized(&mut acc_bytes);
-                            } else if deferred_ref.is_some() {
-                                acc_pairs.push((std::mem::take(&mut buffer.row), pointer.clone()));
+                            } else if let (Some(_), Some(top)) = (deferred_ref.as_ref(), top_n_ref.as_ref()) {
+                                Self::keep_for_top_n(
+                                    top,
+                                    schema_ref.as_slice(),
+                                    &mut top_sort,
+                                    &mut top_bounded,
+                                    &mut acc_pairs,
+                                    &mut buffer.row,
+                                    pointer,
+                                );
                             } else {
                                 acc_rows.push(std::mem::take(&mut buffer.row));
                             }
@@ -1347,9 +1359,18 @@ impl ConcurrentProcessor {
 
                                 if likely(bytes_mode) {
                                     buffer.row.extend_serialized(&mut acc_bytes);
-                                } else if deferred_ref.is_some() {
-                                    acc_pairs
-                                        .push((std::mem::take(&mut buffer.row), pointer.clone()));
+                                } else if let (Some(_), Some(top)) =
+                                    (deferred_ref.as_ref(), top_n_ref.as_ref())
+                                {
+                                    Self::keep_for_top_n(
+                                        top,
+                                        schema_ref.as_slice(),
+                                        &mut top_sort,
+                                        &mut top_bounded,
+                                        &mut acc_pairs,
+                                        &mut buffer.row,
+                                        pointer,
+                                    );
                                 } else {
                                     acc_rows.push(std::mem::take(&mut buffer.row));
                                 }
@@ -1363,21 +1384,10 @@ impl ConcurrentProcessor {
                     // O(n) selection is amortised over at least `cap` new rows.
                     // `select_nth_unstable_by` partitions rather than sorts:
                     // the survivors are unordered, which is all the final sort
-                    // needs from them.
+                    // needs from them. The deferred pairs are trimmed as they
+                    // are pushed (`keep_for_top_n`), not here.
                     if let Some(top) = top_n_ref.as_ref() {
-                        if deferred_ref.is_some() {
-                            if acc_pairs.len() > top.cap.saturating_mul(2) {
-                                let sort = PreparedSort::new(
-                                    &top.keys,
-                                    schema_ref.as_slice(),
-                                    acc_pairs.first().map(|p| &p.0),
-                                );
-                                acc_pairs.select_nth_unstable_by(top.cap - 1, |a, b| {
-                                    sort.compare(&a.0, &b.0)
-                                });
-                                acc_pairs.truncate(top.cap);
-                            }
-                        } else if acc_rows.len() > top.cap.saturating_mul(2) {
+                        if deferred_ref.is_none() && acc_rows.len() > top.cap.saturating_mul(2) {
                             let sort = PreparedSort::new(
                                 &top.keys,
                                 schema_ref.as_slice(),
@@ -1675,6 +1685,45 @@ impl ConcurrentProcessor {
             }
         }
         crate::core::rql::join::fetch_for(&fields, schema_arc)
+    }
+
+    /// Keeps a matched key row for a worker's top-N, unless it already loses.
+    ///
+    /// `kept` is trimmed to its best `cap` whenever it passes twice that, so
+    /// the O(n) selection is amortised over at least `cap` pushes; from the
+    /// first trim on (`bounded`), `kept[cap - 1]` is the worst row kept — the
+    /// selection leaves it there, and rows are only pushed behind it. A row
+    /// that does not sort before it cannot be among this worker's best `cap`,
+    /// let alone the statement's, so it is dropped with one comparison and its
+    /// buffer goes back to the next fetch. A row tied with the worst is
+    /// dropped too: which of several rows tied at the boundary survives was
+    /// already unspecified (the selection is unstable).
+    ///
+    /// The scan used to push every matched row and trim once per batch: ten
+    /// thousand 1.5 KB rows moved into the vector, partitioned, and all but
+    /// `cap` dropped, per batch per worker. For `ORDER BY created DESC LIMIT
+    /// 20` over a million rows that was half the statement — 30% `memmove`,
+    /// 18% comparisons inside the partition, 5% dropping the losers.
+    #[inline]
+    fn keep_for_top_n(
+        top: &TopN,
+        schema: &[SchemaField],
+        sort: &mut Option<PreparedSort>,
+        bounded: &mut bool,
+        kept: &mut Vec<(Row, RowPointer)>,
+        row: &mut Row,
+        pointer: &RowPointer,
+    ) {
+        let sort = sort.get_or_insert_with(|| PreparedSort::new(&top.keys, schema, Some(row)));
+        if *bounded && sort.compare(row, &kept[top.cap - 1].0) != std::cmp::Ordering::Less {
+            return;
+        }
+        kept.push((std::mem::take(row), pointer.clone()));
+        if kept.len() > top.cap.saturating_mul(2) {
+            kept.select_nth_unstable_by(top.cap - 1, |a, b| sort.compare(&a.0, &b.0));
+            kept.truncate(top.cap);
+            *bounded = true;
+        }
     }
 
     fn top_n_spec(
