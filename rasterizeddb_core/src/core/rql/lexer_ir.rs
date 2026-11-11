@@ -440,6 +440,30 @@ fn value_to_mb(value_str: &str, db_type: &DbType) -> Option<MemoryBlock> {
     })
 }
 
+/// Whether `value` is a literal there is nothing to evaluate in: digits with
+/// at most one point between them, a `-` before them or not, or one
+/// single-quoted string holding no quote and no backslash.
+///
+/// Such a value is neither an expression nor NULL, which is what
+/// [`crate::core::rql::expr::needs_evaluation`] and
+/// [`crate::core::rql::lexer_query::looks_like_row_expression`] would each
+/// find by scanning it — the second twice over, for nesting. A loaded row is
+/// nothing but these, and every one of its values was scanned by both for
+/// the NOT NULL check and again to be encoded: a quarter of a bulk load.
+/// `plain_literals_are_what_the_scans_say` holds this to them.
+pub(crate) fn plain_literal(value: &str) -> bool {
+    match value.trim().as_bytes() {
+        [b'\'', inner @ .., b'\''] => !inner.iter().any(|c| *c == b'\'' || *c == b'\\'),
+        number => {
+            let digits = number.strip_prefix(b"-").unwrap_or(number);
+            let mut parts = digits.splitn(2, |c| *c == b'.');
+            let whole = parts.next().unwrap_or(&[]);
+            let all_digits = |part: &[u8]| !part.is_empty() && part.iter().all(u8::is_ascii_digit);
+            all_digits(whole) && parts.next().is_none_or(all_digits)
+        }
+    }
+}
+
 /// Whether a value written in `VALUES` is NULL: the keyword, or a constant
 /// expression that evaluates to NULL (`NULLIF(1, 1)`, `NULL::text`).
 ///
@@ -450,6 +474,9 @@ pub(crate) fn written_null(value: &str) -> bool {
     let value = value.trim();
     if value.eq_ignore_ascii_case("NULL") {
         return true;
+    }
+    if plain_literal(value) {
+        return false;
     }
     if !(crate::core::rql::expr::needs_evaluation(value)
         || crate::core::rql::lexer_query::looks_like_row_expression(value))
@@ -1258,19 +1285,29 @@ pub(crate) fn encode_column_value(
     // PostgreSQL's assignment renders it (`numeric_constant_text`), and is
     // taken before the expression test: `100e-2` looks like arithmetic to it,
     // and evaluated it lost the scale its digits give it ('1', not '1.00').
+    //
+    // Asked only of a text column, and never of a quoted string, which is no
+    // unquoted number: it was asked of every value of every column, and reads
+    // each one digit by digit to say so.
     let rendered_constant;
-    let value: &str = match (&schema_field.db_type, crate::core::value_codec::written_constant_text(value)) {
-        (DbType::STRING | DbType::CHAR, Some(text)) => {
-            rendered_constant = crate::core::value_codec::quote_sql(&text);
-            &rendered_constant
+    let value: &str = match schema_field.db_type {
+        DbType::STRING | DbType::CHAR if !value.trim_start().starts_with('\'') => {
+            match crate::core::value_codec::written_constant_text(value) {
+                Some(text) => {
+                    rendered_constant = crate::core::value_codec::quote_sql(&text);
+                    &rendered_constant
+                }
+                None => value,
+            }
         }
         _ => value,
     };
     // Arithmetic counts as well as a call: `VALUES (2147483647 + 1)` has
     // neither parentheses nor a cast, and was handed to the column's
     // literal reader whole, which refused it as unreadable text.
-    let value = if crate::core::rql::expr::needs_evaluation(value)
-        || crate::core::rql::lexer_query::looks_like_row_expression(value)
+    let value = if !plain_literal(value)
+        && (crate::core::rql::expr::needs_evaluation(value)
+            || crate::core::rql::lexer_query::looks_like_row_expression(value))
     {
         // There is no row yet, so only a constant-foldable expression
         // has meaning here — a nullary function or a literal. Its
@@ -3278,5 +3315,116 @@ mod values_arity {
         assert_eq!(arity("INSERT INTO t AS x (a) VALUES (1, 2)", 3), None);
         assert_eq!(arity("UPDATE t SET a = 1", 3), None);
         assert_eq!(arity("INSERT INTO t (a) VALUES ('VALUES (1, 2, 3)')", 3), None);
+    }
+}
+
+#[cfg(test)]
+mod plain_literal_tests {
+    use super::{plain_literal, written_null};
+    use crate::core::rql::expr::needs_evaluation;
+    use crate::core::rql::lexer_query::looks_like_row_expression;
+    use crate::core::value_codec::numeric_constant_text;
+
+    /// What `encode_column_value` and `written_null` decided before they asked
+    /// `plain_literal`: whether the value is evaluated, and whether it is NULL.
+    fn scans(value: &str) -> (bool, bool) {
+        let evaluated = needs_evaluation(value) || looks_like_row_expression(value);
+        let null = value.trim().eq_ignore_ascii_case("NULL")
+            || (evaluated
+                && crate::core::rql::expr::parse(value.trim(), &[])
+                    .and_then(|e| {
+                        crate::core::rql::expr::eval(
+                            &e,
+                            &crate::core::row::row::Row { position: 0, length: 0, columns: smallvec::SmallVec::new() },
+                            &[],
+                        )
+                    })
+                    .is_ok_and(|v| v.is_null()));
+        (evaluated, null)
+    }
+
+    /// A small generator, so the corpus is the same on every run.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, below: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % below
+        }
+    }
+
+    /// Everything a string's inside may hold that some scanner gives a
+    /// meaning to outside one — operators, brackets, casts, comments,
+    /// keywords, placeholders, other quotes — and text that is none of those.
+    const PIECES: &[&str] = &[
+        "a", "Z", "0", "9", " ", "\t", "\n", "+", "-", "*", "/", "%", "^", "|", "||", "&", "&&", "~", "<", ">", "<<", ">>",
+        "=", "!", "@", "@>", "<@", "#", "#>", "#>>", "?", "?|", "?&", "->", "->>", ":", "::", ";", ",", ".", "(", ")", "[", "]",
+        "{", "}", "\"", "$", "$1", "$$", "_", "--", "/*", "*/", "NULL", "null", "ARRAY[", "CASE ", "SELECT ", "now()",
+        "CURRENT_TIMESTAMP", "DEFAULT", "true", "E", "x::int", "(1 + 2)", "{\"a\": 1}", "[1, 2]", "é", "日本", "😀", "1e5", "0x1F",
+    ];
+
+    #[test]
+    fn plain_literals_are_what_the_scans_say() {
+        let mut rng = Lcg(0x5EED);
+        let mut checked = 0usize;
+        let mut check = |value: &str| {
+            assert!(plain_literal(value), "not taken for plain: {value:?}");
+            assert_eq!(scans(value), (false, false), "{value:?}");
+            assert!(!written_null(value), "{value:?}");
+            checked += 1;
+        };
+        // Strings.
+        for value in ["''", "' '", "'NULL'", "'null'", "'a + b'", "'x::int'", "'-5'", "'(1)'", "'~'", "'$1'", "'--'"] {
+            check(value);
+        }
+        for _ in 0..60_000 {
+            let mut inside = String::new();
+            for _ in 0..rng.next(9) {
+                inside.push_str(PIECES[rng.next(PIECES.len())]);
+            }
+            let pad = ["", " ", "\n ", "\t"][rng.next(4)];
+            check(&format!("{pad}'{inside}'{pad}"));
+        }
+        // A quoted string is no unquoted number, which is what lets the
+        // encoder skip `written_constant_text` for it.
+        for _ in 0..20_000 {
+            let mut inside = String::new();
+            for _ in 0..rng.next(6) {
+                inside.push_str(["0", "7", "1.5", "-", "+", "e", "_", "x", " ", "."][rng.next(10)]);
+            }
+            let value = format!("'{inside}'");
+            assert_eq!(numeric_constant_text(&value), None, "{value:?}");
+        }
+        // Numbers.
+        for value in ["0", "7", "007", "1.50", "-1", "-0", "-0.0", "12345678901234567890123456789012345678901234567890", " 42 ", "-9223372036854775808"] {
+            check(value);
+        }
+        for _ in 0..40_000 {
+            let mut value = String::new();
+            if rng.next(3) == 0 {
+                value.push('-');
+            }
+            for _ in 0..1 + rng.next(24) {
+                value.push((b'0' + rng.next(10) as u8) as char);
+            }
+            if rng.next(2) == 0 {
+                value.push('.');
+                for _ in 0..1 + rng.next(12) {
+                    value.push((b'0' + rng.next(10) as u8) as char);
+                }
+            }
+            check(&value);
+        }
+        assert!(checked > 100_000);
+    }
+
+    #[test]
+    fn everything_else_takes_the_scans() {
+        for value in [
+            "", " ", "NULL", "null", "DEFAULT", "now()", "1 + 1", "- 5", "--5", "+5", "1e5", "0x1F", "1_000", ".5", "5.", "1.2.3", "-",
+            "'it''s'", "'a\\b'", "E'a'", "'a' || 'b'", "'a'::text", "'a' 'b'", "'unterminated", "x'", "DATE '2020-01-01'", "(1)",
+            "ARRAY[1]", "'{1}'::int[]", "$1", "true", "a", "\"a\"", "'a'b'", "1 -- c", "'a' -- c",
+        ] {
+            assert!(!plain_literal(value), "taken for plain: {value:?}");
+        }
     }
 }
