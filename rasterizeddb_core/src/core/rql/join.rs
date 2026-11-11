@@ -128,6 +128,14 @@ pub struct Relation {
     /// NULL-padded, and for RIGHT and FULL the rows it would have matched come
     /// out unmatched — PostgreSQL's meaning in every case.
     pub left_condition: Option<PostJoinFilter>,
+    /// `ON` terms over this relation and those joined before it that no key
+    /// or single-relation filter carries — `ON a.x = b.x OR a.y = b.z`, `ON
+    /// a.id = b.id AND a.n < b.m` — evaluated on each candidate pair as it is
+    /// made (`combine`'s pairing step). A pair it rejects is no match, so an
+    /// outer join's preserved row whose every pair it rejects still comes
+    /// out, NULL-padded: what PostgreSQL's join filter does. A filter after
+    /// the join would drop that row instead, which is why these were refused.
+    pub pair_condition: Option<PostJoinFilter>,
 }
 
 /// A predicate evaluated over combined rows, after the join.
@@ -1203,6 +1211,91 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
             None => None,
         };
 
+        // `ON` terms only a candidate pair can answer: the pairs are made as
+        // an inner join would make them, the condition keeps or rejects each,
+        // and then the preserved side's tuples or rows left with no pair come
+        // out NULL-padded (`Relation::pair_condition`).
+        if let Some(pair) = relation.pair_condition.as_ref() {
+            let candidates: Vec<u32> = if join.keys.is_empty() {
+                let right_n = scanned[idx].len();
+                let mut out = Vec::new();
+                for (t, tuple) in combined.chunks_exact(width).enumerate() {
+                    if left_ok.as_deref().is_some_and(|ok| !ok[t]) {
+                        continue;
+                    }
+                    for r in 0..right_n {
+                        if eligible.as_deref().is_some_and(|ok| !ok[r]) {
+                            continue;
+                        }
+                        let at = out.len();
+                        out.extend_from_slice(tuple);
+                        out[at + idx] = r as u32;
+                    }
+                }
+                out
+            } else if !resolved {
+                Vec::new()
+            } else if left_keys.len() == 1 {
+                let (l, r) = (left_keys[0], right_keys[0]);
+                hash_step(
+                    JoinKind::Inner,
+                    idx,
+                    join.left_rel,
+                    width,
+                    scanned,
+                    &combined,
+                    eligible.as_deref(),
+                    left_ok.as_deref(),
+                    false,
+                    |row| key_bytes(row, l),
+                    |row| key_bytes(row, r),
+                )
+            } else {
+                hash_step(
+                    JoinKind::Inner,
+                    idx,
+                    join.left_rel,
+                    width,
+                    scanned,
+                    &combined,
+                    eligible.as_deref(),
+                    left_ok.as_deref(),
+                    false,
+                    |row| composite_key(row, &left_keys),
+                    |row| composite_key(row, &right_keys),
+                )
+            };
+            let keep = apply_post_join(plan, pair, &Joined { scanned, width, slots: candidates.clone() })?;
+            let mut next: Vec<u32> = Vec::with_capacity(candidates.len());
+            let mut matched_tuples: ahash::HashSet<&[u32]> = ahash::HashSet::default();
+            let mut matched_rows: ahash::HashSet<u32> = ahash::HashSet::default();
+            for (t, tuple) in candidates.chunks_exact(width).enumerate() {
+                if keep.get(t).copied().unwrap_or(false) {
+                    next.extend_from_slice(tuple);
+                    matched_tuples.insert(&tuple[..idx]);
+                    matched_rows.insert(tuple[idx]);
+                }
+            }
+            if matches!(join.kind, JoinKind::Left | JoinKind::Full) {
+                for tuple in combined.chunks_exact(width) {
+                    if !matched_tuples.contains(&tuple[..idx]) {
+                        next.extend_from_slice(tuple);
+                    }
+                }
+            }
+            if matches!(join.kind, JoinKind::Right | JoinKind::Full) {
+                for r in 0..scanned[idx].len() as u32 {
+                    if !matched_rows.contains(&r) {
+                        let at = next.len();
+                        next.extend(std::iter::repeat_n(NO_ROW, width));
+                        next[at + idx] = r;
+                    }
+                }
+            }
+            combined = next;
+            continue;
+        }
+
         combined = if !resolved {
             // A join key that was not fetched cannot match anything: an inner
             // join is then empty, a left join keeps its left rows, a right
@@ -2131,13 +2224,6 @@ fn split_relation_alias(text: &str) -> Result<(String, String), String> {
 /// The equality between two relations is the hash key; every other term becomes
 /// a filter on the relation being joined.
 fn split_on_condition(on: &str) -> Result<(String, String, Vec<String>), String> {
-    if on.to_ascii_uppercase().contains(" OR ") {
-        return Err(format!(
-            "join condition '{}' uses OR, which is not supported yet: only terms combined \
-             with AND can be applied as a filter on the joined relation",
-            on.trim()
-        ));
-    }
 
     let mut equality: Option<(String, String)> = None;
     let mut extra: Vec<String> = Vec::new();
@@ -3090,6 +3176,8 @@ pub fn plan(
     let mut left_terms: Vec<Vec<String>> = vec![Vec::new(); relations.len()];
     // `ON` conditions with no hash key, which become post-join predicates.
     let mut expression_joins: Vec<String> = Vec::new();
+    // `ON` terms evaluated on each candidate pair (`Relation::pair_condition`).
+    let mut pair_terms: Vec<Vec<String>> = vec![Vec::new(); relations.len()];
     for (i, r) in relations.iter().enumerate() {
         let Some(raw) = r.join.as_ref() else { continue };
 
@@ -3112,12 +3200,26 @@ pub fn plan(
         // and a cross join followed by a filter would drop it. So that is
         // refused rather than answered wrongly.
         if raw.left_qualified.is_empty() && raw.right_qualified.is_empty() {
+            // An outer join with no key pairs every tuple with every row and
+            // keeps the pairs its condition accepts, padding what found none
+            // (`Relation::pair_condition`).
             if raw.kind != JoinKind::Inner {
-                return Err(format!(
-                    "an outer join on '{}' needs an equality between two columns: without \
-                     one the unmatched rows it must keep cannot be identified",
-                    raw.extra.join(" AND ").trim()
-                ));
+                joins[i] = Some(JoinedRelation { kind: raw.kind, left_rel: i.saturating_sub(1), keys: Vec::new() });
+                pair_terms[i].extend(raw.extra.iter().cloned());
+                continue;
+            }
+            // An INNER join's condition is a filter on its pairs, so after
+            // the join is as good as at it — unless a later RIGHT or FULL
+            // join pads tuples with NULLs, which a filter after it would then
+            // drop (`… JOIN b ON a.x < b.x RIGHT JOIN c ON …` lost every
+            // padded row of `c`). Then it is decided at this step.
+            let padded_later = relations[i + 1..]
+                .iter()
+                .any(|later| later.join.as_ref().is_some_and(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full)));
+            if padded_later {
+                joins[i] = Some(JoinedRelation { kind: JoinKind::Inner, left_rel: i.saturating_sub(1), keys: Vec::new() });
+                pair_terms[i].extend(raw.extra.iter().cloned());
+                continue;
             }
             joins[i] = Some(JoinedRelation {
                 kind: JoinKind::Cross,
@@ -3183,19 +3285,10 @@ pub fn plan(
                 // the first and then discards, which agrees with SQL only when
                 // the first column is already unique.
                 //
-                // Anything else spanning two relations still has to be
-                // evaluated after the join, which this engine does not do.
+                // Anything else spanning the two is evaluated on each
+                // candidate pair (`Relation::pair_condition`), or, for an
+                // INNER join nothing later pads, after the join.
                 [a, b] if (*a == i && *b == left_rel) || (*a == left_rel && *b == i) => {
-                    let malformed = || {
-                        format!(
-                            "ON term '{}' relates '{}' to '{}' but is not an equality between \
-                             two columns, so it cannot be part of the join key and would have \
-                             to be evaluated after the join",
-                            term.trim(),
-                            r.label,
-                            relations[left_rel].label
-                        )
-                    };
                     // An INNER join's condition that is not a key equality
                     // (`a.id < b.id`) is a filter on the joined pair, the same
                     // as a WHERE term, so it joins the post-join predicates —
@@ -3218,9 +3311,10 @@ pub fn plan(
                     let Some((p_rel, p_field, q_rel, q_field)) = key_equality() else {
                         if raw.kind == JoinKind::Inner && !padded_later {
                             expression_joins.push(term.clone());
-                            continue;
+                        } else {
+                            pair_terms[i].push(term.clone());
                         }
-                        return Err(malformed());
+                        continue;
                     };
                     // Order the pair the same way as the primary key: left
                     // relation first, this one second.
@@ -3231,7 +3325,7 @@ pub fn plan(
                     } else if raw.kind == JoinKind::Inner && !padded_later {
                         expression_joins.push(term.clone());
                     } else {
-                        return Err(malformed());
+                        pair_terms[i].push(term.clone());
                     }
                 }
                 // Reads only relations joined before this one: it decides which
@@ -3239,6 +3333,10 @@ pub fn plan(
                 // relation's rows exist.
                 refs if refs.iter().all(|r| *r < i) => {
                     left_terms[i].push(term.clone());
+                }
+                // This relation and others joined before it: on each pair.
+                refs if refs.iter().all(|r| *r <= i) => {
+                    pair_terms[i].push(term.clone());
                 }
                 _ => {
                     return Err(format!(
@@ -3627,6 +3725,16 @@ pub fn plan(
                 }
             }
         }
+        // And for an `ON` term evaluated on each candidate pair.
+        for terms in &pair_terms {
+            for term in terms {
+                for field in schemas[i].iter() {
+                    if term_names_column(term, &r.label, &r.table, &field.name) {
+                        push(field, &mut fetch);
+                    }
+                }
+            }
+        }
         // And for an `ON` term over earlier relations, evaluated against the
         // tuple so far.
         for terms in &left_terms {
@@ -3729,12 +3837,19 @@ pub fn plan(
             require_unmatched: anti_join[i],
             match_condition,
             left_condition: None,
+            pair_condition: None,
         });
     }
     for (i, terms) in left_terms.iter().enumerate() {
         if !terms.is_empty() {
             let filter = build_post_join_filter(terms, &out_relations)?;
             out_relations[i].left_condition = Some(filter);
+        }
+    }
+    for (i, terms) in pair_terms.iter().enumerate() {
+        if !terms.is_empty() {
+            let filter = build_post_join_filter(terms, &out_relations)?;
+            out_relations[i].pair_condition = Some(filter);
         }
     }
 
@@ -5590,15 +5705,20 @@ mod tests {
     fn an_on_without_a_column_equality_yields_no_key() {
         // A lone literal comparison names no join key. That is reported by
         // returning an empty key rather than by failing: an *inner* join on a
-        // predicate is a cross join filtered by it, which the planner builds.
-        // The planner still refuses the outer-join case, where the two are not
-        // equivalent.
+        // predicate is a cross join filtered by it, and an outer join decides
+        // it on each pair (`Relation::pair_condition`).
         let (l, r, extra) = split_on_condition("r.name = 'x'").unwrap();
         assert!(l.is_empty() && r.is_empty(), "no key: {:?} {:?}", l, r);
         assert_eq!(extra, vec!["r.name = 'x'".to_string()]);
 
-        // OR still cannot be expressed as a per-relation filter.
-        assert!(split_on_condition("a.x = b.y OR a.z = b.w").is_err());
+        // An OR is no key either: one term, decided on each pair.
+        let (l, r, extra) = split_on_condition("a.x = b.y OR a.z = b.w").unwrap();
+        assert!(l.is_empty() && r.is_empty(), "no key: {:?} {:?}", l, r);
+        assert_eq!(extra, vec!["a.x = b.y OR a.z = b.w".to_string()]);
+        // Beside a key equality it is a further term, the key kept.
+        let (l, r, extra) = split_on_condition("a.id = b.id AND (a.x = b.y OR a.z = b.w)").unwrap();
+        assert_eq!((l.as_str(), r.as_str()), ("a.id", "b.id"));
+        assert_eq!(extra, vec!["(a.x = b.y OR a.z = b.w)".to_string()]);
     }
 
     #[test]
@@ -5663,6 +5783,7 @@ mod tests {
                     require_unmatched: false,
                     match_condition: None,
                     left_condition: None,
+                    pair_condition: None,
                     fetch_columns: vec![u_id, u_name.clone(), u_domain],
                 },
                 Relation {
@@ -5677,6 +5798,7 @@ mod tests {
                     require_unmatched: false,
                     match_condition: None,
                     left_condition: None,
+                    pair_condition: None,
                     fetch_columns: vec![d_id, d_name.clone()],
                 },
             ],
