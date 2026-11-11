@@ -104,14 +104,12 @@ async fn window_frames_and_interval_math_runs() {
 // Each names the features it is waiting on. Run them with
 // `cargo test -p rasterizeddb_compat --test wide_types -- --ignored`.
 
-/// Needs `LEFT JOIN LATERAL unnest(...)`, `array_agg(DISTINCT …) FILTER`,
-/// `jsonb_agg`, and the bitwise `&` over bit strings.
-///
-/// The `@>` containment and the `->` path in the same query already work — see
-/// `pg_operators.rs` — so what remains is the set-returning function in `FROM`
-/// and the aggregate spellings around it.
+/// `LEFT JOIN LATERAL unnest(...)`, `COUNT(DISTINCT …)` and `array_agg(DISTINCT
+/// …) FILTER` over that join, `jsonb_agg`, `@>`, and the bitwise `&` over bit
+/// strings. Its `CURRENT_DATE - INTERVAL '30 days'` window is before every
+/// seeded row, so PostgreSQL 17 answers no rows too; with the window widened
+/// the two agree row for row.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "LATERAL set-returning functions in FROM are not implemented"]
 async fn cte_jsonb_lateral_unnest_bitwise_runs() {
     run_named("cte_jsonb_lateral_unnest_bitwise").await.unwrap_or_else(|e| panic!("{}", e));
 }

@@ -4882,8 +4882,20 @@ fn build_aggregate_stage(
                 .ok_or_else(|| format!("unterminated function call in '{}'", entry))?;
             // `string_agg(u.tag, ',' ORDER BY u.tag)`: a second argument and
             // an ORDER BY inside the call, each key a column of the join.
-            let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(expr[open + 1..close].trim())?;
-            let call = crate::core::rql::aggregate::build_call(func, arg_text, second, order, false, &mut |key| {
+            // `COUNT(DISTINCT o.id)`, `array_agg(DISTINCT tag)`: each value
+            // once, as over a single table (`lexer_query`). Read as part of
+            // the argument, the DISTINCT made it an expression nothing could
+            // read ("'DISTINCT o__id' is neither a column nor a value").
+            let inner = expr[open + 1..close].trim();
+            let (distinct, inner) = match crate::core::rql::lexer_query::leading_word(inner, "DISTINCT") {
+                Some(rest) => (true, rest),
+                None => (false, crate::core::rql::lexer_query::leading_word(inner, "ALL").unwrap_or(inner)),
+            };
+            let (arg_text, second, order) = crate::core::rql::aggregate::split_call_arguments(inner)?;
+            if distinct && arg_text == "*" {
+                return Err(format!("{}(DISTINCT *) is not valid", func_name.to_uppercase()));
+            }
+            let call = crate::core::rql::aggregate::build_call(func, arg_text, second, order, distinct, &mut |key| {
                 join_order_key(key, resolve, items)
             })?;
 
@@ -4912,7 +4924,7 @@ fn build_aggregate_stage(
                 Some(text) => Some(filter_over_join(text, items)?),
                 None => None,
             };
-            fold_items.push(SelectItem::Aggregate { distinct: false,
+            fold_items.push(SelectItem::Aggregate { distinct,
                 func,
                 arg,
                 label: alias.unwrap_or_else(|| func.name().to_string()),
@@ -4980,8 +4992,12 @@ fn build_aggregate_stage(
                     return Err(format!("{} in HAVING over a join is not supported yet", func.name()));
                 }
                 let arg_text = call[open + 1..close].trim();
+                let (distinct, arg_text) = match crate::core::rql::lexer_query::leading_word(arg_text, "DISTINCT") {
+                    Some(rest) => (true, rest),
+                    None => (false, crate::core::rql::lexer_query::leading_word(arg_text, "ALL").unwrap_or(arg_text)),
+                };
                 let arg = if arg_text == "*" {
-                    if func != AggFunc::Count {
+                    if func != AggFunc::Count || distinct {
                         return Err(format!("{}(*) is not valid", name.to_uppercase()));
                     }
                     None
@@ -5002,7 +5018,7 @@ fn build_aggregate_stage(
                     Some(text) => Some(filter_over_join(text, items)?),
                     None => None,
                 };
-                Ok(SelectItem::Aggregate { distinct: false,
+                Ok(SelectItem::Aggregate { distinct,
                     func,
                     arg,
                     label: func.name().to_string(),

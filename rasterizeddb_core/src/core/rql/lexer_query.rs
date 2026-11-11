@@ -244,7 +244,7 @@ pub(crate) fn split_aggregate_filter(item: &str) -> (Option<String>, Option<Stri
 }
 
 /// `text` past a leading `word` and the space after it, ignoring case.
-fn leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+pub(crate) fn leading_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     let head = text.get(..word.len())?;
     let rest = &text[word.len()..];
     (head.eq_ignore_ascii_case(word) && rest.starts_with(char::is_whitespace)).then(|| rest.trim())
