@@ -63,6 +63,8 @@ async fn integer_operators_group_and_type_as_postgresql_does() {
             "2|-4|-1|-9223372036854775808|-1|-2|-1",
         ),
         ("SELECT '6' & 3", "2"),
+        // The wider operand's width, in the value too.
+        ("SELECT 1::int2 | 65536, 70000 & 1::int2, 1::int2 # 65536::int8", "65537|0|65537"),
         ("SELECT NULL::int & 1, 5 & NULL", "NULL|NULL"),
     ];
     for (sql, want) in cases {
@@ -87,6 +89,9 @@ async fn bit_strings_combine_bit_by_bit() {
         ("SELECT 1.5 & 1", "42883", "operator does not exist: numeric & integer"),
         ("SELECT B'1010' & 1", "42883", "operator does not exist: bit & integer"),
         ("SELECT 'a' & 1", "22P02", "invalid input syntax for type integer: \"a\""),
+        // One precedence with `||`, left to right: `('a' || 1) | 2`. Read
+        // with `||` first, it answered 'a3'.
+        ("SELECT 'a' || 1 | 2", "42883", "operator does not exist: text | integer"),
     ];
     for (sql, code, message) in cases {
         assert_eq!(error_of(&pool, sql).await, (code.to_string(), message.to_string()), "{sql}");
@@ -145,4 +150,10 @@ async fn bitwise_operators_read_columns_everywhere() {
         vec!["5|20"]
     );
     assert_eq!(rows(&pool, "SELECT a << 2 > 3 FROM (SELECT 1 AS a) t").await, vec!["t"]);
+    // `<<` / `>>` between two inets the evaluator reads are containment.
+    assert_eq!(
+        rows(&pool, "SELECT id, ip << '10.0.0.0/8'::inet, '10.0.0.0/8'::inet >> ip FROM bf ORDER BY id").await,
+        vec!["1|t|t", "2|f|f", "3|t|t"]
+    );
+    assert_eq!(rows(&pool, "SELECT id FROM bf WHERE (ip << '10.0.0.0/8'::inet) = true ORDER BY id").await, vec!["1", "3"]);
 }

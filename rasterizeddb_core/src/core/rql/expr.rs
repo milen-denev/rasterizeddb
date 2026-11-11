@@ -1313,6 +1313,48 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         return Ok(Expr::Call(TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::ArrayCtor), args));
     }
 
+    // `&`, `|`, `#`, `<<` and `>>` are PostgreSQL's "other operators", one
+    // precedence with `||`, looser than arithmetic and grouped left to
+    // right: the rightmost of them all splits first (`1 | 2 || 'x'` is
+    // `(1 | 2) || 'x'`, `1 << 2 + 1` is 8). They were not read at all, so
+    // `flags & 1` was looked up as a column.
+    if !is_case_block(text)
+        && let Some((at, op)) = top_level_bitwise(text)
+        && top_level_concat(text).is_none_or(|c| c < at)
+    {
+        let lhs = text[..at].trim();
+        let rhs = text[at + op.len()..].trim();
+        if rhs.is_empty() {
+            return Err(format!("'{op}' has no right operand"));
+        }
+        use crate::core::rql::pg_functions::PgFunc;
+        let func = match op {
+            "&" => PgFunc::BitAnd,
+            "|" => PgFunc::BitOr,
+            "#" => PgFunc::BitXor,
+            "<<" => PgFunc::ShiftLeft,
+            _ => PgFunc::ShiftRight,
+        };
+        let (mut l, mut r) = (parse(lhs, schema)?, parse(rhs, schema)?);
+        // An untyped string literal takes the other operand's type, as
+        // PostgreSQL resolves `'6' & 3`; a text value does not (`'a' || 1 |
+        // 2` has no operator).
+        let untyped = |e: &Expr| matches!(e, Expr::Literal { db_type: DbType::STRING, .. });
+        let resolve = |literal: &mut Expr, other: &Expr| {
+            let target = match static_type(other) {
+                t @ (DbType::I16 | DbType::I32 | DbType::I64 | DbType::BIT | DbType::VARBIT) => t,
+                _ => return,
+            };
+            *literal = Expr::Cast(Box::new(std::mem::replace(literal, Expr::Null)), target);
+        };
+        if untyped(&l) && !untyped(&r) {
+            resolve(&mut l, &r);
+        } else if untyped(&r) && !untyped(&l) {
+            resolve(&mut r, &l);
+        }
+        return Ok(Expr::Call(TextFunc::Pg(func), vec![l, r]));
+    }
+
     // `||` and the path operators are one precedence in PostgreSQL, grouped
     // left to right, so the last of them at the top is the root. A path
     // after the last `||` takes everything before it as its base:
@@ -1397,31 +1439,6 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             return Err(format!("operator does not exist: {} {} unknown", operand, path.1));
         }
         return Ok(Expr::PathOf { base: Box::new(base), steps: path.0.steps, as_text: path.0.as_text });
-    }
-
-    // `&`, `|`, `#`, `<<` and `>>` are PostgreSQL's "other operators", one
-    // precedence with `||`, looser than arithmetic and grouped left to
-    // right: the rightmost of them all splits first (`1 | 2 || 'x'` is
-    // `(1 | 2) || 'x'`, `1 << 2 + 1` is 8). They were not read at all, so
-    // `flags & 1` was looked up as a column.
-    if !is_case_block(text)
-        && let Some((at, op)) = top_level_bitwise(text)
-        && top_level_concat(text).is_none_or(|c| c < at)
-    {
-        let lhs = text[..at].trim();
-        let rhs = text[at + op.len()..].trim();
-        if rhs.is_empty() {
-            return Err(format!("'{op}' has no right operand"));
-        }
-        use crate::core::rql::pg_functions::PgFunc;
-        let func = match op {
-            "&" => PgFunc::BitAnd,
-            "|" => PgFunc::BitOr,
-            "#" => PgFunc::BitXor,
-            "<<" => PgFunc::ShiftLeft,
-            _ => PgFunc::ShiftRight,
-        };
-        return Ok(Expr::Call(TextFunc::Pg(func), vec![parse(lhs, schema)?, parse(rhs, schema)?]));
     }
 
     // `||` binds looser than arithmetic, so `a || b + 1` concatenates `a` with

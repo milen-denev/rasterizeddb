@@ -436,14 +436,6 @@ fn bitwise_operand(v: &Value, op: &str, other: Option<&Value>) -> Result<(i64, D
     if let Some(int) = bitwise_integer(&t) {
         return Ok((crate::core::rql::expr::as_i64(v).ok_or("an integer could not be read")?, int));
     }
-    if t == DbType::STRING {
-        let text = text_of(v);
-        return text
-            .trim()
-            .parse::<i32>()
-            .map(|n| (i64::from(n), DbType::I32))
-            .map_err(|_| format!("invalid input syntax for type integer: \"{text}\""));
-    }
     let name = |v: &Value| v.db_type().map_or("unknown", crate::core::value_codec::pg_input_type_name);
     Err(match other {
         Some(o) => format!("operator does not exist: {} {op} {}", name(v), name(o)),
