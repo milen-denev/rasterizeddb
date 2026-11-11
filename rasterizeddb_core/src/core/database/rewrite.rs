@@ -71,7 +71,7 @@ pub(crate) enum FileSet {
 }
 
 impl FileSet {
-    fn suffixes(self) -> Vec<&'static str> {
+    pub(super) fn suffixes(self) -> Vec<&'static str> {
         match self {
             FileSet::Whole => RENAMED_SUFFIXES.to_vec(),
             FileSet::Schema => RENAMED_SUFFIXES
@@ -82,14 +82,14 @@ impl FileSet {
         }
     }
 
-    fn tag(self) -> &'static str {
+    pub(super) fn tag(self) -> &'static str {
         match self {
             FileSet::Whole => "whole",
             FileSet::Schema => "schema",
         }
     }
 
-    fn from_tag(tag: &str) -> Option<FileSet> {
+    pub(super) fn from_tag(tag: &str) -> Option<FileSet> {
         match tag {
             "whole" => Some(FileSet::Whole),
             "schema" => Some(FileSet::Schema),
@@ -617,7 +617,7 @@ fn any_file_exists(seed: &DbStorageProvider, name: &str) -> bool {
 
 /// Discards `table`'s `set` and copies the backup's over it.
 #[allow(clippy::too_many_arguments)]
-async fn restore_from_backup(
+pub(super) async fn restore_from_backup(
     io_pointers: &Arc<DbStorageProvider>,
     pool: &StoragePool,
     kv: &KvStores,

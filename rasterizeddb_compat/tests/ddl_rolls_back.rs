@@ -245,3 +245,158 @@ async fn a_read_only_blocks_refused_alter_locks_nothing() {
     assert!(matches!(read, Ok(Ok(_))), "a reader waited on the refused ALTER's lock: {read:?}");
     c.execute("ROLLBACK").await.expect("rollback");
 }
+
+struct OnDisk(std::path::PathBuf);
+
+impl Drop for OnDisk {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A file-backed server: a partitioned table needs a directory.
+async fn on_disk(tag: &str) -> (TestServer, sqlx::PgPool, OnDisk) {
+    let root = std::env::temp_dir().join(format!("ddl_rolls_back_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let server = TestServer::start_file_backed(&root.to_string_lossy()).await.expect("server");
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(4).connect(&server.url()).await.expect("pool");
+    (server, pool, OnDisk(root))
+}
+
+async fn index_names(pool: &sqlx::PgPool, table: &str) -> Vec<String> {
+    sqlx::query("SELECT indexname FROM pg_indexes WHERE tablename = $1 ORDER BY indexname")
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .expect("pg_indexes")
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect()
+}
+
+/// `CREATE INDEX`, `CREATE UNIQUE INDEX` and `DROP INDEX` in a block are
+/// undone by its ROLLBACK and kept by its COMMIT (2026-11-12). They used to
+/// apply at once and stay; a unique index (run as a constraint) was not even
+/// warned about, since only the rewritten statement was checked.
+#[tokio::test]
+async fn index_ddl_rolls_back_with_its_block() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE ix (id INT PRIMARY KEY, x INT, name TEXT)",
+        "CREATE INDEX ix_x ON ix (x)",
+        "INSERT INTO ix VALUES (1, 10, 'a'), (2, 20, 'b')",
+    ] {
+        run(&pool, sql).await.expect(sql);
+    }
+    let before = index_names(&pool, "ix").await;
+    assert!(before.contains(&"ix_x".to_string()), "{before:?}");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("CREATE INDEX ix_name ON ix (name)").await.expect("create index");
+    tx.execute("CREATE UNIQUE INDEX ix_name_u ON ix (name)").await.expect("create unique index");
+    tx.execute("DROP INDEX ix_x").await.expect("drop index");
+    assert!(tx.execute("INSERT INTO ix VALUES (3, 30, 'a')").await.is_err(), "the unique index is enforced in the block");
+    tx.rollback().await.expect("rollback");
+    assert_eq!(index_names(&pool, "ix").await, before, "the index DDL outlived the rollback");
+    run(&pool, "INSERT INTO ix VALUES (3, 30, 'a')").await.expect("the unique index is gone with the rollback");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("CREATE INDEX ix_name ON ix (name)").await.expect("create index");
+    tx.execute("DROP INDEX ix_x").await.expect("drop index");
+    tx.commit().await.expect("commit");
+    let after = index_names(&pool, "ix").await;
+    assert!(after.contains(&"ix_name".to_string()) && !after.contains(&"ix_x".to_string()), "{after:?}");
+    let n: i64 = sqlx::query("SELECT count(*) FROM ix WHERE x = 20").fetch_one(&pool).await.expect("read").get(0);
+    assert_eq!(n, 1);
+}
+
+/// A partitioned table's DDL in a block rolls back (2026-11-12): its ALTER
+/// (a metadata one: the table has no rows yet; one that rewrites rows into
+/// a new uid is warned about and stays, see `block_ddl_table_moved`), its
+/// CREATE INDEX, a table created PARTITION BY, and its DROP, which destroyed
+/// the table and its rows through a ROLLBACK before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_tables_ddl_rolls_back_with_its_block() {
+    let (_s, pool, _dir) = on_disk("partitioned").await;
+    run(&pool, "CREATE TABLE p (id INT NOT NULL, v TEXT) PARTITION BY HASH (id)").await.expect("create");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("ALTER TABLE p ADD COLUMN w INT").await.expect("alter");
+    tx.execute("CREATE INDEX p_v ON p (v)").await.expect("index");
+    tx.execute("CREATE TABLE p2 (id INT NOT NULL) PARTITION BY HASH (id)").await.expect("create partitioned");
+    tx.rollback().await.expect("rollback");
+    assert!(run(&pool, "SELECT w FROM p").await.is_err(), "the added column outlived the rollback");
+    assert!(index_names(&pool, "p").await.is_empty(), "the index outlived the rollback");
+    assert!(!exists(&pool, "p2").await, "the created partitioned table outlived the rollback");
+
+    run(&pool, "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')").await.expect("insert");
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("DROP TABLE p").await.expect("drop");
+    tx.rollback().await.expect("rollback");
+    let n: i64 = sqlx::query("SELECT count(*) FROM p").fetch_one(&pool).await.expect("the dropped table is back").get(0);
+    assert_eq!(n, 3, "the rows of the table the block dropped");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("DROP TABLE p").await.expect("drop");
+    tx.commit().await.expect("commit");
+    assert!(!exists(&pool, "p").await, "a committed drop kept the table");
+}
+
+/// `CREATE TABLE … AS` in a block is dropped by its ROLLBACK (2026-11-12).
+#[tokio::test]
+async fn create_table_as_rolls_back_with_its_block() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE src (id INT PRIMARY KEY, v TEXT)").await.expect("create");
+    run(&pool, "INSERT INTO src VALUES (1, 'a'), (2, 'b')").await.expect("insert");
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("CREATE TABLE copied AS SELECT * FROM src").await.expect("ctas");
+    let n: i64 = sqlx::query("SELECT count(*) FROM copied").fetch_one(&mut *tx).await.expect("read").get(0);
+    assert_eq!(n, 2);
+    tx.rollback().await.expect("rollback");
+    assert!(!exists(&pool, "copied").await, "the table created AS a query outlived the rollback");
+    run(&pool, "CREATE TABLE copied AS SELECT * FROM src").await.expect("created again");
+}
+
+/// `CREATE ROLE` and `DROP ROLE` in a block are the block's writes to the
+/// role catalogue (2026-11-12): its ROLLBACK takes them back, and the block
+/// sees its own. They ran as statements of their own and outlived it.
+#[tokio::test]
+async fn role_statements_roll_back_with_their_block() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE ROLE kept_role").await.expect("role");
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("CREATE ROLE block_role").await.expect("create role");
+    tx.execute("DROP ROLE block_role").await.expect("the block sees the role it created");
+    tx.execute("CREATE ROLE block_role").await.expect("and that it dropped it");
+    tx.execute("DROP ROLE kept_role").await.expect("drop role");
+    tx.rollback().await.expect("rollback");
+    run(&pool, "CREATE ROLE block_role").await.expect("the rolled-back role is gone");
+    let again = run(&pool, "CREATE ROLE kept_role").await;
+    assert!(again.is_err_and(|e| e.contains("already exists")), "the rolled-back DROP ROLE stayed");
+}
+
+/// `CREATE DATABASE` and `DROP DATABASE` cannot run in a block (25001), as
+/// in PostgreSQL: no ROLLBACK takes a database back. One created in a block
+/// used to stay through its ROLLBACK.
+#[tokio::test]
+async fn create_database_is_refused_in_a_block() {
+    let (_s, pool) = server().await;
+    let mut c = pool.acquire().await.expect("conn");
+    c.execute("BEGIN").await.expect("begin");
+    let refused = c.execute("CREATE DATABASE in_a_block").await.expect_err("refused");
+    assert_eq!(refused.as_database_error().and_then(|e| e.code()).as_deref(), Some("25001"), "{refused}");
+    c.execute("ROLLBACK").await.expect("rollback");
+    c.execute("BEGIN").await.expect("begin");
+    let refused = c.execute("DROP DATABASE IF EXISTS in_a_block").await.expect_err("refused");
+    assert_eq!(refused.as_database_error().and_then(|e| e.code()).as_deref(), Some("25001"), "{refused}");
+    c.execute("ROLLBACK").await.expect("rollback");
+    let n: i64 = sqlx::query("SELECT count(*) FROM pg_database WHERE datname = 'in_a_block'")
+        .fetch_one(&pool)
+        .await
+        .expect("pg_database")
+        .get(0);
+    assert_eq!(n, 0);
+    // Outside a block it still runs.
+    run(&pool, "CREATE DATABASE in_a_block").await.expect("create database");
+    run(&pool, "DROP DATABASE in_a_block").await.expect("drop database");
+}

@@ -227,6 +227,9 @@ impl Database {
             self.clear_conversion_intent();
         }
         info!("Converted {name} to a partitioned table ({new_uid:016x}), {partitions} partitions");
+        // Its files are a uid's now: a block's copies of the plain table can
+        // no longer go back (`block_ddl_table_moved`).
+        Box::pin(self.block_ddl_table_moved(name)).await;
         Ok(wrote_family)
     }
 

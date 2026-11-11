@@ -29,26 +29,39 @@
 //! (`executor::BlockDdl`): a change that may yet be undone must not be read
 //! or written over by anyone else.
 //!
-//! Phase 1 covers `CREATE TABLE` and `ALTER TABLE` on plain tables (and the
-//! table an `ALTER … REFERENCES` names); a table that does not outlive the
-//! process is copied in memory and has no crash intent.
+//! Covered: `CREATE TABLE` (also `AS` a query, and `PARTITION BY`), `ALTER
+//! TABLE` (and the table an `ALTER … REFERENCES` names), and `CREATE [UNIQUE]
+//! INDEX` / `DROP INDEX` (2026-11-12), on plain tables on any backend and on
+//! partitioned ones. What is held aside is what the statement can change
+//! ([`FileSet`]): every file for an ALTER of a plain table, which may
+//! rewrite its rows; the schema files for an index, which only declares; and
+//! for a partitioned table always its shell's schema files, `__pt_<uid>_
+//! schema*`, since its DDL changes nothing else (`partitioned_ddl.rs`). A
+//! key/value store's objects are copied through a seed that refuses an
+//! unreachable store rather than copy its empty stand-in. A table that does
+//! not outlive the process is copied in memory and has no crash intent.
 //!
-//! `DROP TABLE` of such tables is not copied: it is **deferred** (2026-11-11,
-//! `Undo::DropAtCommit`, `pgwire::deferred_drops`). It is checked and takes
-//! its ACCESS EXCLUSIVE when issued, and runs as the block's last statement
-//! at COMMIT, so a ROLLBACK, or a crash before COMMIT, never touched the
-//! table. A `CREATE TABLE` of the name later in the block runs the pending
-//! drop first, and that one is then not undone (the client is warned).
+//! `DROP TABLE` is not copied: it is **deferred** (2026-11-11,
+//! `Undo::DropAtCommit`, `pgwire::deferred_drops`), whatever kind of table it
+//! names. It is checked and takes its ACCESS EXCLUSIVE when issued, and runs
+//! as the block's last statement at COMMIT, so a ROLLBACK, or a crash before
+//! COMMIT, never touched the table. A `CREATE TABLE` of the name later in
+//! the block runs the pending drop first, and that one is then not undone
+//! (the client is warned).
 //!
-//! Other DDL in a block, a partitioned table, and a table on a key/value
-//! store stay as before: applied at once, with the warning that says so,
-//! now to the client as well as the log.
+//! Other DDL in a block (`ALTER TABLE … RENAME TO`, a conversion or reshape
+//! of a partitioned table) stays as before: applied at once, with the
+//! warning that says so, to the client as well as the log. Role statements
+//! are the block's writes to the role catalogue (`auth::
+//! execute_role_statement_in`), and `CREATE`/`DROP DATABASE` are refused in
+//! a block (25001), as in PostgreSQL.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use log::{error, info, warn};
 
+use super::rewrite::FileSet;
 use super::{Database, RENAMED_SUFFIXES, copy_files_between, discard_files_in};
 use crate::core::mvcc::TxId;
 use crate::core::storage_providers::traits::StorageIO;
@@ -61,8 +74,11 @@ pub(crate) const COPY_PREFIX: &str = "__txb_";
 /// One undo step of a block's DDL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Undo {
-    /// Put `copy`'s files back over `table`'s.
-    Restore { table: String, copy: String },
+    /// Put `copy`'s files back over `table`'s: those of `set` under the stem
+    /// `stem`, which is the table's name for a plain table and its shell's
+    /// `__pt_<uid>` for a partitioned one (whose DDL changes only the shell's
+    /// schema files, `partitioned_ddl.rs`).
+    Restore { table: String, copy: String, set: FileSet, stem: String },
     /// Drop `table`: the block created it.
     Drop { table: String },
     /// A `DROP TABLE` the block ran, deferred to its commit (`sql`, the
@@ -83,10 +99,15 @@ fn intent_path(root: &str, tx: TxId, seq: u32) -> PathBuf {
     Path::new(root).join(format!("{INTENT_PREFIX}{tx:020}_{seq:06}.{INTENT_EXTENSION}"))
 }
 
-/// `tx`, then the step, then a checksum; anything else does not parse.
+/// `tx`, then the step, then a checksum; anything else does not parse. A
+/// whole plain table's restore keeps the three-field form the first
+/// version wrote, so either binary reads the other's intents.
 fn encode(tx: TxId, undo: &Undo) -> String {
     let body = match undo {
-        Undo::Restore { table, copy } => format!("{tx}\nrestore\t{table}\t{copy}"),
+        Undo::Restore { table, copy, set: FileSet::Whole, stem } if stem == table => {
+            format!("{tx}\nrestore\t{table}\t{copy}")
+        }
+        Undo::Restore { table, copy, set, stem } => format!("{tx}\nrestore\t{table}\t{copy}\t{}\t{stem}", set.tag()),
         Undo::Drop { table } => format!("{tx}\ndrop\t{table}"),
         Undo::DropAtCommit { table, .. } => format!("{tx}\ndropcommit\t{table}"),
     };
@@ -101,20 +122,35 @@ fn decode(text: &str) -> Option<(TxId, Undo)> {
     }
     let (tx, step) = body.split_once('\n')?;
     let tx: TxId = tx.parse().ok()?;
-    let mut parts = step.split('\t');
-    let undo = match (parts.next()?, parts.next(), parts.next(), parts.next()) {
-        ("restore", Some(table), Some(copy), None) if copy.starts_with(COPY_PREFIX) && !table.is_empty() => {
-            Undo::Restore { table: table.to_string(), copy: copy.to_string() }
+    let parts: Vec<&str> = step.split('\t').collect();
+    let undo = match parts.as_slice() {
+        ["restore", table, copy] if copy.starts_with(COPY_PREFIX) && !table.is_empty() => Undo::Restore {
+            table: table.to_string(),
+            copy: copy.to_string(),
+            set: FileSet::Whole,
+            stem: table.to_string(),
+        },
+        ["restore", table, copy, set, stem] if copy.starts_with(COPY_PREFIX) && !table.is_empty() && !stem.is_empty() => {
+            Undo::Restore {
+                table: table.to_string(),
+                copy: copy.to_string(),
+                set: FileSet::from_tag(set)?,
+                stem: stem.to_string(),
+            }
         }
-        ("drop", Some(table), None, None) if !table.is_empty() => Undo::Drop { table: table.to_string() },
+        ["drop", table] if !table.is_empty() => Undo::Drop { table: table.to_string() },
         _ => return None,
     };
     Some((tx, undo))
 }
 
 /// The tables a block DDL statement changes, as `(existing, created)`, or
-/// `None` for a statement phase 1 does not make transactional.
-pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<String>, Vec<String>)> {
+/// `None` for a statement phase 1 does not make transactional. Each existing
+/// table comes with the files the statement can change: all of them for an
+/// `ALTER` that may rewrite rows, the schema files for one that only
+/// declares (an index). A partitioned table's are always its schema files
+/// ([`Database::block_ddl_prepare`]).
+pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<(String, FileSet)>, Vec<String>)> {
     let words: Vec<&str> = sql.split_whitespace().collect();
     let upper = |i: usize| words.get(i).map(|w| w.to_ascii_uppercase()).unwrap_or_default();
     let name_at = |i: usize| -> Option<String> {
@@ -140,12 +176,70 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<String>, Ve
                 // IF NOT EXISTS over a table that is there changes nothing.
                 return Some((Vec::new(), Vec::new()));
             }
-            // A table created AS a query, or partitioned, is phase 2.
-            let rest = sql.to_ascii_uppercase();
-            if rest.contains(" PARTITION BY ") || rest.contains(" AS SELECT") || rest.contains(" AS (SELECT") {
+            // Created AS a query or partitioned, it is still undone by
+            // dropping it: `drop_table_for_rollback` takes either, and a
+            // CREATE TABLE AS whose rows failed is one the statement made
+            // (`block_ddl_unmade`).
+            Some((Vec::new(), vec![name]))
+        }
+        // `CREATE [UNIQUE] INDEX … ON [ONLY] t …`: the table's declarations
+        // change. A unique index is a constraint here (the statement runs as
+        // `ALTER TABLE … ADD CONSTRAINT`), so it is held as an ALTER is.
+        ("CREATE", "INDEX") | ("CREATE", "UNIQUE") => {
+            let unique = upper(1) == "UNIQUE";
+            if unique && upper(2) != "INDEX" {
                 return None;
             }
-            Some((Vec::new(), vec![name]))
+            // `USING partition` is a conversion, which moves every row.
+            if sql.to_ascii_uppercase().contains(" USING PARTITION") {
+                return None;
+            }
+            let on = words.iter().position(|w| w.eq_ignore_ascii_case("ON"))?;
+            let mut i = on + 1;
+            if upper(i) == "ONLY" {
+                i += 1;
+            }
+            let name = name_at(i)?;
+            if database.relation(&name).is_none() {
+                // The statement refuses it (42P01) and changes nothing.
+                return Some((Vec::new(), Vec::new()));
+            }
+            let set = if unique { FileSet::Whole } else { FileSet::Schema };
+            Some((vec![(name, set)], Vec::new()))
+        }
+        // `DROP INDEX [CONCURRENTLY] [IF EXISTS] i [, …] [CASCADE|RESTRICT]`:
+        // index names are database-wide, so each table is found by the
+        // declaration that names it.
+        ("DROP", "INDEX") => {
+            let mut i = 2;
+            if upper(i) == "CONCURRENTLY" {
+                i += 1;
+            }
+            if upper(i) == "IF" && upper(i + 1) == "EXISTS" {
+                i += 2;
+            }
+            let rest = words.get(i..)?.join(" ");
+            let rest = rest.trim().trim_end_matches(';').trim_end();
+            let mut existing: Vec<(String, FileSet)> = Vec::new();
+            for raw in rest.split(',') {
+                let mut raw = raw.trim();
+                for tail in [" CASCADE", " RESTRICT"] {
+                    if raw.len() > tail.len() && raw[raw.len() - tail.len()..].eq_ignore_ascii_case(tail) {
+                        raw = raw[..raw.len() - tail.len()].trim_end();
+                    }
+                }
+                let part = raw.rsplit('.').next().unwrap_or(raw);
+                let index = match part.strip_prefix('"').and_then(|p| p.strip_suffix('"')) {
+                    Some(inner) => inner.replace("\"\"", "\""),
+                    None => part.to_string(),
+                };
+                if let Some(table) = database.index_owner(&index) {
+                    if !existing.iter().any(|(t, _)| *t == table) {
+                        existing.push((table, FileSet::Schema));
+                    }
+                }
+            }
+            Some((existing, Vec::new()))
         }
         ("ALTER", "TABLE") => {
             let mut i = 2;
@@ -156,7 +250,7 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<String>, Ve
                 i += 1;
             }
             let name = name_at(i)?;
-            let mut existing = vec![name];
+            let mut existing = vec![(name, FileSet::Whole)];
             // `RENAME TO` changes the name the undo would restore under.
             let up = sql.to_ascii_uppercase();
             if up.contains(" RENAME TO ") || up.contains(" SET TABLESPACE") || up.contains(" PARTITION ") {
@@ -166,8 +260,8 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<String>, Ve
             for (n, w) in words.iter().enumerate() {
                 if w.eq_ignore_ascii_case("REFERENCES") {
                     if let Some(parent) = name_at(n + 1) {
-                        if !existing.contains(&parent) {
-                            existing.push(parent);
+                        if !existing.iter().any(|(t, _)| *t == parent) {
+                            existing.push((parent, FileSet::Whole));
                         }
                     }
                 }
@@ -179,26 +273,34 @@ pub(crate) fn targets(database: &Database, sql: &str) -> Option<(Vec<String>, Ve
 }
 
 impl Database {
-    /// Whether `table` is one phase 1 can copy and put back.
-    pub(crate) fn block_copyable(&self, table: &str) -> bool {
-        use super::Relation;
-        // A table that does not outlive the process is copied too (in
-        // memory): only its crash intent is skipped, which `prepare` does.
-        matches!(self.relation(table), Some(Relation::Plain(_))) && !self.on_key_value_store(table)
+    /// Whether `table` is one a block can hold aside and put back: a plain
+    /// table on any backend (a key/value store's objects are copied through
+    /// its seed, which refuses rather than copy an unreachable store's
+    /// in-memory stand-in), or a partitioned one, whose DDL changes only its
+    /// shell's schema files. A table that does not outlive the process is
+    /// copied too (in memory): only its crash intent is skipped.
+    pub(crate) fn block_restorable(&self, table: &str) -> bool {
+        self.relation(table).is_some()
     }
 
-    /// Whether `table` is placed on a key/value store, whose objects phase 1
-    /// does not copy aside.
-    fn on_key_value_store(&self, table: &str) -> bool {
-        #[cfg(feature = "storage_pools")]
-        if let Some(spec) = self.storage.spec_of(table) {
-            return matches!(
-                crate::core::storage::TableBackend::parse(&spec),
-                crate::core::storage::TableBackend::KeyValue(_)
-            );
-        }
-        let _ = table;
-        false
+    /// The table that declares index `name` (names are database-wide): a
+    /// `CREATE INDEX` over columns or a path, or a partial unique key, which
+    /// is what a partial `CREATE UNIQUE INDEX` is kept as.
+    pub(crate) fn index_owner(&self, name: &str) -> Option<String> {
+        let mut owner: Option<String> = None;
+        self.each_schema(|table, schema| {
+            if owner.is_none()
+                && (schema.secondary_indexes.iter().any(|i| !i.is_deleted && i.name.eq_ignore_ascii_case(name))
+                    || schema.path_indexes.iter().any(|i| !i.is_deleted && i.name.eq_ignore_ascii_case(name))
+                    || schema
+                        .unique_keys
+                        .iter()
+                        .any(|k| !k.is_deleted && k.predicate.is_some() && k.name.eq_ignore_ascii_case(name)))
+            {
+                owner = Some(table.to_string());
+            }
+        });
+        owner
     }
 
     /// Drops a table a block created and then rolled back: the block (or, at
@@ -216,20 +318,16 @@ impl Database {
     /// [`Database::block_ddl_prepare`] would take on), for the warning about
     /// the DDL that does not.
     pub(crate) fn block_ddl_covers(&self, sql: &str) -> bool {
-        // A DROP TABLE of tables this covers is deferred to the commit
-        // (`pgwire::deferred_drops`).
+        // A DROP TABLE is deferred to the commit (`pgwire::deferred_drops`),
+        // whatever kind of table it names.
         let mut words = sql.split_whitespace();
         if words.next().is_some_and(|w| w.eq_ignore_ascii_case("DROP")) && words.next().is_some_and(|w| w.eq_ignore_ascii_case("TABLE")) {
             use crate::core::rql::lexer_alter::{expand_multi_drop, parse_drop_table};
             let trimmed = sql.trim().trim_end_matches(';').trim_end();
             let each = expand_multi_drop(trimmed).unwrap_or_else(|| vec![trimmed.to_string()]);
-            return each.iter().all(|one| {
-                parse_drop_table(one).is_ok_and(|(name, _)| {
-                    !(self.has_table(&name) || self.is_partitioned(&name)) || self.block_copyable(&name)
-                })
-            });
+            return each.iter().all(|one| parse_drop_table(one).is_ok());
         }
-        targets(self, sql).is_some_and(|(existing, _)| existing.iter().all(|t| self.block_copyable(t)))
+        targets(self, sql).is_some_and(|(existing, _)| existing.iter().all(|(t, _)| self.block_restorable(t)))
     }
 
     /// Before a DDL statement of block `root` runs: copies the tables it
@@ -243,13 +341,13 @@ impl Database {
         if existing.is_empty() && created.is_empty() {
             return Ok(true);
         }
-        if existing.iter().any(|t| !self.block_copyable(t)) {
+        if existing.iter().any(|(t, _)| !self.block_restorable(t)) {
             return Ok(false);
         }
         // The statement's own lock, taken first and kept to the block's end:
         // nobody else may write a table while it is copied, nor read the
         // change before the block commits. The statement then finds it held.
-        for table in &existing {
+        for (table, _) in &existing {
             self.relation_for(
                 table,
                 crate::core::mvcc::owner::current(),
@@ -263,25 +361,53 @@ impl Database {
         self.transactions.mark_wrote(root);
         let mut steps: Vec<Undo> = existing
             .iter()
-            .map(|t| Undo::Restore { table: t.clone(), copy: String::new() })
+            .map(|(t, set)| {
+                // A partitioned table's DDL writes only its shell's schema
+                // files, `__pt_<uid>_schema*` (partitioned_ddl.rs): those are
+                // what is held, under that stem.
+                let (set, stem) = match self.is_partitioned(t) {
+                    true => (FileSet::Schema, self.schema_files_stem(t)),
+                    false => (*set, t.clone()),
+                };
+                Undo::Restore { table: t.clone(), copy: String::new(), set, stem }
+            })
             .collect();
         steps.extend(created.iter().map(|t| Undo::Drop { table: t.clone() }));
         for undo in steps {
             let seq = self.block_ddl.entry(root).or_default().len() as u32;
             let undo = match undo {
-                Undo::Restore { table, .. } => {
-                    let copy = format!("{COPY_PREFIX}{root}_{seq}_{table}");
+                Undo::Restore { table, set, stem, .. } => {
+                    let copy = format!("{COPY_PREFIX}{root}_{seq}_{stem}");
                     // The copy's placement first, as the rewrite's backup
                     // (`rewrite.rs`): its files go where the table's are, and
                     // a crash midway leaves the name pointing at them.
-                    super::pool_rename(&self.storage, &table, &copy);
-                    let table_seed = self.seed_of(&table).await;
-                    let copy_seed = self.seed_of(&copy).await;
-                    if let Err(e) = copy_files_between(&table_seed, &copy_seed, &table, &copy, RENAMED_SUFFIXES).await {
-                        discard_files_in(&copy_seed, &self.storage, self.location.as_deref(), &copy, RENAMED_SUFFIXES).await;
+                    super::pool_rename(&self.storage, &stem, &copy);
+                    let copied = async {
+                        // A key/value store that cannot be opened gives an
+                        // empty in-memory stand-in: copying from it would
+                        // keep nothing aside and report success.
+                        let stem_seed = super::seed_or_unavailable(
+                            &self.db_io_pointers,
+                            &self.storage,
+                            &self.kv,
+                            &self.seeds,
+                            &stem,
+                        )
+                        .await?;
+                        let copy_seed =
+                            super::seed_or_unavailable(&self.db_io_pointers, &self.storage, &self.kv, &self.seeds, &copy)
+                                .await?;
+                        copy_files_between(&stem_seed, &copy_seed, &stem, &copy, &set.suffixes()).await
+                    }
+                    .await;
+                    if let Err(e) = copied {
+                        let copy_seed = self.seed_of(&copy).await;
+                        if discard_files_in(&copy_seed, &self.storage, self.location.as_deref(), &copy, RENAMED_SUFFIXES).await {
+                            super::pool_forget(&self.storage, &copy);
+                        }
                         return Err(format!("could not keep \"{table}\" aside for the block's rollback: {e}"));
                     }
-                    Undo::Restore { table, copy }
+                    Undo::Restore { table, copy, set, stem }
                 }
                 drop => drop,
             };
@@ -364,6 +490,53 @@ impl Database {
             _ => true,
         });
         taken
+    }
+
+    /// `table`'s files moved to another stem (a partitioned table rewritten
+    /// into a new uid, `rewrite_partitioned`, or a plain one converted into
+    /// a partitioned one), deleting the files they were under: every
+    /// block's held copy of it under the old stem can no longer be put back
+    /// (put back, it would land as files no table owns, and the change would
+    /// stay). Those steps are forgotten, their copies discarded, and the
+    /// client warned, as for any DDL that does not roll back; reporting a
+    /// ROLLBACK that left the change in place would be the silent version.
+    pub(crate) async fn block_ddl_table_moved(&self, table: &str) {
+        let stem = self.schema_files_stem(table);
+        let mut stale: Vec<Step> = Vec::new();
+        for mut entry in self.block_ddl.iter_mut() {
+            let steps = entry.value_mut();
+            let mut i = 0;
+            while i < steps.len() {
+                let moved = matches!(&steps[i].undo, Undo::Restore { table: t, stem: s, .. } if t == table && *s != stem);
+                if moved {
+                    stale.push(steps.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if stale.is_empty() {
+            return;
+        }
+        for step in stale {
+            if let Some(path) = &step.intent {
+                let _ = super::rewrite::remove_intent(path);
+            }
+            if let Undo::Restore { copy, .. } = &step.undo {
+                let seed = self.seed_of(copy).await;
+                if discard_files_in(&seed, &self.storage, self.location.as_deref(), copy, RENAMED_SUFFIXES).await {
+                    super::pool_forget(&self.storage, copy);
+                }
+            }
+        }
+        crate::core::notice::push(
+            "WARNING",
+            "01000",
+            format!(
+                "table \"{table}\" was rewritten into new files: this transaction's changes to it are applied at once and \
+                 will not be undone if the transaction rolls back"
+            ),
+        );
     }
 
     /// Whether block `root` has DDL that rolls back with it.
@@ -472,11 +645,14 @@ impl Database {
         let mut failed = Vec::new();
         for step in steps.into_iter().rev() {
             let done = match &step.undo {
-                Undo::Restore { table, copy } => {
-                    let (table_c, copy_c) = (table.clone(), copy.clone());
+                Undo::Restore { table, copy, set, stem } => {
+                    let (stem_c, copy_c, set_c) = (stem.clone(), copy.clone(), *set);
+                    // The instance is retired by the reload (a partitioned
+                    // one's every partition with its shell), so nothing
+                    // writes the files while they are put back.
                     let restored = self
                         .reload_with(table, |_old| async move {
-                            self.put_back(&table_c, &copy_c).await.map_err(|e| e.to_string())
+                            self.put_back(&stem_c, &copy_c, set_c).await.map_err(|e| e.to_string())
                         })
                         .await;
                     match restored {
@@ -515,14 +691,33 @@ impl Database {
         failed
     }
 
-    /// `copy`'s files over `table`'s.
-    async fn put_back(&self, table: &str, copy: &str) -> io::Result<()> {
-        let table_seed = self.seed_of(table).await;
-        let copy_seed = self.seed_of(copy).await;
-        if !discard_files_in(&table_seed, &self.storage, self.location.as_deref(), table, RENAMED_SUFFIXES).await {
-            return Err(io::Error::other(format!("the changed files of \"{table}\" could not be released")));
+    /// `copy`'s files of `set` over `stem`'s, as a failed rewrite's backup
+    /// goes back (`rewrite::restore_from_backup`): both seeds real, or not
+    /// at all.
+    async fn put_back(&self, stem: &str, copy: &str, set: FileSet) -> io::Result<()> {
+        let restore = super::rewrite::restore_from_backup(
+            &self.db_io_pointers,
+            &self.storage,
+            &self.kv,
+            &self.seeds,
+            self.location.as_deref(),
+            stem,
+            copy,
+            set,
+        );
+        match set {
+            // The schema files go back over a live file set's names through
+            // the database's seed, as a metadata change's backup does
+            // (`reload_atomic_with`, `Ungated::SchemaRewrite`).
+            FileSet::Schema => {
+                crate::core::index_store::gated_io::ungated(
+                    crate::core::index_store::gated_io::Ungated::SchemaRewrite,
+                    restore,
+                )
+                .await
+            }
+            FileSet::Whole => restore.await,
         }
-        copy_files_between(&copy_seed, &table_seed, copy, table, RENAMED_SUFFIXES).await
     }
 }
 
@@ -564,21 +759,15 @@ pub(super) async fn recover_files(
             (Undo::Drop { .. }, true) => true,
             // Never written as an intent; nothing to finish.
             (Undo::DropAtCommit { .. }, _) => true,
-            (Undo::Restore { table, copy }, false) => {
+            (Undo::Restore { table, copy, set, stem }, false) => {
                 info!("Restoring \"{table}\": DDL of transaction {tx} did not commit before a crash");
-                let table_seed = super::seed_in(io_pointers, pool, kv, seeds, table).await;
-                let copy_seed = super::seed_in(io_pointers, pool, kv, seeds, copy).await;
-                let released = discard_files_in(&table_seed, pool, Some(&root), table, RENAMED_SUFFIXES).await;
-                match released {
-                    true => match copy_files_between(&copy_seed, &table_seed, copy, table, RENAMED_SUFFIXES).await {
-                        Ok(()) => discard_files_in(&copy_seed, pool, Some(&root), copy, RENAMED_SUFFIXES).await || true,
-                        Err(e) => {
-                            error!("Could not restore \"{table}\" after a crash: {e}");
-                            false
-                        }
-                    },
-                    false => {
-                        error!("Could not release the changed files of \"{table}\" after a crash");
+                match super::rewrite::restore_from_backup(io_pointers, pool, kv, seeds, Some(&root), stem, copy, *set).await {
+                    Ok(()) => {
+                        let copy_seed = super::seed_in(io_pointers, pool, kv, seeds, copy).await;
+                        discard_files_in(&copy_seed, pool, Some(&root), copy, RENAMED_SUFFIXES).await || true
+                    }
+                    Err(e) => {
+                        error!("Could not restore \"{table}\" after a crash: {e}");
                         false
                     }
                 }
@@ -619,7 +808,14 @@ mod tests {
     #[test]
     fn an_intent_round_trips_and_a_torn_one_does_not_parse() {
         for undo in [
-            Undo::Restore { table: "t".into(), copy: format!("{COPY_PREFIX}7_0_t") },
+            Undo::Restore { table: "t".into(), copy: format!("{COPY_PREFIX}7_0_t"), set: FileSet::Whole, stem: "t".into() },
+            Undo::Restore { table: "t".into(), copy: format!("{COPY_PREFIX}7_1_t"), set: FileSet::Schema, stem: "t".into() },
+            Undo::Restore {
+                table: "p".into(),
+                copy: format!("{COPY_PREFIX}7_2___pt_9"),
+                set: FileSet::Schema,
+                stem: "__pt_9".into(),
+            },
             Undo::Drop { table: "new_t".into() },
         ] {
             let text = encode(7, &undo);
@@ -628,6 +824,33 @@ mod tests {
                 assert_eq!(decode(&text[..cut]), None, "a cut at {cut} parsed");
             }
         }
-        assert_eq!(decode(&encode(7, &Undo::Restore { table: "t".into(), copy: "elsewhere".into() })), None);
+        assert_eq!(
+            decode(&encode(
+                7,
+                &Undo::Restore { table: "t".into(), copy: "elsewhere".into(), set: FileSet::Whole, stem: "t".into() }
+            )),
+            None
+        );
+    }
+
+    /// An intent the first version wrote (three fields) reads as a whole
+    /// plain table's restore, so a crash across the upgrade still undoes it.
+    #[test]
+    fn a_first_version_intent_reads_as_a_whole_restore() {
+        let body = format!("7\nrestore\tt\t{COPY_PREFIX}7_0_t");
+        let text = format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body));
+        assert_eq!(
+            decode(&text),
+            Some((
+                7,
+                Undo::Restore { table: "t".into(), copy: format!("{COPY_PREFIX}7_0_t"), set: FileSet::Whole, stem: "t".into() }
+            ))
+        );
+        assert_eq!(text, encode(7, &Undo::Restore {
+            table: "t".into(),
+            copy: format!("{COPY_PREFIX}7_0_t"),
+            set: FileSet::Whole,
+            stem: "t".into()
+        }));
     }
 }

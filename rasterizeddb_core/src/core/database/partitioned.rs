@@ -1213,6 +1213,9 @@ impl Database {
             warn!("Rewrote partitioned table {name}; deleting the old files under uid {old_uid:016x} failed, the startup reaper deletes them: {e}");
         }
         info!("Rewrote partitioned table {name}: uid {old_uid:016x} -> {new_uid:016x}");
+        // The old uid's files are gone: a block's copies of them can no
+        // longer go back (`block_ddl_table_moved`), and its client is told.
+        Box::pin(self.block_ddl_table_moved(name)).await;
         Ok(wrote_family)
     }
 }

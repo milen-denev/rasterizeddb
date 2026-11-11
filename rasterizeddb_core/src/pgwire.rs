@@ -5512,7 +5512,17 @@ where
                                 let mark = database.block_ddl_len(root);
                                 match database.block_ddl_prepare(root, stmt).await {
                                     Ok(t) => transactional = t,
-                                    Err(e) => return fail_statement(state, stream, "55000", &e).await,
+                                    // Its lock wait's own outcome where it has
+                                    // one (a deadlock victim is 40P01, a lock
+                                    // timeout 55P03): a client retries on
+                                    // those. 55000 for a copy that failed.
+                                    Err(e) => {
+                                        let code = match sqlstate_for(&e) {
+                                            "XX000" => "55000",
+                                            code => code,
+                                        };
+                                        return fail_statement(state, stream, code, &e).await;
+                                    }
                                 }
                                 if let Some(t) = state.transaction.as_mut() {
                                     t.ddl_mark = Some(mark);
@@ -6329,8 +6339,13 @@ where
         let head = stmt.trim_start().to_ascii_uppercase();
         // Not TRUNCATE: it deletes rows in the block's transaction, and
         // rolls back with it (`executor::execute_truncate`).
+        // Nor a role statement, whose catalogue write is the block's
+        // (`execute_role_statement_in`), nor CREATE/DROP DATABASE, which a
+        // block refuses (25001).
         if (head.starts_with("CREATE") || head.starts_with("ALTER") || head.starts_with("DROP"))
             && !database.block_ddl_covers(stmt)
+            && crate::auth::parse_role_statement(stmt).is_none()
+            && parse_database_statement(stmt).is_none()
         {
             log::warn!(
                 "DDL inside an explicit transaction cannot be rolled back by this engine; if this block aborts, its effects will persist: {}",
@@ -6737,7 +6752,10 @@ where
                     crate::auth::RoleStatement::AlterPassword { .. } => "ALTER ROLE",
                     crate::auth::RoleStatement::Drop { .. } => "DROP ROLE",
                 };
-                match crate::auth::execute_role_statement(database, statement, state.auth.method)
+                // In a block, the catalogue write is the block's: a
+                // ROLLBACK takes the role back, as PostgreSQL's does.
+                let tx = state.current_tx();
+                match crate::auth::execute_role_statement_in(database, statement, state.auth.method, tx)
                     .await
                 {
                     Ok(()) => send_command_complete(stream, tag).await?,
@@ -6760,6 +6778,22 @@ where
     // the session is attached to, so they are answered here rather than by the
     // executor, which only ever sees one database.
     if let Some(parsed) = parse_database_statement(stmt) {
+        // PostgreSQL refuses both inside a transaction block (25001): a
+        // database is not something a ROLLBACK can take back, here or there.
+        // Run here, one was created or dropped and stayed through the
+        // block's ROLLBACK. An implicit block never holds one: these
+        // statements do not open it (`opens_an_implicit_block`).
+        let verb = match &parsed {
+            Ok(DatabaseStatement::Create { .. }) => Some("CREATE DATABASE"),
+            Ok(DatabaseStatement::Drop { .. }) => Some("DROP DATABASE"),
+            _ => None,
+        };
+        if let Some(verb) = verb
+            && state.transaction.as_ref().is_some_and(|t| !t.implicit)
+        {
+            fail_statement(state, stream, "25001", &format!("{verb} cannot run inside a transaction block")).await?;
+            return Ok(());
+        }
         match parsed {
             Err(e) => fail_statement(state, stream, "42601", &e).await?,
             Ok(statement) => {
@@ -8621,8 +8655,10 @@ async fn commit_block(
 
 /// A block's `DROP TABLE [IF EXISTS] a, … [CASCADE]` as the single-table
 /// drops to run at its commit, `(table, sql)`; `None` for any other
-/// statement, and for a drop of a table the block's DDL rollback does not
-/// cover (partitioned, on a key/value store), which runs at once as before.
+/// statement. Every kind of table is deferred: plain, partitioned, on a
+/// key/value store (a deferral copies nothing, so none needs to be one a
+/// block can hold aside). Dropped at once, a rolled-back drop of a
+/// partitioned table destroyed it and its rows.
 ///
 /// Checked now, as the drop would check them: a missing table (one this
 /// block's earlier drop is pending for counts as missing) without `IF
@@ -8653,9 +8689,6 @@ fn deferred_drops(
         let (name, if_exists) = parse_drop_table(one).ok()?;
         let dropped = pending.iter().any(|p| p.eq_ignore_ascii_case(&name));
         if !dropped && (database.has_table(&name) || database.is_partitioned(&name)) {
-            if !database.block_copyable(&name) {
-                return None;
-            }
             if !present.iter().any(|p| p.eq_ignore_ascii_case(&name)) {
                 present.push(name);
             }

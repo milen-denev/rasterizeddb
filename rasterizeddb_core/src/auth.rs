@@ -745,6 +745,16 @@ pub async fn lookup_role(
     database: &rclite::Arc<crate::core::database::Database>,
     name: &str,
 ) -> Option<Role> {
+    lookup_role_in(database, name, None).await
+}
+
+/// [`lookup_role`] as transaction `tx` sees the catalogue (a block's own
+/// role statements included), or as a statement of its own for `None`.
+pub async fn lookup_role_in(
+    database: &rclite::Arc<crate::core::database::Database>,
+    name: &str,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Option<Role> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
     if !database.has_table(ROLE_TABLE) {
@@ -757,7 +767,10 @@ pub async fn lookup_role(
         quote(name)
     );
     let purpose = recognize_query_purpose(&sql)?;
-    let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
+    let response = match tx {
+        Some(tx) => executor::execute_in_txn(purpose, database.clone(), tx).await,
+        None => executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await,
+    };
     if response.first() != Some(&2) {
         return None;
     }
@@ -1051,23 +1064,42 @@ pub async fn execute_role_statement(
     statement: RoleStatement,
     method: AuthMethod,
 ) -> Result<(), String> {
+    execute_role_statement_in(database, statement, method, None).await
+}
+
+/// [`execute_role_statement`] as part of transaction `tx`, an open block's:
+/// its write to the catalogue is the block's, so a `ROLLBACK` takes it back
+/// as PostgreSQL's does. Run as a statement of its own, a role a rolled-back
+/// block created could still log in. `None` runs it as its own statement.
+pub async fn execute_role_statement_in(
+    database: &rclite::Arc<crate::core::database::Database>,
+    statement: RoleStatement,
+    method: AuthMethod,
+    tx: Option<crate::core::mvcc::TxId>,
+) -> Result<(), String> {
     use crate::core::rql::{executor, lexer_s1::recognize_query_purpose};
 
     async fn run(
         database: &rclite::Arc<crate::core::database::Database>,
         sql: &str,
+        tx: Option<crate::core::mvcc::TxId>,
     ) -> Result<(), String> {
         let purpose =
             recognize_query_purpose(sql).ok_or_else(|| format!("could not parse: {}", sql))?;
-        let response = executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await;
+        let response = match tx {
+            Some(tx) => executor::execute_in_txn(purpose, database.clone(), tx).await,
+            None => executor::execute_as(crate::core::mvcc::owner::OwnerKind::Auth, purpose, database.clone()).await,
+        };
         if response.first() == Some(&3) {
             return Err(String::from_utf8_lossy(&response[1..]).to_string());
         }
         Ok(())
     }
 
+    // The catalogue table itself is made as a statement of its own: an
+    // empty catalogue outliving a rolled-back block grants nothing.
     if !database.has_table(ROLE_TABLE) {
-        run(database, ROLE_TABLE_DDL).await?;
+        run(database, ROLE_TABLE_DDL, None).await?;
     }
 
     // The verifier format follows the configured method, as
@@ -1084,7 +1116,7 @@ pub async fn execute_role_statement(
             can_login,
             is_superuser,
         } => {
-            if lookup_role(database, &name).await.is_some() {
+            if lookup_role_in(database, &name, tx).await.is_some() {
                 return Err(format!("role \"{}\" already exists", name));
             }
             let role = Role {
@@ -1093,10 +1125,10 @@ pub async fn execute_role_statement(
                 can_login,
                 is_superuser,
             };
-            run(database, &role.insert_statement()).await
+            run(database, &role.insert_statement(), tx).await
         }
         RoleStatement::AlterPassword { name, password } => {
-            if lookup_role(database, &name).await.is_none() {
+            if lookup_role_in(database, &name, tx).await.is_none() {
                 return Err(format!("role \"{}\" does not exist", name));
             }
             let stored = match password.as_deref() {
@@ -1111,11 +1143,12 @@ pub async fn execute_role_statement(
                     stored,
                     quote(&name)
                 ),
+                tx,
             )
             .await
         }
         RoleStatement::Drop { name, if_exists } => {
-            if lookup_role(database, &name).await.is_none() {
+            if lookup_role_in(database, &name, tx).await.is_none() {
                 return if if_exists {
                     Ok(())
                 } else {
@@ -1125,6 +1158,7 @@ pub async fn execute_role_statement(
             run(
                 database,
                 &format!("DELETE FROM {} WHERE name = {}", ROLE_TABLE, quote(&name)),
+                tx,
             )
             .await
         }
