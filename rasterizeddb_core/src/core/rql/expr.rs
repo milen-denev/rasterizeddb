@@ -3719,6 +3719,10 @@ pub fn static_type(expr: &Expr) -> DbType {
                 && matches!(op, ArithOp::Mul | ArithOp::Div)
             {
                 DbType::INTERVAL
+            } else if matches!(ty(lhs), DbType::F32) && matches!(ty(rhs), DbType::F32) {
+                // `real op real` is `real`, as PostgreSQL's `float4pl` and
+                // its siblings are; a `real` with anything else is double.
+                DbType::F32
             } else if matches!(ty(lhs), DbType::F32 | DbType::F64)
                 || matches!(ty(rhs), DbType::F32 | DbType::F64)
             {
@@ -4007,6 +4011,34 @@ pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> 
         return decimal_arith(a, op, b);
     }
 
+    // `real op real` in single precision, as PostgreSQL computes it:
+    // `0.1::real * 3::real` is 0.3, where widened to double it printed
+    // 0.30000000447034836 under the wrong type. A finite pair whose result
+    // leaves the type is PostgreSQL's overflow or underflow error.
+    if matches!(a.db_type(), Some(DbType::F32)) && matches!(b.db_type(), Some(DbType::F32)) && !matches!(op, ArithOp::Rem) {
+        let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) else {
+            return Err(format!("'{}' needs numeric operands", op.symbol()));
+        };
+        let (x, y) = (x as f32, y as f32);
+        let value = match op {
+            ArithOp::Add => x + y,
+            ArithOp::Sub => x - y,
+            ArithOp::Mul => x * y,
+            _ => {
+                if y == 0.0 {
+                    return Err("division by zero".to_string());
+                }
+                x / y
+            }
+        };
+        if value.is_infinite() && x.is_finite() && y.is_finite() {
+            return Err("value out of range: overflow".to_string());
+        }
+        if value == 0.0 && matches!(op, ArithOp::Mul | ArithOp::Div) && x != 0.0 && (op == ArithOp::Div || y != 0.0) {
+            return Err("value out of range: underflow".to_string());
+        }
+        return Ok(Value::Data { bytes: value.to_le_bytes().to_vec(), db_type: DbType::F32 });
+    }
     if float_operand(a) || float_operand(b) {
         let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) else {
             return Err(format!("'{}' needs numeric operands", op.symbol()));
@@ -6992,7 +7024,9 @@ fn negate(inner: Expr) -> Result<Expr, String> {
         DbType::I32 | DbType::U32 => (0i32.to_le_bytes().to_vec(), DbType::I32),
         DbType::I64 | DbType::U64 => (0i64.to_le_bytes().to_vec(), DbType::I64),
         DbType::DECIMAL => (0i128.to_le_bytes().to_vec(), DbType::DECIMAL),
-        DbType::F32 | DbType::F64 => (0f64.to_le_bytes().to_vec(), DbType::F64),
+        // A `real` stays one: `-0.1::real` is -0.1, not a double.
+        DbType::F32 => (0f32.to_le_bytes().to_vec(), DbType::F32),
+        DbType::F64 => (0f64.to_le_bytes().to_vec(), DbType::F64),
         DbType::INTERVAL => (
             crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
                 months: 0,
