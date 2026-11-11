@@ -400,3 +400,105 @@ async fn create_database_is_refused_in_a_block() {
     run(&pool, "CREATE DATABASE in_a_block").await.expect("create database");
     run(&pool, "DROP DATABASE in_a_block").await.expect("drop database");
 }
+
+async fn ids_of(pool: &sqlx::PgPool, sql: &str) -> Vec<i32> {
+    sqlx::query(AssertSqlSafe(sql.to_string())).fetch_all(pool).await.expect(sql).iter().map(|r| r.get::<i32, _>(0)).collect()
+}
+
+/// `ALTER TABLE … RENAME TO` in a block is undone by its ROLLBACK and kept
+/// by its COMMIT (2026-11-12): the name, the key a child holds on it, and
+/// its `SERIAL`, which goes on from its rows. It applied at once and stayed.
+#[tokio::test]
+async fn a_rename_rolls_back_with_its_block() {
+    let (_s, pool) = server().await;
+    for sql in [
+        "CREATE TABLE rn (id SERIAL PRIMARY KEY, name TEXT)",
+        "CREATE TABLE rn_child (id INT PRIMARY KEY, rn_id INT REFERENCES rn(id))",
+        "INSERT INTO rn (name) VALUES ('a'), ('b')",
+        "INSERT INTO rn_child VALUES (1, 1)",
+    ] {
+        run(&pool, sql).await.expect(sql);
+    }
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("ALTER TABLE rn RENAME TO rn2").await.expect("rename");
+    tx.execute("INSERT INTO rn2 (name) VALUES ('c')").await.expect("insert under the new name");
+    tx.rollback().await.expect("rollback");
+    assert!(exists(&pool, "rn").await && !exists(&pool, "rn2").await, "the rename outlived the rollback");
+    run(&pool, "INSERT INTO rn (name) VALUES ('d')").await.expect("insert");
+    assert_eq!(ids_of(&pool, "SELECT id FROM rn ORDER BY id").await, vec![1, 2, 4], "the SERIAL went back");
+    assert!(run(&pool, "INSERT INTO rn_child VALUES (2, 99)").await.is_err(), "the child's key is not enforced");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("ALTER TABLE rn RENAME TO rn2").await.expect("rename");
+    tx.commit().await.expect("commit");
+    assert!(exists(&pool, "rn2").await && !exists(&pool, "rn").await);
+    run(&pool, "INSERT INTO rn2 (name) VALUES ('e')").await.expect("insert");
+    assert!(run(&pool, "INSERT INTO rn_child VALUES (3, 99)").await.is_err(), "the child's key follows the rename");
+    run(&pool, "INSERT INTO rn_child VALUES (4, 2)").await.expect("a key that is there");
+}
+
+/// `DROP TABLE t` then `CREATE TABLE t` in one block (2026-11-12, the
+/// pattern of a migration that rebuilds a table): its ROLLBACK brings the
+/// old table and its rows back, its COMMIT keeps the new one. The drop ran
+/// at the CREATE before, and a rolled-back block lost the table.
+#[tokio::test]
+async fn a_table_dropped_and_created_again_rolls_back_with_its_block() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE re (id SERIAL PRIMARY KEY, name TEXT)").await.expect("create");
+    run(&pool, "INSERT INTO re (name) VALUES ('a'), ('b'), ('c')").await.expect("insert");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("DROP TABLE re").await.expect("drop");
+    tx.execute("CREATE TABLE re (id SERIAL PRIMARY KEY, other TEXT)").await.expect("create again");
+    tx.execute("INSERT INTO re (other) VALUES ('x')").await.expect("insert into the new table");
+    tx.rollback().await.expect("rollback");
+    assert_eq!(ids_of(&pool, "SELECT id FROM re ORDER BY id").await, vec![1, 2, 3], "the dropped table's rows");
+    assert!(run(&pool, "SELECT name FROM re").await.is_ok(), "the old table's columns");
+    run(&pool, "INSERT INTO re (name) VALUES ('d')").await.expect("insert");
+    assert_eq!(ids_of(&pool, "SELECT id FROM re WHERE name = 'd'").await, vec![4], "its SERIAL went on from its rows");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("DROP TABLE re").await.expect("drop");
+    tx.execute("CREATE TABLE re (id SERIAL PRIMARY KEY, other TEXT)").await.expect("create again");
+    tx.execute("INSERT INTO re (other) VALUES ('x')").await.expect("insert");
+    tx.commit().await.expect("commit");
+    assert_eq!(ids_of(&pool, "SELECT id FROM re").await, vec![1], "the new table, its SERIAL from 1");
+    assert!(run(&pool, "SELECT name FROM re").await.is_err(), "the old table's column");
+    let hidden: i64 = sqlx::query("SELECT count(*) FROM information_schema.tables WHERE table_name LIKE '__txd%'")
+        .fetch_one(&pool)
+        .await
+        .expect("pg_tables")
+        .get(0);
+    assert_eq!(hidden, 0);
+}
+
+/// A savepoint between the DROP and the CREATE: rolling back to it undoes
+/// the CREATE and keeps the DROP, as PostgreSQL does, so the COMMIT drops
+/// the table. The set-aside table's drop had to follow it back to its name.
+#[tokio::test]
+async fn rolling_back_to_a_savepoint_between_a_drop_and_its_create_keeps_the_drop() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE sp (id INT PRIMARY KEY)").await.expect("create");
+    run(&pool, "INSERT INTO sp VALUES (1)").await.expect("insert");
+    let mut c = pool.acquire().await.expect("conn");
+    for sql in ["BEGIN", "DROP TABLE sp", "SAVEPOINT s", "CREATE TABLE sp (other TEXT)", "ROLLBACK TO SAVEPOINT s", "COMMIT"] {
+        c.execute(sql).await.expect(sql);
+    }
+    assert!(!exists(&pool, "sp").await, "the drop before the savepoint was undone");
+    run(&pool, "CREATE TABLE sp (id INT PRIMARY KEY)").await.expect("the name is free");
+}
+
+/// A block cannot rename a table it dropped (42P01, as PostgreSQL): the
+/// rename would have left the drop at the commit naming nothing.
+#[tokio::test]
+async fn a_dropped_table_cannot_be_renamed_in_its_block() {
+    let (_s, pool) = server().await;
+    run(&pool, "CREATE TABLE dr (id INT PRIMARY KEY)").await.expect("create");
+    let mut c = pool.acquire().await.expect("conn");
+    c.execute("BEGIN").await.expect("begin");
+    c.execute("DROP TABLE dr").await.expect("drop");
+    let e = c.execute("ALTER TABLE dr RENAME TO dr2").await.expect_err("refused");
+    assert_eq!(e.as_database_error().and_then(|d| d.code()).as_deref(), Some("42P01"), "{e}");
+    c.execute("ROLLBACK").await.expect("rollback");
+    assert!(exists(&pool, "dr").await);
+}

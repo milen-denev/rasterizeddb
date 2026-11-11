@@ -12835,6 +12835,13 @@ async fn execute_drop_table(sql: &str, database: &Arc<Database>) -> Vec<u8> {
     }
 }
 
+/// The foreign keys of other tables naming `table`, dropped as `DROP TABLE
+/// … CASCADE` drops them, for a drop a block sets aside instead of running
+/// (`block_ddl::set_aside`). The caller holds ACCESS EXCLUSIVE on `table`.
+pub(crate) async fn drop_keys_naming(database: &Arc<Database>, table: &str) -> Result<(), String> {
+    Box::pin(drop_dependent_foreign_keys(database, table, "DROP TABLE t CASCADE")).await
+}
+
 /// Whether a `DROP TABLE` ends in `CASCADE`, PostgreSQL's request to drop
 /// what depends on the table too (`RESTRICT`, the default, refuses instead).
 fn drop_table_cascades(sql: &str) -> bool {

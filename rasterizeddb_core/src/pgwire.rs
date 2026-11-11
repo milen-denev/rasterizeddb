@@ -5483,29 +5483,14 @@ where
                                     None => {}
                                 }
                                 // A table created under a name the block's
-                                // pending drop holds: that drop runs first.
+                                // pending drop holds: the dropped table is
+                                // set aside under a hidden name, which its
+                                // drop then takes, so a ROLLBACK can still
+                                // bring it back (`block_ddl::set_aside`).
                                 if let Some(name) = created_over_pending_drop(database, root, stmt) {
-                                    let tx = state.current_tx().unwrap_or(root);
-                                    for (_, sql) in database.block_drops_take(root, Some(&name)) {
-                                        let resp = crate::core::rql::executor::execute_in_txn(
-                                            QueryPurpose::DropTable(sql),
-                                            database.clone(),
-                                            tx,
-                                        )
-                                        .await;
-                                        if resp.first() == Some(&3) {
-                                            let message = String::from_utf8_lossy(&resp[1..]).into_owned();
-                                            return fail_statement(state, stream, sqlstate_for(&message), &message).await;
-                                        }
+                                    if let Err(e) = crate::core::database::block_ddl::set_aside(database, root, &name).await {
+                                        return fail_statement(state, stream, sqlstate_for(&e), &e).await;
                                     }
-                                    crate::core::notice::push(
-                                        "WARNING",
-                                        "01000",
-                                        format!(
-                                            "table \"{name}\" was dropped earlier in this transaction and is created again: a \
-                                             ROLLBACK will not bring the dropped table back"
-                                        ),
-                                    );
                                 }
                             }
                             if ddl.is_some() && !read_only {
@@ -6327,10 +6312,9 @@ where
         None => (stmt, false),
     };
 
-    // DDL outside `database::block_ddl`'s phase 1 does not participate in
-    // rollback here: a DROP, a CREATE INDEX, or an ALTER of a partitioned or
-    // key/value table applied inside this block persists even if the block
-    // later aborts. Every
+    // DDL `database::block_ddl` does not cover does not participate in
+    // rollback here: a conversion or reshape of a partitioned table applied
+    // inside this block persists even if the block later aborts. Every
     // PostgreSQL client assumes the opposite — a migration runner wraps its
     // statements in one transaction precisely to get all-or-nothing — so the
     // divergence is warned when it becomes possible, which is the only moment
@@ -8544,27 +8528,11 @@ async fn commit_block(
     // without touching the disk at all. This is the runtime answer, not the
     // `READ ONLY` the session may have declared — a block that declared
     // nothing and wrote nothing gets the same saving.
-    // The block's deferred drops (`deferred_drops`) are its last statements,
-    // run under its locks before it commits: a ROLLBACK, or a crash before
-    // here, never touched the tables.
-    for (table, sql) in database.block_drops_take(t.id, None) {
-        let resp = crate::core::rql::executor::execute_in_txn(QueryPurpose::DropTable(sql), database.clone(), t.id).await;
-        if resp.first() == Some(&3) {
-            let message = format!(
-                "could not commit: dropping \"{table}\" failed ({}); the transaction has been rolled back",
-                String::from_utf8_lossy(&resp[1..])
-            );
-            database.block_ddl_abort(t.id).await;
-            database.abort_transaction(t.id);
-            t.owner.release();
-            return Err((sqlstate_for(&message), message));
-        }
-    }
-
     let wrote = database.transactions.wrote_family(t.id);
 
     if !wrote {
         let family = database.commit_transaction(t.id);
+        run_deferred_drops(database, t.id).await;
         database.block_ddl_commit(t.id).await;
         t.owner.release();
         database.publish_transaction(family).await;
@@ -8641,6 +8609,13 @@ async fn commit_block(
         }
     }
 
+    // The block's deferred drops (`deferred_drops`) are its last statements,
+    // run once its commit is durable and under its locks: a ROLLBACK, or a
+    // crash before the commit, never touched the tables, and a failure to
+    // make the commit durable rolls back a block whose tables are all still
+    // there. Run before it, such a failure left them dropped.
+    run_deferred_drops(database, t.id).await;
+
     // The last durability step is done: the block's DDL copies are not
     // needed any more, and its table locks go now, before the reply
     // (finding L4).
@@ -8651,6 +8626,25 @@ async fn commit_block(
     // here.
     database.publish_transaction(family).await;
     Ok(())
+}
+
+/// A committed block's deferred drops, each run under its locks. The
+/// commit is durable already, so one that fails cannot fail it: it is
+/// logged, and its intent stays for the next open to finish
+/// (`block_ddl::Recovered::DropCommitted`), as one a crash cut short is.
+async fn run_deferred_drops(database: &Arc<Database>, root: crate::core::mvcc::TxId) {
+    for drop in database.block_drops_take(root, None) {
+        let resp = crate::core::rql::executor::execute_in_txn(QueryPurpose::DropTable(drop.sql.clone()), database.clone(), root).await;
+        if resp.first() == Some(&3) {
+            log::error!(
+                "The transaction committed, but dropping \"{}\" failed ({}); the next start finishes the drop",
+                drop.table,
+                String::from_utf8_lossy(&resp[1..])
+            );
+            continue;
+        }
+        drop.done();
+    }
 }
 
 /// A block's `DROP TABLE [IF EXISTS] a, … [CASCADE]` as the single-table

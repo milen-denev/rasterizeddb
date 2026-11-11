@@ -161,6 +161,9 @@ enum End {
     Crash,
     /// A commit made durable, as `commit_block` does.
     Commit,
+    /// The commit made durable, then the process stops before the block's
+    /// deferred drops run: the next open finishes them.
+    CommitCrash,
 }
 
 async fn end_block(db: Arc<Database>, root: crate::core::mvcc::TxId, end: End, dir: &Path) -> Arc<Database> {
@@ -184,9 +187,28 @@ async fn end_block(db: Arc<Database>, root: crate::core::mvcc::TxId, end: End, d
             db.commit_written_transaction(root).expect("commit");
             db.transactions.flush_deferred().expect("outcome");
             db.sync_own_location().expect("sync");
+            // The deferred drops, once durable, as `commit_block` runs them.
+            for drop in db.block_drops_take(root, None) {
+                let db2 = db.clone();
+                let sql = drop.sql.clone();
+                let out = crate::core::mvcc::owner::under(&db.transactions, root, crate::core::mvcc::owner::OwnerKind::Block, async move {
+                    let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql).expect("parse");
+                    crate::core::rql::executor::execute_in_txn(purpose, db2, root).await
+                })
+                .await;
+                assert_ne!(out.first(), Some(&3), "{}: {}", drop.sql, String::from_utf8_lossy(&out[1..]));
+                drop.done();
+            }
             db.block_ddl_commit(root).await;
             owner.release();
             db
+        }
+        End::CommitCrash => {
+            db.commit_written_transaction(root).expect("commit");
+            db.transactions.flush_deferred().expect("outcome");
+            db.sync_own_location().expect("sync");
+            shut(db, dir);
+            Arc::new(open(dir).await)
         }
     }
 }
@@ -412,4 +434,216 @@ async fn a_partitioned_rewrite_in_a_block_is_not_put_back_as_orphan_files() {
         assert!(block_leftovers(dir.path()).is_empty(), "{end:?}: left behind: {:?}", block_leftovers(dir.path()));
         shut(db, dir.path());
     }
+}
+
+/// Block `root`'s `DROP TABLE` as pgwire runs it: deferred to the commit.
+async fn block_drop(db: &Arc<Database>, root: crate::core::mvcc::TxId, table: &str, sql: &str) {
+    let (db2, table, sql) = (db.clone(), table.to_string(), sql.to_string());
+    crate::core::mvcc::owner::under(&db.transactions, root, crate::core::mvcc::owner::OwnerKind::Block, async move {
+        db2.block_drop_defer(root, vec![(table, sql)]).await.expect("defer");
+    })
+    .await;
+}
+
+/// Block `root`'s `CREATE TABLE` of a name it dropped, as pgwire runs it:
+/// the dropped table set aside first.
+async fn block_create_over(db: &Arc<Database>, root: crate::core::mvcc::TxId, name: &str, sql: &str) {
+    let (db2, name) = (db.clone(), name.to_string());
+    crate::core::mvcc::owner::under(&db.transactions, root, crate::core::mvcc::owner::OwnerKind::Block, async move {
+        block_ddl::set_aside(&db2, root, &name).await.expect("set aside");
+    })
+    .await;
+    block_ddl(db, root, &[sql]).await;
+}
+
+/// A statement of block `root` (DML), under its owner.
+async fn in_block(db: &Arc<Database>, root: crate::core::mvcc::TxId, sql: &str) -> Result<Vec<u8>, String> {
+    let (db2, sql) = (db.clone(), sql.to_string());
+    crate::core::mvcc::owner::under(&db.transactions, root, crate::core::mvcc::owner::OwnerKind::Block, async move {
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql).ok_or("parse")?;
+        let out = crate::core::rql::executor::execute_in_txn(purpose, db2, root).await;
+        match out.first() {
+            Some(&3) => Err(String::from_utf8_lossy(&out[1..]).into_owned()),
+            _ => Ok(out),
+        }
+    })
+    .await
+}
+
+async fn count(db: &Arc<Database>, sql: &str) -> usize {
+    let out = exec(db, sql).await.expect("select");
+    crate::core::row::row::vec_into_rows(&out[1..]).expect("rows").len()
+}
+
+/// The hidden tables a block set aside, in the catalogue or on disk.
+fn asides(db: &Database, dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    db.each_schema(|t, _| {
+        if t.starts_with(block_ddl::ASIDE_PREFIX) {
+            found.push(t.to_string());
+        }
+    });
+    for e in std::fs::read_dir(dir).expect("dir").flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with(block_ddl::ASIDE_PREFIX) {
+            found.push(n);
+        }
+    }
+    found
+}
+
+/// `ALTER TABLE … RENAME TO` in a block (2026-11-12): a ROLLBACK, or a
+/// crash before COMMIT, renames it back, and puts back what the rename's
+/// fixups rewrote: its `SERIAL` default, its own foreign key and the one a
+/// child holds on it. Its counter seeds again from its rows, so the next
+/// key is not one it has. It used to apply at once and outlive the ROLLBACK.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rename_in_a_block_rolls_back_recovers_and_commits() {
+    for end in [End::Rollback, End::Crash, End::Commit] {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = Arc::new(open(dir.path()).await);
+        for sql in [
+            "CREATE TABLE t (id SERIAL PRIMARY KEY, parent INT REFERENCES t(id), name TEXT)",
+            "CREATE TABLE c (id INT PRIMARY KEY, t_id INT REFERENCES t(id))",
+            "INSERT INTO t (parent, name) VALUES (NULL, 'a')",
+            "INSERT INTO t (parent, name) VALUES (1, 'b')",
+            "INSERT INTO t (parent, name) VALUES (1, 'c')",
+            "INSERT INTO c (id, t_id) VALUES (1, 1)",
+        ] {
+            exec(&db, sql).await.expect(sql);
+        }
+        let root = db.transactions.begin();
+        block_ddl(&db, root, &["ALTER TABLE t RENAME TO u"]).await;
+        assert!(db.relation("u").is_some() && db.relation("t").is_none(), "{end:?}: the rename did not run");
+        let db = end_block(db, root, end, dir.path()).await;
+        let (kept, gone) = if end == End::Commit { ("u", "t") } else { ("t", "u") };
+        assert!(db.relation(kept).is_some() && db.relation(gone).is_none(), "{end:?}: {kept} should be the table");
+        assert_eq!(ids(&db, kept).await, 3, "{end:?}: the rows");
+        exec(&db, &format!("INSERT INTO {kept} (parent, name) VALUES (2, 'd')")).await.expect("insert");
+        assert_eq!(count(&db, &format!("SELECT id FROM {kept} WHERE id = 4")).await, 1, "{end:?}: the SERIAL went on from the rows");
+        assert!(
+            exec(&db, &format!("INSERT INTO {kept} (parent, name) VALUES (99, 'x')")).await.is_err(),
+            "{end:?}: the self-reference is not enforced"
+        );
+        assert!(exec(&db, "INSERT INTO c (id, t_id) VALUES (2, 99)").await.is_err(), "{end:?}: the child's key is not enforced");
+        exec(&db, "INSERT INTO c (id, t_id) VALUES (3, 2)").await.expect("a child row naming a parent that is there");
+        assert!(block_leftovers(dir.path()).is_empty(), "{end:?}: left behind: {:?}", block_leftovers(dir.path()));
+        shut(db, dir.path());
+    }
+}
+
+/// `DROP TABLE t` then `CREATE TABLE t` in one block (2026-11-12): the old
+/// table is set aside under a hidden name rather than dropped, so a
+/// ROLLBACK, or a crash before COMMIT, brings it back with its rows, its
+/// counter and the key a child holds on it; a COMMIT drops it, also when a
+/// crash comes before the drop runs. The drop used to run at the CREATE,
+/// and a rolled-back block lost the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_dropped_and_created_again_in_a_block_rolls_back_recovers_and_commits() {
+    for end in [End::Rollback, End::Crash, End::Commit, End::CommitCrash] {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = Arc::new(open(dir.path()).await);
+        for sql in [
+            "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT, parent INT REFERENCES t(id))",
+            "CREATE TABLE c (id INT PRIMARY KEY, t_id INT REFERENCES t(id))",
+            "INSERT INTO t (name) VALUES ('a')",
+            "INSERT INTO t (name, parent) VALUES ('b', 1)",
+            "INSERT INTO t (name) VALUES ('c')",
+            "INSERT INTO c (id, t_id) VALUES (1, 1)",
+        ] {
+            exec(&db, sql).await.expect(sql);
+        }
+        let root = db.transactions.begin();
+        block_drop(&db, root, "t", "DROP TABLE t CASCADE").await;
+        block_create_over(&db, root, "t", "CREATE TABLE t (id SERIAL PRIMARY KEY, other TEXT)").await;
+        in_block(&db, root, "INSERT INTO t (other) VALUES ('x')").await.expect("insert into the new table");
+        assert_eq!(columns(&db, "t"), vec!["id".to_string(), "other".to_string()], "{end:?}: the new table");
+        in_block(&db, root, "INSERT INTO c (id, t_id) VALUES (7, 999)").await.expect("the dropped table's key went with it");
+        // The set-aside table's own key names it, not the new table: a row
+        // of its naming key 1 does not hold the new table's key 1.
+        in_block(&db, root, "DELETE FROM t WHERE id = 1").await.expect("the new table's row is its own to delete");
+        in_block(&db, root, "INSERT INTO t (other) VALUES ('y')").await.expect("insert");
+        let db = end_block(db, root, end, dir.path()).await;
+        match end {
+            End::Commit | End::CommitCrash => {
+                assert_eq!(columns(&db, "t"), vec!["id".to_string(), "other".to_string()], "{end:?}");
+                assert_eq!(count(&db, "SELECT id FROM t WHERE id = 2").await, 1, "{end:?}: the new table's counter started at 1");
+                assert_eq!(ids(&db, "t").await, 1, "{end:?}: the new table's rows");
+                exec(&db, "INSERT INTO c (id, t_id) VALUES (2, 999)").await.expect("the key went with the dropped table");
+            }
+            _ => {
+                assert_eq!(columns(&db, "t"), vec!["id".to_string(), "name".to_string(), "parent".to_string()], "{end:?}: the old table");
+                assert_eq!(ids(&db, "t").await, 3, "{end:?}: its rows");
+                exec(&db, "INSERT INTO t (name) VALUES ('d')").await.expect("insert");
+                assert_eq!(count(&db, "SELECT id FROM t WHERE id = 4").await, 1, "{end:?}: its counter went on from its rows");
+                assert!(exec(&db, "INSERT INTO t (name, parent) VALUES ('z', 99)").await.is_err(), "{end:?}: its own key is back");
+                assert!(exec(&db, "INSERT INTO c (id, t_id) VALUES (2, 999)").await.is_err(), "{end:?}: the child's key is back");
+            }
+        }
+        assert!(asides(&db, dir.path()).is_empty(), "{end:?}: set aside and left: {:?}", asides(&db, dir.path()));
+        assert!(block_leftovers(dir.path()).is_empty(), "{end:?}: left behind: {:?}", block_leftovers(dir.path()));
+        shut(db, dir.path());
+    }
+}
+
+/// A block's deferred drop runs once its commit is durable (2026-11-12);
+/// a crash between the two leaves an intent the next open finishes, for
+/// the table the block dropped and never one created under its name since
+/// (the intent names it by incarnation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_committed_drop_a_crash_cut_short_is_finished_for_that_table_only() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = Arc::new(open(dir.path()).await);
+    exec(&db, "CREATE TABLE gone (id INT PRIMARY KEY)").await.expect("create");
+    exec(&db, "CREATE TABLE kept (id INT PRIMARY KEY)").await.expect("create");
+    exec(&db, "INSERT INTO kept (id) VALUES (1)").await.expect("insert");
+    let root = db.transactions.begin();
+    block_drop(&db, root, "gone", "DROP TABLE gone").await;
+    // An intent as a committed drop of an earlier "kept" leaves it: the
+    // name, and an incarnation the table there now does not have.
+    let stale = block_ddl::Undo::DropAtCommit {
+        table: "kept".into(),
+        sql: "DROP TABLE kept".into(),
+        incarnation: db.incarnation_of("kept") ^ 1,
+    };
+    let path = block_ddl::intent_path(&dir.path().to_string_lossy(), root, 99);
+    crate::core::database::rewrite::write_intent(&path, &block_ddl::encode(root, &stale)).expect("intent");
+    let db = end_block(db, root, End::CommitCrash, dir.path()).await;
+    assert!(db.relation("gone").is_none(), "the committed drop was not finished");
+    assert!(db.relation("kept").is_some(), "a table that is not the one dropped was dropped");
+    assert_eq!(ids(&db, "kept").await, 1);
+    assert!(block_leftovers(dir.path()).is_empty(), "left behind: {:?}", block_leftovers(dir.path()));
+    shut(db, dir.path());
+}
+
+/// A step leaving from the middle of a block's list (a partitioned table
+/// rewritten into a new uid forgets its copies) must not hand its number on
+/// to a live step's intent file: numbered by the list's length, the next
+/// step took the number of the one after it, wrote its intent over that
+/// one's, and a crash then left that one's change in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_step_never_takes_a_live_steps_number() {
+    let dir = tempfile::tempdir().expect("dir");
+    let db = Arc::new(open(dir.path()).await);
+    exec(&db, "CREATE TABLE p (id INT NOT NULL, v TEXT) PARTITION BY HASH (id)").await.expect("create");
+    exec(&db, "INSERT INTO p (id, v) VALUES (1, 'a'), (2, 'b')").await.expect("insert");
+    exec(&db, "CREATE TABLE other (id INT PRIMARY KEY)").await.expect("create");
+    exec(&db, "INSERT INTO other (id) VALUES (1)").await.expect("insert");
+    let root = db.transactions.begin();
+    block_ddl(
+        &db,
+        root,
+        &[
+            "CREATE INDEX p_v ON p (v)",
+            "ALTER TABLE other ADD COLUMN extra INT",
+            "ALTER TABLE p ADD COLUMN w INT",
+            "CREATE TABLE z (id INT PRIMARY KEY)",
+        ],
+    )
+    .await;
+    let db = end_block(db, root, End::Crash, dir.path()).await;
+    assert_eq!(columns(&db, "other"), vec!["id".to_string()], "the other table's ALTER survived the crash");
+    assert!(db.relation("z").is_none(), "the created table survived the crash");
+    assert_eq!(ids(&db, "other").await, 1);
+    shut(db, dir.path());
 }
