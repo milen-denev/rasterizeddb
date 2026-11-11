@@ -4850,3 +4850,237 @@ async fn a_sweep_waits_for_an_append_that_has_not_recorded_its_range() {
         .unwrap();
     assert!(!report.deferred, "{report:?}");
 }
+
+/// Rewrites the record at `pos` in place to `new`, as the log's apply does
+/// (its own handle, under the file's in-place count), stopping halfway
+/// through `xmax` until `resume` is signalled. Returns once `paused` would
+/// be: the bytes are half written.
+fn half_written_rewrite(
+    io: &LocalStorageProvider,
+    pos: u64,
+    new: Vec<u8>,
+) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+    use std::io::{Seek, SeekFrom, Write};
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    let seq = io.inplace.clone();
+    let path = io.file_str.clone();
+    let writer = std::thread::spawn(move || {
+        let mut f = std::fs::File::options().write(true).open(&path).unwrap();
+        seq.write(|| {
+            // Through the first half of `xmax` (it starts at byte 29).
+            f.seek(SeekFrom::Start(pos)).unwrap();
+            f.write_all(&new[..33]).unwrap();
+            paused_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            f.write_all(&new[33..]).unwrap();
+        });
+    });
+    paused_rx.recv().unwrap();
+    (writer, resume_tx)
+}
+
+fn record_with_xmax(id: u64, xmax: u64) -> RowPointer {
+    RowPointer {
+        id,
+        length: 10,
+        position: id * 10,
+        deleted: false,
+        xmin: 5,
+        xmax,
+        writing_data: crate::core::row::row_pointer::WritingData { total_columns_size: 10, total_strings_size: 0 },
+    }
+}
+
+/// A read of a record being rewritten in place waits for the write and
+/// returns all of it: one that caught half an `xmax` stamp read a version as
+/// deleted by an older transaction (`inplace_seq`).
+///
+/// Mutation: the read path not checking the count fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copying_read_never_returns_half_an_in_place_write() {
+    const T: u64 = 0x000A_BCDE;
+    let dir = tempfile::tempdir().unwrap();
+    init();
+    let io = Arc::new(LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("tearcopy")).await);
+    let txn = io.begin_txn();
+    let (pos, token) = record_with_xmax(1, 0).save_in_txn(&*io, txn).await.unwrap();
+    io.commit_durable(token).await.unwrap();
+
+    let new = record_with_xmax(1, T).into_memory_block().into_slice().to_vec();
+    let (writer, resume) = half_written_rewrite(&io, pos, new);
+    let reading = io.clone();
+    let read = tokio::spawn(async move {
+        let mut at = pos;
+        let mut buf = [0u8; ROW_POINTER_RECORD_LEN];
+        reading.read_data_into_buffer(&mut at, &mut buf).await.unwrap();
+        RowPointer::from_slice(&buf).xmax
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let finished_early = read.is_finished();
+    resume.send(()).unwrap();
+    writer.join().unwrap();
+    let xmax = read.await.unwrap();
+    assert!(!finished_early, "the read returned while the write was half done (xmax {xmax:#x})");
+    assert_eq!(xmax, T);
+}
+
+/// The same for a record decoded straight out of the mapping, as a scan and
+/// a sweep read the pointer file.
+///
+/// Mutation: `decode_record` ignoring the count fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_decoded_from_the_mapping_is_never_half_an_in_place_write() {
+    use crate::core::row::row_pointer::RowPointerIterator;
+    const T: u64 = 0x000A_BCDE;
+    let dir = tempfile::tempdir().unwrap();
+    init();
+    let mut target = 0;
+    {
+        let io = LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("tearmap")).await;
+        let txn = io.begin_txn();
+        let mut last = 0;
+        for id in 0..64u64 {
+            let (pos, token) = record_with_xmax(id, 0).save_in_txn(&io, txn).await.unwrap();
+            if id == 40 {
+                target = pos;
+            }
+            last = token;
+        }
+        io.commit_durable(last).await.unwrap();
+    }
+    // Reopened, so the mapping covers every record and the scan borrows it.
+    let io = Arc::new(LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("tearmap")).await);
+    assert!(io.try_borrow_range(0, 64 * ROW_POINTER_RECORD_LEN).is_some(), "the records are not mapped");
+
+    let new = record_with_xmax(40, T).into_memory_block().into_slice().to_vec();
+    let (writer, resume) = half_written_rewrite(&io, target, new);
+    let scanning = io.clone();
+    let scan = tokio::spawn(async move {
+        let mut it = RowPointerIterator::new(scanning).await.unwrap();
+        let mut xmax = None;
+        while let Some(p) = it.next_row_pointer().await.unwrap() {
+            if p.id == 40 {
+                xmax = Some(p.xmax);
+            }
+        }
+        xmax.unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let finished_early = scan.is_finished();
+    resume.send(()).unwrap();
+    writer.join().unwrap();
+    let xmax = scan.await.unwrap();
+    assert!(!finished_early, "the scan decoded a record while its write was half done (xmax {xmax:#x})");
+    assert_eq!(xmax, T);
+}
+
+/// Commits an in-place stamp of a record while the file's in-place count is
+/// held from outside; the commit must wait for it, so the write it applies
+/// is one step to readers. Returns whether it finished while held.
+async fn stamp_finishes_while_the_count_is_held(dir: &std::path::Path, name: &str) -> bool {
+    init();
+    let io = Arc::new(LocalStorageProvider::new(dir.to_str().unwrap(), Some(name)).await);
+    let txn = io.begin_txn();
+    let mut record = record_with_xmax(1, 0);
+    let (pos, token) = record.save_in_txn(&*io, txn).await.unwrap();
+    io.commit_durable(token).await.unwrap();
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let seq = io.inplace.clone();
+    let holder = std::thread::spawn(move || {
+        seq.write(|| {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+    });
+    held_rx.recv().unwrap();
+    let stamping = io.clone();
+    let stamp = tokio::spawn(async move {
+        record.xmax = 0x000A_BCDE;
+        let txn = stamping.begin_txn();
+        let token = record.save_at_in_txn(&*stamping, pos, txn).await.unwrap();
+        stamping.commit_durable(token).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let finished = stamp.is_finished();
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    stamp.await.unwrap();
+    finished
+}
+
+/// The log applies an in-place write at commit through its own handle,
+/// under the same count readers of the file check.
+///
+/// Mutation: `apply_held` writing outside the count fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_logs_in_place_apply_is_one_step_to_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let _log = logged(dir.path());
+    assert!(
+        !stamp_finishes_while_the_count_is_held(dir.path(), "tearwal").await,
+        "the log applied an in-place write outside the file's in-place count"
+    );
+}
+
+/// Without a log, the provider overwrites in place itself, under the count.
+///
+/// Mutation: `write_data_txn`'s overwrite outside the count fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_place_write_without_a_log_is_one_step_to_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        !stamp_finishes_while_the_count_is_held(dir.path(), "tearnolog").await,
+        "an in-place write without a log went outside the file's in-place count"
+    );
+}
+
+/// The vectored reads a row fetch makes, out of the mapping: neither returns
+/// half an in-place write.
+///
+/// Mutation: either vectored path not checking the count fails its assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vectored_read_never_returns_half_an_in_place_write() {
+    const T: u64 = 0x000A_BCDE;
+    let dir = tempfile::tempdir().unwrap();
+    init();
+    let mut target = 0;
+    {
+        let io = LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("tearvec")).await;
+        let txn = io.begin_txn();
+        let mut last = 0;
+        for id in 0..64u64 {
+            let (pos, token) = record_with_xmax(id, 0).save_in_txn(&io, txn).await.unwrap();
+            if id == 40 {
+                target = pos;
+            }
+            last = token;
+        }
+        io.commit_durable(last).await.unwrap();
+    }
+    let io = Arc::new(LocalStorageProvider::new(dir.path().to_str().unwrap(), Some("tearvec")).await);
+    for (round, sync) in [(1u64, false), (2, true)] {
+        let xmax = if round == 1 { T } else { T + 1 };
+        let new = record_with_xmax(40, xmax).into_memory_block().into_slice().to_vec();
+        let (writer, resume) = half_written_rewrite(&io, target, new);
+        let reading = io.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; ROW_POINTER_RECORD_LEN];
+            if sync {
+                assert!(reading.try_read_vectored_sync(&mut [(target, &mut buf[..])]), "not served from the mapping");
+            } else {
+                futures::executor::block_on(reading.read_vectored(&mut [(target, &mut buf[..])])).unwrap();
+            }
+            RowPointer::from_slice(&buf).xmax
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let finished_early = read.is_finished();
+        resume.send(()).unwrap();
+        writer.join().unwrap();
+        let got = read.await.unwrap();
+        assert!(!finished_early, "a vectored read (sync: {sync}) returned half a write (xmax {got:#x})");
+        assert_eq!(got, xmax);
+    }
+}

@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod file_sync;
 pub mod helpers;
+pub mod inplace_seq;
 #[cfg(feature = "kv_storage")]
 pub mod kv;
 pub mod memory;

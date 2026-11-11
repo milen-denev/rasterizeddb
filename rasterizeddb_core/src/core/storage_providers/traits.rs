@@ -30,6 +30,10 @@ pub struct BorrowedBytes {
     _owner: Arc<dyn Any + Send + Sync>,
     ptr: *const u8,
     len: usize,
+    /// The file's in-place write count, when its bytes can be rewritten under
+    /// the borrow: a reader decodes a record between `read_begin` and
+    /// `read_valid` and decodes it again if they disagree (`inplace_seq`).
+    seq: Option<Arc<super::inplace_seq::InPlaceSeq>>,
 }
 
 // SAFETY: the bytes are read-only for the guard's lifetime and `_owner` keeps
@@ -47,7 +51,21 @@ impl BorrowedBytes {
             _owner: owner,
             ptr,
             len,
+            seq: None,
         }
+    }
+
+    /// The same bytes, read under `seq` (see the field).
+    #[inline]
+    pub fn with_seq(mut self, seq: Arc<super::inplace_seq::InPlaceSeq>) -> Self {
+        self.seq = Some(seq);
+        self
+    }
+
+    /// The count readers of these bytes check, if they can be rewritten.
+    #[inline(always)]
+    pub fn seq(&self) -> Option<&Arc<super::inplace_seq::InPlaceSeq>> {
+        self.seq.as_ref()
     }
 
     #[inline(always)]

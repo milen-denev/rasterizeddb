@@ -811,6 +811,9 @@ pub struct LocalStorageProvider {
     pub(crate) location: String,
     pub(crate) table_name: String,
     pub(crate) file_str: String,
+    /// The file's in-place write count, shared with every other handle on it
+    /// (`inplace_seq`): bytes rewritten in place are read under it.
+    pub(crate) inplace: Arc<super::inplace_seq::InPlaceSeq>,
     // temp staging file used for append_data()
     pub(crate) temp_file_str: String,
     pub(super) temp_file: Arc<RwLock<std::fs::File>>,
@@ -904,6 +907,7 @@ impl Clone for LocalStorageProvider {
             location: self.location.clone(),
             table_name: self.table_name.clone(),
             file_str: self.file_str.clone(),
+            inplace: self.inplace.clone(),
             temp_file_str: self.temp_file_str.clone(),
             temp_file: self.temp_file.clone(),
             temp_read_file,
@@ -1116,6 +1120,7 @@ impl LocalStorageProvider {
                 read_file,
                 location: final_location.to_string(),
                 table_name: table_name.to_string(),
+                inplace: super::inplace_seq::for_path(&file_str),
                 file_str: file_str.clone(),
                 temp_file_str,
                 temp_file: Arc::new(RwLock::new(temp_file)),
@@ -1251,6 +1256,7 @@ impl LocalStorageProvider {
                 // The name the log keys this file by: it must be the file this
                 // provider writes, or its records would carry `temp.db`'s id.
                 table_name: "CONFIG_TABLE.db".to_string(),
+                inplace: super::inplace_seq::for_path(&file_str),
                 file_str: file_str.clone(),
                 temp_file_str,
                 temp_file: Arc::new(RwLock::new(temp_file)),
@@ -1665,11 +1671,27 @@ impl LocalStorageProvider {
     }
 
     #[inline(always)]
+    /// Copies `buffer.len()` bytes at `position` out of the file, taken as
+    /// one step against in-place writes (`inplace_seq`): a copy a write
+    /// overlapped is made again.
     async fn read_data_into_buffer_internal(
         &self,
         position: &mut u64,
         buffer: &mut [u8],
     ) -> io::Result<()> {
+        let start = *position;
+        loop {
+            let begin = self.inplace.read_begin();
+            let result = self.read_unchecked(position, buffer);
+            if self.inplace.read_valid(begin) {
+                return result;
+            }
+            *position = start;
+        }
+    }
+
+    /// [`Self::read_data_into_buffer_internal`] without the in-place check.
+    fn read_unchecked(&self, position: &mut u64, buffer: &mut [u8]) -> io::Result<()> {
         if buffer.is_empty() {
             return Ok(());
         }
@@ -1929,7 +1951,7 @@ impl StorageIO for LocalStorageProvider {
         // the old row rather than a mix of two.
         let written = {
             let mut file = self.write_file.write();
-            Self::overwrite_with_undo(&mut file, position, buffer)
+            self.inplace.write(|| Self::overwrite_with_undo(&mut file, position, buffer))
         };
         if let Err((e, restored)) = written {
             if let Err(restore) = restored {
@@ -2260,7 +2282,7 @@ impl StorageIO for LocalStorageProvider {
         let ptr = unsafe { map.as_ptr().add(position as usize) };
         // SAFETY: the range was just bounds-checked against the mapping, and
         // `map` keeps it mapped for as long as the guard lives.
-        Some(unsafe { super::traits::BorrowedBytes::new(map, ptr, len) })
+        Some(unsafe { super::traits::BorrowedBytes::new(map, ptr, len) }.with_seq(self.inplace.clone()))
     }
 
     async fn get_len(&self) -> u64 {
@@ -2308,6 +2330,11 @@ impl StorageIO for LocalStorageProvider {
         // Hoist the TLS borrow + Arc<Mmap> resolution out of the per-entry loop.
         // Previously each entry called `mmap_copy_region` -> `with_cached_mmap`,
         // which performed a TLS RefCell borrow and an `ArcSwap::load` per entry.
+        //
+        // The copies as one step against in-place writes (`inplace_seq`):
+        // all of them again if a write overlapped any.
+        self.inplace.read(|| {
+        pending.clear();
         self.with_cached_mmap(|mmap| {
             let mmap_bytes: &[u8] = &mmap[..];
             let mmap_len = mmap_bytes.len() as u64;
@@ -2332,6 +2359,7 @@ impl StorageIO for LocalStorageProvider {
                     pending.push((i, *pos, 0));
                 }
             }
+        })
         });
 
         if pending.is_empty() {
@@ -2361,8 +2389,9 @@ impl StorageIO for LocalStorageProvider {
             return false;
         }
 
-        // Single TLS+ArcSwap resolution, then plain memcpy per entry.
-        self.with_cached_mmap(|mmap| {
+        // Single TLS+ArcSwap resolution, then plain memcpy per entry; as one
+        // step against in-place writes (`inplace_seq`).
+        self.inplace.read(|| self.with_cached_mmap(|mmap| {
             let mmap_bytes: &[u8] = &mmap[..];
             let mmap_len = mmap_bytes.len() as u64;
 
@@ -2384,7 +2413,7 @@ impl StorageIO for LocalStorageProvider {
                 buf.copy_from_slice(&mmap_bytes[start..start + blen]);
             }
             true
-        })
+        }))
     }
 
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
@@ -2393,9 +2422,7 @@ impl StorageIO for LocalStorageProvider {
             return;
         });
         let mut file = self.write_file.write();
-        let written = file
-            .seek(seek)
-            .and_then(|_| file.write_all(buffer))
+        let written = self.inplace.write(|| file.seek(seek).and_then(|_| file.write_all(buffer)))
             .and_then(|()| file.flush())
             .and_then(|()| {
                 crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
@@ -2504,6 +2531,7 @@ impl StorageIO for LocalStorageProvider {
             read_file,
             location: final_location.to_string(),
             table_name: "temp.db".to_string(),
+            inplace: super::inplace_seq::for_path(&file_str),
             file_str: file_str.clone(),
             temp_file_str,
             temp_file: Arc::new(RwLock::new(temp_file)),
@@ -2674,6 +2702,7 @@ impl StorageIO for LocalStorageProvider {
             read_file,
             location: final_location.to_string(),
             table_name: name.to_string(),
+            inplace: super::inplace_seq::for_path(&new_table),
             file_str: new_table.clone(),
             temp_file_str,
             temp_file: Arc::new(RwLock::new(temp_file)),

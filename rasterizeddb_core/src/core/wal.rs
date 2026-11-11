@@ -1277,8 +1277,10 @@ impl Wal {
                     .open(&w.path)?;
                 (existed, f)
             };
-            f.seek(SeekFrom::Start(w.offset))?;
-            f.write_all(&buf)?;
+            // As one step to anyone reading the file meanwhile: these bytes
+            // are rewritten in place under readers (`inplace_seq`).
+            crate::core::storage_providers::inplace_seq::for_file(&f, &w.path.to_string_lossy())
+                .write(|| f.seek(SeekFrom::Start(w.offset)).and_then(|_| f.write_all(&buf)))?;
             // A new file is only durable once its directory entry is.
             if !existed {
                 sync_parent_dir(&w.path)?;

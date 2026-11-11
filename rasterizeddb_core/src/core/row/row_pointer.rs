@@ -262,6 +262,13 @@ impl<S: StorageIO> RowPointerIterator<S> {
         self.end_if_nothing();
     }
 
+    /// The in-place count of the mapping the current chunk is borrowed from,
+    /// if it is borrowed and can be rewritten under the borrow.
+    #[inline(always)]
+    fn borrowed_seq(&self) -> Option<&crate::core::storage_providers::inplace_seq::InPlaceSeq> {
+        self.borrowed_chunk.as_ref().and_then(|b| b.seq()).map(|seq| &**seq)
+    }
+
     /// Bytes of the currently loaded chunk, from the borrowed mapping when the
     /// storage could provide one and from the owned buffer otherwise.
     #[inline(always)]
@@ -563,7 +570,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
             let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
                 &*(buf_slice.as_ptr().add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
             };
-            let row_pointer = RowPointer::from_slice(arr_ref);
+            let row_pointer = decode_record(self.borrowed_seq(), arr_ref);
 
             self.buffer_index += TOTAL_LENGTH;
 
@@ -612,6 +619,10 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
             // Drain as many records as we can from the currently loaded chunk without awaiting.
             let buf_ptr = self.chunk_bytes().as_ptr();
+            // Records decoded straight out of the mapping are read under the
+            // file's in-place count (`decode_record`); a copied chunk was
+            // checked when it was copied.
+            let seq = self.borrowed_chunk.as_ref().and_then(|b| b.seq()).cloned();
             // Cloned once per chunk: holding a borrow of `self.candidates` would
             // conflict with mutating `buffer_index` inside the loop.
             let candidates = self.candidates.clone();
@@ -655,7 +666,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
                     let arr_ref: &[u8; TOTAL_LENGTH] = unsafe {
                         &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH])
                     };
-                    let row_pointer = RowPointer::from_slice(arr_ref);
+                    let row_pointer = decode_record(seq.as_deref(), arr_ref);
                     self.buffer_index += TOTAL_LENGTH;
                     if unlikely(row_pointer.deleted) {
                         continue;
@@ -723,7 +734,7 @@ impl<S: StorageIO> RowPointerIterator<S> {
 
                 let arr_ref: &[u8; TOTAL_LENGTH] =
                     unsafe { &*(buf_ptr.add(self.buffer_index) as *const [u8; TOTAL_LENGTH]) };
-                let row_pointer = RowPointer::from_slice(arr_ref);
+                let row_pointer = decode_record(seq.as_deref(), arr_ref);
                 self.buffer_index += TOTAL_LENGTH;
 
                 if unlikely(row_pointer.deleted) {
@@ -2496,6 +2507,22 @@ impl RowPointer {
         }
 
         Ok((pointer_record_pos, row_pointer))
+    }
+}
+
+/// Decodes a pointer record. One straight out of a mapping is decoded under
+/// the file's in-place count, `seq`, and again if a write landed meanwhile:
+/// an UPDATE's `xmax` stamp rewrites it in place, and a decode that caught
+/// half of it read a version as deleted by some older, committed transaction
+/// (`storage_providers::inplace_seq`).
+#[inline(always)]
+fn decode_record(
+    seq: Option<&crate::core::storage_providers::inplace_seq::InPlaceSeq>,
+    record: &[u8; TOTAL_LENGTH],
+) -> RowPointer {
+    match seq {
+        None => RowPointer::from_slice(record),
+        Some(seq) => seq.read(|| RowPointer::from_slice(record)),
     }
 }
 
