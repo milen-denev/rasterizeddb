@@ -12093,12 +12093,18 @@ fn fold_serialized(
     // Many groups make every part's table nearly as large as the whole one, so
     // the merge costs what the parallelism saved, and the partial tables cost
     // memory (measured: 100k groups over 1M rows, 256 MB serial against 413 MB
-    // in eight parts, no faster). The first part is folded alone first; if it
-    // already holds more than one group per 16 rows the rest is folded
-    // serially into it.
+    // in eight parts, no faster). The first part is folded alone first, and
+    // its group count stands for every part's: the merge then visits about
+    // `groups × parts` entries, and the rest is folded serially into the first
+    // part when that is more than a quarter of the rows.
+    //
+    // Measured against the whole input, not against the first part's rows:
+    // 10k groups over 1M rows is 10k groups in the first 125k rows, which the
+    // per-part test read as "one group per 12 rows" and folded serially — a
+    // merge of 70k entries declined to save 875k pushes.
     let mut folder = fold_part(parts[0])?;
-    let sampled = crate::core::row::row::count_serialized_rows(parts[0]) as usize;
-    if folder.groups().saturating_mul(16) > sampled {
+    let total = crate::core::row::row::count_serialized_rows(bytes) as usize;
+    if folder.groups().saturating_mul(parts.len()).saturating_mul(4) > total {
         for part in &parts[1..] {
             for slice in crate::core::row::row::serialized_rows(part) {
                 let slice = slice.map_err(|e| format!("a scanned row could not be read: {}", e))?;
