@@ -184,11 +184,31 @@ struct FreeState {
     /// sixty-thousand-entry vector on each of those is the kind of cost that
     /// only shows up under exactly the workload this is meant to help.
     extents: BTreeSet<(u64, u64)>,
-    /// Handed to a writer, but not yet seen owned by a live pointer.
+    /// Handed to a writer, but not yet seen owned by a record: start →
+    /// [`Loan`].
     ///
     /// Keyed by start offset: an extent is lent out whole or from its front, so
     /// two live loans can never share a start.
-    in_flight: HashMap<u64, u64>,
+    in_flight: HashMap<u64, Loan>,
+}
+
+/// An extent lent to a writer.
+#[derive(Debug, Clone, Copy)]
+struct Loan {
+    len: u64,
+    /// The pointer slot of the record that owns the extent, once the writer
+    /// has written it ([`FreeSpace::owned_by`]); `u64::MAX` until then, when
+    /// nothing retires the loan. Only a record at this slot or beyond does.
+    ///
+    /// A record below it is an older version at the same start — usually
+    /// the very version whose extent was reclaimed and handed out, since an
+    /// extent is lent from its front. Its tombstone stays in the pointer file
+    /// for good, so it is in every later sweep. Retiring the loan on it
+    /// dropped the loan before the writer's own record existed, and the next
+    /// publication handed the extent out again over the row just written
+    /// there (2026-11-11: `reader_miss_stress` with spread writes lost rows
+    /// in most runs).
+    floor: u64,
 }
 
 /// Reclaimed byte ranges of one table's rows file, and the ranges currently
@@ -230,6 +250,94 @@ pub struct FreeSpace {
     /// publishes or quarantines only if it is unchanged: extents computed from
     /// the old row layout name bytes that live rows have since moved into.
     layout: AtomicU64,
+    /// Rows appended at the frontier whose pointer a sweep may not have seen.
+    /// See [`Appends`]. Taken after `state` when both are held.
+    appends: Mutex<Appends>,
+}
+
+/// Rows appended at the end of the rows file, from the append until a sweep
+/// is sure to see the pointer that owns them.
+///
+/// An append writes the row's bytes, and the file's length moves past them,
+/// before the row's pointer record is written. A sweep that read the length
+/// after the bytes and finished its pointer pass before the record found
+/// those bytes owned by nothing — a gap, once another row appended after them
+/// had its pointer seen first — and published them; the next writer given
+/// that extent wrote over the row, whose pointer then named the other row's
+/// bytes (2026-11-11: `reader_miss_stress`, under load; a pause between the
+/// append and the pointer reproduces it in most runs). A loan cannot shield
+/// them: there is no list entry to take one with before the append, and one
+/// taken after leaves the same window open.
+///
+/// So an append takes a ticket before it writes ([`FreeSpace::begin_append`]),
+/// records the range it got as soon as it has it, and lets go once its pointer
+/// is written. A sweep waits, before it publishes or quarantines, for every
+/// ticket older than its own barrier to have recorded its range (an append is
+/// short), and leaves every recorded range out. A range whose pointer was
+/// written while no sweep ran is forgotten at once, since every later sweep
+/// reads that pointer; one written during a sweep is kept until the sweep
+/// ends. A table only ever appended to never sweeps, and keeps nothing.
+#[derive(Debug, Default)]
+struct Appends {
+    next: u64,
+    /// Tickets that have not yet recorded their range.
+    writing: BTreeSet<u64>,
+    /// Recorded ranges by ticket, with whether their pointer has been
+    /// written.
+    ranges: HashMap<u64, (Extent, bool)>,
+    /// Sweeps between [`FreeSpace::begin_sweep`] and their end (one at a
+    /// time per table, under its maintenance lock).
+    sweeping: u32,
+}
+
+/// An append's place in [`Appends`], from before it writes until its pointer
+/// is written (or it gives up). Dropping it marks the pointer written.
+pub struct AppendTicket<'a> {
+    free_space: Option<&'a FreeSpace>,
+    ticket: u64,
+}
+
+impl AppendTicket<'_> {
+    /// The append put its row at `start`, `len` bytes: shielded from here.
+    pub fn landed(&mut self, start: u64, len: u64) {
+        let Some(free_space) = self.free_space else { return };
+        let mut appends = free_space.appends.lock();
+        appends.writing.remove(&self.ticket);
+        if len > 0 {
+            appends.ranges.insert(self.ticket, (Extent { start, len }, false));
+        }
+    }
+}
+
+impl Drop for AppendTicket<'_> {
+    fn drop(&mut self) {
+        let Some(free_space) = self.free_space else { return };
+        let mut appends = free_space.appends.lock();
+        appends.writing.remove(&self.ticket);
+        if appends.sweeping > 0 {
+            if let Some(range) = appends.ranges.get_mut(&self.ticket) {
+                range.1 = true;
+            }
+        } else {
+            appends.ranges.remove(&self.ticket);
+        }
+    }
+}
+
+/// A sweep, from before it reads the rows file's length to its end. See
+/// [`Appends`].
+pub(crate) struct SweepGuard<'a> {
+    free_space: &'a FreeSpace,
+}
+
+impl Drop for SweepGuard<'_> {
+    fn drop(&mut self) {
+        let mut appends = self.free_space.appends.lock();
+        appends.sweeping -= 1;
+        if appends.sweeping == 0 {
+            appends.ranges.retain(|_, (_, written)| !*written);
+        }
+    }
 }
 
 impl FreeSpace {
@@ -245,7 +353,43 @@ impl FreeSpace {
             enabled: AtomicBool::new(enabled).into(),
             toggles: AtomicU64::new(0),
             layout: AtomicU64::new(0),
+            appends: Mutex::new(Appends::default()),
         }
+    }
+
+    /// Before an append to the rows file: see [`Appends`]. Inert while
+    /// reclamation is off, as reader tickets are.
+    pub fn begin_append(&self) -> AppendTicket<'_> {
+        if !self.is_enabled() {
+            return AppendTicket { free_space: None, ticket: 0 };
+        }
+        let mut appends = self.appends.lock();
+        let ticket = appends.next;
+        appends.next += 1;
+        appends.writing.insert(ticket);
+        AppendTicket { free_space: Some(self), ticket }
+    }
+
+    /// A sweep starts: before it reads the rows file's length.
+    pub(crate) fn begin_sweep(&self) -> SweepGuard<'_> {
+        self.appends.lock().sweeping += 1;
+        SweepGuard { free_space: self }
+    }
+
+    /// The ticket an append starting now would take.
+    fn append_barrier(&self) -> u64 {
+        self.appends.lock().next
+    }
+
+    /// Whether every append that held a ticket below `barrier` has recorded
+    /// its range.
+    fn appends_landed_before(&self, barrier: u64) -> bool {
+        self.appends.lock().writing.first().is_none_or(|&oldest| oldest >= barrier)
+    }
+
+    /// The recorded ranges a sweep may not have seen the pointer of.
+    pub(crate) fn unseen_appends(&self) -> Vec<Extent> {
+        self.appends.lock().ranges.values().map(|(extent, _)| *extent).collect()
     }
 
     /// See the `layout` field.
@@ -329,13 +473,22 @@ impl FreeSpace {
         self.leaked_loans.load(Ordering::Relaxed)
     }
 
-    /// Claims `need` bytes, returning the offset to write them at.
+    /// [`FreeSpace::alloc_after`] at slot 0: for tests, whose sweeps are
+    /// simulated by calling [`FreeSpace::retire_loan`] directly.
+    #[cfg(test)]
+    pub fn alloc(&self, need: u64) -> Option<u64> {
+        self.alloc_after(need, 0)
+    }
+
+    /// Claims `need` bytes, returning the offset to write them at, lent with
+    /// `floor` ([`Loan::floor`]): `u64::MAX` for a writer, which then names
+    /// its record with [`FreeSpace::owned_by`].
     ///
     /// Best fit: the smallest extent that still fits, so large holes stay
     /// available for large rows. A leftover worth keeping goes back on the list
     /// as its own extent; anything smaller is absorbed into the loan and lost
     /// until the next scan finds it again as an interior gap.
-    pub fn alloc(&self, need: u64) -> Option<u64> {
+    pub fn alloc_after(&self, need: u64, floor: u64) -> Option<u64> {
         if need == 0 || !self.is_enabled() {
             return None;
         }
@@ -358,7 +511,7 @@ impl FreeSpace {
                 chosen_len
             };
 
-            state.in_flight.insert(chosen_start, taken);
+            state.in_flight.insert(chosen_start, Loan { len: taken, floor });
             self.in_flight_count
                 .store(state.in_flight.len(), Ordering::Release);
 
@@ -375,10 +528,12 @@ impl FreeSpace {
         Some(start)
     }
 
-    /// A scan saw a live pointer at `start`: whatever loan covered it is now
-    /// accounted for by that pointer and no longer needs shielding.
+    /// A scan saw the record in pointer slot `slot` name `start`: a loan of
+    /// that start taken when the file was no longer than `slot` records is
+    /// now accounted for by that record and no longer needs shielding. A
+    /// record older than the loan is not its owner ([`Loan::floor`]).
     #[inline]
-    fn retire_loan(&self, start: u64) {
+    fn retire_loan(&self, start: u64, slot: u64) {
         // Called once per live row of a full scan, and almost always with
         // nothing outstanding, so the lock is worth avoiding. Hinted `likely`
         // to make the early return the fall-through, which is the same claim
@@ -389,10 +544,27 @@ impl FreeSpace {
             return;
         }
         let state = &mut *self.state.lock();
-        if state.in_flight.remove(&start).is_some() {
+        if state.in_flight.get(&start).is_some_and(|loan| slot >= loan.floor) {
+            state.in_flight.remove(&start);
             self.in_flight_count
                 .store(state.in_flight.len(), Ordering::Release);
         }
+    }
+
+    /// The writer of the extent lent at `start` wrote the record that owns it,
+    /// in pointer slot `slot`: from here, a sweep that reads that record
+    /// retires the loan. A sweep that read it before this leaves the loan for
+    /// the next one.
+    pub fn owned_by(&self, start: u64, slot: u64) {
+        if let Some(loan) = self.state.lock().in_flight.get_mut(&start) {
+            loan.floor = slot;
+        }
+    }
+
+    /// The floor of the loan of the extent at `start`, if one is out.
+    #[cfg(test)]
+    pub(crate) fn loan_floor(&self, start: u64) -> Option<u64> {
+        self.state.lock().in_flight.get(&start).map(|loan| loan.floor)
     }
 
     /// Gives back an extent whose write failed.
@@ -424,18 +596,42 @@ impl FreeSpace {
 
     /// [`FreeSpace::quarantine`], unless the rows were moved since the sweep
     /// read `layout`: see the `layout` field.
+    ///
+    /// What is on the list or on loan now is left out. A sweep finds an extent
+    /// still waiting on the list as free, as it is, and one lent since the
+    /// sweep as free too; held here, either came back when the batch matured,
+    /// after a writer had taken it from the list and the loan had been
+    /// retired by the record that now owns it, and was handed out a second
+    /// time over that row. Left out, the batch holds only bytes nothing can
+    /// write until it is published: the list and the loans are the only ways
+    /// a writer reaches an extent below the frontier.
     fn quarantine_at(&self, candidates: Vec<Extent>, barrier: u64, layout: u64) {
         if candidates.is_empty() {
             return;
         }
+        // The list and the loans read under the same lock the quarantine is
+        // stored under (state, then quarantined: nothing takes them the other
+        // way round), so no writer can take an extent between the two.
+        let state = self.state.lock();
         let mut quarantined = self.quarantined.lock();
         if self.layout() != layout {
             return;
         }
+        let taken: Vec<Extent> = state
+            .extents
+            .iter()
+            .map(|&(len, start)| Extent { start, len })
+            .chain(state.in_flight.iter().map(|(&start, loan)| Extent { start, len: loan.len }))
+            .chain(self.unseen_appends())
+            .collect();
+        drop(state);
+        let candidates = subtract_ranges(merge_overlapping(candidates), &taken);
         // One batch per barrier is enough: a later run's findings supersede an
         // earlier one's, since both derive from the same authoritative sweep.
         quarantined.clear();
-        quarantined.push((barrier, candidates));
+        if !candidates.is_empty() {
+            quarantined.push((barrier, candidates));
+        }
     }
 
     /// Takes the quarantined batches whose barrier has since been passed.
@@ -480,11 +676,18 @@ impl FreeSpace {
             return;
         }
 
+        // Each byte once: two overlapping entries would be lent to two rows.
+        candidates = merge_overlapping(candidates);
+        // Appended rows whose pointer the sweep may have missed (`Appends`).
+        let unseen = self.unseen_appends();
+        if !unseen.is_empty() {
+            candidates = subtract_ranges(candidates, &unseen);
+        }
         if !state.in_flight.is_empty() {
             let loans: Vec<Extent> = state
                 .in_flight
                 .iter()
-                .map(|(&start, &len)| Extent { start, len })
+                .map(|(&start, loan)| Extent { start, len: loan.len })
                 .collect();
             candidates = subtract_ranges(candidates, &loans);
         }
@@ -526,8 +729,10 @@ impl FreeSpace {
 
 /// `ranges` minus `holes`, both half-open. Neither input need be sorted.
 fn subtract_ranges(ranges: Vec<Extent>, holes: &[Extent]) -> Vec<Extent> {
-    let mut sorted_holes: Vec<Extent> = holes.to_vec();
-    sorted_holes.sort_unstable_by_key(|h| h.start);
+    // Sorted and disjoint, so their ends rise with their starts: the search
+    // below relies on it, and holes gathered from the list, the loans and
+    // the appends are not promised to be disjoint.
+    let sorted_holes = merge_overlapping(holes.to_vec());
 
     let mut out = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -1390,8 +1595,10 @@ async fn scan_pointers<S: StorageIO>(
         // that was written into a reclaimed extent and then deleted before the
         // next sweep — the loan outlived the row and shielded those bytes from
         // every scan thereafter. Under delete-and-refill churn that is the whole
-        // working set, once per cycle.
-        free_space.retire_loan(pointer.position);
+        // working set, once per cycle. Only a record appended since the loan
+        // was taken, though: an older one at the same start is the version
+        // whose extent was reclaimed (`Loan::floor`).
+        free_space.retire_loan(pointer.position, slot as u64);
 
         if horizon.is_reclaimable(pointer.deleted, pointer.xmin, pointer.xmax) {
             result.dead_rows += 1;
@@ -1862,9 +2069,13 @@ pub async fn run_once<S: StorageIO>(
     };
     // Under the gate: a compaction that ran before this has finished.
     let layout = free_space.layout();
+    // Before the length is read: a row appended from here on whose pointer
+    // this sweep misses stays shielded until the sweep ends (`Appends`).
+    let _sweep = free_space.begin_sweep();
     // Read before the pointer sweep. A row appended during the scan lands past
     // this, so clamping to it can only ever exclude bytes, never include ones a
-    // pointer has since claimed.
+    // pointer has since claimed. One appended before it whose pointer the scan
+    // missed is not past it: `Appends` shields that one.
     let rows_len = io_rows.get_len().await;
     // Before the sweep reads a slot: clears are applied only if no
     // renumbering began or ended since.
@@ -2037,6 +2248,27 @@ pub async fn run_once<S: StorageIO>(
     #[cfg(test)]
     run_once_test_hooks::reached(free_space, run_once_test_hooks::BEFORE_PUBLISH).await;
 
+    // Every append that began before now has recorded its range, so what
+    // follows can leave out each one whose pointer the scan may have missed
+    // (`Appends`). An append is a write and a length update, so this is short;
+    // one that began after now lands past `rows_len`.
+    let appended = free_space.append_barrier();
+    let mut waits = 0u32;
+    while !free_space.appends_landed_before(appended) {
+        if ctx.retired() {
+            report.deferred = true;
+            return Ok(report);
+        }
+        // A yield is enough for an append between two instructions; one held
+        // up by a slow device is waited on without spinning.
+        waits += 1;
+        if waits < 64 {
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     // Stamped after the scan: a query holding a ticket at or beyond this one
     // started after every tombstone the scan relied on was durable, so it
     // cannot be holding a pointer into any of these extents.
@@ -2092,10 +2324,12 @@ pub async fn run_once<S: StorageIO>(
         return Ok(report);
     }
 
-    // Anything a previous run had to hold back is safe now too: this run's
-    // barrier is at least as recent as theirs.
-    let mut candidates = candidates;
-    candidates.extend(free_space.take_matured(readers));
+    // A batch an earlier run had to hold back is superseded, not added:
+    // nothing could write into it (`FreeSpace::quarantine_at`), so whatever of
+    // it is still free this sweep found again, and its barrier is older than
+    // this run's. Added to this run's findings, it overlapped them, and two
+    // list entries over the same bytes are two rows written over each other.
+    let _superseded = free_space.take_matured(readers);
     free_space.publish_at(candidates, layout);
     report.reclaimed_bytes = free_space.free_bytes();
     report.extents = free_space.len() as u64;
@@ -3145,6 +3379,16 @@ mod tests {
         assert!(subtract_ranges(vec![e(0, 50)], &[e(0, 50)]).is_empty());
     }
 
+    /// Holes that overlap: one inside another. Sorted by start alone their
+    /// ends fall, and the search for the first hole that matters skipped the
+    /// one covering the range, leaving it to be published.
+    ///
+    /// Mutation: dropping the merge of the holes fails the assert.
+    #[test]
+    fn subtraction_handles_holes_that_overlap() {
+        assert_eq!(subtract_ranges(vec![e(50, 10)], &[e(0, 100), e(10, 10)]), Vec::<Extent>::new());
+    }
+
     #[test]
     fn subtraction_handles_multiple_holes_in_one_range() {
         let out = subtract_ranges(vec![e(0, 100)], &[e(10, 10), e(50, 10)]);
@@ -3203,9 +3447,175 @@ mod tests {
         let fs = FreeSpace::new(true);
         fs.publish(vec![e(0, 500)]);
         assert_eq!(fs.alloc(100), Some(0));
-        fs.retire_loan(0);
+        fs.retire_loan(0, 0);
         fs.publish(vec![e(0, 500)]);
         assert_eq!(fs.alloc(500), Some(0));
+    }
+
+    /// The version whose extent was reclaimed keeps its record, at the same
+    /// start the extent is lent from, in every later sweep. That record is
+    /// not the loan's owner: retiring on it dropped the loan before the
+    /// writer's own record existed, and the extent was published again over
+    /// the row just written into it (`reader_miss_stress`, spread writes,
+    /// 2026-11-11).
+    ///
+    /// Mutation: `retire_loan` ignoring the floor fails the second assert.
+    #[test]
+    fn a_loan_is_retired_only_by_a_record_newer_than_it() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500)]);
+        // Lent while the pointer file held 10 records.
+        assert_eq!(fs.alloc_after(500, 10), Some(0));
+        // A sweep meets the reclaimed version's record, slot 3, at offset 0,
+        // and no record of the writer's yet: the extent looks free.
+        fs.retire_loan(0, 3);
+        assert_eq!(fs.loans_outstanding(), 1, "an older record retired the loan");
+        fs.publish(vec![e(0, 500)]);
+        assert_eq!(fs.alloc_after(500, 11), None, "a lent extent was handed out twice");
+        // The writer's record, appended at slot 10 or later, retires it.
+        fs.retire_loan(0, 10);
+        assert_eq!(fs.loans_outstanding(), 0);
+    }
+
+    /// A writer's loan has no owner until its record is written: no record,
+    /// however new, retires it before then, and afterwards only that record
+    /// or a later one does.
+    ///
+    /// Mutation: `owned_by` not setting the floor fails the last assert;
+    /// `retire_loan` ignoring the floor, the first.
+    #[test]
+    fn a_loan_is_retired_only_once_its_owner_is_named() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500)]);
+        assert_eq!(fs.alloc_after(500, u64::MAX), Some(0));
+        fs.retire_loan(0, 1_000_000);
+        assert_eq!(fs.loans_outstanding(), 1, "a loan with no owner yet was retired");
+        fs.owned_by(0, 7);
+        fs.retire_loan(0, 6);
+        assert_eq!(fs.loans_outstanding(), 1, "a record older than the owner retired the loan");
+        fs.retire_loan(0, 7);
+        assert_eq!(fs.loans_outstanding(), 0, "the owner's record did not retire the loan");
+    }
+
+    /// A run that could not wait out its readers quarantines what it found.
+    /// An extent still on the list was in it, found free as it is; a writer
+    /// then took it from the list, a sweep saw the writer's record and
+    /// retired the loan, and the matured batch put the extent back on the
+    /// list under that row. The quarantine leaves out what is on the list or
+    /// on loan, which nothing else can reach.
+    ///
+    /// Mutation: `quarantine_at` without the subtraction fails the asserts.
+    #[test]
+    fn a_quarantined_batch_holds_nothing_the_list_or_a_loan_already_holds() {
+        let reg = Arc::new(ReaderRegistry::new());
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 500), e(1000, 500)]);
+        assert_eq!(fs.alloc_after(500, 5), Some(0));
+
+        // The sweep found 0..500 (lent since), 1000..1500 (still listed) and
+        // 2000..2500 (newly dead) free, and a query held it back.
+        let held = reg.enter();
+        fs.quarantine(vec![e(0, 500), e(1000, 500), e(2000, 500)], reg.barrier());
+        assert_eq!(fs.quarantined_extents(), 1, "only the newly dead extent waits");
+
+        // The writer's record retires its loan; another takes the listed one.
+        fs.retire_loan(0, 5);
+        assert_eq!(fs.alloc_after(500, 6), Some(1000));
+        fs.retire_loan(1000, 6);
+
+        drop(held);
+        let matured = fs.take_matured(&reg);
+        assert_eq!(matured, vec![e(2000, 500)], "a matured batch named bytes rows now own");
+    }
+
+    /// A row appended at the frontier is in the file before its pointer. A
+    /// sweep that missed the pointer finds its bytes free, and published them
+    /// to the next writer over the row (`Appends`). They stay out until the
+    /// sweep ends, even once the pointer is written: the sweep that missed it
+    /// is still the one publishing.
+    ///
+    /// Mutation: `publish_at` without the subtraction fails the first assert;
+    /// the ticket's drop forgetting the range during a sweep, the second.
+    #[test]
+    fn an_appended_row_a_sweep_may_have_missed_is_not_published() {
+        let fs = FreeSpace::new(true);
+        let sweep = fs.begin_sweep();
+        let mut append = fs.begin_append();
+        append.landed(1000, 100);
+        // The sweep found 900..1200 owned by nothing.
+        fs.publish(vec![e(900, 300)]);
+        assert_eq!(fs.free_bytes(), 200, "an appended row's bytes were published");
+        assert_eq!(fs.alloc(101), None);
+
+        // Its pointer is written while the sweep still runs.
+        drop(append);
+        fs.publish(vec![e(900, 300)]);
+        assert_eq!(fs.free_bytes(), 200, "the sweep that missed the pointer published its row");
+
+        // A later sweep reads the pointer, so nothing is shielded.
+        drop(sweep);
+        fs.publish(vec![e(900, 300)]);
+        assert_eq!(fs.free_bytes(), 300);
+    }
+
+    /// An append whose pointer is written while no sweep runs is forgotten
+    /// at once: every later sweep reads that pointer. Kept, a table only ever
+    /// appended to (never swept) held one entry per row for good.
+    ///
+    /// Mutation: the ticket's drop never forgetting fails the assert.
+    #[test]
+    fn an_append_finished_outside_a_sweep_keeps_nothing() {
+        let fs = FreeSpace::new(true);
+        for at in 0..100u64 {
+            let mut append = fs.begin_append();
+            append.landed(at * 100, 100);
+        }
+        assert!(fs.unseen_appends().is_empty(), "finished appends were kept with no sweep running");
+    }
+
+    /// A sweep about to publish waits for each append that took its ticket
+    /// before then to record its range; one that takes its ticket afterwards
+    /// lands past the length the sweep read and does not hold it up.
+    ///
+    /// Mutation: `appends_landed_before` always true fails the first assert.
+    #[test]
+    fn a_sweep_waits_only_for_appends_begun_before_it_publishes() {
+        let fs = FreeSpace::new(true);
+        let mut early = fs.begin_append();
+        let barrier = fs.append_barrier();
+        let _late = fs.begin_append();
+        assert!(!fs.appends_landed_before(barrier), "an append still writing was taken as recorded");
+        early.landed(0, 50);
+        assert!(fs.appends_landed_before(barrier), "an append begun after the barrier held it up");
+    }
+
+    /// A quarantined batch leaves out appended rows whose pointer the sweep
+    /// may have missed, as it leaves out the list and the loans.
+    ///
+    /// Mutation: `quarantine_at` without `unseen_appends` fails the assert.
+    #[test]
+    fn a_quarantined_batch_holds_no_appended_row() {
+        let reg = Arc::new(ReaderRegistry::new());
+        let fs = FreeSpace::new(true);
+        let _sweep = fs.begin_sweep();
+        let mut append = fs.begin_append();
+        append.landed(1000, 100);
+        let _held = reg.enter();
+        fs.quarantine(vec![e(1000, 100), e(2000, 100)], reg.barrier());
+        assert_eq!(fs.quarantined_extents(), 1, "an appended row was quarantined for publication");
+    }
+
+    /// Candidates that overlap are listed once: as two entries, the same
+    /// bytes were lent to two rows.
+    ///
+    /// Mutation: `publish_at` without the merge fails the second alloc.
+    #[test]
+    fn overlapping_candidates_are_listed_once() {
+        let fs = FreeSpace::new(true);
+        fs.publish(vec![e(0, 200), e(100, 200)]);
+        assert_eq!(fs.free_bytes(), 300);
+        assert_eq!(fs.alloc(300), Some(0));
+        assert_eq!(fs.alloc(100), None, "overlapping entries lent the same bytes twice");
     }
 
     #[test]

@@ -104,7 +104,7 @@ struct Tally {
     sweeps: AtomicU64,
 }
 
-async fn stress(db: Arc<Database>, secs: u64, label: &'static str) {
+async fn stress(db: Arc<Database>, secs: u64, label: &'static str, hot: bool) {
     ok(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL, pad TEXT NOT NULL)").await;
     let values: Vec<String> = (0..N).map(|i| format!("({}, 0, 'p')", i)).collect();
     ok(&db, &format!("INSERT INTO t (id, v, pad) VALUES {}", values.join(", "))).await;
@@ -128,7 +128,7 @@ async fn stress(db: Arc<Database>, secs: u64, label: &'static str) {
             while !stop.load(Ordering::Relaxed) {
                 // Hot mode: everyone on the same few rows, as the original
                 // reproduction had it — contention, conflicts, retries.
-                let id = if hot() { xs() % 2 } else { xs() % N as u64 };
+                let id = if hot { xs() % 2 } else { xs() % N as u64 };
                 let q = if xs() % 2 == 0 {
                     format!("UPDATE t SET v = v + 1 WHERE id = {}", id)
                 } else {
@@ -181,7 +181,7 @@ async fn stress(db: Arc<Database>, secs: u64, label: &'static str) {
             };
             while !stop.load(Ordering::Relaxed) {
                 let which = xs() % 4;
-                let pick = |r: u64| if hot() { r % 2 } else { r % N as u64 };
+                let pick = |r: u64| if hot { r % 2 } else { r % N as u64 };
                 let (q, verdict): (String, Option<String>) = match which {
                     0 => {
                         let q = format!("SELECT COUNT(*) FROM t WHERE id < {}", N);
@@ -307,7 +307,7 @@ fn a_reader_never_misses_a_row_in_memory() {
     init_cache();
     on_a_big_stack(async {
         let db = Arc::new(Database::new_named("", true, "missmem").await);
-        stress(db, secs(), "memory").await;
+        stress(db, secs(), "memory", hot()).await;
     });
 }
 
@@ -322,7 +322,44 @@ fn a_reader_never_misses_a_row_on_files() {
     on_a_big_stack(async {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::new_named(dir.path().to_str().unwrap(), false, "missfile").await);
-        stress(db, secs(), "file").await;
+        stress(db, secs(), "file", hot()).await;
+        drop(dir);
+    });
+}
+
+/// Writes spread over the whole set rather than two rows: many relocations
+/// into reclaimed and appended space, little contention. The shape that found
+/// three ways the reclamation sweep handed out bytes a live row still held
+/// (2026-11-11, `vacuum::Loan::floor`, `FreeSpace::quarantine_at`,
+/// `vacuum::Appends`): rows went missing from every read and others read
+/// twice, in most minute-long runs. A row lost that way is lost for good, so
+/// a miss here is storage, not a read.
+#[test]
+fn a_reader_never_misses_a_row_with_spread_writes_in_memory() {
+    if !mode_enabled("memory") {
+        return;
+    }
+    MAX_PERMITS_THREADS.get_or_init(|| 8);
+    BATCH_SIZE.get_or_init(|| 1_000);
+    init_cache();
+    on_a_big_stack(async {
+        let db = Arc::new(Database::new_named("", true, "missmemspread").await);
+        stress(db, secs(), "memory, spread", false).await;
+    });
+}
+
+#[test]
+fn a_reader_never_misses_a_row_with_spread_writes_on_files() {
+    if !mode_enabled("file") {
+        return;
+    }
+    MAX_PERMITS_THREADS.get_or_init(|| 8);
+    BATCH_SIZE.get_or_init(|| 1_000);
+    init_cache();
+    on_a_big_stack(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new_named(dir.path().to_str().unwrap(), false, "missfilespread").await);
+        stress(db, secs(), "file, spread", false).await;
         drop(dir);
     });
 }

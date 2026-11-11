@@ -2394,14 +2394,31 @@ impl RowPointer {
         // the free list because no live pointer refers to it and every query
         // that could have held one has finished, so writing into it cannot
         // disturb a read in progress.
-        let reclaimed = free_space.and_then(|f| f.alloc(total_bytes as u64));
+        //
+        // Lent with no owner yet: only the record below, once written, may
+        // retire the loan, not an older record at the same start
+        // (`vacuum::Loan::floor`, `FreeSpace::owned_by`).
+        let reclaimed = free_space.and_then(|f| f.alloc_after(total_bytes as u64, u64::MAX));
 
+        // An append is shielded from sweeps from before it writes until its
+        // pointer below is written, when the ticket drops: its bytes are in
+        // the file first, owned by nothing a sweep can see (`vacuum::Appends`).
+        let mut appending = match (reclaimed, free_space) {
+            (None, Some(f)) => Some(f.begin_append()),
+            _ => None,
+        };
         let io_position = match reclaimed {
             Some(position) => {
                 let _ = rows_io.write_data_txn(txn, position, slice).await;
                 position
             }
-            None => rows_io.append_data_txn(txn, slice).await.0,
+            None => {
+                let position = rows_io.append_data_txn(txn, slice).await.0;
+                if let Some(ticket) = appending.as_mut() {
+                    ticket.landed(position, total_bytes as u64);
+                }
+                position
+            }
         };
         row_pointer.position = io_position;
 
@@ -2419,7 +2436,12 @@ impl RowPointer {
         // will ever own it. The loan shields those bytes from every future scan,
         // so without giving it back the space is lost for the life of the
         // process.
-        let (pointer_record_pos, token) = match row_pointer.save_in_txn(&*pointers_io, txn).await {
+        let saved = row_pointer.save_in_txn(&*pointers_io, txn).await;
+        drop(appending);
+        if let (Some(free_space), Some(position), Ok((record, _))) = (free_space, reclaimed, &saved) {
+            free_space.owned_by(position, record / ROW_POINTER_RECORD_LEN as u64);
+        }
+        let (pointer_record_pos, token) = match saved {
             Ok(result) => result,
             Err(e) => {
                 if let (Some(free_space), Some(position)) = (free_space, reclaimed) {

@@ -170,9 +170,15 @@ async fn append(target: &mut CopyTarget, versions: Vec<RawVersion>) -> io::Resul
     let d = target.table.data()?;
     let mut txn = d.io_rows.begin_txn();
     for mut v in versions {
+        // Shielded from the target's sweeps until its pointer is written, as
+        // every append is (`vacuum::Appends`).
+        let mut appending = d.free_space.begin_append();
         let (pos, _) = d.io_rows.append_data_txn(txn, &v.bytes).await;
+        appending.landed(pos, v.bytes.len() as u64);
         v.pointer.position = pos;
-        if let Err(e) = v.pointer.save_in_txn(&*d.io_pointers, txn).await {
+        let saved = v.pointer.save_in_txn(&*d.io_pointers, txn).await;
+        drop(appending);
+        if let Err(e) = saved {
             d.io_pointers.abort_txn(txn).await;
             return Err(other(e));
         }

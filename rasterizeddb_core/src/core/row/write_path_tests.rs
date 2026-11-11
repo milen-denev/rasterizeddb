@@ -4624,3 +4624,63 @@ async fn rows_inserted_as_a_sweep_ends_are_counted_live() {
     insert(&t, 9, 0, "after").await;
     assert_eq!(stats.live_rows(), Some(10));
 }
+
+/// The write path records a row it appends at the frontier for as long as a
+/// sweep may have missed its pointer (`vacuum::Appends`): a sweep that read
+/// the rows file's length after the row's bytes and finished before its
+/// pointer published those bytes to the next writer, over the row.
+///
+/// Mutation: the write path not calling `landed` fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_appended_during_a_sweep_stays_shielded_until_it_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "appendshield").await;
+    for i in 0..10u64 {
+        insert(&t, i, 0, "before").await;
+    }
+    let free_space = t.data().unwrap().free_space.clone();
+    let before = t.data().unwrap().io_rows.get_len().await;
+    let sweep = free_space.begin_sweep();
+    insert(&t, 10, 0, "during").await;
+    let after = t.data().unwrap().io_rows.get_len().await;
+    let unseen = free_space.unseen_appends();
+    assert_eq!(
+        unseen.iter().map(|e| (e.start, e.start + e.len)).collect::<Vec<_>>(),
+        vec![(before, after)],
+        "the row appended during the sweep was not shielded"
+    );
+    drop(sweep);
+    assert!(free_space.unseen_appends().is_empty(), "the shield outlived the sweep");
+}
+
+/// A row written into a reclaimed extent names its own record as the
+/// loan's floor, so only that record retires the loan, not the reclaimed
+/// version's record at the same start (`vacuum::Loan::floor`).
+///
+/// Mutation: the write path lending with floor 0, or not calling
+/// `owned_by`, fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reused_extent_is_lent_with_its_own_record_as_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_table(dir.path(), "loanfloor").await;
+    for i in 0..40u64 {
+        insert(&t, i, 0, "a-label-of-a-fixed-moderate-length").await;
+    }
+    t.delete_rows("id < 40", full_fetch(&t.schema.fields), None).await.unwrap();
+    let report = t.vacuum_now().await.unwrap();
+    assert!(report.reclaimed_bytes > 0, "nothing reclaimed: {report:?}");
+    let free_space = t.data().unwrap().free_space.clone();
+    let slots = t.data().unwrap().io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+    let reused_before = free_space.reused_rows();
+    insert(&t, 100, 0, "a-label-of-a-fixed-moderate-length").await;
+    assert_eq!(free_space.reused_rows(), reused_before + 1, "the row did not go into a reclaimed extent");
+    let rows = run(&t, "id = 100").await;
+    assert_eq!(rows.len(), 1);
+    // Every start a loan could be out at: the rows file is a few KB.
+    let floors: Vec<u64> = (0..t.data().unwrap().io_rows.get_len().await)
+        .filter_map(|start| free_space.loan_floor(start))
+        .collect();
+    // The insert appended one record, at slot `slots`.
+    assert_eq!(floors, vec![slots], "the loan's floor is not the slot of the record that owns it");
+}
+
