@@ -4684,3 +4684,169 @@ async fn a_reused_extent_is_lent_with_its_own_record_as_the_floor() {
     assert_eq!(floors, vec![slots], "the loan's floor is not the slot of the record that owns it");
 }
 
+
+fn overlaps(listed: &[crate::core::vacuum::Extent], start: u64, end: u64) -> bool {
+    listed.iter().any(|e| e.start < end && start < e.start + e.len)
+}
+
+/// A row appended at the frontier is in the file before its pointer. A
+/// sweep run in between, after a later row's pointer is already written,
+/// finds the first row's bytes owned by nothing; it published them, and the
+/// next writer given that extent wrote over the row (`vacuum::Appends`).
+///
+/// Mutation: the write path not recording its append, `run_once` not
+/// opening its sweep, or `publish_at` not leaving appends out, fails the
+/// assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_never_publishes_a_row_whose_pointer_is_not_written_yet() {
+    use crate::core::row::row_pointer::write_park;
+    let dir = tempfile::tempdir().unwrap();
+    let t = Arc::new(open_table(dir.path(), "appendgap").await);
+    for i in 0..8u64 {
+        insert(&t, i, 0, "a-label-of-a-fixed-moderate-length").await;
+    }
+    let free_space = t.data().unwrap().free_space.clone();
+    assert!(free_space.listed().is_empty(), "nothing is free yet");
+
+    let start = t.data().unwrap().io_rows.get_len().await;
+    let park = write_park::arm(&free_space);
+    let writer = t.clone();
+    let held = tokio::spawn(async move { insert(&writer, 100, 0, "the-row-held-before-its-pointer").await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), park.parked.notified())
+        .await
+        .expect("the writer never reached its pointer");
+    let end = t.data().unwrap().io_rows.get_len().await;
+    assert!(end > start, "the held row's bytes are not in the file");
+
+    // A later row, pointer and all: the sweep's frontier passes the held one.
+    insert(&t, 101, 0, "a-label-of-a-fixed-moderate-length").await;
+    let report = t.vacuum_now().await.unwrap();
+    assert!(!report.deferred, "{report:?}");
+    assert!(
+        !overlaps(&free_space.listed(), start, end),
+        "the sweep published the bytes of a row whose pointer was not yet written: {:?} over {start}..{end}",
+        free_space.listed()
+    );
+
+    park.release.notify_one();
+    held.await.unwrap();
+    let rows = run(&t, "id = 100").await;
+    assert_eq!(rows.len(), 1, "the held row is missing");
+}
+
+/// A row written into a reclaimed extent shares its start with the
+/// reclaimed version's record, which stays in the pointer file. A sweep run
+/// before the writer's pointer exists reads that old record; it retired the
+/// loan on it and published the extent again, under the row (`vacuum::Loan`).
+///
+/// Mutation: the write path lending with floor 0, or `retire_loan` ignoring
+/// the floor, fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_never_republishes_an_extent_whose_writer_is_still_writing() {
+    use crate::core::row::row_pointer::write_park;
+    let dir = tempfile::tempdir().unwrap();
+    let t = Arc::new(open_table(dir.path(), "loanretire").await);
+    for i in 0..40u64 {
+        insert(&t, i, 0, "a-label-of-a-fixed-moderate-length").await;
+    }
+    t.delete_rows("id < 40", full_fetch(&t.schema.fields), None).await.unwrap();
+    let report = t.vacuum_now().await.unwrap();
+    assert!(report.reclaimed_bytes > 0, "nothing reclaimed: {report:?}");
+    let free_space = t.data().unwrap().free_space.clone();
+    let reused_before = free_space.reused_rows();
+
+    let park = write_park::arm(&free_space);
+    let writer = t.clone();
+    let held = tokio::spawn(async move { insert(&writer, 100, 0, "a-label-of-a-fixed-moderate-length").await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), park.parked.notified())
+        .await
+        .expect("the writer never reached its pointer");
+    assert_eq!(free_space.reused_rows(), reused_before + 1, "the held row did not go into a reclaimed extent");
+    assert_eq!(free_space.loans_outstanding(), 1);
+
+    let report = t.vacuum_now().await.unwrap();
+    assert!(!report.deferred, "{report:?}");
+    assert_eq!(free_space.loans_outstanding(), 1, "a sweep retired the loan of a writer still writing");
+
+    park.release.notify_one();
+    held.await.unwrap();
+    assert_eq!(run(&t, "id = 100").await.len(), 1, "the held row is missing");
+    // Its own record, read by the next sweep, retires the loan.
+    t.vacuum_now().await.unwrap();
+    assert_eq!(free_space.loans_outstanding(), 0, "the writer's own record did not retire its loan");
+}
+
+/// The same row, its pointer written while the sweep that missed it is
+/// still running: that sweep is the one about to publish, so the row stays
+/// out until it ends, not until the pointer exists.
+///
+/// Mutation: `run_once` not opening its sweep, or the ticket's drop
+/// forgetting the row while a sweep runs, fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_whose_pointer_lands_mid_sweep_is_not_published_by_that_sweep() {
+    use crate::core::row::row_pointer::write_park;
+    use crate::core::vacuum::run_once_test_hooks;
+    let dir = tempfile::tempdir().unwrap();
+    let t = Arc::new(open_table(dir.path(), "appendmidsweep").await);
+    for i in 0..8u64 {
+        insert(&t, i, 0, "a-label-of-a-fixed-moderate-length").await;
+    }
+    let free_space = t.data().unwrap().free_space.clone();
+    let start = t.data().unwrap().io_rows.get_len().await;
+    let park = write_park::arm(&free_space);
+    let writer = t.clone();
+    let held = tokio::spawn(async move { insert(&writer, 100, 0, "the-row-held-before-its-pointer").await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), park.parked.notified())
+        .await
+        .expect("the writer never reached its pointer");
+    let end = t.data().unwrap().io_rows.get_len().await;
+    insert(&t, 101, 0, "a-label-of-a-fixed-moderate-length").await;
+
+    // The sweep has read every pointer there is; then the held one lands.
+    let sweep_park = run_once_test_hooks::arm(&free_space, run_once_test_hooks::AFTER_SCAN);
+    let sweeping = t.clone();
+    let sweep = tokio::spawn(async move { sweeping.vacuum_now().await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), sweep_park.parked.notified())
+        .await
+        .expect("the sweep never finished its scan");
+    park.release.notify_one();
+    held.await.unwrap();
+    sweep_park.release.notify_one();
+    let report = sweep.await.unwrap().unwrap();
+    assert!(!report.deferred, "{report:?}");
+    assert!(
+        !overlaps(&free_space.listed(), start, end),
+        "the sweep that missed a row's pointer published it once the pointer landed: {:?} over {start}..{end}",
+        free_space.listed()
+    );
+    assert!(free_space.unseen_appends().is_empty(), "the shield outlived the sweep");
+    assert_eq!(run(&t, "id = 100").await.len(), 1);
+}
+
+/// A sweep about to publish waits for an append that took its ticket
+/// earlier and has not yet recorded where it landed: until it has, the
+/// sweep cannot leave it out.
+///
+/// Mutation: `run_once` not waiting for earlier tickets fails the assert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_waits_for_an_append_that_has_not_recorded_its_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Arc::new(open_table(dir.path(), "appendwait").await);
+    for i in 0..8u64 {
+        insert(&t, i, 0, "a-label-of-a-fixed-moderate-length").await;
+    }
+    let free_space = t.data().unwrap().free_space.clone();
+    let mut append = free_space.begin_append();
+    let sweeping = t.clone();
+    let sweep = tokio::spawn(async move { sweeping.vacuum_now().await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!sweep.is_finished(), "the sweep published without waiting for an append in progress");
+    append.landed(1 << 40, 64);
+    drop(append);
+    let report = tokio::time::timeout(std::time::Duration::from_secs(30), sweep)
+        .await
+        .expect("the sweep did not go on once the append landed")
+        .unwrap()
+        .unwrap();
+    assert!(!report.deferred, "{report:?}");
+}

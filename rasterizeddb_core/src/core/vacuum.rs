@@ -561,6 +561,12 @@ impl FreeSpace {
         }
     }
 
+    /// The extents on the list now.
+    #[cfg(test)]
+    pub(crate) fn listed(&self) -> Vec<Extent> {
+        self.state.lock().extents.iter().map(|&(len, start)| Extent { start, len }).collect()
+    }
+
     /// The floor of the loan of the extent at `start`, if one is out.
     #[cfg(test)]
     pub(crate) fn loan_floor(&self, start: u64) -> Option<u64> {

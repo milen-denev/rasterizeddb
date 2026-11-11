@@ -2429,6 +2429,13 @@ impl RowPointer {
             std::sync::atomic::Ordering::AcqRel,
         );
 
+        // Tests: a writer held here has its bytes in place and no pointer yet,
+        // the window a sweep must not publish (`write_park`).
+        #[cfg(test)]
+        if let Some(f) = free_space {
+            write_park::reached(f).await;
+        }
+
         // Write the pointer last, taking its record offset from the same append
         // so later `save_at` / `delete` calls target this record and no other.
         //
@@ -2489,6 +2496,46 @@ impl RowPointer {
         }
 
         Ok((pointer_record_pos, row_pointer))
+    }
+}
+
+/// Holds one writer of a table between its row bytes and its pointer record,
+/// for tests of what a sweep may publish meanwhile.
+#[cfg(test)]
+pub(crate) mod write_park {
+    use std::sync::Arc;
+
+    use crate::core::vacuum::FreeSpace;
+
+    #[derive(Default)]
+    pub(crate) struct Park {
+        /// Notified once the writer is held.
+        pub parked: tokio::sync::Notify,
+        /// Notify to let it write its pointer.
+        pub release: tokio::sync::Notify,
+    }
+
+    static PARK: parking_lot::Mutex<Option<(usize, Arc<Park>)>> = parking_lot::Mutex::new(None);
+
+    /// Holds the next writer of the table `free_space` belongs to, once.
+    pub(crate) fn arm(free_space: &FreeSpace) -> Arc<Park> {
+        let park = Arc::new(Park::default());
+        *PARK.lock() = Some((free_space as *const _ as usize, park.clone()));
+        park
+    }
+
+    pub(super) async fn reached(free_space: &FreeSpace) {
+        let park = {
+            let mut armed = PARK.lock();
+            match armed.as_ref() {
+                Some((at, _)) if *at == free_space as *const _ as usize => armed.take().map(|(_, p)| p),
+                _ => None,
+            }
+        };
+        if let Some(park) = park {
+            park.parked.notify_one();
+            park.release.notified().await;
+        }
     }
 }
 
