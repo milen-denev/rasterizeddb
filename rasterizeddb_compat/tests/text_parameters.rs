@@ -219,6 +219,46 @@ async fn a_typed_timestamp_value_is_read_as_its_declared_type() {
     );
 }
 
+/// A named statement works out once where its untyped values land, and again
+/// after the schema moves under it. Bound the same way each time, `'007'`
+/// compared with an integer column is the number 7, and compared with a text
+/// column is the text `007` and nothing else; an answer kept across the
+/// change compared the text column with the number. The second bind of each
+/// pair runs from what the first worked out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_statement_relearns_where_its_values_land_after_ddl() {
+    let server = TestServer::start().await.expect("server");
+    let mut c = Raw::connect(server.port()).await;
+    let find = "SELECT id FROM rl WHERE v = $1 ORDER BY id";
+
+    c.simple("CREATE TABLE rl (id INT NOT NULL, v INT)").await;
+    c.simple("INSERT INTO rl VALUES (1, 7), (2, 8), (3, 70)").await;
+    let found = c.run("q", Some(find), &[], &[Some("007")]).await.expect("an integer column");
+    assert_eq!(texts(found), [["1"]]);
+    let found = c.run("q", None, &[], &[Some("0070")]).await.expect("again");
+    assert_eq!(texts(found), [["3"]]);
+
+    // PostgreSQL 17: `v = '007'` over text finds the one row spelled so.
+    c.simple("DROP TABLE rl").await;
+    c.simple("CREATE TABLE rl (id INT NOT NULL, v TEXT)").await;
+    c.simple("INSERT INTO rl VALUES (1, '007'), (2, '7'), (3, '0007'), (4, '7.0')").await;
+    let found = c.run("q", None, &[], &[Some("007")]).await.expect("a text column");
+    assert_eq!(texts(found), [["1"]]);
+    let found = c.run("q", None, &[], &[Some("7")]).await.expect("again");
+    assert_eq!(texts(found), [["2"]]);
+
+    // And back: the text column's answer is not kept either.
+    c.simple("DROP TABLE rl").await;
+    c.simple("CREATE TABLE rl (id INT NOT NULL, v INT)").await;
+    c.simple("INSERT INTO rl VALUES (1, 7), (2, 8)").await;
+    let found = c.run("q", None, &[], &[Some("007")]).await.expect("an integer column again");
+    assert_eq!(texts(found), [["1"]]);
+
+    // The same text prepared again under its name keeps what was learned.
+    let found = c.run("q", Some(find), &[], &[Some("08")]).await.expect("prepared again");
+    assert_eq!(texts(found), [["2"]]);
+}
+
 /// Wherever an untyped value lands in a text column, it is stored as sent:
 /// the shapes below place the parameter where its position does not name
 /// the column (an alias, a CTE ahead of the INSERT, `INSERT … SELECT`), and

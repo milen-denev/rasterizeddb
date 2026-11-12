@@ -2862,6 +2862,13 @@ struct StatementInfo {
     /// client declared none (`param_infer`). Bind decodes values as these: a
     /// client encodes each one as the type it was told.
     inferred_oids: Option<Vec<i32>>,
+    /// For each parameter, whether it stands, whole, where a text column
+    /// takes it (`param_infer`), with the schema generation that was read
+    /// under. Bind asks this of every untyped number-looking value, and the
+    /// answer is the text's and the schema's alone, so it is worked out once
+    /// rather than by tokenizing the statement twice per Bind. Keyed like a
+    /// [`DescribeCacheEntry`]: the generation is read before the inference.
+    text_slots: Option<(u64, Box<[bool]>)>,
 }
 
 /// The column list a `Describe` gave the client, and how it was computed.
@@ -3112,9 +3119,11 @@ where
     // Re-preparing the identical text with the identical parameter types — an
     // unnamed statement re-sent with every command — keeps what was learned
     // describing it. Anything else starts afresh.
-    let (describe_cache, prepared) = match state.statements.remove(&stmt_name) {
-        Some(old) if *old.sql == *query && old.param_oids == param_oids => (old.describe_cache, old.prepared),
-        _ => (Vec::new(), PreparedSelect::Unknown),
+    let (describe_cache, prepared, text_slots) = match state.statements.remove(&stmt_name) {
+        Some(old) if *old.sql == *query && old.param_oids == param_oids => {
+            (old.describe_cache, old.prepared, old.text_slots)
+        }
+        _ => (Vec::new(), PreparedSelect::Unknown, None),
     };
     state.statements.insert(
         stmt_name,
@@ -3127,6 +3136,7 @@ where
             value_free: value_free_shape(&query),
             describe_cache,
             inferred_oids: None,
+            text_slots,
             prepared,
         },
     );
@@ -3229,19 +3239,34 @@ where
                 .is_some_and(|v| std::str::from_utf8(v).is_ok_and(crate::pg_params::is_numeric_literal))
     };
     if params.iter().any(untyped_number) {
-        if let Some(sql) = state.statements.get(&stmt).map(|s| s.sql.clone()) {
-            let placed = param_infer::infer_where_placed(database, &sql, &[]);
-            // Only where the parameter is the slot's whole value: an operand
-            // of an expression there (`$1 + 1`, `-$1`) is the expression's to
-            // type, and typed text it made `'007' + 1` refuse where base and
-            // PostgreSQL store 8.
-            let whole = param_infer::whole_value_params(&sql, params.len());
-            for (idx, p) in params.iter_mut().enumerate() {
-                if p.oid == 0
-                    && whole.get(idx).copied().unwrap_or(false)
-                    && matches!(placed.get(idx).copied().flatten(), Some(25 | 1042 | 1043 | 19))
-                {
-                    p.oid = 25;
+        // Read before inferring, never after: a schema change landing while
+        // the inference runs then leaves the answer under a generation no
+        // later Bind will see.
+        let generation = database
+            .schema_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(info) = state.statements.get_mut(&stmt) {
+            let known = matches!(&info.text_slots, Some((at, slots)) if *at == generation && slots.len() == params.len());
+            if !known {
+                let placed = param_infer::infer_where_placed(database, &info.sql, &[]);
+                // Only where the parameter is the slot's whole value: an
+                // operand of an expression there (`$1 + 1`, `-$1`) is the
+                // expression's to type, and typed text it made `'007' + 1`
+                // refuse where base and PostgreSQL store 8.
+                let whole = param_infer::whole_value_params(&info.sql, params.len());
+                let slots = (0..params.len())
+                    .map(|idx| {
+                        whole.get(idx).copied().unwrap_or(false)
+                            && matches!(placed.get(idx).copied().flatten(), Some(25 | 1042 | 1043 | 19))
+                    })
+                    .collect();
+                info.text_slots = Some((generation, slots));
+            }
+            if let Some((_, slots)) = &info.text_slots {
+                for (p, text) in params.iter_mut().zip(slots.iter()) {
+                    if p.oid == 0 && *text {
+                        p.oid = 25;
+                    }
                 }
             }
         }
