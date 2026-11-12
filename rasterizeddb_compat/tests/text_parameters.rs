@@ -391,3 +391,40 @@ async fn a_value_assigned_to_a_text_column_is_its_text() {
     let found = c.run("", Some("SELECT id FROM pu WHERE v = ($1) ORDER BY id"), &[], &[Some("0098")]).await.expect("select");
     assert_eq!(texts(found), [["13"], ["15"]]);
 }
+
+/// A block's DDL moves the schema twice: when it runs, and again when a
+/// ROLLBACK puts the table back. A prepared comparison must learn where its
+/// value lands at each move: an integer column's answer kept for a text
+/// column compares the text with a number (`text = integer`), and the text
+/// column's answer kept for an integer one is harmless, so each order is
+/// checked where it bites. A text column outside the block and an integer
+/// one in it tests the ROLLBACK's move; the other way about tests the DDL's
+/// own. Each order prepares its own statement: a re-Parse of the same text
+/// keeps what was learned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_statement_relearns_after_a_blocks_ddl_rolls_back() {
+    let server = TestServer::start().await.expect("server");
+    let mut c = Raw::connect(server.port()).await;
+    let find = "SELECT id FROM bl WHERE v = $1 ORDER BY id";
+    for (name, outside, inside) in [("find_t", "TEXT", "INT"), ("find_i", "INT", "TEXT")] {
+        let rows = |ty: &str| {
+            if ty == "TEXT" { "(1, '007'), (2, '7'), (3, '0007')" } else { "(1, 7), (2, 8)" }
+        };
+        c.simple("DROP TABLE IF EXISTS bl").await;
+        c.simple(&format!("CREATE TABLE bl (id INT NOT NULL, v {outside})")).await;
+        c.simple(&format!("INSERT INTO bl VALUES {}", rows(outside))).await;
+        let found = c.run(name, Some(find), &[], &[Some("007")]).await.expect("outside the block");
+        assert_eq!(texts(found), [["1"]], "{outside} outside");
+
+        c.simple("BEGIN").await;
+        c.simple("DROP TABLE bl").await;
+        c.simple(&format!("CREATE TABLE bl (id INT NOT NULL, v {inside})")).await;
+        c.simple(&format!("INSERT INTO bl VALUES {}", rows(inside))).await;
+        let found = c.run(name, None, &[], &[Some("007")]).await.expect("in the block");
+        assert_eq!(texts(found), [["1"]], "{inside} in the block, {outside} outside");
+        c.simple("ROLLBACK").await;
+
+        let found = c.run(name, None, &[], &[Some("007")]).await.expect("after the ROLLBACK");
+        assert_eq!(texts(found), [["1"]], "{outside} back after the ROLLBACK");
+    }
+}
