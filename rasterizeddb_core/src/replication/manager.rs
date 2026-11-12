@@ -260,6 +260,8 @@ pub struct Replication {
     log: ArcSwapOption<ReplicationLog>,
     applied: ArcSwap<AppliedState>,
     capture: DashMap<TxId, Capture, ahash::RandomState>,
+    /// Whether `capture` has ever held anything; see [`Self::nothing_captured`].
+    ever_captured: AtomicBool,
     /// Transactions currently applying a remote record, and which origin they
     /// belong to. Their statements must not be captured again, or a mesh would
     /// echo every transaction forever.
@@ -317,6 +319,7 @@ impl Replication {
             log: ArcSwapOption::empty(),
             applied: ArcSwap::from_pointee(AppliedState::in_memory()),
             capture: DashMap::with_hasher(ahash::RandomState::new()),
+            ever_captured: AtomicBool::new(false),
             applying: DashMap::with_hasher(ahash::RandomState::new()),
             peers: DashMap::with_hasher(ahash::RandomState::new()),
             stats: Stats::default(),
@@ -608,7 +611,22 @@ impl Replication {
         self.warn_if_nondeterministic(sql);
 
         let order = self.capture_order.fetch_add(1, Ordering::Relaxed);
+        // Before the entry exists, so nobody can find the map occupied and
+        // the flag still clear.
+        self.ever_captured.store(true, Ordering::Release);
         self.capture.entry(tx).or_default().note(order, sql, table);
+    }
+
+    /// Whether no transaction has a buffer open.
+    ///
+    /// Asked at the end of every transaction on the server, a read's
+    /// included. `DashMap::is_empty` takes each shard's lock in turn, sixty-
+    /// four of them on this machine, to answer it; a database that has never
+    /// captured a statement, which is every one that is not replicating,
+    /// answers from one load instead.
+    #[inline]
+    fn nothing_captured(&self) -> bool {
+        !self.ever_captured.load(Ordering::Acquire) || self.capture.is_empty()
     }
 
     /// Says so, once, when a statement will not mean the same thing elsewhere.
@@ -641,7 +659,7 @@ impl Replication {
 
     /// Drops what `tx` had buffered. A rolled-back transaction ships nothing.
     pub fn on_abort(&self, tx: TxId) {
-        if self.capture.is_empty() {
+        if self.nothing_captured() {
             return;
         }
         self.capture.remove(&tx);
@@ -649,7 +667,7 @@ impl Replication {
 
     /// The same, over every id a transaction turned out to consist of.
     pub fn on_abort_family(&self, members: &[TxId]) {
-        if self.capture.is_empty() {
+        if self.nothing_captured() {
             return;
         }
         for id in members {
@@ -682,7 +700,7 @@ impl Replication {
     /// wrote again, and applying an `UPDATE` before the `INSERT` it depends on
     /// fails on the replica while succeeding here.
     pub fn commit_record_family(&self, members: &[(TxId, bool)]) -> Option<Arc<TxnRecord>> {
-        if self.capture.is_empty() {
+        if self.nothing_captured() {
             return None;
         }
 
