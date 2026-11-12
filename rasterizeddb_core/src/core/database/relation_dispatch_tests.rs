@@ -215,6 +215,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("slot", "a slot primitive: the raw slot, for B3b's table_for, which dispatches"),
     ("partitioned_table", "a slot primitive: the partitioned map's lookup"),
     ("is_partitioned", "a slot primitive: the partitioned map's lookup"),
+    ("is_exact_key", "a slot primitive: resolve()'s own exact-spelling probe of both maps, asked before folded_key scans"),
     ("has_table", "a slot primitive: what tables.contains_key answered; its callers dispatch"),
     ("swap_instance", "a slot primitive: a reload's or a MOVE's swap; its callers dispatch"),
     ("slot_shape_epoch", "a slot primitive: the shape epoch of the slot a name resolves to, a partitioned table's shell's included (B7, Q7)"),
