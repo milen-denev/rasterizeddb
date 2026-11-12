@@ -2396,21 +2396,23 @@ impl ConcurrentProcessor {
         // ORDER BY requires materialized Row structs to sort by column value;
         // fall back to the row-mode path and serialize at the end.
         if order_by.is_some() {
-            let rows = self
-                .process(
-                    table_name,
-                    where_query,
-                    query_row_fetch,
-                    requested_row_fetch,
-                    table_schema,
-                    io_rows,
-                    iterator,
-                    limit,
-                    order_by,
-                    generation,
-                    visibility,
-                )
-                .await?;
+            // Boxed: row mode's future is ~8 KB, and held inline it made every
+            // bytes-mode read's future that much larger, a point lookup's
+            // included, which each layer above copies whole as it moves it.
+            let rows = Box::pin(self.process(
+                table_name,
+                where_query,
+                query_row_fetch,
+                requested_row_fetch,
+                table_schema,
+                io_rows,
+                iterator,
+                limit,
+                order_by,
+                generation,
+                visibility,
+            ))
+            .await?;
             // Row mode decides for itself which fetch it emits, so nothing
             // here can promise the rows are only the requested columns.
             return Ok((crate::core::row::row::rows_into_vec(rows), true));

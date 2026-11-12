@@ -3733,7 +3733,9 @@ async fn stale_in_error_mode(
         .schema_generation
         .load(std::sync::atomic::Ordering::Acquire);
     let bound: &[BoundParam] = if told.kind == b'P' { params } else { &[] };
-    let current = description_now(database, state, stmt_name, told.kind, &sql, bound, generation)
+    // Boxed, as in `reconcile_with`: reached only once the epoch has moved,
+    // and Bind and Execute both hold this future inline.
+    let current = Box::pin(description_now(database, state, stmt_name, told.kind, &sql, bound, generation))
         .await?
         .filter(|(_, is_select)| *is_select)
         .map(|(fields, _)| fields);
@@ -3894,7 +3896,11 @@ async fn reconcile_with(
         .database
         .schema_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    let current = description_now(
+    // Boxed: reached only when the shape epoch moved and the result no
+    // longer has the columns the client was told, and held inline its future
+    // (3.6 KB) is part of every statement's, copied whole at each layer that
+    // moves one.
+    let current = Box::pin(description_now(
         &check.database,
         state,
         &check.stmt_name,
@@ -3902,7 +3908,7 @@ async fn reconcile_with(
         &check.sql,
         &check.bound,
         generation,
-    )
+    ))
     .await?
     .filter(|(_, is_select)| *is_select)
     .map(|(fields, _)| fields);
@@ -5035,7 +5041,11 @@ where
         // keeps its locks until then (per-savepoint release is v2).
         if t.savepoints.is_empty() {
             let database = t.database.clone();
-            database.block_ddl_abort(t.id).await;
+            // Boxed: held inline its future is ~12 KB, and that made every
+            // handler that can report a failure (Parse, Bind, Describe,
+            // Execute and each layer under it) as large, copied whole each
+            // time one moves. A statement that fails pays one allocation.
+            Box::pin(database.block_ddl_abort(t.id)).await;
             t.abort_now();
         }
     }
