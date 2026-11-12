@@ -1398,8 +1398,10 @@ fn frame_range(
     });
 
     // RANGE with an offset: the first position at or past a value, and the
-    // last at or before one, in the key's sort direction. A NULL current key
-    // frames its NULL peers, as PostgreSQL's does.
+    // last at or before one, in the key's sort direction, as `(lo, hi)`. A
+    // NULL current key frames its NULL peers, as PostgreSQL's does: a start
+    // bound takes the group's first position and an end bound its last
+    // (taking the first for both framed a NULL row as itself alone).
     let descending = spec.order_by.first().is_some_and(|(_, d, _)| *d);
     let range_bound = |offset: i128, is_start: bool| -> (usize, usize) {
         let keys = ctx.keys.expect("computed for an offset");
@@ -1459,7 +1461,7 @@ fn frame_range(
             (FrameMode::Groups, Some(g)) => group_of(position).checked_sub(n as usize).map(|i| g[i].1),
             (FrameMode::Range, _) => {
                 let (a, b) = range_bound(-(n as i128), false);
-                (a <= b).then_some(a)
+                (a <= b).then_some(b)
             }
             _ => position.checked_sub(n as usize),
         },
@@ -1467,7 +1469,7 @@ fn frame_range(
             (FrameMode::Groups, Some(g)) => Some(g[(group_of(position) + n as usize).min(g.len() - 1)].1),
             (FrameMode::Range, _) => {
                 let (a, b) = range_bound(n as i128, false);
-                (a <= b).then_some(a)
+                (a <= b).then_some(b)
             }
             _ => Some((position + n as usize).min(last)),
         },

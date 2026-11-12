@@ -150,3 +150,25 @@ async fn null_keys_outside_windows() {
     assert_eq!(rows_n(&c, "SELECT id, count(*) OVER (PARTITION BY i) FROM (SELECT id, i FROM wt) d ORDER BY id").await, ["1|2", "2|2", "3|2", "4|1", "5|2"] as [&str; 5], "SELECT id, count(*) OVER (PARTITION BY i) FROM (SELECT id, i FROM wt) d ORDER BY id");
     assert_eq!(rows_n(&c, "SELECT a.id, b.id FROM wt a LEFT JOIN wt b ON a.p = b.p ORDER BY 1, 2").await, ["1|1", "1|3", "2|NULL", "3|1", "3|3", "4|4", "5|NULL"] as [&str; 7], "SELECT a.id, b.id FROM wt a LEFT JOIN wt b ON a.p = b.p ORDER BY 1, 2");
 }
+
+/// A RANGE frame with an offset bound frames a NULL key's NULL peers, at
+/// both ends. The end bound took the peer group's first position, so a
+/// NULL row's frame ended where it started: `count(*)` over three NULL
+/// peers was 1, not 3, ascending or descending, NULLS FIRST or LAST.
+/// PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_range_offset_frame_reaches_every_null_peer() {
+    let server = TestServer::start().await.expect("server");
+    let c = client(&server).await;
+    run(&c, "CREATE TABLE rk (id INT PRIMARY KEY, k INT)").await;
+    run(&c, "INSERT INTO rk VALUES (1, 10), (2, 20), (3, NULL), (4, NULL), (5, NULL), (6, 12)").await;
+    for (sql, want) in [
+        ("SELECT id, count(*) OVER (ORDER BY k RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM rk ORDER BY id", ["1|2", "2|1", "3|3", "4|3", "5|3", "6|2"]),
+        ("SELECT id, count(*) OVER (ORDER BY k DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM rk ORDER BY id", ["1|2", "2|1", "3|3", "4|3", "5|3", "6|2"]),
+        ("SELECT id, sum(id) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND 5 FOLLOWING) FROM rk ORDER BY id", ["1|7", "2|2", "3|12", "4|12", "5|12", "6|6"]),
+        ("SELECT id, sum(id) OVER (ORDER BY k NULLS FIRST RANGE BETWEEN 10 PRECEDING AND 1 PRECEDING) FROM rk ORDER BY id", ["1|NULL", "2|7", "3|12", "4|12", "5|12", "6|1"]),
+        ("SELECT id, max(id) OVER (ORDER BY k DESC NULLS LAST RANGE BETWEEN 1 FOLLOWING AND 20 FOLLOWING) FROM rk ORDER BY id", ["1|NULL", "2|6", "3|5", "4|5", "5|5", "6|1"]),
+    ] {
+        assert_eq!(rows_n(&c, sql).await, want, "{sql}");
+    }
+}
