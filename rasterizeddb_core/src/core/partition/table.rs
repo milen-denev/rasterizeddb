@@ -838,6 +838,23 @@ fn spec_from_header(header: &MapHeader, schema: &crate::core::row::schema::Table
     Ok(spec)
 }
 
+/// Set, for the life of the process, once any partitioned table has been
+/// built broken. Statements look for a broken table among the ones they
+/// name only once it is set ([`any_broken`]), so a process that never had
+/// one pays nothing for the check. Never cleared: a broken table dropped
+/// later only costs the check.
+static ANY_BROKEN: AtomicBool = AtomicBool::new(false);
+
+fn note_broken() {
+    ANY_BROKEN.store(true, Ordering::Release);
+}
+
+/// Whether any partitioned table in this process has ever been built
+/// broken (see [`ANY_BROKEN`]).
+pub(crate) fn any_broken() -> bool {
+    ANY_BROKEN.load(Ordering::Acquire)
+}
+
 impl PartitionedTable {
     /// Writes a new table's map log (`HEADER`, `LOCATIONS` with the root,
     /// `PLACE` of `RangeMap::initial(n)`) and its ids file, synced through the
@@ -906,6 +923,9 @@ impl PartitionedTable {
             ::log::error!("{why}");
             why
         });
+        if live.is_err() {
+            note_broken();
+        }
         let broken_pin = live.is_err().then(|| BrokenPin::new(name, ctx.transactions, ctx.scheduler));
         PartitionedTable {
             name: name.to_string(),
@@ -939,6 +959,7 @@ impl PartitionedTable {
     ) -> Self {
         let why = format!("partitioned table \"{name}\" ({uid:016x}) cannot be opened: {why}");
         ::log::error!("{why}");
+        note_broken();
         PartitionedTable {
             name: name.to_string(),
             uid,

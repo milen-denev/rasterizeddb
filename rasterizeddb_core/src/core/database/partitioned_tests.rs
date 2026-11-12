@@ -512,6 +512,81 @@ async fn broken_tables_open_loudly_and_drop() {
     close(db, root);
 }
 
+/// Every statement that names a broken partitioned table fails with why
+/// it is broken, at any depth of the statement, whichever file is missing.
+/// With its schema file gone the table stands on an empty stand-in schema,
+/// and a statement planned against that failed on its first column
+/// ("Column 'id' not found", "Table not found", "INSERT has more
+/// expressions than target columns") without saying why; a CREATE INDEX on
+/// a table with no map log recorded the index before it failed. The plain
+/// table beside it answers, and DROP still removes the broken one.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_statement_on_a_broken_table_says_why() {
+    async fn exec(db: &rclite::Arc<Database>, sql: &str) -> Result<(), String> {
+        let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).ok_or_else(|| format!("cannot parse {sql}"))?;
+        let out = crate::core::rql::executor::execute_with_sync(purpose, db.clone(), true).await;
+        match out.first() {
+            None | Some(&3) => Err(String::from_utf8_lossy(out.get(1..).unwrap_or_default()).into_owned()),
+            _ => Ok(()),
+        }
+    }
+    for gone in ["map", "schema"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let db = rclite::Arc::new(open(root).await);
+        exec(&db, "CREATE TABLE p (id INT NOT NULL, v TEXT) PARTITION BY HASH (id)").await.unwrap();
+        exec(&db, "CREATE TABLE side (id INT NOT NULL PRIMARY KEY, w TEXT)").await.unwrap();
+        exec(&db, "INSERT INTO p (id, v) VALUES (1, 'a'), (2, 'b')").await.unwrap();
+        exec(&db, "INSERT INTO side (id, w) VALUES (1, 'a')").await.unwrap();
+        let uid = partitioned(&db, "p").uid();
+        drop(db);
+        crate::core::wal::remove_for(&path_str(root));
+        let file = match gone {
+            "map" => files::map_file(uid, 0),
+            _ => format!("{}.db", files::schema_stem(uid)),
+        };
+        std::fs::remove_file(root.join(file)).unwrap();
+
+        let db = rclite::Arc::new(open(root).await);
+        assert!(partitioned(&db, "p").broken().is_some(), "{gone}: the table opened");
+        for sql in [
+            "SELECT * FROM p",
+            "SELECT COUNT(*) FROM p",
+            "SELECT id FROM p",
+            "SELECT id, v FROM p WHERE id = 1",
+            "SELECT v FROM p ORDER BY id LIMIT 1",
+            "SELECT v, COUNT(*) FROM p GROUP BY v",
+            "SELECT p.id FROM p JOIN side ON p.id = side.id",
+            "SELECT side.id FROM side JOIN p ON p.id = side.id",
+            "SELECT id FROM side WHERE id IN (SELECT id FROM p)",
+            "INSERT INTO p (id, v) VALUES (9, 'x')",
+            "INSERT INTO p VALUES (9, 'x')",
+            "INSERT INTO p (id, v) VALUES (9, 'x') RETURNING id",
+            "INSERT INTO p (id, v) SELECT id, w FROM side",
+            "UPDATE p SET v = 'q'",
+            "UPDATE p SET v = 'q' WHERE id = 1 RETURNING id",
+            "DELETE FROM p",
+            "DELETE FROM p WHERE id = 1 RETURNING v",
+            "UPDATE side SET w = p.v FROM p WHERE side.id = p.id",
+            "DELETE FROM side USING p WHERE side.id = p.id",
+            "TRUNCATE p",
+            "CREATE INDEX pi ON p (v)",
+            "CREATE TABLE copied AS SELECT * FROM p",
+            "ALTER TABLE p ADD COLUMN z INT",
+        ] {
+            let e = exec(&db, sql).await.expect_err(sql);
+            assert!(e.contains("partitioned table \"p\"") && e.contains("cannot be opened"), "{gone}: {sql}: {e}");
+            assert!(!e.contains("recorded"), "{gone}: {sql} wrote before it failed: {e}");
+        }
+        exec(&db, "SELECT * FROM side").await.expect("the plain table beside it");
+        exec(&db, "DROP TABLE p").await.expect("a broken table can be dropped");
+        assert!(db.relation("p").is_none(), "{gone}: the drop left the table");
+        assert!(db.relation("copied").is_none(), "{gone}: CREATE TABLE AS made a table");
+        drop(db);
+        crate::core::wal::remove_for(&path_str(root));
+    }
+}
+
 /// A CREATE that fails before its catalogue row leaves no file, no row and
 /// no map entry, and the name stays free.
 #[tokio::test(flavor = "multi_thread")]

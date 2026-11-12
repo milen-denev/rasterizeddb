@@ -20135,6 +20135,35 @@ fn system_catalog_refusal(query: &QueryPurpose) -> Option<String> {
         .then(|| format!("permission denied: \"{}\" is a system catalog", crate::auth::ROLE_TABLE))
 }
 
+/// Why a statement that names a partitioned table which could not be
+/// opened fails, before anything plans it. A table refused before its
+/// schema was read stands on an empty stand-in schema, so a statement
+/// planned against it failed on its first column ("Column 'id' not found",
+/// "Table not found", "INSERT has more expressions than target columns")
+/// and never said why. Every relation the text names, at any depth
+/// (`lock_set`): a join, a subquery, `UPDATE … FROM`, `INSERT … SELECT`.
+/// `TRUNCATE` and `CREATE TABLE … AS` come back through here with the
+/// statements they run. `DROP TABLE` is let through, since dropping is how
+/// a broken table is removed, and `ALTER TABLE` reports the same reason in
+/// its own arm. Free until a broken partitioned table has existed in this
+/// process.
+fn broken_relation_refusal(query: &QueryPurpose, database: &Database) -> Option<String> {
+    if !crate::core::partition::table::any_broken() {
+        return None;
+    }
+    let sql = match query {
+        QueryPurpose::QueryRows(d) => &d.query,
+        QueryPurpose::InsertRow(d) => &d.query,
+        QueryPurpose::UpdateRow(sql)
+        | QueryPurpose::DeleteRow(sql)
+        | QueryPurpose::CreateIndex(sql) => sql,
+        _ => return None,
+    };
+    crate::core::rql::lock_set::statement_lock_set(sql)
+        .iter()
+        .find_map(|(name, _)| database.partitioned_table(name).and_then(|t| t.broken().map(str::to_string)))
+}
+
 /// [`execute_with_context`] for a statement whose caller needs only part of
 /// its result. See [`SubqueryNeed`].
 pub(crate) async fn execute_with_need(
@@ -20156,6 +20185,9 @@ pub(crate) async fn execute_with_need(
     };
     if let Some(refusal) = system_catalog_refusal(&query) {
         return ddl_error(&refusal);
+    }
+    if let Some(why) = broken_relation_refusal(&query, &database) {
+        return ddl_error(&why);
     }
     match &query {
         // Taken above, before the borrow.

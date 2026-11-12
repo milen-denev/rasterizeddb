@@ -501,21 +501,18 @@ async fn a_rewrite_undo_that_fails_at_startup_refuses_the_table_and_retries() {
         assert!(!uid_files(dir.path(), &before).is_empty(), "drop_it={drop_it}: the reaper took the old uid the retry needs");
         assert!(!uid_files(dir.path(), &rewritten).is_empty(), "drop_it={drop_it}: the table's current files went");
         assert!(!block_leftovers(dir.path()).is_empty(), "drop_it={drop_it}: the intent the retry needs went");
-        // Every statement fails; the ones that need no column name say why
-        // (a named column fails first against the refused table's empty
-        // stand-in schema, as for any refused partitioned table).
-        for sql in ["SELECT * FROM p", "SELECT COUNT(*) FROM p"] {
-            let err = exec(&db, sql).await.expect_err("the half-recovered table answered");
-            assert!(err.contains("could not put back"), "drop_it={drop_it}: {sql}: {err}");
-        }
+        // Every statement fails, and says why.
         for sql in [
+            "SELECT * FROM p",
+            "SELECT COUNT(*) FROM p",
             "SELECT id FROM p",
             "INSERT INTO p (id, v) VALUES (9, 'x')",
             "INSERT INTO p VALUES (9, 'x')",
             "UPDATE p SET v = 'q'",
             "DELETE FROM p",
         ] {
-            assert!(exec(&db, sql).await.is_err(), "drop_it={drop_it}: {sql} reached the half-recovered table");
+            let err = exec(&db, sql).await.expect_err("the half-recovered table answered");
+            assert!(err.contains("could not put back"), "drop_it={drop_it}: {sql}: {err}");
         }
         if drop_it {
             exec(&db, "DROP TABLE p").await.expect("a refused table can still be dropped");
