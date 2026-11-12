@@ -498,6 +498,25 @@ fn done(toks: &[Tok<'_>], i: usize, verb: &str) -> Result<(), String> {
     }
 }
 
+/// The verb of a statement that restructures a table's partitions (a
+/// reshape, or a conversion to a partitioned table), however it parses;
+/// `None` for any other statement. These move every row into new files and
+/// have no PostgreSQL counterpart, so a transaction block refuses them
+/// (25001), as PostgreSQL refuses its own commands that cannot roll back
+/// (2026-11-12; applied at once with a warning before).
+pub fn restructure_verb(sql: &str) -> Option<&'static str> {
+    if let Some(parsed) = parse_alter(sql) {
+        return Some(parsed.map_or("ALTER TABLE … PARTITION", |(_, op)| op.verb()));
+    }
+    if parse_partition_by(sql).is_some() {
+        return Some("ALTER TABLE … PARTITION BY");
+    }
+    if parse_partition_index(sql).is_some() {
+        return Some("CREATE INDEX … USING partition");
+    }
+    None
+}
+
 /// A reshaping `ALTER TABLE`: `None` when `sql` is another statement, else
 /// the table and the operation, or why the statement does not parse.
 pub fn parse_alter(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {

@@ -6312,9 +6312,22 @@ where
         None => (stmt, false),
     };
 
+    // A reshape or a conversion to a partitioned table moves every row into
+    // new files and is engine-only: refused in a block (25001), as
+    // PostgreSQL refuses its own commands that cannot roll back (2026-11-12).
+    // Applied at once with the warning below before, it outlived a ROLLBACK.
+    // It opens no implicit block (`opens_an_implicit_block`), so a
+    // multi-statement string holding one runs statement by statement.
+    if state.transaction.is_some()
+        && let Some(verb) = crate::core::partition::reshape::restructure_verb(stmt)
+    {
+        fail_statement(state, stream, "25001", &format!("{verb} cannot run inside a transaction block")).await?;
+        return Ok(());
+    }
+
     // DDL `database::block_ddl` does not cover does not participate in
-    // rollback here: a conversion or reshape of a partitioned table applied
-    // inside this block persists even if the block later aborts. Every
+    // rollback here: what is left of it applied inside this block persists
+    // even if the block later aborts. Every
     // PostgreSQL client assumes the opposite — a migration runner wraps its
     // statements in one transaction precisely to get all-or-nothing — so the
     // divergence is warned when it becomes possible, which is the only moment
@@ -8500,7 +8513,12 @@ fn opens_an_implicit_block(sql: &str) -> bool {
         &["BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE"],
     );
     let outside = is(first, &["IMPORT", "VACUUM", "CHECKPOINT", "COPY"])
-        || (is(first, &["CREATE", "DROP", "ALTER"]) && words.next().is_some_and(|w| w.eq_ignore_ascii_case("DATABASE")));
+        || (is(first, &["CREATE", "DROP", "ALTER"]) && words.next().is_some_and(|w| w.eq_ignore_ascii_case("DATABASE")))
+        // A partition restructure, which a block refuses (25001): only
+        // parsed when a word could make it one.
+        || (is(first, &["CREATE", "ALTER"])
+            && words.any(|w| is(w, &["PARTITION", "PARTITIONS", "ISOLATE", "SPLIT"]))
+            && crate::core::partition::reshape::restructure_verb(sql).is_some());
     !first.is_empty() && !control && !outside
 }
 

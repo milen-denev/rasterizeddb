@@ -1166,19 +1166,34 @@ sea-orm's nested transactions both work. Rolling back to a savepoint also
 un-poisons a failed block, which is the reason the feature exists: recovering
 from one failed statement without losing the whole transaction.
 
-**DDL in a block rolls back with it** for `CREATE TABLE` and `ALTER TABLE` on
-plain tables (`database::block_ddl`): before the statement runs, the tables it
-changes are copied aside and an intent naming the block's transaction is
-written; `COMMIT` discards the copies, and `ROLLBACK`, a failed statement, a
-dropped connection or a crash puts them back and drops the tables the block
-created. `ROLLBACK TO SAVEPOINT` undoes the DDL since the savepoint. So a
-migration that fails part-way leaves the schema as it found it,
-and its retry does not fail on "already exists". As in PostgreSQL, the block
-keeps the statement's ACCESS EXCLUSIVE to its end: another session's reads and
-writes of the table wait for it. Still applied at once, and warned about in the
-log: `DROP TABLE`, `CREATE INDEX`, and DDL on a partitioned table or one on a
-key/value store. The copy costs a pass over the table's files, so an `ALTER`
-of a big table in a block takes that much longer than one outside.
+**DDL in a block rolls back with it** (`database::block_ddl`): `CREATE TABLE`
+(also `AS` a query and `PARTITION BY`), `ALTER TABLE` (`RENAME TO` included),
+`CREATE [UNIQUE] INDEX`, `DROP INDEX`, `DROP TABLE` and the role statements, on
+plain tables of any backend (a key/value store's too) and on partitioned ones.
+Before the statement runs, the files it can change are copied aside and an
+intent naming the block's transaction is written; `COMMIT` discards the
+copies, and `ROLLBACK`, a failed statement, a dropped connection or a crash
+puts them back and drops the tables the block created. `ROLLBACK TO
+SAVEPOINT` undoes the DDL since the savepoint. A `DROP TABLE` is deferred: it
+runs once the block's commit is durable, so a rolled-back drop never touched
+the table, and a `CREATE TABLE` of a name the block dropped sets the dropped
+table aside under a hidden name until then. An `ALTER` that rewrites a
+partitioned table's rows into new files keeps the old files until the block
+ends (2026-11-12). So a migration that fails part-way leaves the schema as it
+found it, and its retry does not fail on "already exists". As in PostgreSQL,
+the block keeps the statement's ACCESS EXCLUSIVE to its end: another
+session's reads and writes of the table wait for it. The copy costs a pass
+over the files, so an `ALTER` of a big table in a block takes that much longer
+than one outside.
+
+Refused in a block (`25001`, as PostgreSQL refuses its own commands that
+cannot roll back): `CREATE`/`DROP DATABASE`, and this engine's partition
+restructures, a conversion to a partitioned table (`ALTER TABLE … PARTITION
+BY`, `CREATE INDEX … USING partition`) and a reshape (`SPLIT PARTITION`,
+`MERGE PARTITIONS`, `ISOLATE KEY`, `SPLIT KEY`). Run those outside a block; a
+migration runner's per-migration transaction can be turned off for one (for
+sqlx, `-- no-transaction`). Unlike PostgreSQL, a table the block dropped can
+still be read by the block until it commits.
 
 At `READ COMMITTED` a writer that meets a row another transaction is changing
 waits for it, as PostgreSQL's does, then re-reads the row and applies its own

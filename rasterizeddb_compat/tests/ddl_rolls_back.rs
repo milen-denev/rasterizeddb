@@ -311,8 +311,8 @@ async fn index_ddl_rolls_back_with_its_block() {
 }
 
 /// A partitioned table's DDL in a block rolls back (2026-11-12): its ALTER
-/// (a metadata one: the table has no rows yet; one that rewrites rows into
-/// a new uid is warned about and stays, see `block_ddl_table_moved`), its
+/// (a metadata one: the table has no rows yet; one that rewrites rows is
+/// the next test), its
 /// CREATE INDEX, a table created PARTITION BY, and its DROP, which destroyed
 /// the table and its rows through a ROLLBACK before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -340,6 +340,83 @@ async fn a_partitioned_tables_ddl_rolls_back_with_its_block() {
     tx.execute("DROP TABLE p").await.expect("drop");
     tx.commit().await.expect("commit");
     assert!(!exists(&pool, "p").await, "a committed drop kept the table");
+}
+
+fn code(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error().and_then(|d| d.code()).map(|c| c.into_owned())
+}
+
+/// An ALTER that rewrites a partitioned table's rows into a new uid rolls
+/// back with its block (2026-11-12): the old uid's files are kept until the
+/// block ends. Before, it was applied at once with a warning, and a
+/// ROLLBACK left the new column, and the block's own rows, in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_rewrite_rolls_back_with_its_block() {
+    let (_s, pool, _dir) = on_disk("rewrite").await;
+    run(&pool, "CREATE TABLE p (id INT NOT NULL, v TEXT) PARTITION BY HASH (id)").await.expect("create");
+    run(&pool, "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')").await.expect("insert");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("ALTER TABLE p ADD COLUMN w INT DEFAULT 7").await.expect("alter");
+    tx.execute("INSERT INTO p VALUES (4, 'd', 8)").await.expect("the block's row");
+    let n: i64 = sqlx::query("SELECT count(*) FROM p WHERE w = 7").fetch_one(&mut *tx).await.expect("read").get(0);
+    assert_eq!(n, 3, "the rewrite inside the block");
+    tx.rollback().await.expect("rollback");
+    assert!(run(&pool, "SELECT w FROM p").await.is_err(), "the rewrite's column outlived the rollback");
+    let n: i64 = sqlx::query("SELECT count(*) FROM p").fetch_one(&pool).await.expect("read").get(0);
+    assert_eq!(n, 3, "the rows before the block, without the block's");
+    run(&pool, "INSERT INTO p VALUES (5, 'e')").await.expect("the table takes rows");
+
+    let mut tx = pool.begin().await.expect("begin");
+    tx.execute("ALTER TABLE p ADD COLUMN w INT DEFAULT 7").await.expect("alter");
+    tx.commit().await.expect("commit");
+    let n: i64 = sqlx::query("SELECT count(*) FROM p WHERE w = 7").fetch_one(&pool).await.expect("read").get(0);
+    assert_eq!(n, 4, "a committed rewrite stays");
+}
+
+/// A reshape or a conversion to a partitioned table is refused in a block
+/// (25001), as PostgreSQL refuses its own commands that cannot roll back
+/// (2026-11-12): both move every row into new files and are this engine's
+/// own. Applied at once with a warning before, they outlived a ROLLBACK.
+/// Outside a block they run, through either protocol; a multi-statement
+/// string holding one runs statement by statement, with no implicit block
+/// to promise otherwise, as one holding `CREATE DATABASE` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partition_restructures_are_refused_in_a_block() {
+    let (_s, pool, _dir) = on_disk("restructure").await;
+    for t in ["plain", "plain2"] {
+        run(&pool, &format!("CREATE TABLE {t} (id INT NOT NULL, k INT NOT NULL)")).await.expect("create");
+        run(&pool, &format!("INSERT INTO {t} VALUES (1, 1), (2, 2), (3, 3)")).await.expect("insert");
+    }
+    for sql in [
+        "ALTER TABLE plain PARTITION BY HASH (k) PARTITIONS 4",
+        "CREATE INDEX plain_by ON plain USING partition (k) WITH (partitions = 4)",
+    ] {
+        let mut tx = pool.begin().await.expect("begin");
+        let refused = tx.execute(sql).await.expect_err(sql);
+        assert_eq!(code(&refused).as_deref(), Some("25001"), "{sql}: {refused}");
+        tx.rollback().await.expect("rollback");
+    }
+    // Still plain: a reshape needs a partitioned table.
+    let plain = run(&pool, "ALTER TABLE plain SPLIT PARTITION FOR (k = 1)").await.expect_err("still plain");
+    assert!(plain.contains("not one"), "a refused conversion partitioned the table: {plain}");
+
+    // Outside a block: a multi-statement string (simple protocol) and the
+    // extended protocol, which opens no implicit block for it either.
+    run(&pool, "ALTER TABLE plain PARTITION BY HASH (k) PARTITIONS 4; SELECT 1").await.expect("convert in a string");
+    sqlx::query("CREATE INDEX plain2_by ON plain2 USING partition (k) WITH (partitions = 4)")
+        .execute(&pool)
+        .await
+        .expect("convert through the extended protocol");
+    let mut tx = pool.begin().await.expect("begin");
+    let refused = tx.execute("ALTER TABLE plain SPLIT PARTITION FOR (k = 1)").await.expect_err("split in a block");
+    assert_eq!(code(&refused).as_deref(), Some("25001"), "{refused}");
+    tx.rollback().await.expect("rollback");
+    run(&pool, "ALTER TABLE plain SPLIT PARTITION FOR (k = 1)").await.expect("split outside a block");
+    for t in ["plain", "plain2"] {
+        let n: i64 = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {t}"))).fetch_one(&pool).await.expect("read").get(0);
+        assert_eq!(n, 3, "{t}");
+    }
 }
 
 /// `CREATE TABLE … AS` in a block is dropped by its ROLLBACK (2026-11-12).

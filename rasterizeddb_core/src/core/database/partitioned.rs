@@ -1010,6 +1010,78 @@ impl Database {
         }
     }
 
+    /// Undoes a block's rewrite of partitioned table `name` (`block_ddl`'s
+    /// `Undo::Swapped`), under the lock the block still holds: the catalogue
+    /// row moved back from `new_uid` to `old_uid` (the undo's commit point),
+    /// the old table reopened (from `old`, the instance the rewrite retired,
+    /// as a rewrite that fails reopens it; from the catalogue without one)
+    /// and installed, then the new uid's map log closed and its files
+    /// deleted. Already back on `old_uid` is done.
+    pub(super) async fn swap_back_partitioned(
+        &self,
+        name: &str,
+        old_uid: u64,
+        new_uid: u64,
+        old: Option<&PartitionedTable>,
+    ) -> io::Result<()> {
+        let _ddl = self.partition_ddl.lock().await;
+        let Some(current) = self.partitioned_table(name) else {
+            return Err(io::Error::other(format!("partitioned table \"{name}\" is not there")));
+        };
+        if current.uid() == old_uid {
+            return Ok(());
+        }
+        if current.uid() != new_uid {
+            return Err(io::Error::other(format!(
+                "\"{name}\" is uid {:016x}, neither the rewrite's {new_uid:016x} nor the table's before it {old_uid:016x}",
+                current.uid()
+            )));
+        }
+        let root = self.partition_root()?;
+        let _snapshot_gate = self.uid_deletion_permit().await;
+        let _forget_pause = self.transactions.forget_pause();
+        let changed = super::SchemaChanged(&self.schema_generation);
+        self.schema_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.swap_catalogue_uid(name, new_uid, old_uid).await?;
+        current.retire_partitions().await;
+        let (shell, table) = match old {
+            Some(old) => self.reopen_partitioned(name, old).await,
+            None => self.open_partitioned(name, old_uid).await,
+        };
+        self.swap_partitioned(name, Arc::new(table), shell);
+        drop(changed);
+        #[cfg(feature = "storage_pools")]
+        self.storage.forget_partitions(new_uid);
+        if let Err(e) = current.mark_dropped().await {
+            warn!("Put \"{name}\" back before its rewrite; closing the rewrite's map log failed, the startup reaper deletes it: {e}");
+        } else if let Err(e) = self.discard_uid_files(&root, new_uid) {
+            warn!("Put \"{name}\" back before its rewrite; deleting uid {new_uid:016x}'s files failed, the startup reaper deletes them: {e}");
+        }
+        info!("Put partitioned table {name} back before a rolled-back rewrite: uid {new_uid:016x} -> {old_uid:016x}");
+        Ok(())
+    }
+
+    /// A block that rewrote partitioned table `name` committed: the old
+    /// uid's map log closed (`old`, the instance the rewrite retired) and
+    /// its files deleted, as the rewrite outside a block does at once. A
+    /// failure is the startup reaper's to finish: nothing names the uid.
+    pub(super) async fn release_swapped_uid(&self, name: &str, old_uid: u64, old: Option<&PartitionedTable>) {
+        let _ddl = self.partition_ddl.lock().await;
+        let Ok(root) = self.partition_root() else { return };
+        let _snapshot_gate = self.uid_deletion_permit().await;
+        #[cfg(feature = "storage_pools")]
+        self.storage.forget_partitions(old_uid);
+        if let Some(old) = old
+            && let Err(e) = old.mark_dropped().await
+        {
+            warn!("Rewrote partitioned table {name}; closing the old map log failed, the startup reaper deletes it: {e}");
+            return;
+        }
+        if let Err(e) = self.discard_uid_files(&root, old_uid) {
+            warn!("Rewrote partitioned table {name}; deleting the old files under uid {old_uid:016x} failed, the startup reaper deletes them: {e}");
+        }
+    }
+
     /// Deletes the files of partitions `doomed` (`(pid, directory)`) of
     /// table `uid`, their log records voided first in the log of the
     /// directory they are in (as a DROP voids, `discard_uid_files`), each
@@ -1180,8 +1252,38 @@ impl Database {
             }
         };
 
+        // In a block (2026-11-12), the step that moves the row back first,
+        // its intent written before the row moves: the block may yet roll
+        // back, so the old uid's files stay until it ends.
+        let old_stem = files::schema_stem(old.uid());
+        let old_stem = old_stem.strip_suffix("_schema").unwrap_or(&old_stem);
+        let block = match self.block_holding(name, old_stem) {
+            None => None,
+            Some(block_root) => {
+                let hold = super::block_ddl::SwapHold { old: old.clone(), _pause: self.transactions.forget_pause() };
+                match self.block_swap_register(block_root, name, old.uid(), new_uid, hold) {
+                    Ok(seq) => Some((block_root, seq)),
+                    Err(e) => {
+                        error!("Rewriting partitioned table {name} in a block: {e}");
+                        table.retire_partitions().await;
+                        drop(table);
+                        #[cfg(feature = "storage_pools")]
+                        self.storage.forget_partitions(new_uid);
+                        if let Err(d) = self.discard_uid_files(&root, new_uid) {
+                            error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
+                        }
+                        reopen_old().await;
+                        return Err(e);
+                    }
+                }
+            }
+        };
+
         // 4. The commit point.
         if let Err(e) = self.swap_catalogue_uid(name, old.uid(), new_uid).await {
+            if let Some((block_root, seq)) = block {
+                self.block_swap_cancel(block_root, seq);
+            }
             error!("Rewriting partitioned table {name}: the catalogue could not be switched: {e}");
             table.retire_partitions().await;
             drop(table);
@@ -1199,10 +1301,14 @@ impl Database {
             return Ok(wrote_family);
         }
 
-        // 5. Installed; the old uid gone.
+        // 5. Installed; the old uid gone, or kept to the block's end.
         self.swap_partitioned(name, table, Some(shell));
         drop(changed);
         let old_uid = old.uid();
+        if block.is_some() {
+            info!("Rewrote partitioned table {name} in a block: uid {old_uid:016x} -> {new_uid:016x}, the old kept until the block ends");
+            return Ok(wrote_family);
+        }
         // The pool's per-location counts for the old uid, as a DROP's: left,
         // they would refuse a location drop for partitions that are gone.
         #[cfg(feature = "storage_pools")]

@@ -1544,7 +1544,7 @@ impl Database {
         // its backup (`rewrite.rs`), so the table opens as it was.
         rewrite::recover_interrupted_rewrites(&io_pointers, &storage, &kv_stores, &seeds).await;
 
-        let tables_names: Vec<(String, u64)> =
+        let mut tables_names: Vec<(String, u64)> =
             load_db_tables(&schema, &mut iterator, io_rows.clone()).await;
 
         debug!(
@@ -1568,14 +1568,6 @@ impl Database {
         // them in its way.
         if !in_memory {
             create_intent::recover(&io_pointers, &storage, &kv_stores, &seeds, &tables_names, &held).await;
-        }
-
-        // After WAL recovery and the catalogue read, before any table opens
-        // and so before forgetting resumes: partition files without
-        // MATERIALIZE may hold rows of a transaction whose outcome was lost,
-        // and must go before the forget horizon can pass it (§12).
-        if !in_memory {
-            partitioned::reap_at_startup(location, &io_pointers, &storage, &tables_names);
         }
 
         let table_slots = DashMap::with_hasher(ahash::RandomState::new());
@@ -1612,14 +1604,36 @@ impl Database {
         // A block's DDL a crash interrupted (`block_ddl`): before any table
         // opens, the copies of a block that did not commit put back, and the
         // tables it created named, to drop once the database is open.
+        let mut spared: Vec<u64> = Vec::new();
         let block_ddl_drops = if in_memory {
             Vec::new()
         } else {
-            block_ddl::recover_files(&io_pointers, &storage, &kv_stores, &seeds, |tx| {
-                transactions.outcome(tx) == crate::core::mvcc::TxOutcome::Committed
-            })
+            block_ddl::recover_files(
+                &io_pointers,
+                &io_rows,
+                &io_schema,
+                &storage,
+                &kv_stores,
+                &seeds,
+                &mut tables_names,
+                &mut spared,
+                |tx| transactions.outcome(tx) == crate::core::mvcc::TxOutcome::Committed,
+            )
             .await
         };
+
+        // After WAL recovery, the catalogue read and the block DDL above
+        // (which may move a partitioned table's catalogue row back to the uid
+        // a block's rewrite left, 2026-11-12), before any table opens and so
+        // before forgetting resumes: partition files without MATERIALIZE may
+        // hold rows of a transaction whose outcome was lost, and must go
+        // before the forget horizon can pass it (§12). A uid a block's undo
+        // could not move back to is kept for the next try (`spared`).
+        if !in_memory {
+            let mut live = tables_names.clone();
+            live.extend(spared.iter().map(|uid| (String::new(), *uid)));
+            partitioned::reap_at_startup(location, &io_pointers, &storage, &live);
+        }
         // No forgetting until every table holding rows is registered: plain
         // tables register (and start their vacuum, which forgets) below,
         // partitioned ones after the database exists, and a forget in the
@@ -3723,9 +3737,31 @@ impl Database {
     /// neither; the uid the catalogue no longer names is the startup
     /// reaper's.
     pub(crate) async fn swap_catalogue_uid(&self, table_name: &str, old_uid: u64, new_uid: u64) -> io::Result<()> {
-        let schema = load_db_data_schema(self.db_io_schema.clone()).await?;
+        swap_catalogue_uid_in(&self.db_io_pointers, &self.db_io_rows, &self.db_io_schema, Some(table_name), old_uid, new_uid)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// [`Database::swap_catalogue_uid`] on the catalogue's providers, for the
+/// open before the database exists: the live row naming `old_uid` (and
+/// `table_name`, when given; a uid is the catalogue's alone, so recovery
+/// goes by it) replaced by one naming `new_uid` under the same name, in one
+/// durable storage transaction. `Ok(None)` when no live row names `old_uid`
+/// and no name was given (an undo a crash already finished or never
+/// needed); `Ok(Some(name))`, the row's name, when swapped.
+pub(super) async fn swap_catalogue_uid_in(
+    io_pointers: &Arc<DbStorageProvider>,
+    io_rows: &Arc<DbStorageProvider>,
+    io_schema: &Arc<DbStorageProvider>,
+    table_name: Option<&str>,
+    old_uid: u64,
+    new_uid: u64,
+) -> io::Result<Option<String>> {
+    {
+        let schema = load_db_data_schema(io_schema.clone()).await?;
         let fetch = create_db_data_row_fetch(&schema.fields);
-        let mut iterator = RowPointerIterator::new(self.db_io_pointers.clone())
+        let mut iterator = RowPointerIterator::new(io_pointers.clone())
             .await
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
         let mut found = None;
@@ -3733,7 +3769,7 @@ impl Database {
             if pointer.deleted {
                 continue;
             }
-            let Ok(row) = pointer.fetch_row(self.db_io_rows.clone(), &fetch).await else {
+            let Ok(row) = pointer.fetch_row(io_rows.clone(), &fetch).await else {
                 continue;
             };
             let name = row.columns.iter().find(|c| c.schema_id == 0).map(|c| c.data.into_slice().to_vec());
@@ -3743,16 +3779,21 @@ impl Database {
                 .find(|c| c.schema_id == 1)
                 .and_then(|c| <[u8; 8]>::try_from(c.data.into_slice()).ok())
                 .map(u64::from_le_bytes);
-            if name.as_deref() == Some(table_name.as_bytes()) && clusters == Some(old_uid) {
-                found = Some((record_pos, pointer));
+            let named = table_name.is_none_or(|t| name.as_deref() == Some(t.as_bytes()));
+            if named && clusters == Some(old_uid) {
+                found = Some((record_pos, pointer, String::from_utf8_lossy(&name.unwrap_or_default()).into_owned()));
                 break;
             }
         }
-        let Some((record_pos, mut pointer)) = found else {
-            return Err(io::Error::other(format!(
-                "the catalogue has no row naming \"{table_name}\" with uid {old_uid:016x}"
-            )));
+        let Some((record_pos, mut pointer, row_name)) = found else {
+            return match table_name {
+                None => Ok(None),
+                Some(table_name) => Err(io::Error::other(format!(
+                    "the catalogue has no row naming \"{table_name}\" with uid {old_uid:016x}"
+                ))),
+            };
         };
+        let table_name = row_name.as_str();
         let mut name_mb = MEMORY_POOL.acquire(table_name.len());
         name_mb.into_slice_mut().copy_from_slice(table_name.as_bytes());
         let mut clusters_mb = MEMORY_POOL.acquire(8);
@@ -3763,7 +3804,7 @@ impl Database {
                 ColumnWritePayload { column_type: DbType::U64, size: 8, data: clusters_mb, write_order: 1 }
             ],
         };
-        let mut last = RowPointerIterator::new(self.db_io_pointers.clone())
+        let mut last = RowPointerIterator::new(io_pointers.clone())
             .await
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
         #[allow(clippy::unnecessary_cast)]
@@ -3771,10 +3812,10 @@ impl Database {
             Some(p) => (p.id as u64, p.position),
             None => (0, 0),
         };
-        let txn = self.db_io_pointers.begin_txn();
+        let txn = io_pointers.begin_txn();
         let written = RowPointer::write_row_with_pointer_record_pos(
-            self.db_io_pointers.clone(),
-            self.db_io_rows.clone(),
+            io_pointers.clone(),
+            io_rows.clone(),
             &AtomicU64::new(last_id),
             &AtomicU64::new(table_length),
             #[cfg(feature = "enable_long_row")]
@@ -3787,19 +3828,22 @@ impl Database {
         )
         .await;
         if let Err(e) = written {
-            self.db_io_pointers.abort_txn(txn).await;
+            io_pointers.abort_txn(txn).await;
             return Err(io::Error::other(format!("{e:?}")));
         }
         if let Err(e) = pointer
-            .delete(self.db_io_pointers.clone(), record_pos, Some(txn), crate::core::mvcc::transaction::FROZEN_TX)
+            .delete(io_pointers.clone(), record_pos, Some(txn), crate::core::mvcc::transaction::FROZEN_TX)
             .await
         {
-            self.db_io_pointers.abort_txn(txn).await;
+            io_pointers.abort_txn(txn).await;
             return Err(io::Error::other(format!("{e:?}")));
         }
-        self.db_io_pointers.commit_durable(txn).await?;
-        Ok(())
+        io_pointers.commit_durable(txn).await?;
+        Ok(Some(row_name))
     }
+}
+
+impl Database {
 
     /// Whether the catalogue still names a table.
     ///

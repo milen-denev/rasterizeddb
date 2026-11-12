@@ -61,10 +61,14 @@
 //! ([`Recovered::Undo`]): the files it held aside sit under names only the
 //! rename back restores.
 //!
-//! Still applied at once, with the warning that says so (to the client as
-//! well as the log): a conversion or reshape of a partitioned table, and an
-//! ALTER that rewrites a partitioned table's rows into a new uid
-//! ([`Database::block_ddl_table_moved`]). Role statements are the block's
+//! An ALTER that rewrites a partitioned table's rows into a new uid
+//! (2026-11-12, `Undo::Swapped`) keeps the old uid's files until the block
+//! ends: a ROLLBACK moves the catalogue row back and reopens the old table,
+//! a COMMIT deletes the old uid. After a crash, an uncommitted move is put
+//! back at the open before the startup reaper runs, since the reaper deletes
+//! whichever uid the catalogue does not name. A conversion to a partitioned
+//! table and a reshape are refused in a block (25001, pgwire): both are this
+//! engine's own and move every row. Role statements are the block's
 //! writes to the role catalogue (`auth::execute_role_statement_in`), and
 //! `CREATE`/`DROP DATABASE` are refused in a block (25001), as in
 //! PostgreSQL.
@@ -107,6 +111,30 @@ pub(crate) enum Undo {
     /// schema files the rename's fixups rewrote are held aside by the steps
     /// registered before it, which run after it in an undo.
     Renamed { from: String, to: String },
+    /// The block rewrote partitioned table `table`'s rows into a new uid
+    /// (phase 6 P8, `rewrite_partitioned`): its catalogue row moved from
+    /// `old_uid` to `new_uid`, and the old uid's files kept. Undone by
+    /// moving the row back, reopening the old table and deleting the new
+    /// uid's files; at the commit, the old uid's files are deleted instead
+    /// (2026-11-12; deleted at once before, so a ROLLBACK left the rewrite).
+    Swapped { table: String, old_uid: u64, new_uid: u64 },
+}
+
+/// What a [`Undo::Swapped`] step holds in memory until its block ends: the
+/// old table's instance, whose map log the commit closes, and a pause on
+/// forgetting. The old uid's partitions are not registered while the block
+/// runs, so nothing settles the stamps in them; a forget passing an aborted
+/// transaction they hold would make its rows read as committed once a
+/// ROLLBACK reopens them.
+pub(crate) struct SwapHold {
+    pub(crate) old: rclite::Arc<crate::core::partition::table::PartitionedTable>,
+    pub(crate) _pause: crate::core::mvcc::transaction::ForgetPause,
+}
+
+impl std::fmt::Debug for SwapHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SwapHold({:016x})", self.old.uid())
+    }
 }
 
 /// The hidden name a dropped table is set aside under when the block
@@ -143,6 +171,9 @@ pub(crate) struct Step {
     undo: Undo,
     intent: Option<PathBuf>,
     seq: u32,
+    /// A [`Undo::Swapped`] step's hold, while its block runs (none after a
+    /// crash, when the old table opens from the catalogue).
+    hold: Option<std::sync::Arc<SwapHold>>,
 }
 
 pub(super) fn intent_path(root: &str, tx: TxId, seq: u32) -> PathBuf {
@@ -161,6 +192,7 @@ pub(super) fn encode(tx: TxId, undo: &Undo) -> String {
         Undo::Drop { table } => format!("{tx}\ndrop\t{table}"),
         Undo::DropAtCommit { table, incarnation, .. } => format!("{tx}\ndropcommit\t{table}\t{incarnation:032x}"),
         Undo::Renamed { from, to } => format!("{tx}\nrenamed\t{from}\t{to}"),
+        Undo::Swapped { table, old_uid, new_uid } => format!("{tx}\nswapped\t{table}\t{old_uid:016x}\t{new_uid:016x}"),
     };
     format!("{body}\n{:016x}\n", crate::core::wal::file_id_for_name(&body))
 }
@@ -197,6 +229,13 @@ fn decode(text: &str) -> Option<(TxId, Undo)> {
         },
         ["renamed", from, to] if !from.is_empty() && !to.is_empty() => {
             Undo::Renamed { from: from.to_string(), to: to.to_string() }
+        }
+        ["swapped", table, old_uid, new_uid] if !table.is_empty() && old_uid.len() == 16 && new_uid.len() == 16 => {
+            Undo::Swapped {
+                table: table.to_string(),
+                old_uid: u64::from_str_radix(old_uid, 16).ok()?,
+                new_uid: u64::from_str_radix(new_uid, 16).ok()?,
+            }
         }
         _ => return None,
     };
@@ -517,6 +556,18 @@ impl Database {
     /// Registers `undo` as block `root`'s next step, its intent written
     /// first when what it undoes outlives a crash (`lasting`).
     fn register(&self, root: TxId, undo: Undo, lasting: bool) -> Result<(), String> {
+        self.register_holding(root, undo, lasting, None).map(drop)
+    }
+
+    /// [`Self::register`], with what the step holds in memory; returns its
+    /// number.
+    fn register_holding(
+        &self,
+        root: TxId,
+        undo: Undo,
+        lasting: bool,
+        hold: Option<std::sync::Arc<SwapHold>>,
+    ) -> Result<u32, String> {
         let seq = self.next_seq(root);
         let intent = match self.location.as_deref().filter(|_| lasting) {
             Some(root_dir) => {
@@ -527,8 +578,59 @@ impl Database {
             }
             None => None,
         };
-        self.block_ddl.entry(root).or_default().push(Step { undo, intent, seq });
-        Ok(())
+        self.block_ddl.entry(root).or_default().push(Step { undo, intent, seq, hold });
+        Ok(seq)
+    }
+
+    /// The block whose DDL holds partitioned table `table`'s schema files
+    /// aside under `stem`, if any: the one running a statement on it, since
+    /// every block ALTER registers that step before it runs
+    /// ([`Database::block_ddl_prepare`]) and keeps its ACCESS EXCLUSIVE.
+    pub(crate) fn block_holding(&self, table: &str, stem: &str) -> Option<TxId> {
+        self.block_ddl
+            .iter()
+            .find(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .any(|s| matches!(&s.undo, Undo::Restore { table: t, stem: st, .. } if t == table && st == stem))
+            })
+            .map(|entry| *entry.key())
+    }
+
+    /// Before block `root`'s rewrite of partitioned table `table` moves its
+    /// catalogue row from `old_uid` to `new_uid` (`rewrite_partitioned`):
+    /// the step that moves it back, its intent written first, so a crash
+    /// past the move finds it. `hold` keeps the old instance and a forget
+    /// pause to the block's end ([`SwapHold`]). Returns the step's number,
+    /// for [`Self::block_swap_cancel`].
+    pub(crate) fn block_swap_register(
+        &self,
+        root: TxId,
+        table: &str,
+        old_uid: u64,
+        new_uid: u64,
+        hold: SwapHold,
+    ) -> Result<u32, String> {
+        let lasting = self.survives_a_crash(table);
+        self.register_holding(
+            root,
+            Undo::Swapped { table: table.to_string(), old_uid, new_uid },
+            lasting,
+            Some(std::sync::Arc::new(hold)),
+        )
+    }
+
+    /// The row did not move after all: block `root`'s step `seq` and its
+    /// intent go.
+    pub(crate) fn block_swap_cancel(&self, root: TxId, seq: u32) {
+        let Some(mut steps) = self.block_ddl.get_mut(&root) else { return };
+        if let Some(at) = steps.iter().position(|s| s.seq == seq) {
+            let step = steps.remove(at);
+            if let Some(path) = &step.intent {
+                let _ = super::rewrite::remove_intent(path);
+            }
+        }
     }
 
     /// Holds `table`'s files of `set` aside for block `root`, and registers
@@ -643,9 +745,10 @@ impl Database {
         taken
     }
 
-    /// `table`'s files moved to another stem (a partitioned table rewritten
-    /// into a new uid, `rewrite_partitioned`, or a plain one converted into
-    /// a partitioned one), deleting the files they were under: every
+    /// `table`'s files moved to another stem outside a block's undo (a
+    /// partitioned table rewritten into a new uid by no block, or a plain
+    /// one converted into a partitioned one, which pgwire refuses in a
+    /// block), deleting the files they were under: every
     /// block's held copy of it under the old stem can no longer be put back
     /// (put back, it would land as files no table owns, and the change would
     /// stay). Those steps are forgotten, their copies discarded, and the
@@ -707,11 +810,19 @@ impl Database {
                     continue;
                 }
             }
-            if let Undo::Restore { copy, .. } = &step.undo {
-                let seed = self.seed_of(copy).await;
-                if discard_files_in(&seed, &self.storage, self.location.as_deref(), copy, RENAMED_SUFFIXES).await {
-                    super::pool_forget(&self.storage, copy);
+            match &step.undo {
+                Undo::Restore { copy, .. } => {
+                    let seed = self.seed_of(copy).await;
+                    if discard_files_in(&seed, &self.storage, self.location.as_deref(), copy, RENAMED_SUFFIXES).await {
+                        super::pool_forget(&self.storage, copy);
+                    }
                 }
+                // The rewrite is the table's for good: the old uid's files
+                // go, as the rewrite outside a block deletes them at once.
+                Undo::Swapped { table, old_uid, .. } => {
+                    Box::pin(self.release_swapped_uid(table, *old_uid, step.hold.as_ref().map(|h| &*h.old))).await;
+                }
+                _ => {}
             }
         }
     }
@@ -754,6 +865,10 @@ impl Database {
                 }
                 // The rename did not happen: the old name is still a table.
                 Undo::Renamed { from, to } => self.relation(from).is_some() && self.relation(to).is_none(),
+                // The rewrite never reached its commit point.
+                Undo::Swapped { table, new_uid, .. } => {
+                    self.partitioned_table(table).is_none_or(|t| t.uid() != *new_uid)
+                }
                 Undo::Restore { .. } | Undo::DropAtCommit { .. } => false,
             };
             if unmade {
@@ -783,7 +898,10 @@ impl Database {
         let tables: Vec<String> = failed
             .iter()
             .map(|s| match &s.undo {
-                Undo::Restore { table, .. } | Undo::Drop { table } | Undo::DropAtCommit { table, .. } => table.clone(),
+                Undo::Restore { table, .. }
+                | Undo::Drop { table }
+                | Undo::DropAtCommit { table, .. }
+                | Undo::Swapped { table, .. } => table.clone(),
                 Undo::Renamed { from, .. } => from.clone(),
             })
             .collect();
@@ -825,6 +943,16 @@ impl Database {
                 }
                 // The table was never touched: nothing to undo.
                 Undo::DropAtCommit { .. } => true,
+                Undo::Swapped { table, old_uid, new_uid } => {
+                    let old = step.hold.as_ref().map(|h| &*h.old);
+                    match Box::pin(self.swap_back_partitioned(table, *old_uid, *new_uid, old)).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            error!("Could not put \"{table}\" back as it was before its rewrite, for a block that rolled back: {e}");
+                            false
+                        }
+                    }
+                }
                 Undo::Renamed { from, to } => match self.rename_back(root, from, to).await {
                     Ok(()) => true,
                     Err(e) => {
@@ -1050,11 +1178,25 @@ pub(super) enum Recovered {
 /// not is put back over its table. A table such a transaction created, a
 /// committed deferred drop, and every step of a transaction that renamed a
 /// table, are left for once the database is open ([`Recovered`]).
+///
+/// A partitioned rewrite's catalogue move ([`Undo::Swapped`]) is settled
+/// here for every transaction, renaming or not, and before the startup
+/// reaper, which deletes the uid the catalogue does not name: one that did
+/// not commit has its row moved back to the old uid (by uid alone; the
+/// block may have renamed the table since), and `tables` follows, so the
+/// old table opens and the reaper takes the new uid; one that did leaves
+/// the old uid to the reaper. A move back that fails names the old uid in
+/// `spared`, which the reaper keeps.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_files(
     io_pointers: &rclite::Arc<crate::core::storage_providers::backend::DbStorageProvider>,
+    io_rows: &rclite::Arc<crate::core::storage_providers::backend::DbStorageProvider>,
+    io_schema: &rclite::Arc<crate::core::storage_providers::backend::DbStorageProvider>,
     pool: &super::StoragePool,
     kv: &super::KvStores,
     seeds: &super::SeedCache,
+    tables: &mut [(String, u64)],
+    spared: &mut Vec<u64>,
     committed: impl Fn(TxId) -> bool,
 ) -> Vec<Recovered> {
     let mut later = Vec::new();
@@ -1087,6 +1229,36 @@ pub(super) async fn recover_files(
     // Each such transaction's place in `later`: where its newest intent is.
     let mut placed: Vec<(usize, TxId)> = Vec::new();
     for (path, tx, undo) in intents {
+        if let Undo::Swapped { table, old_uid, new_uid } = &undo {
+            let done = if committed(tx) {
+                true
+            } else {
+                match super::swap_catalogue_uid_in(io_pointers, io_rows, io_schema, None, *new_uid, *old_uid).await {
+                    Ok(moved) => {
+                        if let Some(name) = moved {
+                            info!("Putting \"{name}\" back as it was before its rewrite: transaction {tx} did not commit before a crash");
+                        }
+                        for (_, uid) in tables.iter_mut() {
+                            if *uid == *new_uid {
+                                *uid = *old_uid;
+                            }
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        // The old uid's files are what the next try needs:
+                        // the reaper must not take them for unnamed.
+                        error!("Could not put \"{table}\" back as it was before its rewrite after a crash: {e}");
+                        spared.push(*old_uid);
+                        false
+                    }
+                }
+            };
+            if done {
+                let _ = super::rewrite::remove_intent(&path);
+            }
+            continue;
+        }
         if renaming.contains(&tx) {
             let group = groups.entry(tx).or_default();
             if group.is_empty() {
@@ -1094,7 +1266,7 @@ pub(super) async fn recover_files(
                 later.push(Recovered::Undo(tx, Vec::new()));
             }
             // Newest first here; reversed below, as `undo_steps` takes them.
-            group.push(Step { undo, intent: Some(path), seq: 0 });
+            group.push(Step { undo, intent: Some(path), seq: 0, hold: None });
             continue;
         }
         let done = match (&undo, committed(tx)) {
@@ -1102,7 +1274,7 @@ pub(super) async fn recover_files(
                 let seed = super::seed_in(io_pointers, pool, kv, seeds, copy).await;
                 discard_files_in(&seed, pool, Some(&root), copy, RENAMED_SUFFIXES).await
             }
-            (Undo::Drop { .. }, true) | (Undo::Renamed { .. }, _) => true,
+            (Undo::Drop { .. }, true) | (Undo::Renamed { .. }, _) | (Undo::Swapped { .. }, _) => true,
             // The block never got to its commit: the table was not touched.
             (Undo::DropAtCommit { .. }, false) => true,
             (Undo::DropAtCommit { table, incarnation, .. }, true) => {

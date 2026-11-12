@@ -399,39 +399,79 @@ async fn a_key_value_tables_ddl_in_a_block_rolls_back_recovers_and_commits() {
 }
 
 
+/// The files directly under `dir` (not the paged index runs, `.idxr`
+/// directories, which go when their last reader lets go) of partitioned
+/// table stem `stem` (`__pt_<uid>`).
+fn uid_files(dir: &Path, stem: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("dir")
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("{stem}_")))
+        .collect()
+}
+
 /// An ALTER that rewrites a partitioned table's rows moves them to a new uid
-/// and deletes the old one's files (phase 6 P8), so the block's copy of the
-/// old schema cannot go back. The step is forgotten when the table moves
-/// (`block_ddl_table_moved`, and the client is warned): a ROLLBACK leaves
-/// the rewrite in place rather than put the copy back as files no table
-/// owns and report the change undone. Its earlier DDL on the table goes
-/// with it; the rows are the table's either way.
+/// (phase 6 P8). In a block (2026-11-12) the old uid's files are kept until
+/// the block ends: a ROLLBACK, or a crash before COMMIT, moves the
+/// catalogue row back, reopens the old table and deletes the new uid; a
+/// COMMIT deletes the old uid (or, after a crash past the commit, the
+/// startup reaper does). Before, the rewrite deleted the old files at once
+/// and a ROLLBACK left the rewrite in place, with a warning.
+///
+/// Two rewrites in one block, with the block's own row and an index between
+/// them, so an undo walks two moves back through a schema restore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_partitioned_rewrite_in_a_block_is_not_put_back_as_orphan_files() {
-    for end in [End::Rollback, End::Crash] {
+async fn a_partitioned_rewrite_in_a_block_rolls_back_recovers_and_commits() {
+    for end in [End::Rollback, End::Crash, End::Commit, End::CommitCrash] {
         let dir = tempfile::tempdir().expect("dir");
         let db = Arc::new(open(dir.path()).await);
         exec(&db, "CREATE TABLE p (id INT NOT NULL, v TEXT) PARTITION BY HASH (id)").await.expect("create");
         exec(&db, "INSERT INTO p (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c')").await.expect("insert");
         let before = db.schema_files_stem("p");
         let root = db.transactions.begin();
-        block_ddl(&db, root, &["CREATE INDEX p_v ON p (v)", "ALTER TABLE p ADD COLUMN w INT"]).await;
-        assert_ne!(db.schema_files_stem("p"), before, "the ALTER did not rewrite into a new uid; this test needs one that does");
-        assert_eq!(db.block_ddl_len(root), 0, "{end:?}: a step for the old uid's files was kept");
+        block_ddl(&db, root, &["CREATE INDEX p_v ON p (v)", "ALTER TABLE p ADD COLUMN w INT DEFAULT 7"]).await;
+        let first = db.schema_files_stem("p");
+        assert_ne!(first, before, "the ALTER did not rewrite into a new uid; this test needs one that does");
+        assert!(!uid_files(dir.path(), &before).is_empty(), "{end:?}: the old uid's files went before the block ended");
+        in_block(&db, root, "INSERT INTO p (id, v, w) VALUES (4, 'd', 8)").await.expect("the block's row");
+        block_ddl(&db, root, &["ALTER TABLE p ADD COLUMN x INT DEFAULT 9"]).await;
+        let second = db.schema_files_stem("p");
+        assert_ne!(second, first, "the second ALTER did not rewrite");
+        // Read in the block: it holds the table's ACCESS EXCLUSIVE.
+        let out = in_block(&db, root, "SELECT id FROM p WHERE x = 9").await.expect("read in the block");
+        assert_eq!(crate::core::row::row::vec_into_rows(&out[1..]).expect("rows").len(), 4, "{end:?}: the rewrite's rows");
         let db = end_block(db, root, end, dir.path()).await;
-        assert!(columns(&db, "p").contains(&"w".to_string()), "{end:?}: the rewrite is the table now");
-        assert_eq!(ids(&db, "p").await, 3, "{end:?}: the rows");
-        // Its schema files, which a copy put back would have brought back.
-        // (Its paged index runs, `<stem>_<n>.idxr`, go when their last
-        // reader lets go of them, a rewrite's affair and not a block's.)
-        let orphans: Vec<String> = std::fs::read_dir(dir.path())
-            .expect("dir")
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(&format!("{before}_schema")))
-            .collect();
-        assert!(orphans.is_empty(), "{end:?}: the old uid's schema files came back: {orphans:?}");
+        let committed = matches!(end, End::Commit | End::CommitCrash);
+        if committed {
+            assert_eq!(columns(&db, "p"), ["id", "v", "w", "x"], "{end:?}");
+            assert_eq!(index_names(&db, "p"), ["p_v"], "{end:?}");
+            assert_eq!(db.schema_files_stem("p"), second, "{end:?}");
+            assert_eq!(ids(&db, "p").await, 4, "{end:?}: the rows, the block's included");
+            assert_eq!(count(&db, "SELECT id FROM p WHERE w = 7").await, 3, "{end:?}: the default the rewrite wrote");
+            for gone in [&before, &first] {
+                assert!(uid_files(dir.path(), gone).is_empty(), "{end:?}: {gone} kept: {:?}", uid_files(dir.path(), gone));
+            }
+        } else {
+            assert_eq!(columns(&db, "p"), ["id", "v"], "{end:?}: the rewrite stayed");
+            assert!(index_names(&db, "p").is_empty(), "{end:?}: the index stayed");
+            assert_eq!(db.schema_files_stem("p"), before, "{end:?}: the table is not the one before the block");
+            assert_eq!(ids(&db, "p").await, 3, "{end:?}: the rows before the block, without the block's");
+            for gone in [&first, &second] {
+                assert!(uid_files(dir.path(), gone).is_empty(), "{end:?}: {gone} kept: {:?}", uid_files(dir.path(), gone));
+            }
+        }
+        exec(&db, "INSERT INTO p (id, v) VALUES (10, 'z')").await.expect("the table takes rows");
+        exec(&db, "UPDATE p SET v = 'y' WHERE id = 1").await.expect("and updates");
+        assert_eq!(count(&db, "SELECT id FROM p WHERE v = 'y'").await, 1, "{end:?}");
         assert!(block_leftovers(dir.path()).is_empty(), "{end:?}: left behind: {:?}", block_leftovers(dir.path()));
+        // And it survives the next open as it is.
+        let stem = db.schema_files_stem("p");
+        shut(db, dir.path());
+        let db = Arc::new(open(dir.path()).await);
+        assert_eq!(db.schema_files_stem("p"), stem, "{end:?}: reopened");
+        assert_eq!(ids(&db, "p").await, if committed { 5 } else { 4 }, "{end:?}: reopened");
         shut(db, dir.path());
     }
 }
