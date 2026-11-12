@@ -394,6 +394,37 @@ pub struct ConcurrentProcessor;
 /// cost of another worker outweighs the fetches it would take over.
 const SPARSE_MIN_BATCH: usize = 512;
 
+/// The fewest rows a scan expects to read for the batch prefilter to be built.
+///
+/// The prefilter is an optimisation and nothing more: rows it keeps are still
+/// fetched and evaluated in full, so a scan without one answers the same. It
+/// earns its keep by deciding thousands of rows from one read of the
+/// predicate's columns. Over the handful an index hands back it is an extra
+/// read of columns the fetch reads again a moment later, plus the cost of
+/// planning it: about 2% of a point lookup, whose one candidate nearly always
+/// passes.
+const PREFILTER_MIN_ROWS: u64 = 16;
+
+/// The fewest rows in a batch after which a scan worker yields to the
+/// runtime (the latency guard in `spawn_batch_tasks`). Only a scan's last
+/// batch is ever shorter, and a point lookup's only batch is one row.
+const YIELD_MIN_BATCH: usize = 512;
+
+/// Whether a batch of `batch_len` rows held its worker's thread long enough
+/// to be worth giving back: [`YIELD_MIN_BATCH`] rows, or a full batch where
+/// `--batch-size` is set below that (so a scan of full batches always
+/// yields, whatever the size).
+#[inline(always)]
+fn long_enough_to_yield(batch_len: usize) -> bool {
+    batch_len >= YIELD_MIN_BATCH.min(crate::batch_size().max(1))
+}
+
+/// Whether a scan expecting to read `expected` rows gets a batch prefilter.
+#[inline]
+fn worth_prefiltering(expected: u64) -> bool {
+    expected >= PREFILTER_MIN_ROWS
+}
+
 impl ConcurrentProcessor {
     pub fn new() -> Self {
         Self {}
@@ -751,13 +782,17 @@ impl ConcurrentProcessor {
     /// The batch prefilter for a filtered scan, built from the same tokens as
     /// its plan; `None` with no `WHERE`, with `--scan-prefilter false`, or when
     /// nothing in the clause is a comparison it can decide.
+    ///
+    /// `None` too for a scan of fewer than [`PREFILTER_MIN_ROWS`] rows
+    /// (`expected`, the iterator's `expected_records`).
     fn build_prefilter(
         no_filter: bool,
         tokens_arc: &Arc<SmallVec<[Token; 36]>>,
         schema_arc: &Arc<SmallVec<[SchemaField; 20]>>,
         query_row_fetch: &RowFetch,
+        expected: u64,
     ) -> Option<Arc<BatchPrefilter>> {
-        if no_filter {
+        if no_filter || !worth_prefiltering(expected) {
             return None;
         }
         BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch).map(Arc::new)
@@ -1027,6 +1062,7 @@ impl ConcurrentProcessor {
                 let mut top_bounded = false;
 
                 while let Ok(pointers) = work_rx.recv().await {
+                    let batch_len = pointers.len();
                     // Asked before the batch rather than after: the point is not
                     // to finish this batch faster but to stop starting new ones.
                     // The error is recorded before the stop flag, so the
@@ -1411,7 +1447,18 @@ impl ConcurrentProcessor {
                     // session's statement on those threads waited behind it.
                     // One yield per batch costs one reschedule per
                     // `batch_size()` rows.
-                    if latency_guards_on() {
+                    //
+                    // Not after a short batch, which held the thread for no
+                    // time worth giving back. A yield is not free: the worker
+                    // thread, with nothing else queued, parks for zero time
+                    // (one `epoll_wait`) to take the task back, and takes it
+                    // back in tokio's searching state, which wakes a second
+                    // worker that finds nothing and parks on the I/O driver.
+                    // The next statement on the connection is then delivered
+                    // to that thread. A point lookup's one-row batch paid all
+                    // of that on every statement: two context switches where
+                    // one would do, and the session moved core each time.
+                    if long_enough_to_yield(batch_len) && latency_guards_on() {
                         tokio::task::yield_now().await;
                     }
                 }
@@ -2068,7 +2115,7 @@ impl ConcurrentProcessor {
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan,
-            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
             Arc::clone(&io_rows),
             // No row channel and no bytes channel: nothing is emitted.
             None,
@@ -2220,7 +2267,7 @@ impl ConcurrentProcessor {
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan.clone(),
-            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
             io_rows_outer.clone(),
             Some(tx.clone()),
             None,
@@ -2469,7 +2516,7 @@ impl ConcurrentProcessor {
             Arc::clone(&shared_tuple),
             Arc::clone(&schema_arc),
             compiled_plan.clone(),
-            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0),
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
             io_rows_outer.clone(),
             None,
             Some(tx_b.clone()),
@@ -3332,6 +3379,41 @@ pub(crate) fn build_write_order_map(
         if wo < map.len() && pos < u8::MAX as usize {
             map[wo] = pos as u8;
         }
+    }
+}
+
+#[cfg(test)]
+mod small_scan_rule_tests {
+    use super::*;
+
+    /// A point lookup's one-row batch, and any batch short of
+    /// `YIELD_MIN_BATCH`, does not give the thread back; a full batch does,
+    /// as does every batch an index answer is cut into.
+    #[test]
+    fn only_a_batch_of_real_work_yields() {
+        for short in [0, 1, 2, 100, YIELD_MIN_BATCH - 1] {
+            assert!(!long_enough_to_yield(short), "{short} rows");
+        }
+        for long in [YIELD_MIN_BATCH, SPARSE_MIN_BATCH, crate::batch_size(), 65_536] {
+            assert!(long_enough_to_yield(long), "{long} rows");
+        }
+    }
+
+    /// The prefilter is left out below `PREFILTER_MIN_ROWS` expected rows and
+    /// built from there up; an unfiltered scan never has one.
+    #[test]
+    fn only_a_scan_of_several_rows_is_prefiltered() {
+        for few in [0, 1, PREFILTER_MIN_ROWS - 1] {
+            assert!(!worth_prefiltering(few), "{few} rows");
+        }
+        for many in [PREFILTER_MIN_ROWS, 10_000, u64::MAX] {
+            assert!(worth_prefiltering(many), "{many} rows");
+        }
+        let schema = Arc::new(SmallVec::new());
+        let tokens = Arc::new(SmallVec::new());
+        let fetch = RowFetch { columns_fetching_data: SmallVec::new() };
+        assert!(ConcurrentProcessor::build_prefilter(true, &tokens, &schema, &fetch, u64::MAX).is_none());
+        assert!(ConcurrentProcessor::build_prefilter(false, &tokens, &schema, &fetch, 1).is_none());
     }
 }
 
