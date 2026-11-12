@@ -483,9 +483,12 @@ fn asides(db: &Database, dir: &Path) -> Vec<String> {
             found.push(t.to_string());
         }
     });
+    // Its files, not its paged index runs' directory (`<stem>.idxr`), which
+    // the store empties when its last reader lets go and leaves, as it does
+    // for any table renamed or dropped under disk residency.
     for e in std::fs::read_dir(dir).expect("dir").flatten() {
         let n = e.file_name().to_string_lossy().into_owned();
-        if n.starts_with(block_ddl::ASIDE_PREFIX) {
+        if n.starts_with(block_ddl::ASIDE_PREFIX) && !n.ends_with(".idxr") {
             found.push(n);
         }
     }
