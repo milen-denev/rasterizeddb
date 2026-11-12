@@ -805,12 +805,21 @@ impl Database {
 
     /// Opens the partitioned tables the catalogue names (§7.1), after every
     /// plain table: one that cannot open is left broken, in the partitioned
-    /// map so a DROP still reaches it, and never stops the rest.
-    pub(super) async fn open_partitioned_rows(&self, rows: Vec<(String, u64)>) {
+    /// map so a DROP still reaches it, and never stops the rest. A uid in
+    /// `unfinished` is a block's rewrite a crash interrupted and the
+    /// recovery could not move back (`block_ddl::recover_files`): refused,
+    /// so no write lands in files the next start's retry deletes.
+    pub(super) async fn open_partitioned_rows(&self, rows: Vec<(String, u64)>, unfinished: &[u64]) {
         #[cfg(test)]
         self.forget_before_partitioned_open().await;
         for (name, uid) in rows {
-            let (shell, table) = self.open_partitioned(&name, uid).await;
+            let (shell, table) = if unfinished.contains(&uid) {
+                let why = "a rollback a crash interrupted could not put back the table as it was before its rewrite; \
+                           the next start tries again";
+                (None, self.refused_partitioned(&name, uid, why))
+            } else {
+                self.open_partitioned(&name, uid).await
+            };
             self.install_partitioned(name, Arc::new(table), shell);
         }
     }

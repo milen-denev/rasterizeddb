@@ -1185,8 +1185,10 @@ pub(super) enum Recovered {
 /// not commit has its row moved back to the old uid (by uid alone; the
 /// block may have renamed the table since), and `tables` follows, so the
 /// old table opens and the reaper takes the new uid; one that did leaves
-/// the old uid to the reaper. A move back that fails names the old uid in
-/// `spared`, which the reaper keeps.
+/// the old uid to the reaper. A move back that fails names the old uid and
+/// the new in `spared` (old, new): the reaper keeps the old, the intent stays
+/// for the next start to try again, and the table, still at the new uid,
+/// opens refused, since a write to it would be lost when that try succeeds.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_files(
     io_pointers: &rclite::Arc<crate::core::storage_providers::backend::DbStorageProvider>,
@@ -1196,7 +1198,7 @@ pub(super) async fn recover_files(
     kv: &super::KvStores,
     seeds: &super::SeedCache,
     tables: &mut [(String, u64)],
-    spared: &mut Vec<u64>,
+    spared: &mut Vec<(u64, u64)>,
     committed: impl Fn(TxId) -> bool,
 ) -> Vec<Recovered> {
     let mut later = Vec::new();
@@ -1233,7 +1235,15 @@ pub(super) async fn recover_files(
             let done = if committed(tx) {
                 true
             } else {
-                match super::swap_catalogue_uid_in(io_pointers, io_rows, io_schema, None, *new_uid, *old_uid).await {
+                #[cfg(test)]
+                let moved = if swap_back_hooks::fails(std::path::Path::new(&root)) {
+                    Err(std::io::Error::other("injected by a test"))
+                } else {
+                    super::swap_catalogue_uid_in(io_pointers, io_rows, io_schema, None, *new_uid, *old_uid).await
+                };
+                #[cfg(not(test))]
+                let moved = super::swap_catalogue_uid_in(io_pointers, io_rows, io_schema, None, *new_uid, *old_uid).await;
+                match moved {
                     Ok(moved) => {
                         if let Some(name) = moved {
                             info!("Putting \"{name}\" back as it was before its rewrite: transaction {tx} did not commit before a crash");
@@ -1249,7 +1259,7 @@ pub(super) async fn recover_files(
                         // The old uid's files are what the next try needs:
                         // the reaper must not take them for unnamed.
                         error!("Could not put \"{table}\" back as it was before its rewrite after a crash: {e}");
-                        spared.push(*old_uid);
+                        spared.push((*old_uid, *new_uid));
                         false
                     }
                 }
@@ -1371,6 +1381,27 @@ impl Database {
             .map_err(|failure| io::Error::other(format!("the keys of \"{child}\" naming it: {failure}")))?;
         }
         self.drop_table_for_rollback(table).await
+    }
+}
+
+/// Test-only: makes the recovery's move back of a partitioned rewrite
+/// ([`Undo::Swapped`]) fail for the database at a directory, until disarmed.
+#[cfg(test)]
+pub(crate) mod swap_back_hooks {
+    use std::path::{Path, PathBuf};
+
+    static ARMED: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+    pub(crate) fn fail_recovery_swap_back(dir: &Path) {
+        ARMED.lock().push(dir.to_path_buf());
+    }
+
+    pub(crate) fn disarm(dir: &Path) {
+        ARMED.lock().retain(|d| d != dir);
+    }
+
+    pub(super) fn fails(location: &Path) -> bool {
+        ARMED.lock().iter().any(|d| location.starts_with(d) || d.starts_with(location))
     }
 }
 

@@ -1604,7 +1604,7 @@ impl Database {
         // A block's DDL a crash interrupted (`block_ddl`): before any table
         // opens, the copies of a block that did not commit put back, and the
         // tables it created named, to drop once the database is open.
-        let mut spared: Vec<u64> = Vec::new();
+        let mut spared: Vec<(u64, u64)> = Vec::new();
         let block_ddl_drops = if in_memory {
             Vec::new()
         } else {
@@ -1628,10 +1628,12 @@ impl Database {
         // before forgetting resumes: partition files without MATERIALIZE may
         // hold rows of a transaction whose outcome was lost, and must go
         // before the forget horizon can pass it (§12). A uid a block's undo
-        // could not move back to is kept for the next try (`spared`).
+        // could not move back to is kept for the next try (`spared`), and
+        // the table left at the new one opens refused (`unfinished`).
+        let unfinished: Vec<u64> = spared.iter().map(|(_, new)| *new).collect();
         if !in_memory {
             let mut live = tables_names.clone();
-            live.extend(spared.iter().map(|uid| (String::new(), *uid)));
+            live.extend(spared.iter().map(|(old, _)| (String::new(), *old)));
             partitioned::reap_at_startup(location, &io_pointers, &storage, &live);
         }
         // No forgetting until every table holding rows is registered: plain
@@ -1821,7 +1823,7 @@ impl Database {
                 handle
             },
         };
-        database.open_partitioned_rows(partitioned_rows).await;
+        database.open_partitioned_rows(partitioned_rows, &unfinished).await;
         drop(startup_forget_pause);
         // The plain tables went into the map before the database existed.
         database.rebuild_fk_reverse();

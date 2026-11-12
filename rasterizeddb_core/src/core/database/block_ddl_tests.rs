@@ -476,6 +476,70 @@ async fn a_partitioned_rewrite_in_a_block_rolls_back_recovers_and_commits() {
     }
 }
 
+/// A crash's undo of a block's partitioned rewrite that cannot move the
+/// catalogue row back (an I/O failure, injected) keeps the old uid's files
+/// from the startup reaper and keeps the intent; the table, left at the
+/// uncommitted rewrite's uid, opens refused, so no write lands where the
+/// next start's retry deletes it. That retry puts the table back; or, once
+/// the refused table is dropped, the retry finds no row and the next start
+/// leaves nothing of either uid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewrite_undo_that_fails_at_startup_refuses_the_table_and_retries() {
+    for drop_it in [false, true] {
+        let dir = tempfile::tempdir().expect("dir");
+        let db = Arc::new(open(dir.path()).await);
+        exec(&db, "CREATE TABLE p (id INT NOT NULL, v TEXT) PARTITION BY HASH (id)").await.expect("create");
+        exec(&db, "INSERT INTO p (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c')").await.expect("insert");
+        let before = db.schema_files_stem("p");
+        let root = db.transactions.begin();
+        block_ddl(&db, root, &["ALTER TABLE p ADD COLUMN w INT DEFAULT 7"]).await;
+        let rewritten = db.schema_files_stem("p");
+        assert_ne!(rewritten, before, "the ALTER did not rewrite into a new uid; this test needs one that does");
+
+        block_ddl::swap_back_hooks::fail_recovery_swap_back(dir.path());
+        let db = end_block(db, root, End::Crash, dir.path()).await;
+        assert!(!uid_files(dir.path(), &before).is_empty(), "drop_it={drop_it}: the reaper took the old uid the retry needs");
+        assert!(!uid_files(dir.path(), &rewritten).is_empty(), "drop_it={drop_it}: the table's current files went");
+        assert!(!block_leftovers(dir.path()).is_empty(), "drop_it={drop_it}: the intent the retry needs went");
+        // Every statement fails; the ones that need no column name say why
+        // (a named column fails first against the refused table's empty
+        // stand-in schema, as for any refused partitioned table).
+        for sql in ["SELECT * FROM p", "SELECT COUNT(*) FROM p"] {
+            let err = exec(&db, sql).await.expect_err("the half-recovered table answered");
+            assert!(err.contains("could not put back"), "drop_it={drop_it}: {sql}: {err}");
+        }
+        for sql in [
+            "SELECT id FROM p",
+            "INSERT INTO p (id, v) VALUES (9, 'x')",
+            "INSERT INTO p VALUES (9, 'x')",
+            "UPDATE p SET v = 'q'",
+            "DELETE FROM p",
+        ] {
+            assert!(exec(&db, sql).await.is_err(), "drop_it={drop_it}: {sql} reached the half-recovered table");
+        }
+        if drop_it {
+            exec(&db, "DROP TABLE p").await.expect("a refused table can still be dropped");
+        }
+        shut(db, dir.path());
+
+        block_ddl::swap_back_hooks::disarm(dir.path());
+        let db = Arc::new(open(dir.path()).await);
+        if drop_it {
+            assert!(exec(&db, "SELECT id FROM p").await.is_err(), "the dropped table came back");
+            assert!(uid_files(dir.path(), &before).is_empty(), "the old uid outlived its dropped table");
+        } else {
+            assert_eq!(db.schema_files_stem("p"), before, "the retry did not put the table back");
+            assert_eq!(columns(&db, "p"), ["id", "v"]);
+            assert_eq!(ids(&db, "p").await, 3);
+            exec(&db, "INSERT INTO p (id, v) VALUES (10, 'z')").await.expect("the table takes rows");
+            assert_eq!(ids(&db, "p").await, 4);
+        }
+        assert!(uid_files(dir.path(), &rewritten).is_empty(), "drop_it={drop_it}: the rewrite's uid kept");
+        assert!(block_leftovers(dir.path()).is_empty(), "drop_it={drop_it}: left behind: {:?}", block_leftovers(dir.path()));
+        shut(db, dir.path());
+    }
+}
+
 /// Block `root`'s `DROP TABLE` as pgwire runs it: deferred to the commit.
 async fn block_drop(db: &Arc<Database>, root: crate::core::mvcc::TxId, table: &str, sql: &str) {
     let (db2, table, sql) = (db.clone(), table.to_string(), sql.to_string());

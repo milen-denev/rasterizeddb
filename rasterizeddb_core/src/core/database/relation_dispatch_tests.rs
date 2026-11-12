@@ -239,6 +239,8 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("reopen_partitioned", "a partitioned reload's reopen, after its dispatch"),
     ("swap_partitioned", "a slot primitive: a partitioned reload's swap; its callers dispatch"),
     ("rename_partitioned", "the partitioned branch of rename_table's dispatch"),
+    ("swap_back_partitioned", "a block's undo of a partitioned rewrite: only rewrite_partitioned records the Swapped step"),
+    ("release_swapped_uid", "a block's commit of a partitioned rewrite: only rewrite_partitioned records the Swapped step"),
     ("reinstall_partitioned", "rename_partitioned's swap of the maps, after its dispatch"),
     ("schema_files_stem", "asks the partitioned map itself, as relation() does"),
     ("rewrite_partitioned_header", "rename_partitioned's header step on the shell's __pt_ schema, after its dispatch"),
