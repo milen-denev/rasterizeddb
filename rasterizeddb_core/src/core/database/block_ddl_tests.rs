@@ -399,13 +399,16 @@ async fn a_partitioned_rewrite_in_a_block_is_not_put_back_as_orphan_files() {
         let db = end_block(db, root, end, dir.path()).await;
         assert!(columns(&db, "p").contains(&"w".to_string()), "{end:?}: the rewrite is the table now");
         assert_eq!(ids(&db, "p").await, 3, "{end:?}: the rows");
+        // Its schema files, which a copy put back would have brought back.
+        // (Its paged index runs, `<stem>_<n>.idxr`, go when their last
+        // reader lets go of them, a rewrite's affair and not a block's.)
         let orphans: Vec<String> = std::fs::read_dir(dir.path())
             .expect("dir")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(&before))
+            .filter(|n| n.starts_with(&format!("{before}_schema")))
             .collect();
-        assert!(orphans.is_empty(), "{end:?}: the old uid's files came back: {orphans:?}");
+        assert!(orphans.is_empty(), "{end:?}: the old uid's schema files came back: {orphans:?}");
         assert!(block_leftovers(dir.path()).is_empty(), "{end:?}: left behind: {:?}", block_leftovers(dir.path()));
         shut(db, dir.path());
     }
