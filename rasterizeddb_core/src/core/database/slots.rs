@@ -396,6 +396,14 @@ impl Database {
     /// one is and it is not `name` itself.
     #[cold]
     fn folded_key(&self, name: &str) -> Option<String> {
+        // `name` is itself a key: of a table when the question was about the
+        // partitioned map, which is every statement on a plain table
+        // (`relation_for` asks that map first). No other key then equals it
+        // ignoring case (the collision guard), so there is nothing to scan
+        // for, and the scan below clones every registered name.
+        if self.is_exact_key(name) {
+            return None;
+        }
         let mut found: Option<String> = None;
         let keys = self
             .table_slots
@@ -411,6 +419,15 @@ impl Database {
             }
         }
         found
+    }
+
+    /// Whether `name`, exactly as spelled, is registered in either map. The
+    /// resolver's own question ([`Self::folded_key`] asks it before scanning
+    /// for another spelling); every other lookup by name goes through
+    /// [`Self::resolve`].
+    #[inline]
+    fn is_exact_key(&self, name: &str) -> bool {
+        self.table_slots.contains_key(name) || self.partitioned_tables.contains_key(name)
     }
 
     /// The map key a DDL mutator acts on for `name`: the key [`Database::resolve`]

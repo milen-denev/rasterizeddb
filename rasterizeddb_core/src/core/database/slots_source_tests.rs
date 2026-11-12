@@ -411,10 +411,13 @@ fn the_test_accessor_is_never_called_by_the_engine() {
 }
 
 /// 4: each fn of `slots.rs` that looks a map up (`get`, `contains_key`)
-/// does so through `resolve`, except a walk over the map's own keys.
+/// does so through `resolve`, except a walk over the map's own keys and
+/// the resolver's own exact-spelling check (`is_exact_key`, which
+/// `folded_key` asks so a name that is itself registered is not scanned
+/// for under another spelling).
 #[test]
 fn every_lookup_by_name_goes_through_resolve() {
-    const KEY_WALKS: &[&str] = &["relation_names"];
+    const KEY_WALKS: &[&str] = &["relation_names", "is_exact_key"];
     fn looks_up(tokens: TokenStream) -> bool {
         let flat: Vec<TokenTree> = tokens.into_iter().collect();
         flat.windows(3).any(|w| match (&w[0], &w[1], &w[2]) {
@@ -458,6 +461,7 @@ fn every_lookup_by_name_goes_through_resolve() {
         "relation",
         "has_table",
         "partitioned_table",
+        "is_exact_key",
     ] {
         assert!(
             lookups.iter().any(|l| l == known),
