@@ -1019,14 +1019,7 @@ impl ConcurrentProcessor {
                 // first batch). Boxed: inline it is ~11 KB of the task's
                 // future, which `spawn` copies whole at each layer it moves
                 // through before the first poll.
-                let mut buffer: Box<Buffer<'_>> = Box::new(Buffer {
-                    hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-                    row: Row::default(),
-                    transformers: SmallVec::new(),
-                    intermediate_results: SmallVec::new(),
-                    bool_buffer: SmallVec::new(),
-                    write_order_to_col: SmallVec::new(),
-                });
+                let mut buffer: Box<Buffer<'_>> = Buffer::boxed(Row::default());
 
                 let processor_cell = UnsafeCell::new(TransformerProcessor::new(
                     &mut buffer.transformers,
@@ -2828,14 +2821,7 @@ impl ConcurrentProcessor {
 
                 // Boxed, as in `spawn_batch_tasks`: ~11 KB of the task's
                 // future otherwise.
-                let mut buffer = Box::new(Buffer {
-                    hashtable_buffer: UnsafeCell::new(SmallVec::new()),
-                    row,
-                    transformers: SmallVec::new(),
-                    intermediate_results: SmallVec::new(),
-                    bool_buffer: SmallVec::new(),
-                    write_order_to_col: SmallVec::new(),
-                });
+                let mut buffer = Buffer::boxed(row);
 
                 // Build a processor and parser once per batch
                 let processor_cell = UnsafeCell::new(TransformerProcessor::new(
@@ -3273,6 +3259,44 @@ pub struct Buffer<'a> {
     /// Precomputed map: write_order -> position in `row.columns`.
     /// `u8::MAX` denotes an absent column. Computed once per batch.
     pub write_order_to_col: SmallVec<[u8; 32]>,
+}
+
+impl Buffer<'_> {
+    /// An empty buffer around `row`, built in its allocation.
+    ///
+    /// `Box::new(Buffer { .. })` builds the value on the stack and copies it
+    /// to the heap, all 11.7 KB of it, nearly every byte of which is the
+    /// unused inline space of an empty `SmallVec`: a point lookup spent more
+    /// on that copy than on reading its row. Written a field at a time, an
+    /// empty `SmallVec` is a store of its length.
+    pub fn boxed(row: Row) -> Box<Self> {
+        let mut slot = Box::<Self>::new_uninit();
+        let buffer = slot.as_mut_ptr();
+        // SAFETY: `buffer` points at the allocation `slot` owns, valid and
+        // aligned for a `Buffer`. Each field is written exactly once, through
+        // a raw place (no reference to uninitialised memory is made), and
+        // every field is written before `assume_init`. The destructuring
+        // below names every field, so one added later fails to compile here
+        // rather than being left unwritten.
+        unsafe {
+            (&raw mut (*buffer).hashtable_buffer).write(UnsafeCell::new(SmallVec::new()));
+            (&raw mut (*buffer).row).write(row);
+            (&raw mut (*buffer).transformers).write(SmallVec::new());
+            (&raw mut (*buffer).intermediate_results).write(SmallVec::new());
+            (&raw mut (*buffer).bool_buffer).write(SmallVec::new());
+            (&raw mut (*buffer).write_order_to_col).write(SmallVec::new());
+            let buffer = slot.assume_init();
+            let Buffer {
+                hashtable_buffer: _,
+                row: _,
+                transformers: _,
+                intermediate_results: _,
+                bool_buffer: _,
+                write_order_to_col: _,
+            } = &*buffer;
+            buffer
+        }
+    }
 }
 
 // A zero-copy view over Row's MemoryBlocks for execution, indexed by schema write_order.
