@@ -1965,6 +1965,50 @@ fn finish_array_element(raw: &str, was_quoted: bool) -> Option<String> {
     })
 }
 
+/// `a || b` over two stored arrays, PostgreSQL's `array_cat` for one
+/// dimension: the elements of `a`, then those of `b`. An empty side gives
+/// the other. Elements of one type are spliced as they are stored; integer
+/// and floating types of different widths meet at the wider one (`int8[] ||
+/// numeric[]` is `numeric[]`), and a `text[]` side, which is also what an
+/// untyped `ARRAY['1']` builds, takes the other side's type when its
+/// elements read as it.
+pub fn array_cat(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+    let unreadable = || "could not read an array operand of ||".to_string();
+    let (oid_a, dims_a, elements_a) = decode_array_dims(a).ok_or_else(unreadable)?;
+    let (oid_b, dims_b, elements_b) = decode_array_dims(b).ok_or_else(unreadable)?;
+    if elements_a.is_empty() {
+        return Ok(b.to_vec());
+    }
+    if elements_b.is_empty() {
+        return Ok(a.to_vec());
+    }
+    if dims_a.len() > 1 || dims_b.len() > 1 {
+        return Err("|| over multidimensional arrays is not supported yet".to_string());
+    }
+    let all_null = |e: &[Option<&[u8]>]| e.iter().all(Option::is_none);
+    let splice = |oid: i32| {
+        build_array_dims(oid, &[elements_a.len() + elements_b.len()], elements_a.iter().chain(elements_b.iter()).copied())
+    };
+    if oid_a == oid_b || all_null(&elements_b) {
+        return Ok(splice(oid_a));
+    }
+    if all_null(&elements_a) {
+        return Ok(splice(oid_b));
+    }
+    // The numeric types in PostgreSQL's implicit-cast order.
+    const WIDENING: [i32; 6] = [21, 23, 20, 1700, 700, 701];
+    let rank = |oid: i32| WIDENING.iter().position(|&o| o == oid);
+    let target = match (rank(oid_a), rank(oid_b)) {
+        (Some(x), Some(y)) => WIDENING[x.max(y)],
+        _ if oid_a == 25 => oid_b,
+        _ if oid_b == 25 => oid_a,
+        _ => return Err(format!("operator does not exist: array of type {oid_a} || array of type {oid_b}")),
+    };
+    let (text_a, text_b) = (format_array(a).ok_or_else(unreadable)?, format_array(b).ok_or_else(unreadable)?);
+    let literal = format!("{{{},{}}}", &text_a[1..text_a.len() - 1], &text_b[1..text_b.len() - 1]);
+    parse_array_literal_as(&literal, target).ok_or_else(|| format!("malformed array literal: \"{literal}\""))
+}
+
 /// Renders the binary array representation back to `{a,b,NULL}`, nested as
 /// it has dimensions (`{{1,2},{3,4}}`).
 pub fn format_array(raw: &[u8]) -> Option<String> {

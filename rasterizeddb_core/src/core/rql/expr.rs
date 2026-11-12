@@ -3616,6 +3616,7 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::NumericCast { .. } => DbType::DECIMAL,
         Expr::TypmodCast { value, .. } => static_type(value),
         Expr::Concat(lhs, rhs) if concat_is_jsonb(lhs, rhs) => DbType::JSONB,
+        Expr::Concat(lhs, rhs) if static_type(lhs) == DbType::ARRAY || static_type(rhs) == DbType::ARRAY => DbType::ARRAY,
         Expr::Concat(_, _) => DbType::STRING,
         Expr::Call(TextFunc::ColumnSize | TextFunc::RelationSize, _) => DbType::I64,
         Expr::Call(TextFunc::DateTrunc, _) => DbType::DATETIME,
@@ -4122,6 +4123,42 @@ pub(crate) fn integer_out_of_range(db_type: &DbType) -> String {
 /// A typed text (a `TEXT` column, `'x'::text`) beside a document is text's
 /// `anynonarray || text`, the document rendered as JSON.
 ///
+/// `a || b` with an array on either side: `array || array` concatenates,
+/// `array || element` appends and `element || array` prepends, as
+/// PostgreSQL's `array_cat`, `array_append` and `array_prepend`. Through
+/// the text path both arrays' stored bytes came out as an empty string.
+/// Not strict: a NULL array (or an untyped NULL) gives the other side, as
+/// those functions do, while a NULL element is appended as a NULL element.
+/// An untyped string literal beside an array is an array literal, as
+/// PostgreSQL resolves it (`ARRAY[1] || '{2,3}'`), and is refused when it
+/// is not one.
+fn concat_arrays(lhs: (&Expr, Value, bool), rhs: (&Expr, Value, bool)) -> Result<Value, String> {
+    let as_array = |(e, v, is_array): (&Expr, Value, bool)| -> Result<Option<Vec<u8>>, String> {
+        if is_array || matches!(e, Expr::Null) {
+            return Ok(match v {
+                Value::Data { bytes, .. } => Some(bytes),
+                _ => None,
+            });
+        }
+        if let (Expr::Literal { db_type: DbType::STRING, .. }, Value::Data { bytes, .. }) = (e, &v) {
+            let text = String::from_utf8_lossy(bytes);
+            return crate::core::value_codec::parse_array_literal(&text)
+                .map(Some)
+                .ok_or_else(|| format!("malformed array literal: \"{text}\""));
+        }
+        match crate::core::rql::pg_functions::call(crate::core::rql::pg_functions::PgFunc::ArrayCtor, &[v])? {
+            Value::Data { bytes, db_type: DbType::ARRAY } => Ok(Some(bytes)),
+            _ => Err("could not make an array of the element beside ||".to_string()),
+        }
+    };
+    let (a, b) = (as_array(lhs)?, as_array(rhs)?);
+    Ok(match (a, b) {
+        (None, None) => Value::Null,
+        (Some(only), None) | (None, Some(only)) => Value::Data { bytes: only, db_type: DbType::ARRAY },
+        (Some(a), Some(b)) => Value::Data { bytes: crate::core::value_codec::array_cat(&a, &b)?, db_type: DbType::ARRAY },
+    })
+}
+
 /// Concatenating as text always put the document's encoded bytes beside the
 /// literal: `SET doc = doc || '{"b":1}'` stored a document with text trailing
 /// it, which read back as the old document, and `SET doc = '{"a":1}' ||
@@ -7863,9 +7900,15 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
             };
             let a = operand(lhs)?;
             let b = operand(rhs)?;
+            let array_side = |e: &Expr, v: &Value| {
+                static_type(e) == DbType::ARRAY || matches!(v, Value::Data { db_type: DbType::ARRAY, .. })
+            };
+            let (a_array, b_array) = (array_side(lhs, &a), array_side(rhs, &b));
             // Strict in NULL, as PostgreSQL is: a NULL operand makes the whole
             // expression NULL rather than silently vanishing from the result.
-            if a.is_null() || b.is_null() {
+            if a_array || b_array {
+                concat_arrays((lhs, a, a_array), (rhs, b, b_array))?
+            } else if a.is_null() || b.is_null() {
                 Value::Null
             } else if concat_is_jsonb(lhs, rhs) {
                 Value::Data {

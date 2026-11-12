@@ -72,3 +72,31 @@ async fn an_unnamed_constructor_is_called_array() {
     use sqlx::Column;
     assert_eq!(row.columns()[0].name(), "array");
 }
+
+/// `||` with an array on either side concatenates, appends or prepends, as
+/// PostgreSQL's array_cat, array_append and array_prepend. It went down the
+/// text path, which read each array's stored bytes as an empty string, so
+/// `ARRAY[1] || ARRAY[2]` was '' with no error. A NULL array gives the other
+/// side, a NULL element is appended, and an untyped literal is an array
+/// literal (refused when it is not one). PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn concatenation_joins_arrays_and_elements() {
+    let (_server, pool) = server().await;
+    for (sql, want) in [
+        ("SELECT ARRAY[a] || ARRAY[b] FROM sp ORDER BY a", vec!["{1,2}", "{3,4}"]),
+        ("SELECT ARRAY[c] || ARRAY['z', NULL] FROM sp ORDER BY a", vec!["{x,z,NULL}", "{y,z,NULL}"]),
+        ("SELECT ARRAY[a, b] || a FROM sp ORDER BY a", vec!["{1,2,1}", "{3,4,3}"]),
+        ("SELECT b || ARRAY[a] FROM sp ORDER BY a", vec!["{2,1}", "{4,3}"]),
+        ("SELECT ARRAY[1] || '{2,3}'", vec!["{1,2,3}"]),
+        ("SELECT ARRAY[1] || NULL", vec!["{1}"]),
+        ("SELECT NULL::int[] || 1", vec!["{1}"]),
+        ("SELECT ARRAY[1] || NULL::int", vec!["{1,NULL}"]),
+        ("SELECT ARRAY[1] || ARRAY[2.5]", vec!["{1,2.5}"]),
+        ("SELECT '{}'::int[] || ARRAY[7]", vec!["{7}"]),
+        ("SELECT 'x' || c FROM sp ORDER BY a", vec!["xx", "xy"]),
+    ] {
+        assert_eq!(rows(&pool, sql).await, want, "{sql}");
+    }
+    let e = sqlx::raw_sql("SELECT ARRAY['a'] || 'b'").fetch_all(&pool).await.expect_err("'b' is no array literal");
+    assert!(e.to_string().contains("malformed array literal"), "{e}");
+}
