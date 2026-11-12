@@ -74,6 +74,9 @@ pub struct StatementCancel {
     /// from inside the scan, is the same place and the same reason the deadline
     /// is checked.
     gone: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// When `gone` is first worth asking: [`PEER_ASK_AFTER`] past the moment
+    /// the statement began to be watched.
+    ask_gone_from: Option<Instant>,
     /// The session's `lock_timeout` in milliseconds, for any table-lock wait
     /// the statement makes; `0`, the default, is no bound (PostgreSQL's
     /// meaning, never "fail at once").
@@ -114,6 +117,7 @@ impl StatementCancel {
             deadline,
             flagged: AtomicU8::new(0),
             gone: None,
+            ask_gone_from: None,
             lock_timeout_ms: 0,
             held_reply: None,
         }
@@ -143,8 +147,16 @@ impl StatementCancel {
     }
 
     /// Also stop when `gone()` reports the client has left.
-    pub fn watching(mut self, gone: Box<dyn Fn() -> bool + Send + Sync>) -> Self {
+    ///
+    /// Asked only once the statement has run for [`PEER_ASK_AFTER`].
+    pub fn watching(self, gone: Box<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.watching_from(gone, Instant::now() + PEER_ASK_AFTER)
+    }
+
+    /// [`Self::watching`], with the moment `gone` is first asked given.
+    fn watching_from(mut self, gone: Box<dyn Fn() -> bool + Send + Sync>, from: Instant) -> Self {
         self.gone = Some(gone);
+        self.ask_gone_from = Some(from);
         self
     }
 
@@ -184,11 +196,24 @@ impl StatementCancel {
             }
         }
         match &self.gone {
-            Some(check) if check() => Some(CancelReason::ClientWentAway),
+            Some(check) if self.ask_gone_from.is_none_or(|from| Instant::now() >= from) && check() => {
+                Some(CancelReason::ClientWentAway)
+            }
             _ => None,
         }
     }
 }
+
+/// How long a statement runs before its client is asked after.
+///
+/// The question is a system call (the wire layer peeks at the socket), and it
+/// is put once per scan batch by the dispatch loop and again by each worker.
+/// It exists to stop a statement nobody is waiting for any more, which saves
+/// nothing when the statement would have ended within the millisecond anyway:
+/// a point lookup made two such calls to learn that the client which had just
+/// sent it was still there. A clock read stands in for them until the
+/// statement has run long enough to be worth abandoning.
+pub const PEER_ASK_AFTER: std::time::Duration = std::time::Duration::from_millis(1);
 
 tokio::task_local! {
     /// The cancel signal for the statement this task is running.
@@ -366,6 +391,56 @@ fn keys_match(a: &[u8; 4], b: &[u8; 4]) -> bool {
         diff |= x ^ y;
     }
     std::hint::black_box(diff) == 0
+}
+
+#[cfg(test)]
+mod peer_ask_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn counting(asked: &Arc<AtomicUsize>) -> Box<dyn Fn() -> bool + Send + Sync> {
+        let asked = asked.clone();
+        Box::new(move || {
+            asked.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+    }
+
+    /// A statement that has not yet run for `PEER_ASK_AFTER` puts no question
+    /// to the socket, whatever the socket would have said.
+    #[test]
+    fn a_young_statement_does_not_ask_after_its_client() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let later = Instant::now() + std::time::Duration::from_secs(3600);
+        let cancel = StatementCancel::new(None).watching_from(counting(&asked), later);
+        for _ in 0..3 {
+            assert!(cancel.tripped().is_none());
+        }
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+        // Flagged out of band, it still stops: the delay is on the question only.
+        cancel.flag(CancelReason::UserRequest);
+        assert!(matches!(cancel.tripped(), Some(CancelReason::UserRequest)));
+    }
+
+    /// Once it has, every check asks, and a client that left stops it.
+    #[test]
+    fn a_statement_past_the_delay_asks_every_time() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let cancel = StatementCancel::new(None).watching_from(counting(&asked), Instant::now());
+        assert!(matches!(cancel.tripped(), Some(CancelReason::ClientWentAway)));
+        assert!(matches!(cancel.tripped(), Some(CancelReason::ClientWentAway)));
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+    }
+
+    /// `watching` starts the delay at the statement, not at zero or never.
+    #[test]
+    fn watching_delays_the_first_question_by_the_constant() {
+        let before = Instant::now();
+        let cancel = StatementCancel::new(None).watching(Box::new(|| false));
+        let from = cancel.ask_gone_from.expect("watching sets the moment");
+        assert!(from >= before + PEER_ASK_AFTER);
+        assert!(from <= Instant::now() + PEER_ASK_AFTER);
+    }
 }
 
 #[cfg(test)]
