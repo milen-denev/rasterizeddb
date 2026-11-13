@@ -260,17 +260,88 @@ const RESERVED: &[&str] = &[
     "DEFAULT", "UNION", "HAVING", "FOR", "OUTER", "NATURAL",
 ];
 
+/// The columns of a relation that exists only for one statement — a CTE, or
+/// a derived table under its alias — as `(relation, [(column, oid)])`. They
+/// are resolved by the describe path (`pgwire::param_scratch_relations`),
+/// which types each body without running it.
+pub(super) type Scratch = [(String, Vec<(String, i32)>)];
+
+struct Relation {
+    /// The table, CTE or derived table's name (an alias for a derived table).
+    name: String,
+    /// The parentheses the relation is introduced in, as token indices
+    /// `(open, close)`; the whole statement for one at its top level.
+    scope: (usize, usize),
+}
+
 struct Relations {
     /// Each relation by its name and by its alias.
     by_name: HashMap<String, String>,
-    /// The tables, in the order they appear.
-    tables: Vec<String>,
+    /// The relations, in the order they appear.
+    tables: Vec<Relation>,
+    /// For each token, the parentheses that enclose it.
+    enclosing: Vec<(usize, usize)>,
+}
+
+impl Relations {
+    /// The relations an unqualified column at token `at` may belong to, the
+    /// nearest first: those introduced in the parentheses around it, the
+    /// innermost first, and then every other one in the order written.
+    ///
+    /// In order of appearance alone, a CTE's body came first, so in `WITH c
+    /// AS (SELECT count(*) AS id FROM t …) SELECT … FROM c WHERE id = $1` the
+    /// parameter was typed by `t.id`, not by the `bigint` it is compared with.
+    fn candidates(&self, at: Option<usize>) -> Vec<&str> {
+        let Some(scope_of_column) = at.and_then(|k| self.enclosing.get(k)) else {
+            return self.tables.iter().map(|r| r.name.as_str()).collect();
+        };
+        let contains = |r: &Relation| r.scope.0 <= scope_of_column.0 && scope_of_column.1 <= r.scope.1;
+        let mut near: Vec<&Relation> = self.tables.iter().filter(|r| contains(r)).collect();
+        near.sort_by_key(|r| r.scope.1 - r.scope.0);
+        near.iter()
+            .map(|r| r.name.as_str())
+            .chain(self.tables.iter().filter(|r| !contains(r)).map(|r| r.name.as_str()))
+            .collect()
+    }
+}
+
+/// For each token, the `(open, close)` of the parentheses around it, or
+/// `(0, len)` at the top level.
+fn enclosing(toks: &[Tok]) -> Vec<(usize, usize)> {
+    let top = (0usize, toks.len());
+    let mut close_of = vec![toks.len(); toks.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (k, t) in toks.iter().enumerate() {
+        match t {
+            Tok::Open => stack.push(k),
+            Tok::Close => {
+                if let Some(open) = stack.pop() {
+                    close_of[open] = k;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(toks.len());
+    let mut stack: Vec<usize> = Vec::new();
+    for (k, t) in toks.iter().enumerate() {
+        if *t == Tok::Close {
+            stack.pop();
+        }
+        out.push(stack.last().map_or(top, |&open| (open, close_of[open])));
+        if *t == Tok::Open {
+            stack.push(k);
+        }
+    }
+    out
 }
 
 fn relations(toks: &[Tok]) -> Relations {
+    let enclosing = enclosing(toks);
     let mut rel = Relations {
         by_name: HashMap::new(),
         tables: Vec::new(),
+        enclosing,
     };
     for (i, t) in toks.iter().enumerate() {
         let introduces = ["FROM", "JOIN", "UPDATE", "INTO", "USING"]
@@ -279,10 +350,26 @@ fn relations(toks: &[Tok]) -> Relations {
         if !introduces {
             continue;
         }
+        let scope = rel.enclosing[i];
+        // `FROM (SELECT …) d`: the derived table goes by its alias.
+        if toks.get(i + 1) == Some(&Tok::Open) {
+            let Some(close) = close_after(toks, i + 1) else { continue };
+            let mut k = close + 1;
+            if toks.get(k).is_some_and(|t| t.keyword("AS")) {
+                k += 1;
+            }
+            if let Some(Tok::Ident(None, alias)) = toks.get(k) {
+                if !RESERVED.iter().any(|r| alias.eq_ignore_ascii_case(r)) {
+                    rel.tables.push(Relation { name: alias.clone(), scope });
+                    rel.by_name.insert(alias.to_ascii_lowercase(), alias.clone());
+                }
+            }
+            continue;
+        }
         let Some(Tok::Ident(_, table)) = toks.get(i + 1) else {
             continue;
         };
-        rel.tables.push(table.clone());
+        rel.tables.push(Relation { name: table.clone(), scope });
         rel.by_name.insert(table.to_ascii_lowercase(), table.clone());
         let mut k = i + 2;
         if toks.get(k).is_some_and(|t| t.keyword("AS")) {
@@ -297,14 +384,48 @@ fn relations(toks: &[Tok]) -> Relations {
     rel
 }
 
+/// The `)` matching the `(` at `open`.
+fn close_after(toks: &[Tok], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (k, t) in toks.iter().enumerate().skip(open) {
+        match t {
+            Tok::Open => depth += 1,
+            Tok::Close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The OID a column is advertised as, if `(qualifier, name)` names one.
-fn column_oid(database: &Database, rel: &Relations, qualifier: Option<&str>, name: &str) -> Option<i32> {
-    let candidates: Vec<String> = match qualifier {
-        Some(q) => vec![rel.by_name.get(&q.to_ascii_lowercase())?.clone()],
-        None => rel.tables.clone(),
+/// `at` is the column's token, which decides the nearest relations for an
+/// unqualified name. A statement's own relations (`scratch`) shadow tables
+/// of the same name, as a CTE does.
+fn column_oid(
+    database: &Database,
+    rel: &Relations,
+    scratch: &Scratch,
+    qualifier: Option<&str>,
+    name: &str,
+    at: Option<usize>,
+) -> Option<i32> {
+    let candidates: Vec<&str> = match qualifier {
+        Some(q) => vec![rel.by_name.get(&q.to_ascii_lowercase())?.as_str()],
+        None => rel.candidates(at),
     };
     for table in candidates {
-        let Some(t) = database.schema_view(&table) else {
+        if let Some((_, columns)) = scratch.iter().find(|(n, _)| n.eq_ignore_ascii_case(table)) {
+            match columns.iter().find(|(c, _)| c.eq_ignore_ascii_case(name)) {
+                Some((_, oid)) => return Some(*oid),
+                None => continue,
+            }
+        }
+        let Some(t) = database.schema_view(table) else {
             continue;
         };
         let schema = t.schema();
@@ -320,17 +441,17 @@ fn column_oid(database: &Database, rel: &Relations, qualifier: Option<&str>, nam
     None
 }
 
-fn column_at(database: &Database, rel: &Relations, t: Option<&Tok>) -> Option<i32> {
-    match t? {
-        Tok::Ident(q, name) => column_oid(database, rel, q.as_deref(), name),
+fn column_at(database: &Database, rel: &Relations, scratch: &Scratch, toks: &[Tok], at: Option<usize>) -> Option<i32> {
+    match toks.get(at?)? {
+        Tok::Ident(q, name) => column_oid(database, rel, scratch, q.as_deref(), name, at),
         _ => None,
     }
 }
 
 /// One OID per parameter `$1 … $N`, `N` being the larger of the highest
 /// placeholder and the number declared. See the module documentation.
-pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32> {
-    infer_where_placed(database, sql, declared)
+pub(super) fn infer(database: &Database, sql: &str, declared: &[i32], scratch: &Scratch) -> Vec<i32> {
+    infer_placed(database, sql, declared, scratch)
         .into_iter()
         .map(|o| o.unwrap_or(TEXT))
         .collect()
@@ -340,6 +461,10 @@ pub(super) fn infer(database: &Database, sql: &str, declared: &[i32]) -> Vec<i32
 /// says nothing (an operand of arithmetic, a function argument), where
 /// [`infer`] answers `text`.
 pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32]) -> Vec<Option<i32>> {
+    infer_placed(database, sql, declared, &[])
+}
+
+fn infer_placed(database: &Database, sql: &str, declared: &[i32], scratch: &Scratch) -> Vec<Option<i32>> {
     let toks = tokenize(sql);
     let highest = toks
         .iter()
@@ -379,7 +504,7 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
         let mut alone: Result<Option<usize>, ()> = Ok(None);
         let place = |alone: Result<Option<usize>, ()>, position: usize, oids: &mut Vec<Option<i32>>| {
             if let Ok(Some(n)) = alone {
-                let oid = columns.get(position).and_then(|c| column_oid(database, &rel, None, c));
+                let oid = columns.get(position).and_then(|c| column_oid(database, &rel, scratch, None, c, None));
                 set(n, oid, oids);
             }
         };
@@ -407,7 +532,7 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
                 Tok::Param(n) if depth == 1 => {
                     let oid = columns
                         .get(position)
-                        .and_then(|c| column_oid(database, &rel, None, c));
+                        .and_then(|c| column_oid(database, &rel, scratch, None, c, None));
                     set(*n, oid, &mut oids);
                     alone = Err(());
                 }
@@ -459,8 +584,8 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
         let before = |k: usize| lo.checked_sub(k).and_then(|j| toks.get(j));
         // `col <op> $n`, `col NOT LIKE $n`.
         if before(1).is_some_and(is_comparison) {
-            let col = if before(2).is_some_and(|p| p.keyword("NOT")) { before(3) } else { before(2) };
-            if let Some(oid) = column_at(database, &rel, col) {
+            let col = if before(2).is_some_and(|p| p.keyword("NOT")) { lo.checked_sub(3) } else { lo.checked_sub(2) };
+            if let Some(oid) = column_at(database, &rel, scratch, &toks, col) {
                 set(n, Some(oid), &mut oids);
                 continue;
             }
@@ -492,20 +617,21 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
         }
         // `$n <op> col`.
         if toks.get(hi + 1).is_some_and(is_comparison) {
-            if let Some(oid) = column_at(database, &rel, toks.get(hi + 2)) {
+            if let Some(oid) = column_at(database, &rel, scratch, &toks, Some(hi + 2)) {
                 set(n, Some(oid), &mut oids);
                 continue;
             }
         }
         // `col BETWEEN $1 AND $2`.
+        let back = |k: usize| i.checked_sub(k);
         let between_col = if prev(1).is_some_and(|p| p.keyword("BETWEEN")) {
-            if prev(2).is_some_and(|p| p.keyword("NOT")) { prev(3) } else { prev(2) }
+            if prev(2).is_some_and(|p| p.keyword("NOT")) { back(3) } else { back(2) }
         } else if prev(1).is_some_and(|p| p.keyword("AND")) && prev(3).is_some_and(|p| p.keyword("BETWEEN")) {
-            if prev(4).is_some_and(|p| p.keyword("NOT")) { prev(5) } else { prev(4) }
+            if prev(4).is_some_and(|p| p.keyword("NOT")) { back(5) } else { back(4) }
         } else {
             None
         };
-        if let Some(oid) = column_at(database, &rel, between_col) {
+        if let Some(oid) = column_at(database, &rel, scratch, &toks, between_col) {
             set(n, Some(oid), &mut oids);
             continue;
         }
@@ -515,8 +641,8 @@ pub(super) fn infer_where_placed(database: &Database, sql: &str, declared: &[i32
             k -= 1;
         }
         if k >= 2 && toks[k - 1] == Tok::Open && toks[k - 2].keyword("IN") {
-            let col = if k >= 4 && toks[k - 3].keyword("NOT") { toks.get(k - 4) } else { toks.get(k - 3) };
-            if let Some(oid) = column_at(database, &rel, col) {
+            let col = if k >= 4 && toks[k - 3].keyword("NOT") { k - 4 } else { k - 3 };
+            if let Some(oid) = column_at(database, &rel, scratch, &toks, Some(col)) {
                 set(n, Some(oid), &mut oids);
             }
         }
@@ -667,6 +793,26 @@ mod tests {
             })
             .collect();
         assert_eq!(params, vec![1, 3]);
+    }
+
+    #[test]
+    fn an_unqualified_column_looks_in_its_own_parentheses_first() {
+        let sql = "WITH c AS (SELECT count(*) AS id FROM t WHERE id > $1) SELECT id FROM c JOIN (SELECT 1 AS k) d ON true WHERE id = $2";
+        let toks = tokenize(sql);
+        let rel = relations(&toks);
+        let names: Vec<&str> = rel.tables.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["t", "c", "d"]);
+        let params: Vec<usize> = toks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| matches!(t, Tok::Param(_)))
+            .map(|(k, _)| k)
+            .collect();
+        // `id > $1` inside the body: `t` first. `id = $2` outside: `c` and
+        // the derived table first, `t` only as a last resort.
+        assert_eq!(rel.candidates(Some(params[0] - 2)), ["t", "c", "d"]);
+        assert_eq!(rel.candidates(Some(params[1] - 2)), ["c", "d", "t"]);
+        assert_eq!(rel.candidates(None), ["t", "c", "d"]);
     }
 
     #[test]

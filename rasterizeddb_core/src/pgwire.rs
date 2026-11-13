@@ -3390,7 +3390,13 @@ where
         // One OID per parameter, each declared one as declared and the rest
         // inferred from where they stand. Reporting the declared list alone
         // told a client that declared nothing that there was nothing to bind.
-        let reported = param_infer::infer(database, &sql, &param_oids);
+        // Only a statement with an undeclared parameter has one to infer.
+        let scratch = if (param_oids.is_empty() || param_oids.contains(&0)) && has_placeholder(&sql) {
+            param_scratch_relations(database, &sql).await
+        } else {
+            Vec::new()
+        };
+        let reported = param_infer::infer(database, &sql, &param_oids, &scratch);
         send_parameter_description(stream, &reported).await?;
         if let Some(info) = state.statements.get_mut(&stmt_name) {
             info.inferred_oids = (reported != param_oids).then_some(reported);
@@ -4307,45 +4313,7 @@ pub(crate) async fn describe_query(
     // accumulated in order so a later CTE may read an earlier one, which is
     // the order `WITH a AS (…), b AS (… FROM a)` is written in.
     if let Ok(Some((defs, outer))) = crate::core::rql::cte::split_with(stmt) {
-        let mut relations: Vec<(String, ScratchFields)> = Vec::new();
-        for def in &defs {
-            // A recursive definition is typed by its non-recursive term, as
-            // PostgreSQL types it: the whole body reads itself, which is no
-            // relation yet.
-            let values_anchor;
-            let body = match crate::core::rql::cte::recursive_split(def, &def.body) {
-                Some(Ok((anchor, _, _))) => {
-                    values_anchor = crate::core::rql::cte::values_as_select(anchor);
-                    values_anchor.as_deref().unwrap_or(anchor)
-                }
-                Some(Err(e)) => return Err(std::io::Error::other(e)),
-                None => def.body.as_str(),
-            };
-            match Box::pin(describe_resolved(database, body, &relations)).await? {
-                // A body that is itself a `UNION` is materialised with its rows
-                // widened, so its relation has the wider column too. A column
-                // list renames what it describes, as it renames the relation.
-                Some((columns, _)) => {
-                    let columns = widen_union_fields(database, body, &relations, columns).await?;
-                    let columns = crate::core::rql::cte::described_names(def, columns).map_err(std::io::Error::other)?;
-                    relations.push((def.name.clone(), scratch_fields(&columns)));
-                }
-                // A body of named constants has no relation to resolve; it is
-                // described by the same reading that materialises it.
-                None => match crate::core::rql::cte::constant_body(&def.body) {
-                    Some(constants) => {
-                        let columns: Vec<(String, DbType)> =
-                            constants.into_iter().map(|c| (c.label, c.db_type)).collect();
-                        let columns = crate::core::rql::cte::described_names(def, columns).map_err(std::io::Error::other)?;
-                        relations.push((def.name.clone(), scratch_fields(&columns)));
-                    }
-                    // A body this cannot resolve leaves the rest unresolvable
-                    // too. The outer statement is still tried below: it may not
-                    // read the CTE at all, which is the shape that always worked.
-                    None => break,
-                },
-            }
-        }
+        let relations = Box::pin(cte_relations(database, &defs)).await?;
         if let Some((fields, true)) = Box::pin(describe_resolved(database, &outer, &relations)).await? {
             return Ok(Some((widen_union_fields(database, &outer, &relations, fields).await?, true)));
         }
@@ -4457,18 +4425,28 @@ pub(crate) async fn describe_query(
             }
         }
     }
-    if let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(stmt) {
-        if !alias.is_empty() {
-            if let Some((columns, _)) = Box::pin(describe_resolved(database, &inner, &[])).await? {
-                let columns = widen_union_fields(database, &inner, &[], columns).await?;
-                let fields = scratch_fields(&columns);
-                let rewritten = format!("{}{} {}{}", &stmt[..start], alias, alias, &stmt[end..]);
-                let relations = [(alias.clone(), fields)];
-                if let Some((fields, is_select)) =
-                    Box::pin(describe_resolved(database, &rewritten, &relations)).await?
-                {
-                    return Ok(Some((widen_union_fields(database, stmt, &[], fields).await?, is_select)));
-                }
+    //
+    // Every derived table, each body described as a statement of its own:
+    // only the first was resolved, and only by the plain resolver, so a
+    // derived table inside another (`FROM (SELECT … FROM (SELECT …) a) b`)
+    // or beside one (`FROM (…) a JOIN (…) b`) was described as `NoData` and
+    // its rows then sent anyway ("DataRow field count does not match").
+    {
+        let mut rewritten = stmt.to_string();
+        let mut relations: Vec<(String, ScratchFields)> = Vec::new();
+        for _ in 0..16usize {
+            let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(&rewritten) else {
+                break;
+            };
+            let Some((columns, _)) = Box::pin(describe_query(database, &inner)).await? else {
+                break;
+            };
+            rewritten = format!("{}{} {}{}", &rewritten[..start], alias, alias, &rewritten[end..]);
+            relations.push((alias, scratch_fields(&columns)));
+        }
+        if !relations.is_empty() {
+            if let Some((fields, is_select)) = Box::pin(describe_resolved(database, &rewritten, &relations)).await? {
+                return Ok(Some((widen_union_fields(database, stmt, &[], fields).await?, is_select)));
             }
         }
     }
@@ -4483,6 +4461,125 @@ pub(crate) async fn describe_query(
         Some((fields, is_select)) => Ok(Some((widen_union_fields(database, stmt, &[], fields).await?, is_select))),
         None => Ok(None),
     }
+}
+
+/// Each CTE of `defs` as a relation the statement after them can be described
+/// against: its body's columns, under its name and its column list. Nothing
+/// is materialised. They are accumulated in order so a later CTE may read an
+/// earlier one; a body that cannot be resolved ends the list there.
+async fn cte_relations(
+    database: &Arc<Database>,
+    defs: &[crate::core::rql::cte::CteDef],
+) -> io::Result<Vec<(String, ScratchFields)>> {
+    let mut relations: Vec<(String, ScratchFields)> = Vec::new();
+    for def in defs {
+        // A recursive definition is typed by its non-recursive term, as
+        // PostgreSQL types it: the whole body reads itself, which is no
+        // relation yet.
+        let values_anchor;
+        let body = match crate::core::rql::cte::recursive_split(def, &def.body) {
+            Some(Ok((anchor, _, _))) => {
+                values_anchor = crate::core::rql::cte::values_as_select(anchor);
+                values_anchor.as_deref().unwrap_or(anchor)
+            }
+            Some(Err(e)) => return Err(std::io::Error::other(e)),
+            None => def.body.as_str(),
+        };
+        match Box::pin(describe_resolved(database, body, &relations)).await? {
+            // A body that is itself a `UNION` is materialised with its rows
+            // widened, so its relation has the wider column too. A column
+            // list renames what it describes, as it renames the relation.
+            Some((columns, _)) => {
+                let columns = widen_union_fields(database, body, &relations, columns).await?;
+                let columns = crate::core::rql::cte::described_names(def, columns).map_err(std::io::Error::other)?;
+                relations.push((def.name.clone(), scratch_fields(&columns)));
+            }
+            // A body of named constants has no relation to resolve; it is
+            // described by the same reading that materialises it.
+            None => match crate::core::rql::cte::constant_body(&def.body) {
+                Some(constants) => {
+                    let columns: Vec<(String, DbType)> =
+                        constants.into_iter().map(|c| (c.label, c.db_type)).collect();
+                    let columns = crate::core::rql::cte::described_names(def, columns).map_err(std::io::Error::other)?;
+                    relations.push((def.name.clone(), scratch_fields(&columns)));
+                }
+                // A body this cannot resolve leaves the rest unresolvable
+                // too. The outer statement is still tried below: it may not
+                // read the CTE at all, which is the shape that always worked.
+                None => break,
+            },
+        }
+    }
+    Ok(relations)
+}
+
+/// The columns of the relations a statement makes for itself — its CTEs, and
+/// its derived tables by alias — for typing its parameters
+/// (`param_infer::Scratch`). Inferred from real tables alone, a `$1` compared
+/// with a CTE's or a derived table's column was described as `text`, and
+/// tokio-postgres and sqlx refused to bind an integer to it.
+///
+/// Each body is described with its placeholders replaced by a stand-in, as
+/// a statement describe does (`describe_for_wire`); a relation is taken from
+/// the first stand-in that resolves it. Nothing is run.
+async fn param_scratch_relations(database: &Arc<Database>, sql: &str) -> Vec<(String, Vec<(String, i32)>)> {
+    let mut found: Vec<(String, Vec<(String, i32)>)> = Vec::new();
+    let with = crate::core::rql::cte::split_with(sql).ok().flatten();
+    if with.is_none() && crate::core::rql::cte::next_derived_table(sql).is_none() {
+        return found;
+    }
+    for stand_in in ["NULL", "1", "'1'"] {
+        let text = substitute_placeholders(sql, stand_in);
+        let mut relations = match crate::core::rql::cte::split_with(&text) {
+            Ok(Some((defs, _))) => Box::pin(cte_relations(database, &defs)).await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for (name, fields) in &relations {
+            add_scratch(&mut found, name, fields);
+        }
+        let mut budget = 16usize;
+        derived_relations(database, text, &mut relations, &mut found, &mut budget).await;
+    }
+    found
+}
+
+/// Records a relation's columns under `name`, unless one is already there.
+fn add_scratch(found: &mut Vec<(String, Vec<(String, i32)>)>, name: &str, fields: &ScratchFields) {
+    if !found.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        let columns = fields.iter().map(|f| (f.name.clone(), f.db_type.pg_oid() as i32)).collect();
+        found.push((name.to_string(), columns));
+    }
+}
+
+/// Each derived table in `text`, the CTE bodies' among them, recorded under
+/// its alias: the innermost first, so one that reads another is described
+/// against it. Returns `text` with each replaced by the name it was described
+/// under. At most `budget` of them, as the executor materialises.
+fn derived_relations<'a>(
+    database: &'a Arc<Database>,
+    text: String,
+    relations: &'a mut Vec<(String, ScratchFields)>,
+    found: &'a mut Vec<(String, Vec<(String, i32)>)>,
+    budget: &'a mut usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + 'a>> {
+    Box::pin(async move {
+        let mut rest = text;
+        while *budget > 0 {
+            let Some((start, end, inner, alias)) = crate::core::rql::cte::next_derived_table(&rest) else {
+                break;
+            };
+            *budget -= 1;
+            let name = format!("__param_derived_{budget}");
+            let inner = derived_relations(database, inner, relations, found, budget).await;
+            if let Ok(Some((columns, _))) = Box::pin(describe_resolved(database, &inner, relations)).await {
+                let fields = scratch_fields(&columns);
+                add_scratch(found, &alias, &fields);
+                relations.push((name.clone(), fields));
+            }
+            rest = format!("{}{} {}{}", &rest[..start], name, alias, &rest[end..]);
+        }
+        rest
+    })
 }
 
 /// A `UNION` is described by its first branch, but a column that is `int`
