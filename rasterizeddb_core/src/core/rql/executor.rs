@@ -17344,6 +17344,65 @@ async fn execute_drop_path_index(sql: &str, database: &Arc<Database>) -> Vec<u8>
     ddl_ok(0)
 }
 
+/// What replication does with a statement of each kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Replicated {
+    /// Its text is recorded with its transaction and run on every peer.
+    Recorded,
+    /// It changes something of this node's alone; the reason says what.
+    /// Run on a replicating node, the client is told (a WARNING).
+    Local(&'static str),
+    /// It changes nothing a peer holds.
+    NotAWrite,
+}
+
+/// The decision for every statement kind, in one place and without a
+/// catch-all: a kind added to [`QueryPurpose`] does not build until someone
+/// decides whether its writes reach the peers. Checked against what the
+/// executor actually records by `rasterizeddb_compat`'s `replication_capture`
+/// test, which runs one statement of each kind on a replicating pair.
+///
+/// Statements answered above the executor are decided where they run:
+/// `CREATE`/`DROP DATABASE` are local (replication is single-database, and
+/// `pgwire::handle_database_statement` says so on a replicating node), and
+/// role statements reach the executor as writes to the role catalogue.
+pub(crate) fn replication_of(query: &QueryPurpose) -> Replicated {
+    match query {
+        QueryPurpose::CreateTable(_)
+        | QueryPurpose::DropTable(_)
+        | QueryPurpose::CreateIndex(_)
+        | QueryPurpose::DropIndex(_)
+        | QueryPurpose::AddColumn(_)
+        | QueryPurpose::DropColumn(_)
+        | QueryPurpose::RenameColumn(_)
+        | QueryPurpose::InsertRow(_)
+        | QueryPurpose::UpdateRow(_)
+        | QueryPurpose::DeleteRow(_)
+        | QueryPurpose::Truncate(_) => Replicated::Recorded,
+        // A read, or a read that writes (`CREATE TABLE … AS`, a data-modifying
+        // CTE) through the arms above, which record what they write.
+        QueryPurpose::QueryRows(_) | QueryPurpose::PreparedRows(_) => Replicated::NotAWrite,
+        // A lock is the transaction's, not a row's.
+        QueryPurpose::LockTable(_) => Replicated::NotAWrite,
+        QueryPurpose::Introspect(_) | QueryPurpose::IntrospectError(_) => Replicated::NotAWrite,
+        QueryPurpose::Vacuum(_) => Replicated::Local("VACUUM reclaims this node's files; run it on each node"),
+        QueryPurpose::FilterControl(_) => {
+            Replicated::Local("a filter setting is this node's own; run it on each node that should have it")
+        }
+        QueryPurpose::Replication(_) => Replicated::Local("replication settings are each node's own"),
+        #[cfg(feature = "kv_cache")]
+        QueryPurpose::KvCache(_) => Replicated::Local("the key/value cache is each node's own and is not replicated"),
+        #[cfg(feature = "storage_pools")]
+        QueryPurpose::Storage(_) => {
+            Replicated::Local("STORAGE statements place this node's files; run it on each node that should have it")
+        }
+        #[cfg(feature = "s3_backup")]
+        QueryPurpose::Backup(_) | QueryPurpose::BackupError(_) => {
+            Replicated::Local("backups are this node's own; a peer is backed up by its own settings")
+        }
+    }
+}
+
 /// The SQL text behind a purpose, for the clauses the plan does not carry.
 fn query_sql(query: &QueryPurpose) -> String {
     match query {
@@ -20273,6 +20332,11 @@ pub(crate) async fn execute_with_need(
     }
     if let Some(why) = broken_relation_refusal(&query, &database) {
         return ddl_error(&why);
+    }
+    if database.replication.is_active() {
+        if let Replicated::Local(why) = replication_of(&query) {
+            crate::core::notice::push("WARNING", "01000", format!("not replicated: {why}"));
+        }
     }
     match &query {
         // Taken above, before the borrow.
