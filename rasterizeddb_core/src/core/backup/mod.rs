@@ -1811,6 +1811,35 @@ impl BackupService {
         }
     }
 
+    /// The names of the files `body`'s records write to, from the live log of
+    /// `stream` (see [`SegmentEntry::files`]). A file the log no longer knows
+    /// (dropped since) is left out: its records are voided by the drop's
+    /// barrier on replay.
+    fn file_names_in(&self, stream: &str, body: &[u8]) -> Vec<String> {
+        let ids = crate::core::wal::scan_file_ids(body);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let Some(wal) = self
+            .log_streams_checked()
+            .0
+            .into_iter()
+            .find(|(key, _)| key == stream)
+            .map(|(_, wal)| wal)
+        else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = wal
+            .registered_files()
+            .into_iter()
+            .filter(|(id, _)| ids.contains(id))
+            .filter_map(|(_, path)| path.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Uploads staged segments without cutting the live log first.
     ///
     /// Used by the background task, which does not want to force a checkpoint —
@@ -1863,6 +1892,7 @@ impl BackupService {
 
                 let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
                 let uncompressed = body.len() as u64;
+                let files = self.file_names_in(&database, &body);
 
                 let sequence = self.next_segment_sequence().await;
                 // The root's bundles keep the flat layout an older build wrote, so
@@ -1897,6 +1927,7 @@ impl BackupService {
                         compressed_bytes,
                         uncompressed_bytes: uncompressed,
                         segment_count: group.len() as u32,
+                        files,
                     });
                 }
 

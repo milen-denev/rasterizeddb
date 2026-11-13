@@ -561,7 +561,7 @@ async fn build(
         // in the catalogue but has nothing on disk yet.
         std::fs::create_dir_all(&into)?;
 
-        let (count, replay_path) =
+        let (count, replay_path, named) =
             download_segments(client, &manifest, snapshot, &database, &into).await?;
         segments_replayed += count;
 
@@ -571,7 +571,7 @@ async fn build(
             // deleted a file the copy still holds. A database with no window
             // had every file created during the copy, which began at 0.
             let copied_at = window.as_ref().map_or(0, |w| w.start_lsn);
-            let applied = replay(&replay_path, &into, ceiling_for(&database), copied_at)?;
+            let applied = replay(&replay_path, &into, ceiling_for(&database), copied_at, &named)?;
             stats.applied += applied.applied;
             stats.rolled_back += applied.rolled_back;
             stats.unresolved += applied.unresolved;
@@ -1031,7 +1031,7 @@ async fn download_segments(
     snapshot: &SnapshotEntry,
     database: &str,
     target_dir: &Path,
-) -> io::Result<(u32, PathBuf)> {
+) -> io::Result<(u32, PathBuf, Vec<String>)> {
     let needed: Vec<&manifest::SegmentEntry> = manifest
         .segments_for(database)
         .into_iter()
@@ -1043,8 +1043,13 @@ async fn download_segments(
         .collect();
 
     let replay_path = target_dir.join("restore_replay.wal");
+    // The files the replayed bundles write to, by name: a file made after the
+    // snapshot is in none of what it holds, and is created from these.
+    let mut named: Vec<String> = needed.iter().flat_map(|s| s.files.iter().cloned()).collect();
+    named.sort();
+    named.dedup();
     if needed.is_empty() {
-        return Ok((0, replay_path));
+        return Ok((0, replay_path, named));
     }
 
     let mut out = io::BufWriter::with_capacity(1024 * 1024, std::fs::File::create(&replay_path)?);
@@ -1081,7 +1086,7 @@ async fn download_segments(
         .map_err(|e| io::Error::other(e.to_string()))?
         .sync_data()?;
 
-    Ok((needed.len() as u32, replay_path))
+    Ok((needed.len() as u32, replay_path, named))
 }
 
 /// Applies the concatenated log to the restored files, stopping at `ceiling`.
@@ -1097,6 +1102,7 @@ pub(super) fn replay(
     target_dir: &Path,
     ceiling: Option<u64>,
     copied_at: u64,
+    named: &[String],
 ) -> io::Result<crate::core::wal::RecoveryStats> {
     // File ids are derived from a name within a database directory, never an
     // absolute path, which is exactly what lets a log recorded under one mount
@@ -1113,6 +1119,18 @@ pub(super) fn replay(
             continue;
         }
         resolver.insert(crate::core::wal::file_id_for_name(&name), entry.path());
+    }
+    // A file the archived log writes to that the snapshot does not hold was
+    // made after it: created here, by its name, at the first record for it.
+    // Only a plain name is taken, so a catalogue cannot point the restore
+    // outside the directory.
+    for name in named {
+        let plain = !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..";
+        if plain {
+            resolver
+                .entry(crate::core::wal::file_id_for_name(name))
+                .or_insert_with(|| target_dir.join(name));
+        }
     }
 
     // A file the snapshot copied mid-append can end inside a record. Cut back
@@ -1242,6 +1260,7 @@ mod tests {
             compressed_bytes: 1,
             uncompressed_bytes: 2,
             segment_count: 1,
+            files: Vec::new(),
         });
         m
     }

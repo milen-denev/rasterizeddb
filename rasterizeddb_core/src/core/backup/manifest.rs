@@ -543,6 +543,14 @@ pub struct SegmentEntry {
     pub uncompressed_bytes: u64,
     /// How many cut segments the bundle holds, concatenated in log order.
     pub segment_count: u32,
+    /// The name of every file the bundle's records write to, as the log
+    /// derives their ids ([`crate::core::wal::file_id_for_name`]). A record
+    /// names its file only by id, and a restore resolved ids against the
+    /// files the snapshot holds: a table created after the snapshot had none,
+    /// so every record of it was skipped and the table did not come back.
+    /// Absent from a catalogue written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
 }
 
 impl SnapshotEntry {
@@ -1002,6 +1010,7 @@ mod tests {
                 compressed_bytes: 1,
                 uncompressed_bytes: 2,
                 segment_count: 1,
+                files: Vec::new(),
             },
             SegmentEntry {
                 sequence: 1,
@@ -1013,6 +1022,7 @@ mod tests {
                 compressed_bytes: 1,
                 uncompressed_bytes: 2,
                 segment_count: 1,
+                files: Vec::new(),
             },
         ];
         m
@@ -1204,6 +1214,7 @@ mod tests {
             compressed_bytes: 1,
             uncompressed_bytes: 2,
             segment_count: 1,
+            files: Vec::new(),
         });
 
         let plan = m.plan_retention(1);
@@ -1349,6 +1360,7 @@ mod tests {
             compressed_bytes: 1,
             uncompressed_bytes: 2,
             segment_count: 1,
+            files: Vec::new(),
         });
         assert_eq!(m.segment_sequence_high, 8);
         assert_eq!(m.next_segment_sequence(), 8);
@@ -1418,6 +1430,7 @@ mod tests {
                 compressed_bytes: 1,
                 uncompressed_bytes: 2,
                 segment_count: 1,
+                files: Vec::new(),
             },
             SegmentEntry {
                 sequence: 1,
@@ -1429,6 +1442,7 @@ mod tests {
                 compressed_bytes: 1,
                 uncompressed_bytes: 2,
                 segment_count: 1,
+                files: Vec::new(),
             },
             SegmentEntry {
                 sequence: 2,
@@ -1440,6 +1454,7 @@ mod tests {
                 compressed_bytes: 1,
                 uncompressed_bytes: 2,
                 segment_count: 1,
+                files: Vec::new(),
             },
         ];
         m

@@ -83,7 +83,13 @@ fn config(prefix: &str) -> Option<BackupConfig> {
         // in a fresh temp directory, and a prefix already holding a *different*
         // database's catalogue is refused — correctly, but it would make the
         // second run of the suite fail for the wrong reason.
-        prefix: format!("e2e/{}/{prefix}", run_id()),
+        // `RDB_S3_TEST_PREFIX` puts a run against a real bucket under a root
+        // of its own, apart from any production prefix in the same bucket.
+        prefix: format!(
+            "{}/{}/{prefix}",
+            std::env::var("RDB_S3_TEST_PREFIX").unwrap_or_else(|_| "e2e".to_string()),
+            run_id()
+        ),
         region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
         endpoint: Endpoint::parse(&endpoint).expect("endpoint must be a URL"),
         credentials,
@@ -307,6 +313,50 @@ e2e_test!(captures_writes_that_happened_after_the_snapshot, config, {
         count_in_restored(&target, "SELECT * FROM events").await,
         45,
         "rows written after the snapshot must come back from the archived log"
+    );
+});
+
+e2e_test!(a_table_created_after_the_snapshot_comes_back_from_the_log, config, {
+    // The archived log names every file by a hash of its name, and a restore
+    // resolved those only against the files the snapshot holds. A table
+    // created after the snapshot has none there, so every record of it was
+    // "unresolved" and skipped: found seeding a replica from a live backup,
+    // where the restored copy lacked a table the source had, with a warning
+    // and nothing else.
+    let root = fresh_root();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+
+    let database = Arc::new(Database::new(live.to_str().unwrap()).await);
+    run(&database, "CREATE TABLE older (id INT, note STRING)").await;
+    run(&database, "INSERT INTO older (id, note) VALUES (1, 'before')").await;
+
+    let service = BackupService::connect(config.clone(), live.to_str().unwrap())
+        .await
+        .expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+
+    run(&database, "CREATE TABLE newcomer (id INT, note STRING)").await;
+    for i in 0..30 {
+        run(
+            &database,
+            &format!("INSERT INTO newcomer (id, note) VALUES ({i}, 'after')"),
+        )
+        .await;
+    }
+    run(&database, "INSERT INTO older (id, note) VALUES (2, 'after')").await;
+    service.archive_wal_now().await.expect("archive");
+
+    let target = root.join("restored");
+    let report = rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+        .await
+        .expect("restore");
+    assert_eq!(report.records_unresolved, 0, "every archived record names a file the restore can find");
+    assert_eq!(count_in_restored(&target, "SELECT * FROM older").await, 2);
+    assert_eq!(
+        count_in_restored(&target, "SELECT * FROM newcomer").await,
+        30,
+        "a table created after the snapshot must come back from the archived log"
     );
 });
 
@@ -823,15 +873,24 @@ e2e_test!(the_background_task_archives_without_being_asked, config, {
     }
     assert!(archived, "the scheduled flush never archived anything");
 
-    let target = root.join("restored");
-    rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
-        .await
-        .expect("restore");
-    assert_eq!(
-        count_in_restored(&target, "SELECT * FROM t").await,
-        25,
-        "what the background task archived must be enough to restore"
-    );
+    // The first bundle the loop uploads can be a cut taken before the last
+    // inserts reached it: against a real store, with its latency, the restore
+    // that followed it at once held 0 or 1 of the 25 rows. What the loop owes
+    // is everything, within its schedule, so restores are retried until they
+    // hold it or the time is up.
+    let mut restored = 0;
+    for attempt in 0..20 {
+        let target = root.join(format!("restored-{attempt}"));
+        rasterizeddb_core::core::backup::restore_from(&config, &target, RecoveryTarget::Latest)
+            .await
+            .expect("restore");
+        restored = count_in_restored(&target, "SELECT * FROM t").await;
+        if restored == 25 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert_eq!(restored, 25, "what the background task archived must be enough to restore");
 });
 
 e2e_test!(

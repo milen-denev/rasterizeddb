@@ -3337,6 +3337,31 @@ pub fn scan_commit_range(bytes: &[u8]) -> (u64, u64, u64) {
     (first, last, commits)
 }
 
+/// The ids of every file a run of log records writes to, read from the
+/// framing alone, as [`scan_commit_range`] reads it. A backup records the
+/// names behind them with each archived bundle, so a restore can create a
+/// file the snapshot did not hold (one made after it was taken).
+pub fn scan_file_ids(bytes: &[u8]) -> std::collections::BTreeSet<u64> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut offset = 0usize;
+    while offset + HEADER_LEN <= bytes.len() {
+        let header = &bytes[offset..offset + HEADER_LEN];
+        let magic = u32::from_le_bytes(header[0..4].try_into().expect("4 bytes"));
+        if magic != RECORD_MAGIC || header[4] != FORMAT_VERSION {
+            break;
+        }
+        let len = u32::from_le_bytes(header[32..36].try_into().expect("4 bytes")) as usize;
+        if len > MAX_RECORD_PAYLOAD || offset + HEADER_LEN + len > bytes.len() {
+            break;
+        }
+        if header[5] & FLAG_COMMIT == 0 {
+            ids.insert(u64::from_le_bytes(header[16..24].try_into().expect("8 bytes")));
+        }
+        offset += HEADER_LEN + len;
+    }
+    ids
+}
+
 /// Whether a long-running statement should commit and open a fresh transaction.
 ///
 /// An open transaction blocks checkpointing — the log cannot be reclaimed while

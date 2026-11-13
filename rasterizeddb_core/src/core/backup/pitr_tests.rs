@@ -489,7 +489,7 @@ fn a_restore_across_a_drop_and_recreate_holds_only_the_new_files_bytes() {
     std::fs::copy(&snapshot_copy, target.join("rows.db")).unwrap();
     let replay = root.join("replay.wal");
     concatenate_staged(&staging, &replay);
-    super::restore::replay(&replay, &target, None, window_start).unwrap();
+    super::restore::replay(&replay, &target, None, window_start, &[]).unwrap();
 
     assert_eq!(
         std::fs::read(target.join("rows.db")).unwrap(),
@@ -533,7 +533,7 @@ fn a_restore_keeps_a_file_the_snapshot_copied_after_its_barrier() {
     std::fs::copy(&snapshot_copy, target.join("rows.db")).unwrap();
     let replay = root.join("replay.wal");
     concatenate_staged(&staging, &replay);
-    super::restore::replay(&replay, &target, None, window_start).unwrap();
+    super::restore::replay(&replay, &target, None, window_start, &[]).unwrap();
 
     assert_eq!(
         std::fs::read(target.join("rows.db")).unwrap(),
@@ -575,7 +575,7 @@ fn a_restore_keeps_a_file_whose_barrier_was_the_last_commit_before_the_copy() {
     std::fs::copy(&snapshot_copy, target.join("rows.db")).unwrap();
     let replay = root.join("replay.wal");
     concatenate_staged(&staging, &replay);
-    super::restore::replay(&replay, &target, None, window_start).unwrap();
+    super::restore::replay(&replay, &target, None, window_start, &[]).unwrap();
 
     assert_eq!(
         std::fs::read(target.join("rows.db")).unwrap(),
@@ -663,7 +663,7 @@ fn a_restore_across_runs_resolves_a_barrier_by_its_own_commit() {
     std::fs::write(target.join("y.db"), b"").unwrap();
     let replay = root.join("replay.wal");
     concatenate_staged(&staging, &replay);
-    super::restore::replay(&replay, &target, None, window_start).unwrap();
+    super::restore::replay(&replay, &target, None, window_start, &[]).unwrap();
 
     assert_eq!(
         std::fs::read(target.join("x.db")).unwrap(),
@@ -722,7 +722,7 @@ fn a_barrier_that_never_committed_is_not_committed_by_an_earlier_runs_marker() {
     std::fs::write(target.join("y.db"), b"").unwrap();
     let replay = root.join("replay.wal");
     concatenate_staged(&staging, &replay);
-    super::restore::replay(&replay, &target, None, window_start).unwrap();
+    super::restore::replay(&replay, &target, None, window_start, &[]).unwrap();
 
     assert_eq!(
         std::fs::read(target.join("x.db")).unwrap(),
