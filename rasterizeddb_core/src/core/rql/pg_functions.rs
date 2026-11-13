@@ -120,6 +120,20 @@ pub enum PgFunc {
     StringToArray,
     ArrayToString,
     Cardinality,
+    /// `array_append(a, e)`, `array_prepend(e, a)`, `array_cat(a, b)`: one
+    /// dimension, as `||` concatenates (`value_codec::array_cat`). Not
+    /// strict: a NULL array is the empty one.
+    ArrayAppend,
+    ArrayPrepend,
+    ArrayCat,
+    /// `ts AT TIME ZONE zone` over a `timestamptz` (or a date, cast to
+    /// one): the wall-clock `timestamp` in `zone`. Arguments are the zone,
+    /// then the value, as PostgreSQL's `timezone(zone, ts)`; `expr::parse`
+    /// picks this or [`PgFunc::TimezoneToUtc`] from the value's type.
+    TimezoneToLocal,
+    /// `ts AT TIME ZONE zone` over a `timestamp`: that wall-clock time in
+    /// `zone`, as a `timestamptz`.
+    TimezoneToUtc,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -132,6 +146,7 @@ pub const NAMES: &[&str] = &[
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
+    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -246,6 +261,9 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "STRING_TO_ARRAY" => (StringToArray, &[2, 3]),
         "ARRAY_TO_STRING" => (ArrayToString, &[2, 3]),
         "CARDINALITY" => (Cardinality, &[1]),
+        "ARRAY_APPEND" => (ArrayAppend, &[2]),
+        "ARRAY_PREPEND" => (ArrayPrepend, &[2]),
+        "ARRAY_CAT" => (ArrayCat, &[2]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -297,12 +315,12 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
             _ => DbType::I32,
         },
         MakeDate | ToDate => DbType::DATE,
-        MakeTimestamp | ToTimestamp => DbType::DATETIME,
+        MakeTimestamp | ToTimestamp | TimezoneToLocal | TimezoneToUtc => DbType::DATETIME,
         Age | JustifyHours | JustifyDays | JustifyInterval => DbType::INTERVAL,
         Decode => DbType::BYTEA,
         JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
-        StringToArray | ArrayCtor | ArraySlice | ArrayCast => DbType::ARRAY,
+        StringToArray | ArrayCtor | ArraySlice | ArrayCast | ArrayAppend | ArrayPrepend | ArrayCat => DbType::ARRAY,
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise_type(func, args),
         StructOp => DbType::BOOL,
         QuantifiedCmp => DbType::BOOL,
@@ -320,7 +338,101 @@ pub fn yields_json_text(func: PgFunc) -> bool {
 /// Whether `func` yields a `timestamp` (without time zone), which shows no
 /// offset: `make_timestamp`. (`to_timestamp` is a `timestamptz`.)
 pub fn yields_timestamp(func: PgFunc) -> bool {
-    func == PgFunc::MakeTimestamp
+    matches!(func, PgFunc::MakeTimestamp | PgFunc::TimezoneToLocal)
+}
+
+/// A zone `AT TIME ZONE` resolved: a fixed offset east of UTC in seconds,
+/// or a tz database zone.
+enum Zone {
+    Fixed(i64),
+    Named(jiff::tz::TimeZone),
+}
+
+/// The zone an `AT TIME ZONE` names, as PostgreSQL 17 reads it with its
+/// default abbreviation set:
+/// - an interval: an offset east of UTC (`INTERVAL '02:00'`); one with
+///   months or days is refused, as there;
+/// - `UTC`, `GMT`, `UT`, `Z` (any case): UTC;
+/// - a POSIX offset, `+02`, `-03:30`, `UTC+3`, `GMT-2`, up to 167 hours:
+///   west of UTC for a `+`, as POSIX writes it (`'+02'` is two hours
+///   *behind*);
+/// - otherwise a tz database name (`Europe/Sofia`, `PST8PDT`), any case.
+///
+/// A name of letters only is refused (0A000): PostgreSQL reads those as
+/// abbreviations first, and an abbreviation is a fixed offset (`CET` is
+/// +1 in July, where the zone `CET` is +2; `IST` is Israel's), which the
+/// tz database cannot say. "not recognized" is PostgreSQL's 22023.
+fn zone_of(v: &Value) -> Result<Zone, String> {
+    if let Value::Data { bytes, db_type: DbType::INTERVAL } = v {
+        let iv = crate::core::pg_types::decode_interval(bytes).ok_or("could not read the interval time zone")?;
+        if iv.months != 0 || iv.days != 0 {
+            return Err("interval time zone \"{}\" must not include months or days".replace("{}", &text_of(v)));
+        }
+        return Ok(Zone::Fixed(iv.micros.div_euclid(1_000_000)));
+    }
+    let name = text_of(v);
+    let name = name.trim();
+    let upper = name.to_ascii_uppercase();
+    if matches!(upper.as_str(), "UTC" | "GMT" | "UT" | "Z" | "UCT" | "ZULU" | "UNIVERSAL" | "GREENWICH") {
+        return Ok(Zone::Fixed(0));
+    }
+    // `[UTC|GMT|UT]±hh[:mm[:ss]]`, POSIX's sign.
+    let body = ["UTC", "GMT", "UT"].iter().find_map(|p| upper.strip_prefix(p)).unwrap_or(&upper);
+    if let Some(sign) = body.chars().next().filter(|c| matches!(c, '+' | '-')) {
+        let parts: Vec<&str> = body[1..].split(':').collect();
+        let field = |i: usize, max: i64| -> Option<i64> {
+            match parts.get(i) {
+                None => Some(0),
+                Some(p) if !p.is_empty() && p.len() <= 3 && p.bytes().all(|b| b.is_ascii_digit()) => {
+                    p.parse::<i64>().ok().filter(|n| *n <= max)
+                }
+                _ => None,
+            }
+        };
+        if parts.len() <= 3 {
+            // POSIX allows up to 167 hours (a week less one), as PostgreSQL does.
+            if let (Some(h), Some(m), Some(s)) = (field(0, 167), field(1, 59), field(2, 59)) {
+                let west = h * 3600 + m * 60 + s;
+                return Ok(Zone::Fixed(if sign == '+' { -west } else { west }));
+            }
+        }
+        return Err(format!("time zone \"{name}\" not recognized"));
+    }
+    if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(format!(
+            "time zone \"{name}\": time zone abbreviations are not supported yet; use a full zone name such as Europe/Berlin, or an offset"
+        ));
+    }
+    jiff::tz::TimeZone::get(name).map(Zone::Named).map_err(|_| format!("time zone \"{name}\" not recognized"))
+}
+
+/// `us` (a `timestamptz`, microseconds since the epoch in UTC) as the
+/// wall-clock time in `zone`, or the wall-clock `us` (a `timestamp`) in
+/// `zone` as the UTC instant. A wall-clock time a transition skipped or
+/// repeated is read at the later instant, as PostgreSQL's
+/// `DetermineTimeZoneOffset` does: `2024-03-10 02:30` in New York is
+/// 07:30 UTC, `2024-11-03 01:30` 06:30 UTC.
+fn shift_zone(us: i64, zone: &Zone, to_local: bool) -> Result<i64, String> {
+    let out_of_range = || "timestamp out of range".to_string();
+    match zone {
+        Zone::Fixed(east) => {
+            let shift = east.checked_mul(1_000_000).ok_or_else(out_of_range)?;
+            if to_local { us.checked_add(shift) } else { us.checked_sub(shift) }.ok_or_else(out_of_range)
+        }
+        Zone::Named(tz) => {
+            let at = jiff::Timestamp::from_microsecond(us).map_err(|_| out_of_range())?;
+            if to_local {
+                let east = i64::from(tz.to_offset(at).seconds());
+                us.checked_add(east * 1_000_000).ok_or_else(out_of_range)
+            } else {
+                let wall = jiff::tz::Offset::UTC.to_datetime(at);
+                tz.to_ambiguous_timestamp(wall)
+                    .disambiguate(jiff::tz::Disambiguation::Later)
+                    .map(|t| t.as_microsecond())
+                    .map_err(|_| out_of_range())
+            }
+        }
+    }
 }
 
 /// `SUBSTRING(s FROM a FOR b)`, `POSITION(x IN y)`, `TRIM([BOTH | LEADING |
@@ -769,7 +881,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString);
+    let non_strict = matches!(func, ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat);
     if !non_strict && args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -1506,6 +1618,46 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             text_value(shown.join(&s(1)))
         }
         Cardinality => int_value(array_elements(&s(0))?.len() as i64),
+        TimezoneToLocal | TimezoneToUtc => {
+            let Value::Data { bytes, .. } = &args[1] else {
+                return Ok(Value::Null);
+            };
+            let us = i64::from_le_bytes(bytes.get(..8).and_then(|b| b.try_into().ok()).ok_or("could not read the timestamp")?);
+            let shifted = shift_zone(us, &zone_of(&args[0])?, func == TimezoneToLocal)?;
+            data(shifted.to_le_bytes().to_vec(), DbType::DATETIME)
+        }
+        ArrayAppend | ArrayPrepend | ArrayCat => {
+            let name = match func {
+                ArrayAppend => "array_append",
+                ArrayPrepend => "array_prepend",
+                _ => "array_cat",
+            };
+            // An array argument: its bytes, or `None` for a NULL one.
+            let array = |v: &Value| -> Result<Option<Vec<u8>>, String> {
+                match v {
+                    Value::Data { bytes, db_type: DbType::ARRAY } => Ok(Some(bytes.clone())),
+                    v if v.is_null() => Ok(None),
+                    _ => Err(format!("function {name} needs an array where it was given {}", text_of(v))),
+                }
+            };
+            // An element argument, as a one-element array (a NULL one too).
+            let element = |v: &Value| -> Result<Vec<u8>, String> {
+                match call(ArrayCtor, std::slice::from_ref(v))? {
+                    Value::Data { bytes, db_type: DbType::ARRAY } => Ok(bytes),
+                    _ => Err(format!("{name}: could not make an array of the element")),
+                }
+            };
+            let (a, b) = match func {
+                ArrayAppend => (array(&args[0])?, Some(element(&args[1])?)),
+                ArrayPrepend => (Some(element(&args[0])?), array(&args[1])?),
+                _ => (array(&args[0])?, array(&args[1])?),
+            };
+            match (a, b) {
+                (None, None) => Value::Null,
+                (Some(only), None) | (None, Some(only)) => data(only, DbType::ARRAY),
+                (Some(a), Some(b)) => data(crate::core::value_codec::array_cat(&a, &b)?, DbType::ARRAY),
+            }
+        }
     })
 }
 

@@ -9,6 +9,11 @@ authors = ["Milen Denev"]
 description = "A schemafull, high-performance database written in Rust, designed for speed and scalability."
 
 [dependencies]
+# `AT TIME ZONE`: zone rules from the system's tz database
+# (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
+# copy, so the server answers with the zones its host knows, as PostgreSQL
+# built --with-system-tzdata does.
+jiff = { version = "0.2.35", default-features = false, features = ["std", "tzdb-zoneinfo"] }
 tokio = { version = "1", features = ["full"] }
 byteorder = "1.5"
 itertools = "0.15"

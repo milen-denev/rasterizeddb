@@ -4655,6 +4655,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hmac",
  "itertools 0.15.0",
+ "jiff",
  "kanal",
  "libc",
  "libmimalloc-sys",

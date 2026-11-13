@@ -612,6 +612,9 @@ pub fn needs_evaluation(text: &str) -> bool {
     if keyword_constant(trimmed).is_some() {
         return true;
     }
+    if mentions_at_time_zone(trimmed) {
+        return true;
+    }
     match trimmed.find('(') {
         Some(open) => {
             let name = trimmed[..open].trim();
@@ -1550,6 +1553,20 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                 TextFunc::Pg(crate::core::rql::pg_functions::PgFunc::Power),
                 vec![parse(lhs, schema)?, parse(rhs, schema)?],
             ));
+        }
+
+        // `value AT TIME ZONE zone` binds tighter than `^` and arithmetic and
+        // looser than a unary sign or a cast, and groups left to right, as
+        // PostgreSQL's `AT` does: the last one at the top is the root. It was
+        // not read at all, so the value and its zone were looked up as one
+        // function name ("function '?' is not supported yet").
+        if let Some((at, zone_at)) = top_level_at_time_zone(text) {
+            let value_text = text[..at].trim();
+            let zone_text = text[zone_at..].trim();
+            if value_text.is_empty() || zone_text.is_empty() {
+                return Err("AT TIME ZONE needs a value before it and a zone after it".to_string());
+            }
+            return at_time_zone(parse(value_text, schema)?, parse(zone_text, schema)?);
         }
 
         // No binary operator is left at the top, so a leading sign is unary:
@@ -4116,13 +4133,6 @@ pub(crate) fn integer_out_of_range(db_type: &DbType) -> String {
     )
 }
 
-/// Renders a value as the text SQL would print.
-/// Whether `lhs || rhs` is `jsonb`'s concatenation rather than text's: both
-/// sides are documents, or one is and the other is a written string — an
-/// `unknown` literal, which PostgreSQL resolves to the other side's type.
-/// A typed text (a `TEXT` column, `'x'::text`) beside a document is text's
-/// `anynonarray || text`, the document rendered as JSON.
-///
 /// `a || b` with an array on either side: `array || array` concatenates,
 /// `array || element` appends and `element || array` prepends, as
 /// PostgreSQL's `array_cat`, `array_append` and `array_prepend`. Through
@@ -4159,6 +4169,13 @@ fn concat_arrays(lhs: (&Expr, Value, bool), rhs: (&Expr, Value, bool)) -> Result
     })
 }
 
+/// Renders a value as the text SQL would print.
+/// Whether `lhs || rhs` is `jsonb`'s concatenation rather than text's: both
+/// sides are documents, or one is and the other is a written string — an
+/// `unknown` literal, which PostgreSQL resolves to the other side's type.
+/// A typed text (a `TEXT` column, `'x'::text`) beside a document is text's
+/// `anynonarray || text`, the document rendered as JSON.
+///
 /// Concatenating as text always put the document's encoded bytes beside the
 /// literal: `SET doc = doc || '{"b":1}'` stored a document with text trailing
 /// it, which read back as the old document, and `SET doc = '{"a":1}' ||
@@ -7265,6 +7282,72 @@ fn top_level_arith(text: &str) -> Option<(usize, ArithOp)> {
 /// The last top-level `^` (exponentiation) in `text`, which is where a left
 /// to right grouping splits: `a ^ b ^ c` is `(a ^ b) ^ c`. Not `^@`
 /// (`starts_with`), and only after something that can end an operand.
+/// The last top-level `AT TIME ZONE` in `text`: where its `AT` starts and
+/// where the zone after `ZONE` begins. Words, outside quotes, parentheses
+/// and `CASE` blocks.
+fn top_level_at_time_zone(text: &str) -> Option<(usize, usize)> {
+    find_at_time_zone(text, false)
+}
+
+/// Whether `text` holds `AT TIME ZONE` anywhere outside quotes: a select
+/// item or a `WHERE` term the evaluator has to read (`needs_evaluation`,
+/// `predicate_rewrite::needs_evaluator`).
+pub(crate) fn mentions_at_time_zone(text: &str) -> bool {
+    find_at_time_zone(text, true).is_some()
+}
+
+fn find_at_time_zone(text: &str, any_depth: bool) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    if !text.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"ZONE")) {
+        return None;
+    }
+    let nesting = Nesting::of(text);
+    let word_at = |i: usize, word: &[u8]| -> bool {
+        bytes.len() >= i + word.len()
+            && bytes[i..i + word.len()].eq_ignore_ascii_case(word)
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && bytes.get(i + word.len()).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+    };
+    let skip_space = |mut i: usize| {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        (i > start).then_some(i)
+    };
+    let mut found = None;
+    for i in 0..bytes.len() {
+        let reachable = if any_depth { nesting.depth.get(i).copied().flatten().is_some() } else { nesting.top_level(i) };
+        if !reachable || !word_at(i, b"AT") {
+            continue;
+        }
+        let Some(t) = skip_space(i + 2).filter(|&t| word_at(t, b"TIME")) else { continue };
+        let Some(z) = skip_space(t + 4).filter(|&z| word_at(z, b"ZONE")) else { continue };
+        found = Some((i, z + 4));
+    }
+    found
+}
+
+/// `value AT TIME ZONE zone`: [`PgFunc::TimezoneToUtc`] over a `timestamp`,
+/// [`PgFunc::TimezoneToLocal`] over a `timestamptz`, a date (cast to
+/// `timestamptz`, its midnight in the session's UTC) or a string literal
+/// (read as `timestamptz`, as PostgreSQL resolves an unknown one).
+///
+/// [`PgFunc::TimezoneToUtc`]: crate::core::rql::pg_functions::PgFunc::TimezoneToUtc
+/// [`PgFunc::TimezoneToLocal`]: crate::core::rql::pg_functions::PgFunc::TimezoneToLocal
+fn at_time_zone(value: Expr, zone: Expr) -> Result<Expr, String> {
+    use crate::core::rql::pg_functions::PgFunc;
+    let (func, value) = match static_type(&value) {
+        DbType::DATETIME if yields_timestamp(&value) => (PgFunc::TimezoneToUtc, value),
+        DbType::DATETIME => (PgFunc::TimezoneToLocal, value),
+        DbType::DATE => (PgFunc::TimezoneToLocal, cast_to(value, "timestamptz")?),
+        DbType::STRING if matches!(value, Expr::Literal { .. }) => (PgFunc::TimezoneToLocal, cast_to(value, "timestamptz")?),
+        DbType::NULL => return Ok(Expr::Null),
+        other => return Err(format!("AT TIME ZONE needs a timestamp, timestamptz or date, not {other:?}")),
+    };
+    Ok(Expr::Call(TextFunc::Pg(func), vec![zone, value]))
+}
+
 fn top_level_power(text: &str) -> Option<usize> {
     let nesting = Nesting::of(text);
     let bytes = text.as_bytes();

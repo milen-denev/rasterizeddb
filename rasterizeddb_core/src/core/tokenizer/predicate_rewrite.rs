@@ -2834,6 +2834,11 @@ fn needs_evaluator(text: &str) -> bool {
     if bitwise_term(text) {
         return true;
     }
+    // `ts AT TIME ZONE 'zone'`, which the comparison tokens read as three
+    // words after a column ("syntax error at or near \"at\"").
+    if crate::core::rql::expr::mentions_at_time_zone(text) {
+        return true;
+    }
     let bytes = text.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b == b'.';
     let mut quote: Option<u8> = None;

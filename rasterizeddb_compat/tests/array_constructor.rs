@@ -100,3 +100,25 @@ async fn concatenation_joins_arrays_and_elements() {
     let e = sqlx::raw_sql("SELECT ARRAY['a'] || 'b'").fetch_all(&pool).await.expect_err("'b' is no array literal");
     assert!(e.to_string().contains("malformed array literal"), "{e}");
 }
+
+/// `array_append`, `array_prepend` and `array_cat`, which were "not
+/// supported yet": as `||` concatenates, except that a quoted element is an
+/// element here, not an array literal, and a NULL array is the empty one.
+/// PostgreSQL 17's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn append_prepend_and_cat_build_arrays() {
+    let (_server, pool) = server().await;
+    for (sql, want) in [
+        ("SELECT array_append(ARRAY[a], b) FROM sp ORDER BY a", vec!["{1,2}", "{3,4}"]),
+        ("SELECT array_prepend(b, ARRAY[a]) FROM sp ORDER BY a", vec!["{2,1}", "{4,3}"]),
+        ("SELECT array_cat(ARRAY[c], ARRAY['z']) FROM sp ORDER BY a", vec!["{x,z}", "{y,z}"]),
+        ("SELECT array_append(ARRAY['a'], 'b')", vec!["{a,b}"]),
+        ("SELECT array_prepend('z', ARRAY['a'])", vec!["{z,a}"]),
+        ("SELECT array_append(NULL::int[], 5)", vec!["{5}"]),
+        ("SELECT array_append(ARRAY['x'], NULL)", vec!["{x,NULL}"]),
+        ("SELECT array_cat(NULL::int[], NULL::int[])", vec!["NULL"]),
+        ("SELECT array_cat(ARRAY[1, 2], NULL)", vec!["{1,2}"]),
+    ] {
+        assert_eq!(rows(&pool, sql).await, want, "{sql}");
+    }
+}
