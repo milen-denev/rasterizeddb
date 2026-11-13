@@ -1414,6 +1414,18 @@ async fn an_open_close_storm_at_budget_one_keeps_one_instance_and_every_row() {
     for w in writers {
         want.extend(w.await.unwrap());
     }
+    // The readers and the closer go on until the storm has been one: under a
+    // loaded machine the writers alone could finish first ("51 opens, 44
+    // closes: not a storm", twice in full runs). Bounded, so a closer that
+    // never closes still fails below rather than hanging.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let (opens, closes) = t.open_close_counts();
+        if opens - opens_before > 50 && closes - closes_before > 50 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     stop.store(true, O::Release);
     for r in readers {
         assert!(r.await.unwrap() > 0);
