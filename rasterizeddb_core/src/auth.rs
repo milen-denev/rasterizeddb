@@ -704,8 +704,10 @@ pub async fn ensure_role_catalogue(
         Ok(response)
     }
 
+    // The catalogue and its first role are each node's own to make: not
+    // replicated, or every node's would arrive at every other.
     if !database.has_table(ROLE_TABLE) {
-        run(database, ROLE_TABLE_DDL).await?;
+        crate::replication::Replication::local_only(run(database, ROLE_TABLE_DDL)).await?;
     }
 
     let existing = run(database, &format!("SELECT name FROM {}", ROLE_TABLE)).await?;
@@ -731,7 +733,7 @@ pub async fn ensure_role_catalogue(
         can_login: true,
         is_superuser: true,
     };
-    run(database, &role.insert_statement()).await?;
+    crate::replication::Replication::local_only(run(database, &role.insert_statement())).await?;
 
     log::info!(
         "Created role catalogue with bootstrap role \"{}\"",

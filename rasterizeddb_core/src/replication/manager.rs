@@ -219,6 +219,12 @@ pub(super) fn plain_row_write(sql: &str) -> bool {
         || word.eq_ignore_ascii_case("DELETE")
 }
 
+tokio::task_local! {
+    /// Set around work that is this node's own business: see
+    /// [`Replication::local_only`].
+    static LOCAL_ONLY: ();
+}
+
 /// A node's replication state.
 ///
 /// Held by the [`Database`](crate::core::database::Database) and shared with
@@ -724,6 +730,16 @@ impl Replication {
 
     // -- the capture side ---------------------------------------------------
 
+    /// Runs `work` with nothing it writes captured for the peers.
+    ///
+    /// For what every node does for itself: a node creates its own role
+    /// catalogue and its first role when it first starts, and so does every
+    /// other. Shipped, each node's `CREATE TABLE` met the table the other had
+    /// just made for itself, and both streams stopped on their first record.
+    pub async fn local_only<F: std::future::Future>(work: F) -> F::Output {
+        LOCAL_ONLY.scope((), work).await
+    }
+
     /// A write statement succeeded inside `tx`.
     ///
     /// Costs one relaxed load when replication is off, which is the point: this
@@ -735,6 +751,9 @@ impl Replication {
         // A statement being applied *from* a peer is that peer's transaction,
         // not a new one of ours.
         if self.is_applying(tx) {
+            return;
+        }
+        if LOCAL_ONLY.try_with(|_| ()).is_ok() {
             return;
         }
 

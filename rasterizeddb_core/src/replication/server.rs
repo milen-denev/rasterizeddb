@@ -564,28 +564,25 @@ async fn apply_one(
     }
 
     let high_water = applied.high_water(record.origin);
-    if high_water > 0 && record.seq > high_water + 1 {
+    if record.seq > high_water + 1 {
         // A record cannot be applied over a hole: the statements before it may
         // be what make it valid. The sender starts again from this node's
         // position on seeing this.
+        //
+        // From nothing as well. A node that held nothing of an origin used to
+        // take up its stream wherever the first record to arrive happened to
+        // be, on the grounds that the earlier history might be past retention.
+        // What that did in practice was skip a refused transaction: the first
+        // record of a stream was refused as a conflict, the second arrived
+        // with nothing yet applied, and it was adopted as the start. A node
+        // that really is missing an origin's early history is one to reseed,
+        // and the sender says so rather than send it the rest.
         outcomes.push(refuse(
             &record,
             ApplyStatus::Gap,
             format!("expected sequence {}, got {}", high_water + 1, record.seq),
         ));
         return;
-    }
-    if high_water == 0 && record.seq > 1 {
-        // Nothing has ever been applied from this origin and its stream does
-        // not start at the beginning. A sender of this version never offers
-        // that; one that does has lost its early history, and saying so is the
-        // only honest thing to do about what came before.
-        warn!(
-            "Adopting origin {}'s stream at sequence {}: this node holds nothing earlier, \
-             so transactions before it are not present. Seed this node from a backup of \
-             that origin if the earlier history matters.",
-            record.origin, record.seq
-        );
     }
 
     replication.clock().observe(record.commit_hlc);
@@ -1263,28 +1260,38 @@ mod tests {
         );
     }
 
-    /// A node joining a cluster whose early history is gone adopts the stream
-    /// where it finds it, rather than stalling forever on a gap it cannot close.
+    /// A node that holds nothing of an origin takes its stream from the
+    /// first transaction or not at all. Taking it up wherever a record
+    /// happened to arrive skipped whatever came before, and what came before
+    /// was, in practice, a transaction this node had just refused.
     #[tokio::test]
-    async fn a_fresh_origin_is_adopted_wherever_its_stream_starts() {
+    async fn a_stream_is_not_taken_up_part_way() {
         let database = database().await;
         create_table(&database).await;
         let replication = database.replication.clone();
 
+        // The first is refused: the table it writes is not there.
+        let refused = apply_record(
+            &database,
+            &replication,
+            record(2, 1, vec!["INSERT INTO no_such_table (id) VALUES (1)"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(refused.status, ApplyStatus::Conflict);
+
+        // The second arrives with nothing applied yet.
         let outcome = apply_record(
             &database,
             &replication,
-            record(
-                2,
-                900,
-                vec!["INSERT INTO repl_t (id, name) VALUES (9, 'nine')"],
-            ),
+            record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (9, 'nine')"]),
             NO_SENDER,
         )
         .await;
 
-        assert_eq!(outcome.status, ApplyStatus::Applied);
-        assert_eq!(replication.applied().high_water(2), 900);
+        assert_eq!(outcome.status, ApplyStatus::Gap, "the refused transaction was passed over");
+        assert_eq!(replication.applied().high_water(2), 0);
+        assert_eq!(row_count(&database).await, 0);
     }
 
     #[tokio::test]

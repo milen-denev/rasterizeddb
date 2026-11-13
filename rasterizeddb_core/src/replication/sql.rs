@@ -709,21 +709,25 @@ fn show_peers(replication: &StdArc<Replication>) -> Vec<String> {
     }
 
     let mut lines = vec![format!(
-        "{:<16} {:<24} {:<6} {:<10} {:<8} {:<8} {:<8} {:<8}",
+        "{:<16} {:<24} {:<6} {:<12} {:<8} {:<8} {:<8} {:<8}",
         "peer", "address", "node", "state", "acked", "lag", "queued", "codec"
     )];
 
     for peer in peers {
         let snapshot = peer.snapshot(local_seq);
+        // A link can be connected and delivering nothing: "up" is only said
+        // of one whose peer is taking what it is sent.
         let state = if snapshot.paused {
             "paused"
+        } else if snapshot.state != super::peer::PeerState::Streaming {
+            snapshot.state.as_str()
         } else if snapshot.connected {
             "up"
         } else {
             "down"
         };
         lines.push(format!(
-            "{:<16} {:<24} {:<6} {:<10} {:<8} {:<8} {:<8} {:<8}",
+            "{:<16} {:<24} {:<6} {:<12} {:<8} {:<8} {:<8} {:<8}",
             snapshot.name,
             snapshot.address,
             snapshot.remote_node,
@@ -772,6 +776,11 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
             replication.open_captures()
         ),
         format!(
+            "released to peers through {}, {} committing or awaiting their sync",
+            replication.released_through(),
+            replication.unreleased()
+        ),
+        format!(
             "captured {}, published {}, applied {}, duplicates {}",
             stats.captured.load(Ordering::Relaxed),
             stats.published.load(Ordering::Relaxed),
@@ -786,6 +795,10 @@ fn show_status(replication: &StdArc<Replication>) -> Vec<String> {
             stats.ack_timeouts.load(Ordering::Relaxed)
         ),
     ];
+
+    if let Some(failure) = replication.capture_failure() {
+        lines.push(format!("NOT REPLICATED: {}", failure));
+    }
 
     let raw = stats.bytes_raw.load(Ordering::Relaxed);
     let wire = stats.bytes_wire.load(Ordering::Relaxed);
@@ -931,6 +944,8 @@ pub fn structured_fields(sql: &str) -> Option<Vec<(String, crate::core::db_type:
             text("codec"),
             text("last_ratio"),
             text("last_error"),
+            // Last, so the columns before it stay where readers know them.
+            text("state"),
         ],
     })
 }
@@ -1123,6 +1138,22 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
     );
 
     push(
+        "released_seq",
+        replication.released_through().to_string(),
+        "how far this node's stream is free to send: committed and durable here",
+    );
+    push(
+        "unreleased",
+        replication.unreleased().to_string(),
+        "transactions written to the log that are still committing or awaiting their sync",
+    );
+    push(
+        "capture_failure",
+        replication.capture_failure().unwrap_or_default(),
+        "a statement that ran here and could not be recorded for the peers; empty when there is none",
+    );
+
+    push(
         "ack_timeout_ms",
         config.ack_timeout.as_millis().to_string(),
         "",
@@ -1184,6 +1215,18 @@ fn peer_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
                     None => String::new(),
                 }),
                 SCell::Text(peer.last_error.unwrap_or_default()),
+                SCell::Text(
+                    if peer.paused {
+                        "paused"
+                    } else if peer.state != super::peer::PeerState::Streaming {
+                        peer.state.as_str()
+                    } else if peer.connected {
+                        "up"
+                    } else {
+                        "down"
+                    }
+                    .to_string(),
+                ),
             ])
         })
         .collect()

@@ -131,8 +131,10 @@
 //! - `<t>_flt.db`: retired (persistent indexes §5, B14), deleted at open and
 //!   never written; `.ixs` and `.ixm` are written whole and proven by
 //!   checksums and the marker log, never appended to by offset.
-//! - `db_replication.state`: cut back to whole 16-byte records at its own
-//!   open (`replication::log`).
+//! - `db_replication.state`, `db_replication.intents`: fixed slots, each
+//!   checksummed and judged on its own at their open (`replication::log`); a
+//!   torn one is no slot, and nothing is appended after a fragment.
+//! - `db_replication.log*`: checksummed records; its open cuts a torn tail.
 //! - files written by temporary name and rename (`.cfg`, marks, snapshots).
 //! - tables on a key/value store: each commit is one CRC-checked object, a
 //!   file's length is the end of its committed records rather than any

@@ -1489,6 +1489,20 @@ impl AppliedState {
             );
         }
 
+        // One slot an origin. Two can only come of a slot's first write being
+        // lost with its page and a second slot handed out since; the later
+        // one, by epoch and then by sequence, is the origin's.
+        found.sort_by_key(|(_, p)| (p.origin, p.epoch, p.seq));
+        let mut latest: Vec<(u64, Position)> = Vec::new();
+        for entry in found {
+            match latest.last_mut() {
+                Some(last) if last.1.origin == entry.1.origin => *last = entry,
+                _ => latest.push(entry),
+            }
+        }
+        let highest_slot = bytes.len().saturating_sub(STATE_SLOT as usize) as u64 / STATE_SLOT;
+        let found = latest;
+
         let intents_path = dir.join(INTENTS_FILE);
         let mut intents = OpenOptions::new()
             .create(true)
@@ -1508,7 +1522,8 @@ impl AppliedState {
         let mut file = StateFile {
             handle,
             slots: found.iter().map(|(slot, p)| (p.origin, *slot)).collect(),
-            next_slot: found.iter().map(|(slot, _)| slot + 1).max().unwrap_or(0),
+            // Past every slot the file has room for, used or not.
+            next_slot: found.iter().map(|(slot, _)| slot + 1).max().unwrap_or(0).max(highest_slot),
             epochs: found.iter().map(|(_, p)| (p.origin, p.epoch)).collect(),
             logged,
             intents,
