@@ -787,3 +787,48 @@ async fn a_check_of_nodes_that_are_not_in_step_says_so() {
     let (verdict, lines) = super::check::check(&two, &peer, &[]).await.unwrap();
     assert!(verdict.in_step && verdict.different.is_empty(), "{lines:?}");
 }
+
+/// The same rows held in different bytes are the same rows. Two nodes can
+/// both be right and lay a row out differently: what lies under a `NULL` is
+/// whatever the last writer left, and a column dropped on one node at a
+/// different point is still in that node's layout. A check that compared
+/// stored bytes would raise the alarm on a healthy pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_compares_values_and_not_how_each_node_happens_to_store_them() {
+    let (one, two) = pair().await;
+    // Each node builds the same tables its own way, so nothing here travels.
+    one.replication.set_active(false);
+    two.replication.set_active(false);
+
+    // A NULL written as one, against a NULL that was a value first.
+    run_ok(&one, "CREATE TABLE repl_nulls (id INTEGER NOT NULL, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_nulls (id, name) VALUES (1, NULL)").await;
+    run_ok(&one, "INSERT INTO repl_nulls (id, name) VALUES (2, 'kept')").await;
+    run_ok(&two, "CREATE TABLE repl_nulls (id INTEGER NOT NULL, name VARCHAR)").await;
+    run_ok(&two, "INSERT INTO repl_nulls (id, name) VALUES (1, 'was here once')").await;
+    run_ok(&two, "INSERT INTO repl_nulls (id, name) VALUES (2, 'kept')").await;
+    run_ok(&two, "UPDATE repl_nulls SET name = NULL WHERE id = 1").await;
+
+    // A column that one node never had and the other had and dropped.
+    run_ok(&one, "CREATE TABLE repl_shape (id INTEGER NOT NULL, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_shape (id, name) VALUES (1, 'ada')").await;
+    run_ok(&two, "CREATE TABLE repl_shape (id INTEGER NOT NULL, junk VARCHAR, name VARCHAR)").await;
+    run_ok(&two, "INSERT INTO repl_shape (id, junk, name) VALUES (1, 'in the way', 'ada')").await;
+    run_ok(&two, "ALTER TABLE repl_shape DROP COLUMN junk").await;
+
+    // And a real difference under a NULL-able column, which must still show:
+    // a NULL here against an empty string there.
+    run_ok(&one, "CREATE TABLE repl_really (id INTEGER NOT NULL, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_really (id, name) VALUES (1, NULL)").await;
+    run_ok(&two, "CREATE TABLE repl_really (id INTEGER NOT NULL, name VARCHAR)").await;
+    run_ok(&two, "INSERT INTO repl_really (id, name) VALUES (1, '')").await;
+
+    one.replication.set_active(true);
+    two.replication.set_active(true);
+    let peer = one.replication.peer("two").unwrap();
+    let (verdict, lines) = super::check::check(&one, &peer, &[]).await.unwrap();
+    assert!(verdict.in_step, "{lines:?}");
+    assert!(verdict.unread.is_empty() && verdict.missing.is_empty(), "{lines:?}");
+    assert_eq!(verdict.different.len(), 1, "{lines:?}");
+    assert!(verdict.different[0].starts_with("repl_really:"), "{lines:?}");
+}

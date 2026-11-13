@@ -4,8 +4,8 @@
 //! say the rows are the same, and the one time a pair here diverged, by
 //! 44,670 transactions, both nodes reported the peer up with a lag of zero.
 //! This is the check that does not take the stream's word for it: each node
-//! reduces every table to a row count and a checksum over its rows' bytes,
-//! and the two are compared.
+//! reduces every table to a row count and a checksum over its rows' values,
+//! and the two are compared. Values, not stored bytes: see [`value_hash`].
 //!
 //! ## Only when in step
 //!
@@ -64,14 +64,64 @@ fn fnv(mut state: u64, bytes: &[u8]) -> u64 {
     state
 }
 
-/// One row's hash: every column's position, length and bytes.
+/// A table's columns as a client sees them, in order. `None` when the table
+/// is not there.
+fn live_columns(database: &Arc<Database>, name: &str) -> Option<Vec<String>> {
+    let relation = database.relation(name)?;
+    Some(
+        crate::core::rql::nullable::visible_fields(&relation.schema().fields)
+            .into_iter()
+            .map(|field| field.name)
+            .collect(),
+    )
+}
+
+/// One value, as something two nodes agree on when they hold the same value.
+///
+/// Not its stored bytes. The same row can be laid out differently on two
+/// nodes that both hold it correctly: the bytes under a `NULL` are whatever
+/// the last writer left; a `CHAR(n)` is stored padded or not depending on the
+/// path that wrote it. So a `NULL` is hashed as a `NULL` whatever lies under
+/// it, a value is hashed as the engine writes it out as a literal, and text
+/// is compared without its trailing padding.
+fn value_hash(mut state: u64, column: &crate::core::row::row::Column) -> u64 {
+    // A query's result marks a `NULL` cell by its type; the bytes under it
+    // are not looked at.
+    if column.column_type == crate::core::db_type::DbType::NULL {
+        return fnv(state, &[0]);
+    }
+    state = fnv(state, &[1]);
+    let bytes = column.data.into_slice();
+    let text_like = matches!(
+        column.column_type,
+        crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::CHAR
+    );
+    if text_like {
+        let mut end = bytes.len();
+        while end > 0 && (bytes[end - 1] == 0 || bytes[end - 1] == b' ') {
+            end -= 1;
+        }
+        state = fnv(state, &(end as u32).to_le_bytes());
+        return fnv(state, &bytes[..end]);
+    }
+    match crate::core::rql::subquery::subquery_literal(&column.column_type, bytes, true) {
+        Some(literal) => {
+            state = fnv(state, &(literal.len() as u32).to_le_bytes());
+            fnv(state, literal.as_bytes())
+        }
+        None => {
+            state = fnv(state, &(bytes.len() as u32).to_le_bytes());
+            fnv(state, bytes)
+        }
+    }
+}
+
+/// One row's hash, over the columns it was asked for, in order.
 fn row_hash(row: &crate::core::row::row::Row) -> u64 {
     let mut state = 0xcbf2_9ce4_8422_2325u64;
-    for (at, column) in row.columns.iter().enumerate() {
-        let bytes = column.data.into_slice();
+    for (at, value) in row.columns.iter().enumerate() {
         state = fnv(state, &(at as u32).to_le_bytes());
-        state = fnv(state, &(bytes.len() as u32).to_le_bytes());
-        state = fnv(state, bytes);
+        state = value_hash(state, value);
     }
     // Spread before the rows are summed: FNV's low bits are weak, and a sum
     // of weak hashes cancels more easily than it should.
@@ -86,6 +136,9 @@ async fn table_digest(database: &Arc<Database>, name: &str) -> TableDigest {
         rows,
         checksum: 0,
         note,
+    };
+    let Some(columns) = live_columns(database, name) else {
+        return unread(0, "no such table".to_string());
     };
     let count = match query(database, &format!("SELECT COUNT(*) FROM {name}")).await {
         Ok(rows) => rows
@@ -104,12 +157,30 @@ async fn table_digest(database: &Arc<Database>, name: &str) -> TableDigest {
     if count > MAX_ROWS_READ {
         return unread(count, format!("more than {MAX_ROWS_READ} rows: counted, contents not read"));
     }
-    match query(database, &format!("SELECT * FROM {name}")).await {
+    // Each live column by name. Not `*`, and not the row as stored: a
+    // dropped column stays in the layout, and two nodes that altered a table
+    // at different points relative to their rows lay the same row out
+    // differently.
+    let list = columns;
+    let expected: usize = list.len();
+    match query(database, &format!("SELECT {} FROM {name}", list.join(", "))).await {
         Ok(rows) => {
+            if let Some(odd) = rows.iter().find(|row| row.columns.len() != expected) {
+                return unread(
+                    count,
+                    format!(
+                        "its rows came back with {} columns where {} were asked for; not compared",
+                        odd.columns.len(),
+                        expected
+                    ),
+                );
+            }
             // A sum, so the order the rows came in does not matter, and a
             // row held twice does not cancel itself the way it would in an
             // exclusive-or.
-            let checksum = rows.iter().fold(0u64, |sum, row| sum.wrapping_add(row_hash(row)));
+            let checksum = rows
+                .iter()
+                .fold(0u64, |sum, row| sum.wrapping_add(row_hash(row)));
             TableDigest {
                 name: name.to_string(),
                 rows: rows.len() as u64,

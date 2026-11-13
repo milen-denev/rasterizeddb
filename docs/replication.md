@@ -535,9 +535,14 @@ has applied. That is not the same as holding the same rows, and the one time a
 pair diverged here both nodes reported the peer up with a lag of zero.
 
 `REPLICATION CHECK` does not take the stream's word for it. Each node reduces
-every table a client made to a row count and a checksum over its rows' bytes
-(order-independent, so the two nodes need not store rows in the same order),
-and the two are compared:
+every table a client made to a row count and a checksum over its rows'
+**values** (order-independent, so the two nodes need not store rows in the
+same order), and the two are compared. Values, not stored bytes: two nodes
+that both hold a row correctly can lay it out differently, with different
+bytes left under a `NULL`, a dropped column still in one node's layout, or a
+`CHAR(n)` padded on one and not the other. Each live column is read by name,
+a `NULL` counts as a `NULL` whatever lies under it, and text is compared
+without trailing padding:
 
 ```text
 $ psql -c "REPLICATION CHECK"
@@ -554,7 +559,7 @@ differs for an honest reason. Run it when the nodes are quiet.
 
 What it does not do: a table of more than two million rows is counted but not
 read, because its rows are held in memory while they are hashed; and it says
-which table differs, not which rows.
+which table differs, not which rows. Trailing spaces in text are not compared.
 
 ## 8. The files
 
