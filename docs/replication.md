@@ -397,6 +397,11 @@ ends of a link reach the same verdict. Schema changes are never dropped this way
 — a `CREATE TABLE` discarded as superseded would leave everything after it with
 nowhere to go.
 
+When each table was last written is rebuilt at start from the replication log,
+as far back as the log goes. It used to be kept in memory only, so after a
+restart nothing was superseded and the first old record to arrive won over a
+newer row.
+
 ### 5.2 Each transaction is applied once
 
 Applying a record and noting that it was applied are two writes. Noted first,
@@ -413,10 +418,22 @@ start each origin's position is its last settled one, moved along its intents
 for as long as each one's transaction committed: exactly the last transaction
 whose rows are there, including when the cut fell part-way through a batch.
 
-Still at-least-once: a **schema change** being applied when the node dies. It
-is not undone by an abort and has no row outcome to hang the position on, so
-it can be offered again after the restart and be refused as already done. The
-stream then stalls, visibly, on that statement.
+A **schema change** is the exception to "written first": it makes itself
+durable over several syncs and is not undone by an abort, so a power cut can
+always leave it done and its position not (35 crash images of 160 in the test
+for it). What is written ahead of it instead is a mark that it was started. A
+node that stops part-way finds the mark at its next start, and when the origin
+offers the record again, a statement of it that fails because its work is
+already there (the table exists, the column exists, the table is already gone)
+is taken as done. Only for that one record, and only after a restart found it
+in flight: at any other time such a failure is a conflict.
+
+**A sync that fails** under an applied batch is treated as a failed commit
+sync is everywhere else: the write-ahead log refuses further commits until the
+node is restarted, the origin's stream is halted until then, nothing of the
+batch is acknowledged and nothing is undone. The restart's replay decides what
+survived, and the positions, which ride the same log, come back agreeing with
+the rows.
 
 ## 6. Configuration — CLI
 

@@ -289,3 +289,97 @@ async fn a_peer_cut_anywhere_has_applied_each_transaction_once() {
     assert!(positions.len() >= 3, "the cuts all landed on the same position(s): {positions:?}");
     eprintln!("peer cuts: positions seen {positions:?}");
 }
+
+/// A schema change applied from a peer, cut anywhere. A schema change makes
+/// itself durable over several syncs and is not undone by an abort, so a cut
+/// can leave the table there and its position not. The origin then offers
+/// the record again, and it must be taken: refused as already existing, the
+/// stream stalled until someone stepped in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_schema_change_cut_anywhere_is_taken_when_it_is_offered_again() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let base = tempfile::tempdir().unwrap();
+    let rec_dir = base.path().join("rec");
+    let dir = rec_dir.join("db");
+    {
+        let db = open_node(&dir, 2).await.unwrap();
+        exec(&db, "CREATE TABLE t (id BIGINT)").await.unwrap();
+        db.sync_durable().unwrap();
+        db.replication.flush();
+        close(&dir, db);
+    }
+    let db = open_node(&dir, 2).await.unwrap();
+    let ddl = |seq: u64| TxnRecord {
+        origin: 1,
+        seq,
+        commit_hlc: seq * 1000,
+        flags: 0,
+        statements: vec![format!("CREATE TABLE made_{seq} (id BIGINT NOT NULL PRIMARY KEY, v BIGINT)")],
+        tables: Vec::new(),
+    };
+
+    let rec = Recorder::start(&rec_dir);
+    let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+    let guards = arm_log_syncs(&rec, &rec_dir, &sink, 12);
+    for seq in 1..=2u64 {
+        let outcomes = crate::replication::server::apply_batch(&db, &db.replication, vec![ddl(seq)], 1).await;
+        assert_eq!(outcomes[0].status, crate::replication::protocol::ApplyStatus::Applied, "{outcomes:?}");
+        sink.lock().push(rec.cut_quiescent(format!("after schema change {seq}")));
+    }
+    let fired = guards.iter().filter(|g| g.fired() > 0).count();
+    drop(guards);
+    close(&dir, db);
+    drop(rec);
+    assert!(fired >= 2, "only {fired} cuts fell inside a log sync");
+
+    let points: Vec<CrashPoint> = sink.lock().drain(..).filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok()).collect();
+    let img_dir = base.path().join("image");
+    let img = img_dir.join("db");
+    let mut problems = Vec::new();
+    let (mut stalls, mut lost, mut images) = (0usize, 0usize, 0usize);
+    for point in &points {
+        for seed in 0..seeds {
+            point.write_image(seed, &img_dir);
+            let label = format!("{} seed {seed}", point.label);
+            let db = match open_node(&img, 2).await {
+                Ok(db) => db,
+                Err(e) => {
+                    problems.push(format!("{label}: does not open: {e}"));
+                    continue;
+                }
+            };
+            images += 1;
+            let position = db.replication.applied().high_water(1);
+            for seq in 1..=2u64 {
+                let there = db.has_table(&format!("made_{seq}"));
+                if there && position < seq {
+                    stalls += 1;
+                }
+                if !there && position >= seq {
+                    lost += 1;
+                    problems.push(format!("{label}: the position is {position} and made_{seq} is not there"));
+                }
+            }
+            // The origin sends its stream again from this node's position.
+            let outcomes = crate::replication::server::apply_batch(&db, &db.replication, vec![ddl(1), ddl(2)], 1).await;
+            for outcome in &outcomes {
+                if !outcome.status.is_settled() {
+                    problems.push(format!("{label}: {}:{} came back {} ({})", outcome.origin, outcome.seq, outcome.status, outcome.message));
+                }
+            }
+            for seq in 1..=2u64 {
+                if !db.has_table(&format!("made_{seq}")) {
+                    problems.push(format!("{label}: made_{seq} is missing after the stream was sent again"));
+                }
+            }
+            if db.replication.applied().high_water(1) != 2 {
+                problems.push(format!("{label}: the position ends at {}", db.replication.applied().high_water(1)));
+            }
+            close(&img, db);
+            let _ = std::fs::remove_dir_all(&img_dir);
+        }
+    }
+    eprintln!("schema-change cuts: {images} images, {stalls} had the table ahead of its position, {lost} the position ahead of the table");
+    assert!(stalls > 0, "no cut left a table ahead of its position: the test shows nothing");
+    assert!(problems.is_empty(), "{} problem(s):\n{}", problems.len(), problems.join("\n"));
+}

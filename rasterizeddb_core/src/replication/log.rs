@@ -308,6 +308,8 @@ pub struct ReplicationLog {
     voided: Mutex<std::collections::HashSet<(NodeId, u64)>>,
     /// Conditional records found at open, until [`ReplicationLog::take_undecided`].
     pending_at_open: Mutex<BTreeMap<(NodeId, u64), u64>>,
+    /// Table stamps found at open, until [`ReplicationLog::take_stamps`].
+    stamps_at_open: Mutex<BTreeMap<String, (Hlc, NodeId)>>,
     /// Settable while open: the storage is opened at server start, before
     /// the configuration that says how much to keep has been applied.
     retention_bytes: std::sync::atomic::AtomicU64,
@@ -410,6 +412,8 @@ struct Scanned {
     hot: std::collections::VecDeque<TxnRecord>,
     conditional: BTreeMap<(NodeId, u64), u64>,
     last_hlc: Hlc,
+    /// Per table, the newest write the log holds: when, and by which node.
+    stamps: BTreeMap<String, (Hlc, NodeId)>,
 }
 
 /// Reads one file's records into `found`, and returns where its last whole
@@ -478,6 +482,12 @@ fn scan(
             Ok(record) => {
                 let held = newest.entry(record.origin).or_insert(0);
                 *held = (*held).max(record.seq);
+                for table in &record.tables {
+                    let stamp = found.stamps.entry(table.clone()).or_insert((NO_HLC, 0));
+                    if record.commit_hlc > stamp.0 {
+                        *stamp = (record.commit_hlc, record.origin);
+                    }
+                }
                 found.index.entry(record.origin).or_default().insert(
                     record.seq,
                     RecordLoc {
@@ -532,6 +542,7 @@ impl ReplicationLog {
             hot: Mutex::new(std::collections::VecDeque::with_capacity(HOT_RECORDS)),
             voided: Mutex::new(std::collections::HashSet::new()),
             pending_at_open: Mutex::new(BTreeMap::new()),
+            stamps_at_open: Mutex::new(BTreeMap::new()),
             retention_bytes: std::sync::atomic::AtomicU64::new(retention_bytes),
             kept_origin: std::sync::atomic::AtomicU64::new(0),
             kept_after: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -638,6 +649,7 @@ impl ReplicationLog {
             hot: Mutex::new(found.hot),
             voided: Mutex::new(std::collections::HashSet::new()),
             pending_at_open: Mutex::new(found.conditional),
+            stamps_at_open: Mutex::new(found.stamps),
             retention_bytes: std::sync::atomic::AtomicU64::new(retention_bytes),
             kept_origin: std::sync::atomic::AtomicU64::new(0),
             kept_after: std::sync::atomic::AtomicU64::new(u64::MAX),
@@ -708,6 +720,17 @@ impl ReplicationLog {
         std::mem::take(&mut *self.pending_at_open.lock())
             .into_iter()
             .map(|((origin, seq), tx)| (origin, seq, tx))
+            .collect()
+    }
+
+    /// When each table was last written by a record this log holds, and by
+    /// which node: what last-writer-wins compares an arriving record with.
+    /// Taken once, at open. Without it a restart forgot every local write,
+    /// and an older record arriving afterwards won over a newer row.
+    pub fn take_stamps(&self) -> Vec<(String, Hlc, NodeId)> {
+        std::mem::take(&mut *self.stamps_at_open.lock())
+            .into_iter()
+            .map(|(table, (hlc, node))| (table, hlc, node))
             .collect()
     }
 
@@ -1243,6 +1266,10 @@ const INTENT_LEN: u64 = 48;
 /// it.
 const INTENTS_TRIM_AT: u64 = 1 << 20;
 
+/// In an intent's transaction field: not a step, but a mark that the record
+/// is a schema change that was started. See [`AppliedState::mark_schema`].
+const SCHEMA_MARK: u64 = u64::MAX;
+
 /// One origin's slot: how far its stream is applied *and durable*.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Position {
@@ -1431,6 +1458,9 @@ impl StateFile {
 pub struct AppliedState {
     positions: Mutex<BTreeMap<NodeId, u64>>,
     file: Mutex<Option<StateFile>>,
+    /// Per origin, the schema-change record that was in flight when this
+    /// node last stopped, until it is applied.
+    in_flight: Mutex<BTreeMap<NodeId, u64>>,
 }
 
 impl std::fmt::Debug for AppliedState {
@@ -1446,6 +1476,7 @@ impl AppliedState {
         AppliedState {
             positions: Mutex::new(BTreeMap::new()),
             file: Mutex::new(None),
+            in_flight: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1592,6 +1623,7 @@ impl AppliedState {
         // Each origin: its slot, then along its intents while each step's
         // transaction committed.
         let mut positions: BTreeMap<NodeId, u64> = BTreeMap::new();
+        let mut in_flight: BTreeMap<NodeId, (u64, u64)> = BTreeMap::new();
         let mut origins: Vec<(NodeId, u64, u64)> =
             found.iter().map(|(_, p)| (p.origin, p.seq, p.epoch)).collect();
         for intent in &standing {
@@ -1608,6 +1640,7 @@ impl AppliedState {
                 let steps: Vec<&Intent> = standing
                     .iter()
                     .filter(|i| i.origin == origin && i.epoch == epoch && i.prev == position && i.seq > position)
+                    .filter(|i| i.tx != SCHEMA_MARK)
                     .collect();
                 if steps.is_empty() {
                     break;
@@ -1638,6 +1671,12 @@ impl AppliedState {
             if moved || stopped.is_some() || standing.iter().any(|i| i.origin == origin) {
                 file.write_slot(origin, position, epoch + 1)?;
             }
+            // A schema change started from exactly here and never settled.
+            if let Some(mark) = standing.iter().find(|i| {
+                i.origin == origin && i.epoch == epoch && i.tx == SCHEMA_MARK && i.prev == position && i.seq > position
+            }) {
+                in_flight.insert(origin, (mark.seq, position));
+            }
             if position != 0 {
                 positions.insert(origin, position);
             }
@@ -1646,10 +1685,24 @@ impl AppliedState {
         // file starts again from empty.
         file.intents_end = intent_bytes.len() as u64;
         file.trim_intents(0);
+        // The marks are carried over into the new run of intents: the record
+        // may be offered again any number of restarts from now.
+        for (origin, (seq, position)) in &in_flight {
+            let epoch = file.epoch(*origin);
+            file.write_intent(Intent {
+                origin: *origin,
+                epoch,
+                prev: *position,
+                seq: *seq,
+                tx: SCHEMA_MARK,
+            })?;
+        }
+        file.unsettled.clear();
 
         Ok(AppliedState {
             positions: Mutex::new(positions),
             file: Mutex::new(Some(file)),
+            in_flight: Mutex::new(in_flight.into_iter().map(|(origin, (seq, _))| (origin, seq)).collect()),
         })
     }
 
@@ -1711,8 +1764,36 @@ impl AppliedState {
         Ok(prev)
     }
 
+    /// Notes, ahead of running it, that `origin`'s record `seq` is a schema
+    /// change being applied. Not a step: the position moves by
+    /// [`AppliedState::begin`] as for any record. What it buys is that a node
+    /// which stops part-way knows, at its next start, that this record was
+    /// started — see `server::apply_one`.
+    pub fn mark_schema(&self, origin: NodeId, seq: u64) -> io::Result<()> {
+        let mut file = self.file.lock();
+        let prev = self.high_water(origin);
+        if let Some(file) = file.as_mut() {
+            let epoch = file.epoch(origin);
+            file.write_intent(Intent {
+                origin,
+                epoch,
+                prev,
+                seq,
+                tx: SCHEMA_MARK,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether `origin`'s record `seq` is a schema change that was being
+    /// applied when this node last stopped, and has not been applied since.
+    pub fn schema_in_flight(&self, origin: NodeId, seq: u64) -> bool {
+        self.in_flight.lock().get(&origin) == Some(&seq)
+    }
+
     /// The transaction [`AppliedState::begin`] named has committed.
     pub fn advance(&self, origin: NodeId, seq: u64) {
+        self.in_flight.lock().remove(&origin);
         let mut positions = self.positions.lock();
         let entry = positions.entry(origin).or_insert(0);
         *entry = (*entry).max(seq);

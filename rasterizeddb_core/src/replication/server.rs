@@ -655,6 +655,46 @@ async fn apply_one(
         group.finish(database, replication, from_node, outcomes);
     }
 
+    // A schema change makes itself durable as it goes, over several syncs,
+    // and is not undone by an abort. So there is no place to write its
+    // position that a power cut cannot separate from it: written after, as
+    // for a row write, the table was there and the position was not in 36
+    // crash images of 160, the origin offered the `CREATE` again, it was
+    // refused as already existing, and the stream stalled until someone
+    // stepped in; written before, the position was there and the table was
+    // not in 46, which nothing would ever have reported.
+    //
+    // What can be made durable ahead of it is the fact that it was started.
+    // A record that is nothing but schema changes is marked as in flight
+    // before it runs. If the node stops before the record's position is
+    // settled, the next start finds the mark, and when the origin offers the
+    // record again, a statement of it that fails because its work is already
+    // there is taken as done.
+    let schema_only = record
+        .statements
+        .iter()
+        .all(|statement| !super::manager::plain_row_write(statement));
+    let stood = applied.high_water(record.origin);
+    let resumed = schema_only && applied.schema_in_flight(record.origin, record.seq);
+    if schema_only {
+        if let Err(e) = applied.mark_schema(record.origin, record.seq) {
+            outcomes.push(refuse(
+                &record,
+                ApplyStatus::Failed,
+                format!("the applied position could not be written: {}", e),
+            ));
+            return;
+        }
+    }
+    // The mark is taken back whenever the record is not applied.
+    let take_back = || {
+        if schema_only {
+            if let Err(e) = applied.rollback(record.origin, stood) {
+                warn!("Could not take the applied position back: {}", e);
+            }
+        }
+    };
+
     // A statement that failed on a lock (40P01, 55P03, 57014, 57P01: a
     // deadlock's victim, a lock or statement timeout, a cancel) applied
     // nothing wrong; it lost a race with local work. The record is retried
@@ -696,6 +736,17 @@ async fn apply_one(
                     failure = Some(format!("{} (`{}`)", message, truncate(statement)));
                     transient = true;
                     break;
+                }
+                if resumed && already_done(&message) {
+                    info!(
+                        "Transaction {}:{} was being applied when this node last stopped; `{}` is \
+                         already in place ({}), and is taken as done",
+                        record.origin,
+                        record.seq,
+                        truncate(statement),
+                        message
+                    );
+                    continue;
                 }
                 match policy {
                     ConflictPolicy::Skip | ConflictPolicy::LastWriterWins => {
@@ -748,6 +799,7 @@ async fn apply_one(
                  delivered again",
                 record.origin, record.seq, message
             );
+            take_back();
             outcomes.push(refuse(&record, ApplyStatus::Failed, message));
             return;
         }
@@ -760,6 +812,7 @@ async fn apply_one(
              the conflict policy to skip.",
             record.origin, record.seq, message
         );
+        take_back();
         outcomes.push(refuse(&record, ApplyStatus::Conflict, message));
         return;
     };
@@ -852,6 +905,18 @@ fn lost_a_lock(message: &str) -> bool {
     matches!(
         crate::pgwire::sqlstate_for(message),
         "40P01" | "55P03" | "57014" | "57P01"
+    )
+}
+
+/// Whether a schema change failed because what it makes is already there, or
+/// what it removes is already gone: the answer a statement gets when it ran
+/// before. Classified by the wire's own mapping, as [`lost_a_lock`] is.
+fn already_done(message: &str) -> bool {
+    matches!(
+        crate::pgwire::sqlstate_for(message),
+        // duplicate table, column, object, schema; undefined table, column,
+        // object.
+        "42P07" | "42701" | "42710" | "42P06" | "42P01" | "42703" | "42704"
     )
 }
 

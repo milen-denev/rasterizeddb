@@ -549,6 +549,11 @@ impl Replication {
         };
 
         self.clock.observe(log.last_hlc());
+        // Last-writer-wins compares an arriving record with when each table
+        // was last written here. That is in the log, as far back as it goes.
+        for (table, hlc, node) in log.take_stamps() {
+            self.stamp_tables(&[table], hlc, node);
+        }
         let mut voided = 0usize;
         for (origin, seq, tx) in log.take_undecided() {
             if committed(tx) {
@@ -1612,5 +1617,44 @@ mod tests {
         assert!(!plain_row_write("CREATE TABLE t (id INTEGER)"));
         assert!(!plain_row_write("INSERTED"));
         assert!(!plain_row_write(""));
+    }
+
+    /// Last-writer-wins drops an arriving record that a later local write
+    /// supersedes. "Later local write" has to survive a restart, or the
+    /// first old record to arrive afterwards wins over a newer row.
+    #[test]
+    fn what_was_written_locally_still_supersedes_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = || ReplicationConfig {
+            node_id: 1,
+            ..Default::default()
+        };
+        let written_at = {
+            let replication = Replication::new();
+            replication.set_config(config()).unwrap();
+            replication.open_storage(Some(dir.path())).unwrap();
+            replication.set_active(true);
+            replication.note_statement(7, "UPDATE t SET a = 1", Some("t"));
+            let record = replication.commit_record(7).expect("a write");
+            replication.flush();
+            record.commit_hlc
+        };
+
+        let replication = Replication::new();
+        replication.set_config(config()).unwrap();
+        replication.open_storage(Some(dir.path())).unwrap();
+        let stamp = replication.table_stamp("t").expect("the write is remembered");
+        assert_eq!((stamp.hlc, stamp.node), (written_at, 1));
+
+        let arriving = |commit_hlc| TxnRecord {
+            origin: 2,
+            seq: 1,
+            commit_hlc,
+            flags: 0,
+            statements: vec!["UPDATE t SET a = 2".to_string()],
+            tables: vec!["t".to_string()],
+        };
+        assert!(replication.is_superseded(&arriving(written_at - 1)), "older than the local write");
+        assert!(!replication.is_superseded(&arriving(written_at + 1)), "newer than it");
     }
 }
