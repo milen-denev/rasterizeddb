@@ -3362,6 +3362,25 @@ pub fn scan_file_ids(bytes: &[u8]) -> std::collections::BTreeSet<u64> {
     ids
 }
 
+/// For each file a log at `path` writes to, the lowest offset any of its
+/// records writes at. A restore creates a file the snapshot did not hold only
+/// when this is 0: a log that covers the file from its first byte. One whose
+/// earlier bytes were written around the log (a file built by copying and
+/// renaming, as a replication log's compaction does) would come back as a
+/// hole followed by the logged tail, which reads as nothing at all.
+pub fn file_starts(path: &Path) -> io::Result<std::collections::HashMap<u64, u64>> {
+    let mut starts: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut scan = LogScanner::open(path)?;
+    while let Some(h) = scan.next()? {
+        if h.flags & (FLAG_COMMIT | FLAG_FORGET) != 0 {
+            continue;
+        }
+        let start = starts.entry(h.file_id).or_insert(h.offset);
+        *start = (*start).min(h.offset);
+    }
+    Ok(starts)
+}
+
 /// Whether a long-running statement should commit and open a fresh transaction.
 ///
 /// An open transaction blocks checkpointing — the log cannot be reclaimed while

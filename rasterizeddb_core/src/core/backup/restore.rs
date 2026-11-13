@@ -1123,10 +1123,21 @@ pub(super) fn replay(
     // A file the archived log writes to that the snapshot does not hold was
     // made after it: created here, by its name, at the first record for it.
     // Only a plain name is taken, so a catalogue cannot point the restore
-    // outside the directory.
+    // outside the directory, and only when the log covers the file from its
+    // first byte (`wal::file_starts`). A replication log rotated by its
+    // compaction after the snapshot was written by copy and rename, its
+    // logged records starting past a prefix the log never saw: created from
+    // them, it was a hole the open read as an empty log and cut to nothing,
+    // where leaving it out keeps the generation the snapshot holds.
+    let starts = if named.is_empty() {
+        HashMap::new()
+    } else {
+        crate::core::wal::file_starts(replay_path)?
+    };
     for name in named {
         let plain = !name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..";
-        if plain {
+        let from_the_start = starts.get(&crate::core::wal::file_id_for_name(name)) == Some(&0);
+        if plain && from_the_start {
             resolver
                 .entry(crate::core::wal::file_id_for_name(name))
                 .or_insert_with(|| target_dir.join(name));

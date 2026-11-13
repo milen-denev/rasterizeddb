@@ -798,3 +798,45 @@ fn a_restore_resumes_transaction_ids_past_every_one_the_window_issued() {
         "the restored database handed out {next}; the source had issued up to {highest}"
     );
 }
+
+/// A file the snapshot does not hold is created from the archived log by
+/// name only when the log covers it from its first byte. One whose logged
+/// records start past a prefix written around the log (a replication log
+/// rotated by copy and rename after the snapshot) would come back as a hole
+/// and a tail, which its reader took for an empty file and cut to nothing;
+/// it is left out instead, as before names were archived. Mutation: the
+/// offset check removed.
+#[test]
+fn a_file_is_created_by_name_only_when_the_log_covers_it_from_byte_zero() {
+    let root = temp_testdir::TempDir::default();
+    let live = root.join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let staging = root.join("staging");
+    let wal = Wal::open(live.join("rasterized.wal")).unwrap();
+    wal.set_archive_dir(Some(staging.clone())).unwrap();
+    wal.checkpoint().unwrap();
+    let window_start = wal.commit_lsn();
+
+    // After the snapshot: one file written through the log from byte 0, one
+    // whose first 100 bytes were written around it.
+    let whole = file_id_for_name("whole.db");
+    commit_write(&wal, whole, 0, b"FIRST;");
+    commit_write(&wal, whole, 6, b"SECOND;");
+    let tailed = file_id_for_name("tailed.log.1");
+    commit_write(&wal, tailed, 100, b"LATE-RECORD;");
+    wal.checkpoint().unwrap();
+
+    let target = root.join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    let replay = root.join("replay.wal");
+    concatenate_staged(&staging, &replay);
+    let names = vec!["whole.db".to_string(), "tailed.log.1".to_string()];
+    let stats = super::restore::replay(&replay, &target, None, window_start, &names).unwrap();
+
+    assert_eq!(std::fs::read(target.join("whole.db")).unwrap(), b"FIRST;SECOND;");
+    assert!(
+        !target.join("tailed.log.1").exists(),
+        "a file the log does not cover from byte 0 must not be fabricated"
+    );
+    assert_eq!(stats.unresolved, 1, "its record is reported as unresolved, as before names were archived");
+}
