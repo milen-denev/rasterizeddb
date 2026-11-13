@@ -58,6 +58,7 @@ pub mod lock_set;
 pub mod json_map;
 pub mod path_index;
 pub mod prepared;
+pub mod replicated_values;
 
 pub mod catalog_views;
 pub mod check;

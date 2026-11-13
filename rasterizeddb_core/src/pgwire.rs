@@ -6526,6 +6526,27 @@ where
         return Ok(());
     }
 
+    // On a node that replicates, a write carries the values of its
+    // non-deterministic calls (`now()`, `random()`, `gen_random_uuid()`):
+    // the peers run the statement's text again (`rql::replicated_values`).
+    let deterministic;
+    let stmt = if database.replication.is_active() {
+        match crate::core::rql::replicated_values::fold(stmt) {
+            crate::core::rql::replicated_values::Fold::Unchanged => stmt,
+            crate::core::rql::replicated_values::Fold::Rewritten(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                deterministic = text;
+                deterministic.as_str()
+            }
+            crate::core::rql::replicated_values::Fold::Refused(message) => {
+                fail_statement(state, stream, "0A000", &message).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        stmt
+    };
+
     // `WHERE created_at < NOW()` reaches the predicate tokenizer as the unknown
     // column `NOW`, so the constant parts are evaluated once here, before
     // anything parses the clause.
