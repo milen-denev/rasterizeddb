@@ -19,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::cert::generate_self_signed_cert;
 use crate::session::{AuthChannel, Principal, ServerAuthenticator};
 use crate::tls::{ClientAuth, Fingerprint};
-use crate::common::{read_message_timeout, write_message_timeout};
+use crate::common::write_message_timeout;
 use crate::error::RastcpError;
 use crate::ALPN_PROTOCOL;
 
@@ -132,6 +132,7 @@ pub struct TcpServerBuilder {
     session_cache_size: usize,
     handshake_timeout: Duration,
     request_timeout: Duration,
+    max_message_size: usize,
     shutdown_grace: Duration,
     client_auth: ClientAuth,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -157,6 +158,7 @@ pub struct TcpServer {
     connection_backoff_ms: u64,
     handshake_timeout: Duration,
     request_timeout: Duration,
+    max_message_size: usize,
     shutdown_grace: Duration,
     auth_timeout: Duration,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -177,6 +179,7 @@ impl TcpServerBuilder {
             session_cache_size: 1024,         // Increased from 128
             handshake_timeout: Duration::from_secs(10),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             client_auth: ClientAuth::None,
             authenticator: None,
@@ -305,6 +308,14 @@ impl TcpServerBuilder {
         self
     }
 
+    /// The largest request this server reads, in bytes. A longer one ends the
+    /// connection before any of it is buffered. The default is
+    /// [`crate::common::DEFAULT_MAX_MESSAGE_SIZE`].
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
+        self
+    }
+
     /// How long a shutdown waits for in-flight connections before closing them
     /// anyway. Past this point a stuck handler would keep the process alive.
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
@@ -417,6 +428,7 @@ impl TcpServerBuilder {
             connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
             handshake_timeout: self.handshake_timeout,
             request_timeout: self.request_timeout,
+            max_message_size: self.max_message_size,
             shutdown_grace: self.shutdown_grace,
             auth_timeout: self.auth_timeout,
             authenticator: self.authenticator,
@@ -685,6 +697,7 @@ impl TcpServer {
         let handshake_timeout = self.handshake_timeout;
         let auth_timeout = self.auth_timeout;
         let request_timeout = self.request_timeout;
+        let max_message_size = self.max_message_size;
         let authenticator = self.authenticator.clone();
 
         self.accept_loop(move |stream, connection_shutdown| {
@@ -699,6 +712,7 @@ impl TcpServer {
                     handshake_timeout,
                     auth_timeout,
                     request_timeout,
+                    max_message_size,
                     authenticator,
                     connection_shutdown,
                     handler,
@@ -822,6 +836,7 @@ impl TcpServer {
         handshake_timeout: Duration,
         auth_timeout: Duration,
         request_timeout: Duration,
+        max_message_size: usize,
         authenticator: Option<Arc<dyn ServerAuthenticator>>,
         mut shutdown: watch::Receiver<bool>,
         handler: H,
@@ -899,7 +914,7 @@ impl TcpServer {
                     break;
                 }
 
-                read = read_message_timeout(&mut tls_stream, request_timeout) => read,
+                read = crate::common::read_message_limited_timeout(&mut tls_stream, max_message_size, request_timeout) => read,
             };
 
             match read {

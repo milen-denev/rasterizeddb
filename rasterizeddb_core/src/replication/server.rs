@@ -75,6 +75,10 @@ pub fn bind_on(
     let mut builder =
         rastcp::server::TcpServerBuilder::new(&config.listen_addr, config.listen_port)
             .request_timeout(config.request_timeout)
+            // One transaction is one record and a record is not split: the
+            // transport must take the largest frame the protocol allows, or a
+            // single large transaction stops its link for good.
+            .max_message_size(protocol::MAX_PAYLOAD + protocol::HEADER_LEN)
             // What callers must prove before they reach the handler. Under
             // anything but `Insecure` an unauthenticated caller never gets to
             // send a frame at all.

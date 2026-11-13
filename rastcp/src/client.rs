@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::ALPN_PROTOCOL;
-use crate::common::{read_message, read_message_timeout, write_message, write_message_timeout};
+use crate::common::{write_message, write_message_timeout};
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
 use crate::session::{AuthChannel, ClientAuthenticator};
@@ -77,6 +77,7 @@ pub struct TcpClientBuilder {
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
     auth_timeout: std::time::Duration,
     allow_tls12: bool,
+    max_message_size: usize,
 }
 
 pub struct TcpClient {
@@ -87,6 +88,7 @@ pub struct TcpClient {
     timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
     auth_timeout: std::time::Duration,
+    max_message_size: usize,
 }
 
 impl TcpClientBuilder {
@@ -101,6 +103,7 @@ impl TcpClientBuilder {
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             // See `crate::server::TcpServerBuilder::allow_tls12`.
             allow_tls12: false,
+            max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
         }
     }
 
@@ -149,6 +152,13 @@ impl TcpClientBuilder {
 
     pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// The largest response this client reads, in bytes. The default is
+    /// [`crate::common::DEFAULT_MAX_MESSAGE_SIZE`].
+    pub fn max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
         self
     }
 
@@ -250,6 +260,7 @@ impl TcpClientBuilder {
             timeout: self.timeout,
             authenticator: self.authenticator,
             auth_timeout: self.auth_timeout,
+            max_message_size: self.max_message_size,
         })
     }
 }
@@ -349,11 +360,11 @@ impl TcpClient {
             if let Some(timeout) = self.timeout {
                 write_message_timeout(stream, data, timeout).await?;
                 debug!("Sent {} bytes", data.len());
-                read_message_timeout(stream, timeout).await
+                crate::common::read_message_limited_timeout(stream, self.max_message_size, timeout).await
             } else {
                 write_message(stream, data).await?;
                 debug!("Sent {} bytes", data.len());
-                read_message(stream).await
+                crate::common::read_message_limited(stream, self.max_message_size).await
             }
         };
 

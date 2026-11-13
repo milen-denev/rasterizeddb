@@ -364,6 +364,7 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
 
     let mut builder = TcpClientBuilder::new(&address)
         .timeout(config.request_timeout)
+        .max_message_size(protocol::MAX_PAYLOAD + protocol::HEADER_LEN)
         // Who this node will believe is on the other end. Under
         // `AuthMode::Insecure` this is "anything", which is why that mode is
         // only allowed on loopback.

@@ -908,6 +908,22 @@ impl Replication {
         // row here has nothing on this node a peer could be missing.
         let sync_now = !wrote && !statements.iter().all(|sql| plain_row_write(sql));
 
+        // One transaction is one record, and a record travels whole. Refused
+        // here, before the commit, it is a transaction that does not happen;
+        // let through, it would be one no peer could ever be sent.
+        let size: usize = statements.iter().map(|sql| sql.len() + 4).sum::<usize>() + 64;
+        if size > super::protocol::MAX_PAYLOAD / 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "the transaction's statements come to {} bytes, more than the {} a replicated \
+                     transaction may hold; commit it in smaller transactions",
+                    size,
+                    super::protocol::MAX_PAYLOAD / 2
+                ),
+            ));
+        }
+
         let log = self.log.load_full();
         let record = {
             let mut outbox = self.outbox.lock();
