@@ -103,6 +103,14 @@ async fn a_select_without_from_is_answered_as_postgresql_answers_it() {
     assert_eq!(row.get::<_, f64>("f"), 0.30000000000000004);
     assert!(row.get::<_, bool>("later"));
     assert_eq!(row.get::<_, String>("s"), "xy");
+    // `SELECT 1` itself, the health check every pool runs: it was answered by
+    // a fast path as the text "1" whatever format the client bound, under an
+    // int4 description, so a typed client could not decode it.
+    for sql in ["SELECT 1", "select 1", "SELECT 1::int"] {
+        let row = c.query_one(sql, &[]).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(row.columns()[0].type_(), &tokio_postgres::types::Type::INT4, "{sql}");
+        assert_eq!(row.get::<_, i32>(0), 1, "{sql}");
+    }
     let row = c.query_one("SELECT $1::int + 1 AS n", &[&41i32]).await.expect("a bound parameter");
     assert_eq!(row.get::<_, i32>("n"), 42);
     assert!(c.query("SELECT 1 WHERE 1 = 0", &[]).await.expect("no row").is_empty());

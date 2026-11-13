@@ -859,6 +859,43 @@ fn composite_key<'r>(row: RowRef<'r>, keys: &[KeyColumn]) -> Option<SmallVec<[Ke
 /// rather than fanned out into one tuple per match and discarded afterwards,
 /// and only the unmatched ones are kept, with this side absent.
 #[allow(clippy::too_many_arguments)]
+/// The most a join may hold of its tuples (row indexes, four bytes a
+/// relation): `RDB_JOIN_MEMORY_MB`, read once, default 1024. At the default a
+/// two-relation join stops at 134 million rows.
+///
+/// Every step of a join builds its whole result before the next, so a cross
+/// join, a join with no usable key or a many-to-many key multiplied in
+/// memory with nothing to stop it. `SELECT … FROM a, b, c LIMIT 1000000`
+/// over a few hundred thousand rows asked for the full product at once, the
+/// allocation failed, and the process aborted, taking every session with
+/// it. Past this it is a statement error instead.
+fn join_slots_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("RDB_JOIN_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|mb| *mb > 0)
+            .unwrap_or(1024);
+        mb.saturating_mul(1 << 20) / std::mem::size_of::<u32>()
+    })
+}
+
+/// The refusal for a join that grew past [`join_slots_limit`]: SQLSTATE
+/// 53200 (`out_of_memory`) through `sqlstate_for`.
+fn join_too_large(width: usize) -> String {
+    format!(
+        "out of memory: the join would hold more than {} rows; add a join condition or narrow the WHERE clause",
+        join_slots_limit() / width.max(1)
+    )
+}
+
+/// Whether `out` has outgrown the join's budget.
+#[inline]
+fn over_budget(out: &[u32]) -> bool {
+    out.len() > join_slots_limit()
+}
+
 fn hash_step<'r, K: std::hash::Hash + Eq>(
     kind: JoinKind,
     idx: usize,
@@ -871,7 +908,7 @@ fn hash_step<'r, K: std::hash::Hash + Eq>(
     anti: bool,
     left_key: impl Fn(RowRef<'r>) -> Option<K>,
     right_key: impl Fn(RowRef<'r>) -> Option<K>,
-) -> Vec<u32> {
+) -> Result<Vec<u32>, String> {
     use std::hash::BuildHasher;
     let right = &scanned[idx];
     let state = ahash::RandomState::new();
@@ -931,8 +968,11 @@ fn hash_step<'r, K: std::hash::Hash + Eq>(
                 out[at + idx] = r as u32;
                 t = next[t as usize];
             }
+            if over_budget(&out) {
+                return Err(join_too_large(width));
+            }
         }
-        return out;
+        return Ok(out);
     }
 
     let row = |at: usize| right.get(at).expect("a row index from this relation");
@@ -1001,6 +1041,9 @@ fn hash_step<'r, K: std::hash::Hash + Eq>(
                     }
                     r = next[r as usize];
                 }
+                if over_budget(&out) {
+                    return Err(join_too_large(width));
+                }
             }
             // An inner or right join drops the tuple; a left or full join
             // keeps it with this side absent.
@@ -1024,7 +1067,10 @@ fn hash_step<'r, K: std::hash::Hash + Eq>(
             }
         }
     }
-    out
+    if over_budget(&out) {
+        return Err(join_too_large(width));
+    }
+    Ok(out)
 }
 
 /// `RDB_JOIN_BUILD_RIGHT=1`: always hash the joined relation, as before the
@@ -1308,7 +1354,12 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
         // relation. No key, no hash index — just the product.
         if join.kind == JoinKind::Cross {
             let right_n = scanned[idx].len();
-            let mut next: Vec<u32> = Vec::with_capacity(combined.len() * right_n);
+            let slots = combined.len().checked_mul(right_n).filter(|n| *n <= join_slots_limit());
+            let Some(slots) = slots else {
+                return Err(join_too_large(width));
+            };
+            let mut next: Vec<u32> = Vec::new();
+            next.try_reserve_exact(slots).map_err(|_| join_too_large(width))?;
             for tuple in combined.chunks_exact(width) {
                 for r in 0..right_n {
                     let at = next.len();
@@ -1463,6 +1514,9 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                         out.extend_from_slice(tuple);
                         out[at + idx] = r as u32;
                     }
+                    if over_budget(&out) {
+                        return Err(join_too_large(width));
+                    }
                 }
                 out
             } else if !resolved {
@@ -1481,7 +1535,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                     false,
                     |row| key_bytes(row, l),
                     |row| key_bytes(row, r),
-                )
+                )?
             } else {
                 hash_step(
                     JoinKind::Inner,
@@ -1495,7 +1549,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                     false,
                     |row| composite_key(row, &left_keys),
                     |row| composite_key(row, &right_keys),
-                )
+                )?
             };
             let keep = apply_post_join(plan, pair, &Joined { scanned, width, slots: candidates.clone() })?;
             let mut next: Vec<u32> = Vec::with_capacity(candidates.len());
@@ -1544,7 +1598,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                 anti,
                 |_| None,
                 |_| None,
-            )
+            )?
         } else if left_keys.len() == 1 {
             // The common case: one key column, hashed as a bare slice.
             let (l, r) = (left_keys[0], right_keys[0]);
@@ -1560,7 +1614,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                 anti,
                 |row| key_bytes(row, l),
                 |row| key_bytes(row, r),
-            )
+            )?
         } else {
             hash_step(
                 join.kind,
@@ -1574,7 +1628,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
                 anti,
                 |row| composite_key(row, &left_keys),
                 |row| composite_key(row, &right_keys),
-            )
+            )?
         };
     }
 

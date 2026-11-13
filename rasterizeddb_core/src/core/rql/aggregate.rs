@@ -1174,6 +1174,11 @@ pub(crate) enum Acc {
         /// The argument: its type and NUMERIC scale render each element.
         elem: Option<SchemaField>,
         delimiter: Option<String>,
+        /// Bytes collected so far, values and keys; `usize::MAX` once past
+        /// `limit`, when `values` has been let go. See [`collect_value`].
+        held: usize,
+        /// The most this aggregate may collect, and its name for the error.
+        limit: (usize, &'static str),
     },
     /// `bool_and`, `bool_or`, `every`: whether any non-NULL value was seen,
     /// whether all were true, whether any was.
@@ -1243,6 +1248,8 @@ impl Acc {
                 by_value_descending: None,
                 elem: arg.cloned(),
                 delimiter: None,
+                held: 0,
+                limit: collect_limit(func),
             },
             AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every => Acc::Bools { seen: false, all: true, any: false },
             AggFunc::Min | AggFunc::Max => Acc::Extreme {
@@ -1295,8 +1302,9 @@ impl Acc {
     pub(crate) fn accumulate(&mut self, bytes: Option<&[u8]>, ty: Option<&DbType>) {
         match self {
             // A DISTINCT replay, or a call with no ORDER BY: no keys.
-            Acc::Collect { values, .. } => {
-                values.push((Vec::new(), bytes.map(<[u8]>::to_vec)));
+            Acc::Collect { values, held, limit, .. } => {
+                // Past the limit the state says so and `finish` reports it.
+                let _ = collect_value(values, held, *limit, Vec::new(), bytes);
                 return;
             }
             Acc::Bools { seen, all, any } => {
@@ -1554,7 +1562,16 @@ impl Acc {
             return;
         }
         match (self, other) {
-            (Acc::Collect { values, .. }, Acc::Collect { values: theirs, .. }) => values.extend(theirs.iter().cloned()),
+            (Acc::Collect { values, held, limit, .. }, Acc::Collect { values: theirs, held: their_held, .. }) => {
+                let total = held.saturating_add(*their_held);
+                if total > limit.0 {
+                    *values = Vec::new();
+                    *held = usize::MAX;
+                } else {
+                    values.extend(theirs.iter().cloned());
+                    *held = total;
+                }
+            }
             (Acc::Bools { seen, all, any }, Acc::Bools { seen: s2, all: a2, any: y2 }) => {
                 *seen |= *s2;
                 *all &= *a2;
@@ -1720,9 +1737,12 @@ impl Acc {
     /// kept, in the call's order: NULL over no rows (and `string_agg` over no
     /// non-NULL value), as in PostgreSQL.
     fn finish_collected(&self, func: AggFunc) -> Result<Option<Vec<u8>>, String> {
-        let Acc::Collect { values, order, by_value_descending, elem, delimiter } = self else {
+        let Acc::Collect { values, order, by_value_descending, elem, delimiter, held, limit } = self else {
             return Ok(None);
         };
+        if *held == usize::MAX {
+            return Err(collect_too_large(*limit));
+        }
         let mut values: Vec<&(Vec<Option<(Vec<u8>, DbType)>>, Option<Vec<u8>>)> = values.iter().collect();
         if !order.is_empty() {
             values.sort_by(|a, b| {
@@ -3270,17 +3290,65 @@ fn json_string(text: &str) -> String {
     out
 }
 
+/// The most a collecting aggregate keeps, and its name. PostgreSQL's own
+/// limits: a jsonb array's elements 268435455 bytes, any other value 1 GB.
+fn collect_limit(func: AggFunc) -> (usize, &'static str) {
+    match func {
+        AggFunc::JsonAgg => (268_435_455, "json_agg"),
+        AggFunc::JsonbAgg => (268_435_455, "jsonb_agg"),
+        AggFunc::ArrayAgg => (1_073_741_823, "array_agg"),
+        _ => (1_073_741_823, "string_agg"),
+    }
+}
+
+/// SQLSTATE 54000 (`program_limit_exceeded`) through `sqlstate_for`.
+fn collect_too_large((limit, name): (usize, &'static str)) -> String {
+    if name.starts_with("json") {
+        format!("total size of jsonb array elements exceeds the maximum of {limit} bytes")
+    } else {
+        format!("{name} result exceeds the maximum of {limit} bytes")
+    }
+}
+
+/// Keeps one value of a collecting aggregate, or refuses once the group has
+/// collected more than `limit`.
+///
+/// Everything was kept until the group finished and the size was checked only
+/// on the built result: `jsonb_agg` over ten million documents held 18 GB of
+/// a 23 GB server (values, then their text, then the parsed tree) before it
+/// failed. Past the limit the values are let go at once and the group is
+/// marked, so a caller that cannot fail here is answered by `finish`.
+fn collect_value(
+    values: &mut Vec<(Vec<Option<(Vec<u8>, DbType)>>, Option<Vec<u8>>)>,
+    held: &mut usize,
+    limit: (usize, &'static str),
+    keys: Vec<Option<(Vec<u8>, DbType)>>,
+    bytes: Option<&[u8]>,
+) -> Result<(), String> {
+    if *held == usize::MAX {
+        return Err(collect_too_large(limit));
+    }
+    let size = bytes.map_or(0, <[u8]>::len) + keys.iter().flatten().map(|(k, _)| k.len()).sum::<usize>();
+    *held = held.saturating_add(size);
+    if *held > limit.0 {
+        *values = Vec::new();
+        *held = usize::MAX;
+        return Err(collect_too_large(limit));
+    }
+    values.push((keys, bytes.map(<[u8]>::to_vec)));
+    Ok(())
+}
+
 /// Folds one value of `row` into `acc`: a collecting accumulator keeps it
 /// with the keys of the call's `ORDER BY` (and keeps a NULL, which
 /// `array_agg` and `json_agg` include); every other kind accumulates it.
 fn fold_value(acc: &mut Acc, call: Option<&AggCall>, row: &Row, bytes: Option<&[u8]>, ty: Option<&DbType>) -> Result<(), String> {
-    if let Acc::Collect { values, .. } = acc {
+    if let Acc::Collect { values, held, limit, .. } = acc {
         let keys = match call {
             Some(c) if !c.order.is_empty() => c.keys(row)?,
             _ => Vec::new(),
         };
-        values.push((keys, bytes.map(<[u8]>::to_vec)));
-        return Ok(());
+        return collect_value(values, held, *limit, keys, bytes);
     }
     acc.accumulate(bytes, ty);
     Ok(())
@@ -4009,6 +4077,52 @@ mod tests {
     /// folds combine. A fold split across workers merges these.
     ///
     /// Mutation: `merge` dropping the other worker's values.
+    /// A collecting aggregate stops at its limit and lets its values go,
+    /// rather than holding everything until the built result is too large.
+    /// Mutations: `collect_value` never refusing; the merge summing nothing;
+    /// `finish` ignoring the marker.
+    #[test]
+    fn a_collecting_aggregate_refuses_past_its_limit_and_lets_go() {
+        let limit = (10, "jsonb_agg");
+        let (mut values, mut held) = (Vec::new(), 0usize);
+        collect_value(&mut values, &mut held, limit, Vec::new(), Some(b"abcd")).unwrap();
+        collect_value(&mut values, &mut held, limit, Vec::new(), Some(b"efgh")).unwrap();
+        let e = collect_value(&mut values, &mut held, limit, Vec::new(), Some(b"ijkl")).unwrap_err();
+        assert_eq!(e, "total size of jsonb array elements exceeds the maximum of 10 bytes");
+        assert!(values.is_empty() && values.capacity() == 0, "the collected values are let go");
+        assert_eq!(held, usize::MAX);
+        assert!(collect_value(&mut values, &mut held, limit, Vec::new(), None).is_err(), "and it stays refused");
+        assert_eq!(crate::pgwire::sqlstate_for(&e), "54000");
+        let other = collect_too_large((5, "string_agg"));
+        assert_eq!(other, "string_agg result exceeds the maximum of 5 bytes");
+        assert_eq!(crate::pgwire::sqlstate_for(&other), "54000");
+
+        // The path that cannot fail (`accumulate`) is answered by `finish`.
+        let text = SchemaField::new("s".to_string(), DbType::STRING, 0, 0, 0, false);
+        let mut acc = Acc::new(AggFunc::StringAgg, Some(&text));
+        if let Acc::Collect { limit, .. } = &mut acc {
+            *limit = (6, "string_agg");
+        }
+        acc.accumulate(Some(b"abc"), None);
+        acc.accumulate(Some(b"def"), None);
+        assert_eq!(acc.finish_collected(AggFunc::StringAgg).map(|v| v.is_some()), Ok(true));
+        acc.accumulate(Some(b"g"), None);
+        assert_eq!(acc.finish_collected(AggFunc::StringAgg), Err("string_agg result exceeds the maximum of 6 bytes".to_string()));
+
+        // Two workers' partials that fit alone but not together.
+        let partial = || {
+            let mut acc = Acc::new(AggFunc::StringAgg, Some(&text));
+            if let Acc::Collect { limit, .. } = &mut acc {
+                *limit = (6, "string_agg");
+            }
+            acc.accumulate(Some(b"abcd"), None);
+            acc
+        };
+        let mut merged = partial();
+        merged.merge(&partial());
+        assert!(merged.finish_collected(AggFunc::StringAgg).is_err(), "8 bytes merged past a limit of 6");
+    }
+
     #[test]
     fn collecting_and_boolean_partials_merge_into_one_answer() {
         let text = SchemaField::new("s".to_string(), DbType::STRING, 0, 0, 0, false);

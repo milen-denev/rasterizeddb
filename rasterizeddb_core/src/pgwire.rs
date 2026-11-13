@@ -4813,9 +4813,6 @@ async fn describe_resolved(
             )));
         }
         if builtin {
-            if lower == "select 1" || lower == "select 1::int" {
-                return Ok(Some((vec![("?column?".to_string(), DbType::I32)], true)));
-            }
             if lower == "select version()" {
                 return Ok(Some((vec![("version".to_string(), DbType::STRING)], true)));
             }
@@ -7965,6 +7962,17 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("insufficient resources: partition") {
         return "53000";
     }
+    // A collecting aggregate past PostgreSQL's size limit
+    // (`aggregate::collect_value`), and a jsonb document past its own:
+    // `program_limit_exceeded`, as PostgreSQL reports both.
+    if has("total size of jsonb") && has("exceeds the maximum of") || has(" result exceeds the maximum of ") {
+        return "54000";
+    }
+    // A join that outgrew its memory budget (`join::join_slots_limit`, `RDB_JOIN_MEMORY_MB`):
+    // `out_of_memory`, as PostgreSQL reports work that cannot get memory.
+    if has("out of memory: the join would hold more than") {
+        return "53200";
+    }
     // A reshape the map cannot do (docs/partitioning.md §6.2, P7: two
     // partitions that are not neighbours, a one-point split, a directory
     // that is no storage location): `invalid_parameter_value`. Early: the
@@ -10167,15 +10175,10 @@ where
         return Ok(true);
     }
 
-    // Common introspection queries.
-    if s_lower == "select 1" || s_lower == "select 1::int" {
-        if !omit_description {
-            send_row_description(stream, &[("?column?", DbType::I32)], &[]).await?;
-        }
-        send_data_row(stream, &[Some(b"1")]).await?;
-        send_command_complete(stream, "SELECT 1").await?;
-        return Ok(true);
-    }
+    // `SELECT 1` is not answered here: it was, as text, before FROM-less
+    // SELECTs had a path of their own, and a client that bound binary results
+    // read the text "1" as a malformed int4 under an int4 description. The
+    // FROM-less path (`rql::no_from`) honours the result formats.
 
     // The function PostgreSQL's own extension offers for this. Answered here
     // rather than by the row evaluator, which has no way to reach the statement
