@@ -445,6 +445,21 @@ impl Replication {
         self.seq.load(Ordering::Acquire)
     }
 
+    /// Takes a peer's word for how much of this node's stream it has applied.
+    ///
+    /// A peer holding more than this node remembers means the log lost its
+    /// tail (a crash before the buffered tail reached the disk, or a log cut
+    /// short at open). The sequence then resumed below numbers the peer has
+    /// already applied, and every new transaction under one of them was taken
+    /// for something already sent: never shipped, or dropped as a duplicate,
+    /// with both nodes reporting themselves in step. The sequence moves past
+    /// what the peer holds instead. Returns the sequence it was at when it had
+    /// to move.
+    pub fn adopt_peer_position(&self, peer_has: u64) -> Option<u64> {
+        let before = self.seq.fetch_max(peer_has, Ordering::AcqRel);
+        (before < peer_has).then_some(before)
+    }
+
     // -- storage ------------------------------------------------------------
 
     /// Opens the log and the applied-position state.
@@ -949,6 +964,23 @@ mod tests {
             assert_eq!(record.seq, tx);
         }
         assert_eq!(replication.local_seq(), 5);
+    }
+
+    #[test]
+    fn a_peer_ahead_of_the_sequence_moves_it_past_what_the_peer_holds() {
+        let replication = configured();
+        for tx in 1..=3 {
+            replication.note_statement(tx, "INSERT INTO t (id) VALUES (1)", Some("t"));
+            replication.commit_record(tx).unwrap();
+        }
+        // The peer applied up to 9 before this node lost its log's tail.
+        assert_eq!(replication.adopt_peer_position(9), Some(3));
+        replication.note_statement(4, "INSERT INTO t (id) VALUES (1)", Some("t"));
+        assert_eq!(replication.commit_record(4).unwrap().seq, 10, "never a number the peer already holds");
+        // A peer behind, or level, changes nothing.
+        assert_eq!(replication.adopt_peer_position(4), None);
+        assert_eq!(replication.adopt_peer_position(10), None);
+        assert_eq!(replication.local_seq(), 10);
     }
 
     #[test]

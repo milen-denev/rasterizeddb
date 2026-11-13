@@ -590,7 +590,13 @@ impl ReplicationLog {
         };
         // The record being read may still be sitting in the write buffer.
         log.writer.flush()?;
-        let handle = log.writer.get_mut();
+        // Positional reads: the handle is the writer's, opened without
+        // `O_APPEND`, so a `seek` here moved where the next append went and
+        // every record appended after a catch-up from the file overwrote an
+        // older one. A peer then read "frame ended in the middle of a field"
+        // and stayed down, and the next open cut the log at the first
+        // overwritten record.
+        let handle = log.writer.get_ref();
 
         let mut payload = Vec::new();
         for loc in locations {
@@ -599,10 +605,9 @@ impl ReplicationLog {
                 break;
             }
 
-            handle.seek(SeekFrom::Start(loc.offset + RECORD_HEADER as u64))?;
             payload.clear();
             payload.resize(loc.len as usize, 0);
-            handle.read_exact(&mut payload)?;
+            std::os::unix::fs::FileExt::read_exact_at(handle, &mut payload, loc.offset + RECORD_HEADER as u64)?;
 
             match TxnRecord::decode(&mut Reader::new(&payload)) {
                 Ok(record) => {
@@ -1022,6 +1027,43 @@ mod tests {
         assert!(!more);
         assert_eq!(records[0].seq, 1);
         assert_eq!(records[9].seq, 10);
+    }
+
+    /// A catch-up older than the in-memory window reads the file. It read
+    /// through the writer's own handle, which moved the write position: every
+    /// append after it landed in the middle of the log, over older records.
+    /// Found on a live pair: a burst of writes overflowed the peer queue, the
+    /// peer was served from the file, and the link stayed down for good on
+    /// "replication log record at … is unreadable".
+    #[test]
+    fn a_catch_up_from_the_file_does_not_move_where_appends_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReplicationLog::open(dir.path(), 1 << 30).unwrap();
+        let first = HOT_RECORDS as u64 + 1000;
+        for seq in 1..=first {
+            log.append(&record(1, seq)).unwrap();
+        }
+        // Older than the hot window: served from the file.
+        let (early, _) = log.read_after(1, 0, 10, 1 << 20).unwrap();
+        assert_eq!(early.iter().map(|r| r.seq).collect::<Vec<_>>(), (1..=10).collect::<Vec<_>>());
+        let total = first + 500;
+        for seq in first + 1..=total {
+            log.append(&record(1, seq)).unwrap();
+        }
+
+        let (all, more) = log.read_after(1, 0, usize::MAX - 1, usize::MAX).unwrap();
+        assert!(!more);
+        assert_eq!(all.len() as u64, total, "every record reads back");
+        for (i, r) in all.iter().enumerate() {
+            assert_eq!(r.seq, i as u64 + 1);
+            assert_eq!(r.statements, record(1, r.seq).statements, "record {} holds another's bytes", r.seq);
+        }
+
+        log.flush().unwrap();
+        drop(log);
+        let reopened = ReplicationLog::open(dir.path(), 1 << 30).unwrap();
+        assert_eq!(reopened.highest(1), total, "a reopen keeps every record");
+        assert_eq!(reopened.earliest(1), 1);
     }
 
     #[test]

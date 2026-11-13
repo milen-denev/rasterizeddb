@@ -416,6 +416,13 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
         .find(|entry| entry.origin == config.node_id)
         .map(|entry| entry.seq)
         .unwrap_or(0);
+    if let Some(was) = replication.adopt_peer_position(ours) {
+        error!(
+            "{} has applied this node's stream up to {}, but this node's replication log ends at {}: \
+             the log lost its tail. Local sequence moved to {} so no number the peer holds is reused",
+            peer.name, ours, was, ours
+        );
+    }
     peer.acked_seq.store(ours, Ordering::Relaxed);
 
     Ok(Link {
