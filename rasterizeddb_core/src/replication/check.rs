@@ -64,14 +64,22 @@ fn fnv(mut state: u64, bytes: &[u8]) -> u64 {
     state
 }
 
-/// A table's columns as a client sees them, in order. `None` when the table
-/// is not there.
-fn live_columns(database: &Arc<Database>, name: &str) -> Option<Vec<String>> {
+/// A table's columns as a client sees them, in order, each with whether it
+/// is a `character(n)`: the one text type whose trailing spaces are padding.
+/// `None` when the table is not there.
+fn live_columns(database: &Arc<Database>, name: &str) -> Option<Vec<(String, bool)>> {
+    use crate::core::rql::type_modifier::{is_legacy_bpchar, is_marked_bpchar};
     let relation = database.relation(name)?;
+    let schema = relation.schema();
     Some(
-        crate::core::rql::nullable::visible_fields(&relation.schema().fields)
+        crate::core::rql::nullable::visible_fields(&schema.fields)
             .into_iter()
-            .map(|field| field.name)
+            .map(|field| {
+                let padded = field.db_type == crate::core::db_type::DbType::CHAR
+                    || is_marked_bpchar(&field.name, &schema.type_modifiers)
+                    || is_legacy_bpchar(&field.name, &schema.type_modifiers);
+                (field.name, padded)
+            })
             .collect(),
     )
 }
@@ -82,9 +90,15 @@ fn live_columns(database: &Arc<Database>, name: &str) -> Option<Vec<String>> {
 /// nodes that both hold it correctly: the bytes under a `NULL` are whatever
 /// the last writer left; a `CHAR(n)` is stored padded or not depending on the
 /// path that wrote it. So a `NULL` is hashed as a `NULL` whatever lies under
-/// it, a value is hashed as the engine writes it out as a literal, and text
-/// is compared without its trailing padding.
-fn value_hash(mut state: u64, column: &crate::core::row::row::Column) -> u64 {
+/// it, a value is hashed as the engine writes it out as a literal, and a
+/// `character(n)` is compared without its trailing spaces.
+///
+/// Only a `character(n)`. In `text` and `varchar` a trailing space is part of
+/// the value, and trimming it there would make `'a'` on one node and `'a '`
+/// on the other hash alike: a divergence reported as agreement, which is the
+/// one answer a check like this must never give. A false alarm costs a look;
+/// that costs the data.
+fn value_hash(mut state: u64, column: &crate::core::row::row::Column, padded: bool) -> u64 {
     // A query's result marks a `NULL` cell by its type; the bytes under it
     // are not looked at.
     if column.column_type == crate::core::db_type::DbType::NULL {
@@ -97,8 +111,9 @@ fn value_hash(mut state: u64, column: &crate::core::row::row::Column) -> u64 {
         crate::core::db_type::DbType::STRING | crate::core::db_type::DbType::CHAR
     );
     if text_like {
+        // NULs are storage fill for a fixed-width string, never content.
         let mut end = bytes.len();
-        while end > 0 && (bytes[end - 1] == 0 || bytes[end - 1] == b' ') {
+        while end > 0 && (bytes[end - 1] == 0 || (padded && bytes[end - 1] == b' ')) {
             end -= 1;
         }
         state = fnv(state, &(end as u32).to_le_bytes());
@@ -117,11 +132,12 @@ fn value_hash(mut state: u64, column: &crate::core::row::row::Column) -> u64 {
 }
 
 /// One row's hash, over the columns it was asked for, in order.
-fn row_hash(row: &crate::core::row::row::Row) -> u64 {
+fn row_hash(row: &crate::core::row::row::Row, columns: &[(String, bool)]) -> u64 {
     let mut state = 0xcbf2_9ce4_8422_2325u64;
     for (at, value) in row.columns.iter().enumerate() {
+        let padded = columns.get(at).is_some_and(|(_, padded)| *padded);
         state = fnv(state, &(at as u32).to_le_bytes());
-        state = value_hash(state, value);
+        state = value_hash(state, value, padded);
     }
     // Spread before the rows are summed: FNV's low bits are weak, and a sum
     // of weak hashes cancels more easily than it should.
@@ -161,7 +177,7 @@ async fn table_digest(database: &Arc<Database>, name: &str) -> TableDigest {
     // dropped column stays in the layout, and two nodes that altered a table
     // at different points relative to their rows lay the same row out
     // differently.
-    let list = columns;
+    let list: Vec<&str> = columns.iter().map(|(column, _)| column.as_str()).collect();
     let expected: usize = list.len();
     match query(database, &format!("SELECT {} FROM {name}", list.join(", "))).await {
         Ok(rows) => {
@@ -180,7 +196,7 @@ async fn table_digest(database: &Arc<Database>, name: &str) -> TableDigest {
             // exclusive-or.
             let checksum = rows
                 .iter()
-                .fold(0u64, |sum, row| sum.wrapping_add(row_hash(row)));
+                .fold(0u64, |sum, row| sum.wrapping_add(row_hash(row, &columns)));
             TableDigest {
                 name: name.to_string(),
                 rows: rows.len() as u64,

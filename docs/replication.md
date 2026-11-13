@@ -541,8 +541,10 @@ same order), and the two are compared. Values, not stored bytes: two nodes
 that both hold a row correctly can lay it out differently, with different
 bytes left under a `NULL`, a dropped column still in one node's layout, or a
 `CHAR(n)` padded on one and not the other. Each live column is read by name,
-a `NULL` counts as a `NULL` whatever lies under it, and text is compared
-without trailing padding:
+a `NULL` counts as a `NULL` whatever lies under it, and a `character(n)` is
+compared without its trailing spaces. Only a `character(n)`: in `text` and
+`varchar` a trailing space is part of the value, and `'a'` against `'a '` is
+a difference:
 
 ```text
 $ psql -c "REPLICATION CHECK"
@@ -559,7 +561,7 @@ differs for an honest reason. Run it when the nodes are quiet.
 
 What it does not do: a table of more than two million rows is counted but not
 read, because its rows are held in memory while they are hashed; and it says
-which table differs, not which rows. Trailing spaces in text are not compared.
+which table differs, not which rows.
 
 ## 8. The files
 

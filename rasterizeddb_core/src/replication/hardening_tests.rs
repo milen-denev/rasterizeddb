@@ -832,3 +832,31 @@ async fn a_check_compares_values_and_not_how_each_node_happens_to_store_them() {
     assert_eq!(verdict.different.len(), 1, "{lines:?}");
     assert!(verdict.different[0].starts_with("repl_really:"), "{lines:?}");
 }
+
+/// A trailing space is part of a `text` or `varchar` value and padding in a
+/// `character(n)`. One node holding `'a'` and the other `'a '` in a text
+/// column have diverged, and the check must say so; the same pair in a
+/// `character(3)` is the same value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_treats_a_trailing_space_as_padding_only_where_it_is() {
+    let (one, two) = pair().await;
+    one.replication.set_active(false);
+    two.replication.set_active(false);
+    for (node, value) in [(&one, "a"), (&two, "a ")] {
+        run_ok(node, "CREATE TABLE repl_text (id INTEGER NOT NULL, v TEXT)").await;
+        run_ok(node, &format!("INSERT INTO repl_text (id, v) VALUES (1, '{value}')")).await;
+        run_ok(node, "CREATE TABLE repl_varchar (id INTEGER NOT NULL, v VARCHAR(10))").await;
+        run_ok(node, &format!("INSERT INTO repl_varchar (id, v) VALUES (1, '{value}')")).await;
+        run_ok(node, "CREATE TABLE repl_char (id INTEGER NOT NULL, v CHAR(3))").await;
+        run_ok(node, &format!("INSERT INTO repl_char (id, v) VALUES (1, '{value}')")).await;
+    }
+    one.replication.set_active(true);
+    two.replication.set_active(true);
+
+    let peer = one.replication.peer("two").unwrap();
+    let (verdict, lines) = super::check::check(&one, &peer, &[]).await.unwrap();
+    assert!(verdict.in_step && verdict.unread.is_empty() && verdict.missing.is_empty(), "{lines:?}");
+    let mut different: Vec<&str> = verdict.different.iter().map(|d| d.split(':').next().unwrap()).collect();
+    different.sort_unstable();
+    assert_eq!(different, vec!["repl_text", "repl_varchar"], "{lines:?}");
+}
