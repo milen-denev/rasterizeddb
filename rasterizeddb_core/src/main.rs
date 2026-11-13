@@ -1134,6 +1134,10 @@ fn main() -> std::io::Result<()> {
             .filter_level(level)
             .init();
 
+        // Freed heap goes back to the kernel once the server has been quiet
+        // for a few seconds (`idle_trim`); `RDB_IDLE_TRIM=0` turns it off.
+        rasterizeddb_core::idle_trim::spawn();
+
         {
             let cpu = rasterizeddb_core::simds::cpu::features();
             // Printed, not logged: the default level is `error`, and which

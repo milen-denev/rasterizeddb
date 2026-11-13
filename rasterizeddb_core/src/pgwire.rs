@@ -5528,6 +5528,9 @@ async fn execute_recorded<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Counted as running until it returns, so the idle trimmer
+    // (`idle_trim`) never walks the heap under a statement.
+    let _running = crate::idle_trim::statement();
     // Zero means no limit, as it does in PostgreSQL, so it produces no
     // deadline rather than one that has already passed.
     let deadline = state
