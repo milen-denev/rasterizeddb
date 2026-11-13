@@ -7,10 +7,12 @@
 //! CTE is an optimisation fence, evaluated once however many times it is
 //! referenced. That is a position worth documenting rather than an accident.
 //!
-//! `WITH RECURSIVE` is **refused by keyword**, before anything else looks at
-//! the statement. A recursive CTE run as a non-recursive one does not fail: it
-//! computes the base case, stops, and returns a shorter answer to a well-formed
-//! query. Silently wrong results are worse than an unsupported feature.
+//! `WITH RECURSIVE` is run as PostgreSQL runs it: the non-recursive term
+//! once, then the recursive term again and again over the rows the last
+//! iteration added (a working table), until an iteration adds none
+//! ([`materialize_recursive`]). A definition is recursive only when the
+//! clause says `RECURSIVE` and its body names itself; run as a plain CTE it
+//! would compute the base case and return a shorter answer with no error.
 
 use rclite::Arc;
 
@@ -27,6 +29,11 @@ pub(crate) type ScratchFields = smallvec::SmallVec<[SchemaField; 20]>;
 pub struct CteDef {
     pub name: String,
     pub body: String,
+    /// `name (a, b) AS (…)`: the names its columns take, in order.
+    pub columns: Option<Vec<String>>,
+    /// Written under `WITH RECURSIVE`: the body may name the definition
+    /// itself.
+    pub recursive: bool,
 }
 
 /// A statement whose CTEs have been materialised.
@@ -93,21 +100,12 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
     let trimmed = sql.trim_start();
     let after_with = trimmed[4..].trim_start();
 
-    // Refused by keyword, deliberately before any other check: run as a
-    // non-recursive CTE this would return the base case and no error.
-    if after_with.len() >= 9
+    // `WITH RECURSIVE` applies to every definition of the clause; which of
+    // them actually recurse is decided by whether a body names itself.
+    let recursive = after_with.len() >= 9
         && after_with.as_bytes()[..9].eq_ignore_ascii_case(b"RECURSIVE")
-        && after_with[9..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace())
-    {
-        return Err(
-            "WITH RECURSIVE is not supported yet; refusing rather than returning only the \
-             base case"
-                .to_string(),
-        );
-    }
+        && after_with[9..].chars().next().is_some_and(|c| c.is_whitespace());
+    let after_with = if recursive { after_with[9..].trim_start() } else { after_with };
 
     let mut rest = after_with;
     let mut defs: Vec<CteDef> = Vec::new();
@@ -121,9 +119,20 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         if name.is_empty() {
             return Err("a WITH clause names no query".to_string());
         }
-        let after_name = rest[name_end..].trim_start();
+        let mut after_name = rest[name_end..].trim_start();
+        let mut columns = None;
         if after_name.starts_with('(') {
-            return Err("a WITH clause that renames its columns is not supported yet".to_string());
+            let open = after_name.as_ptr() as usize - rest.as_ptr() as usize;
+            let close = matching_paren(rest, open).ok_or_else(|| format!("unterminated column list for '{}'", name))?;
+            let list: Vec<String> = rest[open + 1..close]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .collect();
+            if list.iter().any(|c| c.is_empty() || !c.chars().all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$')) {
+                return Err(format!("syntax error in the column list of the WITH clause '{}'", name));
+            }
+            columns = Some(list);
+            after_name = rest[close + 1..].trim_start();
         }
         if after_name.len() < 2 || !after_name.as_bytes()[..2].eq_ignore_ascii_case(b"AS") {
             return Err(format!("expected AS after the WITH name '{}'", name));
@@ -139,9 +148,15 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         if body.is_empty() {
             return Err(format!("the WITH clause '{}' has an empty body", name));
         }
-        defs.push(CteDef { name, body });
+        defs.push(CteDef { name, body, columns, recursive });
 
         let after_body = rest[close + 1..].trim_start();
+        // PostgreSQL 14's `SEARCH` and `CYCLE` clauses: refused, as running
+        // the CTE without them would loop or order differently.
+        let next_word = after_body.split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+        if next_word.eq_ignore_ascii_case("SEARCH") || next_word.eq_ignore_ascii_case("CYCLE") {
+            return Err(format!("the {} clause of a recursive WITH query is not supported yet", next_word.to_ascii_uppercase()));
+        }
         if let Some(next) = after_body.strip_prefix(',') {
             rest = next.trim_start();
             continue;
@@ -1292,11 +1307,18 @@ pub fn hoist_insert_with(sql: &str) -> Option<String> {
         return None;
     }
     let (defs, rest) = split_with(source).ok()??;
+    // Rebuilt with what the clause said beyond names and bodies: dropping
+    // `RECURSIVE` ran a recursive body as a plain UNION over whatever table
+    // shares the CTE's name, and dropping a column list renamed the columns.
     let clauses: Vec<String> = defs
         .iter()
-        .map(|def| format!("{} AS ({})", def.name, def.body))
+        .map(|def| match &def.columns {
+            Some(columns) => format!("{} ({}) AS ({})", def.name, columns.join(", "), def.body),
+            None => format!("{} AS ({})", def.name, def.body),
+        })
         .collect();
-    Some(format!("WITH {} {} {}{}", clauses.join(", "), head.trim_end(), rest, tail))
+    let recursive = if defs.iter().any(|d| d.recursive) { "RECURSIVE " } else { "" };
+    Some(format!("WITH {recursive}{} {} {}{}", clauses.join(", "), head.trim_end(), rest, tail))
 }
 
 pub async fn materialize(
@@ -1355,6 +1377,13 @@ async fn materialize_inner(
             body = replace_relation_references(&body, name, temp);
         }
 
+        if def.recursive && names_itself(&body, &def.name) {
+            let temp = materialize_recursive(def, &body, sql, index, database, temps, tx).await?;
+            rewritten = replace_relation_references(&rewritten, &def.name, &temp);
+            published.push((def.name.clone(), temp));
+            continue;
+        }
+
         // A CTE body may modify data — `WITH x AS (INSERT … RETURNING id)` —
         // in which case it runs for its effect and publishes the RETURNING
         // rows. PostgreSQL runs such a CTE exactly once, which is what
@@ -1378,9 +1407,7 @@ async fn materialize_inner(
                         .await
                         .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
 
-                let labels: Vec<String> = (0..literals.len())
-                    .map(|i| format!("col{}", i + 1))
-                    .collect();
+                let labels: Vec<String> = renamed((0..literals.len()).map(|i| format!("col{}", i + 1)).collect(), def)?;
                 let temp = temp_name(&def.name, sql, index);
                 let columns: Vec<String> =
                     labels.iter().map(|name| format!("{} TEXT", name)).collect();
@@ -1425,7 +1452,11 @@ async fn materialize_inner(
 
         // A body of named constants is one `VALUES` row, with no query to run.
         if !modifies {
-            if let Some(constants) = constant_body(&body) {
+            if let Some(mut constants) = constant_body(&body) {
+                let named = renamed(constants.iter().map(|c| c.label.clone()).collect(), def)?;
+                for (c, label) in constants.iter_mut().zip(named) {
+                    c.label = label;
+                }
                 let temp = temp_name(&def.name, sql, index);
                 let columns: Vec<String> = constants
                     .iter()
@@ -1509,23 +1540,18 @@ async fn materialize_inner(
         .map_err(|e| format!("the WITH clause '{}' failed: {}", def.name, e))?;
 
         let labels: Vec<String> = if modifies {
-            returning_labels(&body).ok_or_else(|| {
-                format!(
-                    "the WITH clause '{}' modifies data but has no RETURNING clause to name \
-                     its columns",
-                    def.name
-                )
-            })?
+            renamed(
+                returning_labels(&body).ok_or_else(|| {
+                    format!(
+                        "the WITH clause '{}' modifies data but has no RETURNING clause to name \
+                         its columns",
+                        def.name
+                    )
+                })?,
+                def,
+            )?
         } else {
-            if select_list_of(body).is_none() {
-                return Err(format!("the WITH clause '{}' must be a SELECT", def.name));
-            }
-            select_labels(body, database).await.ok_or_else(|| {
-                format!(
-                    "the WITH clause '{}' has a column this cannot name; alias it with AS",
-                    def.name
-                )
-            })?
+            query_labels(def, body, database).await?
         };
 
         let temp = temp_name(&def.name, sql, index);
@@ -1577,6 +1603,264 @@ async fn materialize_inner(
         rewritten,
         temps: std::mem::take(temps),
     }))
+}
+
+/// `labels` with the names a column list gives (`WITH t (a, b) AS …`): the
+/// first ones renamed, the rest kept, as PostgreSQL does; more names than
+/// columns is its 42P10.
+fn renamed(mut labels: Vec<String>, def: &CteDef) -> Result<Vec<String>, String> {
+    let Some(columns) = &def.columns else {
+        return Ok(labels);
+    };
+    if columns.len() > labels.len() {
+        return Err(format!(
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            def.name,
+            labels.len(),
+            columns.len()
+        ));
+    }
+    for (label, name) in labels.iter_mut().zip(columns) {
+        *label = name.clone();
+    }
+    Ok(labels)
+}
+
+/// The column names a `SELECT` body publishes under `def`: its own labels,
+/// renamed by a column list; with a column list covering every item, an item
+/// that names nothing (`SELECT 1`) takes the list's name.
+async fn query_labels(def: &CteDef, body: &str, database: &Arc<Database>) -> Result<Vec<String>, String> {
+    let Some(list) = select_list_of(body) else {
+        return Err(format!("the WITH clause '{}' must be a SELECT", def.name));
+    };
+    if let Some(labels) = select_labels(body, database).await {
+        return renamed(labels, def);
+    }
+    let items = crate::core::rql::lexer_ct::split_definitions(without_set_quantifier(list)).len();
+    match &def.columns {
+        Some(columns) if columns.len() == items => Ok(columns.clone()),
+        _ => Err(format!("the WITH clause '{}' has a column this cannot name; alias it with AS", def.name)),
+    }
+}
+
+/// Whether `body` reads the relation `name` (a recursive reference).
+fn names_itself(body: &str, name: &str) -> bool {
+    replace_relation_references(body, name, "__cte_self_probe") != body
+}
+
+/// A recursive definition's body as its non-recursive term, whether it
+/// combines by `UNION ALL` (no deduplication), and its recursive term: split
+/// at the last top-level `UNION`, as `a UNION b UNION ALL rec` is `(a UNION
+/// b) UNION ALL rec`. `None` for a definition that does not recurse.
+pub(crate) fn recursive_split<'a>(def: &CteDef, body: &'a str) -> Option<Result<(&'a str, bool, &'a str), String>> {
+    (def.recursive && names_itself(body, &def.name)).then(|| recursive_parts(&def.name, body))
+}
+
+fn recursive_parts<'a>(name: &str, body: &'a str) -> Result<(&'a str, bool, &'a str), String> {
+    let shape = || format!("recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] recursive-term");
+    let mut split = None;
+    let mut from = 0;
+    while let Some(at) = crate::core::rql::join::find_keyword(body, "UNION", from) {
+        split = Some(at);
+        from = at + 5;
+    }
+    let at = split.ok_or_else(shape)?;
+    let anchor = body[..at].trim();
+    let mut tail = body[at + 5..].trim_start();
+    let all = tail.len() >= 3 && tail.as_bytes()[..3].eq_ignore_ascii_case(b"ALL") && tail[3..].starts_with(char::is_whitespace);
+    if all {
+        tail = tail[3..].trim_start();
+    } else if tail.len() >= 8 && tail.as_bytes()[..8].eq_ignore_ascii_case(b"DISTINCT") {
+        tail = tail[8..].trim_start();
+    }
+    if names_itself(anchor, name) {
+        return Err(format!("recursive reference to query \"{name}\" must not appear within its non-recursive term"));
+    }
+    if !names_itself(tail, name) {
+        return Err(shape());
+    }
+    Ok((anchor, all, tail))
+}
+
+/// `VALUES (a, b), (c, d)` as the `SELECT a AS column1, b AS column2 UNION
+/// ALL SELECT c, d` it means, for a recursive CTE's non-recursive term, which
+/// runs as a subquery and a subquery reads no `VALUES`. `column1`… are
+/// PostgreSQL's names for its columns. `None` for anything else.
+pub(crate) fn values_as_select(term: &str) -> Option<String> {
+    let rest = term.trim();
+    if rest.len() < 6 || !rest.as_bytes()[..6].eq_ignore_ascii_case(b"VALUES") {
+        return None;
+    }
+    let mut rest = rest[6..].trim_start();
+    let mut selects: Vec<String> = Vec::new();
+    loop {
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let close = matching_paren(rest, 0)?;
+        let items = crate::core::rql::lexer_ct::split_definitions(&rest[1..close]);
+        if items.is_empty() {
+            return None;
+        }
+        let list: Vec<String> = if selects.is_empty() {
+            items.iter().enumerate().map(|(i, e)| format!("{} AS column{}", e.trim(), i + 1)).collect()
+        } else {
+            items.iter().map(|e| e.trim().to_string()).collect()
+        };
+        selects.push(format!("SELECT {}", list.join(", ")));
+        rest = rest[close + 1..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None if rest.is_empty() => break,
+            None => return None,
+        }
+    }
+    Some(selects.join(" UNION ALL "))
+}
+
+/// `columns` renamed by `def`'s column list, for a description: the first
+/// ones take the list's names, as [`renamed`] does for the relation built.
+pub(crate) fn described_names<T>(def: &CteDef, columns: Vec<(String, T)>) -> Result<Vec<(String, T)>, String> {
+    let labels = renamed(columns.iter().map(|(n, _)| n.clone()).collect(), def)?;
+    Ok(labels.into_iter().zip(columns).map(|(n, (_, t))| (n, t)).collect())
+}
+
+/// The most rows one recursive CTE may produce. PostgreSQL runs an endless
+/// recursion until something stops it; here every row is held in memory, so
+/// an unbounded one would take the server down with it. Far past any
+/// hierarchy a query walks.
+const RECURSIVE_ROW_LIMIT: usize = 10_000_000;
+
+/// The most iterations one recursive CTE may take. PostgreSQL evaluates the
+/// recursion lazily, so `… UNION ALL SELECT n + 1 FROM t) SELECT n FROM t
+/// LIMIT 5` stops after five rows there; here the CTE is built whole first,
+/// and that recursion never ends. Deeper than any hierarchy, and refused
+/// loudly rather than running until the statement timeout.
+const RECURSIVE_ITERATION_LIMIT: usize = 10_000;
+
+/// A recursive definition, `non_recursive UNION [ALL] recursive`, as
+/// PostgreSQL evaluates it: the non-recursive term once into the result,
+/// then the recursive term over a working table holding the rows the last
+/// iteration added, each iteration's rows appended, until one adds none.
+/// Under `UNION` a row already in the result (or twice in one iteration) is
+/// dropped, the anchor's duplicates too, which is what ends a walk over a
+/// cyclic graph. Columns are typed by the non-recursive term, as there.
+/// Returns the result's temporary table; every table made is in `temps`.
+async fn materialize_recursive(
+    def: &CteDef,
+    body: &str,
+    sql: &str,
+    index: usize,
+    database: &Arc<Database>,
+    temps: &mut Vec<String>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<String, String> {
+    let subject = format!("the WITH clause '{}'", def.name);
+    let (anchor, all, recursive_term) = recursive_parts(&def.name, body)?;
+    let values_anchor = values_as_select(anchor);
+    let anchor = values_anchor.as_deref().unwrap_or(anchor);
+
+    let (anchor_rows, scales) = crate::core::rql::executor::run_query_rows_scaled(anchor, database, tx)
+        .await
+        .map_err(|e| format!("{subject} failed: {e}"))?;
+    let labels = query_labels(def, anchor, database).await?;
+    refuse_repeated_labels(&labels, &subject)?;
+    let columns = relation_columns(anchor, &labels, &anchor_rows, scales.as_deref(), database)
+        .await
+        .map_err(|i| format!("{subject} returned a type that cannot be materialised in column '{}'", labels.get(i).map(String::as_str).unwrap_or("?")))?;
+    // A row as the literals it is stored back with: the identity UNION
+    // compares by, NULL equal to NULL as there.
+    let literals = |row: &crate::core::row::row::Row| -> Result<Vec<String>, String> {
+        if row.columns.len() < labels.len() {
+            return Err(format!("{subject} returned {} columns but names {}", row.columns.len(), labels.len()));
+        }
+        row.columns
+            .iter()
+            .zip(columns.iter())
+            .enumerate()
+            .map(|(i, (cell, column))| {
+                cell_literal(column, cell).ok_or_else(|| {
+                    format!("{subject} returned a value in column '{}' that cannot be stored", labels.get(i).map(String::as_str).unwrap_or("?"))
+                })
+            })
+            .collect()
+    };
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut keep = |rows: Vec<crate::core::row::row::Row>| -> Result<Vec<(crate::core::row::row::Row, Vec<String>)>, String> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key = literals(&row)?;
+            if all || seen.insert(key.clone()) {
+                out.push((row, key));
+            }
+        }
+        Ok(out)
+    };
+    let fill = |temp: &str, rows: &[(crate::core::row::row::Row, Vec<String>)]| {
+        let tuples: Vec<String> = rows.iter().map(|(_, key)| format!("({})", key.join(", "))).collect();
+        format!("INSERT INTO {} ({}) VALUES {}", temp, labels.join(", "), tuples.join(", "))
+    };
+    let create = |temp: &str| {
+        let definitions: Vec<String> = labels.iter().zip(columns.iter()).map(|(n, c)| format!("{} {}", n, c.sql_type)).collect();
+        format!("CREATE TABLE {} ({})", temp, definitions.join(", "))
+    };
+
+    let result = temp_name(&def.name, sql, index);
+    create_temporary(&create(&result), database, tx).await.map_err(|e| format!("could not materialise {subject}: {e}"))?;
+    temps.push(result.clone());
+    let mut working = keep(anchor_rows)?;
+    let mut total = working.len();
+    if !working.is_empty() {
+        crate::core::rql::executor::run_statement(&fill(&result, &working), database, tx)
+            .await
+            .map_err(|e| format!("could not fill {subject}: {e}"))?;
+    }
+    // A fresh working table each iteration: one table emptied and refilled
+    // kept every earlier iteration's rows as dead versions each scan steps
+    // over, and a 1000-deep recursion took twice as long.
+    let mut iteration = 0usize;
+    while !working.is_empty() {
+        if let Some(reason) = crate::core::cancel::tripped() {
+            return Err(reason.eval_error().as_str().to_string());
+        }
+        iteration += 1;
+        if iteration > RECURSIVE_ITERATION_LIMIT {
+            return Err(format!(
+                "{subject} recursed more than {RECURSIVE_ITERATION_LIMIT} times; a recursion with no end needs a \
+                 condition in its recursive term (an outer LIMIT does not stop it here), and a long series is \
+                 generate_series's"
+            ));
+        }
+        let work = temp_name(&format!("{}_w{}", def.name, iteration), sql, index);
+        create_temporary(&create(&work), database, tx).await.map_err(|e| format!("could not materialise {subject}: {e}"))?;
+        temps.push(work.clone());
+        let filled = crate::core::rql::executor::run_statement(&fill(&work, &working), database, tx).await;
+        let produced = match filled {
+            Ok(_) => {
+                let step = replace_relation_references(recursive_term, &def.name, &work);
+                crate::core::rql::executor::run_query_rows_scaled(&step, database, tx).await
+            }
+            Err(e) => Err(e),
+        };
+        // The working table is done with either way.
+        drop_temps(database, std::slice::from_ref(&work), tx).await;
+        temps.retain(|t| t != &work);
+        let (rows, _) = produced.map_err(|e| format!("{subject} failed: {e}"))?;
+        working = keep(rows)?;
+        if working.is_empty() {
+            break;
+        }
+        total += working.len();
+        if total > RECURSIVE_ROW_LIMIT {
+            return Err(format!(
+                "{subject} produced more than {RECURSIVE_ROW_LIMIT} rows; a recursion with no end needs a condition in its recursive term"
+            ));
+        }
+        crate::core::rql::executor::run_statement(&fill(&result, &working), database, tx)
+            .await
+            .map_err(|e| format!("could not fill {subject}: {e}"))?;
+    }
+    Ok(result)
 }
 
 /// Materialises one query into a temporary table and returns its name.
@@ -2151,15 +2435,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recursive_is_refused_by_keyword() {
-        // The one that must never be approximated: run as non-recursive it
-        // returns the base case and no error.
-        let err = split_with("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t").unwrap_err();
-        assert!(err.contains("RECURSIVE"), "{}", err);
-        // A CTE merely *named* something starting with "recursive" is fine.
-        let ok =
-            split_with("WITH recursive_totals AS (SELECT a FROM b) SELECT a FROM recursive_totals");
-        assert!(ok.is_ok(), "{:?}", ok.err());
+    fn recursive_marks_every_definition_and_only_the_keyword_does() {
+        // Run as non-recursive it would return the base case and no error, so
+        // the keyword has to reach the materialisation.
+        let (defs, rest) = split_with("WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3), u AS (SELECT 2) SELECT * FROM t")
+            .expect("split")
+            .expect("a WITH");
+        assert!(defs.iter().all(|d| d.recursive));
+        assert_eq!(defs[0].columns.as_deref(), Some(&["n".to_string()][..]));
+        assert_eq!(rest, "SELECT * FROM t");
+        let (anchor, all, term) = recursive_split(&defs[0], &defs[0].body).expect("recursive").expect("its form");
+        assert_eq!((anchor, all, term), ("SELECT 1", true, "SELECT n + 1 FROM t WHERE n < 3"));
+        assert!(recursive_split(&defs[1], &defs[1].body).is_none(), "u does not name itself");
+        // A CTE merely *named* something starting with "recursive" is not.
+        let (defs, _) = split_with("WITH recursive_totals AS (SELECT a FROM b) SELECT a FROM recursive_totals")
+            .expect("split")
+            .expect("a WITH");
+        assert!(!defs[0].recursive);
+        // PostgreSQL 14's SEARCH and CYCLE are refused rather than dropped.
+        let err = split_with("WITH RECURSIVE t AS (SELECT 1 UNION ALL SELECT 1 FROM t) CYCLE x SET y USING z SELECT * FROM t").unwrap_err();
+        assert!(err.contains("CYCLE"), "{err}");
     }
 
     #[test]
@@ -2372,9 +2667,25 @@ mod tests {
     }
 
     #[test]
-    fn a_with_clause_that_renames_its_columns_is_refused() {
-        let err = split_with("WITH a (x, y) AS (SELECT 1, 2) SELECT x FROM a").unwrap_err();
-        assert!(err.contains("renames its columns"), "{}", err);
+    fn a_with_clause_keeps_its_column_list() {
+        let (defs, _) = split_with("WITH a (x, \"y\") AS (SELECT 1, 2) SELECT x FROM a").expect("split").expect("a WITH");
+        assert_eq!(defs[0].columns.as_deref(), Some(&["x".to_string(), "y".to_string()][..]));
+        assert!(split_with("WITH a (x, ) AS (SELECT 1, 2) SELECT x FROM a").is_err());
+        // Fewer names than columns rename the first ones; more is 42P10.
+        assert_eq!(renamed(vec!["?column?".into(), "b".into()], &defs[0]).unwrap(), ["x", "y"]);
+        let one = CteDef { name: "t".into(), body: String::new(), columns: Some(vec!["k".into()]), recursive: false };
+        assert_eq!(renamed(vec!["a".into(), "b".into()], &one).unwrap(), ["k", "b"]);
+        assert!(renamed(vec![], &one).unwrap_err().contains("has 0 columns available but 1 columns specified"));
+    }
+
+    #[test]
+    fn values_anchor_reads_as_a_select() {
+        assert_eq!(
+            values_as_select("VALUES (1, 'a,b'), (2, (3))").as_deref(),
+            Some("SELECT 1 AS column1, 'a,b' AS column2 UNION ALL SELECT 2, (3)")
+        );
+        assert!(values_as_select("SELECT 1").is_none());
+        assert!(values_as_select("VALUES (1) x").is_none());
     }
 }
 

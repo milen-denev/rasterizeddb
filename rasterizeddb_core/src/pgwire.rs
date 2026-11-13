@@ -4309,11 +4309,25 @@ pub(crate) async fn describe_query(
     if let Ok(Some((defs, outer))) = crate::core::rql::cte::split_with(stmt) {
         let mut relations: Vec<(String, ScratchFields)> = Vec::new();
         for def in &defs {
-            match Box::pin(describe_resolved(database, &def.body, &relations)).await? {
+            // A recursive definition is typed by its non-recursive term, as
+            // PostgreSQL types it: the whole body reads itself, which is no
+            // relation yet.
+            let values_anchor;
+            let body = match crate::core::rql::cte::recursive_split(def, &def.body) {
+                Some(Ok((anchor, _, _))) => {
+                    values_anchor = crate::core::rql::cte::values_as_select(anchor);
+                    values_anchor.as_deref().unwrap_or(anchor)
+                }
+                Some(Err(e)) => return Err(std::io::Error::other(e)),
+                None => def.body.as_str(),
+            };
+            match Box::pin(describe_resolved(database, body, &relations)).await? {
                 // A body that is itself a `UNION` is materialised with its rows
-                // widened, so its relation has the wider column too.
+                // widened, so its relation has the wider column too. A column
+                // list renames what it describes, as it renames the relation.
                 Some((columns, _)) => {
-                    let columns = widen_union_fields(database, &def.body, &relations, columns).await?;
+                    let columns = widen_union_fields(database, body, &relations, columns).await?;
+                    let columns = crate::core::rql::cte::described_names(def, columns).map_err(std::io::Error::other)?;
                     relations.push((def.name.clone(), scratch_fields(&columns)));
                 }
                 // A body of named constants has no relation to resolve; it is
@@ -4322,6 +4336,7 @@ pub(crate) async fn describe_query(
                     Some(constants) => {
                         let columns: Vec<(String, DbType)> =
                             constants.into_iter().map(|c| (c.label, c.db_type)).collect();
+                        let columns = crate::core::rql::cte::described_names(def, columns).map_err(std::io::Error::other)?;
                         relations.push((def.name.clone(), scratch_fields(&columns)));
                     }
                     // A body this cannot resolve leaves the rest unresolvable
