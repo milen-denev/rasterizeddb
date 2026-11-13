@@ -34,7 +34,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -232,23 +232,58 @@ struct Logged {
     file_id: u64,
 }
 
-struct LogFile {
+/// One file of the log.
+struct Segment {
     handle: File,
-    dir: PathBuf,
     path: PathBuf,
-    /// Which file of the series this is. A compaction writes the next one
-    /// under a new name, because the log names a file by its name and replays
-    /// by offset: records for the old layout must never land in the new file.
-    generation: u64,
     /// Bytes written, which is also the offset the next record goes to.
-    end: u64,
+    len: u64,
     logged: Option<Logged>,
+}
+
+struct LogFile {
+    dir: PathBuf,
+    /// The log's files by generation: `db_replication.log`, then
+    /// `db_replication.log.1`, `.2`, …. Appends go to the last; retention
+    /// removes whole files from the front.
+    ///
+    /// Never rewritten. The write-ahead log replays "these bytes at this
+    /// offset of the file named so", so a file is restorable from that log
+    /// exactly when everything in it was appended through it. A compaction
+    /// that copied the newest half into a fresh file wrote that half behind
+    /// the log's back, and a restore that replayed the log got the file's
+    /// name, a run of zeros, and the appends that came after.
+    segments: BTreeMap<u64, Segment>,
+    /// The write-ahead log new segments are registered with.
+    wal: Option<Arc<Wal>>,
     /// This node's own records that are only real if their transaction
     /// committed: sequence to transaction id. Cleared by [`ReplicationLog::confirm`]
     /// or [`ReplicationLog::void`]; what is left at open is what a crash
     /// interrupted.
     conditional: BTreeMap<u64, u64>,
-    compacting: bool,
+}
+
+impl LogFile {
+    fn active(&mut self) -> &mut Segment {
+        self.segments.values_mut().next_back().expect("a log has at least one file")
+    }
+
+    fn bytes(&self) -> u64 {
+        self.segments.values().map(|segment| segment.len).sum()
+    }
+}
+
+/// A location's file and the offset inside it, in one word: the generation
+/// above bit 40, so a segment may be a terabyte and there may be sixteen
+/// million of them.
+const GENERATION_SHIFT: u32 = 40;
+
+fn pack(generation: u64, offset: u64) -> u64 {
+    (generation << GENERATION_SHIFT) | offset
+}
+
+fn unpack(packed: u64) -> (u64, u64) {
+    (packed >> GENERATION_SHIFT, packed & ((1 << GENERATION_SHIFT) - 1))
 }
 
 /// This node's own committed history, as far back as the retention budget goes.
@@ -353,23 +388,21 @@ fn generation_of(name: &str) -> Option<u64> {
     rest.parse().ok()
 }
 
+/// The temporary an earlier build's compaction copied into.
 const COMPACTING_NAME: &str = "db_replication.log.compacting";
 
-/// What a scan of a log file found.
+/// What a scan of the log's files found.
+#[derive(Default)]
 struct Scanned {
     index: BTreeMap<NodeId, SeqIndex>,
     hot: std::collections::VecDeque<TxnRecord>,
     conditional: BTreeMap<(NodeId, u64), u64>,
     last_hlc: Hlc,
-    good_end: u64,
 }
 
-fn scan(path: &Path, bytes: &[u8]) -> Scanned {
-    let mut index: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
-    let mut hot = std::collections::VecDeque::with_capacity(HOT_RECORDS);
-    let mut conditional: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
-    let mut last_hlc = NO_HLC;
-
+/// Reads one file's records into `found`, and returns where its last whole
+/// record ends.
+fn scan(path: &Path, generation: u64, bytes: &[u8], found: &mut Scanned) -> u64 {
     let mut at = 0usize;
     let good_end = loop {
         if at + RECORD_HEADER > bytes.len() {
@@ -425,32 +458,33 @@ fn scan(path: &Path, bytes: &[u8]) -> Scanned {
 
         match TxnRecord::decode(&mut Reader::new(body)) {
             Ok(record) => {
-                index.entry(record.origin).or_default().insert(
+                found.index.entry(record.origin).or_default().insert(
                     record.seq,
                     RecordLoc {
-                        offset: body_at as u64,
+                        offset: pack(generation, body_at as u64),
                         len: body.len() as u32,
                     },
                 );
                 // A later record under a sequence replaces the earlier one:
                 // that is how a transaction that never committed is voided.
                 if local_tx != 0 {
-                    conditional.insert((record.origin, record.seq), local_tx);
+                    found.conditional.insert((record.origin, record.seq), local_tx);
                 } else {
-                    conditional.remove(&(record.origin, record.seq));
+                    found.conditional.remove(&(record.origin, record.seq));
                 }
-                last_hlc = last_hlc.max(record.commit_hlc);
-                if let Some(held) = hot
+                found.last_hlc = found.last_hlc.max(record.commit_hlc);
+                if let Some(held) = found
+                    .hot
                     .iter_mut()
                     .rev()
                     .find(|r: &&mut TxnRecord| r.origin == record.origin && r.seq == record.seq)
                 {
                     *held = record;
                 } else {
-                    if hot.len() == HOT_RECORDS {
-                        hot.pop_front();
+                    if found.hot.len() == HOT_RECORDS {
+                        found.hot.pop_front();
                     }
-                    hot.push_back(record);
+                    found.hot.push_back(record);
                 }
             }
             Err(e) => {
@@ -466,14 +500,7 @@ fn scan(path: &Path, bytes: &[u8]) -> Scanned {
 
         at = payload_at + len;
     };
-
-    Scanned {
-        index,
-        hot,
-        conditional,
-        last_hlc,
-        good_end: good_end as u64,
-    }
+    good_end as u64
 }
 
 impl ReplicationLog {
@@ -507,72 +534,88 @@ impl ReplicationLog {
         retention_bytes: u64,
         wal: Option<Arc<Wal>>,
     ) -> io::Result<ReplicationLog> {
-        // The newest generation is the log. An older one beside it is what a
-        // compaction had not yet deleted when the process stopped.
         let mut generations: Vec<u64> = Vec::new();
         for entry in std::fs::read_dir(dir)?.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
             if name == COMPACTING_NAME {
+                // Left by a build that compacted by copying.
                 let _ = std::fs::remove_file(entry.path());
             } else if let Some(generation) = generation_of(&name) {
                 generations.push(generation);
             }
         }
         generations.sort_unstable();
-        let generation = generations.last().copied().unwrap_or(0);
-        for old in generations.iter().copied().filter(|g| *g != generation) {
-            let path = generation_path(dir, old);
-            Self::retire(wal.as_ref(), &path);
+        if generations.is_empty() {
+            generations.push(0);
         }
 
-        let path = generation_path(dir, generation);
-        let mut handle = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-
-        let mut bytes = Vec::new();
-        handle.read_to_end(&mut bytes)?;
-        let scanned = scan(&path, &bytes);
-
-        if scanned.good_end < bytes.len() as u64 {
-            handle.set_len(scanned.good_end)?;
-            handle.sync_data()?;
+        let mut found = Scanned {
+            hot: std::collections::VecDeque::with_capacity(HOT_RECORDS),
+            ..Default::default()
+        };
+        let mut segments: BTreeMap<u64, Segment> = BTreeMap::new();
+        let newest = *generations.last().expect("at least generation 0");
+        let mut total = 0u64;
+        for generation in generations {
+            let path = generation_path(dir, generation);
+            let mut handle = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            let mut bytes = Vec::new();
+            handle.read_to_end(&mut bytes)?;
+            let good_end = scan(&path, generation, &bytes, &mut found);
+            // Only the file appends go to is cut at its last whole record:
+            // the next append lands there. An older one keeps its bytes.
+            if generation == newest && good_end < bytes.len() as u64 {
+                handle.set_len(good_end)?;
+                handle.sync_data()?;
+            }
+            let logged = wal.as_ref().and_then(|wal| Self::attach(wal, &path));
+            total += good_end;
+            segments.insert(
+                generation,
+                Segment {
+                    handle,
+                    path,
+                    len: if generation == newest { good_end } else { bytes.len() as u64 },
+                    logged,
+                },
+            );
         }
-
-        let logged = wal.and_then(|wal| Self::attach(&wal, &path));
 
         log::info!(
-            "Replication log {} opened: {} bytes, {} origin(s){}",
-            path.display(),
-            scanned.good_end,
-            scanned.index.len(),
-            if logged.is_some() { "" } else { ", not write-ahead logged" }
+            "Replication log in {} opened: {} bytes in {} file(s), {} origin(s){}",
+            dir.display(),
+            total,
+            segments.len(),
+            found.index.len(),
+            if segments.values().next_back().is_some_and(|s| s.logged.is_some()) {
+                ""
+            } else {
+                ", not write-ahead logged"
+            }
         );
 
         let log = ReplicationLog {
             file: Mutex::new(Some(LogFile {
-                handle,
                 dir: dir.to_path_buf(),
-                path,
-                generation,
-                end: scanned.good_end,
-                logged,
+                segments,
+                wal,
                 // Keyed by sequence alone: only this node's own records are
                 // ever conditional, and one node has one stream.
-                conditional: scanned.conditional.iter().map(|((_, seq), tx)| (*seq, *tx)).collect(),
-                compacting: false,
+                conditional: found.conditional.iter().map(|((_, seq), tx)| (*seq, *tx)).collect(),
             })),
-            index: Mutex::new(scanned.index),
-            hot: Mutex::new(scanned.hot),
+            index: Mutex::new(found.index),
+            hot: Mutex::new(found.hot),
             voided: Mutex::new(std::collections::HashSet::new()),
-            pending_at_open: Mutex::new(scanned.conditional),
+            pending_at_open: Mutex::new(found.conditional),
             retention_bytes,
-            last_hlc: std::sync::atomic::AtomicU64::new(scanned.last_hlc).into(),
+            last_hlc: std::sync::atomic::AtomicU64::new(found.last_hlc).into(),
         };
         Ok(log)
     }
@@ -614,6 +657,8 @@ impl ReplicationLog {
                 return;
             }
         }
+        #[cfg(any(test, feature = "index_store_failpoints"))]
+        crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
         if let Err(e) = std::fs::remove_file(path) {
             if e.kind() != io::ErrorKind::NotFound {
                 log::warn!("Could not remove {}: {}", path.display(), e);
@@ -628,7 +673,7 @@ impl ReplicationLog {
         self.file
             .lock()
             .as_ref()
-            .is_some_and(|log| log.logged.is_some())
+            .is_some_and(|log| log.segments.values().next_back().is_some_and(|s| s.logged.is_some()))
     }
 
     /// The records a crash left undecided: each is real only if its
@@ -665,23 +710,29 @@ impl ReplicationLog {
         record.encode(&mut body);
         let framed = frame(&body, local_tx);
 
-        {
+        let mut retired: Vec<PathBuf> = Vec::new();
+        let wal = {
             let mut file = self.file.lock();
             if let Some(log) = file.as_mut() {
-                let offset = log.end;
-                std::os::unix::fs::FileExt::write_all_at(&log.handle, &framed, offset)?;
+                if self.retention_bytes != 0 && log.active().len >= self.segment_bytes() {
+                    self.rotate(log, &mut retired)?;
+                }
+                let generation = *log.segments.keys().next_back().expect("a log has a file");
+                let segment = log.active();
+                let offset = segment.len;
+                std::os::unix::fs::FileExt::write_all_at(&segment.handle, &framed, offset)?;
                 // The file first, then the log: a checkpoint syncs the files
                 // its records name and drops the log, so every record must
                 // already be in its file by the time it is logged.
-                if let Some(logged) = &log.logged {
+                if let Some(logged) = &segment.logged {
                     if let Err(e) = logged.wal.log_and_commit_deferred(logged.file_id, offset, &framed) {
                         // Not described to the log, so not durable and not
                         // counted: take the bytes back out of the file.
-                        let _ = log.handle.set_len(offset);
+                        let _ = segment.handle.set_len(offset);
                         return Err(e);
                     }
                 }
-                log.end += framed.len() as u64;
+                segment.len += framed.len() as u64;
                 if local_tx != 0 {
                     log.conditional.insert(record.seq, local_tx);
                 } else {
@@ -691,18 +742,85 @@ impl ReplicationLog {
                 self.index.lock().entry(record.origin).or_default().insert(
                     record.seq,
                     RecordLoc {
-                        offset: offset + lead(local_tx),
+                        offset: pack(generation, offset + lead(local_tx)),
                         len: body.len() as u32,
                     },
                 );
             }
+            file.as_ref().and_then(|log| log.wal.clone())
+        };
+        // Outside the lock: voiding a file's records is a log sync.
+        for path in retired {
+            Self::retire(wal.as_ref(), &path);
         }
 
         self.last_hlc
             .fetch_max(record.commit_hlc, std::sync::atomic::Ordering::AcqRel);
         self.remember(record.clone());
+        Ok(())
+    }
 
-        self.compact_if_needed();
+    /// How large one file of the log grows before the next is started: an
+    /// eighth of the budget, so retention lets go of history an eighth at a
+    /// time.
+    fn segment_bytes(&self) -> u64 {
+        (self.retention_bytes / 8).max(1)
+    }
+
+    /// Starts the next file, and takes the oldest ones out of the log while
+    /// it is over its budget. Their paths go into `retired`, for the caller
+    /// to void and remove once the lock is let go.
+    fn rotate(&self, log: &mut LogFile, retired: &mut Vec<PathBuf>) -> io::Result<()> {
+        let generation = log.segments.keys().next_back().copied().unwrap_or(0) + 1;
+        let path = generation_path(&log.dir, generation);
+        // Announced, so a crash image treats the new file as a power cut
+        // would: its name and its pages are there only as far as a sync, or
+        // a replay of the log, puts them there.
+        #[cfg(any(test, feature = "index_store_failpoints"))]
+        crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Create(&path));
+        let handle = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        // The name has to outlive a power cut before anything is logged
+        // under it: a replay finds a file by its name.
+        crate::core::wal::sync_parent_dir(&path)?;
+        let logged = log.wal.as_ref().and_then(|wal| Self::attach(wal, &path));
+        log.segments.insert(
+            generation,
+            Segment {
+                handle,
+                path,
+                len: 0,
+                logged,
+            },
+        );
+
+        let mut dropped: Vec<u64> = Vec::new();
+        while log.bytes() > self.retention_bytes && log.segments.len() > 1 {
+            let (oldest, segment) = log.segments.pop_first().expect("more than one file");
+            dropped.push(oldest);
+            retired.push(segment.path);
+        }
+        if !dropped.is_empty() {
+            let mut index = self.index.lock();
+            let mut kept: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
+            for (origin, per_origin) in index.iter() {
+                for (seq, loc) in per_origin.iter() {
+                    if !dropped.contains(&unpack(loc.offset).0) {
+                        kept.entry(*origin).or_default().insert(seq, loc);
+                    }
+                }
+            }
+            *index = kept;
+            log::info!(
+                "Replication log: {} file(s) past the retention budget let go, {} bytes held",
+                dropped.len(),
+                log.bytes()
+            );
+        }
         Ok(())
     }
 
@@ -767,8 +885,8 @@ impl ReplicationLog {
     pub fn flush(&self) -> io::Result<()> {
         let handle = {
             let file = self.file.lock();
-            match file.as_ref() {
-                Some(log) => log.handle.try_clone()?,
+            match file.as_ref().and_then(|log| log.segments.values().next_back()) {
+                Some(segment) => segment.handle.try_clone()?,
                 None => return Ok(()),
             }
         };
@@ -782,7 +900,7 @@ impl ReplicationLog {
 
     /// Bytes the log currently occupies.
     pub fn bytes(&self) -> u64 {
-        self.file.lock().as_ref().map(|log| log.end).unwrap_or(0)
+        self.file.lock().as_ref().map(LogFile::bytes).unwrap_or(0)
     }
 
     /// Every origin the log holds something for.
@@ -915,18 +1033,35 @@ impl ReplicationLog {
         let mut bytes = 0usize;
         let mut more = false;
 
-        // Positional reads on a duplicate, with the lock let go: the handle
-        // is the appender's, and a `seek` on it once moved where the next
-        // append went, so every record appended after a catch-up from the
-        // file overwrote an older one.
-        let handle = {
+        // Positional reads on duplicates, with the lock let go: a handle is
+        // the appender's, and a `seek` on it once moved where the next append
+        // went, so every record appended after a catch-up from the file
+        // overwrote an older one.
+        let mut handles: Vec<(u64, File)> = Vec::new();
+        {
             let file = self.file.lock();
             let Some(log) = file.as_ref() else {
                 // In-memory: whatever the hot window could not serve is gone.
                 return Ok((Vec::new(), false));
             };
-            log.handle.try_clone()?
-        };
+            for (_, loc) in &locations {
+                let generation = unpack(loc.offset).0;
+                if handles.iter().any(|(held, _)| *held == generation) {
+                    continue;
+                }
+                match log.segments.get(&generation) {
+                    Some(segment) => handles.push((generation, segment.handle.try_clone()?)),
+                    // Retention let the file go between the index read and
+                    // here. The caller comes round again and finds out.
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "the replication log let go of a file during the read",
+                        ));
+                    }
+                }
+            }
+        }
 
         let mut payload = Vec::new();
         for (seq, loc) in locations {
@@ -935,29 +1070,32 @@ impl ReplicationLog {
                 break;
             }
 
+            let (generation, offset) = unpack(loc.offset);
+            let handle = &handles.iter().find(|(held, _)| *held == generation).expect("cloned above").1;
             payload.clear();
             payload.resize(loc.len as usize, 0);
-            std::os::unix::fs::FileExt::read_exact_at(&handle, &mut payload, loc.offset)?;
+            std::os::unix::fs::FileExt::read_exact_at(handle, &mut payload, offset)?;
 
             match TxnRecord::decode(&mut Reader::new(&payload)) {
                 Ok(record) if record.origin == origin && record.seq == seq => {
                     bytes += loc.len as usize;
                     records.push(record);
                 }
-                // A compaction moved the file under this read: the offsets
-                // were the old file's. The caller comes round again.
-                Ok(_) => {
+                Ok(other) => {
                     return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "the replication log was compacted during the read",
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "replication log holds {}:{} where {}:{} was indexed",
+                            other.origin, other.seq, origin, seq
+                        ),
                     ));
                 }
                 Err(e) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "replication log record {}:{} at {} is unreadable: {}",
-                            origin, seq, loc.offset, e
+                            "replication log record {}:{} at {} of file {} is unreadable: {}",
+                            origin, seq, offset, generation, e
                         ),
                     ));
                 }
@@ -1021,156 +1159,6 @@ impl ReplicationLog {
         Some((records, more))
     }
 
-    /// Starts a new file holding the newest half once the log outgrows its
-    /// budget, and drops the old one.
-    ///
-    /// A new file under a new name rather than a rewrite of this one: the
-    /// write-ahead log replays "these bytes at this offset of the file named
-    /// so", and a record for the old layout landing in the new file would
-    /// overwrite whatever sits there now. The old name's records are voided
-    /// in that log before its file is removed.
-    ///
-    /// The copy runs with the lock let go, because every commit appends under
-    /// it; only what was appended during the copy is moved with it held.
-    fn compact_if_needed(&self) {
-        if self.retention_bytes == 0 {
-            return;
-        }
-        if let Err(e) = self.compact() {
-            log::warn!("Replication log compaction failed, will be tried again: {}", e);
-            if let Some(log) = self.file.lock().as_mut() {
-                log.compacting = false;
-                let _ = std::fs::remove_file(log.dir.join(COMPACTING_NAME));
-            }
-        }
-    }
-
-    fn compact(&self) -> io::Result<()> {
-        // Phase one, locked: decide what stays and take a handle to read it.
-        let (source, keep_from, copied_through, dir, generation) = {
-            let mut file = self.file.lock();
-            let Some(log) = file.as_mut() else {
-                return Ok(());
-            };
-            if log.compacting || log.end <= self.retention_bytes {
-                return Ok(());
-            }
-            log.compacting = true;
-            (
-                log.handle.try_clone()?,
-                log.end - self.retention_bytes / 2,
-                log.end,
-                log.dir.clone(),
-                log.generation,
-            )
-        };
-
-        let kept_in = |from: u64, to: u64| -> Vec<(NodeId, u64, RecordLoc)> {
-            let index = self.index.lock();
-            let mut kept: Vec<(NodeId, u64, RecordLoc)> = Vec::new();
-            for (origin, per_origin) in index.iter() {
-                for (seq, loc) in per_origin.iter() {
-                    if loc.offset >= from && loc.offset < to {
-                        kept.push((*origin, seq, loc));
-                    }
-                }
-            }
-            kept.sort_unstable_by_key(|(_, _, loc)| loc.offset);
-            kept
-        };
-
-        // Phase two, unlocked: copy.
-        let temp_path = dir.join(COMPACTING_NAME);
-        let mut target = BufWriter::with_capacity(256 * 1024, File::create(&temp_path)?);
-        let mut rebuilt: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
-        let mut end = 0u64;
-        let mut body = Vec::new();
-        let mut copy = |kept: Vec<(NodeId, u64, RecordLoc)>,
-                        conditional: &BTreeMap<u64, u64>,
-                        target: &mut BufWriter<File>,
-                        end: &mut u64,
-                        rebuilt: &mut BTreeMap<NodeId, SeqIndex>|
-         -> io::Result<()> {
-            for (origin, seq, loc) in kept {
-                body.clear();
-                body.resize(loc.len as usize, 0);
-                std::os::unix::fs::FileExt::read_exact_at(&source, &mut body, loc.offset)?;
-                let local_tx = conditional.get(&seq).copied().unwrap_or(0);
-                let framed = frame(&body, local_tx);
-                target.write_all(&framed)?;
-                rebuilt.entry(origin).or_default().insert(
-                    seq,
-                    RecordLoc {
-                        offset: *end + lead(local_tx),
-                        len: loc.len,
-                    },
-                );
-                *end += framed.len() as u64;
-            }
-            Ok(())
-        };
-        let conditional_then = self
-            .file
-            .lock()
-            .as_ref()
-            .map(|log| log.conditional.clone())
-            .unwrap_or_default();
-        copy(
-            kept_in(keep_from, copied_through),
-            &conditional_then,
-            &mut target,
-            &mut end,
-            &mut rebuilt,
-        )?;
-        target.flush()?;
-        target.get_ref().sync_data()?;
-
-        // Phase three, locked: what arrived meanwhile, then the switch.
-        let mut file = self.file.lock();
-        let Some(log) = file.as_mut() else {
-            return Ok(());
-        };
-        let late = kept_in(copied_through, u64::MAX);
-        // A record voided or confirmed during the copy is re-framed as it is
-        // now: the late pass rewrites what it supersedes.
-        let moved_late = !late.is_empty();
-        copy(late, &log.conditional, &mut target, &mut end, &mut rebuilt)?;
-        target.flush()?;
-        if moved_late {
-            target.get_ref().sync_data()?;
-        }
-        drop(target);
-
-        let next_generation = generation + 1;
-        let next_path = generation_path(&dir, next_generation);
-        // Renamed into place whole and synced, so a crash leaves either the
-        // old file alone or both, and an open takes the newer.
-        std::fs::rename(&temp_path, &next_path)?;
-        crate::core::wal::sync_parent_dir(&next_path)?;
-
-        let handle = OpenOptions::new().read(true).write(true).open(&next_path)?;
-        let wal = log.logged.as_ref().map(|logged| logged.wal.clone());
-        let logged = wal.as_ref().and_then(|wal| Self::attach(wal, &next_path));
-
-        log::info!(
-            "Replication log compacted: {} bytes -> {} bytes (generation {})",
-            log.end,
-            end,
-            next_generation
-        );
-
-        let old_path = std::mem::replace(&mut log.path, next_path);
-        log.handle = handle;
-        log.generation = next_generation;
-        log.end = end;
-        log.logged = logged;
-        log.compacting = false;
-        *self.index.lock() = rebuilt;
-        drop(file);
-
-        Self::retire(wal.as_ref(), &old_path);
-        Ok(())
-    }
 }
 
 /// Starts a slot file. Never the start of an origin's id and a sequence, which
@@ -2074,7 +2062,7 @@ mod tests {
         }
 
         assert!(
-            log.bytes() <= 4096 + 512,
+            log.bytes() <= 4096 + 1024,
             "retention should bound the file: {}",
             log.bytes()
         );
@@ -2429,34 +2417,43 @@ mod tests {
         assert!(!more);
     }
 
-    /// A compaction starts a new file under a new name. A reopen takes the
-    /// newest, finds what was kept, and leaves no older one behind.
+
+    /// The log is files that are only ever appended to. Past its budget the
+    /// oldest go whole; a reopen reads the rest in order and finds every
+    /// record that was kept, with the transaction it named.
     #[test]
-    fn a_compaction_moves_to_a_new_file_that_a_reopen_finds() {
+    fn the_log_grows_by_files_and_lets_the_oldest_go() {
         let dir = tempfile::tempdir().unwrap();
-        let highest = {
+        let files = |dir: &Path| -> Vec<u64> {
+            let mut generations: Vec<u64> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().and_then(generation_of))
+                .collect();
+            generations.sort_unstable();
+            generations
+        };
+        {
             let log = ReplicationLog::open(dir.path(), 4096).unwrap();
             for seq in 1..=400 {
                 log.append_for(&record(1, seq), if seq % 2 == 0 { 1000 + seq } else { 0 }).unwrap();
             }
             log.flush().unwrap();
-            log.highest(1)
-        };
-        assert_eq!(highest, 400);
-        let names: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter(|n| generation_of(n).is_some())
-            .collect();
-        assert_eq!(names.len(), 1, "one log file at a time: {names:?}");
-        assert_ne!(names[0], LOG_FILE, "a compaction ran, so the first file is gone");
+            assert_eq!(log.highest(1), 400);
+            // Read across files while they are open.
+            let earliest = log.earliest(1);
+            let (records, _) = log.read_after(1, earliest - 1, 1000, 1 << 30).unwrap();
+            assert_eq!(records.len() as u64, 400 - earliest + 1);
+        }
+        let held = files(dir.path());
+        assert!(held.len() > 1, "several files at a time: {held:?}");
+        assert!(held[0] > 0, "the first file was let go: {held:?}");
+        assert!(held.windows(2).all(|w| w[1] == w[0] + 1), "no file missing in between: {held:?}");
 
         let log = ReplicationLog::open(dir.path(), 4096).unwrap();
         assert_eq!(log.highest(1), 400);
         let earliest = log.earliest(1);
         assert!(earliest > 1, "the oldest records were dropped");
-        // Everything kept reads back, from the file, in order and whole.
         let mut from = earliest - 1;
         loop {
             let (records, more) = log.read_after(1, from, 64, 1 << 20).unwrap();
@@ -2470,9 +2467,40 @@ mod tests {
             }
         }
         assert_eq!(from, 400);
-        // The transactions named by the records that were kept came with them.
         let undecided = log.take_undecided();
         assert!(!undecided.is_empty());
-        assert!(undecided.iter().all(|(_, seq, tx)| *tx == 1000 + *seq && seq % 2 == 0));
+        assert!(undecided.iter().all(|(_, seq, tx)| *tx == 1000 + *seq && seq % 2 == 0 && *seq >= earliest));
+
+        // And it goes on appending where it stopped, in the newest file.
+        log.append(&record(1, 401)).unwrap();
+        let (records, _) = log.read_after(1, 399, 10, 1 << 20).unwrap();
+        assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![400, 401]);
+    }
+
+    /// A file of the log is restorable from the write-ahead log only if
+    /// everything in it was appended: nothing may ever be written into one
+    /// except at its end.
+    #[test]
+    fn a_file_of_the_log_is_never_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReplicationLog::open(dir.path(), 8192).unwrap();
+        let mut seen: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for seq in 1..=300 {
+            log.append(&record(1, seq)).unwrap();
+            if seq % 7 == 0 {
+                log.void(1, seq - 1, 5).unwrap();
+            }
+            for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if generation_of(&name).is_none() {
+                    continue;
+                }
+                let now = std::fs::read(entry.path()).unwrap();
+                if let Some(before) = seen.get(&name) {
+                    assert!(now.starts_with(before), "{name} changed below its end at sequence {seq}");
+                }
+                seen.insert(name, now);
+            }
+        }
     }
 }

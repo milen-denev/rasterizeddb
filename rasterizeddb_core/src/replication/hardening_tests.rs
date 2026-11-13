@@ -508,3 +508,166 @@ async fn a_node_with_no_replication_files_starts_from_nothing() {
     drop(one);
     crate::core::wal::remove_for(&dir.path().to_string_lossy());
 }
+
+/// A peer that holds more of this node's stream than this node's own log
+/// does: the node was restored to an earlier point, or lost its log. Nothing
+/// is sent, because the peer would drop every new transaction numbered below
+/// what it holds as one it already has. An operator who accepts the
+/// difference says so, and the stream carries on above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_ahead_of_this_nodes_log_is_not_sent_to_until_an_operator_adopts_it() {
+    let (one, two) = pair().await;
+    run_ok(&one, "CREATE TABLE repl_ahead (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_ahead (id, name) VALUES (1, 'before')").await;
+    settled(&one, &two).await;
+
+    // Node two comes to hold node one's stream up to 50, as it would if node
+    // one had been put back to an earlier point.
+    let link = one.replication.peer("two").unwrap();
+    link.set_paused(true);
+    eventually("the link to drop", || async { !link.snapshot(0).connected }).await;
+    two.replication.applied().set(1, 50).unwrap();
+    link.set_paused(false);
+
+    eventually("the link to refuse", || async {
+        link.snapshot(0).state == super::peer::PeerState::NeedsReseed && link.ahead() == 50
+    })
+    .await;
+    run_ok(&one, "INSERT INTO repl_ahead (id, name) VALUES (2, 'not sent')").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        rows(&two, "SELECT id FROM repl_ahead WHERE 1 = 1").await.map(|r| r.len()),
+        Some(1),
+        "a transaction numbered below what the peer holds must not be offered as new"
+    );
+    assert!(
+        super::sql::execute("REPLICATION ADOPT PEER 'nobody'", &one).await.is_err(),
+        "an unknown peer"
+    );
+
+    let said = super::sql::execute("REPLICATION ADOPT PEER 'two'", &one).await.unwrap();
+    assert!(said[0].contains("to 50"), "{said:?}");
+    assert_eq!(one.replication.local_seq(), 50);
+    assert!(
+        super::sql::execute("REPLICATION ADOPT PEER 'two'", &one).await.is_err(),
+        "nothing left to adopt"
+    );
+
+    run_ok(&one, "INSERT INTO repl_ahead (id, name) VALUES (3, 'after')").await;
+    eventually("the stream to carry on above what the peer held", || async {
+        rows(&two, "SELECT id FROM repl_ahead WHERE id = 3").await.map(|r| r.len()) == Some(1)
+    })
+    .await;
+    assert_eq!(two.replication.applied().high_water(1), 51);
+    assert_eq!(link.snapshot(0).state, super::peer::PeerState::Streaming);
+}
+
+/// A node that replicated, was backed up before its log moved on to further
+/// files and archived after, restores to a copy whose replication files open
+/// and hold its stream up to where it was archived. Every file of the log is
+/// appended through the write-ahead log from its first byte, which is what
+/// lets a restore rebuild one the snapshot never saw. (Written by the review
+/// of this branch, which found that a log compacted by copying came back
+/// empty.)
+#[cfg(feature = "s3_backup")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replicating_node_restores_with_its_whole_stream() {
+    use crate::core::backup::{BackupConfig, BackupService};
+    use crate::core::backup::manifest::RecoveryTarget;
+    use crate::core::backup::s3::{Credentials, Endpoint};
+    let dir = tempfile::tempdir().unwrap();
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
+    super::test_support::init_globals();
+    let (socket, port) = bound_one;
+    let one = Arc::new(
+        Database::try_new_named(&dir.path().to_string_lossy(), false, "repl_bk_one")
+            .await
+            .expect("the database should open"),
+    );
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: port,
+        peers: vec![PeerConfig::new("two", format!("127.0.0.1:{port_two}"))],
+        log_retention_bytes: 16 * 1024,
+        ..Default::default()
+    };
+    brisk(&mut config);
+    one.replication.set_config(config).expect("a valid configuration");
+    one.replication.serve_on(socket);
+    Database::start_replication(one.clone()).expect("replication should start");
+    let two = node(2, bound_two, vec![PeerConfig::new("one", format!("127.0.0.1:{port_one}"))]).await;
+
+    run_ok(&one, "CREATE TABLE repl_bk (id INTEGER, who VARCHAR)").await;
+    for id in 0..5 {
+        run_ok(&one, &format!("INSERT INTO repl_bk (id, who) VALUES ({id}, 'before')")).await;
+    }
+    settled(&one, &two).await;
+
+    let config = BackupConfig {
+        bucket: "rdbtest".to_string(),
+        prefix: format!("review-repl/{:016x}", fastrand::u64(..)),
+        region: "us-east-1".to_string(),
+        endpoint: Endpoint::parse(&crate::core::backup::fake_s3::shared().endpoint()).unwrap(),
+        credentials: Credentials { access_key: "fake".to_string(), secret_key: "fake".to_string(), session_token: None },
+        path_style: true,
+        snapshot_level: 3,
+        segment_level: 3,
+        compression_threads: 1,
+        long_range: false,
+        part_size: 5 * 1024 * 1024,
+        upload_concurrency: 2,
+        max_attempts: 3,
+        snapshot_interval_secs: 0,
+        wal_flush_secs: 0,
+        wal_bundle_bytes: 0,
+        rollover_interval_secs: 0,
+        retain_snapshots: 0,
+        staging_max_bytes: 0,
+        incremental_min_bytes: 0,
+    };
+    let service = BackupService::connect(config.clone(), &dir.path().to_string_lossy()).await.expect("connect");
+    service.snapshot_now().await.expect("snapshot");
+
+    let pad = "x".repeat(400);
+    for id in 5..200 {
+        run_ok(&one, &format!("INSERT INTO repl_bk (id, who) VALUES ({id}, '{pad}')")).await;
+    }
+    settled(&one, &two).await;
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("db_replication."))
+        .collect();
+    eprintln!("live replication files: {names:?}");
+    assert!(
+        names.iter().any(|n| n.starts_with("db_replication.log.")),
+        "the log moved on to another file after the snapshot: {names:?}"
+    );
+    let seq = one.replication.local_seq();
+    service.archive_wal_now().await.expect("archive");
+
+    let target = dir.path().parent().unwrap().join(format!("restored-{:x}", fastrand::u64(..)));
+    let report = crate::core::backup::restore_from(&config, &target, RecoveryTarget::Latest).await.expect("restore");
+    assert_eq!(report.records_unresolved, 0);
+    let restored_names: Vec<String> = std::fs::read_dir(&target)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("db_replication."))
+        .collect();
+    eprintln!("restored replication files: {restored_names:?}");
+
+    let copy = Arc::new(
+        Database::try_new_named(&target.to_string_lossy(), false, "repl_restored")
+            .await
+            .expect("the restored copy opens"),
+    );
+    copy.open_replication_storage().expect("the restored replication files open");
+    let log = copy.replication.log().expect("a log");
+    assert_eq!(log.highest(1), seq, "the restored log holds the stream up to where it was archived");
+    let n = rows(&copy, "SELECT id FROM repl_bk WHERE 1 = 1").await.unwrap().len();
+    assert_eq!(n, 200);
+    let _ = std::fs::remove_dir_all(&target);
+}

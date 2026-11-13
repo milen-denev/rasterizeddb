@@ -471,6 +471,7 @@ REPLICATION DROP PEER 'berlin'
 REPLICATION PAUSE PEER 'berlin'
 REPLICATION RESUME PEER 'berlin'
 REPLICATION RESYNC PEER 'berlin' FROM 0
+REPLICATION ADOPT PEER 'berlin'      -- only when it holds more of this node's stream than this node does (§8)
 
 REPLICATION SET compression = 'auto:zstd:1'
 REPLICATION SET mode = 'quorum:1'
@@ -514,14 +515,17 @@ Beside the data, all named `db_replication.*`, and none is a source of truth
 for user data — the WAL and the transaction status log remain that.
 
 - **`db_replication.log`**, then **`db_replication.log.<n>`** — this node's
-  stream, and what it relays. CRC-framed records, appended with a positional
-  write and described to the database's write-ahead log, so a commit's sync
-  covers its record and a replay after a crash puts back whatever the file
-  lost. A record of a transaction that wrote rows names that transaction, and
-  counts only if it committed. Bounded by `--replication-retention-mb`: past
-  the budget the newest half is copied to the next-numbered file and the old
-  one removed. A new name, because the write-ahead log replays by file name
-  and offset.
+  stream, and what it relays, in files that are only ever appended to.
+  CRC-framed records, each a positional write described to the database's
+  write-ahead log, so a commit's sync covers its record and a replay (after a
+  crash, or in a restore) puts back whatever a file lost. A record of a
+  transaction that wrote rows names that transaction, and counts only if it
+  committed. Bounded by `--replication-retention-mb`: a file grows to an
+  eighth of the budget, the next one is started, and past the budget the
+  oldest files are removed whole. Nothing is ever copied or rewritten: a file
+  can be rebuilt from the write-ahead log only if everything in it went
+  through that log, and a log that was compacted by copying came back from a
+  restore empty.
 - **`db_replication.state`** — how far each origin's stream is applied and
   durable: one checksummed 64-byte slot an origin, overwritten in place. A
   slot that does not check out stops replication from starting rather than
@@ -535,10 +539,22 @@ not replication is switched on: an entry written ahead of a commit that never
 happened is decided by asking how its transaction ended, and that has to be
 asked before anything can forget the answer.
 
-**Seeding or restoring a node** must remove every `db_replication.*` file from
-the copy, and from the node it will pair with (§9.5). They are written through
-the write-ahead log, so a restore from archived log puts them back; a replica
-made that way has to have them stripped afterwards.
+**Restoring this node** from a backup brings these files back with the
+tables, to the same point: the positions especially, since a position older
+than the rows would have the peers' transactions applied a second time. Keep
+them.
+
+**Seeding a different node** from this one's backup must remove every
+`db_replication.*` file from the copy, and from the node it will pair with
+(§9.5): they describe this node's stream and positions, not the new node's.
+
+**A node restored to an earlier point** than its peers have seen is behind its
+own stream: a peer holds transactions of this node that this node no longer
+has. The link reports `needs reseed` and sends nothing, because the peer would
+take every new transaction numbered below what it holds as one it already
+has. Reseed one side from the other; or, to keep both as they are,
+`REPLICATION ADOPT PEER '<name>'` moves this node's sequence past what the
+peer holds.
 
 An **in-memory** database has no files, and its log is the in-memory window
 alone. It reports that window as its retention boundary.

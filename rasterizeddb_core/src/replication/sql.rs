@@ -284,13 +284,53 @@ pub async fn execute(sql: &str, database: &Arc<Database>) -> Result<Vec<String>,
         "PAUSE" => set_peer_paused(&replication, &tokens, true),
         "RESUME" => set_peer_paused(&replication, &tokens, false),
         "RESYNC" => resync(database, &tokens).await,
+        "ADOPT" => adopt_peer(&replication, &tokens),
         "SET" => set(database, statement, &tokens).await,
         _ => Err(format!(
             "unknown replication statement `{}`: try ENABLE, DISABLE, ADD PEER, DROP PEER, \
-             PAUSE PEER, RESUME PEER, RESYNC PEER or SET",
+             PAUSE PEER, RESUME PEER, RESYNC PEER, ADOPT PEER or SET",
             statement
         )),
     }
+}
+
+/// `REPLICATION ADOPT PEER '<name>'`: the peer holds more of this node's
+/// stream than this node's log does, and the operator has decided to keep
+/// both nodes as they are. The sequence moves past what the peer holds, so no
+/// number it has is used again, and the link is tried again.
+///
+/// Refused when the peer is not ahead: there is nothing to accept then, and
+/// a statement that moved the sequence anyway would only make a hole.
+fn adopt_peer(replication: &StdArc<Replication>, tokens: &[String]) -> Result<Vec<String>, String> {
+    let name = peer_name(tokens)?;
+    let peer = replication
+        .peer(&name)
+        .ok_or_else(|| format!("no peer named '{}'", name))?;
+    let ahead = peer.ahead();
+    if ahead == 0 {
+        return Err(format!(
+            "peer '{}' does not hold more of this node's stream than this node does; there is \
+             nothing to adopt",
+            name
+        ));
+    }
+    let was = replication.adopt_peer_position(ahead);
+    peer.clear_ahead();
+    log::warn!(
+        "By REPLICATION ADOPT PEER: local sequence moved from {} past {}, which {} already holds. \
+         Transactions {} holds under those numbers are not on this node",
+        was.unwrap_or(ahead),
+        ahead,
+        name,
+        name
+    );
+    Ok(vec![format!(
+        "local sequence moved from {} to {}; '{}' keeps the transactions it holds below that, \
+         which this node does not have",
+        was.unwrap_or(ahead),
+        ahead,
+        name
+    )])
 }
 
 /// Brings the node up: opens storage, starts the peers, starts the listener.

@@ -125,6 +125,9 @@ pub struct PeerHandle {
     records_sent: AtomicU64,
     batches_sent: AtomicU64,
     state: AtomicU8,
+    /// How much of this node's stream the peer reported at the last
+    /// handshake that found it ahead of this node's own log. Zero otherwise.
+    ahead: AtomicU64,
     codec: AtomicU64,
     /// Last observed compression ratio, as `f64` bits. `0` means "not yet".
     last_ratio: AtomicU64,
@@ -186,6 +189,19 @@ impl PeerHandle {
     #[inline]
     pub fn remote_node(&self) -> NodeId {
         self.remote_node.load(Ordering::Relaxed)
+    }
+
+    /// The position a peer reported that this node's own log does not reach,
+    /// if the last handshake found one.
+    pub fn ahead(&self) -> u64 {
+        self.ahead.load(Ordering::Relaxed)
+    }
+
+    /// The operator has dealt with [`PeerHandle::ahead`]: try the link again.
+    pub fn clear_ahead(&self) {
+        self.ahead.store(0, Ordering::Relaxed);
+        self.set_state(PeerState::Streaming);
+        self.kick.notify_waiters();
     }
 
     pub fn state(&self) -> PeerState {
@@ -263,6 +279,7 @@ fn handle(config: &PeerConfig) -> Arc<PeerHandle> {
         records_sent: AtomicU64::new(0),
         batches_sent: AtomicU64::new(0),
         state: AtomicU8::new(PeerState::Streaming as u8),
+        ahead: AtomicU64::new(0),
         codec: AtomicU64::new(Codec::None.as_wire() as u64),
         last_ratio: AtomicU64::new(0),
         last_error: Mutex::new(None),
@@ -447,13 +464,30 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
 
     // What the peer says it has of ours is where the next send starts.
     let ours = link.position(config.node_id);
-    if let Some(was) = replication.adopt_peer_position(ours) {
-        error!(
-            "{} has applied this node's stream up to {}, but this node's replication log ends at {}: \
-             the log lost its tail. Local sequence moved to {} so no number the peer holds is reused",
-            peer.name, ours, was, ours
+    let held = replication.local_seq();
+    if ours > held {
+        // The peer holds transactions of this node's that this node's own
+        // log does not. A commit's record rides the commit's sync, so a crash
+        // cannot do this: the node was restored to an earlier point, or its
+        // replication log was removed or cut short. Carrying on is wrong in a
+        // way that does not show. The peer keeps transactions this node no
+        // longer has, and every new one here numbered up to what the peer
+        // holds would be taken by it as already applied, and dropped.
+        peer.ahead.store(ours, Ordering::Relaxed);
+        let message = format!(
+            "{} holds this node's stream up to {}, and this node's own log ends at {}: this node \
+             was restored to an earlier point or lost its replication log, and {} has transactions \
+             of it that it no longer has. Nothing is sent. Reseed {} from this node (or this node \
+             from it); or, to keep both as they are and carry on above {}, run \
+             REPLICATION ADOPT PEER '{}'",
+            peer.name, ours, held, peer.name, peer.name, ours, peer.name
         );
+        if peer.set_state(PeerState::NeedsReseed) {
+            error!("{}", message);
+        }
+        return Err(message);
     }
+    peer.ahead.store(0, Ordering::Relaxed);
     peer.acked_seq.store(ours, Ordering::Relaxed);
     replication.note_ack();
 
@@ -588,10 +622,27 @@ async fn send_from(
         return Ok(Sent::Nothing);
     };
     let from = link.position(origin);
+    let own = origin == replication.node_id();
+    if own && from > replication.local_seq() {
+        // As at the handshake: the peer holds more of this node's stream
+        // than this node does. Found out here when the peer's position moved
+        // while the link was up.
+        peer.ahead.store(from, Ordering::Relaxed);
+        let message = format!(
+            "{} holds this node's stream up to {}, past where this node's own log ends ({}). \
+             Nothing is sent; see REPLICATION ADOPT PEER",
+            peer.name,
+            from,
+            replication.local_seq()
+        );
+        if peer.set_state(PeerState::NeedsReseed) {
+            error!("{}", message);
+        }
+        return Err(message);
+    }
     if from >= upto {
         return Ok(Sent::Nothing);
     }
-    let own = origin == replication.node_id();
 
     if !log.can_serve(origin, from) {
         let message = format!(

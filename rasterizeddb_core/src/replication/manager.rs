@@ -474,7 +474,10 @@ impl Replication {
         self.seq.load(Ordering::Acquire)
     }
 
-    /// Takes a peer's word for how much of this node's stream it has applied.
+    /// Moves this node's sequence past what a peer holds of its stream. Only
+    /// on an operator's say-so (`REPLICATION ADOPT PEER`): see the handshake
+    /// in `peer::connect` for why it is not automatic.
+    ///
     ///
     /// A peer holding more than this node remembers means the log lost its
     /// tail (a crash before the buffered tail reached the disk, or a log cut

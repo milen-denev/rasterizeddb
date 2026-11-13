@@ -24,10 +24,17 @@ use crate::replication::TxnRecord;
 use crate::replication::config::ReplicationConfig;
 
 async fn open_node(dir: &Path, node_id: u64) -> Result<Arc<Database>, String> {
+    open_node_keeping(dir, node_id, ReplicationConfig::default().log_retention_bytes).await
+}
+
+/// [`open_node`] with a retention budget, which also sets how soon the log
+/// moves on to its next file.
+async fn open_node_keeping(dir: &Path, node_id: u64, retention: u64) -> Result<Arc<Database>, String> {
     let db = open(dir, "repl_cut").await?;
     db.replication
         .set_config(ReplicationConfig {
             node_id,
+            log_retention_bytes: retention,
             ..Default::default()
         })
         .map_err(|e| e.to_string())?;
@@ -65,19 +72,33 @@ fn arm_log_syncs(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_origin_cut_anywhere_keeps_its_rows_and_its_records_the_same_set() {
+    origin_cuts(8, ReplicationConfig::default().log_retention_bytes, false).await;
+}
+
+/// The same with a log that moves on to a new file every few records, so
+/// cuts fall before, inside and after the start of a file. Every file is
+/// appended through the write-ahead log from its first byte, and a cut must
+/// leave each of them whole up to its last committed record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_origin_cut_while_its_log_moves_to_new_files_keeps_the_same_set() {
+    origin_cuts(40, 8 * 1024, true).await;
+}
+
+async fn origin_cuts(writes: i64, retention: u64, rotates: bool) {
     let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
-    const WRITES: i64 = 8;
+    #[allow(non_snake_case)]
+    let WRITES = writes;
     let base = tempfile::tempdir().unwrap();
     let rec_dir = base.path().join("rec");
     let dir = rec_dir.join("db");
     {
-        let db = open_node(&dir, 1).await.unwrap();
+        let db = open_node_keeping(&dir, 1, retention).await.unwrap();
         exec(&db, "CREATE TABLE t (id BIGINT)").await.unwrap();
         db.sync_durable().unwrap();
         db.replication.flush();
         close(&dir, db);
     }
-    let db = open_node(&dir, 1).await.unwrap();
+    let db = open_node_keeping(&dir, 1, retention).await.unwrap();
     assert_eq!(db.replication.local_seq(), 1, "the CREATE is the stream's first record");
     assert!(db.replication.log().unwrap().is_logged(), "the log does not ride the write-ahead log");
 
@@ -94,6 +115,12 @@ async fn an_origin_cut_anywhere_keeps_its_rows_and_its_records_the_same_set() {
     let fired = guards.iter().filter(|g| g.fired() > 0).count();
     drop(guards);
     sink.lock().push(rec.cut_quiescent("after the last insert"));
+    let log_files = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("db_replication.log"))
+        .count();
+    assert_eq!(log_files > 1, rotates, "{log_files} log file(s)");
     close(&dir, db);
     drop(rec);
     assert!(fired >= WRITES as usize / 2, "only {fired} cuts fell inside a log sync");
@@ -109,7 +136,7 @@ async fn an_origin_cut_anywhere_keeps_its_rows_and_its_records_the_same_set() {
         for seed in 0..seeds {
             point.write_image(seed, &img_dir);
             let label = format!("{} seed {seed}", point.label);
-            let db = match open_node(&img, 1).await {
+            let db = match open_node_keeping(&img, 1, retention).await {
                 Ok(db) => db,
                 Err(e) => {
                     problems.push(format!("{label}: does not open: {e}"));

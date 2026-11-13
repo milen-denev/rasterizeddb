@@ -2203,10 +2203,14 @@ impl Database {
     /// Whether this database's directory holds replication files from an
     /// earlier run.
     pub fn has_replication_files(&self) -> bool {
+        // By prefix: the log's first file is gone once retention has let
+        // it go, and any one of them left means there is something to settle.
         self.location.as_deref().is_some_and(|dir| {
-            let dir = std::path::Path::new(dir);
-            dir.join(crate::replication::log::LOG_FILE).exists()
-                || dir.join(crate::replication::log::STATE_FILE).exists()
+            std::fs::read_dir(dir).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().starts_with("db_replication."))
+            })
         })
     }
 
