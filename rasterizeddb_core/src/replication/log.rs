@@ -1759,6 +1759,20 @@ impl AppliedState {
         Ok(())
     }
 
+    /// Takes the position readers see back to `prev`, and writes nothing.
+    ///
+    /// For when what was begun may or may not be durable and this process
+    /// cannot tell (a sync failed): the intents stay as they are for the next
+    /// start to decide, and until then nothing past `prev` is claimed.
+    pub fn retreat(&self, origin: NodeId, prev: u64) {
+        let mut positions = self.positions.lock();
+        if prev == 0 {
+            positions.remove(&origin);
+        } else {
+            positions.insert(origin, prev);
+        }
+    }
+
     /// Puts `origin` at `seq` whichever way that moves it. What `REPLICATION
     /// RESYNC … FROM` does; zero takes the stream again from the beginning.
     pub fn set(&self, origin: NodeId, seq: u64) -> io::Result<()> {

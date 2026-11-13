@@ -426,24 +426,30 @@ impl Group {
         let synced = database.sync_own_location();
 
         if let Err(e) = synced {
-            // Back to aborted, which is what a restart would conclude anyway,
-            // and the position back to where it stood: recording these as
-            // applied would skip transactions this node may not have, which
-            // is permanent divergence. The sender offers them again.
-            for held in waiting.iter().rev() {
-                database.abort_transaction(held.tx);
-            }
-            if let Err(e) = replication.applied().rollback(self.origin, self.before) {
-                warn!("Could not take the applied position back: {}", e);
-            }
-            if let Err(e) = database.transactions.flush() {
-                warn!("Could not make the aborted outcomes durable: {}", e);
-            }
+            // Not undone. These transactions committed in memory and may or
+            // may not be on disk, and a reader may already have seen them;
+            // aborting them here, as this once did, took rows back from under
+            // that reader on the strength of a guess. A failed commit sync is
+            // the same event wherever it happens: the write-ahead log refuses
+            // further commits until the node is restarted, and the restart's
+            // replay decides what survived. So this origin's stream is
+            // halted, nothing of the batch is acknowledged, and the position
+            // this node reports goes back to where it stood, so the sender
+            // is told nothing it cannot rely on. The intents are left for
+            // the restart: they ride the same log as the rows.
+            replication.halt_apply(
+                self.origin,
+                format!("a batch of its transactions could not be made durable ({})", e),
+            );
+            replication.applied().retreat(self.origin, self.before);
             for held in waiting {
                 outcomes[held.answer] = refuse(
                     &held.record,
                     ApplyStatus::Failed,
-                    format!("the applied rows could not be made durable: {}", e),
+                    format!(
+                        "the applied rows could not be made durable ({}); this node must be restarted",
+                        e
+                    ),
                 );
                 held.owner.release();
             }
@@ -555,6 +561,15 @@ async fn apply_one(
     // Our own transaction, arriving back from a relay. Nothing to do.
     if record.origin == node_id {
         outcomes.push(refuse(&record, ApplyStatus::Duplicate, ""));
+        return;
+    }
+
+    if let Some(why) = replication.apply_halted(record.origin) {
+        outcomes.push(refuse(
+            &record,
+            ApplyStatus::Failed,
+            format!("not applying until this node is restarted: {}", why),
+        ));
         return;
     }
 
@@ -1293,6 +1308,89 @@ mod tests {
         assert_eq!(outcome.status, ApplyStatus::Gap, "the refused transaction was passed over");
         assert_eq!(replication.applied().high_water(2), 0);
         assert_eq!(row_count(&database).await, 0);
+    }
+
+    /// A sync that fails under an applied batch: the batch is not
+    /// acknowledged, the position this node reports does not move, nothing
+    /// is taken back from under a reader, and the origin's stream is not
+    /// applied again until the node is restarted.
+    #[tokio::test]
+    async fn a_failed_sync_halts_the_origin_and_acknowledges_nothing() {
+        crate::replication::test_support::init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_halt").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        database.replication.set_active(true);
+        create_table(&database).await;
+        let replication = database.replication.clone();
+
+        let first = apply_record(
+            &database,
+            &replication,
+            record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(first.status, ApplyStatus::Applied, "{}", first.message);
+
+        crate::core::wal::test_hooks::FAIL_LOG_SYNC.with(|f| f.set(Some(5)));
+        let outcomes = apply_batch(
+            &database,
+            &replication,
+            vec![
+                record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'grace')"]),
+                record(2, 3, vec!["INSERT INTO repl_t (id, name) VALUES (3, 'edsger')"]),
+            ],
+            NO_SENDER,
+        )
+        .await;
+        crate::core::wal::test_hooks::FAIL_LOG_SYNC.with(|f| f.set(None));
+
+        assert!(outcomes.iter().all(|o| o.status == ApplyStatus::Failed), "{outcomes:?}");
+        assert!(outcomes[0].message.contains("must be restarted"), "{}", outcomes[0].message);
+        assert_eq!(replication.applied().high_water(2), 1, "nothing of the batch is claimed");
+        assert!(replication.apply_halted(2).is_some());
+        // Still there for whoever read them: not undone on a guess.
+        assert_eq!(row_count(&database).await, 3);
+
+        // Offered again, as a sender would: refused, and not applied twice.
+        let again = apply_record(
+            &database,
+            &replication,
+            record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'grace')"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(again.status, ApplyStatus::Failed);
+        assert!(again.message.contains("restarted"), "{}", again.message);
+        assert_eq!(row_count(&database).await, 3);
+
+        // The restart decides. Here the log's page cache kept everything, so
+        // all three survive, and the position comes back agreeing with them.
+        drop(replication);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_halt").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        let position = database.replication.applied().high_water(2);
+        assert_eq!(row_count(&database).await as u64, position, "rows and position agree after the restart");
+        assert!(database.replication.apply_halted(2).is_none());
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }
 
     #[tokio::test]

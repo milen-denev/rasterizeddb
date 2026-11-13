@@ -272,6 +272,9 @@ pub struct Replication {
     /// served, a resync during a push) would otherwise both find it not yet
     /// applied, and both apply it.
     apply_locks: DashMap<NodeId, Arc<tokio::sync::Mutex<()>>, ahash::RandomState>,
+    /// Origins whose stream this node has stopped applying until it is
+    /// restarted, and why: see [`Replication::halt_apply`].
+    halted: DashMap<NodeId, String, ahash::RandomState>,
     /// Set when a statement that ran could not be written to the replication
     /// log, so it will never reach a peer. Shown by `SHOW REPLICATION` until
     /// the node restarts: the peers are behind by something only a reseed or
@@ -344,6 +347,7 @@ impl Replication {
             wake: tokio::sync::Notify::new(),
             acks: tokio::sync::Notify::new(),
             apply_locks: DashMap::with_hasher(ahash::RandomState::new()),
+            halted: DashMap::with_hasher(ahash::RandomState::new()),
             capture_failure: parking_lot::Mutex::new(None),
             log: ArcSwapOption::empty(),
             applied: ArcSwap::from_pointee(AppliedState::in_memory()),
@@ -683,6 +687,33 @@ impl Replication {
             .entry(origin)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Stops applying `origin`'s stream for the life of the process.
+    ///
+    /// For a failed sync under an applied batch. The transactions of that
+    /// batch committed in memory and may or may not be on disk; nothing this
+    /// process does afterwards can find out, and neither undoing them (a
+    /// reader may have seen them) nor applying them again is right. A failed
+    /// commit sync is treated the same way everywhere here: the write-ahead
+    /// log refuses further commits until a restart, and the restart's replay
+    /// decides what survived. The positions ride that log, so they come back
+    /// agreeing with the rows.
+    pub fn halt_apply(&self, origin: NodeId, why: String) {
+        log::error!(
+            "Applying origin {}'s stream is halted until this node is restarted: {}",
+            origin,
+            why
+        );
+        self.halted.insert(origin, why);
+    }
+
+    /// Why `origin`'s stream is not being applied, if it is halted.
+    pub fn apply_halted(&self, origin: NodeId) -> Option<String> {
+        if self.halted.is_empty() {
+            return None;
+        }
+        self.halted.get(&origin).map(|why| why.value().clone())
     }
 
     #[inline]
