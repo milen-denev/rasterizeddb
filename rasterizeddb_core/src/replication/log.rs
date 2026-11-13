@@ -34,13 +34,15 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use cacheguard::CacheGuard;
 use parking_lot::Mutex;
 
 use crate::core::storage_providers::CRC;
+use crate::core::wal::Wal;
 
 use super::config::NodeId;
 use super::hlc::{Hlc, NO_HLC};
@@ -49,6 +51,10 @@ use super::protocol::{Reader, TxnRecord, VectorEntry};
 /// Starts every log record. A file that does not begin with one is not this
 /// file, and a record that does not is where the log was torn.
 const RECORD_MAGIC: u32 = 0x5252_4c47; // "RRLG"
+
+/// Starts a record that is real only if a transaction committed: its payload
+/// begins with that transaction's id.
+const RECORD_MAGIC_TX: u32 = 0x5252_4c54; // "RRLT"
 
 /// `magic`, `len`, `crc`.
 const RECORD_HEADER: usize = 12;
@@ -212,14 +218,37 @@ impl SeqIndex {
 /// request. Older ones are read back from the file.
 const HOT_RECORDS: usize = 4096;
 
+/// The file's durability: the database's own write-ahead log, when it has one.
+///
+/// A record appended here is written to the file and then described to that
+/// log, without a sync of its own. The commit that follows syncs the log for
+/// its rows and its outcome, and that one sync covers this record too: they
+/// are records in one log, this one first, and replay stops at the first it
+/// cannot read whole. So a committed transaction's record is on disk whenever
+/// its outcome is, and it costs the commit no second `fdatasync`.
+#[derive(Clone)]
+struct Logged {
+    wal: Arc<Wal>,
+    file_id: u64,
+}
+
 struct LogFile {
-    writer: BufWriter<File>,
+    handle: File,
+    dir: PathBuf,
     path: PathBuf,
+    /// Which file of the series this is. A compaction writes the next one
+    /// under a new name, because the log names a file by its name and replays
+    /// by offset: records for the old layout must never land in the new file.
+    generation: u64,
     /// Bytes written, which is also the offset the next record goes to.
     end: u64,
-    /// Offset of the oldest record still in the file. Non-zero after a
-    /// compaction has dropped a prefix.
-    start: u64,
+    logged: Option<Logged>,
+    /// This node's own records that are only real if their transaction
+    /// committed: sequence to transaction id. Cleared by [`ReplicationLog::confirm`]
+    /// or [`ReplicationLog::void`]; what is left at open is what a crash
+    /// interrupted.
+    conditional: BTreeMap<u64, u64>,
+    compacting: bool,
 }
 
 /// This node's own committed history, as far back as the retention budget goes.
@@ -232,6 +261,12 @@ pub struct ReplicationLog {
     index: Mutex<BTreeMap<NodeId, SeqIndex>>,
     /// The newest records, ready to serve without a read.
     hot: Mutex<std::collections::VecDeque<TxnRecord>>,
+    /// Records voided in memory whose replacement could not be written. They
+    /// read back as void for the life of the process; the next open voids
+    /// them for good.
+    voided: Mutex<std::collections::HashSet<(NodeId, u64)>>,
+    /// Conditional records found at open, until [`ReplicationLog::take_undecided`].
+    pending_at_open: Mutex<BTreeMap<(NodeId, u64), u64>>,
     retention_bytes: u64,
     /// Padded off the two `Mutex` fields above it. Every append does a
     /// `fetch_max` here while holding neither lock, so without the guard the
@@ -267,22 +302,178 @@ mod test_hooks {
         /// whether anything else waits for it.
         pub static SYNC_DELAY: std::cell::Cell<std::time::Duration> =
             const { std::cell::Cell::new(std::time::Duration::ZERO) };
-
-        /// Runs inside `AppliedState::rewrite` between copying the positions
-        /// and swapping the file, to put a `record` exactly in that window.
-        pub static BEFORE_STATE_SWAP: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
-            const { std::cell::RefCell::new(None) };
     }
 }
 
-/// Writes one framed record and returns how many bytes it took.
-fn write_record(writer: &mut impl Write, payload: &[u8]) -> io::Result<u64> {
-    let crc = CRC.checksum(payload);
-    writer.write_all(&RECORD_MAGIC.to_le_bytes())?;
-    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
-    writer.write_all(&crc.to_le_bytes())?;
-    writer.write_all(payload)?;
-    Ok((RECORD_HEADER + payload.len()) as u64)
+/// One record framed for the file: `magic`, `len`, `crc`, then the payload,
+/// which for a conditional record starts with its transaction id.
+fn frame(body: &[u8], local_tx: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RECORD_HEADER + 8 + body.len());
+    if local_tx == 0 {
+        out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&CRC.checksum(body).to_le_bytes());
+    } else {
+        let tx = local_tx.to_le_bytes();
+        let mut digest = CRC.digest();
+        digest.update(&tx);
+        digest.update(body);
+        out.extend_from_slice(&RECORD_MAGIC_TX.to_le_bytes());
+        out.extend_from_slice(&((body.len() + 8) as u32).to_le_bytes());
+        out.extend_from_slice(&digest.finalize().to_le_bytes());
+        out.extend_from_slice(&tx);
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+/// Bytes a framed record carries ahead of its body.
+fn lead(local_tx: u64) -> u64 {
+    RECORD_HEADER as u64 + if local_tx == 0 { 0 } else { 8 }
+}
+
+/// The file of generation `n` in `dir`.
+fn generation_path(dir: &Path, generation: u64) -> PathBuf {
+    if generation == 0 {
+        dir.join(LOG_FILE)
+    } else {
+        dir.join(format!("{LOG_FILE}.{generation}"))
+    }
+}
+
+/// The generation a file name in the directory belongs to, if it is a log.
+fn generation_of(name: &str) -> Option<u64> {
+    if name == LOG_FILE {
+        return Some(0);
+    }
+    let rest = name.strip_prefix(LOG_FILE)?.strip_prefix('.')?;
+    if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+const COMPACTING_NAME: &str = "db_replication.log.compacting";
+
+/// What a scan of a log file found.
+struct Scanned {
+    index: BTreeMap<NodeId, SeqIndex>,
+    hot: std::collections::VecDeque<TxnRecord>,
+    conditional: BTreeMap<(NodeId, u64), u64>,
+    last_hlc: Hlc,
+    good_end: u64,
+}
+
+fn scan(path: &Path, bytes: &[u8]) -> Scanned {
+    let mut index: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
+    let mut hot = std::collections::VecDeque::with_capacity(HOT_RECORDS);
+    let mut conditional: BTreeMap<(NodeId, u64), u64> = BTreeMap::new();
+    let mut last_hlc = NO_HLC;
+
+    let mut at = 0usize;
+    let good_end = loop {
+        if at + RECORD_HEADER > bytes.len() {
+            break at;
+        }
+        let magic = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+        if magic != RECORD_MAGIC && magic != RECORD_MAGIC_TX {
+            log::error!(
+                "Replication log {} has an unrecognised record at byte {}; everything from there is dropped",
+                path.display(),
+                at
+            );
+            break at;
+        }
+        let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes")) as usize;
+        let crc = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes"));
+
+        let payload_at = at + RECORD_HEADER;
+        let Some(payload) = bytes.get(payload_at..payload_at + len) else {
+            // A record whose length runs past the end is the torn tail.
+            break at;
+        };
+        if CRC.checksum(payload) != crc {
+            if payload_at + len == bytes.len() {
+                log::warn!(
+                    "Replication log {} ends in a record that was never whole (byte {}); cutting it off",
+                    path.display(),
+                    at
+                );
+            } else {
+                log::error!(
+                    "Replication log {} fails its checksum at byte {} with {} byte(s) after it; \
+                     everything from there is dropped",
+                    path.display(),
+                    at,
+                    bytes.len() - payload_at - len
+                );
+            }
+            break at;
+        }
+        let (local_tx, body_at, body) = if magic == RECORD_MAGIC_TX {
+            if len < 8 {
+                break at;
+            }
+            (
+                u64::from_le_bytes(payload[..8].try_into().expect("8 bytes")),
+                payload_at + 8,
+                &payload[8..],
+            )
+        } else {
+            (0, payload_at, payload)
+        };
+
+        match TxnRecord::decode(&mut Reader::new(body)) {
+            Ok(record) => {
+                index.entry(record.origin).or_default().insert(
+                    record.seq,
+                    RecordLoc {
+                        offset: body_at as u64,
+                        len: body.len() as u32,
+                    },
+                );
+                // A later record under a sequence replaces the earlier one:
+                // that is how a transaction that never committed is voided.
+                if local_tx != 0 {
+                    conditional.insert((record.origin, record.seq), local_tx);
+                } else {
+                    conditional.remove(&(record.origin, record.seq));
+                }
+                last_hlc = last_hlc.max(record.commit_hlc);
+                if let Some(held) = hot
+                    .iter_mut()
+                    .rev()
+                    .find(|r: &&mut TxnRecord| r.origin == record.origin && r.seq == record.seq)
+                {
+                    *held = record;
+                } else {
+                    if hot.len() == HOT_RECORDS {
+                        hot.pop_front();
+                    }
+                    hot.push_back(record);
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "Replication log {} holds an undecodable record at byte {} ({}); everything from there is dropped",
+                    path.display(),
+                    at,
+                    e
+                );
+                break at;
+            }
+        }
+
+        at = payload_at + len;
+    };
+
+    Scanned {
+        index,
+        hot,
+        conditional,
+        last_hlc,
+        good_end: good_end as u64,
+    }
 }
 
 impl ReplicationLog {
@@ -292,116 +483,161 @@ impl ReplicationLog {
             file: Mutex::new(None),
             index: Mutex::new(BTreeMap::new()),
             hot: Mutex::new(std::collections::VecDeque::with_capacity(HOT_RECORDS)),
+            voided: Mutex::new(std::collections::HashSet::new()),
+            pending_at_open: Mutex::new(BTreeMap::new()),
             retention_bytes,
             last_hlc: std::sync::atomic::AtomicU64::new(NO_HLC).into(),
         }
     }
 
+    /// Opens the log in `dir` with no write-ahead log behind it: a record is
+    /// durable when [`ReplicationLog::sync`] says so.
+    pub fn open(dir: &Path, retention_bytes: u64) -> io::Result<ReplicationLog> {
+        Self::open_logged(dir, retention_bytes, None)
+    }
+
     /// Opens the log in `dir`, rebuilding its index from what is already there.
     ///
-    /// A torn tail — the last record half-written when the process died — is
-    /// truncated rather than rejected: it is the expected shape of a crash, and
-    /// everything before it is still good.
-    pub fn open(dir: &Path, retention_bytes: u64) -> io::Result<ReplicationLog> {
-        let path = dir.join(LOG_FILE);
+    /// `wal` is the database's own log, already replayed: every record a
+    /// durable commit depends on is back in the file by now. A torn tail — the
+    /// last record half-written when the machine died, and never described to
+    /// that log — is cut off: it belongs to a transaction that did not commit.
+    pub fn open_logged(
+        dir: &Path,
+        retention_bytes: u64,
+        wal: Option<Arc<Wal>>,
+    ) -> io::Result<ReplicationLog> {
+        // The newest generation is the log. An older one beside it is what a
+        // compaction had not yet deleted when the process stopped.
+        let mut generations: Vec<u64> = Vec::new();
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name == COMPACTING_NAME {
+                let _ = std::fs::remove_file(entry.path());
+            } else if let Some(generation) = generation_of(&name) {
+                generations.push(generation);
+            }
+        }
+        generations.sort_unstable();
+        let generation = generations.last().copied().unwrap_or(0);
+        for old in generations.iter().copied().filter(|g| *g != generation) {
+            let path = generation_path(dir, old);
+            Self::retire(wal.as_ref(), &path);
+        }
+
+        let path = generation_path(dir, generation);
         let mut handle = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
 
-        let mut index: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
-        let mut hot = std::collections::VecDeque::with_capacity(HOT_RECORDS);
-        let mut last_hlc = NO_HLC;
-
         let mut bytes = Vec::new();
         handle.read_to_end(&mut bytes)?;
+        let scanned = scan(&path, &bytes);
 
-        let mut at = 0usize;
-        let good_end = loop {
-            if at + RECORD_HEADER > bytes.len() {
-                break at;
-            }
-            let magic = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
-            if magic != RECORD_MAGIC {
-                log::warn!(
-                    "Replication log {} has an unrecognised record at byte {}; truncating there",
-                    path.display(),
-                    at
-                );
-                break at;
-            }
-            let len =
-                u32::from_le_bytes(bytes[at + 4..at + 8].try_into().expect("4 bytes")) as usize;
-            let crc = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes"));
-
-            let payload_at = at + RECORD_HEADER;
-            let Some(payload) = bytes.get(payload_at..payload_at + len) else {
-                // A record whose length runs past the end is the torn tail.
-                break at;
-            };
-            if CRC.checksum(payload) != crc {
-                log::warn!(
-                    "Replication log {} fails its checksum at byte {}; truncating there",
-                    path.display(),
-                    at
-                );
-                break at;
-            }
-
-            match TxnRecord::decode(&mut Reader::new(payload)) {
-                Ok(record) => {
-                    index.entry(record.origin).or_default().insert(
-                        record.seq,
-                        RecordLoc {
-                            offset: at as u64,
-                            len: len as u32,
-                        },
-                    );
-                    last_hlc = last_hlc.max(record.commit_hlc);
-                    if hot.len() == HOT_RECORDS {
-                        hot.pop_front();
-                    }
-                    hot.push_back(record);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Replication log {} holds an undecodable record at byte {} ({}); truncating there",
-                        path.display(),
-                        at,
-                        e
-                    );
-                    break at;
-                }
-            }
-
-            at = payload_at + len;
-        };
-
-        if (good_end as u64) < bytes.len() as u64 {
-            handle.set_len(good_end as u64)?;
+        if scanned.good_end < bytes.len() as u64 {
+            handle.set_len(scanned.good_end)?;
+            handle.sync_data()?;
         }
-        handle.seek(SeekFrom::Start(good_end as u64))?;
+
+        let logged = wal.and_then(|wal| Self::attach(&wal, &path));
 
         log::info!(
-            "Replication log {} opened: {} bytes, {} origin(s)",
+            "Replication log {} opened: {} bytes, {} origin(s){}",
             path.display(),
-            good_end,
-            index.len()
+            scanned.good_end,
+            scanned.index.len(),
+            if logged.is_some() { "" } else { ", not write-ahead logged" }
         );
 
-        Ok(ReplicationLog {
+        let log = ReplicationLog {
             file: Mutex::new(Some(LogFile {
-                writer: BufWriter::with_capacity(64 * 1024, handle),
+                handle,
+                dir: dir.to_path_buf(),
                 path,
-                end: good_end as u64,
-                start: 0,
+                generation,
+                end: scanned.good_end,
+                logged,
+                // Keyed by sequence alone: only this node's own records are
+                // ever conditional, and one node has one stream.
+                conditional: scanned.conditional.iter().map(|((_, seq), tx)| (*seq, *tx)).collect(),
+                compacting: false,
             })),
-            index: Mutex::new(index),
-            hot: Mutex::new(hot),
+            index: Mutex::new(scanned.index),
+            hot: Mutex::new(scanned.hot),
+            voided: Mutex::new(std::collections::HashSet::new()),
+            pending_at_open: Mutex::new(scanned.conditional),
             retention_bytes,
-            last_hlc: std::sync::atomic::AtomicU64::new(last_hlc).into(),
-        })
+            last_hlc: std::sync::atomic::AtomicU64::new(scanned.last_hlc).into(),
+        };
+        Ok(log)
+    }
+
+    /// Registers `path` with the write-ahead log, or says why it is not.
+    fn attach(wal: &Arc<Wal>, path: &Path) -> Option<Logged> {
+        let name = path.file_name()?.to_str()?;
+        let file_id = crate::core::wal::file_id_for_name(name);
+        match wal.register_file(file_id, path.to_path_buf()) {
+            Ok(()) => Some(Logged {
+                wal: wal.clone(),
+                file_id,
+            }),
+            Err(e) => {
+                log::error!(
+                    "Replication log {} could not be registered with the write-ahead log ({}); \
+                     it is synced on its own instead",
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Voids the log's records for a file that is going away, then removes
+    /// it. Left behind on any failure: the next open tries again.
+    fn retire(wal: Option<&Arc<Wal>>, path: &Path) {
+        if let Some(wal) = wal {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                return;
+            };
+            if let Err(e) = wal.forget_dropped_files(&[crate::core::wal::file_id_for_name(name)]) {
+                log::warn!(
+                    "Could not void the log records of {} ({}); keeping the file for now",
+                    path.display(),
+                    e
+                );
+                return;
+            }
+        }
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                log::warn!("Could not remove {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    /// Whether appends are covered by the database's write-ahead log. When
+    /// they are not, a caller that needs a record durable calls
+    /// [`ReplicationLog::sync`].
+    pub fn is_logged(&self) -> bool {
+        self.file
+            .lock()
+            .as_ref()
+            .is_some_and(|log| log.logged.is_some())
+    }
+
+    /// The records a crash left undecided: each is real only if its
+    /// transaction committed. Taken once, by whoever can ask.
+    pub fn take_undecided(&self) -> Vec<(NodeId, u64, u64)> {
+        std::mem::take(&mut *self.pending_at_open.lock())
+            .into_iter()
+            .map(|((origin, seq), tx)| (origin, seq, tx))
+            .collect()
     }
 
     /// The highest commit timestamp this log has seen, so a restarting node can
@@ -410,23 +646,53 @@ impl ReplicationLog {
         self.last_hlc.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Adds a record. Cheap: an encode and a buffered write, no `fsync`.
+    /// Adds a record that stands on its own: a relayed one, or one whose
+    /// transaction has nothing durable to commit.
     pub fn append(&self, record: &TxnRecord) -> io::Result<()> {
-        let mut payload = Vec::with_capacity(record.encoded_size_hint());
-        record.encode(&mut payload);
+        self.append_for(record, 0)
+    }
+
+    /// Adds a record. One positional write and one write-ahead log record, no
+    /// `fsync`.
+    ///
+    /// `local_tx`, when not zero, is the transaction the record belongs to:
+    /// the record is real only if that transaction committed. It is written
+    /// before the commit, so that no committed transaction can be without its
+    /// record; [`ReplicationLog::confirm`] or [`ReplicationLog::void`] settles
+    /// it afterwards, and the next open settles what a crash left.
+    pub fn append_for(&self, record: &TxnRecord, local_tx: u64) -> io::Result<()> {
+        let mut body = Vec::with_capacity(record.encoded_size_hint());
+        record.encode(&mut body);
+        let framed = frame(&body, local_tx);
 
         {
             let mut file = self.file.lock();
             if let Some(log) = file.as_mut() {
                 let offset = log.end;
-                let written = write_record(&mut log.writer, &payload)?;
-                log.end += written;
+                std::os::unix::fs::FileExt::write_all_at(&log.handle, &framed, offset)?;
+                // The file first, then the log: a checkpoint syncs the files
+                // its records name and drops the log, so every record must
+                // already be in its file by the time it is logged.
+                if let Some(logged) = &log.logged {
+                    if let Err(e) = logged.wal.log_and_commit_deferred(logged.file_id, offset, &framed) {
+                        // Not described to the log, so not durable and not
+                        // counted: take the bytes back out of the file.
+                        let _ = log.handle.set_len(offset);
+                        return Err(e);
+                    }
+                }
+                log.end += framed.len() as u64;
+                if local_tx != 0 {
+                    log.conditional.insert(record.seq, local_tx);
+                } else {
+                    log.conditional.remove(&record.seq);
+                }
 
                 self.index.lock().entry(record.origin).or_default().insert(
                     record.seq,
                     RecordLoc {
-                        offset,
-                        len: payload.len() as u32,
+                        offset: offset + lead(local_tx),
+                        len: body.len() as u32,
                     },
                 );
             }
@@ -434,53 +700,102 @@ impl ReplicationLog {
 
         self.last_hlc
             .fetch_max(record.commit_hlc, std::sync::atomic::Ordering::AcqRel);
+        self.remember(record.clone());
 
-        {
-            let mut hot = self.hot.lock();
-            if hot.len() == HOT_RECORDS {
-                hot.pop_front();
-            }
-            hot.push_back(record.clone());
-        }
-
-        self.compact_if_needed()?;
+        self.compact_if_needed();
         Ok(())
     }
 
-    /// Makes everything appended so far durable. Called by the periodic
-    /// flusher and at shutdown.
+    /// Puts `record` in the hot window, over any record it replaces.
+    fn remember(&self, record: TxnRecord) {
+        let mut hot = self.hot.lock();
+        if let Some(held) = hot
+            .iter_mut()
+            .rev()
+            .find(|r| r.origin == record.origin && r.seq == record.seq)
+        {
+            *held = record;
+            return;
+        }
+        if hot.len() == HOT_RECORDS {
+            hot.pop_front();
+        }
+        hot.push_back(record);
+    }
+
+    /// The record's transaction committed: nothing about it is conditional
+    /// any more.
+    pub fn confirm(&self, seq: u64) {
+        if let Some(log) = self.file.lock().as_mut() {
+            log.conditional.remove(&seq);
+        }
+    }
+
+    /// The transaction behind `origin:seq` did not commit. Its place in the
+    /// stream is kept, by a record that carries nothing: a peer applies it by
+    /// moving past it, so the stream stays without holes.
     ///
-    /// The buffer is handed to the kernel under the `file` lock, and the
-    /// `fdatasync` runs on a duplicate of the descriptor *after* the lock is
-    /// released. Every local commit appends under that lock, so syncing while
-    /// holding it stalled all committers for one fsync per flusher tick.
+    /// Voided in memory whatever happens to the write: an error means only
+    /// that the void is not on disk yet, and the next open, which finds the
+    /// transaction uncommitted, writes it then.
+    pub fn void(&self, origin: NodeId, seq: u64, commit_hlc: Hlc) -> io::Result<()> {
+        let void = TxnRecord {
+            origin,
+            seq,
+            commit_hlc,
+            flags: super::protocol::FLAG_VOID,
+            statements: Vec::new(),
+            tables: Vec::new(),
+        };
+        match self.append_for(&void, 0) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.voided.lock().insert((origin, seq));
+                self.remember(void);
+                Err(e)
+            }
+        }
+    }
+
+    /// Makes everything appended so far durable on its own. Called by the
+    /// periodic flusher and at shutdown, and by a commit when no write-ahead
+    /// log covers the file.
     ///
-    /// Durability is unchanged: every byte appended before this call was
-    /// written to the inode before the lock was dropped, and the duplicate
-    /// syncs that same inode. If a compaction swaps the file in between, it
-    /// copied those bytes into its replacement and synced the replacement
-    /// before renaming it into place, so they are durable either way.
+    /// The `fdatasync` runs on a duplicate of the descriptor *after* the lock
+    /// is released. Every local commit appends under that lock, so syncing
+    /// while holding it stalled all committers for one fsync per flusher tick.
     pub fn flush(&self) -> io::Result<()> {
         let handle = {
-            let mut file = self.file.lock();
-            match file.as_mut() {
-                Some(log) => {
-                    log.writer.flush()?;
-                    log.writer.get_ref().try_clone()?
-                }
+            let file = self.file.lock();
+            match file.as_ref() {
+                Some(log) => log.handle.try_clone()?,
                 None => return Ok(()),
             }
         };
         sync_unlocked(&handle)
     }
 
+    /// [`ReplicationLog::flush`], under the name a commit calls it by.
+    pub fn sync(&self) -> io::Result<()> {
+        self.flush()
+    }
+
     /// Bytes the log currently occupies.
     pub fn bytes(&self) -> u64 {
-        self.file
-            .lock()
-            .as_ref()
-            .map(|log| log.end - log.start)
-            .unwrap_or(0)
+        self.file.lock().as_ref().map(|log| log.end).unwrap_or(0)
+    }
+
+    /// Every origin the log holds something for.
+    pub fn origins(&self) -> Vec<NodeId> {
+        let mut origins: Vec<NodeId> = self.index.lock().keys().copied().collect();
+        if origins.is_empty() {
+            for record in self.hot.lock().iter() {
+                if !origins.contains(&record.origin) {
+                    origins.push(record.origin);
+                }
+            }
+        }
+        origins
     }
 
     /// The newest sequence held for `origin`, or 0.
@@ -501,9 +816,9 @@ impl ReplicationLog {
         self.hot
             .lock()
             .iter()
-            .rev()
-            .find(|record| record.origin == origin)
+            .filter(|record| record.origin == origin)
             .map(|record| record.seq)
+            .max()
             .unwrap_or(0)
     }
 
@@ -528,8 +843,9 @@ impl ReplicationLog {
         self.hot
             .lock()
             .iter()
-            .find(|record| record.origin == origin)
+            .filter(|record| record.origin == origin)
             .map(|record| record.seq)
+            .min()
             .unwrap_or(0)
     }
 
@@ -541,10 +857,6 @@ impl ReplicationLog {
     }
 
     /// Everything held for `origin` after `after_seq`, in order.
-    ///
-    /// Returns the records and whether more remain past the limits. Serves from
-    /// the hot window without touching the disk whenever the request is covered
-    /// by it, which is the usual case.
     pub fn read_after(
         &self,
         origin: NodeId,
@@ -552,15 +864,35 @@ impl ReplicationLog {
         max_records: usize,
         max_bytes: usize,
     ) -> io::Result<(Vec<TxnRecord>, bool)> {
+        self.read_range(origin, after_seq, u64::MAX, max_records, max_bytes)
+    }
+
+    /// Everything held for `origin` after `after_seq` and up to `upto`, in
+    /// sequence order.
+    ///
+    /// Returns the records and whether more remain past the limits. Serves from
+    /// the hot window without touching the disk whenever the request is covered
+    /// by it, which is the usual case.
+    pub fn read_range(
+        &self,
+        origin: NodeId,
+        after_seq: u64,
+        upto: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> io::Result<(Vec<TxnRecord>, bool)> {
         if max_records == 0 {
-            return Ok((Vec::new(), self.highest(origin) > after_seq));
+            return Ok((Vec::new(), self.highest(origin).min(upto) > after_seq));
+        }
+        if upto <= after_seq {
+            return Ok((Vec::new(), false));
         }
 
-        if let Some(served) = self.read_hot(origin, after_seq, max_records, max_bytes) {
+        if let Some(served) = self.read_hot(origin, after_seq, upto, max_records, max_bytes) {
             return Ok(served);
         }
 
-        let locations: Vec<RecordLoc> = {
+        let locations: Vec<(u64, RecordLoc)> = {
             let index = self.index.lock();
             match index.get(&origin) {
                 // `after_seq + 1..` rather than an exclusive bound on `after_seq`
@@ -568,7 +900,7 @@ impl ReplicationLog {
                 // range that silently reports "nothing to send".
                 Some(per_origin) => per_origin
                     .iter_from(after_seq.saturating_add(1))
-                    .map(|(_, loc)| loc)
+                    .take_while(|(seq, _)| *seq <= upto)
                     .take(max_records + 1)
                     .collect(),
                 None => Vec::new(),
@@ -583,23 +915,21 @@ impl ReplicationLog {
         let mut bytes = 0usize;
         let mut more = false;
 
-        let mut file = self.file.lock();
-        let Some(log) = file.as_mut() else {
-            // In-memory: whatever the hot window could not serve is gone.
-            return Ok((Vec::new(), false));
+        // Positional reads on a duplicate, with the lock let go: the handle
+        // is the appender's, and a `seek` on it once moved where the next
+        // append went, so every record appended after a catch-up from the
+        // file overwrote an older one.
+        let handle = {
+            let file = self.file.lock();
+            let Some(log) = file.as_ref() else {
+                // In-memory: whatever the hot window could not serve is gone.
+                return Ok((Vec::new(), false));
+            };
+            log.handle.try_clone()?
         };
-        // The record being read may still be sitting in the write buffer.
-        log.writer.flush()?;
-        // Positional reads: the handle is the writer's, opened without
-        // `O_APPEND`, so a `seek` here moved where the next append went and
-        // every record appended after a catch-up from the file overwrote an
-        // older one. A peer then read "frame ended in the middle of a field"
-        // and stayed down, and the next open cut the log at the first
-        // overwritten record.
-        let handle = log.writer.get_ref();
 
         let mut payload = Vec::new();
-        for loc in locations {
+        for (seq, loc) in locations {
             if records.len() == max_records || (bytes >= max_bytes && !records.is_empty()) {
                 more = true;
                 break;
@@ -607,21 +937,40 @@ impl ReplicationLog {
 
             payload.clear();
             payload.resize(loc.len as usize, 0);
-            std::os::unix::fs::FileExt::read_exact_at(handle, &mut payload, loc.offset + RECORD_HEADER as u64)?;
+            std::os::unix::fs::FileExt::read_exact_at(&handle, &mut payload, loc.offset)?;
 
             match TxnRecord::decode(&mut Reader::new(&payload)) {
-                Ok(record) => {
+                Ok(record) if record.origin == origin && record.seq == seq => {
                     bytes += loc.len as usize;
                     records.push(record);
+                }
+                // A compaction moved the file under this read: the offsets
+                // were the old file's. The caller comes round again.
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the replication log was compacted during the read",
+                    ));
                 }
                 Err(e) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "replication log record at {} is unreadable: {}",
-                            loc.offset, e
+                            "replication log record {}:{} at {} is unreadable: {}",
+                            origin, seq, loc.offset, e
                         ),
                     ));
+                }
+            }
+        }
+
+        let voided = self.voided.lock();
+        if !voided.is_empty() {
+            for record in &mut records {
+                if voided.contains(&(record.origin, record.seq)) {
+                    record.flags = super::protocol::FLAG_VOID;
+                    record.statements.clear();
+                    record.tables.clear();
                 }
             }
         }
@@ -638,23 +987,29 @@ impl ReplicationLog {
         &self,
         origin: NodeId,
         after_seq: u64,
+        upto: u64,
         max_records: usize,
         max_bytes: usize,
     ) -> Option<(Vec<TxnRecord>, bool)> {
         let hot = self.hot.lock();
 
-        let oldest_for_origin = hot.iter().find(|r| r.origin == origin)?.seq;
+        let oldest_for_origin = hot.iter().filter(|r| r.origin == origin).map(|r| r.seq).min()?;
         if oldest_for_origin > after_seq + 1 {
             return None;
         }
 
+        let mut wanted: Vec<&TxnRecord> = hot
+            .iter()
+            .filter(|r| r.origin == origin && r.seq > after_seq && r.seq <= upto)
+            .collect();
+        // A relayed stream can reach the window out of order; this node's own
+        // is appended in sequence order, and sorting it costs a scan.
+        wanted.sort_by_key(|r| r.seq);
+
         let mut records = Vec::new();
         let mut bytes = 0usize;
         let mut more = false;
-        for record in hot
-            .iter()
-            .filter(|r| r.origin == origin && r.seq > after_seq)
-        {
+        for record in wanted {
             if records.len() == max_records || (bytes >= max_bytes && !records.is_empty()) {
                 more = true;
                 break;
@@ -666,118 +1021,360 @@ impl ReplicationLog {
         Some((records, more))
     }
 
-    /// Drops the oldest half of the file once it outgrows its budget.
+    /// Starts a new file holding the newest half once the log outgrows its
+    /// budget, and drops the old one.
     ///
-    /// Rewriting rather than truncating in place: the records are variable
-    /// length, so there is no cheaper way to drop a prefix, and halving means
-    /// the rewrite happens once per half-budget of traffic rather than once per
-    /// record.
-    fn compact_if_needed(&self) -> io::Result<()> {
+    /// A new file under a new name rather than a rewrite of this one: the
+    /// write-ahead log replays "these bytes at this offset of the file named
+    /// so", and a record for the old layout landing in the new file would
+    /// overwrite whatever sits there now. The old name's records are voided
+    /// in that log before its file is removed.
+    ///
+    /// The copy runs with the lock let go, because every commit appends under
+    /// it; only what was appended during the copy is moved with it held.
+    fn compact_if_needed(&self) {
         if self.retention_bytes == 0 {
-            return Ok(());
+            return;
         }
-        {
-            let file = self.file.lock();
-            match file.as_ref() {
-                Some(log) if log.end - log.start > self.retention_bytes => {}
-                _ => return Ok(()),
+        if let Err(e) = self.compact() {
+            log::warn!("Replication log compaction failed, will be tried again: {}", e);
+            if let Some(log) = self.file.lock().as_mut() {
+                log.compacting = false;
+                let _ = std::fs::remove_file(log.dir.join(COMPACTING_NAME));
             }
         }
+    }
 
+    fn compact(&self) -> io::Result<()> {
+        // Phase one, locked: decide what stays and take a handle to read it.
+        let (source, keep_from, copied_through, dir, generation) = {
+            let mut file = self.file.lock();
+            let Some(log) = file.as_mut() else {
+                return Ok(());
+            };
+            if log.compacting || log.end <= self.retention_bytes {
+                return Ok(());
+            }
+            log.compacting = true;
+            (
+                log.handle.try_clone()?,
+                log.end - self.retention_bytes / 2,
+                log.end,
+                log.dir.clone(),
+                log.generation,
+            )
+        };
+
+        let kept_in = |from: u64, to: u64| -> Vec<(NodeId, u64, RecordLoc)> {
+            let index = self.index.lock();
+            let mut kept: Vec<(NodeId, u64, RecordLoc)> = Vec::new();
+            for (origin, per_origin) in index.iter() {
+                for (seq, loc) in per_origin.iter() {
+                    if loc.offset >= from && loc.offset < to {
+                        kept.push((*origin, seq, loc));
+                    }
+                }
+            }
+            kept.sort_unstable_by_key(|(_, _, loc)| loc.offset);
+            kept
+        };
+
+        // Phase two, unlocked: copy.
+        let temp_path = dir.join(COMPACTING_NAME);
+        let mut target = BufWriter::with_capacity(256 * 1024, File::create(&temp_path)?);
+        let mut rebuilt: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
+        let mut end = 0u64;
+        let mut body = Vec::new();
+        let mut copy = |kept: Vec<(NodeId, u64, RecordLoc)>,
+                        conditional: &BTreeMap<u64, u64>,
+                        target: &mut BufWriter<File>,
+                        end: &mut u64,
+                        rebuilt: &mut BTreeMap<NodeId, SeqIndex>|
+         -> io::Result<()> {
+            for (origin, seq, loc) in kept {
+                body.clear();
+                body.resize(loc.len as usize, 0);
+                std::os::unix::fs::FileExt::read_exact_at(&source, &mut body, loc.offset)?;
+                let local_tx = conditional.get(&seq).copied().unwrap_or(0);
+                let framed = frame(&body, local_tx);
+                target.write_all(&framed)?;
+                rebuilt.entry(origin).or_default().insert(
+                    seq,
+                    RecordLoc {
+                        offset: *end + lead(local_tx),
+                        len: loc.len,
+                    },
+                );
+                *end += framed.len() as u64;
+            }
+            Ok(())
+        };
+        let conditional_then = self
+            .file
+            .lock()
+            .as_ref()
+            .map(|log| log.conditional.clone())
+            .unwrap_or_default();
+        copy(
+            kept_in(keep_from, copied_through),
+            &conditional_then,
+            &mut target,
+            &mut end,
+            &mut rebuilt,
+        )?;
+        target.flush()?;
+        target.get_ref().sync_data()?;
+
+        // Phase three, locked: what arrived meanwhile, then the switch.
         let mut file = self.file.lock();
         let Some(log) = file.as_mut() else {
             return Ok(());
         };
-        if log.end - log.start <= self.retention_bytes {
-            // Someone else compacted while this call waited for the lock.
-            return Ok(());
-        }
-
-        log.writer.flush()?;
-
-        // Keep everything from the point where the newest half begins.
-        let keep_from = log.end - self.retention_bytes / 2;
-        let mut index = self.index.lock();
-
-        let mut kept: Vec<(NodeId, u64, RecordLoc)> = Vec::new();
-        for (origin, per_origin) in index.iter() {
-            for (seq, loc) in per_origin.iter() {
-                if loc.offset >= keep_from {
-                    kept.push((*origin, seq, loc));
-                }
-            }
-        }
-        kept.sort_unstable_by_key(|(_, _, loc)| loc.offset);
-
-        let temp_path = log.path.with_extension("compacting");
-        let mut source = OpenOptions::new().read(true).open(&log.path)?;
-        let mut target = BufWriter::with_capacity(64 * 1024, File::create(&temp_path)?);
-
-        let mut rebuilt: BTreeMap<NodeId, SeqIndex> = BTreeMap::new();
-        let mut end = 0u64;
-        let mut payload = Vec::new();
-        for (origin, seq, loc) in kept {
-            source.seek(SeekFrom::Start(loc.offset + RECORD_HEADER as u64))?;
-            payload.clear();
-            payload.resize(loc.len as usize, 0);
-            source.read_exact(&mut payload)?;
-
-            let offset = end;
-            end += write_record(&mut target, &payload)?;
-            rebuilt.entry(origin).or_default().insert(
-                seq,
-                RecordLoc {
-                    offset,
-                    len: loc.len,
-                },
-            );
-        }
-
+        let late = kept_in(copied_through, u64::MAX);
+        // A record voided or confirmed during the copy is re-framed as it is
+        // now: the late pass rewrites what it supersedes.
+        let moved_late = !late.is_empty();
+        copy(late, &log.conditional, &mut target, &mut end, &mut rebuilt)?;
         target.flush()?;
-        target.get_ref().sync_data()?;
+        if moved_late {
+            target.get_ref().sync_data()?;
+        }
         drop(target);
 
-        // Rename over the original, so a crash mid-compaction leaves either the
-        // old log or the new one and never a half of each.
-        std::fs::rename(&temp_path, &log.path)?;
+        let next_generation = generation + 1;
+        let next_path = generation_path(&dir, next_generation);
+        // Renamed into place whole and synced, so a crash leaves either the
+        // old file alone or both, and an open takes the newer.
+        std::fs::rename(&temp_path, &next_path)?;
+        crate::core::wal::sync_parent_dir(&next_path)?;
 
-        let mut handle = OpenOptions::new().read(true).write(true).open(&log.path)?;
-        handle.seek(SeekFrom::Start(end))?;
+        let handle = OpenOptions::new().read(true).write(true).open(&next_path)?;
+        let wal = log.logged.as_ref().map(|logged| logged.wal.clone());
+        let logged = wal.as_ref().and_then(|wal| Self::attach(wal, &next_path));
 
         log::info!(
-            "Replication log compacted: {} bytes -> {} bytes",
-            log.end - log.start,
-            end
+            "Replication log compacted: {} bytes -> {} bytes (generation {})",
+            log.end,
+            end,
+            next_generation
         );
 
-        log.writer = BufWriter::with_capacity(64 * 1024, handle);
+        let old_path = std::mem::replace(&mut log.path, next_path);
+        log.handle = handle;
+        log.generation = next_generation;
         log.end = end;
-        log.start = 0;
-        *index = rebuilt;
+        log.logged = logged;
+        log.compacting = false;
+        *self.index.lock() = rebuilt;
+        drop(file);
 
+        Self::retire(wal.as_ref(), &old_path);
         Ok(())
     }
 }
 
-/// How far this node has applied each other origin's stream.
-pub struct AppliedState {
-    positions: Mutex<BTreeMap<NodeId, u64>>,
-    file: Mutex<Option<BufWriter<File>>>,
-    path: Option<PathBuf>,
-    /// Records appended since the file was last rewritten, so it does not grow
-    /// without bound when one origin is advanced millions of times.
-    /// Padded for the same reason: incremented per applied record, and its
-    /// unpadded neighbour is the writer `Mutex`.
-    appends: CacheGuard<std::sync::atomic::AtomicU64>,
-    /// One rewrite at a time. Several `record` calls can cross the threshold
-    /// together, and two rewrites sharing the one temp path would interleave
-    /// their writes into it and rename a file missing positions.
-    rewriting: Mutex<()>,
+/// Starts a slot file. Never the start of an origin's id and a sequence, which
+/// is how the file before this one began.
+const STATE_MAGIC: [u8; 16] = *b"RDB-REPL-POS-3\0\0";
+/// The header and every slot are this long, so no slot straddles a sector:
+/// an overwrite of one is all there or not at all.
+const STATE_SLOT: u64 = 64;
+
+pub const INTENTS_FILE: &str = "db_replication.intents";
+const INTENT_LEN: u64 = 48;
+/// Past this the intents file is emptied the next time nothing is waiting on
+/// it.
+const INTENTS_TRIM_AT: u64 = 1 << 20;
+
+/// One origin's slot: how far its stream is applied *and durable*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Position {
+    origin: NodeId,
+    seq: u64,
+    /// Which run of intents builds on this slot. Raised whenever the slot is
+    /// set by anything but the intents themselves settling, so an intent left
+    /// from before can never be read against a position it was not written
+    /// for.
+    epoch: u64,
 }
 
-/// Rewrite the state file after this many appends. At 16 bytes each that caps
-/// it at around 256 KiB between rewrites.
-const STATE_REWRITE_AFTER: u64 = 16_384;
+impl Position {
+    fn encode(&self) -> [u8; STATE_SLOT as usize] {
+        let mut out = [0u8; STATE_SLOT as usize];
+        out[..8].copy_from_slice(&self.origin.to_le_bytes());
+        out[8..16].copy_from_slice(&self.seq.to_le_bytes());
+        out[16..24].copy_from_slice(&self.epoch.to_le_bytes());
+        // Never zero for a written slot, so an all-zero slot is an empty one.
+        out[32] = 1;
+        let crc = CRC.checksum(&out[..33]);
+        out[36..40].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// `Ok(None)` for a slot nothing was written to.
+    fn decode(bytes: &[u8]) -> Result<Option<Position>, ()> {
+        if bytes.iter().all(|b| *b == 0) {
+            return Ok(None);
+        }
+        let crc = u32::from_le_bytes(bytes[36..40].try_into().expect("4 bytes"));
+        if bytes[32] != 1 || CRC.checksum(&bytes[..33]) != crc {
+            return Err(());
+        }
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        Ok(Some(Position {
+            origin: word(0),
+            seq: word(8),
+            epoch: word(16),
+        }))
+    }
+}
+
+/// "`origin` moves from `prev` to `seq`, if transaction `tx` committed."
+/// A `tx` of zero is a step no transaction stands behind (a record that wrote
+/// no row): it holds if the steps before it do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Intent {
+    origin: NodeId,
+    epoch: u64,
+    prev: u64,
+    seq: u64,
+    tx: u64,
+}
+
+impl Intent {
+    fn encode(&self) -> [u8; INTENT_LEN as usize] {
+        let mut out = [0u8; INTENT_LEN as usize];
+        out[..8].copy_from_slice(&self.origin.to_le_bytes());
+        out[8..16].copy_from_slice(&self.epoch.to_le_bytes());
+        out[16..24].copy_from_slice(&self.prev.to_le_bytes());
+        out[24..32].copy_from_slice(&self.seq.to_le_bytes());
+        out[32..40].copy_from_slice(&self.tx.to_le_bytes());
+        out[40] = 1;
+        let crc = CRC.checksum(&out[..41]);
+        out[44..48].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// `None` for anything that is not a whole intent: an empty slot, a torn
+    /// one, the leftovers of a file emptied since.
+    fn decode(bytes: &[u8]) -> Option<Intent> {
+        let crc = u32::from_le_bytes(bytes[44..48].try_into().expect("4 bytes"));
+        if bytes[40] != 1 || CRC.checksum(&bytes[..41]) != crc {
+            return None;
+        }
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        Some(Intent {
+            origin: word(0),
+            epoch: word(8),
+            prev: word(16),
+            seq: word(24),
+            tx: word(32),
+        })
+    }
+}
+
+struct StateFile {
+    handle: File,
+    /// Which slot each origin has. Slots are handed out once and overwritten
+    /// in place from then on: the file never grows past one slot an origin,
+    /// and is never rewritten.
+    slots: BTreeMap<NodeId, u64>,
+    next_slot: u64,
+    epochs: BTreeMap<NodeId, u64>,
+    logged: Option<Logged>,
+    intents: File,
+    intents_end: u64,
+    intents_logged: Option<Logged>,
+    /// Origins with intents written and not yet settled into their slot.
+    unsettled: std::collections::BTreeSet<NodeId>,
+}
+
+impl StateFile {
+    fn epoch(&self, origin: NodeId) -> u64 {
+        self.epochs.get(&origin).copied().unwrap_or(0)
+    }
+
+    fn write_slot(&mut self, origin: NodeId, seq: u64, epoch: u64) -> io::Result<()> {
+        let slot = match self.slots.get(&origin) {
+            Some(slot) => *slot,
+            None => {
+                let slot = self.next_slot;
+                self.next_slot += 1;
+                self.slots.insert(origin, slot);
+                slot
+            }
+        };
+        let offset = STATE_SLOT + slot * STATE_SLOT;
+        let bytes = Position { origin, seq, epoch }.encode();
+        std::os::unix::fs::FileExt::write_all_at(&self.handle, &bytes, offset)?;
+        if let Some(logged) = &self.logged {
+            logged.wal.log_and_commit_deferred(logged.file_id, offset, &bytes)?;
+        }
+        self.epochs.insert(origin, epoch);
+        Ok(())
+    }
+
+    fn write_intent(&mut self, intent: Intent) -> io::Result<()> {
+        let bytes = intent.encode();
+        let offset = self.intents_end;
+        std::os::unix::fs::FileExt::write_all_at(&self.intents, &bytes, offset)?;
+        match &self.intents_logged {
+            Some(logged) => {
+                logged.wal.log_and_commit_deferred(logged.file_id, offset, &bytes)?;
+            }
+            // Nothing else will carry it to disk ahead of the commit it
+            // speaks for.
+            None => self.intents.sync_data()?,
+        }
+        self.intents_end += INTENT_LEN;
+        self.unsettled.insert(intent.origin);
+        Ok(())
+    }
+
+    /// Empties the intents file once it has grown and nothing waits on it.
+    ///
+    /// What it held is behind every slot by then, and stays dead if a replay
+    /// of the log's older records puts some of it back: an intent counts only
+    /// from the exact position, and under the exact epoch, it was written
+    /// for, and every slot has moved past those. A newer intent written over
+    /// the same offset is later in the log, so the replay ends with it.
+    fn trim_intents(&mut self, at: u64) {
+        if self.intents_end < at || !self.unsettled.is_empty() {
+            return;
+        }
+        if self.intents.set_len(0).is_ok() {
+            self.intents_end = 0;
+        }
+    }
+}
+
+/// How far this node has applied each other origin's stream.
+///
+/// ## Exactly once
+///
+/// Applying a record and noting that it was applied are two writes, and a
+/// crash between them is the whole problem: noted first, the transaction is
+/// lost; noted after, as it was, it is applied again on restart, and a
+/// replayed `INSERT` into a table without a unique key, or a `SET n = n + 1`,
+/// lands twice.
+///
+/// So the note is made conditional and written first. Before an applying
+/// transaction commits, an *intent* goes into the database's write-ahead log:
+/// "this origin moves from `prev` to `seq`, if transaction `tx` committed".
+/// The commit's outcome is logged after it, in the same log, and one sync
+/// covers both. After any crash the log holds a prefix: an outcome is never
+/// there without its intent. At open each origin's position is its slot, moved
+/// along its intents for as long as each one's transaction committed, and it
+/// stops at exactly the last transaction whose rows are there.
+///
+/// Several records may share one sync (see `server::Group`); each has its own
+/// intent, so a cut part-way through such a batch still stops at the right
+/// record. Once the sync has returned the slot itself is moved, and the
+/// intents behind it count for nothing.
+pub struct AppliedState {
+    positions: Mutex<BTreeMap<NodeId, u64>>,
+    file: Mutex<Option<StateFile>>,
+}
 
 impl std::fmt::Debug for AppliedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -792,21 +1389,30 @@ impl AppliedState {
         AppliedState {
             positions: Mutex::new(BTreeMap::new()),
             file: Mutex::new(None),
-            path: None,
-            appends: std::sync::atomic::AtomicU64::new(0).into(),
-            rewriting: Mutex::new(()),
         }
     }
 
-    /// Opens the state file in `dir`, replaying it to recover each position.
-    ///
-    /// The file is a sequence of `(origin, seq)` pairs and the recovered
-    /// position is the maximum per origin, so a torn tail costs at most the
-    /// most recent advance — which replays one transaction, not a stream.
+    /// Opens the state in `dir` with no write-ahead log and nobody to ask
+    /// about transactions: an intent whose transaction would have to be asked
+    /// about counts as not applied.
     pub fn open(dir: &Path) -> io::Result<AppliedState> {
+        Self::open_logged(dir, None, &|_| false)
+    }
+
+    /// Opens the state in `dir` and settles what a crash left.
+    ///
+    /// `committed` answers for a transaction id of this database. Every
+    /// intent still standing is decided by it, once, here: before anything
+    /// can forget how that transaction ended.
+    pub fn open_logged(
+        dir: &Path,
+        wal: Option<Arc<Wal>>,
+        committed: &dyn Fn(u64) -> bool,
+    ) -> io::Result<AppliedState> {
         let path = dir.join(STATE_FILE);
         let mut handle = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -814,31 +1420,164 @@ impl AppliedState {
         let mut bytes = Vec::new();
         handle.read_to_end(&mut bytes)?;
 
-        let mut positions: BTreeMap<NodeId, u64> = BTreeMap::new();
-        let whole = bytes.len() - bytes.len() % 16;
-        for chunk in bytes[..whole].chunks_exact(16) {
-            let origin = u64::from_le_bytes(chunk[..8].try_into().expect("8 bytes"));
-            let seq = u64::from_le_bytes(chunk[8..].try_into().expect("8 bytes"));
-            let entry = positions.entry(origin).or_insert(0);
-            *entry = (*entry).max(seq);
+        let mut found: Vec<(u64, Position)> = Vec::new();
+        if bytes.is_empty() {
+            let mut header = [0u8; STATE_SLOT as usize];
+            header[..16].copy_from_slice(&STATE_MAGIC);
+            std::os::unix::fs::FileExt::write_all_at(&handle, &header, 0)?;
+            handle.sync_data()?;
+            crate::core::wal::sync_parent_dir(&path)?;
+        } else if bytes.len() >= 16 && bytes[..16] == STATE_MAGIC {
+            let slots = bytes.len().saturating_sub(STATE_SLOT as usize) / STATE_SLOT as usize;
+            for slot in 0..slots {
+                let at = STATE_SLOT as usize + slot * STATE_SLOT as usize;
+                match Position::decode(&bytes[at..at + STATE_SLOT as usize]) {
+                    Ok(Some(position)) => found.push((slot as u64, position)),
+                    Ok(None) => {}
+                    Err(()) => {
+                        // Guessing low applies transactions twice and guessing
+                        // high skips them. Neither is this code's to choose.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "replication state {} is damaged at slot {}: how far a peer's stream \
+                                 has been applied is not known. Reseed this node, or remove the file \
+                                 and resynchronise each peer from a known sequence",
+                                path.display(),
+                                slot
+                            ),
+                        ));
+                    }
+                }
+            }
+        } else {
+            // The file before this one: `(origin, seq)` pairs, the maximum
+            // per origin being the position. Written out as slots, whole,
+            // under a temporary name.
+            let mut legacy: BTreeMap<NodeId, u64> = BTreeMap::new();
+            let whole = bytes.len() - bytes.len() % 16;
+            for chunk in bytes[..whole].chunks_exact(16) {
+                let origin = u64::from_le_bytes(chunk[..8].try_into().expect("8 bytes"));
+                let seq = u64::from_le_bytes(chunk[8..].try_into().expect("8 bytes"));
+                let entry = legacy.entry(origin).or_insert(0);
+                *entry = (*entry).max(seq);
+            }
+            let temp = path.with_extension("converting");
+            let mut out = vec![0u8; STATE_SLOT as usize];
+            out[..16].copy_from_slice(&STATE_MAGIC);
+            for (slot, (origin, seq)) in legacy.iter().enumerate() {
+                let position = Position {
+                    origin: *origin,
+                    seq: *seq,
+                    epoch: 0,
+                };
+                out.extend_from_slice(&position.encode());
+                found.push((slot as u64, position));
+            }
+            {
+                let mut file = File::create(&temp)?;
+                file.write_all(&out)?;
+                file.sync_data()?;
+            }
+            std::fs::rename(&temp, &path)?;
+            crate::core::wal::sync_parent_dir(&path)?;
+            handle = OpenOptions::new().read(true).write(true).open(&path)?;
+            log::info!(
+                "Replication state {} converted to slots: {} origin(s)",
+                path.display(),
+                legacy.len()
+            );
         }
 
-        if whole != bytes.len() {
-            log::warn!(
-                "Replication state {} ended mid-record; dropping the last {} byte(s)",
-                path.display(),
-                bytes.len() - whole
-            );
-            handle.set_len(whole as u64)?;
+        let intents_path = dir.join(INTENTS_FILE);
+        let mut intents = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&intents_path)?;
+        let mut intent_bytes = Vec::new();
+        intents.read_to_end(&mut intent_bytes)?;
+        let standing: Vec<Intent> = intent_bytes
+            .chunks_exact(INTENT_LEN as usize)
+            .filter_map(Intent::decode)
+            .collect();
+
+        let logged = wal.clone().and_then(|wal| ReplicationLog::attach(&wal, &path));
+        let intents_logged = wal.and_then(|wal| ReplicationLog::attach(&wal, &intents_path));
+        let mut file = StateFile {
+            handle,
+            slots: found.iter().map(|(slot, p)| (p.origin, *slot)).collect(),
+            next_slot: found.iter().map(|(slot, _)| slot + 1).max().unwrap_or(0),
+            epochs: found.iter().map(|(_, p)| (p.origin, p.epoch)).collect(),
+            logged,
+            intents,
+            intents_end: 0,
+            intents_logged,
+            unsettled: std::collections::BTreeSet::new(),
+        };
+
+        // Each origin: its slot, then along its intents while each step's
+        // transaction committed.
+        let mut positions: BTreeMap<NodeId, u64> = BTreeMap::new();
+        let mut origins: Vec<(NodeId, u64, u64)> =
+            found.iter().map(|(_, p)| (p.origin, p.seq, p.epoch)).collect();
+        for intent in &standing {
+            if !origins.iter().any(|(origin, _, _)| *origin == intent.origin) {
+                // An origin's very first records: no slot was written yet.
+                origins.push((intent.origin, 0, 0));
+            }
         }
-        handle.seek(SeekFrom::Start(whole as u64))?;
+        for (origin, slot_seq, epoch) in origins {
+            let mut position = slot_seq;
+            let mut moved = false;
+            let mut stopped = None;
+            loop {
+                let steps: Vec<&Intent> = standing
+                    .iter()
+                    .filter(|i| i.origin == origin && i.epoch == epoch && i.prev == position && i.seq > position)
+                    .collect();
+                if steps.is_empty() {
+                    break;
+                }
+                // A record tried twice has two intents from one position; at
+                // most one of their transactions committed.
+                match steps.iter().find(|i| i.tx == 0 || committed(i.tx)) {
+                    Some(step) => {
+                        position = step.seq;
+                        moved = true;
+                    }
+                    None => {
+                        stopped = Some(steps[0].seq);
+                        break;
+                    }
+                }
+            }
+            if let Some(seq) = stopped {
+                log::warn!(
+                    "Origin {}'s transaction {} was being applied when this node stopped and did \
+                     not commit; it will be applied again",
+                    origin,
+                    seq
+                );
+            }
+            // Settled into the slot, under a new epoch: nothing left in the
+            // intents file can be read against it again.
+            if moved || stopped.is_some() || standing.iter().any(|i| i.origin == origin) {
+                file.write_slot(origin, position, epoch + 1)?;
+            }
+            if position != 0 {
+                positions.insert(origin, position);
+            }
+        }
+        // Every origin with an intent standing has a new epoch now, so the
+        // file starts again from empty.
+        file.intents_end = intent_bytes.len() as u64;
+        file.trim_intents(0);
 
         Ok(AppliedState {
             positions: Mutex::new(positions),
-            file: Mutex::new(Some(BufWriter::with_capacity(4096, handle))),
-            path: Some(path),
-            appends: std::sync::atomic::AtomicU64::new(0).into(),
-            rewriting: Mutex::new(()),
+            file: Mutex::new(Some(file)),
         })
     }
 
@@ -853,10 +1592,13 @@ impl AppliedState {
         seq <= self.high_water(origin)
     }
 
-    /// Advances `origin` to `seq`, if that is forwards.
+    /// Advances `origin` to `seq`, if that is forwards, on no transaction's
+    /// account: for a record that was passed over. Not while intents for the
+    /// origin are waiting on a sync — settle them first.
     ///
     /// Returns whether anything moved, so a duplicate costs no I/O.
     pub fn record(&self, origin: NodeId, seq: u64) -> io::Result<bool> {
+        let mut file = self.file.lock();
         {
             let mut positions = self.positions.lock();
             let entry = positions.entry(origin).or_insert(0);
@@ -865,31 +1607,96 @@ impl AppliedState {
             }
             *entry = seq;
         }
-
-        let mut file = self.file.lock();
-        if let Some(writer) = file.as_mut() {
-            writer.write_all(&origin.to_le_bytes())?;
-            writer.write_all(&seq.to_le_bytes())?;
+        if let Some(file) = file.as_mut() {
+            debug_assert!(!file.unsettled.contains(&origin), "a bare advance over waiting intents");
+            let epoch = file.epoch(origin);
+            file.write_slot(origin, seq, epoch)?;
         }
-        drop(file);
-
-        if self
-            .appends
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
-            >= STATE_REWRITE_AFTER
-        {
-            self.rewrite()?;
-        }
-
         Ok(true)
     }
 
-    /// Forgets what has been applied from `origin`, so its stream is taken
-    /// again from the beginning. What `REPLICATION RESYNC` does.
+    /// Writes "`origin` moves to `seq`, if `tx` commits", ahead of that
+    /// commit. A `tx` of zero is a step with no transaction behind it.
+    /// Returns the position it moves from.
+    ///
+    /// The position readers see does not move: [`AppliedState::advance`]
+    /// moves it once the transaction has committed,
+    /// [`AppliedState::settle`] makes it the slot's once that is durable, and
+    /// [`AppliedState::rollback`] takes it back if it never is.
+    pub fn begin(&self, origin: NodeId, seq: u64, tx: u64) -> io::Result<u64> {
+        let mut file = self.file.lock();
+        let prev = self.high_water(origin);
+        if let Some(file) = file.as_mut() {
+            let epoch = file.epoch(origin);
+            file.write_intent(Intent {
+                origin,
+                epoch,
+                prev,
+                seq,
+                tx,
+            })?;
+        }
+        Ok(prev)
+    }
+
+    /// The transaction [`AppliedState::begin`] named has committed.
+    pub fn advance(&self, origin: NodeId, seq: u64) {
+        let mut positions = self.positions.lock();
+        let entry = positions.entry(origin).or_insert(0);
+        *entry = (*entry).max(seq);
+    }
+
+    /// Everything begun for `origin` is committed and durable: its slot moves
+    /// to where the intents brought it.
+    pub fn settle(&self, origin: NodeId) -> io::Result<()> {
+        let mut file = self.file.lock();
+        let position = self.high_water(origin);
+        if let Some(file) = file.as_mut() {
+            if !file.unsettled.remove(&origin) {
+                return Ok(());
+            }
+            let epoch = file.epoch(origin);
+            file.write_slot(origin, position, epoch)?;
+            file.trim_intents(INTENTS_TRIM_AT);
+        }
+        Ok(())
+    }
+
+    /// What was begun for `origin` did not become durable: the position is
+    /// `prev` again.
+    ///
+    /// Under a new epoch, so the intents written for it are dead. They could
+    /// not be left for the next open to decide: an aborted transaction's id
+    /// is eventually forgotten, and reads as committed from then on.
+    pub fn rollback(&self, origin: NodeId, prev: u64) -> io::Result<()> {
+        let mut file = self.file.lock();
+        {
+            let mut positions = self.positions.lock();
+            if prev == 0 {
+                positions.remove(&origin);
+            } else {
+                positions.insert(origin, prev);
+            }
+        }
+        if let Some(file) = file.as_mut() {
+            file.unsettled.remove(&origin);
+            let epoch = file.epoch(origin) + 1;
+            file.write_slot(origin, prev, epoch)?;
+            file.trim_intents(INTENTS_TRIM_AT);
+        }
+        Ok(())
+    }
+
+    /// Puts `origin` at `seq` whichever way that moves it. What `REPLICATION
+    /// RESYNC … FROM` does; zero takes the stream again from the beginning.
+    pub fn set(&self, origin: NodeId, seq: u64) -> io::Result<()> {
+        self.rollback(origin, seq)?;
+        self.flush()
+    }
+
+    /// Forgets what has been applied from `origin`.
     pub fn reset(&self, origin: NodeId) -> io::Result<()> {
-        self.positions.lock().remove(&origin);
-        self.rewrite()
+        self.set(origin, 0)
     }
 
     /// The whole vector, for a handshake or an acknowledgement.
@@ -904,97 +1711,18 @@ impl AppliedState {
             .collect()
     }
 
-    /// Same shape as [`ReplicationLog::flush`]: write out under the lock,
-    /// sync a duplicate descriptor outside it, so `record` is never parked
-    /// behind an fsync. A `rewrite` that swaps the file in between synced its
-    /// replacement before renaming it, so nothing written before this call is
-    /// left unsynced.
+    /// Syncs both files on duplicate descriptors, outside the lock, so an
+    /// apply is never parked behind an fsync.
     pub fn flush(&self) -> io::Result<()> {
-        let handle = {
-            let mut file = self.file.lock();
-            match file.as_mut() {
-                Some(writer) => {
-                    writer.flush()?;
-                    writer.get_ref().try_clone()?
-                }
+        let (slots, intents) = {
+            let file = self.file.lock();
+            match file.as_ref() {
+                Some(file) => (file.handle.try_clone()?, file.intents.try_clone()?),
                 None => return Ok(()),
             }
         };
-        sync_unlocked(&handle)
-    }
-
-    /// Replaces the file with one record per origin.
-    ///
-    /// The positions are copied, written to a temp file and synced without
-    /// the `file` lock, so `record` is not parked behind the sync. A `record`
-    /// that lands in that window advances `positions` and appends to the *old*
-    /// file — which the rename then discards. So the swap re-reads the
-    /// positions under the `file` lock and appends whatever moved since the
-    /// copy to the new file before installing it. `record` updates `positions`
-    /// before it takes the `file` lock, so every advance is either in that
-    /// second read or written to the new file after the lock is released;
-    /// recovery takes the maximum per origin, so seeing one twice is harmless.
-    ///
-    /// Losing one did not merely cost a position: on restart this node asked
-    /// for that origin's transaction again and **applied it twice** — the
-    /// table stamps that would mark it superseded are not persisted, so a
-    /// replayed `INSERT` into a table without a unique key, or a `SET n = n +
-    /// 1`, landed a second time. On a clean restart too, since nothing
-    /// rewrote the file from memory at shutdown.
-    fn rewrite(&self) -> io::Result<()> {
-        let Some(path) = self.path.as_ref() else {
-            return Ok(());
-        };
-        let _one_at_a_time = self.rewriting.lock();
-
-        let snapshot: BTreeMap<NodeId, u64> = self.positions.lock().clone();
-
-        let temp_path = path.with_extension("rewriting");
-        {
-            let mut target = BufWriter::with_capacity(4096, File::create(&temp_path)?);
-            for (origin, seq) in &snapshot {
-                target.write_all(&origin.to_le_bytes())?;
-                target.write_all(&seq.to_le_bytes())?;
-            }
-            target.flush()?;
-            target.get_ref().sync_data()?;
-        }
-
-        #[cfg(test)]
-        test_hooks::BEFORE_STATE_SWAP.with(|hook| {
-            if let Some(f) = hook.borrow_mut().as_mut() {
-                f();
-            }
-        });
-
-        let mut file = self.file.lock();
-        // Whatever advanced after the copy above went to the old file only.
-        let moved: Vec<(NodeId, u64)> = self
-            .positions
-            .lock()
-            .iter()
-            .filter(|(origin, seq)| snapshot.get(origin) != Some(seq))
-            .map(|(o, s)| (*o, *s))
-            .collect();
-        let mut handle = OpenOptions::new().read(true).write(true).open(&temp_path)?;
-        handle.seek(SeekFrom::End(0))?;
-        if !moved.is_empty() {
-            let mut extra = Vec::with_capacity(moved.len() * 16);
-            for (origin, seq) in &moved {
-                extra.extend_from_slice(&origin.to_le_bytes());
-                extra.extend_from_slice(&seq.to_le_bytes());
-            }
-            handle.write_all(&extra)?;
-            // Synced here, under the lock, only in this rare case: a `flush`
-            // may already have made these durable in the old file, and the
-            // rename must not take that back.
-            handle.sync_data()?;
-        }
-        std::fs::rename(&temp_path, path)?;
-        *file = Some(BufWriter::with_capacity(4096, handle));
-        self.appends.store(0, std::sync::atomic::Ordering::Relaxed);
-
-        Ok(())
+        sync_unlocked(&intents)?;
+        sync_unlocked(&slots)
     }
 }
 
@@ -1267,42 +1995,6 @@ mod tests {
         );
     }
 
-    /// A position advanced while the state file is being rewritten must
-    /// survive the swap. It used to go to the old file only and vanish with
-    /// the rename, and the restarted node then applied that origin's
-    /// transaction a second time.
-    #[test]
-    fn a_record_racing_a_rewrite_survives_it() {
-        use std::sync::Arc;
-        let dir = tempfile::tempdir().unwrap();
-        let state = Arc::new(AppliedState::open(dir.path()).unwrap());
-        state.record(1, 5).unwrap();
-        state.record(2, 3).unwrap();
-
-        let racer = state.clone();
-        test_hooks::BEFORE_STATE_SWAP.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move || {
-                // Lands between the copy and the swap: an advance of an origin
-                // the copy holds, and one it has never seen.
-                racer.record(2, 4).unwrap();
-                racer.record(9, 1).unwrap();
-            }));
-        });
-        // `reset` rewrites; the reset origin must stay gone.
-        state.reset(1).unwrap();
-        test_hooks::BEFORE_STATE_SWAP.with(|hook| *hook.borrow_mut() = None);
-
-        // After the swap, appends go to the new file.
-        state.record(2, 6).unwrap();
-        state.flush().unwrap();
-        drop(state);
-
-        let reopened = AppliedState::open(dir.path()).unwrap();
-        assert_eq!(reopened.high_water(9), 1, "an advance during the rewrite was lost");
-        assert_eq!(reopened.high_water(2), 6);
-        assert_eq!(reopened.high_water(1), 0, "the reset origin came back");
-    }
-
     /// The shape a crash leaves: a record that got half-written.
     #[test]
     fn a_torn_tail_is_truncated_and_the_rest_survives() {
@@ -1484,45 +2176,6 @@ mod tests {
     }
 
     #[test]
-    fn a_state_file_torn_mid_record_recovers_what_was_whole() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let state = AppliedState::open(dir.path()).unwrap();
-            state.record(1, 17).unwrap();
-            state.flush().unwrap();
-        }
-
-        let path = dir.path().join(STATE_FILE);
-        let mut bytes = std::fs::read(&path).unwrap();
-        bytes.extend_from_slice(&[0u8; 5]);
-        std::fs::write(&path, &bytes).unwrap();
-
-        let state = AppliedState::open(dir.path()).unwrap();
-        assert_eq!(state.high_water(1), 17);
-    }
-
-    #[test]
-    fn the_state_file_is_rewritten_rather_than_growing_without_bound() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = AppliedState::open(dir.path()).unwrap();
-
-        for seq in 1..=(STATE_REWRITE_AFTER + 100) {
-            state.record(1, seq).unwrap();
-        }
-        state.flush().unwrap();
-
-        let size = std::fs::metadata(dir.path().join(STATE_FILE))
-            .unwrap()
-            .len();
-        assert!(
-            size < STATE_REWRITE_AFTER * 16,
-            "the file should have been rewritten: {}",
-            size
-        );
-        assert_eq!(state.high_water(1), STATE_REWRITE_AFTER + 100);
-    }
-
-    #[test]
     fn the_vector_reports_every_origin() {
         let state = AppliedState::in_memory();
         state.record(1, 3).unwrap();
@@ -1539,5 +2192,272 @@ mod tests {
                 seq: 100
             }
         );
+    }
+
+    /// The slot is written ahead of the commit it depends on. After a crash
+    /// it counts when that transaction committed, and is the position before
+    /// it when it did not.
+    #[test]
+    fn a_position_written_ahead_counts_only_if_its_transaction_committed() {
+        for committed in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let state = AppliedState::open(dir.path()).unwrap();
+                state.record(1, 4).unwrap();
+                assert_eq!(state.begin(1, 5, 900).unwrap(), 4);
+                // A reader sees the old position until the commit.
+                assert_eq!(state.high_water(1), 4);
+                state.flush().unwrap();
+            }
+            let state = AppliedState::open_logged(dir.path(), None, &|tx| {
+                assert_eq!(tx, 900);
+                committed
+            })
+            .unwrap();
+            assert_eq!(state.high_water(1), if committed { 5 } else { 4 });
+
+            // Settled for good: a later open asks nobody.
+            state.flush().unwrap();
+            drop(state);
+            let state =
+                AppliedState::open_logged(dir.path(), None, &|_| panic!("already settled")).unwrap();
+            assert_eq!(state.high_water(1), if committed { 5 } else { 4 });
+        }
+    }
+
+    /// Several records share one sync. A cut part-way through leaves the
+    /// position at the last one whose transaction committed, wherever that
+    /// is: never at a later one, and never back at the start.
+    #[test]
+    fn a_batch_cut_part_way_stops_at_its_last_committed_step() {
+        for (durable, expected) in [(0u64, 4u64), (1, 5), (2, 7), (3, 8)] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let state = AppliedState::open(dir.path()).unwrap();
+                state.record(1, 4).unwrap();
+                // 5 and 6 each by a transaction, 7 by none, 8 by one.
+                for (seq, tx) in [(5, 901), (6, 902), (7, 0), (8, 903)] {
+                    state.begin(1, seq, tx).unwrap();
+                    state.advance(1, seq);
+                }
+                assert_eq!(state.high_water(1), 8);
+                state.flush().unwrap();
+            }
+            // Outcomes are logged in order, so the durable ones are a prefix.
+            let state = AppliedState::open_logged(dir.path(), None, &|tx| tx - 900 <= durable).unwrap();
+            let expected = match durable {
+                // 902 committed carries the step no transaction stands behind.
+                2 => 7,
+                _ => expected,
+            };
+            assert_eq!(state.high_water(1), expected, "{durable} outcome(s) durable");
+        }
+    }
+
+    /// Once the sync has returned the slot holds the position, and the
+    /// intents behind it are never asked about again.
+    #[test]
+    fn settled_intents_count_for_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let state = AppliedState::open(dir.path()).unwrap();
+            for (seq, tx) in [(1, 901), (2, 902)] {
+                state.begin(1, seq, tx).unwrap();
+                state.advance(1, seq);
+            }
+            state.settle(1).unwrap();
+            state.flush().unwrap();
+        }
+        let state = AppliedState::open_logged(dir.path(), None, &|_| panic!("already in the slot")).unwrap();
+        assert_eq!(state.high_water(1), 2);
+    }
+
+    #[test]
+    fn a_position_taken_back_is_the_one_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppliedState::open(dir.path()).unwrap();
+        state.record(1, 4).unwrap();
+        let before = state.begin(1, 5, 900).unwrap();
+        state.advance(1, 5);
+        assert_eq!(state.high_water(1), 5);
+        state.rollback(1, before).unwrap();
+        assert_eq!(state.high_water(1), 4);
+        state.flush().unwrap();
+        drop(state);
+
+        let state = AppliedState::open_logged(dir.path(), None, &|_| panic!("nothing to ask")).unwrap();
+        assert_eq!(state.high_water(1), 4);
+    }
+
+    /// One slot an origin, overwritten in place: the file does not grow with
+    /// the stream, so it never needs rewriting.
+    #[test]
+    fn the_state_file_holds_one_slot_an_origin_however_far_it_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppliedState::open(dir.path()).unwrap();
+        for seq in 1..=20_000 {
+            state.record(1, seq).unwrap();
+            if seq % 5_000 == 0 {
+                state.record(2, seq).unwrap();
+            }
+        }
+        state.flush().unwrap();
+        let size = std::fs::metadata(dir.path().join(STATE_FILE)).unwrap().len();
+        assert_eq!(size, STATE_SLOT * 3, "a header and two slots");
+        drop(state);
+
+        let state = AppliedState::open(dir.path()).unwrap();
+        assert_eq!(state.high_water(1), 20_000);
+        assert_eq!(state.high_water(2), 20_000);
+    }
+
+    /// The file an earlier build wrote: `(origin, seq)` pairs, the maximum
+    /// counting.
+    #[test]
+    fn a_state_file_of_pairs_is_converted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = Vec::new();
+        for (origin, seq) in [(1u64, 3u64), (2, 9), (1, 7), (1, 5)] {
+            bytes.extend_from_slice(&origin.to_le_bytes());
+            bytes.extend_from_slice(&seq.to_le_bytes());
+        }
+        // And a torn pair at its end, which that format cut off.
+        bytes.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(dir.path().join(STATE_FILE), &bytes).unwrap();
+
+        let state = AppliedState::open(dir.path()).unwrap();
+        assert_eq!(state.high_water(1), 7);
+        assert_eq!(state.high_water(2), 9);
+        state.record(1, 8).unwrap();
+        state.flush().unwrap();
+        drop(state);
+
+        let state = AppliedState::open(dir.path()).unwrap();
+        assert_eq!(state.high_water(1), 8);
+        assert_eq!(state.high_water(2), 9);
+    }
+
+    /// A slot that does not check out is not a position anyone should guess.
+    #[test]
+    fn a_damaged_slot_refuses_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let state = AppliedState::open(dir.path()).unwrap();
+            state.record(1, 4).unwrap();
+            state.flush().unwrap();
+        }
+        let path = dir.path().join(STATE_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[STATE_SLOT as usize + 8] ^= 0x40;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = AppliedState::open(dir.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A record written ahead of a commit that never happened is found at
+    /// open, with the transaction to ask about.
+    #[test]
+    fn a_reopened_log_reports_the_records_a_crash_left_undecided() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
+            log.append_for(&record(1, 1), 70).unwrap();
+            log.confirm(1);
+            log.append_for(&record(1, 2), 71).unwrap();
+            log.append(&record(1, 3)).unwrap();
+            log.flush().unwrap();
+        }
+        let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
+        // Confirming is in memory only: the file still names both
+        // transactions, and both are asked about.
+        let mut undecided = log.take_undecided();
+        undecided.sort();
+        assert_eq!(undecided, vec![(1, 1, 70), (1, 2, 71)]);
+        assert!(log.take_undecided().is_empty(), "taken once");
+    }
+
+    #[test]
+    fn a_voided_record_keeps_its_place_and_carries_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
+            for seq in 1..=3 {
+                log.append_for(&record(1, seq), 70 + seq).unwrap();
+            }
+            log.void(1, 2, 5).unwrap();
+            let (records, _) = log.read_after(1, 0, 10, 1 << 20).unwrap();
+            assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+            assert!(records[1].is_void() && records[1].statements.is_empty());
+            assert!(!records[0].is_void() && !records[2].is_void());
+            log.flush().unwrap();
+        }
+        // And from the file: the void is the record a reopen finds.
+        let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
+        let (records, _) = log.read_after(1, 0, 10, 1 << 20).unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records[1].is_void());
+        let mut undecided = log.take_undecided();
+        undecided.sort();
+        assert_eq!(undecided, vec![(1, 1, 71), (1, 3, 73)], "the voided one is decided");
+    }
+
+    #[test]
+    fn a_read_stops_at_the_sequence_it_is_capped_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReplicationLog::open(dir.path(), 1 << 20).unwrap();
+        for seq in 1..=10 {
+            log.append(&record(1, seq)).unwrap();
+        }
+        let (records, more) = log.read_range(1, 2, 6, 100, 1 << 20).unwrap();
+        assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4, 5, 6]);
+        assert!(!more);
+    }
+
+    /// A compaction starts a new file under a new name. A reopen takes the
+    /// newest, finds what was kept, and leaves no older one behind.
+    #[test]
+    fn a_compaction_moves_to_a_new_file_that_a_reopen_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let highest = {
+            let log = ReplicationLog::open(dir.path(), 4096).unwrap();
+            for seq in 1..=400 {
+                log.append_for(&record(1, seq), if seq % 2 == 0 { 1000 + seq } else { 0 }).unwrap();
+            }
+            log.flush().unwrap();
+            log.highest(1)
+        };
+        assert_eq!(highest, 400);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|n| generation_of(n).is_some())
+            .collect();
+        assert_eq!(names.len(), 1, "one log file at a time: {names:?}");
+        assert_ne!(names[0], LOG_FILE, "a compaction ran, so the first file is gone");
+
+        let log = ReplicationLog::open(dir.path(), 4096).unwrap();
+        assert_eq!(log.highest(1), 400);
+        let earliest = log.earliest(1);
+        assert!(earliest > 1, "the oldest records were dropped");
+        // Everything kept reads back, from the file, in order and whole.
+        let mut from = earliest - 1;
+        loop {
+            let (records, more) = log.read_after(1, from, 64, 1 << 20).unwrap();
+            for r in &records {
+                assert_eq!(r.seq, from + 1);
+                assert_eq!(r.statements, record(1, r.seq).statements);
+                from = r.seq;
+            }
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(from, 400);
+        // The transactions named by the records that were kept came with them.
+        let undecided = log.take_undecided();
+        assert!(!undecided.is_empty());
+        assert!(undecided.iter().all(|(_, seq, tx)| *tx == 1000 + *seq && seq % 2 == 0));
     }
 }

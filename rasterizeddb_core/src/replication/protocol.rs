@@ -105,6 +105,11 @@ pub const FLAG_MORE: u8 = 1 << 0;
 /// originating there — a relayed transaction.
 pub const FLAG_RELAYED: u8 = 1 << 0;
 
+/// Record flag: this sequence carries nothing. The transaction it was handed
+/// to did not commit, and its place in the stream is kept so the stream has no
+/// holes. A peer applies it by moving past it.
+pub const FLAG_VOID: u8 = 1 << 1;
+
 #[derive(Debug)]
 pub enum ProtocolError {
     /// The first bytes were not a replication frame at all.
@@ -334,6 +339,11 @@ impl TxnRecord {
     #[inline]
     pub fn is_relayed(&self) -> bool {
         self.flags & FLAG_RELAYED != 0
+    }
+
+    #[inline]
+    pub fn is_void(&self) -> bool {
+        self.flags & FLAG_VOID != 0
     }
 }
 

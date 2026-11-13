@@ -1443,5 +1443,8 @@ mod create_crash_tests;
 #[path = "pins_crash_tests.rs"]
 mod pins_crash_tests;
 
+#[path = "replication_crash_tests.rs"]
+mod replication_crash_tests;
+
 #[path = "lazy_crash_tests.rs"]
 mod lazy_crash_tests;

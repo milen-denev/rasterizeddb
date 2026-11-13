@@ -1248,6 +1248,16 @@ fn main() -> std::io::Result<()> {
             .get(&args.pg_default_db)
             .expect("the catalogue always holds its default database");
 
+        // Replication's files are settled at every start that finds them,
+        // switched on or not: see `Database::open_replication_storage`. Before
+        // the configuration below, which does not change what they hold.
+        if arc_database.has_replication_files() {
+            if let Err(e) = arc_database.open_replication_storage() {
+                eprintln!("replication storage could not be opened: {e}");
+                std::process::exit(2);
+            }
+        }
+
         // Started before the SQL listener, so a node is ready to take its
         // peers' transactions by the time it is ready to take a client's.
         // Configuration is applied either way: a node started without

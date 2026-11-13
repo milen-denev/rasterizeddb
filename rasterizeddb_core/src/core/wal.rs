@@ -1443,6 +1443,14 @@ impl Wal {
         self.commit_through(self.issued.load(Ordering::Acquire))
     }
 
+    /// The sequence of the newest record written, synced or not: once
+    /// [`Wal::durable_through`] reaches it, everything logged before the call
+    /// is on stable storage. For a caller that may act on a commit only when
+    /// the records before this point are durable, whoever syncs them.
+    pub fn issued_through(&self) -> u64 {
+        self.issued.load(Ordering::Acquire)
+    }
+
     /// Highest commit sequence assigned so far.
     pub fn commit_lsn(&self) -> u64 {
         self.commit_lsn.load(Ordering::Acquire)

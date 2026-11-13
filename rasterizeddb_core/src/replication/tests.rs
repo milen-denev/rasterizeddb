@@ -898,13 +898,13 @@ async fn a_synchronous_commit_gives_up_on_a_peer_that_is_not_there() {
 /// A commit becomes visible to the cluster only once its outcome is durable.
 ///
 /// The autocommit path commits, flushes the outcome record, and reports failure
-/// if that flush did not work — rolling the transaction back. Publishing inside
-/// the commit put the transaction on the wire *before* that check, so a flush
-/// failure left the peers holding a write this node had disowned, with no way to
-/// recall it. The ordering is the fix, and this pins it: committing alone must
-/// publish nothing.
+/// if that flush did not work — rolling the transaction back. A transaction on
+/// the wire before that check left the peers holding a write this node had
+/// disowned, with no way to recall it. So a commit writes the record and takes
+/// its place in the stream, and nothing more: it is not for sending until the
+/// transaction is published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn committing_publishes_nothing_until_the_outcome_is_durable() {
+async fn committing_releases_nothing_until_the_outcome_is_durable() {
     let database = super::test_support::in_memory_database().await;
     let mut config = ReplicationConfig {
         node_id: 1,
@@ -922,7 +922,8 @@ async fn committing_publishes_nothing_until_the_outcome_is_durable() {
         "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
     )
     .await;
-    let published_before = database.replication.local_seq();
+    let released_before = database.replication.released_through();
+    assert_eq!(released_before, database.replication.local_seq());
 
     // A write in a transaction the caller owns, as an explicit block does.
     let tx = database.transactions.begin();
@@ -934,20 +935,54 @@ async fn committing_publishes_nothing_until_the_outcome_is_durable() {
     let family = database.commit_transaction(tx);
     assert_eq!(
         database.replication.local_seq(),
-        published_before,
+        released_before + 1,
+        "the commit takes the transaction's place in the stream"
+    );
+    assert_eq!(
+        database.replication.released_through(),
+        released_before,
         "committing must not put the transaction on the wire — the outcome is not durable yet"
     );
 
     database.publish_transaction(family).await;
     assert_eq!(
-        database.replication.local_seq(),
-        published_before + 1,
+        database.replication.released_through(),
+        released_before + 1,
         "publishing is what hands it to the cluster"
     );
 }
 
-/// And the other half: a transaction that is aborted publishes nothing, so the
+/// A committed transaction whose family is dropped without being published is
+/// released all the same: left open, its record would hold back every
+/// transaction after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_committed_transaction_nobody_published_does_not_hold_the_stream() {
+    let database = super::test_support::in_memory_database().await;
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: listener().1,
+        ..Default::default()
+    };
+    brisk(&mut config);
+    database.replication.set_config(config).unwrap();
+    database.replication.open_storage(None).unwrap();
+    database.replication.set_active(true);
+    run_ok(&database, "CREATE TABLE repl_users (id INTEGER, name VARCHAR)").await;
+    let before = database.replication.released_through();
+
+    let tx = database.transactions.begin();
+    let purpose =
+        recognize_query_purpose("INSERT INTO repl_users (id, name) VALUES (1, 'ada')").unwrap();
+    crate::core::rql::executor::execute_in_txn(purpose, database.clone(), tx).await;
+    drop(database.commit_transaction(tx));
+
+    run_ok(&database, "INSERT INTO repl_users (id, name) VALUES (2, 'grace')").await;
+    assert_eq!(database.replication.released_through(), before + 2);
+}
+
+/// And the other half: a transaction that is aborted ships nothing, so the
 /// rollback the durability check performs cannot leak a write to the peers.
+/// Its place in the stream is kept by a record that carries nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_aborted_transaction_is_never_published() {
     let database = super::test_support::in_memory_database().await;
@@ -967,7 +1002,7 @@ async fn an_aborted_transaction_is_never_published() {
         "CREATE TABLE repl_users (id INTEGER, name VARCHAR)",
     )
     .await;
-    let published_before = database.replication.local_seq();
+    let before = database.replication.local_seq();
 
     let tx = database.transactions.begin();
     let purpose =
@@ -979,11 +1014,14 @@ async fn an_aborted_transaction_is_never_published() {
     database.abort_transaction(tx);
     database.publish_transaction(family).await;
 
-    assert_eq!(
-        database.replication.local_seq(),
-        published_before,
+    let log = database.replication.log().unwrap();
+    let (records, _) = log.read_after(1, before, 10, 1 << 20).unwrap();
+    assert_eq!(records.len(), 1, "the sequence it was given is still in the stream");
+    assert!(
+        records[0].is_void() && records[0].statements.is_empty(),
         "an aborted transaction must leave nothing for the peers, even if publish is called"
     );
+    assert_eq!(database.replication.released_through(), before + 1);
     assert_eq!(
         database.replication.open_captures(),
         0,

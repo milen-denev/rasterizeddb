@@ -1,31 +1,41 @@
 //! One outbound link to one peer.
 //!
-//! A peer is a handle plus a task. The handle is what the commit path touches:
-//! enqueueing a record on it is a bounded channel send and nothing else, so a
-//! slow or missing peer can never make a local commit wait. The task owns the
-//! connection and does everything expensive — connecting, batching,
-//! compressing, waiting for the acknowledgement, reconnecting.
+//! A peer is a handle plus a task. The task owns the connection and does
+//! everything: connecting, reading the log, batching, compressing, waiting
+//! for the acknowledgement, reconnecting. The commit path does not touch a
+//! peer at all. A commit writes its record to the replication log and, once
+//! it is durable, moves the node's release mark; each peer's task reads the
+//! log from where its peer has got to, up to that mark.
 //!
-//! ## Why the queue is allowed to overflow
+//! ## Why the sender reads the log
 //!
-//! The queue is bounded, and a full one drops the record rather than blocking.
-//! That sounds lossy and is not, because the queue is not the record's only
-//! home: it is already in the replication log. A drop raises a catch-up flag,
-//! and the task backfills from the log the moment it comes round again. The
-//! alternative — blocking the commit until a dead peer's queue drains — trades
-//! a bounded amount of catch-up work for an unbounded amount of client latency.
+//! Records used to reach a peer through a bounded queue filled by the commit
+//! path, with the log as the fallback when the queue overflowed. That made
+//! two paths with different orders and different failure modes: the queue
+//! delivered in arrival order, which is not sequence order; an overflow
+//! dropped records and flagged a catch-up from the file; a relayed record
+//! that was dropped was never caught up at all. One path cannot disagree with
+//! itself. The log is in sequence order, holds everything, and the newest few
+//! thousand records are served from memory, so reading it costs what the
+//! queue did.
+//!
+//! ## The peer says where it is
+//!
+//! What to send next is never this node's guess. Every handshake and every
+//! acknowledgement carries the peer's own account of how far it has applied
+//! each origin, and the next read starts there. A refused record is therefore
+//! sent again, never skipped; a peer that was rewound is followed back.
 //!
 //! ## Batching
 //!
-//! Under load the sender coalesces whatever has accumulated into one frame, up
-//! to a record and byte limit, waiting at most `batch_linger` for more. This is
-//! where most of the throughput comes from: one TLS record, one round trip and
-//! one compression pass amortised over a whole batch instead of per commit. At
-//! low load the linger is sub-millisecond and the batch is one record, so
-//! latency is not traded away for a throughput that is not being asked for.
+//! Whatever is sendable goes in one frame, up to a record and byte limit,
+//! after waiting at most `batch_linger` for more. One TLS record, one round
+//! trip and one compression pass are amortised over a batch, and at low load
+//! the batch is one record.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use cacheguard::CacheGuard;
 use std::time::Duration;
@@ -35,10 +45,43 @@ use parking_lot::Mutex;
 use rastcp::client::{TcpClient, TcpClientBuilder};
 
 use super::config::{Codec, Compression, NodeId, PeerConfig};
-use super::manager::{Outbound, Replication};
+use super::manager::Replication;
 use super::protocol::{
     self, ApplyStatus, FrameCodec, FrameKind, Hello, HelloAck, Pull, PushAck, Reader, TxnRecord,
+    VectorEntry,
 };
+
+/// What a link is doing about its peer's backlog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerState {
+    /// Sending, or nothing to send.
+    Streaming,
+    /// The peer refuses the next transaction (a conflict, a statement that
+    /// fails there). Nothing after it can be applied; it is offered again,
+    /// less and less often, until someone resolves it.
+    Stalled,
+    /// The peer needs history this node no longer holds. Nothing is sent:
+    /// sending what is left would skip the missing part without a trace.
+    NeedsReseed,
+}
+
+impl PeerState {
+    fn from_wire(byte: u8) -> PeerState {
+        match byte {
+            1 => PeerState::Stalled,
+            2 => PeerState::NeedsReseed,
+            _ => PeerState::Streaming,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeerState::Streaming => "streaming",
+            PeerState::Stalled => "stalled",
+            PeerState::NeedsReseed => "needs reseed",
+        }
+    }
+}
 
 /// What the status view shows for one peer.
 #[derive(Clone, Debug)]
@@ -52,45 +95,43 @@ pub struct PeerSnapshot {
     pub acked_seq: u64,
     /// How far behind the local stream that leaves it.
     pub lag: u64,
+    /// Records committed here that are not yet free to send to anyone: their
+    /// commit is not durable yet.
     pub queued: usize,
     pub records_sent: u64,
     pub batches_sent: u64,
+    /// Always zero: nothing is dropped. Kept so the status view's columns do
+    /// not move.
     pub dropped: u64,
     pub codec: Codec,
     /// Compressed/uncompressed on the last batch, if it was compressed.
     pub last_ratio: Option<f64>,
     pub last_error: Option<String>,
+    pub state: PeerState,
 }
 
 /// The handle: what everything other than the peer's own task sees.
 pub struct PeerHandle {
     pub name: String,
     address: Mutex<String>,
-    sender: kanal::AsyncSender<Outbound>,
     paused: AtomicBool,
     connected: AtomicBool,
     stopping: AtomicBool,
     remote_node: AtomicU64,
     /// Padded. This is the one field on the handle written by the ack path and
     /// read by everything else — a genuine cross-thread ping-pong, unlike the
-    /// counters below it, which the peer's own task owns outright and bumps
-    /// three at a time (so they are better off sharing a line, not being split
-    /// across three).
+    /// counters below it, which the peer's own task owns outright.
     acked_seq: CacheGuard<AtomicU64>,
     records_sent: AtomicU64,
     batches_sent: AtomicU64,
-    dropped: AtomicU64,
-    /// Raised when a record could not be queued, or a send failed. The task
-    /// backfills from the log when it sees it.
-    ///
-    /// Padded for the same reason in the other direction: capturing writer
-    /// threads raise it, the peer task polls it every loop iteration.
-    needs_catchup: CacheGuard<AtomicBool>,
+    state: AtomicU8,
     codec: AtomicU64,
     /// Last observed compression ratio, as `f64` bits. `0` means "not yet".
     last_ratio: AtomicU64,
     last_error: Mutex<Option<String>>,
     compression: Mutex<Option<Compression>>,
+    /// Wakes the task out of an idle wait: stopped, resumed, readdressed.
+    kick: tokio::sync::Notify,
 }
 
 impl std::fmt::Debug for PeerHandle {
@@ -116,13 +157,9 @@ impl PeerHandle {
 
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
-        if !paused {
-            // Anything committed while this peer was paused was never queued
-            // for it — `Replication::publish` skips a paused peer — so the log
-            // is the only place those records exist for this link. Resuming has
-            // to go and look.
-            self.needs_catchup.store(true, Ordering::Relaxed);
-        }
+        // Resuming needs no backfill of its own: the task reads the log from
+        // where the peer is, and what committed during the pause is there.
+        self.kick.notify_waiters();
     }
 
     #[inline]
@@ -138,9 +175,7 @@ impl PeerHandle {
     /// Ends the peer's task. The handle stays usable but inert.
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
-        // Closing wakes the task out of `recv` rather than leaving it parked
-        // until the next record that will never come.
-        let _ = self.sender.close();
+        self.kick.notify_waiters();
     }
 
     pub fn acked_seq(&self) -> u64 {
@@ -153,20 +188,12 @@ impl PeerHandle {
         self.remote_node.load(Ordering::Relaxed)
     }
 
-    /// Queues a record. Never blocks; a full queue drops and flags a catch-up.
-    pub fn enqueue(&self, outbound: Outbound) {
-        if self.is_stopping() {
-            return;
-        }
-        match self.sender.try_send(outbound) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => {
-                // `Ok(false)` is a full queue, `Err` a closed one. Either way
-                // the record is in the log and catch-up will find it.
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                self.needs_catchup.store(true, Ordering::Relaxed);
-            }
-        }
+    pub fn state(&self) -> PeerState {
+        PeerState::from_wire(self.state.load(Ordering::Relaxed))
+    }
+
+    fn set_state(&self, state: PeerState) -> bool {
+        self.state.swap(state as u8, Ordering::Relaxed) != state as u8
     }
 
     fn set_error(&self, message: Option<String>) {
@@ -197,7 +224,7 @@ impl PeerHandle {
     pub fn set_address(&self, address: String) {
         *self.address.lock() = address;
         // The task reconnects to the new address once the current attempt ends.
-        self.needs_catchup.store(true, Ordering::Relaxed);
+        self.kick.notify_waiters();
     }
 
     pub fn snapshot(&self, local_seq: u64) -> PeerSnapshot {
@@ -210,27 +237,24 @@ impl PeerHandle {
             remote_node: self.remote_node.load(Ordering::Relaxed),
             acked_seq: acked,
             lag: local_seq.saturating_sub(acked),
-            queued: self.sender.len(),
+            queued: 0,
             records_sent: self.records_sent.load(Ordering::Relaxed),
             batches_sent: self.batches_sent.load(Ordering::Relaxed),
-            dropped: self.dropped.load(Ordering::Relaxed),
+            dropped: 0,
             codec: Codec::from_wire(self.codec.load(Ordering::Relaxed) as u8)
                 .unwrap_or(Codec::None),
             last_ratio: self.ratio(),
             last_error: self.last_error.lock().clone(),
+            state: self.state(),
         }
     }
 }
 
-/// Builds a peer and starts its task.
-pub fn spawn(replication: Arc<Replication>, config: &PeerConfig) -> Arc<PeerHandle> {
-    let capacity = replication.config().queue_capacity;
-    let (sender, receiver) = kanal::bounded_async::<Outbound>(capacity);
-
-    let handle = Arc::new(PeerHandle {
+/// Builds a peer's handle without a task behind it.
+fn handle(config: &PeerConfig) -> Arc<PeerHandle> {
+    Arc::new(PeerHandle {
         name: config.name.clone(),
         address: Mutex::new(config.address.clone()),
-        sender,
         paused: AtomicBool::new(config.paused),
         connected: AtomicBool::new(false),
         stopping: AtomicBool::new(false),
@@ -238,72 +262,62 @@ pub fn spawn(replication: Arc<Replication>, config: &PeerConfig) -> Arc<PeerHand
         acked_seq: AtomicU64::new(0).into(),
         records_sent: AtomicU64::new(0),
         batches_sent: AtomicU64::new(0),
-        dropped: AtomicU64::new(0),
-        // A fresh link has no idea what the peer holds, so its first act is to
-        // ask — which is what catch-up does.
-        needs_catchup: AtomicBool::new(true).into(),
+        state: AtomicU8::new(PeerState::Streaming as u8),
         codec: AtomicU64::new(Codec::None.as_wire() as u64),
         last_ratio: AtomicU64::new(0),
         last_error: Mutex::new(None),
         compression: Mutex::new(config.compression),
-    });
+        kick: tokio::sync::Notify::new(),
+    })
+}
 
+/// Builds a peer and starts its task.
+pub fn spawn(replication: Arc<Replication>, config: &PeerConfig) -> Arc<PeerHandle> {
+    let handle = handle(config);
     let task_handle = handle.clone();
     tokio::spawn(async move {
-        run(replication, task_handle, receiver).await;
+        run(replication, task_handle).await;
     });
-
     handle
 }
 
-/// The peer's task: connect, catch up, then stream until told to stop.
-async fn run(
-    replication: Arc<Replication>,
-    peer: Arc<PeerHandle>,
-    receiver: kanal::AsyncReceiver<Outbound>,
-) {
+/// The peer's task: connect, then stream until told to stop.
+async fn run(replication: Arc<Replication>, peer: Arc<PeerHandle>) {
     let mut backoff = replication.config().reconnect_base;
     let mut codec = FrameCodec::new(replication.config().compression.level);
 
     while !peer.is_stopping() {
         if peer.is_paused() {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = tokio::time::timeout(Duration::from_millis(200), peer.kick.notified()).await;
             continue;
         }
 
         match connect(&replication, &peer).await {
             Ok(mut link) => {
                 peer.connected.store(true, Ordering::Relaxed);
-                peer.set_error(None);
+                if peer.state() == PeerState::Streaming {
+                    peer.set_error(None);
+                }
                 let acked_before = peer.acked_seq();
                 info!(
                     "Replication link to {} ({}) established, node {}, codec {}",
                     peer.name, link.address, link.remote_node, link.codec
                 );
 
-                if let Err(e) = stream(&replication, &peer, &mut link, &receiver, &mut codec).await
-                {
+                if let Err(e) = stream(&replication, &peer, &mut link, &mut codec).await {
                     warn!("Replication link to {} ended: {}", peer.name, e);
                     peer.set_error(Some(e));
                 }
 
-                // Connecting is not progress. A peer that refuses every
-                // transaction — a stalled origin under `conflict abort` — still
-                // accepts the connection, so resetting the backoff here spun the
-                // link at `reconnect_base` indefinitely: reconnect, re-send the
-                // same refused transaction, drop, repeat, several times a second
-                // for as long as the conflict stood. Reset only when the link
-                // actually moved the peer forward, so a stall decays to
-                // `reconnect_max` while a healthy flapping link still recovers
-                // immediately.
+                // Connecting is not progress. Reset the backoff only when the
+                // link actually moved the peer forward, so a link that fails
+                // the same way each time decays to `reconnect_max` while a
+                // healthy flapping one still recovers immediately.
                 if peer.acked_seq() > acked_before {
                     backoff = replication.config().reconnect_base;
                 }
 
                 peer.connected.store(false, Ordering::Relaxed);
-                // Whatever was in flight when the link dropped is unconfirmed;
-                // the next connection re-derives what to send from the log.
-                peer.needs_catchup.store(true, Ordering::Relaxed);
             }
             Err(e) => {
                 peer.connected.store(false, Ordering::Relaxed);
@@ -316,7 +330,7 @@ async fn run(
             break;
         }
 
-        tokio::time::sleep(backoff).await;
+        let _ = tokio::time::timeout(backoff, peer.kick.notified()).await;
         backoff = (backoff * 2).min(replication.config().reconnect_max);
     }
 
@@ -329,6 +343,18 @@ struct Link {
     address: String,
     remote_node: NodeId,
     codec: Codec,
+    /// How far the peer has applied each origin, by its own last account.
+    applied: HashMap<NodeId, u64>,
+}
+
+impl Link {
+    fn take_vector(&mut self, vector: &[VectorEntry]) {
+        self.applied = vector.iter().map(|entry| (entry.origin, entry.seq)).collect();
+    }
+
+    fn position(&self, origin: NodeId) -> u64 {
+        self.applied.get(&origin).copied().unwrap_or(0)
+    }
 }
 
 /// Dials the peer and completes the handshake.
@@ -409,13 +435,17 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
     peer.codec
         .store(ack.codec.as_wire() as u64, Ordering::Relaxed);
 
+    let mut link = Link {
+        client,
+        address,
+        remote_node: ack.node_id,
+        codec: ack.codec,
+        applied: HashMap::new(),
+    };
+    link.take_vector(&ack.applied);
+
     // What the peer says it has of ours is where the next send starts.
-    let ours = ack
-        .applied
-        .iter()
-        .find(|entry| entry.origin == config.node_id)
-        .map(|entry| entry.seq)
-        .unwrap_or(0);
+    let ours = link.position(config.node_id);
     if let Some(was) = replication.adopt_peer_position(ours) {
         error!(
             "{} has applied this node's stream up to {}, but this node's replication log ends at {}: \
@@ -424,154 +454,255 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
         );
     }
     peer.acked_seq.store(ours, Ordering::Relaxed);
+    replication.note_ack();
 
-    Ok(Link {
-        client,
-        address,
-        remote_node: ack.node_id,
-        codec: ack.codec,
-    })
+    Ok(link)
 }
+
+/// How long an idle sender waits before looking again without being woken.
+///
+/// A release wakes it at once. This is for what does not: a commit that did
+/// not wait for its sync becomes sendable when the log writer's next round
+/// makes it durable, and nothing announces that.
+const IDLE_POLL: Duration = Duration::from_millis(200);
+
+/// The same, while commits are waiting on exactly that.
+const GATED_POLL: Duration = Duration::from_millis(10);
 
 /// Streams records until the link fails or the peer is stopped.
 async fn stream(
     replication: &Arc<Replication>,
     peer: &Arc<PeerHandle>,
     link: &mut Link,
-    receiver: &kanal::AsyncReceiver<Outbound>,
     codec: &mut FrameCodec,
 ) -> Result<(), String> {
     // One buffer for the life of the link.
     let mut frame = Vec::new();
+    let node_id = replication.node_id();
+    // How long to leave a peer alone after it refused what it was offered.
+    let mut refusal_pause = Duration::ZERO;
 
     loop {
         if peer.is_stopping() || peer.is_paused() {
             return Ok(());
         }
 
-        if peer.needs_catchup.swap(false, Ordering::Relaxed) {
-            if let Err(e) = catch_up(replication, peer, link, codec, &mut frame).await {
-                // Put the flag back: the backlog is still there.
-                peer.needs_catchup.store(true, Ordering::Relaxed);
-                return Err(e);
-            }
-        }
+        // Taken before the look, so a release during the look still wakes
+        // the wait below.
+        let woken = replication.woken();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
 
-        let Some(batch) = next_batch(replication, receiver).await else {
-            // The channel closed, which only happens on `stop`.
-            return Ok(());
-        };
-        if batch.is_empty() {
-            // Idle. Round again, so the pause and catch-up flags are re-read.
-            continue;
-        }
+        let config = replication.config();
+        let mut outcome = send_from(
+            replication,
+            peer,
+            link,
+            codec,
+            &mut frame,
+            node_id,
+            replication.released_through(),
+        )
+        .await?;
 
-        let records: Vec<Arc<TxnRecord>> = batch.iter().map(|o| o.record.clone()).collect();
-        let mut refs: Vec<&TxnRecord> = records.iter().map(|r| r.as_ref()).collect();
-        // Sequence numbers are assigned at commit and queued just after, so two
-        // transactions committing concurrently can reach the queue in the other
-        // order. The receiver refuses a record that would leave a hole and the
-        // sender then backfills it, which converges but costs a round trip per
-        // inversion — under concurrent load that was most of a batch. Sorting
-        // here is a few comparisons on a handful of records and removes the
-        // inversions that happen within one batch, which is nearly all of them.
-        refs.sort_unstable_by_key(|record| (record.origin, record.seq));
-
-        match push(replication, peer, link, codec, &refs, &mut frame).await {
-            Ok(settled) => {
-                // Only what the peer reported as applied or already-held. A
-                // record it refused has *not* reached it, and signalling for
-                // one would let a synchronous commit claim a durability it
-                // does not have — the waiter times out instead, which is the
-                // honest answer.
-                let mut refused = 0;
-                for outbound in &batch {
-                    if settled.contains(&outbound.record) {
-                        if let Some(ack) = outbound.ack.as_ref() {
-                            ack.signal();
-                        }
-                    } else {
-                        refused += 1;
+        if config.relay {
+            // Everything this node has logged of other origins, for a peer
+            // that may not hear them first-hand. Not the peer's own stream,
+            // which it has by definition.
+            if let Some(log) = replication.log() {
+                for origin in log.origins() {
+                    if origin == node_id || origin == link.remote_node {
+                        continue;
                     }
-                }
-
-                if refused == batch.len() {
-                    // Nothing got through. Most likely the peer's apply has
-                    // stalled on a conflict, and hammering it changes nothing —
-                    // back off so a stalled stream is quiet rather than a spin.
-                    tokio::time::sleep(replication.config().reconnect_base).await;
+                    let sent = send_from(
+                        replication,
+                        peer,
+                        link,
+                        codec,
+                        &mut frame,
+                        origin,
+                        log.highest(origin),
+                    )
+                    .await?;
+                    outcome = outcome.max(sent);
                 }
             }
-            Err(e) => {
-                // The batch is unconfirmed and stays that way; the commits
-                // waiting on it fall back on their timeout, and the records
-                // themselves are recovered from the log on reconnect.
-                peer.needs_catchup.store(true, Ordering::Relaxed);
-                return Err(e);
+        }
+
+        match outcome {
+            Sent::Advanced => {
+                refusal_pause = Duration::ZERO;
+                continue;
+            }
+            Sent::Refused => {
+                // Offered again, less and less often: a stalled stream is
+                // quiet rather than a spin, and picks up by itself once
+                // whatever blocked it is resolved.
+                refusal_pause = if refusal_pause.is_zero() {
+                    config.reconnect_base
+                } else {
+                    (refusal_pause * 2).min(config.reconnect_max)
+                };
+                let _ = tokio::time::timeout(refusal_pause, peer.kick.notified()).await;
+            }
+            Sent::Nothing => {
+                let poll = if replication.unreleased() > 0 {
+                    GATED_POLL
+                } else {
+                    IDLE_POLL
+                };
+                tokio::select! {
+                    _ = &mut woken => {}
+                    _ = peer.kick.notified() => {}
+                    _ = tokio::time::sleep(poll) => {}
+                }
             }
         }
     }
 }
 
-/// How long an idle sender waits before returning to its loop.
-///
-/// Without it a sender with nothing queued parks in `recv` indefinitely and
-/// never re-reads the flags around it — so a peer paused and then resumed would
-/// sit there until the next commit happened to wake it, and a catch-up raised
-/// while it was parked would not run. Coming up for air a few times a second
-/// costs one timer per idle link.
-const IDLE_POLL: Duration = Duration::from_millis(200);
+/// What one look at one origin's stream came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Sent {
+    /// The peer has everything sendable.
+    Nothing,
+    /// A batch went and the peer took none of it.
+    Refused,
+    /// The peer moved forward.
+    Advanced,
+}
 
-/// Collects the next batch, waiting out the linger for company.
-///
-/// An empty batch means "nothing right now" and is the caller's cue to go round
-/// its loop again. `None` means the channel has closed for good.
-async fn next_batch(
+/// Sends the peer the next batch of `origin`'s stream, from where the peer
+/// says it is up to `upto`.
+async fn send_from(
     replication: &Arc<Replication>,
-    receiver: &kanal::AsyncReceiver<Outbound>,
-) -> Option<Vec<Outbound>> {
-    let first = match tokio::time::timeout(IDLE_POLL, receiver.recv()).await {
-        Ok(Ok(first)) => first,
-        Ok(Err(_)) => return None,
-        Err(_) => return Some(Vec::new()),
+    peer: &Arc<PeerHandle>,
+    link: &mut Link,
+    codec: &mut FrameCodec,
+    frame: &mut Vec<u8>,
+    origin: NodeId,
+    upto: u64,
+) -> Result<Sent, String> {
+    let Some(log) = replication.log() else {
+        return Ok(Sent::Nothing);
     };
+    let from = link.position(origin);
+    if from >= upto {
+        return Ok(Sent::Nothing);
+    }
+    let own = origin == replication.node_id();
+
+    if !log.can_serve(origin, from) {
+        let message = format!(
+            "{} has origin {}'s stream up to {} and this node's log now starts at {}: the \
+             transactions between are no longer held here. Nothing more is sent, because sending \
+             the rest would skip them. Reseed {} from a backup, or raise \
+             --replication-retention-mb before a peer falls this far behind again",
+            peer.name,
+            origin,
+            from,
+            log.earliest(origin),
+            peer.name
+        );
+        if peer.set_state(PeerState::NeedsReseed) {
+            error!("{}", message);
+        }
+        // Ends the link: the next handshake finds out whether the peer has
+        // been reseeded since.
+        return Err(message);
+    }
 
     let config = replication.config();
-    let mut bytes = first.record.encoded_size_hint();
-    let mut batch = Vec::with_capacity(config.batch_max_records.min(64));
-    batch.push(first);
+    // At low load the first record is all there is; a short wait lets the
+    // commits right behind it share its frame.
+    if own && !config.batch_linger.is_zero() && upto - from < config.batch_max_records as u64 {
+        tokio::time::sleep(config.batch_linger).await;
+    }
+    let upto = if own { replication.released_through() } else { upto };
 
-    if config.batch_linger.is_zero() {
-        // No linger: take whatever is already queued and go.
-        while batch.len() < config.batch_max_records && bytes < config.batch_max_bytes {
-            match receiver.try_recv() {
-                Ok(Some(item)) => {
-                    bytes += item.record.encoded_size_hint();
-                    batch.push(item);
-                }
-                _ => break,
-            }
-        }
-        return Some(batch);
+    let (records, _more) = match log.read_range(
+        origin,
+        from,
+        upto,
+        config.batch_max_records,
+        config.batch_max_bytes,
+    ) {
+        Ok(read) => read,
+        // A compaction swapped the file under the read. Look again.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Sent::Advanced),
+        Err(e) => return Err(format!("could not read the replication log: {}", e)),
+    };
+    if records.is_empty() {
+        return Ok(Sent::Nothing);
     }
 
-    let deadline = tokio::time::Instant::now() + config.batch_linger;
-    while batch.len() < config.batch_max_records && bytes < config.batch_max_bytes {
-        match tokio::time::timeout_at(deadline, receiver.recv()).await {
-            Ok(Ok(item)) => {
-                bytes += item.record.encoded_size_hint();
-                batch.push(item);
+    // The stream has no holes by construction. One here means the log lost
+    // records (a damaged file cut short at open): the peer cannot be given
+    // what follows, and must not be told it is in step.
+    let mut expected = from + 1;
+    for record in &records {
+        if record.seq != expected {
+            let message = format!(
+                "origin {}'s transactions {}..{} are missing from this node's replication log; \
+                 {} cannot be brought past {} from here and must be reseeded",
+                origin,
+                expected,
+                record.seq - 1,
+                peer.name,
+                from
+            );
+            if peer.set_state(PeerState::NeedsReseed) {
+                error!("{}", message);
             }
-            // Either the linger expired or the channel closed. Both mean send
-            // what we have; a closed channel is noticed on the next round.
-            _ => break,
+            return Err(message);
         }
+        expected += 1;
     }
 
-    Some(batch)
+    let refs: Vec<&TxnRecord> = records.iter().collect();
+    let ack = push(replication, peer, link, codec, &refs, frame).await?;
+    link.take_vector(&ack.applied);
+    if own {
+        // Stored, not raised: a peer that was rewound (`RESYNC … FROM`) is
+        // followed back, or the status view would claim a position the peer
+        // no longer has.
+        peer.acked_seq.store(link.position(origin), Ordering::Relaxed);
+        replication.note_ack();
+    }
+
+    if link.position(origin) > from {
+        if peer.set_state(PeerState::Streaming) {
+            info!("Peer {} is applying origin {}'s stream again", peer.name, origin);
+        }
+        peer.set_error(None);
+        return Ok(Sent::Advanced);
+    }
+
+    // Nothing moved. The first record's outcome says why.
+    let first = ack
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.origin == origin && !outcome.status.is_settled());
+    match first {
+        Some(outcome) if matches!(outcome.status, ApplyStatus::Conflict | ApplyStatus::Failed) => {
+            let message = format!(
+                "{} cannot apply transaction {}:{}: {}",
+                peer.name, outcome.origin, outcome.seq, outcome.message
+            );
+            if peer.set_state(PeerState::Stalled) {
+                error!(
+                    "{}. Its stream from origin {} is stalled until that is resolved",
+                    message, origin
+                );
+            }
+            peer.set_error(Some(message));
+        }
+        _ => {}
+    }
+    Ok(Sent::Refused)
 }
 
-/// Sends one batch and applies what the acknowledgement says.
+/// Sends one batch and returns what the peer said about it.
 async fn push(
     replication: &Arc<Replication>,
     peer: &Arc<PeerHandle>,
@@ -582,11 +713,7 @@ async fn push(
     // the capacity — which is what stops every batch from growing a buffer up
     // to its size from nothing.
     frame: &mut Vec<u8>,
-) -> Result<Settled, String> {
-    if records.is_empty() {
-        return Ok(Settled::default());
-    }
-
+) -> Result<PushAck, String> {
     let config = replication.config();
     let compression = peer.compression_override().unwrap_or(config.compression);
     codec.set_level(compression.level);
@@ -666,40 +793,14 @@ async fn push(
         .map_err(|e| format!("{} sent an unreadable PUSH-ACK: {}", peer.name, e))?;
 
     replication.clock().observe(ack.clock);
-    Ok(record_outcomes(replication, peer, &ack))
+    count_outcomes(replication, peer, &ack);
+    Ok(ack)
 }
 
-/// Which records of a batch the peer actually took.
-///
-/// A record the peer refused is *not* in here, which is what stops a
-/// synchronous commit from reporting success for a transaction the other node
-/// never applied.
-#[derive(Default, Debug)]
-pub struct Settled {
-    taken: std::collections::HashSet<(NodeId, u64)>,
-}
-
-impl Settled {
-    #[inline]
-    fn contains(&self, record: &TxnRecord) -> bool {
-        self.taken.contains(&(record.origin, record.seq))
-    }
-}
-
-/// Folds an acknowledgement into the peer's position and the node's counters.
-fn record_outcomes(
-    replication: &Arc<Replication>,
-    peer: &Arc<PeerHandle>,
-    ack: &PushAck,
-) -> Settled {
+/// Folds an acknowledgement into the node's counters.
+fn count_outcomes(replication: &Arc<Replication>, peer: &Arc<PeerHandle>, ack: &PushAck) {
     let stats = replication.stats();
-    let node_id = replication.node_id();
-    let mut settled = Settled::default();
-
     for outcome in &ack.outcomes {
-        if outcome.status.is_settled() {
-            settled.taken.insert((outcome.origin, outcome.seq));
-        }
         match outcome.status {
             ApplyStatus::Applied => {
                 stats.applied.fetch_add(1, Ordering::Relaxed);
@@ -709,102 +810,21 @@ fn record_outcomes(
             }
             ApplyStatus::Conflict => {
                 stats.conflicts.fetch_add(1, Ordering::Relaxed);
-                warn!(
+                debug!(
                     "{} refused transaction {}:{} as a conflict: {}",
                     peer.name, outcome.origin, outcome.seq, outcome.message
                 );
             }
             ApplyStatus::Failed => {
                 stats.failures.fetch_add(1, Ordering::Relaxed);
-                error!(
+                debug!(
                     "{} could not apply transaction {}:{}: {}",
                     peer.name, outcome.origin, outcome.seq, outcome.message
                 );
             }
             ApplyStatus::Gap => {
                 stats.gaps.fetch_add(1, Ordering::Relaxed);
-                // The peer is missing something earlier; backfill it.
-                peer.needs_catchup.store(true, Ordering::Relaxed);
             }
-        }
-    }
-
-    // The peer's own account of how far it has got is more trustworthy than
-    // counting acknowledgements, and it also covers what a third node sent.
-    if let Some(entry) = ack.applied.iter().find(|entry| entry.origin == node_id) {
-        peer.acked_seq.fetch_max(entry.seq, Ordering::Relaxed);
-    }
-
-    settled
-}
-
-/// Sends whatever the peer is missing of this node's stream, from the log.
-///
-/// Runs on connect and whenever something is known to have been dropped. The
-/// starting point comes from the peer itself, so this cannot skip a record it
-/// never received.
-async fn catch_up(
-    replication: &Arc<Replication>,
-    peer: &Arc<PeerHandle>,
-    link: &mut Link,
-    codec: &mut FrameCodec,
-    frame: &mut Vec<u8>,
-) -> Result<(), String> {
-    let Some(log) = replication.log() else {
-        return Ok(());
-    };
-
-    let node_id = replication.node_id();
-    let mut from = peer.acked_seq();
-    let target = replication.local_seq();
-    if from >= target {
-        return Ok(());
-    }
-
-    if !log.can_serve(node_id, from) {
-        warn!(
-            "Peer {} needs transactions from sequence {}, which retention has already \
-             dropped. It will keep only what arrives from now on; run a full \
-             resynchronisation to close the gap.",
-            peer.name,
-            from + 1
-        );
-        // Resume from what is still held rather than repeatedly failing on
-        // history that no longer exists.
-        from = log.earliest(node_id).saturating_sub(1);
-    }
-
-    let config = replication.config();
-    info!(
-        "Catching peer {} up from sequence {} to {}",
-        peer.name, from, target
-    );
-
-    loop {
-        if peer.is_stopping() || peer.is_paused() {
-            return Ok(());
-        }
-
-        let (records, more) = log
-            .read_after(
-                node_id,
-                from,
-                config.batch_max_records,
-                config.batch_max_bytes,
-            )
-            .map_err(|e| format!("could not read the replication log: {}", e))?;
-
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        let highest = records.last().map(|r| r.seq).unwrap_or(from);
-        let refs: Vec<&TxnRecord> = records.iter().collect();
-        push(replication, peer, link, codec, &refs, frame).await?;
-
-        from = highest;
-        if !more {
-            return Ok(());
         }
     }
 }
@@ -871,73 +891,12 @@ mod tests {
         replication
             .set_config(ReplicationConfig {
                 node_id: 1,
-                // Small, so the overflow path is reachable in a test.
-                queue_capacity: 4,
                 ..Default::default()
             })
             .unwrap();
         replication.open_storage(None).unwrap();
         replication.set_active(true);
         replication
-    }
-
-    fn record(seq: u64) -> Arc<TxnRecord> {
-        Arc::new(TxnRecord {
-            origin: 1,
-            seq,
-            commit_hlc: seq * 100,
-            flags: 0,
-            statements: vec!["INSERT INTO t (id) VALUES (1)".to_string()],
-            tables: vec!["t".to_string()],
-        })
-    }
-
-    /// A peer that cannot be reached must not be able to block a commit, and
-    /// must not silently lose the records either.
-    #[tokio::test]
-    async fn a_full_queue_drops_and_asks_for_a_catch_up_instead_of_blocking() {
-        let replication = replication();
-        // An address nothing is listening on, so the task never drains.
-        let peer = spawn(
-            replication.clone(),
-            &PeerConfig::new("unreachable", "127.0.0.1:1"),
-        );
-
-        for seq in 1..=100 {
-            peer.enqueue(Outbound {
-                record: record(seq),
-                ack: None,
-            });
-        }
-
-        assert!(
-            peer.dropped.load(Ordering::Relaxed) > 0,
-            "a bounded queue must overflow rather than grow"
-        );
-        assert!(
-            peer.needs_catchup.load(Ordering::Relaxed),
-            "a drop must leave a note to backfill"
-        );
-
-        peer.stop();
-    }
-
-    #[tokio::test]
-    async fn a_stopped_peer_accepts_nothing_more() {
-        let replication = replication();
-        let peer = spawn(replication.clone(), &PeerConfig::new("gone", "127.0.0.1:1"));
-        peer.stop();
-
-        let before = peer.dropped.load(Ordering::Relaxed);
-        peer.enqueue(Outbound {
-            record: record(1),
-            ack: None,
-        });
-        assert_eq!(
-            peer.dropped.load(Ordering::Relaxed),
-            before,
-            "nothing should be counted"
-        );
     }
 
     #[tokio::test]
@@ -970,135 +929,39 @@ mod tests {
         peer.stop();
     }
 
+    /// Every kind of outcome is counted, and none of them moves a position:
+    /// only the peer's own account of where it is does that.
     #[tokio::test]
-    async fn a_batch_takes_everything_already_queued() {
-        let replication = Arc::new(Replication::new());
-        replication
-            .set_config(ReplicationConfig {
-                node_id: 1,
-                batch_linger: Duration::ZERO,
-                batch_max_records: 16,
-                ..Default::default()
-            })
-            .unwrap();
-
-        let (sender, receiver) = kanal::bounded_async::<Outbound>(64);
-        for seq in 1..=5 {
-            sender
-                .send(Outbound {
-                    record: record(seq),
-                    ack: None,
-                })
-                .await
-                .unwrap();
-        }
-
-        let batch = next_batch(&replication, &receiver).await.unwrap();
-        assert_eq!(
-            batch.len(),
-            5,
-            "all five were waiting, so all five should go together"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_batch_stops_at_its_record_limit() {
-        let replication = Arc::new(Replication::new());
-        replication
-            .set_config(ReplicationConfig {
-                node_id: 1,
-                batch_linger: Duration::ZERO,
-                batch_max_records: 3,
-                ..Default::default()
-            })
-            .unwrap();
-
-        let (sender, receiver) = kanal::bounded_async::<Outbound>(64);
-        for seq in 1..=10 {
-            sender
-                .send(Outbound {
-                    record: record(seq),
-                    ack: None,
-                })
-                .await
-                .unwrap();
-        }
-
-        let batch = next_batch(&replication, &receiver).await.unwrap();
-        assert_eq!(batch.len(), 3);
-    }
-
-    /// The durability claim a synchronous commit makes: a record the peer
-    /// refused must not count towards it.
-    #[tokio::test]
-    async fn only_records_the_peer_took_are_settled() {
+    async fn outcomes_are_counted_by_kind() {
         let replication = replication();
-        let peer = spawn(replication.clone(), &PeerConfig::new("p", "127.0.0.1:1"));
-
+        let peer = handle(&PeerConfig::new("p", "127.0.0.1:1"));
+        let outcome = |seq, status| ApplyOutcome {
+            origin: 1,
+            seq,
+            status,
+            message: String::new(),
+        };
         let ack = PushAck {
             node_id: 2,
             clock: 1,
             outcomes: vec![
-                ApplyOutcome {
-                    origin: 1,
-                    seq: 1,
-                    status: ApplyStatus::Applied,
-                    message: String::new(),
-                },
-                ApplyOutcome {
-                    origin: 1,
-                    seq: 2,
-                    status: ApplyStatus::Duplicate,
-                    message: String::new(),
-                },
-                ApplyOutcome {
-                    origin: 1,
-                    seq: 3,
-                    status: ApplyStatus::Conflict,
-                    message: "duplicate key".to_string(),
-                },
-                ApplyOutcome {
-                    origin: 1,
-                    seq: 4,
-                    status: ApplyStatus::Failed,
-                    message: "no such table".to_string(),
-                },
-                ApplyOutcome {
-                    origin: 1,
-                    seq: 5,
-                    status: ApplyStatus::Gap,
-                    message: String::new(),
-                },
+                outcome(1, ApplyStatus::Applied),
+                outcome(2, ApplyStatus::Duplicate),
+                outcome(3, ApplyStatus::Conflict),
+                outcome(4, ApplyStatus::Failed),
+                outcome(5, ApplyStatus::Gap),
             ],
             applied: Vec::new(),
         };
 
-        let settled = record_outcomes(&replication, &peer, &ack);
+        count_outcomes(&replication, &peer, &ack);
 
-        assert!(settled.contains(&record(1)), "applied counts");
-        assert!(
-            settled.contains(&record(2)),
-            "the peer already having it counts"
-        );
-        assert!(
-            !settled.contains(&record(3)),
-            "a refused record has not reached the peer"
-        );
-        assert!(!settled.contains(&record(4)), "nor has a failed one");
-        assert!(
-            !settled.contains(&record(5)),
-            "nor one that arrived over a hole"
-        );
-
-        peer.stop();
-    }
-
-    #[tokio::test]
-    async fn a_closed_channel_ends_the_stream_rather_than_hanging() {
-        let replication = replication();
-        let (sender, receiver) = kanal::bounded_async::<Outbound>(4);
-        drop(sender);
-
-        assert!(next_batch(&replication, &receiver).await.is_none());
+        let stats = replication.stats();
+        assert_eq!(stats.applied.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.duplicates.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.conflicts.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.failures.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.gaps.load(Ordering::Relaxed), 1);
+        assert_eq!(peer.acked_seq(), 0);
     }
 }

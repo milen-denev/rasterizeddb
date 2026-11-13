@@ -288,11 +288,21 @@ async fn handle_push(
         Err(e) => return protocol::error_frame(&format!("unreadable PUSH: {}", e)),
     };
 
-    let mut outcomes = Vec::with_capacity(records.len());
-    for record in records {
-        let outcome = apply_record(database, replication, record, sender).await;
-        outcomes.push(outcome);
-    }
+    // In a task of its own. The transport drops this future when its request
+    // timeout passes or the connection goes, and an apply dropped between two
+    // statements leaves a transaction open for good, holding its row locks.
+    // The task runs the batch to its end whatever becomes of the request; a
+    // sender that gave up and sent it again waits its turn and is told the
+    // records are already held.
+    let task = {
+        let database = database.clone();
+        let replication = replication.clone();
+        tokio::spawn(async move { apply_batch(&database, &replication, records, sender).await })
+    };
+    let outcomes = match task.await {
+        Ok(outcomes) => outcomes,
+        Err(e) => return protocol::error_frame(&format!("the apply did not finish: {}", e)),
+    };
 
     let ack = PushAck {
         node_id: replication.node_id(),
@@ -325,9 +335,17 @@ fn handle_pull(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
         ));
     }
 
-    let (records, more) = match log.read_after(
+    // Of this node's own stream, only what is settled and durable here: a
+    // puller must not get ahead of what a pushed peer would be sent.
+    let upto = if request.origin == replication.node_id() {
+        replication.released_through()
+    } else {
+        u64::MAX
+    };
+    let (records, more) = match log.read_range(
         request.origin,
         request.after_seq,
+        upto,
         request.max_records as usize,
         request.max_bytes as usize,
     ) {
@@ -354,42 +372,210 @@ fn refuse(record: &TxnRecord, status: ApplyStatus, message: impl Into<String>) -
     }
 }
 
-/// Applies one record, or explains why it was not applied.
-async fn apply_record(
+/// A record applied and committed in memory, waiting for the sync that
+/// makes it durable.
+struct Waiting {
+    tx: crate::core::mvcc::TxId,
+    owner: crate::core::mvcc::owner::OwnerRelease,
+    record: TxnRecord,
+    /// Where its outcome sits in the batch's answer.
+    answer: usize,
+}
+
+/// The records of one origin applied since the last sync.
+///
+/// Each record is its own transaction, committed in order. What they share is
+/// the `fdatasync`: one a batch, not one a record. The origin commits many
+/// writers under one sync, so a peer paying one each could never keep up with
+/// it, and falling behind is what every other failure here starts from.
+/// Nothing is acknowledged before the sync, and if the sync fails every
+/// record waiting on it is taken back, positions included.
+struct Group {
+    origin: NodeId,
+    /// The position before the first record waiting.
+    before: u64,
+    waiting: Vec<Waiting>,
+}
+
+impl Group {
+    fn new(origin: NodeId) -> Group {
+        Group {
+            origin,
+            before: 0,
+            waiting: Vec::new(),
+        }
+    }
+
+    /// The one sync, and what follows from how it went.
+    fn finish(
+        &mut self,
+        database: &Arc<Database>,
+        replication: &StdArc<Replication>,
+        from_node: NodeId,
+        outcomes: &mut [ApplyOutcome],
+    ) {
+        if self.waiting.is_empty() {
+            return;
+        }
+        let waiting = std::mem::take(&mut self.waiting);
+        let synced = database.sync_own_location();
+
+        if let Err(e) = synced {
+            // Back to aborted, which is what a restart would conclude anyway,
+            // and the position back to where it stood: recording these as
+            // applied would skip transactions this node may not have, which
+            // is permanent divergence. The sender offers them again.
+            for held in waiting.iter().rev() {
+                database.abort_transaction(held.tx);
+            }
+            if let Err(e) = replication.applied().rollback(self.origin, self.before) {
+                warn!("Could not take the applied position back: {}", e);
+            }
+            if let Err(e) = database.transactions.flush() {
+                warn!("Could not make the aborted outcomes durable: {}", e);
+            }
+            for held in waiting {
+                outcomes[held.answer] = refuse(
+                    &held.record,
+                    ApplyStatus::Failed,
+                    format!("the applied rows could not be made durable: {}", e),
+                );
+                held.owner.release();
+            }
+            return;
+        }
+
+        // Durable: the slot takes the position the intents brought it to.
+        if let Err(e) = replication.applied().settle(self.origin) {
+            warn!("Could not settle origin {}'s applied position: {}", self.origin, e);
+        }
+        let relay = replication.config().relay;
+        for held in waiting {
+            // Durable: the apply's table locks go now (finding L4).
+            held.owner.release();
+            replication.stamp_tables(&held.record.tables, held.record.commit_hlc, held.record.origin);
+            debug!(
+                "Applied transaction {}:{} ({} statements)",
+                held.record.origin,
+                held.record.seq,
+                held.record.statements.len()
+            );
+            if relay {
+                relay_onwards(replication, held.record, from_node);
+            }
+        }
+    }
+}
+
+/// Logs a record that arrived here for the nodes this one can see and its
+/// sender cannot. The senders read it from the log like any other.
+fn relay_onwards(replication: &StdArc<Replication>, mut record: TxnRecord, _from_node: NodeId) {
+    // Marked, so a reader can tell a transaction that passed through here
+    // from one that started here.
+    record.flags |= protocol::FLAG_RELAYED;
+    if let Some(log) = replication.log() {
+        if let Err(e) = log.append(&record) {
+            warn!(
+                "Could not log relayed transaction {}:{}: {}; the nodes behind this one will \
+                 not get it from here",
+                record.origin, record.seq, e
+            );
+            return;
+        }
+    }
+    replication.relay_logged();
+}
+
+/// Applies a batch of records, in order, and reports on each.
+///
+/// Records of one origin are applied under that origin's lock, so the same
+/// record arriving on two connections is applied by one and found already
+/// held by the other.
+pub(crate) async fn apply_batch(
+    database: &Arc<Database>,
+    replication: &StdArc<Replication>,
+    records: Vec<TxnRecord>,
+    // Which peer handed these over. `NO_SENDER` when they did not come off a
+    // link — a `RESYNC` pull, say.
+    from_node: NodeId,
+) -> Vec<ApplyOutcome> {
+    let mut outcomes: Vec<ApplyOutcome> = Vec::with_capacity(records.len());
+    let mut records = records.into_iter().peekable();
+
+    while let Some(first) = records.next() {
+        let origin = first.origin;
+        let lock = replication.apply_lock(origin);
+        let _turn = lock.lock().await;
+
+        let mut group = Group::new(origin);
+        let mut next = Some(first);
+        while let Some(record) = next.take() {
+            apply_one(database, replication, record, from_node, &mut group, &mut outcomes).await;
+            if records.peek().is_some_and(|following| following.origin == origin) {
+                next = records.next();
+            }
+        }
+        group.finish(database, replication, from_node, &mut outcomes);
+    }
+
+    outcomes
+}
+
+/// Applies one record on its own. For callers with one record in hand.
+pub(super) async fn apply_record(
     database: &Arc<Database>,
     replication: &StdArc<Replication>,
     record: TxnRecord,
-    // Which peer handed this over, so relaying does not send it straight back.
-    // `NO_SENDER` when it did not come off a link — a `RESYNC` pull, say.
     from_node: NodeId,
 ) -> ApplyOutcome {
+    apply_batch(database, replication, vec![record], from_node)
+        .await
+        .pop()
+        .expect("one record in, one outcome out")
+}
+
+/// Applies one record into `group`, or explains why it was not applied. Its
+/// outcome is pushed onto `outcomes`.
+async fn apply_one(
+    database: &Arc<Database>,
+    replication: &StdArc<Replication>,
+    record: TxnRecord,
+    from_node: NodeId,
+    group: &mut Group,
+    outcomes: &mut Vec<ApplyOutcome>,
+) {
     let applied = replication.applied();
     let node_id = replication.node_id();
 
     // Our own transaction, arriving back from a relay. Nothing to do.
     if record.origin == node_id {
-        return refuse(&record, ApplyStatus::Duplicate, "");
+        outcomes.push(refuse(&record, ApplyStatus::Duplicate, ""));
+        return;
     }
 
+    // Read under the origin's lock: nobody else moves this position.
     if applied.already_applied(record.origin, record.seq) {
-        return refuse(&record, ApplyStatus::Duplicate, "");
+        outcomes.push(refuse(&record, ApplyStatus::Duplicate, ""));
+        return;
     }
 
     let high_water = applied.high_water(record.origin);
     if high_water > 0 && record.seq > high_water + 1 {
         // A record cannot be applied over a hole: the statements before it may
-        // be what make it valid. The sender backfills on seeing this.
-        return refuse(
+        // be what make it valid. The sender starts again from this node's
+        // position on seeing this.
+        outcomes.push(refuse(
             &record,
             ApplyStatus::Gap,
             format!("expected sequence {}, got {}", high_water + 1, record.seq),
-        );
+        ));
+        return;
     }
     if high_water == 0 && record.seq > 1 {
         // Nothing has ever been applied from this origin and its stream does
-        // not start at the beginning: its early history is beyond retention.
-        // Adopting the stream here is the only way forward, and saying so is
-        // the only honest thing to do about what came before.
+        // not start at the beginning. A sender of this version never offers
+        // that; one that does has lost its early history, and saying so is the
+        // only honest thing to do about what came before.
         warn!(
             "Adopting origin {}'s stream at sequence {}: this node holds nothing earlier, \
              so transactions before it are not present. Seed this node from a backup of \
@@ -400,18 +586,56 @@ async fn apply_record(
 
     replication.clock().observe(record.commit_hlc);
 
+    // A sequence the origin handed to a transaction that did not commit.
+    // There is nothing to run: the stream moves past it.
+    if record.is_void() || record.statements.is_empty() {
+        group.finish(database, replication, from_node, outcomes);
+        let outcome = match applied.record(record.origin, record.seq) {
+            Ok(_) => ApplyOutcome {
+                origin: record.origin,
+                seq: record.seq,
+                status: ApplyStatus::Applied,
+                message: String::new(),
+            },
+            Err(e) => refuse(
+                &record,
+                ApplyStatus::Failed,
+                format!("the applied position could not be written: {}", e),
+            ),
+        };
+        if outcome.status == ApplyStatus::Applied && replication.config().relay {
+            relay_onwards(replication, record, from_node);
+        }
+        outcomes.push(outcome);
+        return;
+    }
+
     let policy = replication.conflict_policy();
     if policy == ConflictPolicy::LastWriterWins && replication.is_superseded(&record) {
         // Every table it writes has a strictly later local write, so applying
         // it would move those rows backwards in time.
+        group.finish(database, replication, from_node, outcomes);
         if let Err(e) = applied.record(record.origin, record.seq) {
             warn!("Could not record the applied position: {}", e);
         }
-        return refuse(
+        outcomes.push(refuse(
             &record,
             ApplyStatus::Conflict,
             "superseded by a later local write",
-        );
+        ));
+        return;
+    }
+
+    // A statement that is not a plain row write (a schema change) takes locks
+    // that the records waiting in the group may hold their side of, and is
+    // not undone by an abort. It runs with nothing waiting, and is synced
+    // before anything follows it.
+    let plain = record
+        .statements
+        .iter()
+        .all(|statement| super::manager::plain_row_write(statement));
+    if !plain {
+        group.finish(database, replication, from_node, outcomes);
     }
 
     // A statement that failed on a lock (40P01, 55P03, 57014, 57P01: a
@@ -428,8 +652,8 @@ async fn apply_record(
         replication.enter_apply(tx, record.origin);
         // The apply's lock owner: a named internal owner, its transaction's
         // root, never `FROZEN_TX` (docs/persistent-indexes.md §7 Owner;
-        // finding L2). Released after the last durability step below, or on
-        // any way out.
+        // finding L2). Released after the last durability step, or on any
+        // way out.
         let owner = crate::core::mvcc::owner::OwnerRelease::for_root(&database.row_locks, tx);
 
         let mut failure: Option<String> = None;
@@ -479,6 +703,9 @@ async fn apply_record(
         let Some(message) = failure else {
             break (tx, owner);
         };
+        // What is waiting goes to disk first: the flush below is this
+        // transaction's, and must not be what carries the others' outcomes.
+        group.finish(database, replication, from_node, outcomes);
         // `Database::abort_transaction`, not the manager's `abort`: the latter
         // ended the transaction but left its row locks in the lock table and
         // its capture buffers behind (finding L2).
@@ -504,7 +731,8 @@ async fn apply_record(
                  delivered again",
                 record.origin, record.seq, message
             );
-            return refuse(&record, ApplyStatus::Failed, message);
+            outcomes.push(refuse(&record, ApplyStatus::Failed, message));
+            return;
         }
         // Deliberately *not* advancing the applied position. Under `abort` the
         // stream stops here rather than silently skipping a transaction, which
@@ -515,87 +743,77 @@ async fn apply_record(
              the conflict policy to skip.",
             record.origin, record.seq, message
         );
-        return refuse(&record, ApplyStatus::Conflict, message);
+        outcomes.push(refuse(&record, ApplyStatus::Conflict, message));
+        return;
     };
 
+    // The position goes into the log ahead of the commit it depends on, as
+    // "this sequence, if this transaction committed": one sync then covers
+    // the rows, the position and the outcome, and after a crash the position
+    // counts exactly when the rows do (`AppliedState`).
+    let wrote = database.transactions.wrote_family(tx);
+    let before = applied.high_water(record.origin);
+    // The records waiting in the group are synced first: taking this one's
+    // step back starts a new run of intents, and theirs must be in the slot
+    // by then.
+    let give_up = |why: String, group: &mut Group, outcomes: &mut Vec<ApplyOutcome>| {
+        database.abort_transaction(tx);
+        group.finish(database, replication, from_node, outcomes);
+        let before = applied.high_water(record.origin).min(before);
+        if let Err(e) = applied.rollback(record.origin, before) {
+            warn!("Could not take the applied position back: {}", e);
+        }
+        if let Err(e) = database.transactions.flush() {
+            warn!("Could not make the aborted outcome durable: {}", e);
+        }
+        // Not recorded as applied, so the record comes again and is applied
+        // then, instead of being skipped for good.
+        refuse(&record, ApplyStatus::Failed, why)
+    };
+
+    // A transaction that wrote no row has no durable outcome to ask about
+    // later; its step is written as one that holds if the steps before it do.
+    if let Err(e) = applied.begin(record.origin, record.seq, if wrote { tx } else { 0 }) {
+        let outcome = give_up(format!("the applied position could not be written: {}", e), group, outcomes);
+        owner.release();
+        outcomes.push(outcome);
+        return;
+    }
     // Through the same path as a client's commit: rows applied to a table on
     // another storage location are in that location's log, and they have to
     // be durable before the outcome exists for any root flush to carry to
-    // disk. The bare commit left them to the log writer, and a power cut in
-    // between kept this transaction's root half and lost the rest.
+    // disk.
     if let Err(e) = database.commit_written_transaction(tx) {
-        database.abort_transaction(tx);
-        if let Err(e) = database.transactions.flush() {
-            warn!("Could not make the aborted outcome durable: {}", e);
-        }
+        let outcome = give_up(format!("the applied rows could not be made durable: {}", e), group, outcomes);
         owner.release();
-        // Not recorded as applied, so the record comes again and is applied
-        // then, instead of being skipped for good.
-        return refuse(
-            &record,
-            ApplyStatus::Failed,
-            format!("the applied rows could not be made durable: {}", e),
-        );
+        outcomes.push(outcome);
+        return;
     }
-    if let Err(e) = database.transactions.flush() {
-        // Back to aborted, which is what a restart would conclude anyway, and
-        // not recorded as applied: recording it would skip a transaction this
-        // node may not have, which is permanent divergence.
-        database.abort_transaction(tx);
-        if let Err(e) = database.transactions.flush() {
-            warn!("Could not make the aborted outcome durable: {}", e);
-        }
+    if let Err(e) = database.transactions.flush_deferred() {
+        let outcome = give_up(format!("the transaction outcome could not be recorded: {}", e), group, outcomes);
         owner.release();
-        return refuse(
-            &record,
-            ApplyStatus::Failed,
-            format!("the transaction outcome could not be made durable: {}", e),
-        );
+        outcomes.push(outcome);
+        return;
     }
-    // Durable: the apply's table locks go now (finding L4).
-    owner.release();
+    applied.advance(record.origin, record.seq);
 
-    // Recorded after the commit is durable: a crash in the window between them
-    // replays this transaction rather than losing it. See `super::log`.
-    if let Err(e) = applied.record(record.origin, record.seq) {
-        warn!("Could not record the applied position: {}", e);
+    if group.waiting.is_empty() {
+        group.before = before;
     }
-    replication.stamp_tables(&record.tables, record.commit_hlc, record.origin);
-
-    debug!(
-        "Applied transaction {}:{} ({} statements)",
-        record.origin,
-        record.seq,
-        record.statements.len()
-    );
-
-    // A record that arrived here may still have to reach nodes this one can
-    // see and its sender cannot.
-    let origin = record.origin;
-    let seq = record.seq;
-
-    if replication.config().relay {
-        // Marked before it is either logged or forwarded, so what a third node
-        // receives and what this node's log holds are the same record — and a
-        // reader can tell a transaction that passed through here from one that
-        // started here.
-        let mut relayed = record;
-        relayed.flags |= protocol::FLAG_RELAYED;
-        let relayed = StdArc::new(relayed);
-
-        if let Some(log) = replication.log() {
-            if let Err(e) = log.append(&relayed) {
-                warn!("Could not log a relayed transaction: {}", e);
-            }
-        }
-        replication.relay(relayed, from_node);
-    }
-
-    ApplyOutcome {
-        origin,
-        seq,
+    outcomes.push(ApplyOutcome {
+        origin: record.origin,
+        seq: record.seq,
         status: ApplyStatus::Applied,
         message: String::new(),
+    });
+    group.waiting.push(Waiting {
+        tx,
+        owner,
+        record,
+        answer: outcomes.len() - 1,
+    });
+    if !plain {
+        group.finish(database, replication, from_node, outcomes);
     }
 }
 
@@ -642,8 +860,7 @@ pub async fn apply_pulled(
 ) -> (usize, usize) {
     let mut applied = 0;
     let mut refused = 0;
-    for record in records {
-        let outcome = apply_record(database, replication, record, NO_SENDER).await;
+    for outcome in apply_batch(database, replication, records, NO_SENDER).await {
         if outcome.status == ApplyStatus::Applied {
             applied += 1;
         } else if !outcome.status.is_settled() {

@@ -266,13 +266,46 @@ fn next_database_id() -> u64 {
 /// [`Database::commit_transaction`] and consumed by
 /// [`Database::publish_transaction`]: the set is only reliably answerable at
 /// commit, and threading it through makes that impossible to get wrong.
-#[derive(Debug, Clone)]
-pub struct TransactionFamily(Vec<(crate::core::mvcc::TxId, bool)>);
+///
+/// It also carries the transaction's replication record, written just ahead
+/// of the commit (`Replication::prepare_family`). Publishing releases it to
+/// the peers; a family dropped without being published releases it too,
+/// because the transaction did commit and a record left unsettled would hold
+/// back every transaction after it. An abort voids the record first, and the
+/// drop then finds nothing to release.
+#[derive(Debug)]
+pub struct TransactionFamily {
+    members: Vec<(crate::core::mvcc::TxId, bool)>,
+    /// The id the commit was asked for, and what its record is settled
+    /// through.
+    record: Option<(
+        crate::core::mvcc::TxId,
+        StdArc<crate::replication::Replication>,
+        StdArc<TransactionManager>,
+    )>,
+}
 
 impl TransactionFamily {
     /// Every id, whether or not its writes survived.
     pub fn ids(&self) -> Vec<crate::core::mvcc::TxId> {
-        self.0.iter().map(|(id, _)| *id).collect()
+        self.members.iter().map(|(id, _)| *id).collect()
+    }
+}
+
+impl Drop for TransactionFamily {
+    fn drop(&mut self) {
+        let Some((root, replication, transactions)) = self.record.take() else {
+            return;
+        };
+        if !replication.is_prepared(root) {
+            return;
+        }
+        // Committed and never published. Its outcome goes into the log first,
+        // so the release below waits for a sync that covers it.
+        if let Err(e) = transactions.flush_deferred() {
+            warn!("Could not record a transaction outcome before releasing its replication record: {}", e);
+        }
+        replication.release(root);
     }
 }
 
@@ -2011,15 +2044,57 @@ impl Database {
     ) -> std::io::Result<TransactionFamily> {
         self.transactions.check_ids_reserved(tx)?;
         self.sync_other_locations()?;
-        Ok(self.commit_transaction(tx))
+        let mut family = self.family_of(tx);
+        // The replication record, ahead of the commit: on failure nothing
+        // has been committed, and the caller aborts.
+        self.prepare_replication(tx, &mut family)?;
+        Ok(self.commit_family(tx, family))
     }
 
+    /// Commits a transaction with nothing to make durable first.
+    ///
+    /// Infallible, so a replication record that cannot be written is not a
+    /// commit that can be refused: the statement has run. It is reported, and
+    /// kept on show, as a statement the peers will never receive.
     pub fn commit_transaction(&self, tx: crate::core::mvcc::TxId) -> TransactionFamily {
         // Read *before* the commit. A rolled-back savepoint already resolves as
         // aborted while its parent runs, so the answer is correct here — and
         // asking afterwards would depend on the manager keeping its parent map
         // past the commit, which it happens to do and is not obliged to.
-        let family = self.family_of(tx);
+        let mut family = self.family_of(tx);
+        if let Err(e) = self.prepare_replication(tx, &mut family) {
+            self.replication.note_capture_failure(format!(
+                "A transaction committed but could not be written to the replication log ({}); \
+                 the peers will not receive it",
+                e
+            ));
+        }
+        self.commit_family(tx, family)
+    }
+
+    /// Writes `tx`'s replication record, if it captured anything, and ties it
+    /// to `family`. See `Replication::prepare_family` for why this comes
+    /// before the commit.
+    fn prepare_replication(
+        &self,
+        tx: crate::core::mvcc::TxId,
+        family: &mut TransactionFamily,
+    ) -> std::io::Result<()> {
+        if !self.replication.is_active() {
+            return Ok(());
+        }
+        let wrote = self.transactions.wrote_family(tx);
+        if self
+            .replication
+            .prepare_family(&family.members, tx, wrote)?
+            .is_some()
+        {
+            family.record = Some((tx, self.replication.clone(), self.transactions.clone()));
+        }
+        Ok(())
+    }
+
+    fn commit_family(&self, tx: crate::core::mvcc::TxId, family: TransactionFamily) -> TransactionFamily {
         self.transactions.commit(tx);
         // A row lock outlives nothing: whatever this transaction held is
         // another transaction's the moment it ends. Its owner's table locks
@@ -2048,9 +2123,9 @@ impl Database {
     /// In the default asynchronous mode this is a channel send per peer, so a
     /// peer that is slow or gone cannot hold a commit up. Under a synchronous
     /// mode it waits for acknowledgements, bounded by `ack_timeout`.
-    pub async fn publish_transaction(&self, family: TransactionFamily) {
-        if let Some(record) = self.replication.commit_record_family(&family.0) {
-            self.replication.publish(record).await;
+    pub async fn publish_transaction(&self, mut family: TransactionFamily) {
+        if let Some((root, replication, _)) = family.record.take() {
+            replication.publish_prepared(root).await;
         }
     }
 
@@ -2075,16 +2150,21 @@ impl Database {
         // map, and a database that is not replicating should not pay for a
         // question whose answer it will throw away.
         if !self.replication.is_active() {
-            return TransactionFamily(vec![(tx, true)]);
+            return TransactionFamily {
+                members: vec![(tx, true)],
+                record: None,
+            };
         }
 
-        TransactionFamily(
-            self.transactions
+        TransactionFamily {
+            members: self
+                .transactions
                 .family_of(tx)
                 .into_iter()
                 .map(|id| (id, self.transactions.outcome(id) != TxOutcome::Aborted))
                 .collect(),
-        )
+            record: None,
+        }
     }
 
     /// Ends `tx` without effect and discards what replication buffered for it.
@@ -2100,6 +2180,34 @@ impl Database {
         // Every id, including savepoints: their buffers would otherwise sit in
         // the capture map for the life of the process.
         self.replication.on_abort_family(&family.ids());
+    }
+
+    /// Opens replication's two files and settles what a crash left in them.
+    ///
+    /// Called at every server start whether or not replication is switched
+    /// on, when the files are there: a record or a position written ahead of
+    /// a commit that never happened is decided by asking how its transaction
+    /// ended, and that has to be asked before anything can forget the answer.
+    pub fn open_replication_storage(&self) -> io::Result<()> {
+        let transactions = self.transactions.clone();
+        let committed = move |tx: crate::core::mvcc::TxId| {
+            transactions.outcome(tx) == crate::core::mvcc::TxOutcome::Committed
+        };
+        self.replication.open_storage_logged(
+            self.location.as_deref().map(std::path::Path::new),
+            self.transactions.outcome_log(),
+            &committed,
+        )
+    }
+
+    /// Whether this database's directory holds replication files from an
+    /// earlier run.
+    pub fn has_replication_files(&self) -> bool {
+        self.location.as_deref().is_some_and(|dir| {
+            let dir = std::path::Path::new(dir);
+            dir.join(crate::replication::log::LOG_FILE).exists()
+                || dir.join(crate::replication::log::STATE_FILE).exists()
+        })
     }
 
     /// Brings replication up: opens its log, starts each peer, and starts the
@@ -2121,7 +2229,7 @@ impl Database {
             .validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-        replication.open_storage(database.location.as_deref().map(std::path::Path::new))?;
+        database.open_replication_storage()?;
         replication.set_active(true);
 
         for peer_config in &config.peers {
