@@ -285,13 +285,45 @@ pub async fn execute(sql: &str, database: &Arc<Database>) -> Result<Vec<String>,
         "RESUME" => set_peer_paused(&replication, &tokens, false),
         "RESYNC" => resync(database, &tokens).await,
         "ADOPT" => adopt_peer(&replication, &tokens),
+        "CHECK" => check(database, &tokens).await,
         "SET" => set(database, statement, &tokens).await,
         _ => Err(format!(
             "unknown replication statement `{}`: try ENABLE, DISABLE, ADD PEER, DROP PEER, \
-             PAUSE PEER, RESUME PEER, RESYNC PEER, ADOPT PEER or SET",
+             PAUSE PEER, RESUME PEER, RESYNC PEER, ADOPT PEER, CHECK or SET",
             statement
         )),
     }
+}
+
+/// `REPLICATION CHECK [PEER '<name>'] [TABLE <table>]`: compares this node's
+/// tables with a peer's, row for row. With no peer named, with each of them.
+async fn check(database: &Arc<Database>, tokens: &[String]) -> Result<Vec<String>, String> {
+    let replication = database.replication.clone();
+    let word = |keyword: &str| {
+        tokens
+            .iter()
+            .position(|t| t.eq_ignore_ascii_case(keyword))
+            .and_then(|at| tokens.get(at + 1))
+            .map(|value| unquote(value).to_string())
+    };
+    let only: Vec<String> = word("TABLE").into_iter().collect();
+    let peers = match word("PEER") {
+        Some(name) => vec![replication
+            .peer(&name)
+            .ok_or_else(|| format!("no peer named '{}'", name))?],
+        None => replication.peers(),
+    };
+    if peers.is_empty() {
+        return Err("no peers configured: there is nothing to compare with".to_string());
+    }
+    let mut lines = Vec::new();
+    for peer in peers {
+        match super::check::check(database, &peer, &only).await {
+            Ok((_, said)) => lines.extend(said),
+            Err(e) => lines.push(format!("{} could not be compared: {}", peer.name, e)),
+        }
+    }
+    Ok(lines)
 }
 
 /// `REPLICATION ADOPT PEER '<name>'`: the peer holds more of this node's

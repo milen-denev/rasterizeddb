@@ -207,6 +207,7 @@ async fn handle_frame(database: Arc<Database>, request: Vec<u8>) -> Vec<u8> {
         FrameKind::Hello => handle_hello(&replication, &payload),
         FrameKind::Push => handle_push(&database, &replication, &payload).await,
         FrameKind::Pull => handle_pull(&replication, &payload),
+        FrameKind::Digest => super::check::answer(&database, &payload).await,
         FrameKind::Ping => {
             let mut out = Vec::with_capacity(8);
             out.extend_from_slice(&replication.clock().now().to_le_bytes());

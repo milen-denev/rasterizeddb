@@ -64,6 +64,10 @@ pub enum FrameKind {
     Pong = 7,
     /// A refusal, with a reason a human can read.
     Error = 8,
+    /// "What do your tables hold?" — for comparing two nodes row for row.
+    Digest = 9,
+    /// The answer to a `Digest`.
+    DigestAck = 10,
 }
 
 impl FrameKind {
@@ -78,6 +82,8 @@ impl FrameKind {
             6 => FrameKind::Ping,
             7 => FrameKind::Pong,
             8 => FrameKind::Error,
+            9 => FrameKind::Digest,
+            10 => FrameKind::DigestAck,
             _ => return None,
         })
     }
@@ -95,6 +101,8 @@ impl fmt::Display for FrameKind {
             FrameKind::Ping => "PING",
             FrameKind::Pong => "PONG",
             FrameKind::Error => "ERROR",
+            FrameKind::Digest => "DIGEST",
+            FrameKind::DigestAck => "DIGEST-ACK",
         })
     }
 }
@@ -613,6 +621,131 @@ impl PushAck {
             applied,
         })
     }
+}
+
+/// What one table holds, reduced to something two nodes can compare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableDigest {
+    pub name: String,
+    pub rows: u64,
+    /// Over every row's column bytes, and independent of the order the rows
+    /// were read in. Zero when `note` says the contents were not read.
+    pub checksum: u64,
+    /// Empty when the table was read whole; otherwise why it was not.
+    pub note: String,
+}
+
+/// A node's answer to a `Digest`: its tables, and where its streams stood
+/// before and after it read them. The two differ when something was written
+/// or applied meanwhile, and the digests then describe no single moment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeDigest {
+    pub node_id: NodeId,
+    /// How far this node's own stream was released, before and after.
+    pub released: (u64, u64),
+    /// Its transactions still committing, after.
+    pub unreleased: u64,
+    pub applied_before: Vec<VectorEntry>,
+    pub applied_after: Vec<VectorEntry>,
+    pub tables: Vec<TableDigest>,
+}
+
+impl NodeDigest {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        put_u64(out, self.node_id);
+        put_u64(out, self.released.0);
+        put_u64(out, self.released.1);
+        put_u64(out, self.unreleased);
+        for vector in [&self.applied_before, &self.applied_after] {
+            put_u32(out, vector.len() as u32);
+            for entry in vector {
+                put_u64(out, entry.origin);
+                put_u64(out, entry.seq);
+            }
+        }
+        put_u32(out, self.tables.len() as u32);
+        for table in &self.tables {
+            put_str(out, &table.name);
+            put_u64(out, table.rows);
+            put_u64(out, table.checksum);
+            put_str(out, &table.note);
+        }
+    }
+
+    pub fn decode(reader: &mut Reader<'_>) -> Result<NodeDigest, ProtocolError> {
+        let node_id = reader.u64()?;
+        let released = (reader.u64()?, reader.u64()?);
+        let unreleased = reader.u64()?;
+        let mut vectors = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let count = reader.u32()? as usize;
+            let mut vector = Vec::with_capacity(count.min(reader.remaining() / 16));
+            for _ in 0..count {
+                vector.push(VectorEntry {
+                    origin: reader.u64()?,
+                    seq: reader.u64()?,
+                });
+            }
+            vectors.push(vector);
+        }
+        let applied_after = vectors.pop().expect("two vectors");
+        let applied_before = vectors.pop().expect("two vectors");
+        let count = reader.u32()? as usize;
+        let mut tables = Vec::with_capacity(count.min(reader.remaining() / 24));
+        for _ in 0..count {
+            tables.push(TableDigest {
+                name: reader.str()?,
+                rows: reader.u64()?,
+                checksum: reader.u64()?,
+                note: reader.str()?,
+            });
+        }
+        Ok(NodeDigest {
+            node_id,
+            released,
+            unreleased,
+            applied_before,
+            applied_after,
+            tables,
+        })
+    }
+
+    /// How far this node had applied `origin`'s stream, if that did not move
+    /// while it read its tables.
+    pub fn applied(&self, origin: NodeId) -> Option<u64> {
+        let at = |vector: &[VectorEntry]| {
+            vector
+                .iter()
+                .find(|entry| entry.origin == origin)
+                .map(|entry| entry.seq)
+                .unwrap_or(0)
+        };
+        let (before, after) = (at(&self.applied_before), at(&self.applied_after));
+        (before == after).then_some(after)
+    }
+
+    /// How far this node's own stream stood, if nothing was committed while
+    /// it read its tables.
+    pub fn own(&self) -> Option<u64> {
+        (self.released.0 == self.released.1 && self.unreleased == 0).then_some(self.released.1)
+    }
+}
+
+/// The tables a `Digest` asks about; none means all of them.
+pub fn encode_digest_request(tables: &[String], out: &mut Vec<u8>) {
+    put_u32(out, tables.len() as u32);
+    for table in tables {
+        put_str(out, table);
+    }
+}
+
+pub fn decode_digest_request(reader: &mut Reader<'_>) -> Result<Vec<String>, ProtocolError> {
+    let count = reader.u32()? as usize;
+    let mut tables = Vec::with_capacity(count.min(reader.remaining() / 4));
+    for _ in 0..count {
+        tables.push(reader.str()?);
+    }
+    Ok(tables)
 }
 
 /// "Send me everything you have from `origin` after `after_seq`."

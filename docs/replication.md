@@ -472,6 +472,8 @@ REPLICATION PAUSE PEER 'berlin'
 REPLICATION RESUME PEER 'berlin'
 REPLICATION RESYNC PEER 'berlin' FROM 0
 REPLICATION ADOPT PEER 'berlin'      -- only when it holds more of this node's stream than this node does (§8)
+REPLICATION CHECK                    -- compare every table with every peer, row for row (§7.1)
+REPLICATION CHECK PEER 'berlin' TABLE orders
 
 REPLICATION SET compression = 'auto:zstd:1'
 REPLICATION SET mode = 'quorum:1'
@@ -508,6 +510,34 @@ $ psql -c "SHOW REPLICATION STATUS"
  peer             address                  node   state      acked    lag      queued   codec
  two              127.0.0.1:7442           2      up         361      0        0        zstd
 ```
+
+### 7.1 Checking that two nodes hold the same rows
+
+`SHOW REPLICATION` compares sequence numbers: how much of each stream a node
+has applied. That is not the same as holding the same rows, and the one time a
+pair diverged here both nodes reported the peer up with a lag of zero.
+
+`REPLICATION CHECK` does not take the stream's word for it. Each node reduces
+every table a client made to a row count and a checksum over its rows' bytes
+(order-independent, so the two nodes need not store rows in the same order),
+and the two are compared:
+
+```text
+$ psql -c "REPLICATION CHECK"
+ node 1 and berlin (node 2) are in step: each has applied all the other has committed (5120 from here, 14 from there)
+ 3 table(s) compared: 1 DIFFERENT, 0 on one node only
+ DIFFERENT  orders: 5100 rows here, 5099 on berlin
+```
+
+The comparison only counts when the two nodes are **in step**: nothing was
+committed or applied on either while it read its tables, and each has applied
+all the other has released. Otherwise it is tried again a few times and then
+reported as `NOT in step`, since a table read while a transaction is in flight
+differs for an honest reason. Run it when the nodes are quiet.
+
+What it does not do: a table of more than two million rows is counted but not
+read, because its rows are held in memory while they are hashed; and it says
+which table differs, not which rows.
 
 ## 8. The files
 

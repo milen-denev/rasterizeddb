@@ -83,6 +83,7 @@
 //! first — replication ships what happens from now on, not what happened
 //! before. Seed it from a backup, then start it.
 
+pub mod check;
 pub mod config;
 pub mod hlc;
 pub mod log;

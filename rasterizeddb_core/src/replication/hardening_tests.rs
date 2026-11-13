@@ -711,3 +711,79 @@ async fn storage_opened_before_the_configuration_takes_its_retention_from_it() {
     drop(database);
     crate::core::wal::remove_for(&dir.path().to_string_lossy());
 }
+
+/// `REPLICATION CHECK` says two nodes hold the same rows when they do, and
+/// names the table when they do not: a row missing, a row extra, and a row
+/// that is there on both with different contents, none of which the
+/// sequence numbers show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_finds_rows_that_differ_between_two_nodes_that_report_in_step() {
+    let (one, two) = pair().await;
+    run_ok(&one, "CREATE TABLE repl_same (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "CREATE TABLE repl_lost (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "CREATE TABLE repl_changed (id INTEGER, name VARCHAR)").await;
+    for table in ["repl_same", "repl_lost", "repl_changed"] {
+        for id in 0..50 {
+            run_ok(&one, &format!("INSERT INTO {table} (id, name) VALUES ({id}, 'row {id}')")).await;
+        }
+    }
+    run_ok(&two, "INSERT INTO repl_same (id, name) VALUES (1000, 'from two')").await;
+    settled(&one, &two).await;
+
+    let peer = one.replication.peer("two").unwrap();
+    let (verdict, lines) = super::check::check(&one, &peer, &[]).await.unwrap();
+    assert!(verdict.in_step, "{lines:?}");
+    assert_eq!(verdict.compared, 3, "{lines:?}");
+    assert!(verdict.different.is_empty() && verdict.missing.is_empty() && verdict.unread.is_empty(), "{lines:?}");
+    assert!(lines[1].contains("the same rows on both"), "{lines:?}");
+
+    // Behind replication's back on node two, as a divergence would be: the
+    // streams still report both nodes in step.
+    two.replication.set_active(false);
+    run_ok(&two, "DELETE FROM repl_lost WHERE id = 7").await;
+    run_ok(&two, "UPDATE repl_changed SET name = 'not the same' WHERE id = 7").await;
+    run_ok(&two, "CREATE TABLE repl_only_two (id INTEGER)").await;
+    two.replication.set_active(true);
+    assert_eq!(two.replication.applied().high_water(1), one.replication.local_seq());
+
+    let (verdict, lines) = super::check::check(&one, &peer, &[]).await.unwrap();
+    assert!(verdict.in_step, "{lines:?}");
+    assert_eq!(verdict.different.len(), 2, "{lines:?}");
+    assert!(verdict.different.iter().any(|d| d.starts_with("repl_lost: 50 rows here, 49 on two")), "{lines:?}");
+    assert!(
+        verdict.different.iter().any(|d| d.starts_with("repl_changed: 50 rows on both, and they are not the same rows")),
+        "{lines:?}"
+    );
+    assert_eq!(verdict.missing, vec!["repl_only_two: on two, not here".to_string()], "{lines:?}");
+
+    // One table by name, through the statement, from the other side.
+    let said = super::sql::execute("REPLICATION CHECK PEER 'one' TABLE repl_changed", &two).await.unwrap();
+    assert!(said.iter().any(|line| line.starts_with("DIFFERENT  repl_changed")), "{said:?}");
+    let said = super::sql::execute("REPLICATION CHECK TABLE repl_same", &two).await.unwrap();
+    assert!(said.iter().any(|line| line.contains("the same rows on both")), "{said:?}");
+    assert!(super::sql::execute("REPLICATION CHECK PEER 'nobody'", &one).await.is_err());
+}
+
+/// A comparison made while one node is behind is reported as not
+/// comparable, not as a difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_of_nodes_that_are_not_in_step_says_so() {
+    let (one, two) = pair().await;
+    run_ok(&one, "CREATE TABLE repl_behind (id INTEGER, name VARCHAR)").await;
+    settled(&one, &two).await;
+
+    // Node two stops hearing node one, which carries on writing.
+    let link = one.replication.peer("two").unwrap();
+    link.set_paused(true);
+    run_ok(&one, "INSERT INTO repl_behind (id, name) VALUES (1, 'not there yet')").await;
+
+    let peer = two.replication.peer("one").unwrap();
+    let (verdict, lines) = super::check::check(&two, &peer, &[]).await.unwrap();
+    assert!(!verdict.in_step, "{lines:?}");
+    assert!(lines[0].contains("NOT in step"), "{lines:?}");
+
+    link.set_paused(false);
+    settled(&one, &two).await;
+    let (verdict, lines) = super::check::check(&two, &peer, &[]).await.unwrap();
+    assert!(verdict.in_step && verdict.different.is_empty(), "{lines:?}");
+}

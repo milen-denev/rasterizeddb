@@ -883,6 +883,31 @@ fn count_outcomes(replication: &Arc<Replication>, peer: &Arc<PeerHandle>, ack: &
     }
 }
 
+/// Sends one request on a connection of its own and returns the answer's
+/// kind and payload. For requests that are not part of the stream.
+pub async fn ask(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    kind: FrameKind,
+    payload: &[u8],
+) -> Result<(FrameKind, Vec<u8>), String> {
+    let mut link = connect(replication, peer).await?;
+    let response = link
+        .client
+        .send(protocol::plain_frame(kind, 0, payload))
+        .await
+        .map_err(|e| format!("asking {} failed: {}", peer.name, e))?;
+    let mut codec = FrameCodec::new(replication.config().compression.level);
+    let mut scratch = Vec::new();
+    let (header, body) = codec
+        .decode_frame(&response, &mut scratch)
+        .map_err(|e| format!("{} answered with an unreadable frame: {}", peer.name, e))?;
+    match header.kind {
+        FrameKind::Error => Err(protocol::decode_error(body)),
+        kind => Ok((kind, body.to_vec())),
+    }
+}
+
 /// Asks a peer for what *this* node is missing of `origin`'s stream.
 ///
 /// The inverse of [`catch_up`], and what `REPLICATION RESYNC` uses: normally a
