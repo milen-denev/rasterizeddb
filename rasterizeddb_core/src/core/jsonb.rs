@@ -2061,6 +2061,151 @@ pub fn concat(left: &[u8], right: &[u8]) -> Result<Vec<u8>, String> {
     encode_text(&text)
 }
 
+/// An object from entries already in key order, each key and value as the
+/// bytes they are stored as: a member nobody changed is copied, never
+/// decoded, so its numbers keep every digit (`decode` goes through
+/// serde_json, which would round a fraction through a float).
+fn build_object(entries: &[(&[u8], std::borrow::Cow<'_, [u8]>)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + entries.len() * OBJ_ENTRY + entries.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>());
+    out.push(TAG_OBJ);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let table_at = out.len();
+    out.resize(table_at + entries.len() * OBJ_ENTRY, 0);
+    let body_at = out.len();
+    for (index, (key, value)) in entries.iter().enumerate() {
+        let key_off = out.len() - body_at;
+        out.extend_from_slice(key);
+        let val_off = out.len() - body_at;
+        out.extend_from_slice(value);
+        let entry = table_at + index * OBJ_ENTRY;
+        out[entry..entry + 4].copy_from_slice(&(key_off as u32).to_le_bytes());
+        out[entry + 4..entry + 8].copy_from_slice(&(key.len() as u32).to_le_bytes());
+        out[entry + 8..entry + 12].copy_from_slice(&(val_off as u32).to_le_bytes());
+        out[entry + 12..entry + 16].copy_from_slice(&(value.len() as u32).to_le_bytes());
+    }
+    out
+}
+
+/// An array of encoded elements, as [`build_object`] builds an object.
+fn build_array(items: &[std::borrow::Cow<'_, [u8]>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + items.len() * ARR_ENTRY + items.iter().map(|v| v.len()).sum::<usize>());
+    out.push(TAG_ARR);
+    out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+    let table_at = out.len();
+    out.resize(table_at + items.len() * ARR_ENTRY, 0);
+    let body_at = out.len();
+    for (index, item) in items.iter().enumerate() {
+        let offset = out.len() - body_at;
+        out.extend_from_slice(item);
+        let entry = table_at + index * ARR_ENTRY;
+        out[entry..entry + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        out[entry + 4..entry + 8].copy_from_slice(&(item.len() as u32).to_le_bytes());
+    }
+    out
+}
+
+const UNREADABLE: &str = "a stored document could not be read";
+
+/// `jsonb_set(doc, path, value, create_missing)`, PostgreSQL's: the member
+/// `path` names replaced by `value` (already encoded). A missing last step
+/// is added when `create_missing` (a key in key order; an array index past
+/// either end appends or prepends), and a path that runs out before its end
+/// leaves the document as it was. An array step is an integer, negative
+/// counting from the end. A scalar document is refused, as there. Only the
+/// containers along the path are rebuilt; every other member is copied as
+/// it is stored.
+pub fn set_path(doc: &[u8], path: &[String], value: &[u8], create_missing: bool) -> Result<Vec<u8>, String> {
+    if !matches!(doc.first(), Some(&TAG_OBJ) | Some(&TAG_ARR)) {
+        return Err("cannot set path in scalar".to_string());
+    }
+    if path.is_empty() {
+        return Ok(doc.to_vec());
+    }
+    set_at(doc, path, 0, value, create_missing)
+}
+
+fn set_at(doc: &[u8], path: &[String], at: usize, value: &[u8], create: bool) -> Result<Vec<u8>, String> {
+    use std::borrow::Cow;
+    let step = &path[at];
+    let last = at + 1 == path.len();
+    let replace = |member: &[u8]| -> Result<Vec<u8>, String> {
+        if last { Ok(value.to_vec()) } else { set_at(member, path, at + 1, value, create) }
+    };
+    match doc.first() {
+        Some(&TAG_OBJ) => {
+            let o = Composite::of(doc, OBJ_ENTRY).ok_or(UNREADABLE)?;
+            let mut entries: Vec<(&[u8], Cow<'_, [u8]>)> = Vec::with_capacity(o.count + 1);
+            let mut found = false;
+            for i in 0..o.count {
+                let (key, member) = o.entry(doc, i).ok_or(UNREADABLE)?;
+                if key == step.as_bytes() {
+                    found = true;
+                    entries.push((key, Cow::Owned(replace(member)?)));
+                } else {
+                    entries.push((key, Cow::Borrowed(member)));
+                }
+            }
+            if !found && last && create {
+                let at = entries.partition_point(|(k, _)| *k < step.as_bytes());
+                entries.insert(at, (step.as_bytes(), Cow::Borrowed(value)));
+            }
+            Ok(build_object(&entries))
+        }
+        Some(&TAG_ARR) => {
+            let a = Composite::of(doc, ARR_ENTRY).ok_or(UNREADABLE)?;
+            let index: i64 = step
+                .trim()
+                .parse()
+                .map_err(|_| format!("path element at position {} is not an integer: \"{}\"", at + 1, step))?;
+            let mut items: Vec<Cow<'_, [u8]>> =
+                (0..a.count).map(|i| a.element(doc, i).map(Cow::Borrowed).ok_or(UNREADABLE)).collect::<Result<_, _>>()?;
+            let n = items.len() as i64;
+            let position = if index < 0 { index + n } else { index };
+            if (0..n).contains(&position) {
+                let p = position as usize;
+                items[p] = Cow::Owned(replace(&items[p])?);
+            } else if last && create {
+                if position < 0 {
+                    items.insert(0, Cow::Borrowed(value));
+                } else {
+                    items.push(Cow::Borrowed(value));
+                }
+            }
+            Ok(build_array(&items))
+        }
+        // A scalar on the way: the path runs out, nothing changes.
+        _ => Ok(doc.to_vec()),
+    }
+}
+
+/// `jsonb_strip_nulls(doc)`: every object member whose value is `null`
+/// removed, at any depth; a `null` array element stays, as PostgreSQL keeps
+/// it. Members are copied as stored, as [`set_path`] copies them.
+pub fn strip_nulls(doc: &[u8]) -> Result<Vec<u8>, String> {
+    use std::borrow::Cow;
+    match doc.first() {
+        Some(&TAG_OBJ) => {
+            let o = Composite::of(doc, OBJ_ENTRY).ok_or(UNREADABLE)?;
+            let mut entries: Vec<(&[u8], Cow<'_, [u8]>)> = Vec::with_capacity(o.count);
+            for i in 0..o.count {
+                let (key, member) = o.entry(doc, i).ok_or(UNREADABLE)?;
+                if member.first() != Some(&TAG_NULL) {
+                    entries.push((key, Cow::Owned(strip_nulls(member)?)));
+                }
+            }
+            Ok(build_object(&entries))
+        }
+        Some(&TAG_ARR) => {
+            let a = Composite::of(doc, ARR_ENTRY).ok_or(UNREADABLE)?;
+            let items: Vec<Cow<'_, [u8]>> = (0..a.count)
+                .map(|i| a.element(doc, i).ok_or(UNREADABLE).and_then(|m| strip_nulls(m).map_err(|_| UNREADABLE)).map(Cow::Owned))
+                .collect::<Result<_, _>>()?;
+            Ok(build_array(&items))
+        }
+        _ => Ok(doc.to_vec()),
+    }
+}
+
 /// `doc->'a'->>'b'`: a path written out, the last step with `->>` when
 /// `as_text`.
 pub fn path_text(column: &str, steps: &[Step], as_text: bool) -> String {

@@ -134,6 +134,10 @@ pub enum PgFunc {
     /// `ts AT TIME ZONE zone` over a `timestamp`: that wall-clock time in
     /// `zone`, as a `timestamptz`.
     TimezoneToUtc,
+    /// `jsonb_set(doc, path, value [, create_missing])`.
+    JsonbSet,
+    /// `jsonb_strip_nulls(doc)`.
+    JsonbStripNulls,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -146,7 +150,7 @@ pub const NAMES: &[&str] = &[
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
-    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT",
+    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -264,6 +268,8 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "ARRAY_APPEND" => (ArrayAppend, &[2]),
         "ARRAY_PREPEND" => (ArrayPrepend, &[2]),
         "ARRAY_CAT" => (ArrayCat, &[2]),
+        "JSONB_SET" => (JsonbSet, &[3, 4]),
+        "JSONB_STRIP_NULLS" => (JsonbStripNulls, &[1]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -318,7 +324,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         MakeTimestamp | ToTimestamp | TimezoneToLocal | TimezoneToUtc => DbType::DATETIME,
         Age | JustifyHours | JustifyDays | JustifyInterval => DbType::INTERVAL,
         Decode => DbType::BYTEA,
-        JsonBuildObject | JsonBuildArray | ToJson => DbType::JSONB,
+        JsonBuildObject | JsonBuildArray | ToJson | JsonbSet | JsonbStripNulls => DbType::JSONB,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
         StringToArray | ArrayCtor | ArraySlice | ArrayCast | ArrayAppend | ArrayPrepend | ArrayCat => DbType::ARRAY,
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise_type(func, args),
@@ -339,6 +345,15 @@ pub fn yields_json_text(func: PgFunc) -> bool {
 /// offset: `make_timestamp`. (`to_timestamp` is a `timestamptz`.)
 pub fn yields_timestamp(func: PgFunc) -> bool {
     matches!(func, PgFunc::MakeTimestamp | PgFunc::TimezoneToLocal)
+}
+
+/// A `jsonb` argument as an encoded document: a document as it is stored,
+/// anything else read as `jsonb` input (an unknown literal, `'{"a":1}'`).
+fn jsonb_of(v: &Value) -> Result<Vec<u8>, String> {
+    match v {
+        Value::Data { bytes, db_type: DbType::JSONB } => Ok(bytes.clone()),
+        other => crate::core::jsonb::encode_text(&text_of(other)).map_err(|e| format!("invalid input syntax for type json: {e}")),
+    }
 }
 
 /// A zone `AT TIME ZONE` resolved: a fixed offset east of UTC in seconds,
@@ -1618,6 +1633,25 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             text_value(shown.join(&s(1)))
         }
         Cardinality => int_value(array_elements(&s(0))?.len() as i64),
+        JsonbSet => {
+            let path: Vec<String> = match &args[1] {
+                Value::Data { bytes, db_type: DbType::ARRAY } => {
+                    array_elements(&crate::core::value_codec::format_array(bytes).ok_or("could not read the path")?)?
+                }
+                other => array_elements(&text_of(other))?,
+            }
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| e.ok_or_else(|| format!("path element at position {} is null", i + 1)))
+            .collect::<Result<_, _>>()?;
+            let create = match args.get(3) {
+                None => true,
+                Some(Value::Data { bytes, db_type: DbType::BOOL }) => bytes.first() == Some(&1),
+                Some(other) => matches!(text_of(other).to_ascii_lowercase().as_str(), "t" | "true"),
+            };
+            data(crate::core::jsonb::set_path(&jsonb_of(&args[0])?, &path, &jsonb_of(&args[2])?, create)?, DbType::JSONB)
+        }
+        JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
         TimezoneToLocal | TimezoneToUtc => {
             let Value::Data { bytes, .. } = &args[1] else {
                 return Ok(Value::Null);
