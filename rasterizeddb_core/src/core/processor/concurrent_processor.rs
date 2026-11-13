@@ -388,6 +388,44 @@ pub(crate) fn latency_guards_on() -> bool {
     }
 }
 
+/// The first failure a scan's workers met: its code, shared lock-free
+/// across them as before, and for a WHERE expression that could not be
+/// evaluated the evaluator's own message. That one code stands for every
+/// evaluator error the other codes do not name, so without the message an
+/// invalid cast reached the client as "an expression in the WHERE clause
+/// could not be evaluated" with SQLSTATE XX000, where PostgreSQL says
+/// `invalid input syntax for type integer: "abc"` (22P02).
+#[derive(Default)]
+pub struct ScanFailure {
+    code: AtomicU8,
+    detail: parking_lot::Mutex<Option<String>>,
+}
+
+impl ScanFailure {
+    /// Records `e` unless a failure is already recorded. The worker that
+    /// wins keeps the message its own evaluation left on this thread.
+    pub fn record(&self, e: EvalError) {
+        let won = self
+            .code
+            .compare_exchange(0, e.to_code(), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .is_ok();
+        if won && e == EvalError::ExpressionFailed {
+            *self.detail.lock() = crate::core::row::error::take_expression_failure();
+        }
+    }
+
+    /// The recorded failure as the statement's error, if any.
+    fn outcome(&self) -> Option<std::io::Error> {
+        let e = EvalError::from_code(self.code.load(std::sync::atomic::Ordering::Acquire))?;
+        if e == EvalError::ExpressionFailed {
+            if let Some(detail) = self.detail.lock().take() {
+                return Some(std::io::Error::other(detail));
+            }
+        }
+        Some(e.into())
+    }
+}
+
 pub struct ConcurrentProcessor;
 
 /// The fewest index candidates a scan worker is given. Below this the
@@ -444,11 +482,10 @@ impl ConcurrentProcessor {
     /// query then returned that truncated set as a success.
     fn check_worker_outcome(
         join_results: Vec<std::result::Result<(), tokio::task::JoinError>>,
-        eval_error: &AtomicU8,
+        eval_error: &ScanFailure,
     ) -> std::io::Result<()> {
-        if let Some(e) = EvalError::from_code(eval_error.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return Err(e.into());
+        if let Some(e) = eval_error.outcome() {
+            return Err(e);
         }
 
         for r in join_results {
@@ -878,7 +915,7 @@ impl ConcurrentProcessor {
         // A WHERE expression that is undefined for some row must fail the whole
         // query; letting workers skip the row would return a short result set
         // that is indistinguishable from a complete one.
-        eval_error: Arc<CacheGuard<AtomicU8>>,
+        eval_error: Arc<CacheGuard<ScanFailure>>,
         // Which row versions the workers may emit.
         visibility: Visibility,
         // Why this statement should stop, if it should.
@@ -1062,12 +1099,7 @@ impl ConcurrentProcessor {
                     // statement fails through `check_worker_outcome` rather than
                     // returning the rows it happened to reach.
                     if let Some(reason) = cancel_ref.as_ref().and_then(|c| c.tripped()) {
-                        let _ = eval_error_ref.compare_exchange(
-                            0,
-                            reason.eval_error().to_code(),
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Acquire,
-                        );
+                        eval_error_ref.record(reason.eval_error());
                         stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
@@ -1306,12 +1338,7 @@ impl ConcurrentProcessor {
                                     // worker. Continuing would emit whatever
                                     // this worker matched so far as if the
                                     // query had succeeded.
-                                    let _ = eval_error_ref.compare_exchange(
-                                        0,
-                                        e.to_code(),
-                                        std::sync::atomic::Ordering::AcqRel,
-                                        std::sync::atomic::Ordering::Acquire,
-                                    );
+                                    eval_error_ref.record(e);
                                     stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                     break;
                                 }
@@ -1482,12 +1509,7 @@ impl ConcurrentProcessor {
                             .is_ok()
                         {
                             if !Self::keys_match(&key_row, &row, &top.keys) {
-                                let _ = eval_error_ref.compare_exchange(
-                                    0,
-                                    EvalError::RowMovedUnderScan.to_code(),
-                                    std::sync::atomic::Ordering::AcqRel,
-                                    std::sync::atomic::Ordering::Acquire,
-                                );
+                                eval_error_ref.record(EvalError::RowMovedUnderScan);
                                 stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -1586,12 +1608,7 @@ impl ConcurrentProcessor {
             // finished — so a cancelled statement would return the rows it
             // happened to reach as though they were the complete answer.
             if let Some(reason) = crate::core::cancel::tripped() {
-                let _ = eval_error.compare_exchange(
-                    0,
-                    reason.eval_error().to_code(),
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                );
+                eval_error.record(reason.eval_error());
                 stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
@@ -2100,7 +2117,7 @@ impl ConcurrentProcessor {
         let counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
         let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
         let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
         let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
 
         let (batch_handles, pointer_read_error) = Self::spawn_batch_tasks(
@@ -2206,7 +2223,7 @@ impl ConcurrentProcessor {
         // The increment/threshold check is performed inside the `if result { }` section.
         let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
         let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
 
         // Important: for ORDER BY queries, we must not stop early based on LIMIT,
         // otherwise we only sort a prefix of the matching rows.
@@ -2455,7 +2472,7 @@ impl ConcurrentProcessor {
 
         let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
         let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
         let enforce_limit_early = limit.is_some();
 
         let shared_tuple: Arc<(RowFetch, RowFetch)> =
@@ -2630,7 +2647,7 @@ impl ConcurrentProcessor {
 
         let limit_counter = Arc::new(AtomicU64::new(0));
         let stop_processing = Arc::new(AtomicBool::new(false));
-        let eval_error: Arc<CacheGuard<AtomicU8>> = Arc::new(AtomicU8::new(0).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
         // A WHERE clause the planner refuses. Reported through the result
         // rather than by panicking: the panic unwound the task running the
         // statement and the connection with it, where the SELECT path returns
@@ -2723,12 +2740,7 @@ impl ConcurrentProcessor {
             // the stop flag, so a cancelled scan fails rather than returning a
             // prefix of its rows as a complete answer.
             if let Some(reason) = crate::core::cancel::tripped() {
-                let _ = eval_error.compare_exchange(
-                    0,
-                    reason.eval_error().to_code(),
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                );
+                eval_error.record(reason.eval_error());
                 stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
@@ -2954,12 +2966,7 @@ impl ConcurrentProcessor {
                     let result = match result {
                         Ok(matched) => matched,
                         Err(e) => {
-                            let _ = eval_error_ref.compare_exchange(
-                                0,
-                                e.to_code(),
-                                std::sync::atomic::Ordering::AcqRel,
-                                std::sync::atomic::Ordering::Acquire,
-                            );
+                            eval_error_ref.record(e);
                             stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }

@@ -248,9 +248,25 @@ impl EvalError {
         } else if lower.contains("out of range") || lower.contains("overflow") {
             EvalError::ArithmeticOverflow
         } else {
+            // The message itself cannot cross the one-byte code the scan
+            // workers report through; it is left for the worker that records
+            // this failure ([`take_expression_failure`]), on this thread.
+            LAST_EXPRESSION_FAILURE.with(|m| *m.borrow_mut() = Some(message.to_string()));
             EvalError::ExpressionFailed
         }
     }
+}
+
+thread_local! {
+    static LAST_EXPRESSION_FAILURE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The evaluator's own message for the last [`EvalError::ExpressionFailed`]
+/// made on this thread, taken: "invalid input syntax for type integer:
+/// \"abc\"" rather than the generic text, so the client gets the reason
+/// and its SQLSTATE (22P02) instead of XX000.
+pub fn take_expression_failure() -> Option<String> {
+    LAST_EXPRESSION_FAILURE.with(|m| m.borrow_mut().take())
 }
 
 impl fmt::Display for EvalError {

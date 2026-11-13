@@ -8185,6 +8185,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         || has("invalid input syntax for type date")
         || has("invalid input syntax for type time")
         || has("invalid input syntax for type interval")
+        // `to_date`/`to_timestamp` reading text its template does not fit:
+        // `invalid value "abc" for "YYYY"` (the quoted parts are dropped
+        // before matching, so the needle is what is left around them).
+        || (has("invalid value") && has(" for "))
     {
         // PostgreSQL's `invalid_datetime_format`, not the generic 22P02.
         "22007"
