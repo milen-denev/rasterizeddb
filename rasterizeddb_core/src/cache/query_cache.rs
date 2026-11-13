@@ -241,21 +241,24 @@ pub fn lookup(
     }
 
     let probe = |key_limit: Option<u64>| {
-        let slot = QUERY_CACHE
-            .get()
-            .and_then(|c| c.get(&slot_hash(table, where_clause, key_limit)))?;
-        let entry = slot.entry.load_full()?;
-        let same_key = &*entry.table == table
-            && &*entry.where_clause == where_clause
-            && entry.limit == key_limit;
-        if same_key && entry.generation < generation {
-            // Stranded by a write: generations only grow, so nothing can be
-            // answered from it again. Freed now rather than when the slot is
-            // reused, which may be never.
-            slot.release();
-            return None;
-        }
-        (same_key && entry.generation == generation).then_some(entry)
+        // Read in place: the slot's holder is borrowed, not cloned, so the
+        // only shared count a hit writes is the entry's own, which it has to
+        // (the caller keeps the entry for as long as it fetches rows).
+        let cache = QUERY_CACHE.get()?;
+        cache.read(&slot_hash(table, where_clause, key_limit), |slot| {
+            let entry = slot.entry.load_full()?;
+            let same_key = &*entry.table == table
+                && &*entry.where_clause == where_clause
+                && entry.limit == key_limit;
+            if same_key && entry.generation < generation {
+                // Stranded by a write: generations only grow, so nothing can be
+                // answered from it again. Freed now rather than when the slot is
+                // reused, which may be never.
+                slot.release();
+                return None;
+            }
+            (same_key && entry.generation == generation).then_some(entry)
+        })?
     };
 
     // The complete set first: it answers any limit by truncation, and is the

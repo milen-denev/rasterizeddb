@@ -66,6 +66,15 @@ const MAX_ARGS: usize = 1024 * 1024;
 const MAX_QUERY: usize = 1024 * 1024 * 1024;
 /// Output past this is written out mid-batch rather than buffered further.
 const FLUSH_AT: usize = 256 * 1024;
+/// Commands parsed ahead of the one running, so their keys' memory can be
+/// asked for together (see [`Conn::prefetch`]). The CPU keeps about a dozen
+/// line requests in flight; sixteen commands keep that full without the first
+/// lines going cold again before their command runs.
+const WINDOW: usize = 16;
+/// Arguments held for one window before it is cut short.
+const WINDOW_ARGS: usize = 96;
+/// Keys one window asks for: a long `MGET` is warmed up to here and no further.
+const WINDOW_KEYS: usize = 32;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 
@@ -245,6 +254,27 @@ fn parse_len(digits: &[u8]) -> Option<i64> {
 /// Parses one command from the front of `buf` into `args`.
 pub fn parse<'a>(buf: &'a [u8], args: &mut SmallVec<[&'a [u8]; 8]>, authed: bool) -> Frame {
     args.clear();
+    parse_onto(buf, args, authed)
+}
+
+/// Parses one command from the front of `buf`, appending its arguments to
+/// `args`. Anything but a whole command leaves `args` as it was.
+pub fn parse_onto<'a, A>(buf: &'a [u8], args: &mut SmallVec<A>, authed: bool) -> Frame
+where
+    A: smallvec::Array<Item = &'a [u8]>,
+{
+    let start = args.len();
+    let frame = parse_frame(buf, args, authed);
+    if !matches!(frame, Frame::Command { .. }) {
+        args.truncate(start);
+    }
+    frame
+}
+
+fn parse_frame<'a, A>(buf: &'a [u8], args: &mut SmallVec<A>, authed: bool) -> Frame
+where
+    A: smallvec::Array<Item = &'a [u8]>,
+{
     if buf.is_empty() {
         return Frame::Incomplete { need: 1 };
     }
@@ -315,7 +345,11 @@ pub fn parse<'a>(buf: &'a [u8], args: &mut SmallVec<[&'a [u8]; 8]>, authed: bool
 
 /// The telnet form: one line of space-separated words, with `"…"` and `'…'`
 /// quoting as `redis-cli` and Redis's `sdssplitargs` accept.
-fn parse_inline<'a>(buf: &'a [u8], args: &mut SmallVec<[&'a [u8]; 8]>, authed: bool) -> Frame {
+fn parse_inline<'a, A>(buf: &'a [u8], args: &mut SmallVec<A>, authed: bool) -> Frame
+where
+    A: smallvec::Array<Item = &'a [u8]>,
+{
+    let start = args.len();
     let Some(nl) = memchr::memchr(b'\n', buf) else {
         return if buf.len() > 64 * 1024 {
             Frame::Error("Protocol error: too big inline request".into())
@@ -352,11 +386,11 @@ fn parse_inline<'a>(buf: &'a [u8], args: &mut SmallVec<[&'a [u8]; 8]>, authed: b
             }
             args.push(&line[start..i]);
         }
-        if !authed && args.len() > UNAUTH_ARGS {
+        if !authed && args.len() - start > UNAUTH_ARGS {
             return Frame::Error("Protocol error: unauthenticated multibulk length".into());
         }
     }
-    if args.is_empty() {
+    if args.len() == start {
         Frame::Empty { consumed: nl + 1 }
     } else {
         Frame::Command { consumed: nl + 1 }
@@ -519,15 +553,50 @@ impl Conn {
             let mut commands_run = 0u64;
             let mut flow = Flow::Continue;
             {
-                let mut args: SmallVec<[&[u8]; 8]> = SmallVec::new();
-                loop {
-                    match parse(&inbuf[pos..], &mut args, self.authed) {
-                        Frame::Incomplete { need: more } => {
+                let mut held: SmallVec<[&[u8]; WINDOW_ARGS]> = SmallVec::new();
+                let mut window: SmallVec<[Queued; WINDOW]> = SmallVec::new();
+                'batch: loop {
+                    // Parse a window of commands, then run it.
+                    let ended =
+                        fill_window(&inbuf, &mut pos, self.reads_ahead(), self.authed, &mut held, &mut window);
+                    if window.len() > 1 {
+                        self.prefetch(&window, &held);
+                    }
+                    for queued in &window {
+                        need = 0;
+                        commands_run += 1;
+                        let mark = out.len();
+                        flow = self
+                            .execute(queued.spec, &held[queued.start..queued.end], &mut out, &mut sock)
+                            .await?;
+                        match self.reply_mode {
+                            ReplyMode::On => {}
+                            ReplyMode::Off => out.truncate(mark),
+                            ReplyMode::SkipThis => {
+                                out.truncate(mark);
+                                self.reply_mode = ReplyMode::On;
+                            }
+                            ReplyMode::SkipNext => {
+                                out.truncate(mark);
+                                self.reply_mode = ReplyMode::SkipThis;
+                            }
+                        }
+                        if flow == Flow::Close {
+                            break 'batch;
+                        }
+                        if out.len() >= FLUSH_AT {
+                            sock.write_all(&out).await?;
+                            out.clear();
+                        }
+                    }
+                    match ended {
+                        // The window filled; there may be more to parse.
+                        None => {}
+                        Some(Frame::Incomplete { need: more }) => {
                             need = more;
                             break;
                         }
-                        Frame::Empty { consumed } => pos += consumed,
-                        Frame::Error(message) => {
+                        Some(Frame::Error(message)) => {
                             out.push(b'-');
                             out.extend_from_slice(b"ERR ");
                             out.extend_from_slice(message.as_bytes());
@@ -535,31 +604,8 @@ impl Conn {
                             flow = Flow::Close;
                             break;
                         }
-                        Frame::Command { consumed } => {
-                            pos += consumed;
-                            need = 0;
-                            commands_run += 1;
-                            let mark = out.len();
-                            flow = self.execute(&args, &mut out, &mut sock).await?;
-                            match self.reply_mode {
-                                ReplyMode::On => {}
-                                ReplyMode::Off => out.truncate(mark),
-                                ReplyMode::SkipThis => {
-                                    out.truncate(mark);
-                                    self.reply_mode = ReplyMode::On;
-                                }
-                                ReplyMode::SkipNext => {
-                                    out.truncate(mark);
-                                    self.reply_mode = ReplyMode::SkipThis;
-                                }
-                            }
-                            if flow == Flow::Close {
-                                break;
-                            }
-                            if out.len() >= FLUSH_AT {
-                                sock.write_all(&out).await?;
-                                out.clear();
-                            }
+                        Some(Frame::Empty { .. } | Frame::Command { .. }) => {
+                            unreachable!("the parse loop consumes these")
                         }
                     }
                 }
@@ -615,11 +661,114 @@ fn encode_message(v3: bool, msg: &Message, out: &mut Vec<u8>) {
     }
 }
 
+/// A parsed command waiting in the window: its spec, if the name is a
+/// command, and where its arguments are in the window's argument list.
+struct Queued {
+    spec: Option<&'static Spec>,
+    start: usize,
+    end: usize,
+}
+
+/// Parses commands from `buf[*pos..]` into an emptied window, advancing
+/// `pos` past each. Returns what the parser said when it was the parser that
+/// stopped the window (the input ran out, or was malformed), and `None` when
+/// the window closed on a command.
+///
+/// Reading ahead must not change what any command sees, and the one thing a
+/// command can change about the parsing of the next is whether the client is
+/// authenticated (the limits in [`parse_onto`]). So with `ahead` off the
+/// window is a single command, which is the loop this replaced; and with it
+/// on, the window closes on the first command that is not a plain data
+/// command, since every command that can change the connection's state is a
+/// connection command. That command runs last in its window, and whatever
+/// follows it is parsed only after it has run.
+fn fill_window<'a>(
+    buf: &'a [u8],
+    pos: &mut usize,
+    ahead: bool,
+    authed: bool,
+    held: &mut SmallVec<[&'a [u8]; WINDOW_ARGS]>,
+    window: &mut SmallVec<[Queued; WINDOW]>,
+) -> Option<Frame> {
+    held.clear();
+    window.clear();
+    loop {
+        let start = held.len();
+        match parse_onto(&buf[*pos..], held, authed) {
+            Frame::Empty { consumed } => *pos += consumed,
+            Frame::Command { consumed } => {
+                *pos += consumed;
+                let spec = commands::lookup(held[start]);
+                window.push(Queued { spec, start, end: held.len() });
+                let plain = spec.is_some_and(|s| !s.is(CONN | SERVER | BLOCKING));
+                if !ahead || !plain || window.len() == WINDOW || held.len() >= WINDOW_ARGS {
+                    return None;
+                }
+            }
+            other => return Some(other),
+        }
+    }
+}
+
 impl Conn {
-    async fn execute(&mut self, args: &[&[u8]], out: &mut Vec<u8>, sock: &mut TcpStream) -> io::Result<Flow> {
+    /// Whether commands may be parsed ahead of the one running (see
+    /// [`fill_window`]): only when authenticated, outside `MULTI` and not
+    /// subscribed. Before authentication the next frame's limits depend on
+    /// this one's outcome; in the other two states commands are queued or
+    /// refused rather than run, and there is nothing to warm.
+    fn reads_ahead(&self) -> bool {
+        self.authed && self.multi.is_none() && !self.subscribed()
+    }
+
+    /// Asks for the memory the window's commands are about to read.
+    ///
+    /// A lookup in a keyspace larger than the cache is three or four memory
+    /// waits in a row, and they were most of what a pipelined command cost.
+    /// Run one command at a time, each waits alone. Here every key's table
+    /// lines are asked for first, then every key's value, and only then do
+    /// the commands run, so the waits of sixteen commands overlap.
+    ///
+    /// Advisory throughout: nothing learned here is passed to the commands,
+    /// which hash and look up their keys again as if this had not run. A key
+    /// position the spec gets wrong (the `numkeys` commands) warms a line
+    /// nobody reads.
+    fn prefetch(&self, window: &[Queued], held: &[&[u8]]) {
+        let store = &*self.store;
+        let mut keys: SmallVec<[(u64, usize); WINDOW_KEYS]> = SmallVec::new();
+        'window: for queued in window {
+            let Some(spec) = queued.spec else { continue };
+            if spec.first <= 0 || spec.is(CONN | SERVER) {
+                continue;
+            }
+            let n = (queued.end - queued.start) as i32;
+            let last = if spec.last < 0 { n + spec.last } else { spec.last.min(n - 1) };
+            let mut i = spec.first;
+            while i <= last && i < n {
+                if keys.len() == WINDOW_KEYS {
+                    break 'window;
+                }
+                let at = queued.start + i as usize;
+                let h = store.hash(held[at]);
+                store.prefetch_table(h);
+                keys.push((h, at));
+                i += spec.step.max(1);
+            }
+        }
+        for &(h, at) in &keys {
+            store.prefetch_value(h, held[at]);
+        }
+    }
+
+    async fn execute(
+        &mut self,
+        spec: Option<&'static Spec>,
+        args: &[&[u8]],
+        out: &mut Vec<u8>,
+        sock: &mut TcpStream,
+    ) -> io::Result<Flow> {
         let v3 = self.v3;
         let mut r = Resp { out, v3 };
-        let Some(spec) = commands::lookup(args[0]) else {
+        let Some(spec) = spec else {
             if self.multi.is_some() {
                 self.multi_failed = true;
             }
@@ -1287,6 +1436,103 @@ mod tests {
         }
         let (f, _) = parsed(b"*1\r\n$100000\r\nab");
         assert_eq!(f, Frame::Incomplete { need: 4 + 9 + 100_000 + 2 });
+    }
+
+    /// One window, as (command names, what the parser ended it with).
+    fn window_at(buf: &[u8], pos: &mut usize, ahead: bool, authed: bool) -> (Vec<String>, Option<Frame>) {
+        let mut held = SmallVec::new();
+        let mut window = SmallVec::new();
+        let ended = fill_window(buf, pos, ahead, authed, &mut held, &mut window);
+        let names = window
+            .iter()
+            .map(|q| {
+                assert!(q.start < q.end && q.end <= held.len());
+                String::from_utf8_lossy(held[q.start]).into_owned()
+            })
+            .collect();
+        (names, ended)
+    }
+
+    fn frame(args: &[&str]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn a_window_closes_on_the_command_that_changes_the_connection() {
+        let mut buf = Vec::new();
+        for args in [&["SET", "a", "1"][..], &["GET", "a"], &["SELECT", "1"], &["GET", "a"], &["NOPE"], &["GET", "a"]] {
+            buf.extend(frame(args));
+        }
+        buf.extend_from_slice(b"*0\r\n\r\n");
+        buf.extend(frame(&["BLPOP", "q", "0"]));
+        buf.extend(frame(&["GET", "a"]));
+        buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$5\r\nhal");
+        let mut pos = 0;
+        // SELECT changes the store the next command runs against: it runs
+        // last in its window, and the GET after it is parsed afterwards.
+        let (names, ended) = window_at(&buf, &mut pos, true, true);
+        assert_eq!(names, ["SET", "GET", "SELECT"]);
+        assert_eq!(ended, None);
+        // An unknown name and a blocking command close a window too.
+        assert_eq!(window_at(&buf, &mut pos, true, true).0, ["GET", "NOPE"]);
+        assert_eq!(window_at(&buf, &mut pos, true, true).0, ["GET", "BLPOP"]);
+        // The input running out mid-command ends the window with what was
+        // whole, and leaves the position at the partial command.
+        let before_partial = buf.len() - b"*2\r\n$3\r\nGET\r\n$5\r\nhal".len();
+        let (names, ended) = window_at(&buf, &mut pos, true, true);
+        assert_eq!(names, ["GET"]);
+        assert!(matches!(ended, Some(Frame::Incomplete { .. })), "{ended:?}");
+        assert_eq!(pos, before_partial);
+
+        // Without read-ahead (before AUTH, inside MULTI, subscribed) every
+        // window is one command, whatever follows it.
+        let mut pos = 0;
+        for expected in ["SET", "GET", "SELECT", "GET", "NOPE", "GET", "BLPOP", "GET"] {
+            let (names, ended) = window_at(&buf, &mut pos, false, true);
+            assert_eq!(names, [expected]);
+            assert_eq!(ended, None);
+        }
+    }
+
+    #[test]
+    fn a_window_is_bounded_and_keeps_what_came_before_an_error() {
+        let mut buf = Vec::new();
+        for i in 0..WINDOW + 3 {
+            buf.extend(frame(&["GET", &format!("k{i}")]));
+        }
+        buf.extend_from_slice(b"*1\r\n$-7\r\n");
+        let mut pos = 0;
+        let (names, ended) = window_at(&buf, &mut pos, true, true);
+        assert_eq!((names.len(), ended), (WINDOW, None));
+        // The malformed frame ends the next window, after the three commands
+        // in front of it: they still run, and are answered, before the error.
+        let (names, ended) = window_at(&buf, &mut pos, true, true);
+        assert_eq!(names.len(), 3);
+        assert!(matches!(ended, Some(Frame::Error(_))), "{ended:?}");
+
+        // One command with more arguments than a window holds is a window.
+        let many: Vec<String> = (0..WINDOW_ARGS * 2).map(|i| format!("k{i}")).collect();
+        let mut args = vec!["MGET"];
+        args.extend(many.iter().map(String::as_str));
+        let mut buf = frame(&args);
+        buf.extend(frame(&["GET", "a"]));
+        let mut pos = 0;
+        assert_eq!(window_at(&buf, &mut pos, true, true).0, ["MGET"]);
+        assert_eq!(window_at(&buf, &mut pos, true, true).0, ["GET"]);
+
+        // Before authentication the limits apply to each frame as it is
+        // parsed, and a refused frame leaves no arguments behind.
+        let mut buf = frame(&["PING"]);
+        buf.extend(frame(&["AUTH", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]));
+        let mut pos = 0;
+        assert_eq!(window_at(&buf, &mut pos, false, false).0, ["PING"]);
+        let (names, ended) = window_at(&buf, &mut pos, false, false);
+        assert!(names.is_empty());
+        assert!(matches!(ended, Some(Frame::Error(_))), "{ended:?}");
     }
 
     #[test]

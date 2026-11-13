@@ -14,7 +14,6 @@ mod sets;
 mod strings;
 mod zsets;
 
-use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use super::KvError;
@@ -303,18 +302,36 @@ commands! {
     Move = "move", 3, WRITE | SERVER | NO_MULTI, 1, 1, 1;
 }
 
+/// Lengths a command name can have, for [`lookup`]'s index.
+const NAME_LENGTHS: usize = 32;
+
 /// The spec for a command name, case-insensitively.
+///
+/// Every pipelined command comes through here, so it is an index rather than
+/// a hash map: the names are grouped by length and first letter, which leaves
+/// one to a handful in a group, and the name is compared against those as it
+/// arrived. A hash map had to lower-case a copy and hash it first.
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
-    static INDEX: OnceLock<HashMap<&'static [u8], &'static Spec, ahash::RandomState>> = OnceLock::new();
-    let index = INDEX.get_or_init(|| TABLE.iter().map(|s| (s.name.as_bytes(), s)).collect());
-    if name.len() > 32 {
-        return None;
-    }
-    let mut lower = [0u8; 32];
-    for (d, s) in lower.iter_mut().zip(name) {
-        *d = s.to_ascii_lowercase();
-    }
-    index.get(&lower[..name.len()]).copied()
+    static INDEX: OnceLock<Vec<Vec<&'static Spec>>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut groups = vec![Vec::new(); NAME_LENGTHS * 26];
+        for spec in TABLE {
+            let name = spec.name.as_bytes();
+            groups[name_group(name).expect("a command name is a letter first and under 32 bytes")].push(spec);
+        }
+        groups
+    });
+    index[name_group(name)?]
+        .iter()
+        .find(|spec| spec.name.as_bytes().eq_ignore_ascii_case(name))
+        .copied()
+}
+
+/// The index group for a name: by its length and its first letter.
+#[inline]
+fn name_group(name: &[u8]) -> Option<usize> {
+    let letter = (*name.first()? | 0x20).wrapping_sub(b'a') as usize;
+    (letter < 26 && name.len() < NAME_LENGTHS).then(|| name.len() * 26 + letter)
 }
 
 // ---------------------------------------------------------------------------

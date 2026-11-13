@@ -837,6 +837,112 @@ async fn tcp_pipelining_transactions_pubsub_and_blocking() {
     assert_eq!(c.call(&["QUIT"]).await, "+OK");
 }
 
+/// The connection parses a pipeline a window at a time and warms the memory
+/// its commands will read before running them. Every reply must still be the
+/// one a command-at-a-time server gives, in the same order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_a_pipeline_is_answered_as_if_run_one_command_at_a_time() {
+    let _settings = default_settings();
+    let (port, _handle) = start_server().await;
+    let mut c = Client::connect(port).await;
+
+    // Several windows of writes and reads on distinct keys, then one read of
+    // more keys than a window warms, all in one write.
+    let mut batch = Vec::new();
+    for i in 0..50 {
+        batch.extend(Client::encode(&["SET", &format!("k{i}"), &format!("v{i}")]));
+    }
+    for i in 0..50 {
+        batch.extend(Client::encode(&["GET", &format!("k{i}")]));
+    }
+    let keys: Vec<String> = (0..50).map(|i| format!("k{i}")).collect();
+    let mut mget = vec!["MGET"];
+    mget.extend(keys.iter().map(String::as_str));
+    batch.extend(Client::encode(&mget));
+    c.send_raw(&batch).await;
+    for _ in 0..50 {
+        assert_eq!(c.read().await, "+OK");
+    }
+    for i in 0..50 {
+        assert_eq!(c.read().await, format!("v{i}"));
+    }
+    let all: Vec<String> = (0..50).map(|i| format!("v{i}")).collect();
+    assert_eq!(c.read().await, format!("[{}]", all.join(",")));
+
+    // Commands that change what the next one means, in the middle of a
+    // pipeline: each later command sees the state the earlier ones left.
+    let mut batch = Vec::new();
+    let script: &[&[&str]] = &[
+        &["SET", "a", "1"],
+        &["SELECT", "1"],
+        &["SET", "a", "2"],
+        &["GET", "a"],
+        &["SELECT", "0"],
+        &["GET", "a"],
+        &["MULTI"],
+        &["INCR", "a"],
+        &["INCR", "a"],
+        &["EXEC"],
+        &["GET", "a"],
+        &["NOPE"],
+        &["CLIENT", "REPLY", "SKIP"],
+        &["SET", "a", "skipped"],
+        &["GET", "a"],
+        &["DEL", "a"],
+        &["GET", "a"],
+    ];
+    for (i, args) in script.iter().enumerate() {
+        batch.extend(Client::encode(args));
+        // Blank frames between commands are skipped wherever they fall.
+        if i % 3 == 0 {
+            batch.extend_from_slice(b"*0\r\n\r\n");
+        }
+    }
+    // The batch ends part-way through a command, finished by a later write.
+    let last = Client::encode(&["SET", "tail", "done"]);
+    batch.extend_from_slice(&last[..9]);
+    c.send_raw(&batch).await;
+    let expected = [
+        "+OK", "+OK", "+OK", "2", "+OK", "1", "+OK", "+QUEUED", "+QUEUED", "[:2,:3]", "3",
+    ];
+    for want in expected {
+        assert_eq!(c.read().await, want);
+    }
+    assert!(c.read().await.starts_with("-ERR unknown command"));
+    for want in ["skipped", ":1", "nil"] {
+        assert_eq!(c.read().await, want);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    c.send_raw(&last[9..]).await;
+    assert_eq!(c.read().await, "+OK");
+    assert_eq!(c.call(&["GET", "tail"]).await, "done");
+
+    // A malformed frame after good commands: they are answered first, then
+    // the error, then the connection closes without running what follows.
+    let mut bad = Client::connect(port).await;
+    let mut batch = Client::encode(&["SET", "e", "1"]);
+    batch.extend(Client::encode(&["INCR", "e"]));
+    batch.extend_from_slice(b"*1\r\n$-7\r\n");
+    batch.extend(Client::encode(&["INCR", "e"]));
+    bad.send_raw(&batch).await;
+    assert_eq!(bad.read().await, "+OK");
+    assert_eq!(bad.read().await, ":2");
+    assert!(bad.read().await.starts_with("-ERR Protocol error"));
+    assert_eq!(bad.read().await, "<closed>");
+    assert_eq!(c.call(&["GET", "e"]).await, "2");
+
+    // QUIT in a pipeline ends it there.
+    let mut quitter = Client::connect(port).await;
+    let mut batch = Client::encode(&["SET", "q", "1"]);
+    batch.extend(Client::encode(&["QUIT"]));
+    batch.extend(Client::encode(&["SET", "q", "2"]));
+    quitter.send_raw(&batch).await;
+    assert_eq!(quitter.read().await, "+OK");
+    assert_eq!(quitter.read().await, "+OK");
+    assert_eq!(quitter.read().await, "<closed>");
+    assert_eq!(c.call(&["GET", "q"]).await, "1");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_large_values_and_many_clients() {
     let _settings = default_settings();

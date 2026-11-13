@@ -23,7 +23,8 @@
 //! one allocation instead of two and a `GET` touches one line of heap after
 //! the table.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ahash::RandomState;
@@ -47,6 +48,58 @@ pub const SLOT_OVERHEAD: usize = std::mem::size_of::<Slot>() + 24;
 #[inline]
 pub fn shard_of(hash: u64) -> usize {
     ((hash >> SHARD_SHIFT) as usize) & (SHARDS - 1)
+}
+
+// ---------------------------------------------------------------------------
+// Prefetch
+// ---------------------------------------------------------------------------
+
+/// Where a shard's table is, for a reader that does not hold its lock.
+///
+/// Once the keyspace is larger than the CPU's cache, a lookup is a chain of
+/// memory waits and little else: the table's control bytes, the slot, then
+/// the key and value behind it. Measured on a million 64-byte values, a `GET`
+/// took four last-level misses, and the lookup was 72% of the store's own
+/// time. One command cannot shorten that chain. A pipelined batch can overlap
+/// it: ask for every command's lines first, then run the commands against
+/// lines that have arrived (see `resp.rs`).
+///
+/// Asking needs an address before the lock is taken, and hashbrown does not
+/// give one out. So the shard publishes it here, under its write lock,
+/// whenever the table is reallocated. The address is only ever handed to a
+/// prefetch, which cannot fault and changes no state: a stale or torn hint
+/// warms the wrong line and nothing else. Nothing is ever read through it.
+///
+/// It leans on hashbrown's layout: slot `i` ends at `ctrl - i * size_of::<T>()`
+/// and a hash's probe starts at its low bits. Neither is a public promise,
+/// so `the_prefetch_hint_matches_the_table` pins both; if an upgrade moves
+/// them, that test fails and correctness is untouched.
+#[derive(Default)]
+pub struct Hint {
+    /// The table's control bytes, or zero for no table.
+    ctrl: AtomicUsize,
+    mask: AtomicUsize,
+}
+
+impl Hint {
+    #[inline]
+    fn set(&self, ctrl: usize, mask: usize) {
+        self.mask.store(mask, Ordering::Relaxed);
+        self.ctrl.store(ctrl, Ordering::Relaxed);
+    }
+}
+
+/// Asks for the line holding `addr`. Any address is allowed.
+#[inline(always)]
+fn prefetch(addr: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint; it reads nothing and cannot fault.
+    unsafe {
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch(addr as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = addr;
 }
 
 // ---------------------------------------------------------------------------
@@ -254,32 +307,47 @@ impl Slot {
 // Shards
 // ---------------------------------------------------------------------------
 
+/// Field order is the layout (`repr(C)`): the table, the version and the
+/// byte count are what a plain `GET` or `SET` reads and writes, and with the
+/// cell's lock word and hit counter in front of them they fill exactly the
+/// cell's first cache line (pinned by `a_command_touches_one_line_of_its_shard`).
+/// Everything a command only sometimes needs follows on the next lines.
+#[repr(C)]
 pub struct Shard {
     pub(crate) table: HashTable<Slot>,
+    /// Bumped by every write; a slot records the value it was written at.
+    pub version: u64,
     /// Bytes charged to the keys in this shard.
     pub used: usize,
     /// Keys here with a lifetime, so the sweeper can skip shards without any.
     pub ttl_keys: usize,
-    /// Bumped by every write; a slot records the value it was written at.
-    pub version: u64,
     pub evicted: u64,
     pub expired: u64,
     pub sweep_cursor: usize,
     rng: u64,
+    /// The bucket count this shard's hint was published for.
+    hinted_buckets: usize,
+    /// Every shard's hint, shared with the store, which reads them without
+    /// a lock; this shard's is `hints[index]`.
+    hints: Arc<[Hint]>,
+    index: usize,
     hasher: RandomState,
 }
 
 impl Shard {
-    fn new(hasher: RandomState, seed: u64) -> Shard {
+    fn new(hasher: RandomState, seed: u64, hints: Arc<[Hint]>, index: usize) -> Shard {
         Shard {
             table: HashTable::new(),
+            version: 0,
             used: 0,
             ttl_keys: 0,
-            version: 0,
             evicted: 0,
             expired: 0,
             sweep_cursor: 0,
             rng: seed | 1,
+            hinted_buckets: 0,
+            hints,
+            index,
             hasher,
         }
     }
@@ -341,8 +409,17 @@ impl Shard {
             self.ttl_keys += 1;
         }
         let hasher = &self.hasher;
-        self.table
+        let entry = self
+            .table
             .insert_unique(h, slot, |s| hasher.hash_one(s.key()));
+        let (index, at) = (entry.bucket_index(), entry.get() as *const Slot as usize);
+        // Only an insert reallocates the table, and a reallocation changes
+        // its bucket count, so this is the one place the hint can go stale.
+        let buckets = self.table.num_buckets();
+        if buckets != self.hinted_buckets {
+            self.hinted_buckets = buckets;
+            self.hints[self.index].set(at + (index + 1) * std::mem::size_of::<Slot>(), buckets - 1);
+        }
     }
 
     /// Removes `key`, live or expired.
@@ -521,6 +598,8 @@ impl Shard {
     pub fn clear(&mut self) -> usize {
         let n = self.table.len();
         self.table = HashTable::new();
+        self.hinted_buckets = 0;
+        self.hints[self.index].set(0, 0);
         self.used = 0;
         self.ttl_keys = 0;
         self.version += 1;
@@ -581,11 +660,16 @@ impl Shard {
     }
 }
 
-/// A shard and the read counters that live on its line.
-#[repr(align(128))]
+/// A shard and its read counters.
+///
+/// The hit counter and the lock word lead, so with the shard's first fields
+/// a command that finds its key touches one line of the cell. The miss
+/// counter trails: a miss is the rarer answer, and it would push the shard's
+/// byte count off that line.
+#[repr(C, align(128))]
 pub struct ShardCell {
-    pub lock: RwLock<Shard>,
     pub hits: AtomicU64,
+    pub lock: RwLock<Shard>,
     pub misses: AtomicU64,
 }
 
@@ -595,6 +679,9 @@ pub struct ShardCell {
 
 pub struct KvCache {
     cells: Box<[ShardCell]>,
+    /// Where each shard's table is, for prefetching. Sixteen bytes a shard in
+    /// one block, so the first prefetch stage reads nothing but this.
+    hints: Arc<[Hint]>,
     hasher: RandomState,
     /// The database number (`SELECT`), for `INFO keyspace`.
     pub db: usize,
@@ -612,12 +699,13 @@ impl KvCache {
     pub fn new(db: usize) -> KvCache {
         let hasher = RandomState::new();
         let mut seed = now_ms() ^ 0x9E37_79B9_7F4A_7C15;
+        let hints: Arc<[Hint]> = (0..SHARDS).map(|_| Hint::default()).collect();
         let cells: Vec<ShardCell> = (0..SHARDS)
             .map(|i| {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64 | 1);
                 ShardCell {
-                    lock: RwLock::new(Shard::new(hasher.clone(), seed)),
                     hits: AtomicU64::new(0),
+                    lock: RwLock::new(Shard::new(hasher.clone(), seed, hints.clone(), i)),
                     misses: AtomicU64::new(0),
                 }
             })
@@ -625,6 +713,7 @@ impl KvCache {
         tick_lru_clock();
         KvCache {
             cells: cells.into_boxed_slice(),
+            hints,
             hasher,
             db,
             waiters: super::blocking::Waiters::default(),
@@ -651,6 +740,61 @@ impl KvCache {
 
     pub fn cells(&self) -> &[ShardCell] {
         &self.cells
+    }
+
+    /// First prefetch stage: asks for the control bytes `h` probes from and
+    /// the slots a key with that hash most likely sits in. Takes no lock and
+    /// reads nothing but the hint.
+    #[inline]
+    pub fn prefetch_table(&self, h: u64) {
+        let hint = &self.hints[shard_of(h)];
+        let ctrl = hint.ctrl.load(Ordering::Relaxed);
+        if ctrl == 0 {
+            return;
+        }
+        let pos = (h as usize) & hint.mask.load(Ordering::Relaxed);
+        // The group is 16 control bytes from `pos`, which may cross a line.
+        prefetch(ctrl.wrapping_add(pos));
+        prefetch(ctrl.wrapping_add(pos + 15));
+        // Slots run downwards from the control bytes. A key is in the first
+        // free slot from `pos`, which is its own or the next far more often
+        // than not; a key further along costs the wait this would have saved.
+        let size = std::mem::size_of::<Slot>();
+        let home = ctrl.wrapping_sub((pos + 1).wrapping_mul(size));
+        prefetch(home.wrapping_add(size - 1));
+        prefetch(home);
+        prefetch(home.wrapping_sub(size));
+    }
+
+    /// Second prefetch stage, run once the first stage's lines have had time
+    /// to arrive: finds the slot `key` probably lives in and asks for what it
+    /// points at. "Probably", because it matches on the table's hash tag and
+    /// the key's length without reading the key, which is the line being
+    /// asked for. Skips a shard a writer holds rather than wait on a hint.
+    #[inline]
+    pub fn prefetch_value(&self, h: u64, key: &[u8]) {
+        let Some(shard) = self.cell(h).lock.try_read() else {
+            return;
+        };
+        let Some(slot) = shard.table.find(h, |s| s.klen as usize == key.len()) else {
+            return;
+        };
+        let (at, len) = (slot.data.as_ptr() as usize, slot.data.len());
+        prefetch(at);
+        if len > 64 {
+            prefetch(at + 64);
+        }
+        if len > 1 {
+            prefetch(at + (len - 1).min(191));
+        }
+        let boxed = match &slot.value {
+            Value::Str | Value::Int(_) => return,
+            Value::Hash(v) => &**v as *const HashVal as usize,
+            Value::List(v) => &**v as *const ListVal as usize,
+            Value::Set(v) => &**v as *const SetVal as usize,
+            Value::ZSet(v) => &**v as *const ZSet as usize,
+        };
+        prefetch(boxed);
     }
 
     /// The byte budget of one shard, from the process-wide `maxmemory`.
@@ -1010,5 +1154,96 @@ impl Access for Pinned<'_> {
         for (i, guard) in self.guards.iter_mut() {
             f(*i, guard);
         }
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    /// The hint is only ever handed to a prefetch, so a wrong one costs speed
+    /// and breaks nothing: no other test could notice. This one checks the
+    /// two things it assumes about hashbrown's layout, at several fills.
+    #[test]
+    fn the_prefetch_hint_matches_the_table() {
+        let store = KvCache::new(0);
+        let size = std::mem::size_of::<Slot>();
+        let mut inserted = 0u32;
+        for target in [3_000u32, 60_000, 200_000] {
+            while inserted < target {
+                let key = format!("key:{inserted:012}");
+                let h = store.hash(key.as_bytes());
+                store
+                    .cell(h)
+                    .lock
+                    .write()
+                    .insert(h, Slot::string(key.as_bytes(), b"v", 0));
+                inserted += 1;
+            }
+            let (mut near, mut total) = (0usize, 0usize);
+            for (cell, hint) in store.cells().iter().zip(store.hints.iter()) {
+                let shard = cell.lock.read();
+                let ctrl = hint.ctrl.load(Ordering::Relaxed);
+                let mask = hint.mask.load(Ordering::Relaxed);
+                assert_eq!(mask + 1, shard.table.num_buckets(), "the hint is for another table size");
+                for index in 0..shard.table.num_buckets() {
+                    let Some(slot) = shard.table.get_bucket(index) else {
+                        continue;
+                    };
+                    // Slot `index` is where `prefetch_table` computes it.
+                    assert_eq!(
+                        slot as *const Slot as usize,
+                        ctrl - (index + 1) * size,
+                        "slots are not laid out downwards from the control bytes"
+                    );
+                    // A probe starts at the hash's low bits: a key is at or
+                    // just after that slot. Were the start taken from other
+                    // bits, about one key in a hundred would be.
+                    let home = store.hash(slot.key()) as usize & mask;
+                    total += 1;
+                    if index.wrapping_sub(home) & mask <= 1 {
+                        near += 1;
+                    }
+                }
+            }
+            assert_eq!(total, inserted as usize);
+            println!("{inserted} keys: {:.1}% in their own slot or the next", near as f64 * 100.0 / total as f64);
+            assert!(near * 2 > total, "only {near} of {total} keys are where a probe starts");
+        }
+        store.flush();
+        for hint in store.hints.iter() {
+            assert_eq!(hint.ctrl.load(Ordering::Relaxed), 0, "a dropped table is still hinted");
+        }
+        // A table built again after the flush is published again.
+        let h = store.hash(b"k");
+        store.cell(h).lock.write().insert(h, Slot::string(b"k", b"v", 0));
+        assert_ne!(store.hints[shard_of(h)].ctrl.load(Ordering::Relaxed), 0);
+        // And every prefetch entry point takes any hash, present or not.
+        for i in 0..1000u64 {
+            store.prefetch_table(i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            store.prefetch_value(i.wrapping_mul(0x9E37_79B9_7F4A_7C15), b"absent");
+        }
+        store.prefetch_value(h, b"k");
+    }
+
+    /// What `Shard`'s and `ShardCell`'s field order is for. A field added in
+    /// front of these moves the byte count or the table onto a second line,
+    /// and every command pays for it without any test failing but this one.
+    #[test]
+    fn a_command_touches_one_line_of_its_shard() {
+        use std::mem::{offset_of, size_of};
+        let store = KvCache::new(0);
+        let cell = store.cell_at(0);
+        // Where the shard really is inside its lock: the lock type's own
+        // field order is not ours to assume.
+        let shard = cell.lock.data_ptr() as usize - cell as *const ShardCell as usize;
+        let lock_word = offset_of!(ShardCell, lock)
+            + if shard == offset_of!(ShardCell, lock) { size_of::<Shard>() } else { 0 };
+        assert_eq!(offset_of!(ShardCell, hits), 0);
+        assert!(lock_word + 8 <= 64, "the lock word is on a second line");
+        assert_eq!(offset_of!(Shard, table), 0);
+        assert!(shard + offset_of!(Shard, version) + 8 <= 64, "the version is on a second line");
+        assert!(shard + offset_of!(Shard, used) + 8 <= 64, "the byte count is on a second line");
+        assert_eq!(size_of::<Hint>(), 16);
     }
 }
