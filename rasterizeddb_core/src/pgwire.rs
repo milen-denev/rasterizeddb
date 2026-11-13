@@ -6534,7 +6534,15 @@ where
     let folded_where = match crate::core::rql::executor::fold_where_constants_checked(stmt) {
         Ok(folded) => folded,
         Err(e) => {
-            fail_statement(state, stream, "22003", &e).await?;
+            // The refusals are data exceptions: an overflowing integer
+            // constant (22003), a literal its cast cannot read (22P02,
+            // 22008, …). Each keeps its own code; one the classifier does
+            // not place in class 22 is the overflow it was first written for.
+            let code = match sqlstate_for(&e) {
+                code if code.starts_with("22") => code,
+                _ => "22003",
+            };
+            fail_statement(state, stream, code, &e).await?;
             return Ok(());
         }
     };

@@ -8875,6 +8875,10 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
         let lead = &operand[..operand.len() - operand.trim_start().len()];
         let tail = &operand[lead.len() + trimmed.len()..];
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
+        if let Some(e) = constant_refusal(trimmed) {
+            refused.get_or_insert(e);
+            return operand.to_string();
+        }
         if let Some(typed) = typed_text_literal(trimmed) {
             return wrap(typed);
         }
@@ -9022,6 +9026,10 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                     out.push_str(&equivalent);
                     continue;
                 }
+                if let Some(equivalent) = constant_cast_term(term) {
+                    out.push_str(&equivalent);
+                    continue;
+                }
                 // A parenthesised group is folded inside. Read as one
                 // comparison, `(v < 0.1234 * 100)` split into `(v ` and
                 // ` 0.1234 * 100)`, neither of which folds, and the
@@ -9070,12 +9078,55 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                             }
                         }
                     }
-                    None => out.push_str(term),
+                    None => {
+                        // A bare boolean term (`WHERE 'maybe'::boolean`) is
+                        // left to the tokenizer, but its constant is still
+                        // PostgreSQL's to refuse.
+                        if let Some(e) = constant_refusal(term.trim().trim_end_matches(';').trim_end()) {
+                            refused.get_or_insert(e);
+                        }
+                        out.push_str(term)
+                    }
                 }
             }
         }
     }
     out
+}
+
+/// The error PostgreSQL raises while parsing `text`, when `text` is a constant
+/// it cannot compute: a literal cast to a type its text is not
+/// (`'abc'::int`, `CAST('x' AS date)`, `int4 'abc'`) or any other constant
+/// whose evaluation is a data exception (SQLSTATE class 22).
+///
+/// PostgreSQL converts such a literal while parsing, so the statement fails
+/// whatever the table holds and whatever surrounds the term. Left as text, the
+/// predicate tokenizer read the failed cast as a value that matches nothing:
+/// `WHERE 'abc'::int = 1` counted 0 rows, `WHERE 'abc'::int > 0 OR true`
+/// every row, and `WHERE 1 = 'abc'::int` failed with an internal message.
+///
+/// Only a term with a quoted literal that is not just that literal is
+/// evaluated; one naming a column does not parse against the empty schema
+/// and is left alone, as is any failure outside class 22 (a function the
+/// evaluator lacks, say), which the tokenizer may still answer.
+fn constant_refusal(text: &str) -> Option<String> {
+    if !text.contains('\'') {
+        return None;
+    }
+    let bare_literal = text.starts_with('\'')
+        && crate::core::sql_scan::quoted_end(text.as_bytes(), 0, b'\'') == text.len();
+    if bare_literal {
+        return None;
+    }
+    let expr = crate::core::rql::expr::parse(text, &[]).ok()?;
+    let empty = crate::core::row::row::Row {
+        position: 0,
+        length: 0,
+        columns: smallvec::SmallVec::new(),
+    };
+    let e = crate::core::rql::expr::eval_output(&expr, &empty, &[]).err()?;
+    let message = e.to_string();
+    crate::pgwire::sqlstate_for(&message).starts_with("22").then_some(message)
 }
 
 /// Whether `text` is numeric literals joined by `+ - * /`, with parentheses:
@@ -9259,6 +9310,40 @@ fn boolean_literal_term(term: &str) -> Option<String> {
     let lead = &term[..term.len() - term.trim_start().len()];
     let tail = &term[term.trim_end().len()..];
     Some(format!("{}{}{}", lead, replacement, tail))
+}
+
+/// A predicate term with no column in it that casts a literal (`'1'::int =
+/// 1`, `'true'::boolean`), as the comparison its value means: `1=1` or `1=0`.
+///
+/// PostgreSQL folds such a term while planning. Left to the tokenizer, which
+/// reads a cast literal as a value to compare with a column, `WHERE '1'::int
+/// = 1` matched no row, `WHERE 1 = '1'::int` failed as "operand size does not
+/// match", and `WHERE 'true'::boolean` as "Unexpected end of token stream".
+/// A term that evaluates to NULL is left as it is: under `NOT` it is neither.
+fn constant_cast_term(term: &str) -> Option<String> {
+    let trimmed = term.trim().trim_end_matches(';').trim_end();
+    if !trimmed.contains('\'') || !trimmed.contains("::") {
+        return None;
+    }
+    // The evaluator reads conditions inside CASE, not bare: 1 when the term
+    // holds, 0 when it does not, NULL when it is neither.
+    let probe = format!("CASE WHEN {trimmed} THEN 1 WHEN NOT ({trimmed}) THEN 0 END");
+    let expr = crate::core::rql::expr::parse(&probe, &[]).ok()?;
+    let empty = crate::core::row::row::Row {
+        position: 0,
+        length: 0,
+        columns: smallvec::SmallVec::new(),
+    };
+    let value = crate::core::rql::expr::eval_output(&expr, &empty, &[]).ok()?;
+    let replacement = match value {
+        crate::core::rql::expr::Value::Data { bytes, .. } if !bytes.is_empty() => {
+            if bytes.iter().any(|b| *b != 0) { "1=1" } else { "1=0" }
+        }
+        _ => return None,
+    };
+    let lead = &term[..term.len() - term.trim_start().len()];
+    let tail = &term[lead.len() + trimmed.len()..];
+    Some(format!("{lead}{replacement}{tail}"))
 }
 
 enum BooleanPiece<'a> {
@@ -23786,3 +23871,4 @@ mod shadow_latch_tests;
 #[cfg(test)]
 #[path = "row_lock_handover_tests.rs"]
 mod row_lock_handover_tests;
+
