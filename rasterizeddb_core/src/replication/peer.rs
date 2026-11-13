@@ -335,6 +335,8 @@ async fn run(replication: Arc<Replication>, peer: Arc<PeerHandle>) {
                 }
 
                 peer.connected.store(false, Ordering::Relaxed);
+                // No longer a peer the log holds history for past its budget.
+                replication.note_ack();
             }
             Err(e) => {
                 peer.connected.store(false, Ordering::Relaxed);

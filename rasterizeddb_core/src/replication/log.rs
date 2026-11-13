@@ -239,6 +239,8 @@ struct Segment {
     /// Bytes written, which is also the offset the next record goes to.
     len: u64,
     logged: Option<Logged>,
+    /// The newest sequence of each origin written to this file.
+    newest: BTreeMap<NodeId, u64>,
 }
 
 struct LogFile {
@@ -273,6 +275,10 @@ impl LogFile {
     }
 }
 
+/// How many times its budget the log may reach while a connected peer still
+/// needs its oldest file.
+const KEEP_FOR_PEERS_FACTOR: u64 = 4;
+
 /// A location's file and the offset inside it, in one word: the generation
 /// above bit 40, so a segment may be a terabyte and there may be sixteen
 /// million of them.
@@ -302,7 +308,13 @@ pub struct ReplicationLog {
     voided: Mutex<std::collections::HashSet<(NodeId, u64)>>,
     /// Conditional records found at open, until [`ReplicationLog::take_undecided`].
     pending_at_open: Mutex<BTreeMap<(NodeId, u64), u64>>,
-    retention_bytes: u64,
+    /// Settable while open: the storage is opened at server start, before
+    /// the configuration that says how much to keep has been applied.
+    retention_bytes: std::sync::atomic::AtomicU64,
+    /// The origin whose stream a connected peer is still being sent, and how
+    /// far the slowest such peer has got: see [`ReplicationLog::keep_for_peers`].
+    kept_origin: std::sync::atomic::AtomicU64,
+    kept_after: std::sync::atomic::AtomicU64,
     /// Padded off the two `Mutex` fields above it. Every append does a
     /// `fetch_max` here while holding neither lock, so without the guard the
     /// update invalidated the line carrying the mutex words that the next
@@ -313,7 +325,7 @@ pub struct ReplicationLog {
 impl std::fmt::Debug for ReplicationLog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicationLog")
-            .field("retention_bytes", &self.retention_bytes)
+            .field("retention_bytes", &self.retention())
             .finish()
     }
 }
@@ -402,7 +414,13 @@ struct Scanned {
 
 /// Reads one file's records into `found`, and returns where its last whole
 /// record ends.
-fn scan(path: &Path, generation: u64, bytes: &[u8], found: &mut Scanned) -> u64 {
+fn scan(
+    path: &Path,
+    generation: u64,
+    bytes: &[u8],
+    found: &mut Scanned,
+    newest: &mut BTreeMap<NodeId, u64>,
+) -> u64 {
     let mut at = 0usize;
     let good_end = loop {
         if at + RECORD_HEADER > bytes.len() {
@@ -458,6 +476,8 @@ fn scan(path: &Path, generation: u64, bytes: &[u8], found: &mut Scanned) -> u64 
 
         match TxnRecord::decode(&mut Reader::new(body)) {
             Ok(record) => {
+                let held = newest.entry(record.origin).or_insert(0);
+                *held = (*held).max(record.seq);
                 found.index.entry(record.origin).or_default().insert(
                     record.seq,
                     RecordLoc {
@@ -512,7 +532,9 @@ impl ReplicationLog {
             hot: Mutex::new(std::collections::VecDeque::with_capacity(HOT_RECORDS)),
             voided: Mutex::new(std::collections::HashSet::new()),
             pending_at_open: Mutex::new(BTreeMap::new()),
-            retention_bytes,
+            retention_bytes: std::sync::atomic::AtomicU64::new(retention_bytes),
+            kept_origin: std::sync::atomic::AtomicU64::new(0),
+            kept_after: std::sync::atomic::AtomicU64::new(u64::MAX),
             last_hlc: std::sync::atomic::AtomicU64::new(NO_HLC).into(),
         }
     }
@@ -568,7 +590,8 @@ impl ReplicationLog {
                 .open(&path)?;
             let mut bytes = Vec::new();
             handle.read_to_end(&mut bytes)?;
-            let good_end = scan(&path, generation, &bytes, &mut found);
+            let mut newest_here = BTreeMap::new();
+            let good_end = scan(&path, generation, &bytes, &mut found, &mut newest_here);
             // Only the file appends go to is cut at its last whole record:
             // the next append lands there. An older one keeps its bytes.
             if generation == newest && good_end < bytes.len() as u64 {
@@ -584,6 +607,7 @@ impl ReplicationLog {
                     path,
                     len: if generation == newest { good_end } else { bytes.len() as u64 },
                     logged,
+                    newest: newest_here,
                 },
             );
         }
@@ -614,7 +638,9 @@ impl ReplicationLog {
             hot: Mutex::new(found.hot),
             voided: Mutex::new(std::collections::HashSet::new()),
             pending_at_open: Mutex::new(found.conditional),
-            retention_bytes,
+            retention_bytes: std::sync::atomic::AtomicU64::new(retention_bytes),
+            kept_origin: std::sync::atomic::AtomicU64::new(0),
+            kept_after: std::sync::atomic::AtomicU64::new(u64::MAX),
             last_hlc: std::sync::atomic::AtomicU64::new(found.last_hlc).into(),
         };
         Ok(log)
@@ -714,7 +740,7 @@ impl ReplicationLog {
         let wal = {
             let mut file = self.file.lock();
             if let Some(log) = file.as_mut() {
-                if self.retention_bytes != 0 && log.active().len >= self.segment_bytes() {
+                if self.retention() != 0 && log.active().len >= self.segment_bytes() {
                     self.rotate(log, &mut retired)?;
                 }
                 let generation = *log.segments.keys().next_back().expect("a log has a file");
@@ -733,6 +759,8 @@ impl ReplicationLog {
                     }
                 }
                 segment.len += framed.len() as u64;
+                let held = segment.newest.entry(record.origin).or_insert(0);
+                *held = (*held).max(record.seq);
                 if local_tx != 0 {
                     log.conditional.insert(record.seq, local_tx);
                 } else {
@@ -760,11 +788,37 @@ impl ReplicationLog {
         Ok(())
     }
 
+    /// Says how far the slowest *connected* peer has been sent `origin`'s
+    /// stream, or that there is none (`u64::MAX`).
+    ///
+    /// The retention budget is for a peer that is away: how much history to
+    /// hold in case it returns. A peer that is here and being sent the
+    /// stream is another matter. Under a burst the origin, with many writers,
+    /// outruns a peer that applies one transaction at a time, and a budget
+    /// that let go of files such a peer had not been sent yet turned a few
+    /// seconds of lag into a node that had to be reseeded. Those files are
+    /// kept, up to [`KEEP_FOR_PEERS_FACTOR`] times the budget, past which a
+    /// peer that cannot keep up is not allowed to fill the disk.
+    pub fn keep_for_peers(&self, origin: NodeId, slowest: u64) {
+        self.kept_origin.store(origin, std::sync::atomic::Ordering::Release);
+        self.kept_after.store(slowest, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The retention budget in force.
+    pub fn retention(&self) -> u64 {
+        self.retention_bytes.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Changes the retention budget. It takes effect at the next file.
+    pub fn set_retention(&self, bytes: u64) {
+        self.retention_bytes.store(bytes, std::sync::atomic::Ordering::Release);
+    }
+
     /// How large one file of the log grows before the next is started: an
     /// eighth of the budget, so retention lets go of history an eighth at a
     /// time.
     fn segment_bytes(&self) -> u64 {
-        (self.retention_bytes / 8).max(1)
+        (self.retention() / 8).max(1)
     }
 
     /// Starts the next file, and takes the oldest ones out of the log while
@@ -795,11 +849,26 @@ impl ReplicationLog {
                 path,
                 len: 0,
                 logged,
+                newest: BTreeMap::new(),
             },
         );
 
+        let kept_origin = self.kept_origin.load(std::sync::atomic::Ordering::Acquire);
+        let kept_after = self.kept_after.load(std::sync::atomic::Ordering::Acquire);
         let mut dropped: Vec<u64> = Vec::new();
-        while log.bytes() > self.retention_bytes && log.segments.len() > 1 {
+        let retention = self.retention();
+        while log.bytes() > retention && log.segments.len() > 1 {
+            // A file a connected peer has not been sent all of yet is kept
+            // past the budget, up to a hard limit: see `keep_for_peers`.
+            let needed = log
+                .segments
+                .values()
+                .next()
+                .and_then(|oldest| oldest.newest.get(&kept_origin))
+                .is_some_and(|newest| *newest > kept_after);
+            if needed && log.bytes() <= retention.saturating_mul(KEEP_FOR_PEERS_FACTOR) {
+                break;
+            }
             let (oldest, segment) = log.segments.pop_first().expect("more than one file");
             dropped.push(oldest);
             retired.push(segment.path);
@@ -2502,5 +2571,43 @@ mod tests {
                 seen.insert(name, now);
             }
         }
+    }
+
+    /// A connected peer that has not been sent a file yet keeps it past the
+    /// budget; once it has, or once the log reaches its hard limit, the
+    /// budget applies again.
+    #[test]
+    fn a_file_a_connected_peer_still_needs_outlives_the_budget_up_to_a_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReplicationLog::open(dir.path(), 4096).unwrap();
+
+        // A peer at sequence 10 is being sent the stream.
+        log.keep_for_peers(1, 10);
+        for seq in 1..=120 {
+            log.append(&record(1, seq)).unwrap();
+        }
+        assert!(log.bytes() > 4096, "held past the budget for the peer: {}", log.bytes());
+        assert!(log.earliest(1) <= 11, "what the peer needs next is still here");
+        let (records, _) = log.read_after(1, 10, 1000, 1 << 30).unwrap();
+        assert_eq!(records.len(), 110);
+
+        // It catches up: the budget applies at the next file.
+        log.keep_for_peers(1, 120);
+        for seq in 121..=140 {
+            log.append(&record(1, seq)).unwrap();
+        }
+        assert!(log.bytes() <= 4096 + 1024, "back within the budget: {}", log.bytes());
+
+        // A peer that never moves does not hold the log for ever.
+        log.keep_for_peers(1, 0);
+        for seq in 141..=1400 {
+            log.append(&record(1, seq)).unwrap();
+        }
+        assert!(
+            log.bytes() <= 4096 * KEEP_FOR_PEERS_FACTOR + 1024,
+            "the hard limit: {}",
+            log.bytes()
+        );
+        assert!(log.earliest(1) > 1);
     }
 }

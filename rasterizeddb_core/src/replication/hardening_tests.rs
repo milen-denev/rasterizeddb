@@ -671,3 +671,43 @@ async fn a_replicating_node_restores_with_its_whole_stream() {
     assert_eq!(n, 200);
     let _ = std::fs::remove_dir_all(&target);
 }
+
+/// The server opens replication's files at start, before the replication
+/// flags have been applied, to settle what a crash left. What the log keeps
+/// is still the configuration's to say: opened first with the default budget,
+/// a restarted node grew one file to an eighth of 256 MiB whatever
+/// `--replication-retention-mb` said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_opened_before_the_configuration_takes_its_retention_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    super::test_support::init_globals();
+    let database = Arc::new(
+        Database::try_new_named(&dir.path().to_string_lossy(), false, "repl_keep")
+            .await
+            .expect("the database should open"),
+    );
+    // As `main` does when it finds the files: open first, configure after.
+    database.open_replication_storage().unwrap();
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: listener().1,
+        log_retention_bytes: 64 * 1024,
+        ..Default::default()
+    };
+    brisk(&mut config);
+    database.replication.set_config(config).unwrap();
+    database.replication.serve_on(listener().0);
+    database.open_replication_storage().unwrap();
+    database.replication.set_active(true);
+    assert_eq!(database.replication.log().unwrap().retention(), 64 * 1024);
+
+    run_ok(&database, "CREATE TABLE repl_keep (id INTEGER, body VARCHAR)").await;
+    let body = "y".repeat(1000);
+    for id in 0..200 {
+        run_ok(&database, &format!("INSERT INTO repl_keep (id, body) VALUES ({id}, '{body}')")).await;
+    }
+    let held = database.replication.log().unwrap().bytes();
+    assert!(held <= 64 * 1024 + 16 * 1024, "the log holds {held} bytes against a 64 KiB budget");
+    drop(database);
+    crate::core::wal::remove_for(&dir.path().to_string_lossy());
+}

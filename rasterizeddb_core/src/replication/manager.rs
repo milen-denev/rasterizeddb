@@ -595,6 +595,9 @@ impl Replication {
         let Some(log) = self.log.load_full() else {
             return;
         };
+        // The storage may have been opened before this configuration was
+        // applied: what it keeps is the configuration's to say.
+        log.set_retention(self.config.load().log_retention_bytes);
         let mut outbox = self.outbox.lock();
         let held = if node_id == 0 { 0 } else { log.highest(node_id) };
         self.seq.fetch_max(held, Ordering::AcqRel);
@@ -1110,9 +1113,22 @@ impl Replication {
         self.wake.notified()
     }
 
-    /// A peer's position moved: commits waiting on it look again.
+    /// A peer's position moved, or a link came up or went down: commits
+    /// waiting on a peer look again, and the log is told how far the slowest
+    /// connected peer has got (`ReplicationLog::keep_for_peers`).
     pub fn note_ack(&self) {
         self.acks.notify_waiters();
+        if let Some(log) = self.log.load_full() {
+            let slowest = self
+                .peers
+                .iter()
+                .filter(|peer| peer.is_connected() && !peer.is_paused())
+                .filter(|peer| peer.state() == super::peer::PeerState::Streaming)
+                .map(|peer| peer.acked_seq())
+                .min()
+                .unwrap_or(u64::MAX);
+            log.keep_for_peers(self.node_id(), slowest);
+        }
     }
 
     /// Hands `root`'s record to the peers and, in a synchronous mode, waits

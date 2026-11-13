@@ -526,6 +526,11 @@ for user data — the WAL and the transaction status log remain that.
   can be rebuilt from the write-ahead log only if everything in it went
   through that log, and a log that was compacted by copying came back from a
   restore empty.
+  The budget is for a peer that is away. A file that a **connected** peer has
+  not been sent all of yet is kept past it, up to four times the budget: under
+  a burst the origin's many writers outrun a peer applying one transaction at
+  a time, and letting go of what such a peer still needed turned a few seconds
+  of lag into a node to reseed.
 - **`db_replication.state`** — how far each origin's stream is applied and
   durable: one checksummed 64-byte slot an origin, overwritten in place. A
   slot that does not check out stops replication from starting rather than
