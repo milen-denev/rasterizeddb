@@ -3,6 +3,7 @@ pub mod client;
 pub mod common;
 pub mod config;
 pub mod error;
+mod interrupt;
 pub mod server;
 pub mod session;
 pub mod tls;

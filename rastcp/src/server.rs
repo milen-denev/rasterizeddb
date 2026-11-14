@@ -13,13 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 
 use crate::cert::generate_self_signed_cert;
+use crate::interrupt::{Guard, Interrupted, StopListener, StopSignal};
 use crate::session::{AuthChannel, Principal, ServerAuthenticator};
 use crate::tls::{ClientAuth, Fingerprint};
-use crate::common::write_message_timeout;
+use crate::common::write_message_with;
 use crate::error::RastcpError;
 use crate::ALPN_PROTOCOL;
 
@@ -84,35 +84,19 @@ fn normalize_max_connections(requested_max_connections: Option<usize>) -> usize 
 /// `CLOSE_WAIT` and the listening port in `TIME_WAIT`.
 #[derive(Clone)]
 pub struct ShutdownHandle {
-    tx: Arc<watch::Sender<bool>>,
+    signal: Arc<StopSignal>,
 }
 
 impl ShutdownHandle {
     /// Asks the server to stop. Idempotent, and safe to call from a signal
-    /// handler task while the server is still accepting.
+    /// handler task while the server is still accepting. It sticks: an accept
+    /// loop that starts afterwards stops at once.
     pub fn shutdown(&self) {
-        // send_replace rather than send: the value must stick even at the
-        // moment when no accept loop is subscribed yet.
-        self.tx.send_replace(true);
+        self.signal.stop();
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        *self.tx.borrow()
-    }
-}
-
-/// Resolves once `rx` observes a shutdown, including one signalled before this
-/// future was created. Pends forever if the sender is gone, which can only
-/// happen once the server itself has been dropped.
-async fn shutdown_signalled(rx: &mut watch::Receiver<bool>) {
-    loop {
-        if *rx.borrow_and_update() {
-            return;
-        }
-
-        if rx.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
+        self.signal.is_stopping()
     }
 }
 
@@ -162,7 +146,7 @@ pub struct TcpServer {
     shutdown_grace: Duration,
     auth_timeout: Duration,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
-    shutdown_tx: Arc<watch::Sender<bool>>,
+    stop: Arc<StopSignal>,
     /// SHA-256 of the certificate this server presents, so an operator can pin
     /// it on the other nodes without going and finding the file.
     certificate_fingerprint: Fingerprint,
@@ -418,8 +402,6 @@ impl TcpServerBuilder {
 
         info!("Server built to listen on {}:{}", self.addr, self.port);
 
-        let (shutdown_tx, _) = watch::channel(false);
-
         Ok(TcpServer {
             listener: tokio_listener,
             acceptor,
@@ -432,7 +414,7 @@ impl TcpServerBuilder {
             shutdown_grace: self.shutdown_grace,
             auth_timeout: self.auth_timeout,
             authenticator: self.authenticator,
-            shutdown_tx: Arc::new(shutdown_tx),
+            stop: StopSignal::new(),
             certificate_fingerprint,
         })
     }
@@ -505,7 +487,7 @@ impl TcpServer {
     /// Hands out a trigger for a graceful shutdown of this server.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         ShutdownHandle {
-            tx: self.shutdown_tx.clone(),
+            signal: self.stop.clone(),
         }
     }
 
@@ -515,7 +497,7 @@ impl TcpServer {
     }
 
     pub fn is_shutting_down(&self) -> bool {
-        *self.shutdown_tx.borrow()
+        self.stop.is_stopping()
     }
 
     pub fn active_connections(&self) -> usize {
@@ -528,11 +510,11 @@ impl TcpServer {
     /// The accept still carries its own timeout so a loop that is not watching
     /// anything else cannot park forever, and the shutdown branch is `biased`
     /// so a pending stop wins over a connection that arrives in the same tick.
-    async fn next_connection(&self, shutdown: &mut watch::Receiver<bool>) -> AcceptStep {
+    async fn next_connection(&self, shutdown: &mut StopListener) -> AcceptStep {
         tokio::select! {
             biased;
 
-            _ = shutdown_signalled(shutdown) => AcceptStep::Shutdown,
+            _ = shutdown.stopped() => AcceptStep::Shutdown,
 
             accepted = tokio::time::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept()) => {
                 match accepted {
@@ -554,12 +536,12 @@ impl TcpServer {
     async fn sleep_or_shutdown(
         &self,
         duration: Duration,
-        shutdown: &mut watch::Receiver<bool>,
+        shutdown: &mut StopListener,
     ) -> bool {
         tokio::select! {
             biased;
 
-            _ = shutdown_signalled(shutdown) => false,
+            _ = shutdown.stopped() => false,
             _ = tokio::time::sleep(duration) => true,
         }
     }
@@ -612,10 +594,10 @@ impl TcpServer {
     /// quietly be written without them.
     async fn accept_loop<S, Fut>(&self, serve: S) -> Result<(), RastcpError>
     where
-        S: Fn(TcpStream, watch::Receiver<bool>) -> Fut + Send + Sync,
+        S: Fn(TcpStream, StopListener) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let mut shutdown = self.shutdown_tx.subscribe();
+        let mut shutdown = self.stop.listen();
         let mut consecutive_max_connections = 0;
 
         loop {
@@ -663,7 +645,7 @@ impl TcpServer {
             let conn_counter = self.current_connections.clone();
             // Each connection watches the same signal, so a shutdown also ends
             // idle keep-alive sessions instead of waiting out the grace period.
-            let connection_shutdown = self.shutdown_tx.subscribe();
+            let connection_shutdown = self.stop.listen();
 
             // Increment connection counter
             let current = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -838,7 +820,7 @@ impl TcpServer {
         request_timeout: Duration,
         max_message_size: usize,
         authenticator: Option<Arc<dyn ServerAuthenticator>>,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: StopListener,
         handler: H,
     ) -> Result<(), RastcpError>
     where
@@ -902,31 +884,40 @@ impl TcpServer {
             debug!("{} authenticated as {}", peer_addr, principal);
         }
 
+        // One stop listener and one timer for the life of the connection, in
+        // place of a timer per read, per handler call and per write.
+        let mut guard = Guard::new(shutdown, request_timeout);
+        // Where a response and its length prefix are joined into one write, so
+        // they leave as one TLS record. Kept across requests: a connection
+        // that answers small requests never allocates for it again.
+        let mut scratch = Vec::new();
+
         loop {
             // A shutdown ends the session between requests: the peer
             // gets a close_notify and a clean EOF, instead of a socket
             // that dies under it and leaves it stuck in CLOSE_WAIT.
-            let read = tokio::select! {
-                biased;
-
-                _ = shutdown_signalled(&mut shutdown) => {
+            let read = match guard
+                .run(
+                    crate::common::read_message_limited(&mut tls_stream, max_message_size),
+                    true,
+                )
+                .await
+            {
+                Ok(read) => read,
+                Err(Interrupted::Stopping) => {
                     debug!("Shutting down, closing connection to {}", peer_addr);
                     break;
                 }
-
-                read = crate::common::read_message_limited_timeout(&mut tls_stream, max_message_size, request_timeout) => read,
+                Err(Interrupted::TimedOut) => Err(RastcpError::ConnectionTimeout),
             };
 
             match read {
                 Ok(data) => {
                     debug!("Received {} bytes from {}", data.len(), peer_addr);
 
-                    let response = match tokio::time::timeout(
-                        request_timeout,
-                        handler(principal.clone(), data),
-                    )
-                    .await
-                    {
+                    // Not stoppable from here on: a request that was read is
+                    // answered, which is what lets a shutdown drain.
+                    let response = match guard.run(handler(principal.clone(), data), false).await {
                         Ok(response) => response,
                         Err(_) => {
                             error!("Handler timed out for {}", peer_addr);
@@ -936,9 +927,15 @@ impl TcpServer {
 
                     debug!("Replying with {} bytes to {}", response.len(), peer_addr);
 
-                    if let Err(e) =
-                        write_message_timeout(&mut tls_stream, &response, request_timeout).await
+                    let written = match guard
+                        .run(write_message_with(&mut tls_stream, &mut scratch, &response), false)
+                        .await
                     {
+                        Ok(written) => written,
+                        Err(_) => Err(RastcpError::ConnectionTimeout),
+                    };
+
+                    if let Err(e) = written {
                         error!("Failed to write response to {}: {}", peer_addr, e);
                         break;
                     }

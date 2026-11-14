@@ -325,3 +325,121 @@ async fn test_graceful_shutdown_drains_and_frees_the_port() {
         .await
         .expect("port should be free immediately after a graceful shutdown");
 }
+
+/// A server on a port of its own, with `request_timeout` as given.
+async fn echo_server_with_timeout<F, Fut>(
+    request_timeout: Duration,
+    handler: F,
+) -> (String, tokio::task::JoinHandle<()>)
+where
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = Vec<u8>> + Send + 'static,
+{
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
+        .request_timeout(request_timeout)
+        .build()
+        .await
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        server.run(handler).await.unwrap();
+    });
+
+    (addr, handle)
+}
+
+// The three tests below pin what the server's request timeout means. It is
+// enforced by one timer per connection rather than one per read, handler call
+// and write, so each of the three ways that could go wrong gets a test: a busy
+// connection cut off because the timer was never moved, and an idle peer or a
+// stuck handler left alone because it was moved too freely.
+
+#[tokio::test]
+async fn test_a_connection_in_use_for_longer_than_the_timeout_stays_open() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let request_timeout = Duration::from_millis(300);
+    let (addr, server_handle) =
+        echo_server_with_timeout(request_timeout, |data| async move { data }).await;
+
+    let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+
+    // Five timeouts' worth of requests, none of them slow, each arriving well
+    // inside the timeout of the one before.
+    for round in 0..15u8 {
+        let echoed = client
+            .send(vec![round])
+            .await
+            .unwrap_or_else(|e| panic!("request {round} failed on a busy connection: {e}"));
+        assert_eq!(echoed, vec![round]);
+        sleep(request_timeout / 3).await;
+    }
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_a_connection_idle_for_longer_than_the_timeout_is_closed() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let request_timeout = Duration::from_millis(200);
+    let (addr, server_handle) =
+        echo_server_with_timeout(request_timeout, |data| async move { data }).await;
+
+    let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .unwrap();
+
+    assert_eq!(client.send(b"first".to_vec()).await.unwrap(), b"first".to_vec());
+
+    // Silent for three timeouts: the server has to have let go of the slot.
+    sleep(request_timeout * 3).await;
+
+    let result = client.send(b"second".to_vec()).await;
+    assert!(
+        result.is_err(),
+        "the server kept serving a connection that had been idle past its timeout"
+    );
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn test_a_handler_slower_than_the_timeout_ends_the_connection() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let request_timeout = Duration::from_millis(200);
+    let (addr, server_handle) = echo_server_with_timeout(request_timeout, |data| async move {
+        sleep(Duration::from_secs(3)).await;
+        data
+    })
+    .await;
+
+    let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .await
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let result = client.send(b"slow".to_vec()).await;
+    let took = started.elapsed();
+
+    // The client would wait ten seconds and the handler three; only the
+    // server's own timeout ends this in a fraction of one.
+    assert!(result.is_err(), "a request whose handler timed out was answered");
+    assert!(took >= request_timeout, "the handler was cut off early, after {took:?}");
+    assert!(took < Duration::from_secs(2), "the handler was not cut off, {took:?} elapsed");
+
+    server_handle.abort();
+}

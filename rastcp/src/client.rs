@@ -8,9 +8,10 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::ALPN_PROTOCOL;
-use crate::common::{write_message, write_message_timeout};
+use crate::common::{read_message_limited, write_message_with};
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
+use crate::interrupt::Deadline;
 use crate::session::{AuthChannel, ClientAuthenticator};
 use crate::tls::{ClientIdentity, Trust};
 
@@ -86,6 +87,12 @@ pub struct TcpClient {
     server_name: ServerName<'static>,
     connection: Option<TlsStream<TcpStream>>,
     timeout: Option<std::time::Duration>,
+    /// The one timer behind every request's timeout on the open connection.
+    /// Made with the connection, because both belong to the runtime that
+    /// opened it; `None` when the client has no timeout or no connection.
+    deadline: Option<Deadline>,
+    /// Where a request and its length prefix are joined into one write.
+    scratch: Vec<u8>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
     auth_timeout: std::time::Duration,
     max_message_size: usize,
@@ -258,6 +265,8 @@ impl TcpClientBuilder {
             server_name,
             connection: None,
             timeout: self.timeout,
+            deadline: None,
+            scratch: Vec::new(),
             authenticator: self.authenticator,
             auth_timeout: self.auth_timeout,
             max_message_size: self.max_message_size,
@@ -301,6 +310,7 @@ impl TcpClient {
 
             self.authenticate(&mut tls_stream).await?;
 
+            self.deadline = self.timeout.map(Deadline::new);
             self.connection = Some(tls_stream);
         }
         Ok(())
@@ -356,15 +366,32 @@ impl TcpClient {
 
         let io_result = {
             let stream = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+            let max_message_size = self.max_message_size;
+            let scratch = &mut self.scratch;
 
-            if let Some(timeout) = self.timeout {
-                write_message_timeout(stream, data, timeout).await?;
-                debug!("Sent {} bytes", data.len());
-                crate::common::read_message_limited_timeout(stream, self.max_message_size, timeout).await
-            } else {
-                write_message(stream, data).await?;
-                debug!("Sent {} bytes", data.len());
-                crate::common::read_message_limited(stream, self.max_message_size).await
+            match self.deadline.as_mut() {
+                // Each half of the exchange gets the whole timeout, as it did
+                // when each had a timer of its own.
+                Some(deadline) => {
+                    match deadline.run(write_message_with(stream, scratch, data)).await {
+                        Ok(Ok(())) => {
+                            debug!("Sent {} bytes", data.len());
+                            deadline
+                                .run(read_message_limited(stream, max_message_size))
+                                .await
+                                .unwrap_or(Err(RastcpError::ConnectionTimeout))
+                        }
+                        Ok(Err(err)) => Err(err),
+                        Err(_) => Err(RastcpError::ConnectionTimeout),
+                    }
+                }
+                None => match write_message_with(stream, scratch, data).await {
+                    Ok(()) => {
+                        debug!("Sent {} bytes", data.len());
+                        read_message_limited(stream, max_message_size).await
+                    }
+                    Err(err) => Err(err),
+                },
             }
         };
 
@@ -374,7 +401,7 @@ impl TcpClient {
                 Ok(response)
             }
             Err(err) => {
-                self.connection = None;
+                self.drop_connection();
                 Err(err)
             }
         }
@@ -382,8 +409,14 @@ impl TcpClient {
 
     // Add a close method to explicitly close the connection
     pub async fn close(&mut self) -> Result<(), RastcpError> {
-        self.connection = None;
+        self.drop_connection();
         Ok(())
+    }
+
+    /// Forgets the connection and the timer that was made with it.
+    fn drop_connection(&mut self) {
+        self.connection = None;
+        self.deadline = None;
     }
 
     // Add a is_connected method to check connection status

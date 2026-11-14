@@ -18,8 +18,6 @@ socket2 = "0.6"
 webpki-roots = { version = "1.0" }
 cacheguard = "0.1.0"
 xutex = "0.2.1"
-opool = "0.2.0"
-once_cell = "1.21"
 libc = "0.2"
 sha2 = "0.11"
 subtle = "2.6"
