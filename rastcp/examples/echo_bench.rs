@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! echo_bench server <port> <worker-threads>
+//! echo_bench server-percore <port> <threads>
 //! echo_bench client <addr:port> <connections> <seconds> <payload-bytes> <worker-threads> [depth]
 //! echo_bench mux    <addr:port> <connections> <seconds> <payload-bytes> <worker-threads> <callers>
 //! ```
@@ -40,6 +41,7 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("server") => server(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
+        Some("server-percore") => server_per_core(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
         Some("client") => client(
             args.get(2)
                 .cloned()
@@ -85,6 +87,51 @@ fn server(port: u16, threads: usize) {
 
         server.run(|data| async move { data }).await.expect("run");
     });
+}
+
+/// The same echo server as a thread per core: each thread has a runtime and a
+/// listener of its own on the one port, and the kernel deals connections
+/// between them. A connection then never leaves the thread that accepted it.
+/// Here to measure what that is worth before the library offers it.
+fn server_per_core(port: u16, threads: usize) {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+    let mut workers = Vec::new();
+
+    for _ in 0..threads.max(1) {
+        workers.push(std::thread::spawn(move || {
+            let socket =
+                Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+            socket.set_reuse_address(true).expect("reuse address");
+            socket.set_reuse_port(true).expect("reuse port");
+            let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+            socket.bind(&SockAddr::from(addr)).expect("bind");
+            socket.listen(1024).expect("listen");
+            let listener: std::net::TcpListener = socket.into();
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+
+            runtime.block_on(async move {
+                let server = TcpServerBuilder::from_listener(listener)
+                    .expect("listener")
+                    .max_connections(4096)
+                    .build()
+                    .await
+                    .expect("server");
+
+                server.run(|data| async move { data }).await.expect("run");
+            });
+        }));
+    }
+
+    println!("listening on 127.0.0.1:{port} with {threads} thread(s), one runtime each");
+
+    for worker in workers {
+        worker.join().expect("worker");
+    }
 }
 
 /// Microsecond buckets up to 20 ms; anything slower lands in the last one.

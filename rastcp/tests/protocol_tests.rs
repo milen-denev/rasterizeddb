@@ -443,3 +443,73 @@ async fn test_a_handler_slower_than_the_timeout_ends_the_connection() {
 
     server_handle.abort();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_servers_sharing_a_port_both_take_connections() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // Find a free port, then let go of it: both servers have to bind it
+    // themselves for the option to be what is under test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
+    let mut handles = Vec::new();
+    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut servers = Vec::new();
+
+    for index in 0..2u8 {
+        let server = Arc::new(
+            TcpServerBuilder::new("127.0.0.1", port)
+                .reuse_port(true)
+                .build()
+                .await
+                .unwrap_or_else(|e| panic!("server {index} could not share the port: {e}")),
+        );
+        servers.push(server.clone());
+
+        let served = served.clone();
+        handles.push(tokio::spawn(async move {
+            server
+                .run(move |_data| {
+                    let served = served.clone();
+                    async move {
+                        served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        vec![index]
+                    }
+                })
+                .await
+        }));
+    }
+
+    // Enough connections that the kernel's dealing reaches both.
+    let mut answered_by = [0u32; 2];
+    for _ in 0..64 {
+        let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{port}"))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .await
+            .unwrap();
+        let response = client.send(b"who".to_vec()).await.unwrap();
+        answered_by[response[0] as usize] += 1;
+    }
+
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 64);
+    assert!(
+        answered_by[0] > 0 && answered_by[1] > 0,
+        "one server took every connection: {answered_by:?}"
+    );
+
+    // Without the option the port is not shared, which is the default.
+    assert!(
+        TcpServerBuilder::new("127.0.0.1", port).build().await.is_err(),
+        "a server that did not ask to share the port was given it"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+}
