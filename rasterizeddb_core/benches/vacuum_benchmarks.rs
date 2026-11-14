@@ -137,7 +137,7 @@ fn bench_sweep(c: &mut Criterion) {
 
     let table = rt.block_on(async {
         let table = build_table(dir.path(), "bench_sweep", ROWS).await;
-        table.wait_filters_ready().await;
+        table.wait_filters_ready().await.expect("filters ready");
         // A fifth of the table dead: enough to be worth reclaiming, typical of a
         // table that has been running a while.
         table
@@ -188,7 +188,7 @@ fn bench_insert_paths(c: &mut Criterion) {
         let dir = bench_dir();
         let table = rt.block_on(async {
             let table = build_table(dir.path(), "bench_reuse", ROWS).await;
-            table.wait_filters_ready().await;
+            table.wait_filters_ready().await.expect("filters ready");
             table
                 .delete_rows("cat < 40000", full_fetch(&table.schema.fields), None)
                 .await
@@ -226,7 +226,7 @@ fn bench_compaction(c: &mut Criterion) {
                 let dir = bench_dir();
                 let table = rt.block_on(async {
                     let table = build_table(dir.path(), "bench_compact", ROWS).await;
-                    table.wait_filters_ready().await;
+                    table.wait_filters_ready().await.expect("filters ready");
                     table
                         .delete_rows("cat < 25000", full_fetch(&table.schema.fields), None)
                         .await

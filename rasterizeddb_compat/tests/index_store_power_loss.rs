@@ -568,7 +568,6 @@ async fn power_cuts(place: Place, table: &'static str, indexed: bool) {
         let touched: Vec<ModelRow> = [40i64, 41, 42, 43].iter().filter_map(|i| s1.remove(i)).collect();
         sqlx::query(AssertSqlSafe(format!("VACUUM {table}"))).execute(&mut *conn).await.unwrap();
         drop(conn);
-        model = s1.clone();
         let preds = battery(&[&s0, &s1], &touched);
         let guards = arm_cuts(&rec, &step_names, &dirs.base, &sink);
         assert_eq!(s.checkpoint().await, "1 of 1 clean");

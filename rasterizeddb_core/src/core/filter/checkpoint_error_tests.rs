@@ -55,13 +55,13 @@ impl SidecarIo {
 
     fn take_failure(&self) -> bool {
         self.fail_next
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
     }
 
     fn take_landed_failure(&self) -> bool {
         self.land_and_fail_next
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
     }
 

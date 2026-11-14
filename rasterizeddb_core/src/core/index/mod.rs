@@ -1505,7 +1505,7 @@ impl TableIndexes {
         crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableIndexes::set_ready");
         let _ = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some((s & !1) | ready as u64));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| Some((s & !1) | ready as u64));
     }
 
     /// The renumbering epoch. A build reads it before its first slot and
@@ -1523,7 +1523,7 @@ impl TableIndexes {
         crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableIndexes::invalidate");
         let prev = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(((s >> 1) + 1) << 1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(((s >> 1) + 1) << 1))
             .unwrap_or_else(|s| s);
         (prev >> 1) + 1
     }
@@ -1533,7 +1533,7 @@ impl TableIndexes {
     pub fn set_ready_at(&self, _proof: Proof<'_>, epoch: u64) -> bool {
         crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "TableIndexes::set_ready_at");
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| (s >> 1 == epoch).then_some(s | 1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| (s >> 1 == epoch).then_some(s | 1))
             .is_ok()
     }
 

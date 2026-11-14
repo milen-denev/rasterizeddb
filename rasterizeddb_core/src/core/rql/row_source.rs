@@ -41,7 +41,7 @@
 //! reads or fills the query cache, each partition under its own scope, so a
 //! wide fan-out cannot flush it.
 //!
-//! [`write_partitions`] is the same fan-out for `UPDATE` and `DELETE` (S11):
+//! [`write_partitions_as_of`] is the same fan-out for `UPDATE` and `DELETE` (S11):
 //! one snapshot and one transaction across partitions, visited one at a time.
 
 use std::io;
@@ -641,27 +641,13 @@ pub(crate) type PartWrite = io::Result<(u64, Vec<Row>)>;
 ///   row (§9, I17): a replay in `execute_in_txn` runs in the same
 ///   transaction, whose earlier partitions' new versions it would see and
 ///   apply again.
-pub(crate) async fn write_partitions<F, Fut>(
-    table: &PartitionedTable,
-    where_clause: &str,
-    tx: TxId,
-    collect: Option<&mut Vec<Row>>,
-    write: F,
-) -> io::Result<u64>
-where
-    F: FnMut(Arc<PartTable>, Option<Visibility>, bool) -> Fut,
-    Fut: std::future::Future<Output = PartWrite>,
-{
-    write_partitions_as_of(table, where_clause, tx, None, collect, write).await
-}
-
-/// [`write_partitions`] under `statement`, a snapshot the caller took
-/// before it: the one a statement's foreign-key work read the rows it judged
-/// under (the keys a `DELETE` removes, what an `UPDATE` changes; phase 3
-/// P4), so the rows written are exactly those rows. Every partition is then
-/// written under it, a lone partition too, as a plain table's write is given
-/// the statement's `Visibility` in the same case. `None` is
-/// [`write_partitions`].
+///
+/// `statement` is a snapshot the caller took before it: the one a
+/// statement's foreign-key work read the rows it judged under (the keys a
+/// `DELETE` removes, what an `UPDATE` changes; phase 3 P4), so the rows
+/// written are exactly those rows. Every partition is then written under it,
+/// a lone partition too, as a plain table's write is given the statement's
+/// `Visibility` in the same case. `None` is the plain fan-out above.
 pub(crate) async fn write_partitions_as_of<F, Fut>(
     table: &PartitionedTable,
     where_clause: &str,

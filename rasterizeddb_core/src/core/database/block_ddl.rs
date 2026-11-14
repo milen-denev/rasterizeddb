@@ -793,11 +793,6 @@ impl Database {
         );
     }
 
-    /// Whether block `root` has DDL that rolls back with it.
-    pub(crate) fn block_ddl_pending(&self, root: TxId) -> bool {
-        self.block_ddl.get(&root).is_some_and(|s| !s.is_empty())
-    }
-
     /// Block `root` committed durably: its intents go, then its copies.
     pub(crate) async fn block_ddl_commit(&self, root: TxId) {
         let Some((_, steps)) = self.block_ddl.remove(&root) else { return };

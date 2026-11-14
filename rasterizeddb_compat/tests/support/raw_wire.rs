@@ -103,6 +103,7 @@ impl RawConn {
     }
 
     /// Parses `sql` once as the named statement `name`.
+    #[allow(dead_code)] // shared support: not every test binary parses
     pub async fn parse(&mut self, name: &str, sql: &str) -> Result<(), String> {
         let mut body = Vec::new();
         body.extend_from_slice(name.as_bytes());
@@ -117,6 +118,7 @@ impl RawConn {
 
     /// Bind, Describe(portal), Execute, Sync of a parsed statement with no
     /// parameters, in text format: the sequence `pgbench -M prepared` sends.
+    #[allow(dead_code)] // shared support: not every test binary executes
     pub async fn execute(&mut self, name: &str) -> Result<Shape, String> {
         let mut bind = Vec::new();
         bind.push(0); // unnamed portal

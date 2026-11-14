@@ -1600,10 +1600,6 @@ mod differential {
         assert!(matched > 300, "only {matched} matches");
     }
 
-    fn words_of(doc: &str) -> Vec<String> {
-        super::words(doc).into_iter().map(|w| w.to_lowercase()).collect()
-    }
-
     /// A query cached by its text answers for that text, not for whatever
     /// else later occupies the same memory.
     #[test]

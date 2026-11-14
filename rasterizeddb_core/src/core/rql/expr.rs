@@ -503,36 +503,6 @@ pub enum TextFunc {
     Pg(crate::core::rql::pg_functions::PgFunc),
 }
 
-/// How many elements an array's text form `{a,b,"c,d"}` holds.
-///
-/// Counted from the text rather than the binary header because that is the
-/// form `format_array` yields, and a comma inside a quoted element is not a
-/// separator — `{"a,b"}` holds one element, not two.
-fn array_element_count(text: &str) -> usize {
-    let trimmed = text.trim();
-    let body = trimmed
-        .strip_prefix('{')
-        .and_then(|t| t.strip_suffix('}'))
-        .unwrap_or(trimmed);
-    if body.trim().is_empty() {
-        return 0;
-    }
-    let mut count = 1usize;
-    let mut in_quotes = false;
-    let mut chars = body.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '\\' if in_quotes => {
-                chars.next();
-            }
-            ',' if !in_quotes => count += 1,
-            _ => {}
-        }
-    }
-    count
-}
-
 /// A binary arithmetic operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArithOp {

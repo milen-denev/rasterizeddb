@@ -918,7 +918,7 @@ impl ConnectionSlot {
     /// together cannot both see room for one.
     fn try_acquire(counter: &StdArc<AtomicUsize>, cap: usize) -> Option<Self> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < cap).then_some(n + 1)
             })
             .ok()
@@ -7763,7 +7763,8 @@ fn engine_integrity_phrase(message: &str, statement: &str) -> Option<&'static st
     })
 }
 
-/// [`materialize_sqlstate`] with [`sqlstate_in`]'s blanking.
+/// The code a failed CTE body or derived table is reported under
+/// ([`materialize_class`]), with [`sqlstate_in`]'s blanking.
 pub(crate) fn materialize_sqlstate_in(message: &str, statement: &str) -> &'static str {
     // A body with a syntax error is one (`WITH c AS (SELECT … FROM t WHER
     // id = 1)`), not a feature this lacks.
@@ -7851,12 +7852,8 @@ fn quoted_client_texts(statement: &str) -> Vec<(String, String)> {
     found
 }
 
-pub(crate) fn materialize_sqlstate(message: &str) -> &'static str {
-    materialize_class(sqlstate_for(message))
-}
-
 /// The code a failed CTE body or derived table is reported under, given the
-/// code of its own failure: see [`materialize_sqlstate`].
+/// code of its own failure.
 fn materialize_class(code: &'static str) -> &'static str {
     // A body naming a relation or column that is not there, or a column two
     // relations have, is the client's mistake, as it is outside a CTE

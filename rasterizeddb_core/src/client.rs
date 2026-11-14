@@ -380,7 +380,7 @@ impl DbClientPool {
 
     fn try_reserve_connection_slot(&self) -> bool {
         self.current_size
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current_size| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current_size| {
                 (current_size < self.max_pool_size).then_some(current_size + 1)
             })
             .is_ok()

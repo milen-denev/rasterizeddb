@@ -154,7 +154,6 @@ async fn a_typed_array_is_described_and_sent_as_its_type() {
     assert_eq!(n.iter().map(|d| d.to_string()).collect::<Vec<_>>(), ["1.50", "-2"]);
     assert_eq!(t, [Some("x".to_string()), None]);
     // The element OID in the bytes is the described type's.
-    use sqlx::ValueRef;
     for (at, oid) in [(0usize, 23i32), (1, 16), (2, 1700), (3, 25)] {
         let raw = row.try_get_raw(at).expect("raw");
         let bytes = raw.as_bytes().expect("binary bytes");

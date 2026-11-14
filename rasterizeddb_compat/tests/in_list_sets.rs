@@ -8,7 +8,7 @@
 //! values are in scope: the old comparison program wrapped its index there.
 
 use rasterizeddb_compat::TestServer;
-use sqlx::{AssertSqlSafe, Executor, Row};
+use sqlx::{AssertSqlSafe, Executor};
 
 const N: i64 = 5000;
 

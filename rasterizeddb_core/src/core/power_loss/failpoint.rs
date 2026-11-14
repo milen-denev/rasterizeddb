@@ -181,9 +181,12 @@ pub fn on_sync(event: &crate::core::sync_audit::SyncEvent) {
 }
 
 /// `failpoint!(name, path)`: an `io::Result<()>` for the site to `?`.
+/// Only the tests' sites use it so far.
+#[cfg(test)]
 macro_rules! failpoint {
     ($name:expr, $path:expr) => {
         $crate::core::power_loss::failpoint::hit($name, $path)
     };
 }
+#[cfg(test)]
 pub(crate) use failpoint;

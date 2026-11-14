@@ -5,7 +5,7 @@
 //! about what they enforce. Every expected answer here is PostgreSQL 17's.
 
 use rasterizeddb_compat::TestServer;
-use sqlx::{AssertSqlSafe, Executor};
+use sqlx::AssertSqlSafe;
 
 async fn exec(pool: &sqlx::PgPool, sql: &str) {
     sqlx::query(AssertSqlSafe(sql))

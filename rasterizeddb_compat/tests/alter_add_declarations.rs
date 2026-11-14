@@ -8,7 +8,7 @@
 //! PostgreSQL 17's.
 
 use rasterizeddb_compat::TestServer;
-use sqlx::{AssertSqlSafe, Executor, Row};
+use sqlx::{AssertSqlSafe, Row};
 
 async fn exec(pool: &sqlx::PgPool, sql: &str) {
     sqlx::query(AssertSqlSafe(sql)).execute(pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));

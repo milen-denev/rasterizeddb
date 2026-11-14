@@ -52,7 +52,6 @@ async fn a_nested_literal_is_stored_with_its_dimensions() {
     // Binary, typed: a two-dimensional integer[] is not a Vec<i32>, but its
     // bytes say two dimensions of int4.
     let row = sqlx::query("SELECT i FROM md").fetch_one(&pool).await.expect("select");
-    use sqlx::ValueRef;
     let raw = row.try_get_raw(0).expect("raw");
     let bytes = raw.as_bytes().expect("binary");
     assert_eq!(&bytes[..4], &2i32.to_be_bytes(), "two dimensions");

@@ -434,15 +434,6 @@ fn cpu_time() -> Duration {
     Duration::from_millis(ticks * 1000 / hz)
 }
 
-/// The bytes this process caused to be read from and written to storage.
-fn io_bytes() -> (u64, u64) {
-    let io = std::fs::read_to_string("/proc/self/io").unwrap_or_default();
-    let get = |key: &str| {
-        io.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-    };
-    (get("read_bytes:"), get("write_bytes:"))
-}
-
 /// P5b-2b's measurement (docs/partitioning.md "Phase 3 P5b-2b as built"):
 /// the first unrouted read over `P5B2B_N` closed partitions (default 1,024)
 /// of `P5B2B_ROWS` rows each (default 200, an index on `v`), every one

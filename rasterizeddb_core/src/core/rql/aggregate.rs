@@ -1186,13 +1186,8 @@ pub(crate) enum Acc {
 }
 
 impl Acc {
-    /// The accumulator for one select item: [`Acc::new`], over DISTINCT values
-    /// when the item says so.
-    pub(crate) fn for_item(func: AggFunc, arg: Option<&SchemaField>, distinct: bool) -> Self {
-        Acc::for_call(func, arg, distinct, None)
-    }
-
-    /// [`Acc::for_item`] for a call carrying a delimiter or an `ORDER BY`.
+    /// The accumulator for one aggregate call: [`Acc::new`], over DISTINCT
+    /// values when the call says so, and taking its delimiter or `ORDER BY`.
     pub(crate) fn for_call(func: AggFunc, arg: Option<&SchemaField>, distinct: bool, call: Option<&AggCall>) -> Self {
         let mut plain = Acc::new(func, arg);
         if let Acc::Collect { order, by_value_descending, delimiter, .. } = &mut plain {
@@ -2693,7 +2688,6 @@ impl<'p> Folder<'p> {
 
     /// Starts a group for the key in `self.key`, returning its number.
     fn new_group(&mut self, byte_cell: Option<usize>, hash: u64) -> usize {
-        use std::hash::BuildHasher;
         let at = self.keys.len();
         self.keys.push(self.key.as_slice().into());
         if let Some(shown) = self.shown.as_mut() {
@@ -2715,7 +2709,6 @@ impl<'p> Folder<'p> {
 
     /// The group for the key in `self.key`, created if it is new.
     fn group_for_key(&mut self, byte_cell: Option<usize>) -> usize {
-        use std::hash::BuildHasher;
         if let Some(cell) = byte_cell {
             if self.byte_groups[cell] != u32::MAX {
                 return self.byte_groups[cell] as usize;

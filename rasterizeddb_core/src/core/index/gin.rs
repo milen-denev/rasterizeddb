@@ -368,7 +368,7 @@ impl GinIndex {
         // were counted and are not part of what it removed. Saturating, as a
         // `clear` beside it may already have zeroed them.
         let sub = |counter: &AtomicU64, n: u64| {
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(n)));
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(n)));
         };
         sub(&self.entries, removed);
         sub(&self.forgotten, gone.len() as u64);
@@ -1232,12 +1232,11 @@ mod tests {
     /// unreadable, some `NULL`, and some forgotten. Returns the documents
     /// by slot, `None` where nothing can match.
     fn random_index(r: &mut Rng, opclass: GinOpclass, n: u64) -> (GinIndex, Vec<Option<Vec<u8>>>) {
-        random_index_with(r, opclass, n, &|| GinIndex::new(decl("r"), 0, opclass))
+        random_index_with(r, n, &|| GinIndex::new(decl("r"), 0, opclass))
     }
 
     fn random_index_with(
         r: &mut Rng,
-        opclass: GinOpclass,
         n: u64,
         make: &dyn Fn() -> GinIndex,
     ) -> (GinIndex, Vec<Option<Vec<u8>>>) {
@@ -1351,8 +1350,8 @@ mod tests {
             let opclass = if round % 2 == 0 { GinOpclass::Ops } else { GinOpclass::PathOps };
             let seed = 0x5eed_0000 + round;
             let n = 300 + (round * 37) % 300;
-            let (mem, _) = random_index_with(&mut Rng(seed), opclass, n, &|| GinIndex::new(decl("m"), 0, opclass));
-            let (paged, docs) = random_index_with(&mut Rng(seed), opclass, n, &|| {
+            let (mem, _) = random_index_with(&mut Rng(seed), n, &|| GinIndex::new(decl("m"), 0, opclass));
+            let (paged, docs) = random_index_with(&mut Rng(seed), n, &|| {
                 GinIndex::new_paged(decl(&format!("p{round}")), 0, opclass, &placement, budgets)
             });
             assert!(paged.is_paged());

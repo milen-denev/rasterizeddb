@@ -2805,7 +2805,7 @@ impl ConcurrentProcessor {
                                 break;
                             }
 
-                            let reserved = limit_counter_ref.fetch_update(
+                            let reserved = limit_counter_ref.try_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
                                 // `<`, not `<=`: the counter is the number of rows already
@@ -2981,7 +2981,7 @@ impl ConcurrentProcessor {
                                 break;
                             }
 
-                            let reserved = limit_counter_ref.fetch_update(
+                            let reserved = limit_counter_ref.try_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
                                 // `<`, not `<=`: the counter is the number of rows already

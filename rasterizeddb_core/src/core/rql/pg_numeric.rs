@@ -175,10 +175,6 @@ impl PgNum {
         Some((v.s..=most).rev().find_map(|s| v.round_to(s)).unwrap_or(v))
     }
 
-    pub(crate) fn neg(self) -> Option<Self> {
-        Some(PgNum { m: self.m.checked_neg()?, s: self.s })
-    }
-
     pub(crate) fn abs(self) -> Option<Self> {
         Some(PgNum { m: self.m.checked_abs()?, s: self.s })
     }

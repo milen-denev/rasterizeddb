@@ -608,7 +608,7 @@ pub(crate) fn query_output_scales(
                     // slot. The fetched columns are the *inputs*: `v + 1, id, v`
                     // fetches `v` and `id`, so reading scales off them gave the
                     // third output the scale of `id`'s slot.
-                    use crate::core::rql::aggregate::{AggFunc, SelectItem};
+                    use crate::core::rql::aggregate::SelectItem;
                     let engine = crate::core::value_codec::DECIMAL_SCALE;
                     let declared = |name: &str| {
                         crate::core::rql::type_modifier::scale_of(name, &schema.type_modifiers) as u32
@@ -9159,6 +9159,7 @@ fn literal_arithmetic(text: &str) -> bool {
 /// zero divisor. Nothing else is folded: a literal beyond `int8`
 /// (`numeric`), any other character. `None` also for a lone literal, which
 /// needs no folding.
+#[cfg(test)]
 fn fold_integer_arithmetic(text: &str) -> Option<String> {
     match integer_arithmetic(text) {
         IntegerFold::Folded(value) => Some(value),
@@ -21523,7 +21524,7 @@ pub(crate) async fn execute_with_need(
             // deletes must be the same rows. See `keys_about_to_be_deleted`.
             // Or the one its reads took, when it read first (a subquery).
             let referenced = !referencing_keys(&database, &table_name).is_empty();
-            let mut self_references: Vec<SelfReference> = Vec::new();
+            let self_references: Vec<SelfReference>;
             let statement_visibility = statement_snapshot_for(depth, || {
                 if referenced { table.statement_visibility(tx) } else { table.statement_visibility_deferred(tx) }
             })
@@ -21882,7 +21883,7 @@ async fn partitioned_write_reply(
 /// the row to another partition (phase 6), and refused here it writes
 /// nothing in any partition, where the range guard alone would refuse it
 /// only after earlier partitions had written. The guard still checks every
-/// merged row. Then [`write_partitions`] visits the routed partitions, each
+/// merged row. Then [`write_partitions_as_of`] visits the routed partitions, each
 /// collecting its pre-images when the statement returns rows (S17); the
 /// rows are built only once every partition has succeeded, so a failed
 /// statement returns none.
@@ -21891,7 +21892,7 @@ async fn partitioned_write_reply(
 /// execution routes its own values.
 ///
 /// [`PartitionedTable::assignments_keep_point`]: crate::core::partition::table::PartitionedTable::assignments_keep_point
-/// [`write_partitions`]: crate::core::rql::row_source::write_partitions
+/// [`write_partitions_as_of`]: crate::core::rql::row_source::write_partitions_as_of
 async fn execute_partitioned_update(
     query: &QueryPurpose,
     update_plan: crate::core::rql::lexer_ur::UpdateRow,
@@ -22122,12 +22123,12 @@ async fn partitioned_update_foreign_keys(
 }
 
 /// A `DELETE` on a partitioned table (§9, S11): the `RETURNING` list resolved
-/// before anything is deleted, then [`write_partitions`] over the routed
+/// before anything is deleted, then [`write_partitions_as_of`] over the routed
 /// partitions, each collecting the rows it deleted when the statement returns
 /// them (S17), reported once every partition has succeeded. Prepared, it
 /// stays on the text path, as the `UPDATE` does.
 ///
-/// [`write_partitions`]: crate::core::rql::row_source::write_partitions
+/// [`write_partitions_as_of`]: crate::core::rql::row_source::write_partitions_as_of
 async fn execute_partitioned_delete(
     query: &QueryPurpose,
     delete_plan: crate::core::rql::lexer_dr::DeleteRow,

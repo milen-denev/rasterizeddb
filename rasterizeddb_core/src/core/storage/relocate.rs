@@ -375,7 +375,7 @@ async fn plan_partitions(database: &Arc<Database>, pool: &StorageManager) -> Res
         usable.iter().map(|p| (p.clone(), at.iter().filter(|a| *a == p).count())).collect();
     let mut plan: Vec<PartitionMove> = Vec::new();
     let mut planned = vec![false; parts.len()];
-    let mut take = |i: usize, to: String, reason: &'static str, at: &mut Vec<String>, free: &mut std::collections::HashMap<String, u64>, counts: &mut std::collections::HashMap<String, usize>, plan: &mut Vec<PartitionMove>| {
+    let take = |i: usize, to: String, reason: &'static str, at: &mut Vec<String>, free: &mut std::collections::HashMap<String, u64>, counts: &mut std::collections::HashMap<String, usize>, plan: &mut Vec<PartitionMove>| {
         let (table, pid, _, bytes) = &parts[i];
         let from = at[i].clone();
         if let Some(space) = free.get_mut(&to) {

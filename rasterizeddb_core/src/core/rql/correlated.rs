@@ -273,7 +273,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn a_select_item_becomes_a_left_lateral_join() {
         let out = rewrite_select("SELECT id, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct WHERE id > 1 ORDER BY id")
             .unwrap()

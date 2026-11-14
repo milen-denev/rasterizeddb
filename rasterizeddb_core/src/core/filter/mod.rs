@@ -1016,7 +1016,7 @@ impl TableFilters {
         // To the next odd value: always a change, always "running".
         let _ = self
             .renumber_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e | 1) + 2 * (e & 1)));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e | 1) + 2 * (e & 1)));
         for c in &self.columns {
             let mut c = c.write();
             c.demote_below(n_slots);
@@ -1060,7 +1060,7 @@ impl TableFilters {
         // To the next even value: always a change, never "running".
         let _ = self
             .renumber_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e + 2) & !1));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |e| Some((e + 2) & !1));
         for c in &self.columns {
             c.write().forget_backfill_writes();
         }

@@ -571,13 +571,13 @@ fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
     .iter()
     .enumerate()
     {
-        q.all(&format!("INSERT INTO {{c}}i (cid, k) VALUES ({n}, {value})"));
+        let _ = q.all(&format!("INSERT INTO {{c}}i (cid, k) VALUES ({n}, {value})"));
     }
     for (n, value) in ["'x'::text", "'x'::varchar", "CAST('a' AS TEXT)", "'it''s'", "'-5'", "'nope'::text", "'X'"]
         .iter()
         .enumerate()
     {
-        q.all(&format!("INSERT INTO {{c}}t (cid, k) VALUES ({n}, {value})"));
+        let _ = q.all(&format!("INSERT INTO {{c}}t (cid, k) VALUES ({n}, {value})"));
     }
     let upper = uuid.to_ascii_uppercase();
     let bare = uuid.replace('-', "");
@@ -592,10 +592,10 @@ fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
     .iter()
     .enumerate()
     {
-        q.all(&format!("INSERT INTO {{c}}u (cid, k) VALUES ({n}, {value})"));
+        let _ = q.all(&format!("INSERT INTO {{c}}u (cid, k) VALUES ({n}, {value})"));
     }
     for (n, value) in ["-7", "-7::int", "CAST(-6 AS INT)", "'-5'", "-999"].iter().enumerate() {
-        q.all(&format!("INSERT INTO {{c}}n (cid, k) VALUES ({n}, {value})"));
+        let _ = q.all(&format!("INSERT INTO {{c}}n (cid, k) VALUES ({n}, {value})"));
     }
     // Prepared, as an ORM binds `$n` (text parameters).
     for (i, (suffix, _, _)) in CONFIGS.iter().enumerate() {
@@ -618,13 +618,13 @@ fn every_literal_form_of_a_key_answers_like_the_plain_twin() {
         q.ok(&format!("SELECT cid, k FROM {{c}}{t} ORDER BY cid"));
     }
     // The parents' deletes see those children, routed and fanned out.
-    q.all("DELETE FROM {p}i WHERE k = -7");
-    q.all("DELETE FROM {p}i WHERE k IN (-1, -9)");
-    q.all("DELETE FROM {p}t WHERE k = 'x'");
-    q.all(&format!("DELETE FROM {{p}}u WHERE k = '{uuid}'"));
+    let _ = q.all("DELETE FROM {p}i WHERE k = -7");
+    let _ = q.all("DELETE FROM {p}i WHERE k IN (-1, -9)");
+    let _ = q.all("DELETE FROM {p}t WHERE k = 'x'");
+    let _ = q.all(&format!("DELETE FROM {{p}}u WHERE k = '{uuid}'"));
     q.restart();
-    q.all("INSERT INTO {c}i (cid, k) VALUES (200, -6::bigint)");
-    q.all("INSERT INTO {c}i (cid, k) VALUES (201, -1::bigint)");
+    let _ = q.all("INSERT INTO {c}i (cid, k) VALUES (200, -6::bigint)");
+    let _ = q.all("INSERT INTO {c}i (cid, k) VALUES (201, -1::bigint)");
     q.same_rows_of("{c}i");
 }
 

@@ -6,7 +6,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    usize,
 };
 
 use std::cell::RefCell;

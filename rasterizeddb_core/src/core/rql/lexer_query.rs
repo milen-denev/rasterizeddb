@@ -2332,7 +2332,7 @@ pub fn row_fetch_from_select_query(
         }
         for (position, item) in select_items.iter().enumerate() {
             match item {
-                SelectItem::Column { field, label } => {
+                SelectItem::Column { field, label: _ } => {
                     if !group_by.iter().any(|g| g.write_order == field.write_order) {
                         if determined_by_key {
                             group_by.push(field.clone());

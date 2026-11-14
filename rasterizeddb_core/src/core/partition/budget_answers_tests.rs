@@ -50,13 +50,6 @@ fn table(db: &Database, name: &str) -> Arc<PartitionedTable> {
     }
 }
 
-fn pid_of_tenant(t: &PartitionedTable, tenant: i64) -> u32 {
-    let epoch = t.epoch().unwrap();
-    let pids = t.route_where(&format!("tenant_id = {tenant}")).unwrap().pids(&epoch.map);
-    assert_eq!(pids.len(), 1);
-    pids[0]
-}
-
 async fn sizes_of(t: &PartitionedTable) -> (u64, u64, u64, Vec<(u32, &'static str, u64)>, u64) {
     let tot = t.totals().await.unwrap();
     let parts = t.partitions().await.unwrap().into_iter().map(|p| (p.pid, p.state, p.slots)).collect();

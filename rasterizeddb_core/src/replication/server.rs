@@ -380,7 +380,6 @@ fn refuse(record: &TxnRecord, status: ApplyStatus, message: impl Into<String>) -
 /// A record applied and committed in memory, waiting for the sync that
 /// makes it durable.
 struct Waiting {
-    tx: crate::core::mvcc::TxId,
     owner: crate::core::mvcc::owner::OwnerRelease,
     record: TxnRecord,
     /// Where its outcome sits in the batch's answer.
@@ -547,6 +546,7 @@ pub(crate) async fn apply_batch(
 }
 
 /// Applies one record on its own. For callers with one record in hand.
+#[cfg(test)]
 pub(super) async fn apply_record(
     database: &Arc<Database>,
     replication: &StdArc<Replication>,
@@ -891,7 +891,6 @@ async fn apply_one(
         message: String::new(),
     });
     group.waiting.push(Waiting {
-        tx,
         owner,
         record,
         answer: outcomes.len() - 1,

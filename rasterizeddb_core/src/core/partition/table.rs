@@ -3220,13 +3220,6 @@ pub(crate) mod lifecycle_hooks {
         (reached, resume)
     }
 
-    /// The next open of partition `pid` under `dir` waits, once the
-    /// instance is built and before it is put in its slot, until the second
-    /// `Notify` is signalled; the first is signalled when it gets there.
-    pub(crate) fn park_open(dir: &Path, pid: u32) -> (StdArc<Notify>, StdArc<Notify>) {
-        arm(&OPENS, dir, pid)
-    }
-
     /// The next close of partition `pid` under `dir` waits, once it has
     /// taken the instance out of its slot and before it retires it.
     pub(crate) fn park_close(dir: &Path, pid: u32) -> (StdArc<Notify>, StdArc<Notify>) {

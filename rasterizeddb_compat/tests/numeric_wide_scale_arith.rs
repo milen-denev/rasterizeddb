@@ -11,7 +11,7 @@
 //! refused (0A000), never answered without its digits.
 
 use rasterizeddb_compat::TestServer;
-use sqlx::{AssertSqlSafe, Executor, Row, ValueRef};
+use sqlx::{AssertSqlSafe, Executor, Row};
 
 struct Root(String);
 

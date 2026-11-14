@@ -282,6 +282,8 @@ async fn a_declared_partition_nobody_uses_builds_nothing() {
     assert!(slots <= touched && watches <= touched && locks <= touched, "after a rename: {slots}, {watches}, {locks}");
     exec(&db, "ALTER TABLE pt RENAME COLUMN w TO v").await;
     let t = pt(&db);
+    let (slots, watches, locks) = t.built_per_partition();
+    assert!(slots <= touched && watches <= touched && locks <= touched, "after renaming back: {slots}, {watches}, {locks}");
 
     let db = restart(dir.path(), db).await;
     let t = pt(&db);

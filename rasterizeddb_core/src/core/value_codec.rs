@@ -1902,69 +1902,6 @@ fn element_order(typed: Option<&crate::core::db_type::DbType>, x: &[u8], y: &[u8
     x.cmp(y)
 }
 
-/// Splits `{a,"b,c",NULL}` into its elements. `None` is an unquoted `NULL`.
-fn parse_array_elements(text: &str) -> Option<Vec<Option<String>>> {
-    if let Some(parsed) = parse_nested_array(text) {
-        return Some(parsed.elements);
-    }
-    parse_array_elements_flat(text)
-}
-
-/// The one-level reading [`parse_array_elements`] falls back to.
-fn parse_array_elements_flat(text: &str) -> Option<Vec<Option<String>>> {
-    let trimmed = text.trim();
-    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?;
-    if inner.trim().is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut was_quoted = false;
-    let mut chars = inner.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if quoted => {
-                // Inside quotes a backslash escapes the next character.
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            '"' => {
-                quoted = !quoted;
-                was_quoted = true;
-            }
-            ',' if !quoted => {
-                out.push(finish_array_element(&current, was_quoted));
-                current.clear();
-                was_quoted = false;
-            }
-            _ => current.push(c),
-        }
-    }
-    if quoted {
-        return None;
-    }
-    out.push(finish_array_element(&current, was_quoted));
-
-    Some(out)
-}
-
-fn finish_array_element(raw: &str, was_quoted: bool) -> Option<String> {
-    // Only an *unquoted* NULL is the null element; `"NULL"` is the four-letter
-    // string, exactly as Postgres reads it.
-    if !was_quoted && raw.trim().eq_ignore_ascii_case("NULL") {
-        return None;
-    }
-    Some(if was_quoted {
-        raw.to_string()
-    } else {
-        raw.trim().to_string()
-    })
-}
-
 /// `a || b` over two stored arrays, PostgreSQL's `array_cat` for one
 /// dimension: the elements of `a`, then those of `b`. An empty side gives
 /// the other. Elements of one type are spliced as they are stored; integer

@@ -58,8 +58,8 @@ use crate::simds::cpu::{self, SimdLevel};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// For A/B measurement and tests: off sends every row through the generic
-/// encoder.
+/// For tests: off sends every row through the generic encoder.
+#[cfg(test)]
 pub(crate) fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
 }

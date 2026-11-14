@@ -2566,7 +2566,7 @@ impl<S: StorageIO> VacuumService<S> {
         if self
             .stats
             .inject_panics
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .is_ok()
         {
             panic!("injected vacuum panic");

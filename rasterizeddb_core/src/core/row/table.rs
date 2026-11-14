@@ -1350,6 +1350,8 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// Writes a new table's schema and its fields to `io_schema`.
+    #[cfg(test)]
+    #[cfg(test)]
     pub(crate) async fn create_schema_files(
         io_schema: Arc<S>,
         name: &str,
@@ -2122,6 +2124,7 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// See [`TableData::reserve_insert_id`].
+    #[cfg(test)]
     pub(crate) async fn reserve_insert_id(&self) -> Result<IdsInFlight<'_>> {
         Ok(self.data()?.ids.reserve_insert_id().await)
     }

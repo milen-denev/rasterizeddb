@@ -909,7 +909,6 @@ fn hash_step<'r, K: std::hash::Hash + Eq>(
     left_key: impl Fn(RowRef<'r>) -> Option<K>,
     right_key: impl Fn(RowRef<'r>) -> Option<K>,
 ) -> Result<Vec<u32>, String> {
-    use std::hash::BuildHasher;
     let right = &scanned[idx];
     let state = ahash::RandomState::new();
 
@@ -2132,7 +2131,6 @@ pub fn project_serialized(plan: &JoinPlan, combined: &Joined<'_>, out: &mut Vec<
     // `{"a":1.0}` there are the same row, so with one in the select list each
     // row is keyed by `value_key` instead, built once per row.
     if plan.distinct {
-        use std::hash::BuildHasher;
         let state = ahash::RandomState::new();
         let document = |position: usize| {
             plan.items
@@ -2580,7 +2578,7 @@ enum AntiJoin {
     Unmatched,
     /// Anything else — refused, because evaluating it before the join gives a
     /// different answer and there is no evaluator over combined rows.
-    NotApplicable(String),
+    NotApplicable,
 }
 
 /// Classifies a conjunct that references only relation `rel`, which sits on the
@@ -2588,19 +2586,16 @@ enum AntiJoin {
 fn anti_join_column(
     conjunct: &str,
     rel: usize,
-    relations: &[RelationRef],
     schemas: &[SmallVec<[SchemaField; 20]>],
     join: Option<&JoinedRelation>,
 ) -> AntiJoin {
     let trimmed = conjunct.trim();
     let upper = trimmed.to_ascii_uppercase();
     let Some(head) = upper.strip_suffix("IS NULL") else {
-        return AntiJoin::NotApplicable(format!(
-            "WHERE term '{}' filters '{}', which is the null-supplying side of an outer join. Only \
-             '<column> IS NULL' is supported there; anything else would be applied before the \
-             join and change which rows count as unmatched",
-            trimmed, relations[rel].label
-        ));
+        // Only `<column> IS NULL` reads "found no match" on the
+        // null-supplying side; anything else applied before the join would
+        // change which rows count as unmatched.
+        return AntiJoin::NotApplicable;
     };
     let column_text = trimmed[..head.trim_end().len()].trim();
     let (_, column) = split_qualified(column_text);
@@ -2623,11 +2618,9 @@ fn anti_join_column(
     // nullable column would make `IS NULL` true for a row that *did* match,
     // which is not the same question.
     match crate::core::rql::nullable::flag_field(&column, &schemas[rel]) {
-        Some(_) => AntiJoin::NotApplicable(format!(
-            "WHERE term '{}' tests a nullable column on the null-supplying side of an outer join, where \
-             IS NULL cannot distinguish 'no matching row' from 'matched with a NULL value'",
-            trimmed
-        )),
+        // A nullable column: IS NULL cannot tell "no matching row" from
+        // "matched with a NULL value".
+        Some(_) => AntiJoin::NotApplicable,
         None => AntiJoin::Unmatched,
     }
 }
@@ -3671,7 +3664,6 @@ pub fn plan(
                     match anti_join_column(
                         &conjunct,
                         rel,
-                        &relations,
                         &schemas,
                         joins[rel].as_ref(),
                     ) {
@@ -3683,7 +3675,7 @@ pub fn plan(
                         // unmatched row's NULLs make it unknown. It was refused
                         // ("only '<column> IS NULL' is supported there"), and
                         // `LEFT JOIN … WHERE b.n > 0` is an ordinary query.
-                        AntiJoin::NotApplicable(_) => cross_relation.push(qualify_bare(&conjunct, &relations, &schemas)),
+                        AntiJoin::NotApplicable => cross_relation.push(qualify_bare(&conjunct, &relations, &schemas)),
                     }
                 } else {
                     predicates[rel].push(conjunct);
