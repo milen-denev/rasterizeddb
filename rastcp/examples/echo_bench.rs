@@ -79,6 +79,9 @@ fn server(port: u16, threads: usize) {
     runtime(threads).block_on(async move {
         let server = TcpServerBuilder::new("127.0.0.1", port)
             .max_connections(4096)
+            // An echo never waits, which is the case inline handlers are for.
+            // RASTCP_BENCH_INLINE=0 measures the default instead.
+            .inline_handlers(std::env::var("RASTCP_BENCH_INLINE").as_deref() != Ok("0"))
             .build()
             .await
             .expect("server");
@@ -118,6 +121,9 @@ fn server_per_core(port: u16, threads: usize) {
                 let server = TcpServerBuilder::from_listener(listener)
                     .expect("listener")
                     .max_connections(4096)
+                    // An echo never waits, which is the case inline handlers are for.
+                    // RASTCP_BENCH_INLINE=0 measures the default instead.
+                    .inline_handlers(std::env::var("RASTCP_BENCH_INLINE").as_deref() != Ok("0"))
                     .build()
                     .await
                     .expect("server");

@@ -123,6 +123,7 @@ pub struct TcpServerBuilder {
     request_timeout: Duration,
     max_message_size: usize,
     max_in_flight: usize,
+    inline_handlers: bool,
     shutdown_grace: Duration,
     client_auth: ClientAuth,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -151,6 +152,7 @@ pub struct TcpServer {
     request_timeout: Duration,
     max_message_size: usize,
     max_in_flight: usize,
+    inline_handlers: bool,
     shutdown_grace: Duration,
     auth_timeout: Duration,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -173,6 +175,7 @@ impl TcpServerBuilder {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            inline_handlers: false,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             client_auth: ClientAuth::None,
             authenticator: None,
@@ -339,6 +342,30 @@ impl TcpServerBuilder {
         self
     }
 
+    /// Whether a multiplexed connection starts each handler on its own task
+    /// before handing it to the runtime. Off by default.
+    ///
+    /// Off, every request of a multiplexed connection is given to the runtime
+    /// as it arrives, so its requests run on every core at once. That is what
+    /// a handler that does real work needs: the connection only moves bytes.
+    ///
+    /// On, the connection polls each handler once itself, and only one that
+    /// has to wait is given to the runtime. A handler that answers without
+    /// waiting then costs no task and no allocation — worth having when
+    /// handlers are that cheap, as a cache lookup is: an echo is served at a
+    /// third of the cost. It is the wrong choice for anything that computes
+    /// before it first waits, because that computing is then done by the
+    /// connection, one request after another, while the rest of the machine
+    /// idles. Measured with the database's point query, 16 callers on one
+    /// connection ran at a third of the rate with this on.
+    ///
+    /// A plain (`rastcp/1`) connection runs its handlers itself whatever
+    /// this is: its requests are answered in order, one at a time.
+    pub fn inline_handlers(mut self, inline: bool) -> Self {
+        self.inline_handlers = inline;
+        self
+    }
+
     /// How long a shutdown waits for in-flight connections before closing them
     /// anyway. Past this point a stuck handler would keep the process alive.
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
@@ -452,6 +479,7 @@ impl TcpServerBuilder {
             request_timeout: self.request_timeout,
             max_message_size: self.max_message_size,
             max_in_flight: self.max_in_flight,
+            inline_handlers: self.inline_handlers,
             shutdown_grace: self.shutdown_grace,
             auth_timeout: self.auth_timeout,
             authenticator: self.authenticator,
@@ -742,6 +770,7 @@ impl TcpServer {
         let request_timeout = self.request_timeout;
         let max_message_size = self.max_message_size;
         let max_in_flight = self.max_in_flight;
+        let inline_handlers = self.inline_handlers;
         let authenticator = self.authenticator.clone();
 
         self.accept_loop(move |stream, connection_shutdown| {
@@ -758,6 +787,7 @@ impl TcpServer {
                     request_timeout,
                     max_message_size,
                     max_in_flight,
+                    inline_handlers,
                     authenticator,
                     connection_shutdown,
                     handler,
@@ -1087,13 +1117,16 @@ impl TcpServer {
     /// The request loop of a multiplexed (`rastcp/2`) connection.
     ///
     /// Every frame carries an id the client chose and the reply carries it
-    /// back, so nothing here has to happen in order. A handler that finishes
-    /// the first time it is polled is answered on the spot, as on a plain
-    /// connection. One that has to wait is moved to a task of its own, and the
-    /// connection goes on reading: its reply is written when it is ready,
-    /// whatever else was answered in between. That is what lets one connection
-    /// carry many callers, and lets their requests run on every core instead
-    /// of queueing behind each other.
+    /// back, so nothing here has to happen in order. Each request is handed to
+    /// the runtime as a task of its own and the connection goes on reading;
+    /// a reply is written when it is ready, whatever else was answered in
+    /// between. That is what lets one connection carry many callers, and lets
+    /// their requests run on every core instead of queueing behind each other.
+    ///
+    /// With `inline_handlers` the connection polls each handler once first
+    /// and answers on the spot if that finished it; see
+    /// [`TcpServerBuilder::inline_handlers`] for when that is and is not a
+    /// good idea.
     #[allow(clippy::too_many_arguments)]
     async fn serve_multiplexed<H, Fut>(
         tls_stream: &mut ServerTls,
@@ -1104,8 +1137,9 @@ impl TcpServer {
         max_message_size: usize,
         request_timeout: Duration,
         max_in_flight: usize,
+        inline_handlers: bool,
     ) where
-        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync,
+        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         let mut reader = FrameReader::tagged();
@@ -1115,9 +1149,10 @@ impl TcpServer {
         // task cannot say so itself: it panicked.
         let mut ids: std::collections::HashMap<tokio::task::Id, u32> =
             std::collections::HashMap::new();
-        // Where a handler is polled for the first time. Most finish there and
-        // the cell is used again, so a request that never waits costs no
-        // allocation; one that does takes the cell with it to its task.
+        // Where, with `inline_handlers`, a handler is polled for the first
+        // time. One that finishes there leaves the cell to be used again, so
+        // it costs no allocation; one that does not takes the cell with it to
+        // its task.
         let mut cell: std::pin::Pin<Box<Option<Fut>>> = Box::pin(None);
         // Set once the server is stopping: no more requests are read, the
         // ones being handled are answered, and then the connection closes.
@@ -1176,6 +1211,23 @@ impl TcpServer {
                         }
                         warn!("{} sent a frame of kind {} as a request", peer_addr, tag.kind);
                         break 'connection;
+                    }
+                    Event::Frame(Ok((tag, data))) if !inline_handlers => {
+                        debug!("Received {} bytes from {}", data.len(), peer_addr);
+
+                        let handler = handler.clone();
+                        let principal = principal.clone();
+                        let id = tag.id;
+                        let task = in_flight.spawn(async move {
+                            // Made here, in the task, and boxed: a handler's
+                            // future can run to tens of kilobytes, and built
+                            // on the connection it would be copied on its way
+                            // into the task.
+                            let call = Box::pin(handler(principal, data));
+                            (id, tokio::time::timeout(request_timeout, call).await.ok())
+                        });
+                        ids.insert(task.id(), id);
+                        Ok(())
                     }
                     Event::Frame(Ok((tag, data))) => {
                         debug!("Received {} bytes from {}", data.len(), peer_addr);
@@ -1296,12 +1348,13 @@ impl TcpServer {
         request_timeout: Duration,
         max_message_size: usize,
         max_in_flight: usize,
+        inline_handlers: bool,
         authenticator: Option<Arc<dyn ServerAuthenticator>>,
         shutdown: StopListener,
         handler: H,
     ) -> Result<(), RastcpError>
     where
-        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync,
+        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         // Disable Nagle's algorithm on the accepted connection. Linux does
@@ -1376,6 +1429,7 @@ impl TcpServer {
                 max_message_size,
                 request_timeout,
                 max_in_flight,
+                inline_handlers,
             )
             .await;
         } else {

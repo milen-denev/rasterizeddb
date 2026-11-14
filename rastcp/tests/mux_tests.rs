@@ -559,12 +559,14 @@ async fn plain_and_multiplexed_clients_are_served_side_by_side() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_handler_that_panics_at_once_does_not_keep_its_connection_slot() {
     bounded(async {
-        // A panic before the handler's first wait unwinds the task serving
-        // the connection, on either protocol. The connection is lost; the
-        // count of open connections must not go on including it, or enough
-        // such panics leave the server refusing everyone.
+        // Wherever the connection runs a handler itself — always on a plain
+        // connection, and on a multiplexed one with inline handlers — a panic
+        // before the handler's first wait unwinds the task serving the
+        // connection. The connection is lost; the count of open connections
+        // must not go on including it, or enough such panics leave the server
+        // refusing everyone.
         let running = serve_with(
-            |builder| builder,
+            |builder| builder.inline_handlers(true),
             |data: Vec<u8>| async move {
                 if data.first() == Some(&PANIC) {
                     panic!("the handler was asked to panic");
@@ -599,6 +601,124 @@ async fn a_handler_that_panics_at_once_does_not_keep_its_connection_slot() {
 
         // And the server is still serving.
         assert!(multiplexed.send(&request(ECHO, 3, 8)).await.is_ok());
+
+        running.task.abort();
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handlers_that_compute_before_they_wait_run_side_by_side() {
+    bounded(async {
+        // A handler that works for a while without ever waiting, as a query
+        // that is all parsing and planning does. On one connection these must
+        // still overlap: if the connection ran each one itself they would
+        // queue behind each other while three of the four workers sat idle.
+        let running_now = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let (now, peak) = (running_now.clone(), most.clone());
+
+        let running = serve_with(
+            |builder| builder,
+            move |data: Vec<u8>| {
+                let (now, peak) = (now.clone(), peak.clone());
+                async move {
+                    let current = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    // Occupies its worker; this is the point of the test.
+                    std::thread::sleep(Duration::from_millis(60));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    data
+                }
+            },
+        )
+        .await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+        client.connect().await.unwrap();
+
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for seed in 0..8usize {
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                let request = request(ECHO, seed, 24);
+                assert!(client.send(&request).await.unwrap() == request);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let took = started.elapsed();
+
+        assert_eq!(running.server.active_connections(), 1);
+        let peak = most.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "eight requests on one connection never overlapped"
+        );
+        // One after another they take 480 ms.
+        assert!(
+            took < Duration::from_millis(400),
+            "eight requests took {took:?}"
+        );
+
+        running.task.abort();
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inline_handlers_serve_the_same_requests_the_same_way() {
+    bounded(async {
+        // The other way of running handlers: polled once by the connection,
+        // and handed on only if they have to wait. Fast and slow requests,
+        // a timed-out handler and a panicking one all take different paths
+        // through it than through the default.
+        let running = serve_with(
+            |builder| builder.inline_handlers(true).request_timeout(SLOW_FOR * 3),
+            respond,
+        )
+        .await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+
+        let slow_client = client.clone();
+        let slow = tokio::spawn(async move {
+            let request = request(SLOW, 1, 32);
+            slow_client
+                .send(&request)
+                .await
+                .map(|response| response == request)
+        });
+
+        let mut tasks = Vec::new();
+        for task in 0..16usize {
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                for round in 0..100usize {
+                    let seed = task * 1000 + round;
+                    let len = [0, 5, 900, 16 * 1024 + 1, 40_000][seed % 5];
+                    let request = request(ECHO, seed, len);
+                    let response = client.send(&request).await.unwrap();
+                    assert!(
+                        response == request,
+                        "task {task} round {round} got another's response"
+                    );
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert!(matches!(slow.await.unwrap(), Ok(true)));
+
+        let outcome = client.send(&request(PANIC, 1, 16)).await;
+        assert!(
+            matches!(outcome, Err(RastcpError::ProtocolError(_))),
+            "got {outcome:?}"
+        );
+        assert!(client.send(&request(ECHO, 7, 16)).await.is_ok());
+        assert_eq!(running.server.active_connections(), 1);
 
         running.task.abort();
     })
