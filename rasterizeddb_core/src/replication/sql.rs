@@ -1214,6 +1214,21 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         load(&stats.ack_timeouts),
         "synchronous commits that gave up waiting for a peer",
     );
+    push(
+        "push_round_trip_us",
+        load(&stats.push_round_trip_us),
+        "total time this node's batches took to be acknowledged: the wire both ways plus the peer's apply",
+    );
+    push(
+        "batches_applied",
+        load(&stats.batches_applied),
+        "batches applied here for a peer",
+    );
+    push(
+        "apply_us",
+        load(&stats.apply_us),
+        "total time those took to apply; against the sender's push_round_trip_us it says how much of a round trip is apply",
+    );
 
     push(
         "released_seq",

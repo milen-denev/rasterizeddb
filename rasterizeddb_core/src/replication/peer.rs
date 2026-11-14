@@ -947,12 +947,17 @@ async fn push(
         Some(wire as f64 / raw.max(1) as f64)
     });
 
+    let sent_at = std::time::Instant::now();
     let response = link
         .client
         .send_borrowed(frame)
         .await
         .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
     link.last_exchange = std::time::Instant::now();
+    replication.stats().push_round_trip_us.fetch_add(
+        link.last_exchange.duration_since(sent_at).as_micros() as u64,
+        Ordering::Relaxed,
+    );
 
     let stats = replication.stats();
     stats.bytes_raw.fetch_add(raw, Ordering::Relaxed);

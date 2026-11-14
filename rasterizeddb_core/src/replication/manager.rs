@@ -99,6 +99,24 @@ pub struct Stats {
     /// Applies retried after a lock failure (40P01, 55P03, 57014, 57P01):
     /// aborted, released and run again rather than skipped (finding L2).
     pub apply_retries: AtomicU64,
+    /// Microseconds this node's senders have spent between handing a batch
+    /// to the transport and having its acknowledgement: the wire both ways
+    /// and everything the peer did with the batch in between.
+    pub push_round_trip_us: AtomicU64,
+    /// Batches applied here on behalf of a peer, and the microseconds that
+    /// took. Set against the sender's round trips, this says how much of a
+    /// round trip is the apply and how much is everything else — which is
+    /// what decides whether a lagging peer is short of network or of apply.
+    ///
+    /// Measured with these on a pair of real nodes (`SHOW REPLICATION STATS`
+    /// before and after 15 s of writers, 2026-11-14): with 16 writers the
+    /// apply was 20.4 ms of a 20.9 ms round trip, 98%, the sender was inside
+    /// a round trip 96% of the time, and the peer needed 7 s more to catch
+    /// up. So what a loaded link waits for is the peer applying, one batch
+    /// after another; sending the next batch before the last is acknowledged
+    /// would win back the other 2%.
+    pub batches_applied: AtomicU64,
+    pub apply_us: AtomicU64,
 }
 
 impl Stats {

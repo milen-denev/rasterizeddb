@@ -1380,3 +1380,58 @@ async fn a_greeted_node_cannot_speak_as_another() {
 
     assert_eq!(one.replication.applied().high_water(8), 0);
 }
+
+/// The counters that say where a link's time goes are kept, and agree with
+/// each other: a batch is applied inside the round trip that carried it, so
+/// the receiver cannot have spent longer applying than the sender spent
+/// waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_round_trip_and_apply_counters_account_for_the_same_batches() {
+    use std::sync::atomic::Ordering;
+
+    let (one, two) = pair().await;
+    run_ok(&one, "CREATE TABLE repl_timed (id INTEGER, name VARCHAR)").await;
+    for id in 0..20 {
+        run_ok(&one, &format!("INSERT INTO repl_timed (id, name) VALUES ({id}, 'row')")).await;
+    }
+    settled(&one, &two).await;
+
+    let sent = one.replication.stats();
+    let received = two.replication.stats();
+
+    let batches_sent = sent.batches_sent.load(Ordering::Relaxed);
+    let batches_applied = received.batches_applied.load(Ordering::Relaxed);
+    let round_trips = sent.push_round_trip_us.load(Ordering::Relaxed);
+    let applying = received.apply_us.load(Ordering::Relaxed);
+
+    assert!(batches_sent > 0, "nothing was sent");
+    assert_eq!(batches_applied, batches_sent, "a batch was sent and not counted as applied, or the reverse");
+    assert!(round_trips > 0, "the sender's round trips took no time at all");
+    assert!(applying > 0, "the applies took no time at all");
+    assert!(
+        applying <= round_trips,
+        "the peer spent {applying} us applying batches whose round trips took {round_trips} us"
+    );
+
+    // Nothing was sent the other way, and nothing is counted that way.
+    assert_eq!(two.replication.stats().push_round_trip_us.load(Ordering::Relaxed), 0);
+    assert_eq!(one.replication.stats().batches_applied.load(Ordering::Relaxed), 0);
+
+    // And they are where an operator looks for them, saying the same.
+    let shown = super::sql::execute_structured("SHOW REPLICATION STATS", &one)
+        .expect("the structured form");
+    let shown = crate::core::row::row::vec_into_rows(&shown[1..]).expect("rows");
+    let metric = |name: &str| {
+        shown.iter().find_map(|row| {
+            let text = |index: usize| {
+                String::from_utf8_lossy(row.columns[index].data.into_slice())
+                    .trim_end_matches('\0')
+                    .to_string()
+            };
+            (text(0) == name).then(|| text(1))
+        })
+    };
+    assert_eq!(metric("push_round_trip_us"), Some(round_trips.to_string()));
+    assert_eq!(metric("batches_applied"), Some("0".to_string()));
+    assert_eq!(metric("apply_us"), Some("0".to_string()));
+}

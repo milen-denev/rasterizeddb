@@ -434,6 +434,7 @@ async fn handle_push(
     // The task runs the batch to its end whatever becomes of the request; a
     // sender that gave up and sent it again waits its turn and is told the
     // records are already held.
+    let began = std::time::Instant::now();
     let task = {
         let database = database.clone();
         let replication = replication.clone();
@@ -443,6 +444,11 @@ async fn handle_push(
         Ok(outcomes) => outcomes,
         Err(e) => return protocol::error_frame(&format!("the apply did not finish: {}", e)),
     };
+    let stats = replication.stats();
+    stats.batches_applied.fetch_add(1, Ordering::Relaxed);
+    stats
+        .apply_us
+        .fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     let ack = PushAck {
         node_id: replication.node_id(),

@@ -534,6 +534,16 @@ comes up as should always be what its command line says.
 under a live cluster makes its stream ambiguous. The token is never echoed by
 `SHOW`; it reports `(set)` or `(unset)`.
 
+**Where a lagging peer's time goes.** `SHOW REPLICATION STATS` carries three
+counters for this. On the sending node, `push_round_trip_us` is the total time
+its batches took to be acknowledged: the wire both ways and everything the peer
+did in between. On the receiving node, `batches_applied` and `apply_us` are how
+many batches it applied and how long that took. Read both nodes before and
+after a spell of load: if the receiver's `apply_us` is nearly all of the
+sender's `push_round_trip_us`, the peer is short of apply, and no amount of
+network will help it; if it is a small part, look at the link. On two nodes on
+one machine, 16 writers gave an apply of 20.4 ms in a round trip of 20.9 ms.
+
 **A quiet link is kept alive.** A node's link to a peer carries transactions
 when there are some; when it has carried nothing for `keepalive_ms` (10 seconds
 by default) — because there is nothing to send, or because the peer is refusing
