@@ -7,10 +7,10 @@ description = "Exhaustive black-box test suite for the RasterizedDB bit-level fi
 
 [dependencies]
 rasterizeddb_core = { path = "../rasterizeddb_core" }
-smallvec = { version = "1.15", features = ["union", "write"] }
-rclite = "0.4.1"
+smallvec = { version = "1.16", features = ["union", "write"] }
+rclite = "0.4.2"
 tokio = { version = "1", features = ["full"] }
-fastrand = "2.3"
+fastrand = "2.5"
 tempfile = "3"
 
 [dev-dependencies]

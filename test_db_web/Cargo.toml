@@ -7,7 +7,7 @@ edition = "2024"
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 rasterizeddb_core = { path = "../rasterizeddb_core" }
-tower = "0.5.2"
-once_cell = "1.21.3"
+tower = "0.5.3"
+once_cell = "1.21.4"
 async-lazy = { version = "0.1.2", features = ["parking_lot"] }
 rand = "0.10"

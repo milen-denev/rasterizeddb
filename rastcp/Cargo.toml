@@ -4,15 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.47", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 rustls = { version = "0.23" }
 tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
 thiserror = "2.0"
 log = "0.4"
 env_logger = "0.11"
-futures-util = "0.3"
-bytes = "1.10"
+bytes = "1.12"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = "0.3"
 socket2 = "0.6"
@@ -20,7 +19,6 @@ webpki-roots = { version = "1.0" }
 cacheguard = "0.1.0"
 xutex = "0.2.1"
 opool = "0.2.0"
-branches = "0.4.4"
 once_cell = "1.21"
 libc = "0.2"
 sha2 = "0.11"
@@ -34,7 +32,7 @@ default = []
 tls-keylog = []
 
 [dev-dependencies]
-serde_json = "1.0.143"
-bincode = { version = "2", features = ["serde"] }
-serde = { version = "1.0.219", features = ["derive"] }
-uuid = "1.18.1"
+serde_json = "1.0.154"
+bincode = { version = "2.0.1", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+uuid = "1.29.2"

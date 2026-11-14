@@ -7,7 +7,7 @@ description = "PostgreSQL feature-compatibility harness for RasterizedDB: sea-or
 
 [dependencies]
 rasterizeddb_core = { path = "../rasterizeddb_core" }
-rclite = "0.4.1"
+rclite = "0.4.2"
 tokio = { version = "1", features = ["full"] }
 
 sea-orm = { version = "2.0", default-features = false, features = [

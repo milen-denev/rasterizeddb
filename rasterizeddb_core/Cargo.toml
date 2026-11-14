@@ -13,30 +13,29 @@ description = "A schemafull, high-performance database written in Rust, designed
 # (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
 # copy, so the server answers with the zones its host knows, as PostgreSQL
 # built --with-system-tzdata does.
-jiff = { version = "0.2.35", default-features = false, features = ["std", "tzdb-zoneinfo"] }
+jiff = { version = "0.2.43", default-features = false, features = ["std", "tzdb-zoneinfo"] }
 tokio = { version = "1", features = ["full"] }
 byteorder = "1.5"
 itertools = "0.15"
 ahash = "0.8"
 # `HashTable<u32>` for the hash-join build side: indices only, keys read back from the rows.
-hashbrown = { version = "0.16", default-features = false }
+hashbrown = { version = "0.16.1", default-features = false }
 # Bulk scanning of SQL text for the next quote/placeholder byte.
 memchr = "2"
 # NUMERIC exp/ln/log/power (`rql::pg_numeric_math`): their working precision
 # runs past an i128 before the result is rounded back into one.
-num-bigint = "0.4"
+num-bigint = "0.4.8"
 num-traits = "0.2"
 # Shortest round-trip float digits for PostgreSQL's float text (`value_codec::pg_float8_text`);
 # already in the tree through serde_json.
 ryu = "1.0.23"
 # POSIX regular expressions (`~`, `~*`, `regexp_like`), for CHECKs `pg_dump` writes.
 regex = "1"
-once_cell = "1.21.3"
-orx-concurrent-vec = "3.10"
+once_cell = "1.21.4"
 stopwatch = "0.0.7"
 futures = "0.3"
 async-lazy = { version = "0.1", features = ["parking_lot"] }
-dashmap = "6.1"
+dashmap = "6.2"
 # Release builds compile `trace!` out entirely, so the hot-path level checks
 # cost nothing. `debug` is kept: `--log-level debug` is the documented way to
 # see statement text on a live node (pgwire's `Statement:` line). Production
@@ -55,18 +54,18 @@ temp_testdir = "0.2"
 memmap2 = "0.9"
 rand = "0.10"
 memory-stats = "1.2"
-smallvec = { version = "1.15", features = ["union", "write"]}
-arc-swap = "1.8"
-fastrand = "2.3"
-parking_lot = "0.12"
+smallvec = { version = "1.16", features = ["union", "write"]}
+arc-swap = "1.9"
+fastrand = "2.5"
+parking_lot = "0.12.5"
 libc = "0.2"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 kanal = "0.1"
-rclite = "0.4.1"
+rclite = "0.4.2"
 opool = "0.2.0"
 cacheguard = "0.1.0"
 xutex = "0.2.1"
-branches = "0.4.4"
+branches = "0.4.6"
 
 # pgwire TLS
 rustls = "0.23"
@@ -90,7 +89,7 @@ serde_json = "1"
 # zstd carries the whole snapshot and every archived log segment. It is the
 # only new code pulled in: the S3 client is built on rustls/tokio-rustls/sha2/
 # hmac/base64, which the pgwire listener already required.
-zstd = { version = "0.13", optional = true, features = ["zstdmt"] }
+zstd = { version = "0.13.3", optional = true, features = ["zstdmt"] }
 # Root certificates for the *client* side of TLS. `rustls` ships none, and
 # rustls-native-certs would add a platform dependency for a store the server
 # has no other use for.
@@ -100,7 +99,7 @@ webpki-roots = { version = "1", optional = true }
 criterion = { version = "0.8" }
 tempfile = "3"
 # The write gate's source test parses `src/` (core/index_store/gate_source_tests.rs).
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "2.0.119", features = ["full", "visit"] }
 proc-macro2 = "1"
 quote = "1"
 
