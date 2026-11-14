@@ -88,6 +88,10 @@ pub(crate) mod test_hooks {
         /// a device error would, without poisoning the shared log: the error
         /// paths of every committer that syncs those logs before committing.
         pub static FAIL_POOL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Fails the next copy of staged outcomes into the status file on
+        /// this thread, after the log holding them has synced: the one half
+        /// of a commit sync that can fail with the commit already durable.
+        pub static FAIL_STAGED_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Fails the next deletion of the rename intent on this thread.
         pub static FAIL_INTENT_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -1977,9 +1981,19 @@ impl Database {
         self.apply_staged_outcomes()
     }
 
-    fn apply_staged_outcomes(&self) -> std::io::Result<()> {
+    /// Copies the outcomes the log has made durable into the status file.
+    ///
+    /// A failure here is not a failure of durability: the log already holds
+    /// these outcomes, a restart's replay would put them in the file, and the
+    /// ranges stay staged for the next call. It is reported so a caller can
+    /// say the disk is unwell, not so it can conclude the commit was lost.
+    pub(crate) fn apply_staged_outcomes(&self) -> std::io::Result<()> {
         if self.location.is_none() {
             return Ok(()); // in-memory: no status file
+        }
+        #[cfg(test)]
+        if test_hooks::FAIL_STAGED_COPY.with(|f| f.replace(false)) {
+            return Err(io::Error::other("injected failure to copy staged outcomes"));
         }
         // Outcome bytes that `flush_deferred` staged may be copied into the
         // status file now, and not before: the log record justifying them is
@@ -2574,7 +2588,7 @@ impl Database {
     }
 
     /// Makes the database's own log durable: the catalogue's changes.
-    fn sync_own_log(&self) -> std::io::Result<()> {
+    pub(crate) fn sync_own_log(&self) -> std::io::Result<()> {
         let Some(location) = self.location.as_deref() else {
             return Ok(()); // in-memory: nothing to sync
         };

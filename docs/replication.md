@@ -369,8 +369,9 @@ Per record:
 The records of a batch share **one `fdatasync`**, and nothing is acknowledged
 before it. The origin commits many writers under one sync; a peer paying one
 each could never keep up, and falling behind is where the other failures
-start. If the sync fails, every record waiting on it is taken back, positions
-included, and offered again. A schema change is synced on its own.
+start. If the sync fails, nothing of the batch is acknowledged and the
+origin's stream is halted until the node is restarted (§5.2). A schema change
+is synced on its own.
 
 ### 5.1 Conflict policies
 
@@ -428,12 +429,33 @@ already there (the table exists, the column exists, the table is already gone)
 is taken as done. Only for that one record, and only after a restart found it
 in flight: at any other time such a failure is a conflict.
 
-**A sync that fails** under an applied batch is treated as a failed commit
+The mark covers a record made of schema changes only. A transaction block
+that **mixes schema changes with row writes** is tied to its transaction like
+any other record, and a node that stops part-way through applying one can come
+back with the schema change done and the position before it. The origin then
+offers the block again, its `CREATE` or `ALTER` fails as already done, and the
+link reports `stalled` with that error. That is the expected shape of this
+case (22 crash images of 50 in the test for it), and it is a visible stop, not
+a divergence: in no image was the position ahead of the table or its rows, and
+none applied a row twice. The stream stays stopped for as long as the
+half-applied schema change is on the stalled node; giving that node a fresh
+base copy from the origin (§9.5) clears it. Undoing the change there with a
+statement of your own is not the way out, since on a replicating node that
+statement is itself sent to the origin. Keeping schema changes in their own
+statements, outside blocks that also write rows, avoids the case altogether.
+
+**A log sync that fails** under an applied batch is treated as a failed commit
 sync is everywhere else: the write-ahead log refuses further commits until the
 node is restarted, the origin's stream is halted until then, nothing of the
 batch is acknowledged and nothing is undone. The restart's replay decides what
 survived, and the positions, which ride the same log, come back agreeing with
 the rows.
+
+Only the log's sync counts for this. Once it has succeeded the batch is
+durable and is acknowledged, even if copying the transaction outcomes into the
+status file then fails: the log already holds them, the copy is retried at the
+next sync and redone by a restart's replay, and the failure is logged as an
+error for the operator. The stream is not halted over it.
 
 ## 6. Configuration — CLI
 

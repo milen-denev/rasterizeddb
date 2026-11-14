@@ -393,8 +393,9 @@ struct Waiting {
 /// the `fdatasync`: one a batch, not one a record. The origin commits many
 /// writers under one sync, so a peer paying one each could never keep up with
 /// it, and falling behind is what every other failure here starts from.
-/// Nothing is acknowledged before the sync, and if the sync fails every
-/// record waiting on it is taken back, positions included.
+/// Nothing is acknowledged before the sync, and if the sync fails nothing of
+/// the batch is acknowledged at all: the origin's stream is halted and the
+/// position reported goes back to where it stood (see `finish`).
 struct Group {
     origin: NodeId,
     /// The position before the first record waiting.
@@ -423,13 +424,26 @@ impl Group {
             return;
         }
         let waiting = std::mem::take(&mut self.waiting);
-        let synced = database.sync_own_location();
+        // The two halves of `Database::sync_own_location`, told apart,
+        // because only the first decides whether the batch is durable.
+        let synced = database.sync_own_log();
+        if synced.is_ok() {
+            // The log holds the rows, their outcomes and the intents, so the
+            // batch is durable and is acknowledged as such. What can still
+            // fail is the copy of those outcomes into the status file, which
+            // the log already covers: the ranges stay staged and the next
+            // sync, or a restart's replay, writes them. That is a disk worth
+            // an operator's attention (the callee logs it as an error) and
+            // not a reason to stop a stream whose every byte is safe; the
+            // log writer's own round treats it the same way.
+            let _ = database.apply_staged_outcomes();
+        }
 
         if let Err(e) = synced {
             // Not undone. These transactions committed in memory and may or
             // may not be on disk, and a reader may already have seen them;
             // aborting them here, as this once did, took rows back from under
-            // that reader on the strength of a guess. A failed commit sync is
+            // that reader on the strength of a guess. A failed log sync is
             // the same event wherever it happens: the write-ahead log refuses
             // further commits until the node is restarted, and the restart's
             // replay decides what survived. So this origin's stream is
@@ -1454,6 +1468,78 @@ mod tests {
         let position = database.replication.applied().high_water(2);
         assert_eq!(row_count(&database).await as u64, position, "rows and position agree after the restart");
         assert!(database.replication.apply_halted(2).is_none());
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+
+    /// The log synced and only the copy of the outcomes into the status
+    /// file failed: the batch is durable, so it is acknowledged, the
+    /// position moves and the stream goes on. Nothing here is a reason to
+    /// halt, because the log already covers what the copy would have put
+    /// in the file.
+    #[tokio::test]
+    async fn a_failed_status_copy_after_a_durable_log_does_not_halt() {
+        crate::replication::test_support::init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_copy").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        database.replication.set_active(true);
+        create_table(&database).await;
+        let replication = database.replication.clone();
+
+        crate::core::database::test_hooks::FAIL_STAGED_COPY.with(|f| f.set(true));
+        let outcomes = apply_batch(
+            &database,
+            &replication,
+            vec![
+                record(2, 1, vec!["INSERT INTO repl_t (id, name) VALUES (1, 'ada')"]),
+                record(2, 2, vec!["INSERT INTO repl_t (id, name) VALUES (2, 'grace')"]),
+            ],
+            NO_SENDER,
+        )
+        .await;
+        assert!(
+            !crate::core::database::test_hooks::FAIL_STAGED_COPY.with(|f| f.get()),
+            "the injected failure was never reached"
+        );
+
+        assert!(outcomes.iter().all(|o| o.status == ApplyStatus::Applied), "{outcomes:?}");
+        assert_eq!(replication.applied().high_water(2), 2);
+        assert!(replication.apply_halted(2).is_none());
+
+        // The stream goes on.
+        let next = apply_record(
+            &database,
+            &replication,
+            record(2, 3, vec!["INSERT INTO repl_t (id, name) VALUES (3, 'edsger')"]),
+            NO_SENDER,
+        )
+        .await;
+        assert_eq!(next.status, ApplyStatus::Applied, "{}", next.message);
+
+        // And a restart, which reads the outcomes back from the log, finds
+        // every row and a position that agrees with them.
+        drop(replication);
+        drop(database);
+        crate::core::wal::remove_for(&dir.path().to_string_lossy());
+        let database = Arc::new(Database::new_named(&dir.path().to_string_lossy(), false, "repl_copy").await);
+        database
+            .replication
+            .set_config(ReplicationConfig {
+                node_id: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        database.open_replication_storage().unwrap();
+        assert_eq!(database.replication.applied().high_water(2), 3);
+        assert_eq!(row_count(&database).await, 3);
         drop(database);
         crate::core::wal::remove_for(&dir.path().to_string_lossy());
     }

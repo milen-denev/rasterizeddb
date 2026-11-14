@@ -383,3 +383,129 @@ async fn a_schema_change_cut_anywhere_is_taken_when_it_is_offered_again() {
     assert!(stalls > 0, "no cut left a table ahead of its position: the test shows nothing");
     assert!(problems.is_empty(), "{} problem(s):\n{}", problems.len(), problems.join("\n"));
 }
+
+/// A record that mixes a schema change with row writes, cut anywhere. It is
+/// tied to its transaction like any record of rows, and has no in-flight
+/// mark. What must hold is that a cut never leaves a silent difference: the
+/// position is never ahead of the table or its row, the row is never there
+/// twice, and when the origin offers the stream again each record is either
+/// applied whole or refused where anyone can see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_block_cut_anywhere_is_applied_whole_or_visibly_refused() {
+    let seeds = env_count("RDB_POWER_LOSS_SEEDS", 5, 1024);
+    let base = tempfile::tempdir().unwrap();
+    let rec_dir = base.path().join("rec");
+    let dir = rec_dir.join("db");
+    {
+        let db = open_node(&dir, 2).await.unwrap();
+        exec(&db, "CREATE TABLE t (id BIGINT)").await.unwrap();
+        db.sync_durable().unwrap();
+        db.replication.flush();
+        close(&dir, db);
+    }
+    let db = open_node(&dir, 2).await.unwrap();
+    // No key on the table, so a row applied twice would show as two rows.
+    let mixed = |seq: u64| TxnRecord {
+        origin: 1,
+        seq,
+        commit_hlc: seq * 1000,
+        flags: 0,
+        statements: vec![
+            format!("CREATE TABLE mixed_{seq} (id BIGINT, v BIGINT)"),
+            format!("INSERT INTO mixed_{seq} (id, v) VALUES ({seq}, {seq})"),
+        ],
+        tables: vec![format!("mixed_{seq}")],
+    };
+    async fn rows(db: &Arc<Database>, seq: u64) -> Result<usize, String> {
+        Ok(decode(&exec(db, &format!("SELECT id FROM mixed_{seq} WHERE 1 = 1")).await?)?.len())
+    }
+
+    let rec = Recorder::start(&rec_dir);
+    let sink: StdArc<Mutex<Vec<Result<CrashPoint, String>>>> = StdArc::new(Mutex::new(Vec::new()));
+    let guards = arm_log_syncs(&rec, &rec_dir, &sink, 12);
+    for seq in 1..=2u64 {
+        let outcomes = crate::replication::server::apply_batch(&db, &db.replication, vec![mixed(seq)], 1).await;
+        assert_eq!(outcomes[0].status, crate::replication::protocol::ApplyStatus::Applied, "{outcomes:?}");
+        sink.lock().push(rec.cut_quiescent(format!("after mixed block {seq}")));
+    }
+    let fired = guards.iter().filter(|g| g.fired() > 0).count();
+    drop(guards);
+    close(&dir, db);
+    drop(rec);
+    assert!(fired >= 2, "only {fired} cuts fell inside a log sync");
+
+    let points: Vec<CrashPoint> = sink.lock().drain(..).filter_map(|p| p.map_err(|why| eprintln!("{why}")).ok()).collect();
+    let img_dir = base.path().join("image");
+    let img = img_dir.join("db");
+    let mut problems = Vec::new();
+    let (mut ahead, mut stalls, mut images) = (0usize, 0usize, 0usize);
+    for point in &points {
+        for seed in 0..seeds {
+            point.write_image(seed, &img_dir);
+            let label = format!("{} seed {seed}", point.label);
+            let db = match open_node(&img, 2).await {
+                Ok(db) => db,
+                Err(e) => {
+                    problems.push(format!("{label}: does not open: {e}"));
+                    continue;
+                }
+            };
+            images += 1;
+            let position = db.replication.applied().high_water(1);
+            for seq in 1..=2u64 {
+                let there = db.has_table(&format!("mixed_{seq}"));
+                if there && position < seq {
+                    ahead += 1;
+                }
+                if position >= seq {
+                    if !there {
+                        problems.push(format!("{label}: the position is {position} and mixed_{seq} is not there"));
+                    } else {
+                        match rows(&db, seq).await {
+                            Ok(1) => {}
+                            other => problems.push(format!("{label}: the position is {position} and mixed_{seq} holds {other:?} rows")),
+                        }
+                    }
+                }
+            }
+            // The origin sends its stream again from this node's position.
+            let outcomes = crate::replication::server::apply_batch(&db, &db.replication, vec![mixed(1), mixed(2)], 1).await;
+            let after = db.replication.applied().high_water(1);
+            let mut refused = false;
+            for outcome in &outcomes {
+                if outcome.status.is_settled() {
+                    continue;
+                }
+                refused = true;
+                // A refusal is a stop anyone can see, as long as the
+                // position stays behind it and says so.
+                if after >= outcome.seq {
+                    problems.push(format!(
+                        "{label}: {}:{} came back {} and the position is {after}",
+                        outcome.origin, outcome.seq, outcome.status
+                    ));
+                }
+                if outcome.message.is_empty() {
+                    problems.push(format!("{label}: {}:{} was refused without a reason", outcome.origin, outcome.seq));
+                }
+            }
+            if refused {
+                stalls += 1;
+            }
+            for seq in 1..=after.min(2) {
+                match rows(&db, seq).await {
+                    Ok(1) => {}
+                    other => problems.push(format!("{label}: mixed_{seq} holds {other:?} rows with the position at {after}")),
+                }
+            }
+            if !refused && after != 2 {
+                problems.push(format!("{label}: nothing was refused and the position ends at {after}"));
+            }
+            close(&img, db);
+            let _ = std::fs::remove_dir_all(&img_dir);
+        }
+    }
+    eprintln!("mixed-block cuts: {images} images, {ahead} had the table ahead of its position, {stalls} stalled when the stream was sent again");
+    assert!(images > 0, "no image was examined");
+    assert!(problems.is_empty(), "{} problem(s):\n{}", problems.len(), problems.join("\n"));
+}
