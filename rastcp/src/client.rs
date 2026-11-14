@@ -11,7 +11,8 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
-use crate::ALPN_PROTOCOL;
+use crate::mux::MuxClient;
+use crate::{ALPN_MULTIPLEXED, ALPN_PROTOCOL};
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
 use crate::frame::{FrameReader, FrameWriter};
@@ -21,6 +22,11 @@ use crate::tls::{ClientIdentity, Trust};
 
 /// How long the credential exchange may take, when there is one.
 const DEFAULT_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many requests a multiplexed client keeps in flight unless told
+/// otherwise. Half the server's default, so two such clients sharing a server
+/// connection limit still fit.
+const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 
 // A certificate verifier that accepts any certificate
 #[derive(Debug)]
@@ -83,17 +89,27 @@ pub struct TcpClientBuilder {
     auth_timeout: std::time::Duration,
     allow_tls12: bool,
     max_message_size: usize,
+    max_in_flight: usize,
 }
 
 pub struct TcpClient {
+    dialer: Dialer,
+    connection: Option<Connection>,
+}
+
+/// Everything needed to open an authenticated connection to one server, and
+/// the limits that apply to it once open. What a builder turns into, and what
+/// a client keeps so it can open the connection again.
+pub(crate) struct Dialer {
     addr: String,
     connector: TlsConnector,
     server_name: ServerName<'static>,
-    connection: Option<Connection>,
-    timeout: Option<std::time::Duration>,
+    pub(crate) timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
     auth_timeout: std::time::Duration,
-    max_message_size: usize,
+    pub(crate) max_message_size: usize,
+    /// Only a multiplexed client has more than one request in flight.
+    pub(crate) max_in_flight: usize,
 }
 
 impl TcpClientBuilder {
@@ -109,7 +125,21 @@ impl TcpClientBuilder {
             // See `crate::server::TcpServerBuilder::allow_tls12`.
             allow_tls12: false,
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
         }
+    }
+
+    /// How many requests a multiplexed client keeps in flight at once.
+    /// Default 128; further callers wait their turn.
+    ///
+    /// Keep it at or below the server's own limit
+    /// ([`crate::server::TcpServerBuilder::max_in_flight`], default 256):
+    /// above that the server stops reading until it catches up, and the
+    /// surplus waits in socket buffers instead of here. Has no effect on a
+    /// client built with [`TcpClientBuilder::build`].
+    pub fn max_in_flight(mut self, requests: usize) -> Self {
+        self.max_in_flight = requests.max(1);
+        self
     }
 
     /// The credentials this client presents once the tunnel is up.
@@ -178,6 +208,24 @@ impl TcpClientBuilder {
     }
 
     pub async fn build(self) -> Result<TcpClient, RastcpError> {
+        Ok(TcpClient {
+            dialer: self.dialer(ALPN_PROTOCOL)?,
+            connection: None,
+        })
+    }
+
+    /// Builds a client many tasks can share, speaking the multiplexed
+    /// protocol. See [`MuxClient`].
+    ///
+    /// Must be called, and the client used, inside a Tokio runtime: the
+    /// connection is driven by a task of its own.
+    pub async fn build_multiplexed(self) -> Result<MuxClient, RastcpError> {
+        Ok(MuxClient::new(self.dialer(ALPN_MULTIPLEXED)?))
+    }
+
+    /// The TLS configuration and limits this builder describes, offering
+    /// `alpn` as the protocol to speak.
+    fn dialer(self, alpn: &[u8]) -> Result<Dialer, RastcpError> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // `trust` when given; otherwise the older boolean, which chose between
@@ -237,7 +285,7 @@ impl TcpClientBuilder {
         client_config.enable_early_data = false;
         client_config.resumption = Resumption::in_memory_sessions(128);
         client_config.enable_sni = true;
-        client_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        client_config.alpn_protocols = vec![alpn.to_vec()];
         // Writing session keys to disk is a debugging aid that hands anyone who
         // can read that file the ability to decrypt every recorded session, so
         // it is behind a feature rather than an environment variable alone.
@@ -257,15 +305,15 @@ impl TcpClientBuilder {
         .map_err(|_| RastcpError::CertificateLoading("Invalid server name".into()))?
         .to_owned();
 
-        Ok(TcpClient {
+        Ok(Dialer {
             addr: self.addr,
             connector: TlsConnector::from(Arc::new(config)),
             server_name,
-            connection: None,
             timeout: self.timeout,
             authenticator: self.authenticator,
             auth_timeout: self.auth_timeout,
             max_message_size: self.max_message_size,
+            max_in_flight: self.max_in_flight,
         })
     }
 }
@@ -485,57 +533,50 @@ impl<B: AsRef<[u8]>> Pump<'_, B> {
     }
 }
 
-impl TcpClient {
-    pub async fn new(addr: &str) -> Result<Self, RastcpError> {
-        TcpClientBuilder::new(addr).build().await
-    }
+impl Dialer {
+    /// Opens a connection: TCP, the TLS handshake, then the credential
+    /// exchange if this client was given credentials.
+    pub(crate) async fn open(&self) -> Result<TlsStream<TcpStream>, RastcpError> {
+        let stream = match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, TcpStream::connect(&self.addr))
+                .await
+                .map_err(|_| RastcpError::ConnectionTimeout)??,
+            None => TcpStream::connect(&self.addr).await?,
+        };
 
-    pub async fn connect(&mut self) -> Result<(), RastcpError> {
-        if self.connection.is_none() {
-            let stream = match self.timeout {
-                Some(timeout) => tokio::time::timeout(timeout, TcpStream::connect(&self.addr))
-                    .await
-                    .map_err(|_| RastcpError::ConnectionTimeout)??,
-                None => TcpStream::connect(&self.addr).await?,
-            };
+        // Disable Nagle's algorithm: small request/response RPCs over a
+        // long-lived connection otherwise hit Linux's ~40 ms
+        // delayed-ACK timer between turns.
+        let _ = stream.set_nodelay(true);
 
-            // Disable Nagle's algorithm: small request/response RPCs over a
-            // long-lived connection otherwise hit Linux's ~40 ms
-            // delayed-ACK timer between turns.
-            let _ = stream.set_nodelay(true);
+        info!("Connected to {}", self.addr);
 
-            info!("Connected to {}", self.addr);
-
-            let mut tls_stream = match self.timeout {
-                Some(timeout) => {
-                    tokio::time::timeout(timeout, self.connector.connect(self.server_name.clone(), stream))
-                        .await
-                        .map_err(|_| RastcpError::TlsHandshakeTimeout)??
-                }
-                None => self
-                    .connector
+        let mut tls_stream = match self.timeout {
+            Some(timeout) => tokio::time::timeout(
+                timeout,
+                self.connector.connect(self.server_name.clone(), stream),
+            )
+            .await
+            .map_err(|_| RastcpError::TlsHandshakeTimeout)??,
+            None => {
+                self.connector
                     .connect(self.server_name.clone(), stream)
-                    .await?,
-            };
-            debug!("TLS connection established");
+                    .await?
+            }
+        };
+        debug!("TLS connection established");
 
-            self.authenticate(&mut tls_stream).await?;
+        self.authenticate(&mut tls_stream).await?;
 
-            self.connection = Some(Connection {
-                stream: tls_stream,
-                reader: FrameReader::new(),
-                writer: FrameWriter::new(),
-                deadline: self.timeout.map(Deadline::new),
-            });
-        }
-        Ok(())
+        Ok(tls_stream)
     }
 
     /// Presents credentials, if this client was given any.
     ///
-    /// Deliberately part of `connect` rather than something a caller does
-    /// afterwards: a client that reconnects after a transport error would
-    /// otherwise resume sending requests on a fresh, unauthenticated session.
+    /// Deliberately part of opening a connection rather than something a
+    /// caller does afterwards: a client that reconnects after a transport
+    /// error would otherwise resume sending requests on a fresh,
+    /// unauthenticated session.
     async fn authenticate(
         &self,
         tls_stream: &mut TlsStream<TcpStream>,
@@ -560,6 +601,26 @@ impl TcpClient {
             Err(_) => Err(RastcpError::ConnectionTimeout),
         }
     }
+}
+
+impl TcpClient {
+    pub async fn new(addr: &str) -> Result<Self, RastcpError> {
+        TcpClientBuilder::new(addr).build().await
+    }
+
+    pub async fn connect(&mut self) -> Result<(), RastcpError> {
+        if self.connection.is_none() {
+            let stream = self.dialer.open().await?;
+
+            self.connection = Some(Connection {
+                stream,
+                reader: FrameReader::new(),
+                writer: FrameWriter::new(),
+                deadline: self.dialer.timeout.map(Deadline::new),
+            });
+        }
+        Ok(())
+    }
 
     // Modified send method to use the existing connection
     pub async fn send(&mut self, data: Vec<u8>) -> Result<Vec<u8>, RastcpError> {
@@ -579,7 +640,7 @@ impl TcpClient {
             self.connect().await?;
         }
 
-        let max_message_size = self.max_message_size;
+        let max_message_size = self.dialer.max_message_size;
         let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange(data, max_message_size).await {
@@ -620,7 +681,7 @@ impl TcpClient {
             self.connect().await?;
         }
 
-        let max_message_size = self.max_message_size;
+        let max_message_size = self.dialer.max_message_size;
         let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange_batch(requests, max_message_size).await {

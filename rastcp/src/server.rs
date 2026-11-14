@@ -13,15 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::cert::generate_self_signed_cert;
 use crate::interrupt::{Guard, Interrupted, StopListener, StopSignal};
 use crate::session::{AuthChannel, Principal, ServerAuthenticator};
 use crate::tls::{ClientAuth, Fingerprint};
-use crate::frame::{FrameReader, FrameWriter};
+use crate::frame::{FrameReader, FrameWriter, KIND_DATA, KIND_FAILED, KIND_TIMED_OUT, Tag};
 use crate::error::RastcpError;
-use crate::ALPN_PROTOCOL;
+use crate::{ALPN_MULTIPLEXED, ALPN_PROTOCOL};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 512;
 const HARD_MAX_CONNECTIONS: usize = 4_096;
@@ -32,6 +33,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// is holding.
 const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// How many requests one multiplexed connection may have being handled at
+/// once. Past it the connection is not read until one finishes, so the peer
+/// is slowed by TCP rather than the server by an unbounded number of tasks.
+const DEFAULT_MAX_IN_FLIGHT: usize = 256;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -117,6 +122,7 @@ pub struct TcpServerBuilder {
     handshake_timeout: Duration,
     request_timeout: Duration,
     max_message_size: usize,
+    max_in_flight: usize,
     shutdown_grace: Duration,
     client_auth: ClientAuth,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -143,6 +149,7 @@ pub struct TcpServer {
     handshake_timeout: Duration,
     request_timeout: Duration,
     max_message_size: usize,
+    max_in_flight: usize,
     shutdown_grace: Duration,
     auth_timeout: Duration,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -164,6 +171,7 @@ impl TcpServerBuilder {
             handshake_timeout: Duration::from_secs(10),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             client_auth: ClientAuth::None,
             authenticator: None,
@@ -300,6 +308,18 @@ impl TcpServerBuilder {
         self
     }
 
+    /// How many requests a multiplexed connection may have being handled at
+    /// once. Default 256.
+    ///
+    /// A connection at the limit is not read until a request finishes, so a
+    /// peer that sends faster than its requests are served is held back by
+    /// TCP. A plain (`rastcp/1`) connection handles one request at a time
+    /// whatever this is.
+    pub fn max_in_flight(mut self, requests: usize) -> Self {
+        self.max_in_flight = requests.max(1);
+        self
+    }
+
     /// How long a shutdown waits for in-flight connections before closing them
     /// anyway. Past this point a stuck handler would keep the process alive.
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
@@ -381,7 +401,8 @@ impl TcpServerBuilder {
         // Naming the protocol is what stops a client of *this* server being
         // steered into handing its bytes to some other TLS service that happens
         // to share the certificate, and vice versa.
-        server_config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        // Both versions are offered; a client asks for the one it speaks.
+        server_config.alpn_protocols = vec![ALPN_MULTIPLEXED.to_vec(), ALPN_PROTOCOL.to_vec()];
         server_config.cert_compression_cache = Arc::new(CompressionCache::new(64));
         // Half-RTT data goes out before the client's Finished — and so before a
         // client certificate has been verified. Harmless when nobody is being
@@ -411,6 +432,7 @@ impl TcpServerBuilder {
             handshake_timeout: self.handshake_timeout,
             request_timeout: self.request_timeout,
             max_message_size: self.max_message_size,
+            max_in_flight: self.max_in_flight,
             shutdown_grace: self.shutdown_grace,
             auth_timeout: self.auth_timeout,
             authenticator: self.authenticator,
@@ -653,11 +675,16 @@ impl TcpServer {
 
             let connection = serve(stream, connection_shutdown);
 
+            // Given back when the task ends, however it ends. A handler that
+            // panics unwinds this task, and a count decremented only on the
+            // way out of an orderly return would then include that connection
+            // for ever: enough panics and the server is at capacity with
+            // nobody connected.
+            let open = OpenConnection(conn_counter);
+
             tokio::spawn(async move {
+                let _open = open;
                 connection.await;
-                // Decrement connection counter when done
-                let remaining = conn_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
-                debug!("Connection closed. Active connections: {}", remaining);
             });
         }
 
@@ -680,6 +707,7 @@ impl TcpServer {
         let auth_timeout = self.auth_timeout;
         let request_timeout = self.request_timeout;
         let max_message_size = self.max_message_size;
+        let max_in_flight = self.max_in_flight;
         let authenticator = self.authenticator.clone();
 
         self.accept_loop(move |stream, connection_shutdown| {
@@ -695,6 +723,7 @@ impl TcpServer {
                     auth_timeout,
                     request_timeout,
                     max_message_size,
+                    max_in_flight,
                     authenticator,
                     connection_shutdown,
                     handler,
@@ -815,7 +844,7 @@ impl TcpServer {
     async fn send_replies(
         guard: &mut Guard,
         writer: &mut FrameWriter,
-        tls_stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+        tls_stream: &mut ServerTls,
     ) -> Result<(), RastcpError> {
         if writer.is_empty() {
             return Ok(());
@@ -847,6 +876,383 @@ impl TcpServer {
         }
     }
 
+    /// The request loop of a plain (`rastcp/1`) connection: requests are
+    /// handled one at a time, and answered in the order they arrived.
+    async fn serve_in_order<H, Fut>(
+        tls_stream: &mut ServerTls,
+        guard: &mut Guard,
+        peer_addr: SocketAddr,
+        principal: Arc<Principal>,
+        handler: &H,
+        max_message_size: usize,
+    ) where
+        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync,
+        Fut: Future<Output = Vec<u8>> + Send,
+    {
+        let mut reader = FrameReader::new();
+        let mut writer = FrameWriter::new();
+
+        'connection: loop {
+            // Nothing is owed to the peer at this point, so this is where the
+            // connection may sit idle, and where a shutdown ends it: the peer
+            // gets a close_notify and a clean EOF, instead of a socket that
+            // dies under it and leaves it stuck in CLOSE_WAIT.
+            let mut next = match guard
+                .run(reader.frame(tls_stream, max_message_size), true)
+                .await
+            {
+                Ok(next) => next,
+                Err(Interrupted::Stopping) => {
+                    debug!("Shutting down, closing connection to {}", peer_addr);
+                    break;
+                }
+                Err(Interrupted::TimedOut) => Err(RastcpError::ConnectionTimeout),
+            };
+
+            // Then every request that has already arrived is served before
+            // anything is written back, so a peer that sent several gets them
+            // answered with one write. They are still handled one at a time
+            // and in order: the replies carry nothing to match them to their
+            // requests but their position.
+            let mut served = 0usize;
+
+            loop {
+                let data = match next {
+                    Ok(data) => data,
+                    Err(e) => {
+                        // The requests before this one were served, and their
+                        // replies are still owed.
+                        if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                            debug!("Failed to write response to {}: {}", peer_addr, e);
+                        }
+                        Self::log_read_end(peer_addr, e);
+                        break 'connection;
+                    }
+                };
+
+                debug!("Received {} bytes from {}", data.len(), peer_addr);
+
+                // Not stoppable from here on: a request that was read is
+                // answered, which is what lets a shutdown drain.
+                let mut call = std::pin::pin!(handler(principal.clone(), data));
+
+                let response = match poll_once(call.as_mut()).await {
+                    Some(response) => response,
+                    None => {
+                        // This one has to wait for something. The replies
+                        // already made do not wait with it.
+                        if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                            error!("Failed to write response to {}: {}", peer_addr, e);
+                            break 'connection;
+                        }
+
+                        match guard.run(call, false).await {
+                            Ok(response) => response,
+                            Err(_) => {
+                                error!("Handler timed out for {}", peer_addr);
+                                break 'connection;
+                            }
+                        }
+                    }
+                };
+
+                debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+
+                let queued = match writer.queue(&response) {
+                    Ok(true) if !writer.is_full() => Ok(()),
+                    Ok(true) => Self::send_replies(guard, &mut writer, tls_stream).await,
+                    Ok(false) => guard
+                        .run(writer.send_large(tls_stream, &response), false)
+                        .await
+                        .unwrap_or(Err(RastcpError::ConnectionTimeout)),
+                    Err(e) => Err(e),
+                };
+
+                if let Err(e) = queued {
+                    error!("Failed to write response to {}: {}", peer_addr, e);
+                    break 'connection;
+                }
+
+                // A stopping server finishes what it has read and reads no
+                // more; the wait at the top of the outer loop closes.
+                if guard.is_stopping() {
+                    break;
+                }
+
+                served += 1;
+
+                // Asking the connection for more costs a trip through the TLS
+                // stream and the reactor even when the answer is no, and for a
+                // peer that sends one request and waits it always is no. So
+                // the question is put only to a peer that has shown it sends
+                // ahead: more bytes are already here, or this batch is
+                // already more than one request.
+                if !reader.has_buffered() && served < 2 {
+                    break;
+                }
+
+                match reader.frame_now(tls_stream, max_message_size).await {
+                    Some(frame) => next = frame,
+                    None => break,
+                }
+            }
+
+            if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                error!("Failed to write response to {}: {}", peer_addr, e);
+                break;
+            }
+        }
+    }
+
+    /// Queues a reply on a multiplexed connection, or writes it at once if it
+    /// is too large to be worth copying.
+    async fn reply(
+        guard: &mut Guard,
+        writer: &mut FrameWriter,
+        tls_stream: &mut ServerTls,
+        tag: Tag,
+        payload: &[u8],
+    ) -> Result<(), RastcpError> {
+        if writer.queue_tagged(tag, payload)? {
+            return Ok(());
+        }
+
+        guard
+            .run(writer.send_large_tagged(tls_stream, tag, payload), false)
+            .await
+            .unwrap_or(Err(RastcpError::ConnectionTimeout))
+    }
+
+    /// The next thing a multiplexed connection has to deal with: a handler
+    /// that finished, or — when `reading` — a request that arrived.
+    ///
+    /// Finished handlers first: a reply that is ready is a caller waiting.
+    fn poll_event(
+        reader: &mut FrameReader,
+        tls_stream: &mut ServerTls,
+        in_flight: &mut InFlight,
+        cx: &mut std::task::Context<'_>,
+        reading: bool,
+        max_message_size: usize,
+    ) -> std::task::Poll<Event> {
+        if !in_flight.is_empty() {
+            if let std::task::Poll::Ready(Some(done)) = in_flight.poll_join_next_with_id(cx) {
+                return std::task::Poll::Ready(Event::Done(done));
+            }
+        }
+
+        if reading {
+            if let std::task::Poll::Ready(frame) = reader.poll_tagged(tls_stream, cx, max_message_size) {
+                return std::task::Poll::Ready(Event::Frame(frame));
+            }
+        }
+
+        std::task::Poll::Pending
+    }
+
+    /// The request loop of a multiplexed (`rastcp/2`) connection.
+    ///
+    /// Every frame carries an id the client chose and the reply carries it
+    /// back, so nothing here has to happen in order. A handler that finishes
+    /// the first time it is polled is answered on the spot, as on a plain
+    /// connection. One that has to wait is moved to a task of its own, and the
+    /// connection goes on reading: its reply is written when it is ready,
+    /// whatever else was answered in between. That is what lets one connection
+    /// carry many callers, and lets their requests run on every core instead
+    /// of queueing behind each other.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_multiplexed<H, Fut>(
+        tls_stream: &mut ServerTls,
+        guard: &mut Guard,
+        peer_addr: SocketAddr,
+        principal: Arc<Principal>,
+        handler: &H,
+        max_message_size: usize,
+        request_timeout: Duration,
+        max_in_flight: usize,
+    ) where
+        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        let mut reader = FrameReader::tagged();
+        let mut writer = FrameWriter::new();
+        let mut in_flight: InFlight = JoinSet::new();
+        // Which request each task is handling, for the one case where the
+        // task cannot say so itself: it panicked.
+        let mut ids: std::collections::HashMap<tokio::task::Id, u32> =
+            std::collections::HashMap::new();
+        // Where a handler is polled for the first time. Most finish there and
+        // the cell is used again, so a request that never waits costs no
+        // allocation; one that does takes the cell with it to its task.
+        let mut cell: std::pin::Pin<Box<Option<Fut>>> = Box::pin(None);
+        // Set once the server is stopping: no more requests are read, the
+        // ones being handled are answered, and then the connection closes.
+        let mut draining = false;
+
+        'connection: loop {
+            if draining && in_flight.is_empty() {
+                debug!("Shutting down, closing connection to {}", peer_addr);
+                break;
+            }
+
+            let reading = !draining && in_flight.len() < max_in_flight;
+            let idle = in_flight.is_empty();
+            let wait = std::future::poll_fn(|cx| {
+                Self::poll_event(&mut reader, tls_stream, &mut in_flight, cx, reading, max_message_size)
+            });
+
+            // An idle connection is closed after the timeout, as a plain one
+            // is. A connection with requests in flight is not idle however
+            // long they take; each of them has the timeout to itself.
+            let mut event = if idle {
+                match guard.run(wait, true).await {
+                    Ok(event) => event,
+                    Err(Interrupted::Stopping) => {
+                        draining = true;
+                        continue;
+                    }
+                    Err(Interrupted::TimedOut) => Event::Frame(Err(RastcpError::ConnectionTimeout)),
+                }
+            } else {
+                match guard.run_unbounded(wait, !draining).await {
+                    Some(event) => event,
+                    None => {
+                        draining = true;
+                        continue;
+                    }
+                }
+            };
+
+            // Then everything else that is ready, before anything is written.
+            let mut handled = 0usize;
+
+            loop {
+                let replied = match event {
+                    Event::Frame(Err(e)) => {
+                        // Replies already made are still owed.
+                        if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                            debug!("Failed to write response to {}: {}", peer_addr, e);
+                        }
+                        Self::log_read_end(peer_addr, e);
+                        break 'connection;
+                    }
+                    Event::Frame(Ok((tag, _))) if tag.kind != KIND_DATA => {
+                        if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                            debug!("Failed to write response to {}: {}", peer_addr, e);
+                        }
+                        warn!("{} sent a frame of kind {} as a request", peer_addr, tag.kind);
+                        break 'connection;
+                    }
+                    Event::Frame(Ok((tag, data))) => {
+                        debug!("Received {} bytes from {}", data.len(), peer_addr);
+
+                        cell.set(Some(handler(principal.clone(), data)));
+                        let first = match cell.as_mut().as_pin_mut() {
+                            Some(call) => poll_once(call).await,
+                            None => None,
+                        };
+
+                        match first {
+                            Some(response) => {
+                                cell.set(None);
+                                Self::reply(guard, &mut writer, tls_stream, tag, &response).await
+                            }
+                            None => {
+                                let mut call = std::mem::replace(&mut cell, Box::pin(None));
+                                let id = tag.id;
+                                let task = in_flight.spawn(async move {
+                                    let run = std::future::poll_fn(|cx| match call.as_mut().as_pin_mut() {
+                                        Some(call) => call.poll(cx),
+                                        None => std::task::Poll::Pending,
+                                    });
+                                    (id, tokio::time::timeout(request_timeout, run).await.ok())
+                                });
+                                ids.insert(task.id(), id);
+                                Ok(())
+                            }
+                        }
+                    }
+                    Event::Done(Ok((task, (id, Some(response))))) => {
+                        ids.remove(&task);
+                        debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+                        Self::reply(guard, &mut writer, tls_stream, Tag::data(id), &response).await
+                    }
+                    Event::Done(Ok((task, (id, None)))) => {
+                        ids.remove(&task);
+                        error!("Handler timed out for {}", peer_addr);
+                        Self::reply(guard, &mut writer, tls_stream, Tag { id, kind: KIND_TIMED_OUT }, &[])
+                            .await
+                    }
+                    Event::Done(Err(failure)) => match ids.remove(&failure.id()) {
+                        // The request is answered, so its caller is not left
+                        // waiting, and the connection's other requests are
+                        // not made to pay for this one.
+                        Some(id) => {
+                            error!("Handler failed for {}: {}", peer_addr, failure);
+                            let tag = Tag { id, kind: KIND_FAILED };
+                            Self::reply(guard, &mut writer, tls_stream, tag, b"the handler panicked").await
+                        }
+                        None => Ok(()),
+                    },
+                };
+
+                if let Err(e) = replied {
+                    error!("Failed to write response to {}: {}", peer_addr, e);
+                    break 'connection;
+                }
+
+                handled += 1;
+
+                if writer.is_full() {
+                    if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                        error!("Failed to write response to {}: {}", peer_addr, e);
+                        break 'connection;
+                    }
+                }
+
+                // Handlers that have finished cost nothing to ask about.
+                if let Some(done) = in_flight.try_join_next_with_id() {
+                    event = Event::Done(done);
+                    continue;
+                }
+
+                if guard.is_stopping() {
+                    draining = true;
+                }
+
+                // Asking the connection for more is not free; see the same
+                // test in `serve_in_order`.
+                let reading = !draining && in_flight.len() < max_in_flight;
+                if !reading || (handled < 2 && !reader.has_buffered()) {
+                    break;
+                }
+
+                let more = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(match reader.poll_tagged(tls_stream, cx, max_message_size) {
+                        std::task::Poll::Ready(frame) => Some(frame),
+                        std::task::Poll::Pending => None,
+                    })
+                })
+                .await;
+
+                match more {
+                    Some(frame) => event = Event::Frame(frame),
+                    None => break,
+                }
+            }
+
+            if let Err(e) = Self::send_replies(guard, &mut writer, tls_stream).await {
+                error!("Failed to write response to {}: {}", peer_addr, e);
+                break;
+            }
+        }
+
+        // Handlers still running are left to finish, as the handler of a plain
+        // connection finishes before a lost peer is noticed. Dropping them
+        // here would cancel each wherever it happened to be waiting.
+        in_flight.detach_all();
+    }
+
     /// One accepted socket, from handshake to close.
     async fn serve_connection<H, Fut>(
         stream: TcpStream,
@@ -855,13 +1261,14 @@ impl TcpServer {
         auth_timeout: Duration,
         request_timeout: Duration,
         max_message_size: usize,
+        max_in_flight: usize,
         authenticator: Option<Arc<dyn ServerAuthenticator>>,
         shutdown: StopListener,
         handler: H,
     ) -> Result<(), RastcpError>
     where
         H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync,
-        Fut: Future<Output = Vec<u8>> + Send,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         // Disable Nagle's algorithm on the accepted connection. Linux does
         // NOT inherit TCP_NODELAY from the listener, so without this an
@@ -923,118 +1330,30 @@ impl TcpServer {
         // One stop listener and one timer for the life of the connection, in
         // place of a timer per read, per handler call and per write.
         let mut guard = Guard::new(shutdown, request_timeout);
-        let mut reader = FrameReader::new();
-        let mut writer = FrameWriter::new();
 
-        'connection: loop {
-            // Nothing is owed to the peer at this point, so this is where the
-            // connection may sit idle, and where a shutdown ends it: the peer
-            // gets a close_notify and a clean EOF, instead of a socket that
-            // dies under it and leaves it stuck in CLOSE_WAIT.
-            let mut next = match guard
-                .run(reader.frame(&mut tls_stream, max_message_size), true)
-                .await
-            {
-                Ok(next) => next,
-                Err(Interrupted::Stopping) => {
-                    debug!("Shutting down, closing connection to {}", peer_addr);
-                    break;
-                }
-                Err(Interrupted::TimedOut) => Err(RastcpError::ConnectionTimeout),
-            };
-
-            // Then every request that has already arrived is served before
-            // anything is written back, so a peer that sent several gets them
-            // answered with one write. They are still handled one at a time
-            // and in order: the replies carry nothing to match them to their
-            // requests but their position.
-            let mut served = 0usize;
-
-            loop {
-                let data = match next {
-                    Ok(data) => data,
-                    Err(e) => {
-                        // The requests before this one were served, and their
-                        // replies are still owed.
-                        if let Err(e) = Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await {
-                            debug!("Failed to write response to {}: {}", peer_addr, e);
-                        }
-                        Self::log_read_end(peer_addr, e);
-                        break 'connection;
-                    }
-                };
-
-                debug!("Received {} bytes from {}", data.len(), peer_addr);
-
-                // Not stoppable from here on: a request that was read is
-                // answered, which is what lets a shutdown drain.
-                let mut call = std::pin::pin!(handler(principal.clone(), data));
-
-                let response = match poll_once(call.as_mut()).await {
-                    Some(response) => response,
-                    None => {
-                        // This one has to wait for something. The replies
-                        // already made do not wait with it.
-                        if let Err(e) = Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await {
-                            error!("Failed to write response to {}: {}", peer_addr, e);
-                            break 'connection;
-                        }
-
-                        match guard.run(call, false).await {
-                            Ok(response) => response,
-                            Err(_) => {
-                                error!("Handler timed out for {}", peer_addr);
-                                break 'connection;
-                            }
-                        }
-                    }
-                };
-
-                debug!("Replying with {} bytes to {}", response.len(), peer_addr);
-
-                let queued = match writer.queue(&response) {
-                    Ok(true) if !writer.is_full() => Ok(()),
-                    Ok(true) => Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await,
-                    Ok(false) => guard
-                        .run(writer.send_large(&mut tls_stream, &response), false)
-                        .await
-                        .unwrap_or(Err(RastcpError::ConnectionTimeout)),
-                    Err(e) => Err(e),
-                };
-
-                if let Err(e) = queued {
-                    error!("Failed to write response to {}: {}", peer_addr, e);
-                    break 'connection;
-                }
-
-                // A stopping server finishes what it has read and reads no
-                // more; the wait at the top of the outer loop closes.
-                if guard.is_stopping() {
-                    break;
-                }
-
-                served += 1;
-
-                // Asking the connection for more costs a trip through the TLS
-                // stream and the reactor even when the answer is no, and for a
-                // peer that sends one request and waits it always is no. So
-                // the question is put only to a peer that has shown it sends
-                // ahead: more bytes are already here, or this batch is
-                // already more than one request.
-                if !reader.has_buffered() && served < 2 {
-                    break;
-                }
-
-                match reader.frame_now(&mut tls_stream, max_message_size).await {
-                    Some(frame) => next = frame,
-                    None => break,
-                }
-            }
-
-            if let Err(e) = Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await {
-                error!("Failed to write response to {}: {}", peer_addr, e);
-                break;
-            }
+        // The handshake settled which protocol this connection speaks.
+        if tls_stream.get_ref().1.alpn_protocol() == Some(ALPN_MULTIPLEXED) {
+            Self::serve_multiplexed(
+                &mut tls_stream,
+                &mut guard,
+                peer_addr,
+                principal,
+                &handler,
+                max_message_size,
+                request_timeout,
+                max_in_flight,
+            )
+            .await;
+        } else {
+            Self::serve_in_order(
+                &mut tls_stream,
+                &mut guard,
+                peer_addr,
+                principal,
+                &handler,
+                max_message_size,
+            )
+            .await;
         }
 
         // Explicit shutdown to ensure clean TLS termination
@@ -1045,6 +1364,31 @@ impl TcpServer {
         debug!("Connection handler completed for {}", peer_addr);
         Ok(())
     }
+}
+
+/// One connection's share of the server's connection count.
+struct OpenConnection(Arc<CacheGuard<std::sync::atomic::AtomicUsize>>);
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        let remaining = self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+        debug!("Connection closed. Active connections: {}", remaining);
+    }
+}
+
+/// A server-side TLS connection.
+type ServerTls = tokio_rustls::server::TlsStream<TcpStream>;
+
+/// The handlers of one multiplexed connection that had to wait: each yields
+/// the id of its request and its reply, or `None` if it ran out of time.
+type InFlight = JoinSet<(u32, Option<Vec<u8>>)>;
+
+/// What a multiplexed connection wakes up for.
+enum Event {
+    /// A request, or the reason there will be no more.
+    Frame(Result<(Tag, Vec<u8>), RastcpError>),
+    /// A handler finished, or panicked.
+    Done(Result<(tokio::task::Id, (u32, Option<Vec<u8>>)), tokio::task::JoinError>),
 }
 
 /// Polls `future` once: its output if it had one ready, `None` if it has to

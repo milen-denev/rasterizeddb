@@ -33,6 +33,50 @@ fn read_error(err: std::io::Error) -> RastcpError {
 /// Bytes of length before every frame.
 pub(crate) const PREFIX: usize = 4;
 
+/// Bytes of [`Tag`] between the length and the payload of a multiplexed frame.
+const TAG: usize = 5;
+
+/// A frame that carries a request, or the response to one.
+pub(crate) const KIND_DATA: u8 = 0;
+
+/// A response saying the handler did not finish within the server's timeout.
+pub(crate) const KIND_TIMED_OUT: u8 = 1;
+
+/// A response saying the handler failed without producing a reply. The
+/// payload is a message for a log.
+pub(crate) const KIND_FAILED: u8 = 2;
+
+/// What a multiplexed (`rastcp/2`) frame carries besides its payload.
+///
+/// `id` is chosen by the client and returned unchanged, which is what lets
+/// responses come back in any order. `kind` says what the payload is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Tag {
+    pub(crate) id: u32,
+    pub(crate) kind: u8,
+}
+
+impl Tag {
+    pub(crate) fn data(id: u32) -> Self {
+        Self {
+            id,
+            kind: KIND_DATA,
+        }
+    }
+
+    fn encode(self) -> [u8; TAG] {
+        let id = self.id.to_le_bytes();
+        [id[0], id[1], id[2], id[3], self.kind]
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            kind: bytes[4],
+        }
+    }
+}
+
 /// How much is read ahead. One full TLS record of plaintext, so a record is
 /// taken whole.
 const READ_AHEAD: usize = 16 * 1024;
@@ -48,6 +92,7 @@ const FLUSH_AT: usize = 32 * 1024;
 
 /// A body larger than the read-ahead buffer, part-way in.
 struct Partial {
+    tag: Tag,
     body: Vec<u8>,
     filled: usize,
 }
@@ -62,10 +107,23 @@ pub(crate) struct FrameReader {
     start: usize,
     end: usize,
     partial: Option<Partial>,
+    /// Bytes before each payload: the length, and for a multiplexed stream
+    /// the tag.
+    header: usize,
 }
 
 impl FrameReader {
+    /// A reader of plain (`rastcp/1`) frames.
     pub(crate) fn new() -> Self {
+        Self::with_header(PREFIX)
+    }
+
+    /// A reader of multiplexed (`rastcp/2`) frames.
+    pub(crate) fn tagged() -> Self {
+        Self::with_header(PREFIX + TAG)
+    }
+
+    fn with_header(header: usize) -> Self {
         Self {
             // Initialised once. Reading into initialised memory spares the
             // TLS stream zeroing the whole spare capacity on every read.
@@ -73,6 +131,7 @@ impl FrameReader {
             start: 0,
             end: 0,
             partial: None,
+            header,
         }
     }
 
@@ -95,6 +154,24 @@ impl FrameReader {
     where
         S: AsyncRead + Unpin + ?Sized,
     {
+        self.poll_tagged(stream, cx, max_message_size)
+            .map(|frame| frame.map(|(_, body)| body))
+    }
+
+    /// The next frame and its tag. For a plain reader the tag is all zeroes.
+    ///
+    /// `max_message_size` bounds the payload; the tag is not counted.
+    pub(crate) fn poll_tagged<S>(
+        &mut self,
+        stream: &mut S,
+        cx: &mut Context<'_>,
+        max_message_size: usize,
+    ) -> Poll<Result<(Tag, Vec<u8>), RastcpError>>
+    where
+        S: AsyncRead + Unpin + ?Sized,
+    {
+        let header = self.header;
+
         loop {
             if let Some(partial) = self.partial.as_mut() {
                 while partial.filled < partial.body.len() {
@@ -110,19 +187,24 @@ impl FrameReader {
                     partial.filled += read;
                 }
 
-                let body = self
+                let frame = self
                     .partial
                     .take()
-                    .map(|partial| partial.body)
-                    .unwrap_or_default();
-                return Poll::Ready(Ok(body));
+                    .map(|partial| (partial.tag, partial.body))
+                    .unwrap_or((Tag::data(0), Vec::new()));
+                return Poll::Ready(Ok(frame));
             }
 
             let available = self.end - self.start;
 
-            if available >= PREFIX {
-                let prefix = &self.buf[self.start..self.start + PREFIX];
+            if available >= header {
+                let prefix = &self.buf[self.start..self.start + header];
                 let len = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+                let tag = if header > PREFIX {
+                    Tag::decode(&prefix[PREFIX..])
+                } else {
+                    Tag::data(0)
+                };
 
                 // Checked on the prefix alone, before anything is reserved: a
                 // peer cannot make this side allocate by claiming a length.
@@ -133,8 +215,8 @@ impl FrameReader {
                     }));
                 }
 
-                let buffered = (available - PREFIX).min(len);
-                let from = self.start + PREFIX;
+                let buffered = (available - header).min(len);
+                let from = self.start + header;
 
                 let mut body = Vec::new();
                 if let Err(err) = body.try_reserve_exact(len) {
@@ -148,7 +230,7 @@ impl FrameReader {
                         self.start = 0;
                         self.end = 0;
                     }
-                    return Poll::Ready(Ok(body));
+                    return Poll::Ready(Ok((tag, body)));
                 }
 
                 // The rest of this body is still on its way. It goes straight
@@ -157,14 +239,15 @@ impl FrameReader {
                 self.start = 0;
                 self.end = 0;
                 self.partial = Some(Partial {
+                    tag,
                     body,
                     filled: buffered,
                 });
                 continue;
             }
 
-            // Fewer than four bytes here: at most a split prefix. Move it to
-            // the front so the read below has the whole buffer behind it.
+            // Less than a header here: at most a split one. Move it to the
+            // front so the read below has the whole buffer behind it.
             if self.start > 0 {
                 self.buf.copy_within(self.start..self.end, 0);
                 self.end = available;
@@ -251,14 +334,72 @@ impl FrameWriter {
     /// Queues the prefix of a frame of `len` bytes, whose body the caller then
     /// writes itself.
     pub(crate) fn queue_prefix(&mut self, len: usize) -> Result<(), RastcpError> {
-        // The prefix is four bytes on the wire, so a longer payload cannot be
+        self.queue_header(len, None)
+    }
+
+    /// Queues what goes before a payload of `len` bytes: its length, and on a
+    /// multiplexed stream its tag.
+    fn queue_header(&mut self, len: usize, tag: Option<Tag>) -> Result<(), RastcpError> {
+        // The length is four bytes on the wire, so a longer payload cannot be
         // framed at all; truncating its length would desynchronise the stream.
         let len = u32::try_from(len).map_err(|_| RastcpError::MessageTooLarge {
             len,
             max: u32::MAX as usize,
         })?;
         self.buf.extend_from_slice(&len.to_le_bytes());
+        if let Some(tag) = tag {
+            self.buf.extend_from_slice(&tag.encode());
+        }
         Ok(())
+    }
+
+    /// Queues `payload` as a multiplexed frame, whatever its size.
+    ///
+    /// For a side that hands its buffer to another task to write, where there
+    /// is no stream here to write a large payload to directly.
+    pub(crate) fn queue_tagged_copy(
+        &mut self,
+        tag: Tag,
+        payload: &[u8],
+    ) -> Result<(), RastcpError> {
+        self.buf.reserve(PREFIX + TAG + payload.len());
+        self.queue_header(payload.len(), Some(tag))?;
+        self.buf.extend_from_slice(payload);
+        Ok(())
+    }
+
+    /// Queues `payload` as a multiplexed frame if it is small enough to be
+    /// worth copying. Returns whether it was queued; if not, send it with
+    /// [`FrameWriter::send_large_tagged`].
+    pub(crate) fn queue_tagged(&mut self, tag: Tag, payload: &[u8]) -> Result<bool, RastcpError> {
+        if payload.len() > COALESCE_LIMIT {
+            return Ok(false);
+        }
+
+        self.queue_tagged_copy(tag, payload)?;
+        Ok(true)
+    }
+
+    /// Sends everything queued, then `payload` as a multiplexed frame, without
+    /// copying it.
+    pub(crate) async fn send_large_tagged<S>(
+        &mut self,
+        stream: &mut S,
+        tag: Tag,
+        payload: &[u8],
+    ) -> Result<(), RastcpError>
+    where
+        S: AsyncWrite + Unpin + ?Sized,
+    {
+        self.queue_header(payload.len(), Some(tag))?;
+        self.send_queued_then(stream, payload).await
+    }
+
+    /// Takes what is queued, leaving `spare` (emptied) in its place, so a
+    /// buffer can be handed to whoever writes it without allocating another.
+    pub(crate) fn swap(&mut self, spare: &mut Vec<u8>) {
+        spare.clear();
+        std::mem::swap(&mut self.buf, spare);
     }
 
     /// Queues `payload` as a frame if it is small enough to be worth copying.
@@ -284,9 +425,21 @@ impl FrameWriter {
     where
         S: AsyncWrite + Unpin + ?Sized,
     {
-        // The prefix leaves with whatever was already waiting, so it does not
-        // cost a record and a system call of its own.
         self.queue_prefix(payload.len())?;
+        self.send_queued_then(stream, payload).await
+    }
+
+    /// Writes what is queued and then `payload`. The header of a large frame
+    /// leaves with whatever was already waiting, so it does not cost a record
+    /// and a system call of its own.
+    async fn send_queued_then<S>(
+        &mut self,
+        stream: &mut S,
+        payload: &[u8],
+    ) -> Result<(), RastcpError>
+    where
+        S: AsyncWrite + Unpin + ?Sized,
+    {
         let sent = async {
             stream.write_all(&self.buf).await?;
             stream.write_all(payload).await?;
@@ -550,6 +703,117 @@ mod tests {
             assert_eq!(
                 reader.frame(&mut near, MAX).await.unwrap(),
                 Vec::<u8>::new()
+            );
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn tagged_frames_keep_their_tags_through_every_path() {
+        bounded(async {
+            let sizes = [
+                0usize,
+                1,
+                9,
+                100,
+                COALESCE_LIMIT,
+                COALESCE_LIMIT + 1,
+                READ_AHEAD * 3 + 5,
+                2,
+            ];
+
+            // Whole, and in pieces small enough to split the nine-byte header
+            // at every one of its bytes.
+            for piece in [usize::MAX, 1, 2, 3, 5, 7, 8, 9, 10] {
+                let (mut near, mut far) = duplex(1 << 22);
+                let mut writer = FrameWriter::new();
+                let mut wire = Vec::new();
+
+                for (seed, len) in sizes.iter().enumerate() {
+                    let tag = Tag {
+                        id: 0x0102_0304u32.wrapping_mul(seed as u32 + 1),
+                        kind: (seed % 3) as u8,
+                    };
+                    writer.queue_tagged_copy(tag, &payload(seed, *len)).unwrap();
+                }
+                writer.swap(&mut wire);
+                assert!(writer.is_empty());
+
+                let sender = tokio::spawn(async move {
+                    for chunk in wire.chunks(piece.min(wire.len())) {
+                        far.write_all(chunk).await.unwrap();
+                        if piece != usize::MAX {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    far
+                });
+
+                let mut reader = FrameReader::tagged();
+                for (seed, len) in sizes.iter().enumerate() {
+                    let (tag, body) =
+                        std::future::poll_fn(|cx| reader.poll_tagged(&mut near, cx, MAX))
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        tag.id,
+                        0x0102_0304u32.wrapping_mul(seed as u32 + 1),
+                        "frame {seed}"
+                    );
+                    assert_eq!(tag.kind, (seed % 3) as u8, "frame {seed}");
+                    assert_eq!(
+                        body,
+                        payload(seed, *len),
+                        "frame {seed} in pieces of {piece}"
+                    );
+                }
+
+                drop(sender.await.unwrap());
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_large_tagged_frame_is_written_behind_the_ones_waiting() {
+        bounded(async {
+            let (mut near, mut far) = duplex(1 << 22);
+            let small = payload(1, 50);
+            let large = payload(2, COALESCE_LIMIT * 2);
+
+            let mut writer = FrameWriter::new();
+            assert!(writer.queue_tagged(Tag::data(7), &small).unwrap());
+            assert!(!writer.queue_tagged(Tag::data(8), &large).unwrap());
+            writer
+                .send_large_tagged(
+                    &mut far,
+                    Tag {
+                        id: 8,
+                        kind: KIND_FAILED,
+                    },
+                    &large,
+                )
+                .await
+                .unwrap();
+            assert!(writer.is_empty());
+
+            let mut reader = FrameReader::tagged();
+            let first = std::future::poll_fn(|cx| reader.poll_tagged(&mut near, cx, MAX))
+                .await
+                .unwrap();
+            let second = std::future::poll_fn(|cx| reader.poll_tagged(&mut near, cx, MAX))
+                .await
+                .unwrap();
+            assert_eq!(first, (Tag::data(7), small));
+            assert_eq!(
+                second,
+                (
+                    Tag {
+                        id: 8,
+                        kind: KIND_FAILED
+                    },
+                    large
+                )
             );
         })
         .await

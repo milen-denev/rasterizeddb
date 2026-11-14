@@ -225,7 +225,7 @@ impl Deadline {
     ///
     /// Ready when the wait has outlived it. Otherwise the timer is known to be
     /// registered to wake `cx`'s task no later than `expires`.
-    fn poll_expired(&mut self, cx: &mut Context<'_>, expires: Instant) -> Poll<()> {
+    pub(crate) fn poll_expired(&mut self, cx: &mut Context<'_>, expires: Instant) -> Poll<()> {
         let listening = self
             .waker
             .as_ref()
@@ -314,6 +314,36 @@ impl Guard {
 
     pub(crate) fn is_stopping(&self) -> bool {
         self.stop.is_stopping()
+    }
+
+    /// Runs `future` to completion with no deadline, unless — when
+    /// `stoppable` — the server stops first, which is `None`.
+    ///
+    /// For a wait that is bounded elsewhere: a connection waiting on handlers
+    /// that each carry their own timeout.
+    pub(crate) async fn run_unbounded<F: Future>(
+        &mut self,
+        future: F,
+        stoppable: bool,
+    ) -> Option<F::Output> {
+        let mut future = std::pin::pin!(future);
+
+        std::future::poll_fn(|cx| {
+            if stoppable && self.stop.is_stopping() {
+                return Poll::Ready(None);
+            }
+
+            if let Poll::Ready(output) = future.as_mut().poll(cx) {
+                return Poll::Ready(Some(output));
+            }
+
+            if stoppable && self.stop.poll_stopped(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+
+            Poll::Pending
+        })
+        .await
     }
 
     /// Runs `future` to completion unless it stays pending past the deadline

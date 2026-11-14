@@ -5,11 +5,14 @@
 //! ```text
 //! echo_bench server <port> <worker-threads>
 //! echo_bench client <addr:port> <connections> <seconds> <payload-bytes> <worker-threads> [depth]
+//! echo_bench mux    <addr:port> <connections> <seconds> <payload-bytes> <worker-threads> <callers>
 //! ```
 //!
 //! The handler echoes, so everything measured is the transport: framing, TLS
 //! records, timers, wakeups and system calls. `depth` is how many requests a
-//! connection keeps in flight; 1 is one request per round trip.
+//! connection keeps in flight; 1 is one request per round trip. `mux` shares
+//! each connection between `callers` tasks, each sending one request at a
+//! time, which is how an application with many concurrent queries uses it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,10 +50,23 @@ fn main() {
             arg(&args, 6, 4usize),
             arg(&args, 7, 1usize),
         ),
+        Some("mux") => mux(
+            args.get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+            arg(&args, 3, 1usize),
+            arg(&args, 4, 5u64),
+            arg(&args, 5, 64usize),
+            arg(&args, 6, 4usize),
+            arg(&args, 7, 64usize),
+        ),
         _ => {
             eprintln!("usage: echo_bench server <port> <threads>");
             eprintln!(
                 "       echo_bench client <addr:port> <connections> <seconds> <payload> <threads> [depth]"
+            );
+            eprintln!(
+                "       echo_bench mux <addr:port> <connections> <seconds> <payload> <threads> <callers>"
             );
             std::process::exit(2);
         }
@@ -184,4 +200,86 @@ async fn round(client: &mut rastcp::client::TcpClient, request: &[u8], depth: us
             .all(|response| response.len() == request.len())
     );
     depth as u64
+}
+
+fn mux(
+    addr: String,
+    connections: usize,
+    seconds: u64,
+    payload: usize,
+    threads: usize,
+    callers: usize,
+) {
+    let runtime = runtime(threads);
+
+    runtime.block_on(async move {
+        let stop = Arc::new(AtomicBool::new(false));
+        let measuring = Arc::new(AtomicBool::new(false));
+        let total = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::with_capacity(connections * callers);
+
+        for _ in 0..connections {
+            let client = TcpClientBuilder::new(&addr)
+                .verify_certificate(false)
+                .max_in_flight(callers.max(1))
+                .build_multiplexed()
+                .await
+                .expect("client");
+            client.connect().await.expect("connect");
+
+            for _ in 0..callers {
+                let client = client.clone();
+                let stop = stop.clone();
+                let measuring = measuring.clone();
+                let total = total.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    let request = vec![0x5au8; payload];
+                    let mut histogram = vec![0u64; BUCKETS];
+                    let mut done = 0u64;
+
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        let response = client.send(&request).await.expect("send");
+                        assert_eq!(response.len(), request.len());
+
+                        if measuring.load(Ordering::Relaxed) {
+                            let micros = started.elapsed().as_micros() as usize;
+                            histogram[micros.min(BUCKETS - 1)] += 1;
+                            done += 1;
+                        }
+                    }
+
+                    total.fetch_add(done, Ordering::Relaxed);
+                    histogram
+                }));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        measuring.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        measuring.store(false, Ordering::Relaxed);
+        let elapsed = started.elapsed().as_secs_f64();
+        stop.store(true, Ordering::Relaxed);
+
+        let mut histogram = vec![0u64; BUCKETS];
+        for task in tasks {
+            for (slot, count) in histogram.iter_mut().zip(task.await.expect("task")) {
+                *slot += count;
+            }
+        }
+
+        let done = total.load(Ordering::Relaxed);
+        let rounds: u64 = histogram.iter().sum();
+
+        println!(
+            "ops={done} secs={elapsed:.3} ops_per_sec={:.0} p50_us={} p99_us={} p999_us={} conns={connections} payload={payload} callers={callers} mux",
+            done as f64 / elapsed,
+            percentile(&histogram, rounds, 0.50),
+            percentile(&histogram, rounds, 0.99),
+            percentile(&histogram, rounds, 0.999),
+        );
+    });
 }
