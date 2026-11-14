@@ -90,6 +90,7 @@ pub struct TcpClientBuilder {
     allow_tls12: bool,
     max_message_size: usize,
     max_in_flight: usize,
+    reconnect_when_idle_closed: bool,
 }
 
 pub struct TcpClient {
@@ -110,6 +111,8 @@ pub(crate) struct Dialer {
     pub(crate) max_message_size: usize,
     /// Only a multiplexed client has more than one request in flight.
     pub(crate) max_in_flight: usize,
+    /// See [`TcpClientBuilder::reconnect_when_idle_closed`].
+    reconnect_when_idle_closed: bool,
 }
 
 impl TcpClientBuilder {
@@ -126,7 +129,31 @@ impl TcpClientBuilder {
             allow_tls12: false,
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            reconnect_when_idle_closed: false,
         }
+    }
+
+    /// Whether a client that finds its idle connection closed opens another
+    /// and sends on that, instead of sending into the closed one and failing.
+    /// Off by default.
+    ///
+    /// A server closes a connection that has been quiet for its request
+    /// timeout. With this on, a connection unused for 100 ms is looked at
+    /// before a request is put on it, and replaced if the server has let go
+    /// of it; the request is sent once, on the new connection, and the caller
+    /// never sees the old one fail.
+    ///
+    /// Turn it on only for a protocol in which every request stands alone. The
+    /// new connection is authenticated like any other this client opens, but
+    /// nothing else is done to it: a caller that sets its connection up with
+    /// requests of its own — a handshake, a session — would find itself
+    /// sending on one that had none of that, without having been told. Such a
+    /// caller needs the failure, which is what it gets with this off. Has no
+    /// effect on a multiplexed client, which always knows when its connection
+    /// closes because it is always reading.
+    pub fn reconnect_when_idle_closed(mut self, reconnect: bool) -> Self {
+        self.reconnect_when_idle_closed = reconnect;
+        self
     }
 
     /// How many requests a multiplexed client keeps in flight at once.
@@ -314,6 +341,7 @@ impl TcpClientBuilder {
             auth_timeout: self.auth_timeout,
             max_message_size: self.max_message_size,
             max_in_flight: self.max_in_flight,
+            reconnect_when_idle_closed: self.reconnect_when_idle_closed,
         })
     }
 }
@@ -727,9 +755,14 @@ impl TcpClient {
     }
 
     /// Makes sure there is a connection to send on: opens one if there is
-    /// none, and replaces one the server closed while it sat idle.
+    /// none, and — for a client that asked — replaces one the server closed
+    /// while it sat idle.
     async fn ready(&mut self, max_message_size: usize) -> Result<(), RastcpError> {
-        if let Some(connection) = self.connection.as_mut() {
+        if !self.dialer.reconnect_when_idle_closed {
+            // The connection is used as it is. If the server has closed it
+            // the request fails, and a caller that set the connection up
+            // itself learns that it has to do so again.
+        } else if let Some(connection) = self.connection.as_mut() {
             if connection.has_gone(max_message_size).await {
                 debug!("The idle connection to the server was closed; opening another");
                 self.connection = None;

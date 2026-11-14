@@ -404,32 +404,52 @@ async fn test_a_connection_idle_for_longer_than_the_timeout_is_closed() {
     let serving = server.clone();
     let server_handle = tokio::spawn(async move { serving.run(|data| async move { data }).await });
 
+    // Two clients, alike except that one asked to have a connection that was
+    // closed under it replaced.
     let mut client = TcpClientBuilder::new(&addr)
+        .timeout(Duration::from_secs(5))
+        .reconnect_when_idle_closed(true)
+        .build()
+        .await
+        .unwrap();
+    let mut plain = TcpClientBuilder::new(&addr)
         .timeout(Duration::from_secs(5))
         .build()
         .await
         .unwrap();
 
     assert_eq!(client.send(b"first".to_vec()).await.unwrap(), b"first".to_vec());
-    assert_eq!(server.active_connections(), 1);
+    assert_eq!(plain.send(b"first".to_vec()).await.unwrap(), b"first".to_vec());
+    assert_eq!(server.active_connections(), 2);
 
-    // Silent for three timeouts: the server has to have let go of the slot.
+    // Silent for three timeouts: the server has to have let go of the slots.
     sleep(request_timeout * 3).await;
     assert_eq!(
         server.active_connections(),
         0,
-        "the server kept a connection that had been idle past its timeout"
+        "the server kept connections that had been idle past its timeout"
     );
 
-    // The client finds that out before it sends, not by sending: the request
-    // goes to a connection opened for it and is answered. Failing here would
-    // leave the caller with an error that does not say whether the request
-    // ran, for a request that was never sent.
+    // The one that asked finds out before it sends, not by sending: the
+    // request goes to a connection opened for it and is answered. Failing
+    // here would leave the caller with an error that does not say whether
+    // the request ran, for a request that was never sent.
     assert_eq!(
         client.send(b"second".to_vec()).await.unwrap(),
         b"second".to_vec(),
         "a request after an idle spell was sent into the closed connection"
     );
+    assert_eq!(server.active_connections(), 1);
+
+    // The one that did not is told its connection is gone, and is not moved
+    // to another behind its back. A caller that greets the server on every
+    // connection it opens — the replication link does — depends on that:
+    // moved silently, it would be sending on a connection it never greeted.
+    assert!(
+        plain.send(b"second".to_vec()).await.is_err(),
+        "a client that did not ask for it was given a new connection without being told"
+    );
+    assert!(!plain.is_connected());
     assert_eq!(server.active_connections(), 1);
 
     server_handle.abort();

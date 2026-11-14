@@ -137,7 +137,13 @@ async fn open_connection(
 ) -> io::Result<TcpClient> {
     let mut builder = TcpClientBuilder::new(server_address)
         .verify_certificate(false)
-        .timeout(transport_timeout);
+        .timeout(transport_timeout)
+        // A pooled connection sits idle between queries, and the server
+        // closes one that has been quiet for its request timeout. Every query
+        // stands alone, so one opened in its place serves just as well — and
+        // without this the first query after a quiet spell would fail, which
+        // is what the automatic retry used to be there to hide.
+        .reconnect_when_idle_closed(true);
 
     if let Some(credentials) = credentials {
         builder = builder.authenticator(credentials.clone());
@@ -1212,6 +1218,65 @@ mod tests {
         });
 
         (port, asked, handle)
+    }
+
+    #[tokio::test]
+    async fn a_pooled_query_after_a_quiet_spell_is_answered_without_a_retry() {
+        // What made the retry safe to switch off. The server lets go of a
+        // connection that has been quiet for its request timeout; the pooled
+        // connection is then replaced before the query is sent, and the
+        // client — which no longer sends anything twice — still gets its
+        // answer, having sent the query once.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+
+        let server = TcpServerBuilder::from_listener(listener)
+            .unwrap()
+            .request_timeout(Duration::from_millis(200))
+            .build()
+            .await
+            .unwrap();
+        let server_handle = tokio::spawn(async move {
+            server
+                .run(move |_| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        vec![0]
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = DbClient::with_pool_settings_and_timeouts(
+            Some(&format!("127.0.0.1:{port}")),
+            1,
+            1,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            client.execute_query("INSERT INTO t VALUES (1)").await,
+            Ok(QueryExecutionResult::Ok)
+        ));
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let after = client.execute_query("INSERT INTO t VALUES (2)").await;
+        assert!(
+            matches!(after, Ok(QueryExecutionResult::Ok)),
+            "the first query after a quiet spell failed: {after:?}"
+        );
+        assert_eq!(asked.load(Ordering::SeqCst), 2, "each query reaches the server exactly once");
+
+        server_handle.abort();
     }
 
     #[tokio::test]
