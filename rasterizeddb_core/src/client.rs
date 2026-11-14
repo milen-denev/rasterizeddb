@@ -1,6 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 use rastcp::client::{TcpClient, TcpClientBuilder};
 use rastcp::error::RastcpError;
+use rastcp::mux::MuxClient;
 use rastcp::session::ClientAuthenticator;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -458,8 +459,31 @@ impl DbClientPool {
 
 /// Client for connecting to RasterizedDB
 pub struct DbClient {
-    pool: Arc<DbClientPool>,
+    transport: Transport,
     connected: AtomicBool,
+}
+
+/// How a client's queries reach the server.
+enum Transport {
+    /// Each query borrows a connection for itself. The default.
+    Pooled(Arc<DbClientPool>),
+    /// Every query shares a few connections. See [`DbClient::multiplexed`].
+    Shared(SharedConnections),
+}
+
+/// A fixed set of multiplexed connections, used in turn.
+struct SharedConnections {
+    clients: Vec<MuxClient>,
+    /// Which connection the next query goes to. Padded: it is written by
+    /// every query, and the connections beside it are read by every query.
+    next: CacheGuard<AtomicUsize>,
+}
+
+impl SharedConnections {
+    fn pick(&self) -> &MuxClient {
+        let turn = self.next.fetch_add(1, Ordering::Relaxed);
+        &self.clients[turn % self.clients.len()]
+    }
 }
 
 /// Who a client authenticates as.
@@ -641,7 +665,73 @@ impl DbClient {
         });
 
         Ok(DbClient {
-            pool: pool_arc,
+            transport: Transport::Pooled(pool_arc),
+            connected: AtomicBool::new(true),
+        })
+    }
+
+    /// A client whose queries share `connections` connections between them,
+    /// however many are in flight, instead of each borrowing one of its own.
+    ///
+    /// What that buys is on the wire. A pooled client with a hundred
+    /// concurrent queries holds a hundred TLS sessions and makes a system
+    /// call each way per query; this one holds `connections` sessions and
+    /// sends whatever queries are waiting together, as the server answers
+    /// them together. One connection is driven by one task, so use more than
+    /// one for a client busy enough to keep a core occupied with nothing but
+    /// its transport; two to four is plenty.
+    ///
+    /// The queries a caller sees are the same: each gets its own answer, and
+    /// a query that fails in transit is retried once exactly as the pooled
+    /// client retries it. What differs is that queries on a shared connection
+    /// run side by side on the server, so two sent together may be carried
+    /// out in either order — as they already may be when a pool sends them on
+    /// two connections.
+    ///
+    /// Needs a server that speaks `rastcp/2`. Against an older one the
+    /// handshake is refused and this returns that error; use
+    /// [`DbClient::new`] there.
+    pub async fn multiplexed(
+        addr: Option<&str>,
+        connections: usize,
+        transport_timeout: Duration,
+        credentials: Option<DbCredentials>,
+    ) -> io::Result<Self> {
+        let server_address = resolve_server_address(addr.unwrap_or("127.0.0.1"));
+
+        let credentials: Credentials = credentials.map(|c| {
+            Arc::new(PasswordAuthenticator::new(c.user, c.password)) as Arc<dyn ClientAuthenticator>
+        });
+
+        let mut clients = Vec::with_capacity(connections.max(1));
+
+        for _ in 0..connections.max(1) {
+            let mut builder = TcpClientBuilder::new(&server_address)
+                .verify_certificate(false)
+                .timeout(transport_timeout);
+
+            if let Some(credentials) = &credentials {
+                builder = builder.authenticator(credentials.clone());
+            }
+
+            let client = builder
+                .build_multiplexed()
+                .await
+                .map_err(rastcp_error_to_io_error)?;
+
+            // Opened now, so that a wrong address, a refused login or a server
+            // too old to speak the protocol is an error from this call and not
+            // from whichever query happens to come first.
+            client.connect().await.map_err(rastcp_error_to_io_error)?;
+
+            clients.push(client);
+        }
+
+        Ok(DbClient {
+            transport: Transport::Shared(SharedConnections {
+                clients,
+                next: CacheGuard::new(AtomicUsize::new(0)),
+            }),
             connected: AtomicBool::new(true),
         })
     }
@@ -649,8 +739,17 @@ impl DbClient {
     /// Connect to the database server
     pub async fn connect(&self) -> io::Result<()> {
         if !self.connected.load(Ordering::Relaxed) {
-            // Get a client to verify connectivity
-            let _client = self.pool.get_client().await?;
+            match &self.transport {
+                // Get a client to verify connectivity
+                Transport::Pooled(pool) => {
+                    let _client = pool.get_client().await?;
+                }
+                Transport::Shared(shared) => {
+                    for client in &shared.clients {
+                        client.connect().await.map_err(rastcp_error_to_io_error)?;
+                    }
+                }
+            }
             self.connected.store(true, Ordering::Relaxed);
         }
         Ok(())
@@ -677,8 +776,13 @@ impl DbClient {
         let query_bytes = query.as_bytes().to_vec();
         let mut last_error = None;
 
+        let pool = match &self.transport {
+            Transport::Pooled(pool) => pool,
+            Transport::Shared(shared) => return Self::execute_shared(shared, query).await,
+        };
+
         for attempt in 0..=1 {
-            let mut client_guard = self.pool.get_client().await?;
+            let mut client_guard = pool.get_client().await?;
 
             match client_guard.send(query_bytes.clone()).await {
                 Ok(response) => return Self::parse_query_response(response),
@@ -687,6 +791,33 @@ impl DbClient {
                     continue;
                 }
                 Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| io::Error::other("Query execution failed")))
+    }
+
+    /// One query over the shared connections, with the pooled client's retry:
+    /// once, and only for an error that says the query may not have arrived.
+    async fn execute_shared(
+        shared: &SharedConnections,
+        query: &str,
+    ) -> io::Result<QueryExecutionResult> {
+        let mut last_error = None;
+
+        for attempt in 0..=1 {
+            // The retry goes to the next connection, which is not the one
+            // that just failed unless there is only one.
+            match shared.pick().send(query.as_bytes()).await {
+                Ok(response) => return Self::parse_query_response(response),
+                Err(err) => {
+                    let err = rastcp_error_to_io_error(err);
+                    if attempt == 0 && is_retryable_transport_error(err.kind()) {
+                        last_error = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
 
@@ -755,9 +886,17 @@ impl DbClient {
 
     /// Get current pool stats
     pub fn get_pool_stats(&self) -> (usize, usize) {
-        let current_size = self.pool.current_size.load(Ordering::Relaxed);
-        let max_size = self.pool.max_pool_size;
-        (current_size, max_size)
+        match &self.transport {
+            Transport::Pooled(pool) => {
+                let current_size = pool.current_size.load(Ordering::Relaxed);
+                (current_size, pool.max_pool_size)
+            }
+            // Open connections, of the fixed number this client shares.
+            Transport::Shared(shared) => {
+                let open = shared.clients.iter().filter(|client| client.is_connected()).count();
+                (open, shared.clients.len())
+            }
+        }
     }
 }
 
@@ -823,7 +962,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let client = DbClient {
-            pool: Arc::new(
+            transport: Transport::Pooled(Arc::new(
                 DbClientPool::new_with_server_address_and_timeouts(
                     format!("127.0.0.1:{port}"),
                     1,
@@ -841,11 +980,145 @@ mod tests {
                 )
                 .await
                 .unwrap(),
-            ),
+            )),
             connected: AtomicBool::new(true),
         };
 
         let result = client.execute_query("SELECT 1").await.unwrap();
+
+        assert!(matches!(result, QueryExecutionResult::Ok));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multiplexed_client_runs_many_queries_over_few_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let (now, peak) = (running.clone(), most.clone());
+
+        let server = Arc::new(
+            TcpServerBuilder::from_listener(listener)
+                .unwrap()
+                .build()
+                .await
+                .unwrap(),
+        );
+        let serving = server.clone();
+        let server_handle = tokio::spawn(async move {
+            serving
+                .run(move |query| {
+                    let (now, peak) = (now.clone(), peak.clone());
+                    async move {
+                        let current = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        now.fetch_sub(1, Ordering::SeqCst);
+
+                        // "Rows affected", carrying the query's own number
+                        // back, so an answer delivered to the wrong caller
+                        // does not look like the right one.
+                        let text = String::from_utf8_lossy(&query);
+                        let number: u64 = text.rsplit(' ').next().unwrap().parse().unwrap();
+                        let mut response = vec![1u8];
+                        response.extend_from_slice(&number.to_le_bytes());
+                        response
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = Arc::new(
+            DbClient::multiplexed(
+                Some(&format!("127.0.0.1:{port}")),
+                2,
+                Duration::from_secs(30),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut queries = Vec::new();
+        for number in 0..40u64 {
+            let client = client.clone();
+            queries.push(tokio::spawn(async move {
+                let result = client
+                    .execute_query(&format!("SELECT {number}"))
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(result, QueryExecutionResult::RowsAffected(n) if n == number),
+                    "query {number} was given another query's answer"
+                );
+            }));
+        }
+        for query in queries {
+            tokio::time::timeout(Duration::from_secs(30), query)
+                .await
+                .expect("a query never came back")
+                .unwrap();
+        }
+
+        // Forty queries, two connections: a pooled client would have opened
+        // forty, or run them two at a time.
+        assert_eq!(server.active_connections(), 2);
+        assert_eq!(client.get_pool_stats(), (2, 2));
+        let peak = most.load(Ordering::SeqCst);
+        assert!(peak > 2, "at most {peak} queries were ever in flight on two connections");
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_multiplexed_query_is_retried_once_on_a_timed_out_transport() {
+        // The pooled client's retry, on the shared transport: same handler,
+        // same budgets, same expectation as the test above for the pool.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let server = TcpServerBuilder::from_listener(listener)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            server
+                .run(move |_| {
+                    let attempts = attempts_clone.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                        }
+                        vec![0]
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = DbClient::multiplexed(
+            Some(&format!("127.0.0.1:{port}")),
+            1,
+            Duration::from_millis(500),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(20), client.execute_query("SELECT 1"))
+            .await
+            .expect("the query never came back")
+            .unwrap();
 
         assert!(matches!(result, QueryExecutionResult::Ok));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);

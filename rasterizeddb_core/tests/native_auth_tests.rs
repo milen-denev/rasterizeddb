@@ -288,3 +288,53 @@ async fn a_reconnected_client_authenticates_again() {
         "the second connection must be authenticated too"
     );
 }
+
+/// The multiplexed transport opens its connection on a path of its own, so
+/// the same two facts are checked for it: the caller is asked to prove who it
+/// is, and every request on the shared connection is served as that caller —
+/// including on the connection it opens after the first is closed.
+#[tokio::test]
+async fn a_shared_connection_authenticates_and_serves_every_request_as_that_user() {
+    let (listener, port) = loopback();
+    serve(
+        listener,
+        database_with_roles(&[]).await,
+        AuthMethod::ScramSha256,
+    )
+    .await;
+
+    let shared = |password: &str| {
+        TcpClientBuilder::new(&format!("127.0.0.1:{}", port))
+            .timeout(Duration::from_secs(5))
+            .authenticator(StdArc::new(PasswordAuthenticator::new("alice", password))
+                as StdArc<dyn ClientAuthenticator>)
+            .build_multiplexed()
+    };
+
+    let wrong = shared("not-the-password").await.expect("the client should build");
+    assert!(
+        wrong.send(b"SELECT 1").await.is_err(),
+        "a wrong password reached the request handler over a shared connection"
+    );
+    assert!(!wrong.is_connected());
+
+    let client = shared("hunter2").await.expect("the client should build");
+
+    let mut requests = Vec::new();
+    for _ in 0..16 {
+        let client = client.clone();
+        requests.push(tokio::spawn(async move { client.send(b"SELECT 1").await }));
+    }
+    for request in requests {
+        let response = request.await.unwrap().expect("an authenticated request");
+        assert_eq!(String::from_utf8_lossy(&response), "alice:true");
+    }
+
+    client.close().await;
+
+    assert_eq!(
+        String::from_utf8_lossy(&client.send(b"SELECT 1").await.unwrap()),
+        "alice:true",
+        "the connection opened after a close must be authenticated too"
+    );
+}
