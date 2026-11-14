@@ -602,6 +602,19 @@ pub struct ReplicationConfig {
 
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// How long a peer link may carry nothing before it is asked "are you
+    /// there?". Zero never asks.
+    ///
+    /// The receiving end of a link closes a connection that has been quiet
+    /// for its request timeout. Without this a link is only spoken on when
+    /// there are transactions to send, so the first write after a quiet spell
+    /// finds it closed: the send fails, the link is rebuilt, and that write is
+    /// late by the reconnect delay. It also means a peer that has gone is not
+    /// noticed until there is something to send it.
+    ///
+    /// See [`ReplicationConfig::keepalive_interval`] for what is actually
+    /// used.
+    pub keepalive: Duration,
     /// How long a failed peer link waits before reconnecting, doubling up to
     /// [`ReplicationConfig::reconnect_max`].
     pub reconnect_base: Duration,
@@ -635,6 +648,7 @@ impl Default for ReplicationConfig {
             log_retention_bytes: 256 * 1024 * 1024,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
+            keepalive: Duration::from_secs(10),
             reconnect_base: Duration::from_millis(200),
             reconnect_max: Duration::from_secs(30),
             peers: Vec::new(),
@@ -647,6 +661,22 @@ impl ReplicationConfig {
     /// of carrying and comparing a string on every connection.
     pub fn cluster_id(&self) -> u64 {
         cluster_id_of(&self.cluster)
+    }
+
+    /// How often a quiet link is spoken on, or `None` for never.
+    ///
+    /// [`ReplicationConfig::keepalive`], but never more than a third of the
+    /// request timeout: asking less often than the other end waits would let
+    /// the link be closed between two askings, which is the thing this is for
+    /// preventing. A third rather than just under it, so one answer that is
+    /// slow to come does not cost the link. The peers of a cluster are
+    /// expected to share a request timeout; this node's own is the only one
+    /// it knows.
+    pub fn keepalive_interval(&self) -> Option<Duration> {
+        if self.keepalive.is_zero() {
+            return None;
+        }
+        Some(self.keepalive.min(self.request_timeout / 3))
     }
 
     /// Rejects a configuration that cannot work, before anything binds a port.

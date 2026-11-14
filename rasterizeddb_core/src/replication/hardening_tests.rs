@@ -860,3 +860,249 @@ async fn a_check_treats_a_trailing_space_as_padding_only_where_it_is() {
     different.sort_unstable();
     assert_eq!(different, vec!["repl_text", "repl_varchar"], "{lines:?}");
 }
+
+/// A pair whose settings a test adjusts after the brisk defaults.
+async fn pair_tuned(tune: fn(&mut ReplicationConfig)) -> (Arc<Database>, Arc<Database>) {
+    async fn tuned(
+        node_id: u64,
+        bound: (std::net::TcpListener, u16),
+        peers: Vec<PeerConfig>,
+        tune: fn(&mut ReplicationConfig),
+    ) -> Arc<Database> {
+        let (socket, port) = bound;
+        let database = super::test_support::in_memory_database().await;
+        let mut config = ReplicationConfig {
+            node_id,
+            listen_port: port,
+            peers,
+            ..Default::default()
+        };
+        brisk(&mut config);
+        tune(&mut config);
+        database.replication.set_config(config).expect("a valid configuration");
+        database.replication.serve_on(socket);
+        Database::start_replication(database.clone()).expect("replication should start");
+        database
+    }
+
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
+    let one = tuned(
+        1,
+        bound_one,
+        vec![PeerConfig::new("two", format!("127.0.0.1:{port_two}"))],
+        tune,
+    )
+    .await;
+    let two = tuned(
+        2,
+        bound_two,
+        vec![PeerConfig::new("one", format!("127.0.0.1:{port_one}"))],
+        tune,
+    )
+    .await;
+    (one, two)
+}
+
+/// A link with nothing to carry is still a link.
+///
+/// The receiving end of a link closes a connection that has been quiet for
+/// its request timeout, as any server of this transport does. A sender that
+/// only speaks when it has transactions to send would then find, at the first
+/// write after a quiet spell, that its link had been closed under it: the
+/// send fails, the link is reported down with an error, the sender waits out
+/// its reconnect delay, dials, greets the peer again, and only then sends. On
+/// a node that is written to now and then that is every write.
+///
+/// So a quiet link is kept in use, and the write after the spell goes out on
+/// the link that was there all along.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_has_been_quiet_is_still_up_for_the_next_write() {
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let (one, two) = pair_tuned(|config| {
+        config.request_timeout = REQUEST_TIMEOUT;
+    })
+    .await;
+
+    run_ok(&one, "CREATE TABLE repl_quiet (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_quiet (id, name) VALUES (1, 'before')").await;
+    settled(&one, &two).await;
+
+    let to_two = one.replication.peer("two").expect("the peer is configured");
+    let to_one = two.replication.peer("one").expect("the peer is configured");
+    let links_before = (to_two.links_established(), to_one.links_established());
+
+    // Four request timeouts with nothing to replicate, in either direction.
+    tokio::time::sleep(REQUEST_TIMEOUT * 4).await;
+
+    assert!(to_two.is_connected(), "the quiet link to two was reported down");
+    assert!(to_one.is_connected(), "the quiet link to one was reported down");
+
+    run_ok(&one, "INSERT INTO repl_quiet (id, name) VALUES (2, 'after')").await;
+    settled(&one, &two).await;
+
+    assert_eq!(
+        rows(&two, "SELECT id, name FROM repl_quiet").await,
+        Some(vec![
+            vec!["1".to_string(), "before".to_string()],
+            vec!["2".to_string(), "after".to_string()],
+        ])
+    );
+
+    assert_eq!(
+        (to_two.links_established(), to_one.links_established()),
+        links_before,
+        "a link was closed while it was quiet and had to be built again"
+    );
+    assert_eq!(to_two.snapshot(one.replication.local_seq()).last_error, None, "the link to two reported an error");
+}
+
+/// The setting that turns the keep-alive off turns it off: the link is left
+/// to be closed, and the write after the quiet spell has to build another.
+/// This is what every link did before, and what the test above would see if
+/// the keep-alive were not what kept its link up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_keepalive_off_a_quiet_link_is_closed_and_built_again() {
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+    let (one, two) = pair_tuned(|config| {
+        config.request_timeout = REQUEST_TIMEOUT;
+        config.keepalive = Duration::ZERO;
+    })
+    .await;
+
+    run_ok(&one, "CREATE TABLE repl_unkept (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_unkept (id, name) VALUES (1, 'before')").await;
+    settled(&one, &two).await;
+
+    let to_two = one.replication.peer("two").expect("the peer is configured");
+    let links_before = to_two.links_established();
+
+    tokio::time::sleep(REQUEST_TIMEOUT * 4).await;
+
+    run_ok(&one, "INSERT INTO repl_unkept (id, name) VALUES (2, 'after')").await;
+    settled(&one, &two).await;
+
+    // Nothing is lost either way; the write arrives on the link built for it.
+    assert_eq!(
+        rows(&two, "SELECT id, name FROM repl_unkept").await.map(|rows| rows.len()),
+        Some(2)
+    );
+    assert!(
+        to_two.links_established() > links_before,
+        "the link survived four request timeouts of silence with the keep-alive off"
+    );
+}
+
+/// A peer that has gone is reported gone, without waiting for a transaction
+/// to need it.
+///
+/// A sender that only speaks when it has something to send cannot tell a
+/// quiet peer from a dead one: its link reads "connected" for as long as
+/// nothing is written, which on a standby is for as long as it matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_goes_away_is_reported_down_with_nothing_to_send_it() {
+    use super::protocol::{self, FrameCodec, FrameKind, HelloAck};
+
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+    // The other end of the link: something that greets and answers pings as a
+    // node does, and that the test can take away.
+    let (peer_socket, peer_port) = listener();
+    let cluster_id = ReplicationConfig::default().cluster_id();
+    let peer_server = std::sync::Arc::new(
+        rastcp::server::TcpServerBuilder::from_listener(peer_socket)
+            .expect("a bound listener")
+            .build()
+            .await
+            .expect("the stand-in peer should build"),
+    );
+    let serving = peer_server.clone();
+    let peer_task = tokio::spawn(async move {
+        let _ = serving
+            .run(move |frame: Vec<u8>| async move {
+                let mut scratch = Vec::new();
+                let kind = FrameCodec::default()
+                    .decode_frame(&frame, &mut scratch)
+                    .map(|(header, _)| header.kind);
+
+                match kind {
+                    Ok(FrameKind::Hello) => {
+                        let ack = HelloAck {
+                            node_id: 2,
+                            cluster_id,
+                            codec: super::config::Codec::None,
+                            clock: 1,
+                            applied: Vec::new(),
+                        };
+                        let mut out = Vec::new();
+                        ack.encode(&mut out);
+                        protocol::plain_frame(FrameKind::HelloAck, 0, &out)
+                    }
+                    Ok(FrameKind::Ping) => {
+                        protocol::plain_frame(FrameKind::Pong, 0, &1u64.to_le_bytes())
+                    }
+                    _ => protocol::error_frame("the stand-in peer only greets and answers pings"),
+                }
+            })
+            .await;
+    });
+
+    let (socket, port) = listener();
+    let one = super::test_support::in_memory_database().await;
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: port,
+        peers: vec![PeerConfig::new("two", format!("127.0.0.1:{peer_port}"))],
+        ..Default::default()
+    };
+    brisk(&mut config);
+    config.request_timeout = REQUEST_TIMEOUT;
+    one.replication.set_config(config).expect("a valid configuration");
+    one.replication.serve_on(socket);
+    Database::start_replication(one.clone()).expect("replication should start");
+
+    let to_two = one.replication.peer("two").expect("the peer is configured");
+    eventually("the link to come up", || async { to_two.is_connected() }).await;
+
+    // Up, and staying up through several request timeouts of saying nothing.
+    tokio::time::sleep(REQUEST_TIMEOUT * 3).await;
+    assert!(to_two.is_connected(), "a quiet link to a live peer was reported down");
+    assert_eq!(to_two.links_established(), 1, "a quiet link to a live peer was rebuilt");
+
+    // The peer goes. Nothing is written on this node, before or after.
+    peer_server.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), peer_task).await;
+    drop(peer_server);
+
+    let noticed = tokio::time::Instant::now();
+    eventually("the lost peer to be reported down", || async { !to_two.is_connected() }).await;
+    assert!(
+        noticed.elapsed() < Duration::from_secs(5),
+        "it took {:?} to notice a peer that had gone",
+        noticed.elapsed()
+    );
+    assert_eq!(one.replication.local_seq(), 0, "the test wrote something; it must not");
+}
+
+#[test]
+fn the_keepalive_is_never_less_often_than_a_third_of_the_request_timeout() {
+    let mut config = ReplicationConfig::default();
+
+    // The defaults: ten seconds, against a request timeout of thirty.
+    assert_eq!(config.keepalive_interval(), Some(Duration::from_secs(10)));
+
+    // A shorter request timeout pulls it in, so the link is not closed
+    // between two keep-alives by a setting that never mentioned them.
+    config.request_timeout = Duration::from_secs(6);
+    assert_eq!(config.keepalive_interval(), Some(Duration::from_secs(2)));
+
+    // Asked to be more frequent than that, it is.
+    config.keepalive = Duration::from_millis(500);
+    assert_eq!(config.keepalive_interval(), Some(Duration::from_millis(500)));
+
+    // And zero is off, whatever the request timeout.
+    config.keepalive = Duration::ZERO;
+    assert_eq!(config.keepalive_interval(), None);
+}

@@ -534,6 +534,18 @@ comes up as should always be what its command line says.
 under a live cluster makes its stream ambiguous. The token is never echoed by
 `SHOW`; it reports `(set)` or `(unset)`.
 
+**A quiet link is kept alive.** A node's link to a peer carries transactions
+when there are some; when there are none for `keepalive_ms` (10 seconds by
+default) it sends a `PING` instead. Two things follow. The receiving end closes
+a connection it has not heard from for its request timeout, so without this the
+first write after a quiet spell would find the link closed, rebuild it, and
+arrive late by the reconnect delay. And a peer that has gone is reported down
+within one interval, where a link that only spoke when it had something to send
+would read "connected" for as long as nothing was written. `REPLICATION SET
+keepalive_ms = 0` turns it off; whatever it is set to, a link is never left
+quiet for more than a third of `request_timeout_ms`. Every build answers a
+`PING`, so a node with this talks to a peer without it.
+
 Example:
 
 ```text

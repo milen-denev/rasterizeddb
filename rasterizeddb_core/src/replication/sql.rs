@@ -111,6 +111,10 @@ pub const KEYS: &[Key] = &[
         help: "per-request timeout on a peer link",
     },
     Key {
+        name: "keepalive_ms",
+        help: "how long a peer link may be quiet before it is pinged; 0 never pings, and a third of request_timeout_ms is the most that is used",
+    },
+    Key {
         name: "reconnect_base_ms",
         help: "first reconnect delay; doubles up to the maximum",
     },
@@ -717,6 +721,7 @@ fn apply_setting(config: &mut ReplicationConfig, key: &str, value: &str) -> Resu
         "request_timeout_ms" => {
             config.request_timeout = Duration::from_millis(parse_number(value, key)?)
         }
+        "keepalive_ms" => config.keepalive = Duration::from_millis(parse_number(value, key)?),
         "reconnect_base_ms" => {
             config.reconnect_base = Duration::from_millis(parse_number(value, key)?)
         }
@@ -759,6 +764,7 @@ fn describe_setting(config: &ReplicationConfig, key: &str) -> String {
         "log_retention_mb" => (config.log_retention_bytes / (1024 * 1024)).to_string(),
         "connect_timeout_ms" => config.connect_timeout.as_millis().to_string(),
         "request_timeout_ms" => config.request_timeout.as_millis().to_string(),
+        "keepalive_ms" => config.keepalive.as_millis().to_string(),
         "reconnect_base_ms" => config.reconnect_base.as_millis().to_string(),
         "reconnect_max_ms" => config.reconnect_max.as_millis().to_string(),
         _ => String::new(),

@@ -124,6 +124,9 @@ pub struct PeerHandle {
     acked_seq: CacheGuard<AtomicU64>,
     records_sent: AtomicU64,
     batches_sent: AtomicU64,
+    /// How many times a link to this peer has been established. One, for a
+    /// link that has stayed up since the node started.
+    links: AtomicU64,
     state: AtomicU8,
     /// How much of this node's stream the peer reported at the last
     /// handshake that found it ahead of this node's own log. Zero otherwise.
@@ -151,6 +154,12 @@ impl PeerHandle {
     #[inline]
     pub fn address(&self) -> String {
         self.address.lock().clone()
+    }
+
+    /// How many times a link to this peer has been established.
+    #[inline]
+    pub fn links_established(&self) -> u64 {
+        self.links.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -278,6 +287,7 @@ fn handle(config: &PeerConfig) -> Arc<PeerHandle> {
         acked_seq: AtomicU64::new(0).into(),
         records_sent: AtomicU64::new(0),
         batches_sent: AtomicU64::new(0),
+        links: AtomicU64::new(0),
         state: AtomicU8::new(PeerState::Streaming as u8),
         ahead: AtomicU64::new(0),
         codec: AtomicU64::new(Codec::None.as_wire() as u64),
@@ -312,6 +322,7 @@ async fn run(replication: Arc<Replication>, peer: Arc<PeerHandle>) {
         match connect(&replication, &peer).await {
             Ok(mut link) => {
                 peer.connected.store(true, Ordering::Relaxed);
+                peer.links.fetch_add(1, Ordering::Relaxed);
                 if peer.state() == PeerState::Streaming {
                     peer.set_error(None);
                 }
@@ -364,6 +375,8 @@ struct Link {
     codec: Codec,
     /// How far the peer has applied each origin, by its own last account.
     applied: HashMap<NodeId, u64>,
+    /// When the peer last answered anything on this link.
+    last_exchange: std::time::Instant,
 }
 
 impl Link {
@@ -461,6 +474,7 @@ async fn connect(replication: &Arc<Replication>, peer: &Arc<PeerHandle>) -> Resu
         remote_node: ack.node_id,
         codec: ack.codec,
         applied: HashMap::new(),
+        last_exchange: std::time::Instant::now(),
     };
     link.take_vector(&ack.applied);
 
@@ -583,11 +597,25 @@ async fn stream(
                 let _ = tokio::time::timeout(refusal_pause, peer.kick.notified()).await;
             }
             Sent::Nothing => {
-                let poll = if replication.unreleased() > 0 {
+                let mut poll = if replication.unreleased() > 0 {
                     GATED_POLL
                 } else {
                     IDLE_POLL
                 };
+
+                // A link with nothing to carry is spoken on anyway, often
+                // enough that the other end does not take it for abandoned.
+                if let Some(every) = config.keepalive_interval() {
+                    let quiet = link.last_exchange.elapsed();
+                    if quiet >= every {
+                        keep_alive(replication, peer, link, codec).await?;
+                        // Whatever became sendable while that was in flight
+                        // goes before any waiting.
+                        continue;
+                    }
+                    poll = poll.min(every.saturating_sub(quiet));
+                }
+
                 tokio::select! {
                     _ = &mut woken => {}
                     _ = peer.kick.notified() => {}
@@ -596,6 +624,48 @@ async fn stream(
             }
         }
     }
+}
+
+/// Asks the peer whether it is there, on a link that has had nothing to carry.
+///
+/// A `Ping` is as old as the protocol: every build that can receive a stream
+/// answers one, so this needs nothing of the peer that a link does not already.
+/// The answer carries the peer's clock, which is folded in as it is from any
+/// other frame — a quiet pair of nodes otherwise goes without hearing each
+/// other's.
+///
+/// An error ends the link, as a failed send does. That is the other half of
+/// what this is for: a peer that has gone is found out within one interval,
+/// and reported down then, not when the next transaction happens to need it.
+async fn keep_alive(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    link: &mut Link,
+    codec: &mut FrameCodec,
+) -> Result<(), String> {
+    let response = link
+        .client
+        .send(protocol::plain_frame(FrameKind::Ping, 0, &[]))
+        .await
+        .map_err(|e| format!("{} did not answer a keep-alive: {}", peer.name, e))?;
+
+    let mut scratch = Vec::new();
+    let (header, body) = codec
+        .decode_frame(&response, &mut scratch)
+        .map_err(|e| format!("{} answered with an unreadable frame: {}", peer.name, e))?;
+
+    match header.kind {
+        FrameKind::Pong => {}
+        FrameKind::Error => return Err(protocol::decode_error(body)),
+        other => return Err(format!("{} answered a PING with {}", peer.name, other)),
+    }
+
+    if let Some(clock) = body.get(..8).and_then(|bytes| bytes.try_into().ok()) {
+        replication.clock().observe(u64::from_le_bytes(clock));
+    }
+
+    link.last_exchange = std::time::Instant::now();
+    Ok(())
 }
 
 /// What one look at one origin's stream came to.
@@ -820,6 +890,7 @@ async fn push(
         .send_borrowed(frame)
         .await
         .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
+    link.last_exchange = std::time::Instant::now();
 
     let stats = replication.stats();
     stats.bytes_raw.fetch_add(raw, Ordering::Relaxed);
