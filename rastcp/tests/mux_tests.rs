@@ -724,3 +724,122 @@ async fn inline_handlers_serve_the_same_requests_the_same_way() {
     })
     .await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn callers_waiting_on_an_attempt_to_connect_share_its_failure() {
+    bounded(async {
+        // Something that accepts connections and never speaks: the handshake
+        // runs out the client's whole timeout before it fails.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }
+        });
+
+        const TIMEOUT: Duration = Duration::from_millis(400);
+        let client = mux(&addr, TIMEOUT).await;
+
+        // Eight callers find the connection down together. One attempt is
+        // made on behalf of all of them; eight in a row would take eight
+        // timeouts.
+        let started = Instant::now();
+        let mut callers = Vec::new();
+        for seed in 0..8usize {
+            let client = client.clone();
+            callers.push(tokio::spawn(async move {
+                client.send(&request(ECHO, seed, 8)).await
+            }));
+        }
+        for caller in callers {
+            assert!(
+                caller.await.unwrap().is_err(),
+                "a request was answered by a server that is not one"
+            );
+        }
+        let took = started.elapsed();
+        assert!(took >= TIMEOUT, "the attempt gave up after {took:?}");
+        assert!(
+            took < TIMEOUT * 3,
+            "eight callers waited {took:?} for one failure"
+        );
+
+        // The failure belonged to those who waited for it. A caller that
+        // comes later gets an attempt of its own, not a remembered answer.
+        let started = Instant::now();
+        assert!(client.send(&request(ECHO, 99, 8)).await.is_err());
+        let took = started.elapsed();
+        assert!(
+            took >= TIMEOUT * 3 / 4,
+            "a later caller was refused after {took:?} without an attempt"
+        );
+
+        silent.abort();
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_was_begun_is_finished_though_its_connection_is_lost() {
+    bounded(async {
+        let begun = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicU64::new(0));
+        let (starts, finishes) = (begun.clone(), finished.clone());
+
+        let running = serve_with(
+            |builder| builder,
+            move |data: Vec<u8>| {
+                let (starts, finishes) = (starts.clone(), finishes.clone());
+                async move {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    sleep(Duration::from_millis(300)).await;
+                    finishes.fetch_add(1, Ordering::SeqCst);
+                    data
+                }
+            },
+        )
+        .await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+
+        let mut in_flight = Vec::new();
+        for seed in 0..4usize {
+            let client = client.clone();
+            in_flight.push(tokio::spawn(async move {
+                client.send(&request(ECHO, seed, 8)).await
+            }));
+        }
+
+        until("the requests are begun", || {
+            begun.load(Ordering::SeqCst) == 4
+        })
+        .await;
+        client.close().await;
+
+        for task in in_flight {
+            assert!(task.await.unwrap().is_err());
+        }
+        until("the server sees the connection go", || {
+            running.server.active_connections() == 0
+        })
+        .await;
+
+        // Nobody is left to answer, and the work is done all the same: a
+        // write half carried out is worse than one carried out unseen.
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            0,
+            "the test is too slow to test anything"
+        );
+        until("the handlers finish", || {
+            finished.load(Ordering::SeqCst) == 4
+        })
+        .await;
+
+        running.task.abort();
+    })
+    .await
+}

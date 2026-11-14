@@ -91,6 +91,11 @@ struct State {
     deadlines: VecDeque<Expiry>,
     /// Frames received on this connection.
     received: u64,
+    /// Attempts to open a connection that have finished, and how the last one
+    /// failed if it did. Callers that were waiting on an attempt share its
+    /// failure instead of each making the same attempt again.
+    dials: u64,
+    dial_error: Option<RastcpError>,
 }
 
 /// One request id and what is known about the request that holds it.
@@ -128,20 +133,43 @@ struct Expiry {
 }
 
 /// An error to hand to each of several callers. The original cannot be shared
-/// out — an I/O error is not `Clone` — so each gets one that reads the same.
+/// out — an I/O error is not `Clone` — so each gets one of the same kind that
+/// reads the same.
+///
+/// Every variant is spelled out, so that adding one to [`RastcpError`] is a
+/// compile error here and not a failure quietly reported as something else.
 fn replicate(err: &RastcpError) -> RastcpError {
     match err {
         RastcpError::Io(io) => RastcpError::Io(std::io::Error::new(io.kind(), io.to_string())),
         RastcpError::Tls(tls) => RastcpError::Tls(tls.clone()),
         RastcpError::ConnectionClosed => RastcpError::ConnectionClosed,
         RastcpError::ConnectionTimeout => RastcpError::ConnectionTimeout,
+        RastcpError::CertificateLoading(message) => {
+            RastcpError::CertificateLoading(message.clone())
+        }
+        RastcpError::InvalidMessageFormat => RastcpError::InvalidMessageFormat,
         RastcpError::MessageTooLarge { len, max } => RastcpError::MessageTooLarge {
             len: *len,
             max: *max,
         },
+        RastcpError::ConnectionLimitReached => RastcpError::ConnectionLimitReached,
         RastcpError::ProtocolError(message) => RastcpError::ProtocolError(message.clone()),
+        RastcpError::AuthenticationError(message) => {
+            RastcpError::AuthenticationError(message.clone())
+        }
+        RastcpError::SocketBindingError(message) => {
+            RastcpError::SocketBindingError(message.clone())
+        }
+        RastcpError::SocketListeningError(message) => {
+            RastcpError::SocketListeningError(message.clone())
+        }
+        RastcpError::SocketKeepAliveError(message) => {
+            RastcpError::SocketKeepAliveError(message.clone())
+        }
+        RastcpError::TlsHandshakeTimeout => RastcpError::TlsHandshakeTimeout,
         RastcpError::HandlerTimeout => RastcpError::HandlerTimeout,
-        other => RastcpError::ProtocolError(other.to_string()),
+        RastcpError::ConnectionBackpressure => RastcpError::ConnectionBackpressure,
+        RastcpError::NotConnected => RastcpError::NotConnected,
     }
 }
 
@@ -319,21 +347,47 @@ impl Shared {
 
     /// Makes sure a connection is up, opening one if there is none.
     async fn open(self: &Arc<Self>) -> Result<(), RastcpError> {
+        let seen = self.lock().dials;
         let _opening = self.opening.lock().await;
 
-        if self.lock().up {
-            return Ok(());
+        {
+            let state = self.lock();
+
+            if state.up {
+                return Ok(());
+            }
+
+            // An attempt finished while this caller waited for its turn, and
+            // it failed. That attempt was made for this caller too. Making
+            // another for each caller in the queue would have a hundred
+            // callers wait out a hundred handshake timeouts, one after the
+            // other, to be told the same thing.
+            if state.dials != seen {
+                if let Some(err) = &state.dial_error {
+                    return Err(replicate(err));
+                }
+            }
         }
 
-        let stream = self.dialer.open().await?;
+        let dialled = self.dialer.open().await;
 
-        let epoch = {
-            let mut state = self.lock();
-            state.epoch += 1;
-            state.up = true;
-            state.received = 0;
-            state.epoch
+        let mut state = self.lock();
+        state.dials += 1;
+
+        let stream = match dialled {
+            Ok(stream) => stream,
+            Err(err) => {
+                state.dial_error = Some(replicate(&err));
+                return Err(err);
+            }
         };
+
+        state.dial_error = None;
+        state.epoch += 1;
+        state.up = true;
+        state.received = 0;
+        let epoch = state.epoch;
+        drop(state);
 
         tokio::spawn(drive(self.clone(), stream, epoch));
 
@@ -374,37 +428,55 @@ async fn drive(shared: Arc<Shared>, mut stream: TlsStream<TcpStream>, epoch: u64
         deadline: shared.dialer.timeout.map(Deadline::new),
     };
 
-    let end = std::future::poll_fn(|cx| link.poll(&shared, &mut stream, cx)).await;
+    // Whatever ends this task, the client is told its connection is gone.
+    // Without that a panic in here would leave every caller queueing requests
+    // for a task that no longer exists, and nothing to time them out.
+    let mut ended = Ended {
+        shared: &shared,
+        epoch,
+        reason: RastcpError::ConnectionClosed,
+    };
 
-    let reason = match end {
+    match std::future::poll_fn(|cx| link.poll(&shared, &mut stream, cx)).await {
         Ok(()) => {
             debug!("Closing a multiplexed connection that was given up");
             // An orderly end: say so, but do not let a peer that is not
             // listening hold the task.
             let closing = std::time::Duration::from_secs(5);
             let _ = tokio::time::timeout(closing, stream.shutdown()).await;
-            RastcpError::ConnectionClosed
         }
         Err(err) => {
             match err {
                 RastcpError::ConnectionClosed => debug!("The multiplexed connection was closed"),
                 ref err => warn!("The multiplexed connection was lost: {err}"),
             }
-            err
-        }
-    };
-
-    let mut wakers = Vec::new();
-    {
-        let mut state = shared.lock();
-        // A newer connection may already be up; its state is not this
-        // task's to clear.
-        if state.epoch == epoch {
-            state.lose(&reason, &mut wakers);
+            ended.reason = err;
         }
     }
-    for waker in wakers {
-        waker.wake();
+}
+
+/// Marks a connection lost when the task that owned it ends.
+struct Ended<'a> {
+    shared: &'a Shared,
+    epoch: u64,
+    reason: RastcpError,
+}
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        let mut wakers = Vec::new();
+        {
+            let mut state = self.shared.lock();
+            // A newer connection may already be up, or this one may have been
+            // given up and its requests failed already; then the state is not
+            // this task's to clear.
+            if state.epoch == self.epoch {
+                state.lose(&self.reason, &mut wakers);
+            }
+        }
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
@@ -637,6 +709,8 @@ impl MuxClient {
                     free: Vec::new(),
                     deadlines: VecDeque::new(),
                     received: 0,
+                    dials: 0,
+                    dial_error: None,
                 }),
                 handles: AtomicUsize::new(1),
             }),

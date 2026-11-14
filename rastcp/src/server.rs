@@ -1144,7 +1144,7 @@ impl TcpServer {
     {
         let mut reader = FrameReader::tagged();
         let mut writer = FrameWriter::new();
-        let mut in_flight: InFlight = JoinSet::new();
+        let mut in_flight = InFlight(JoinSet::new());
         // Which request each task is handling, for the one case where the
         // task cannot say so itself: it panicked.
         let mut ids: std::collections::HashMap<tokio::task::Id, u32> =
@@ -1333,10 +1333,6 @@ impl TcpServer {
             }
         }
 
-        // Handlers still running are left to finish, as the handler of a plain
-        // connection finishes before a lost peer is noticed. Dropping them
-        // here would cancel each wherever it happened to be waiting.
-        in_flight.detach_all();
     }
 
     /// One accepted socket, from handshake to close.
@@ -1467,9 +1463,36 @@ impl Drop for OpenConnection {
 /// A server-side TLS connection.
 type ServerTls = tokio_rustls::server::TlsStream<TcpStream>;
 
-/// The handlers of one multiplexed connection that had to wait: each yields
-/// the id of its request and its reply, or `None` if it ran out of time.
-type InFlight = JoinSet<(u32, Option<Vec<u8>>)>;
+/// The handlers of one multiplexed connection that are running as tasks: each
+/// yields the id of its request and its reply, or `None` if it ran out of
+/// time.
+///
+/// Dropping a `JoinSet` cancels its tasks, each wherever it happened to be
+/// waiting. This lets them go instead, on every way out of the connection —
+/// a lost peer, an error, a panic — so a request that was begun is finished,
+/// as the handler of a plain connection is finished before a lost peer is
+/// even noticed.
+struct InFlight(JoinSet<(u32, Option<Vec<u8>>)>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
+}
+
+impl std::ops::Deref for InFlight {
+    type Target = JoinSet<(u32, Option<Vec<u8>>)>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for InFlight {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// What a multiplexed connection wakes up for.
 enum Event {
