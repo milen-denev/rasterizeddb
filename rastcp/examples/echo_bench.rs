@@ -27,7 +27,9 @@ fn runtime(threads: usize) -> tokio::runtime::Runtime {
 }
 
 fn arg<T: std::str::FromStr>(args: &[String], index: usize, default: T) -> T {
-    args.get(index).and_then(|v| v.parse().ok()).unwrap_or(default)
+    args.get(index)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
@@ -36,7 +38,9 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("server") => server(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
         Some("client") => client(
-            args.get(2).cloned().unwrap_or_else(|| "127.0.0.1:7878".to_string()),
+            args.get(2)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:7878".to_string()),
             arg(&args, 3, 64usize),
             arg(&args, 4, 5u64),
             arg(&args, 5, 64usize),
@@ -165,8 +169,19 @@ fn client(
 
 /// One round of `depth` requests on a connection. Returns how many completed.
 async fn round(client: &mut rastcp::client::TcpClient, request: &[u8], depth: usize) -> u64 {
-    let _ = depth;
-    let response = client.send_borrowed(request).await.expect("send");
-    assert_eq!(response.len(), request.len());
-    1
+    if depth <= 1 {
+        let response = client.send_borrowed(request).await.expect("send");
+        assert_eq!(response.len(), request.len());
+        return 1;
+    }
+
+    let batch = vec![request; depth];
+    let responses = client.send_batch(&batch).await.expect("send_batch");
+    assert_eq!(responses.len(), depth);
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.len() == request.len())
+    );
+    depth as u64
 }

@@ -3,6 +3,7 @@ pub mod client;
 pub mod common;
 pub mod config;
 pub mod error;
+mod frame;
 mod interrupt;
 pub mod server;
 pub mod session;

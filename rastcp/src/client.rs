@@ -3,14 +3,18 @@ use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, Error, SignatureScheme};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::ALPN_PROTOCOL;
-use crate::common::{read_message_limited, write_message_with};
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
+use crate::frame::{FrameReader, FrameWriter};
 use crate::interrupt::Deadline;
 use crate::session::{AuthChannel, ClientAuthenticator};
 use crate::tls::{ClientIdentity, Trust};
@@ -85,14 +89,8 @@ pub struct TcpClient {
     addr: String,
     connector: TlsConnector,
     server_name: ServerName<'static>,
-    connection: Option<TlsStream<TcpStream>>,
+    connection: Option<Connection>,
     timeout: Option<std::time::Duration>,
-    /// The one timer behind every request's timeout on the open connection.
-    /// Made with the connection, because both belong to the runtime that
-    /// opened it; `None` when the client has no timeout or no connection.
-    deadline: Option<Deadline>,
-    /// Where a request and its length prefix are joined into one write.
-    scratch: Vec<u8>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
     auth_timeout: std::time::Duration,
     max_message_size: usize,
@@ -265,12 +263,225 @@ impl TcpClientBuilder {
             server_name,
             connection: None,
             timeout: self.timeout,
-            deadline: None,
-            scratch: Vec::new(),
             authenticator: self.authenticator,
             auth_timeout: self.auth_timeout,
             max_message_size: self.max_message_size,
         })
+    }
+}
+
+/// An open, authenticated connection and everything that belongs to it.
+///
+/// One struct so that all of it is dropped together. Bytes read ahead, a
+/// request half written and a timer armed for the old socket are all wrong for
+/// the connection that replaces it.
+struct Connection {
+    stream: TlsStream<TcpStream>,
+    reader: FrameReader,
+    writer: FrameWriter,
+    /// The one timer behind every timeout on this connection. Made with it,
+    /// because both belong to the runtime that opened it; `None` when the
+    /// client has no timeout.
+    deadline: Option<Deadline>,
+}
+
+/// Runs `wait` under `deadline`, if there is one.
+async fn within<T, F>(deadline: &mut Option<Deadline>, wait: F) -> Result<T, RastcpError>
+where
+    F: Future<Output = Result<T, RastcpError>>,
+{
+    match deadline {
+        Some(deadline) => deadline.run(wait).await.unwrap_or(Err(RastcpError::ConnectionTimeout)),
+        None => wait.await,
+    }
+}
+
+impl Connection {
+    /// Sends one request and reads its response. Each half gets the whole
+    /// timeout, as it did when each had a timer of its own.
+    async fn exchange(
+        &mut self,
+        request: &[u8],
+        max_message_size: usize,
+    ) -> Result<Vec<u8>, RastcpError> {
+        let Self {
+            stream,
+            reader,
+            writer,
+            deadline,
+        } = self;
+
+        within(deadline, async {
+            if writer.queue(request)? {
+                writer.flush(stream).await
+            } else {
+                writer.send_large(stream, request).await
+            }
+        })
+        .await?;
+        debug!("Sent {} bytes", request.len());
+
+        within(deadline, reader.frame(stream, max_message_size)).await
+    }
+
+    /// Sends every request and reads every response, both at once.
+    ///
+    /// Writing the whole batch before reading anything would deadlock on a
+    /// large one: the server stops reading when its replies have nowhere to
+    /// go, this side stops writing when the server stops reading, and neither
+    /// moves again. So responses are taken off the connection while requests
+    /// are still going onto it.
+    async fn exchange_batch<B: AsRef<[u8]>>(
+        &mut self,
+        requests: &[B],
+        max_message_size: usize,
+    ) -> Result<Vec<Vec<u8>>, RastcpError> {
+        let Self {
+            stream,
+            reader,
+            writer,
+            deadline,
+        } = self;
+
+        let mut pump = Pump {
+            requests,
+            next: 0,
+            writer,
+            written: 0,
+            large: None,
+            flushed: false,
+            reader,
+            responses: Vec::with_capacity(requests.len()),
+            max_message_size,
+        };
+
+        // One wait per response rather than one for the batch: the timeout
+        // bounds how long the server may go quiet, as it does for requests
+        // sent one at a time, not how long a large batch may take in all.
+        while pump.responses.len() < requests.len() {
+            let before = pump.responses.len();
+            within(
+                deadline,
+                std::future::poll_fn(|cx| pump.poll_progress(stream, cx, before)),
+            )
+            .await?;
+        }
+
+        Ok(pump.responses)
+    }
+}
+
+/// The state of one batch in flight: what is still to be written and what has
+/// come back.
+struct Pump<'a, B> {
+    requests: &'a [B],
+    /// The first request not yet handed to the writer.
+    next: usize,
+    writer: &'a mut FrameWriter,
+    /// How much of what the writer holds has reached the stream.
+    written: usize,
+    /// A request too large to copy, and how much of it has been written.
+    large: Option<(&'a [u8], usize)>,
+    flushed: bool,
+    reader: &'a mut FrameReader,
+    responses: Vec<Vec<u8>>,
+    max_message_size: usize,
+}
+
+impl<B: AsRef<[u8]>> Pump<'_, B> {
+    /// Writes as much as the stream takes without waiting. Pending only when
+    /// the stream is; ready once every request has been written and flushed.
+    fn poll_send(
+        &mut self,
+        stream: &mut TlsStream<TcpStream>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), RastcpError>> {
+        loop {
+            let queued = self.writer.queued();
+            if self.written < queued.len() {
+                let n = ready!(Pin::new(&mut *stream).poll_write(cx, &queued[self.written..]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()));
+                }
+                self.written += n;
+                continue;
+            }
+            self.writer.clear();
+            self.written = 0;
+
+            if let Some((payload, at)) = self.large.as_mut() {
+                if *at < payload.len() {
+                    let n = ready!(Pin::new(&mut *stream).poll_write(cx, &payload[*at..]))?;
+                    if n == 0 {
+                        return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()));
+                    }
+                    *at += n;
+                    continue;
+                }
+                self.large = None;
+            }
+
+            if self.next < self.requests.len() {
+                // As many small requests as make one good-sized write, or the
+                // prefix of one large one.
+                while self.next < self.requests.len() && !self.writer.is_full() {
+                    let request = self.requests[self.next].as_ref();
+                    self.next += 1;
+
+                    if !self.writer.queue(request)? {
+                        self.writer.queue_prefix(request.len())?;
+                        self.large = Some((request, 0));
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            if !self.flushed {
+                ready!(Pin::new(&mut *stream).poll_flush(cx))?;
+                self.flushed = true;
+            }
+
+            return Poll::Ready(Ok(()));
+        }
+    }
+
+    /// Moves the batch along. Ready once more responses are in than `before`.
+    fn poll_progress(
+        &mut self,
+        stream: &mut TlsStream<TcpStream>,
+        cx: &mut Context<'_>,
+        before: usize,
+    ) -> Poll<Result<(), RastcpError>> {
+        // Pending here is not the end of this poll: the stream not taking more
+        // is exactly when the responses have to be read.
+        let sent = match self.poll_send(stream, cx) {
+            Poll::Ready(Ok(())) => true,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => false,
+        };
+
+        while self.responses.len() < self.requests.len() {
+            match self.reader.poll_frame(stream, cx, self.max_message_size) {
+                Poll::Ready(Ok(response)) => self.responses.push(response),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => break,
+            }
+        }
+
+        if self.responses.len() == self.requests.len() && !sent {
+            // An answer to a request that has not been sent. Whatever the
+            // peer is, it is not following this protocol.
+            return Poll::Ready(Err(RastcpError::ProtocolError(
+                "the server answered more requests than it was sent".to_string(),
+            )));
+        }
+
+        if self.responses.len() > before {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -310,8 +521,12 @@ impl TcpClient {
 
             self.authenticate(&mut tls_stream).await?;
 
-            self.deadline = self.timeout.map(Deadline::new);
-            self.connection = Some(tls_stream);
+            self.connection = Some(Connection {
+                stream: tls_stream,
+                reader: FrameReader::new(),
+                writer: FrameWriter::new(),
+                deadline: self.timeout.map(Deadline::new),
+            });
         }
         Ok(())
     }
@@ -364,44 +579,57 @@ impl TcpClient {
             self.connect().await?;
         }
 
-        let io_result = {
-            let stream = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
-            let max_message_size = self.max_message_size;
-            let scratch = &mut self.scratch;
+        let max_message_size = self.max_message_size;
+        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
 
-            match self.deadline.as_mut() {
-                // Each half of the exchange gets the whole timeout, as it did
-                // when each had a timer of its own.
-                Some(deadline) => {
-                    match deadline.run(write_message_with(stream, scratch, data)).await {
-                        Ok(Ok(())) => {
-                            debug!("Sent {} bytes", data.len());
-                            deadline
-                                .run(read_message_limited(stream, max_message_size))
-                                .await
-                                .unwrap_or(Err(RastcpError::ConnectionTimeout))
-                        }
-                        Ok(Err(err)) => Err(err),
-                        Err(_) => Err(RastcpError::ConnectionTimeout),
-                    }
-                }
-                None => match write_message_with(stream, scratch, data).await {
-                    Ok(()) => {
-                        debug!("Sent {} bytes", data.len());
-                        read_message_limited(stream, max_message_size).await
-                    }
-                    Err(err) => Err(err),
-                },
-            }
-        };
-
-        match io_result {
+        match connection.exchange(data, max_message_size).await {
             Ok(response) => {
                 debug!("Received {} bytes response", response.len());
                 Ok(response)
             }
             Err(err) => {
-                self.drop_connection();
+                self.connection = None;
+                Err(err)
+            }
+        }
+    }
+
+    /// Sends several requests at once and returns their responses, in order.
+    ///
+    /// The requests leave together and the server answers them together, so a
+    /// batch of small requests costs a handful of system calls on each side
+    /// instead of two per request. The server handles them one after another
+    /// in the order given, exactly as if each had been sent with
+    /// [`TcpClient::send`] after the response to the one before.
+    ///
+    /// All or nothing from the caller's side: on an error the connection is
+    /// dropped and no responses are returned, though the server may already
+    /// have carried out any number of the requests. Batch only what is safe to
+    /// send again, or what the caller can otherwise reconcile.
+    ///
+    /// The timeout bounds the wait for each next response, not the batch.
+    pub async fn send_batch<B: AsRef<[u8]>>(
+        &mut self,
+        requests: &[B],
+    ) -> Result<Vec<Vec<u8>>, RastcpError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !self.is_connected() {
+            self.connect().await?;
+        }
+
+        let max_message_size = self.max_message_size;
+        let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
+
+        match connection.exchange_batch(requests, max_message_size).await {
+            Ok(responses) => {
+                debug!("Received {} responses", responses.len());
+                Ok(responses)
+            }
+            Err(err) => {
+                self.connection = None;
                 Err(err)
             }
         }
@@ -409,14 +637,8 @@ impl TcpClient {
 
     // Add a close method to explicitly close the connection
     pub async fn close(&mut self) -> Result<(), RastcpError> {
-        self.drop_connection();
-        Ok(())
-    }
-
-    /// Forgets the connection and the timer that was made with it.
-    fn drop_connection(&mut self) {
         self.connection = None;
-        self.deadline = None;
+        Ok(())
     }
 
     // Add a is_connected method to check connection status

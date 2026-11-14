@@ -19,7 +19,7 @@ use crate::cert::generate_self_signed_cert;
 use crate::interrupt::{Guard, Interrupted, StopListener, StopSignal};
 use crate::session::{AuthChannel, Principal, ServerAuthenticator};
 use crate::tls::{ClientAuth, Fingerprint};
-use crate::common::write_message_with;
+use crate::frame::{FrameReader, FrameWriter};
 use crate::error::RastcpError;
 use crate::ALPN_PROTOCOL;
 
@@ -811,6 +811,42 @@ impl TcpServer {
         }
     }
 
+    /// Writes out the replies that are waiting, under the connection's deadline.
+    async fn send_replies(
+        guard: &mut Guard,
+        writer: &mut FrameWriter,
+        tls_stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    ) -> Result<(), RastcpError> {
+        if writer.is_empty() {
+            return Ok(());
+        }
+
+        guard
+            .run(writer.flush(tls_stream), false)
+            .await
+            .unwrap_or(Err(RastcpError::ConnectionTimeout))
+    }
+
+    /// Records why a connection stopped yielding requests, at the level each
+    /// reason deserves: a peer hanging up is ordinary, a malformed stream is
+    /// not.
+    fn log_read_end(peer_addr: SocketAddr, e: RastcpError) {
+        match e {
+            RastcpError::ConnectionClosed => {
+                info!("Connection closed by peer: {}", peer_addr);
+            }
+            RastcpError::Io(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                info!("Connection reset by peer: {}", peer_addr);
+            }
+            RastcpError::Tls(e) => {
+                warn!("TLS error from {}: {}", peer_addr, e);
+            }
+            e => {
+                error!("Error reading from {}: {}", peer_addr, e);
+            }
+        }
+    }
+
     /// One accepted socket, from handshake to close.
     async fn serve_connection<H, Fut>(
         stream: TcpStream,
@@ -887,23 +923,19 @@ impl TcpServer {
         // One stop listener and one timer for the life of the connection, in
         // place of a timer per read, per handler call and per write.
         let mut guard = Guard::new(shutdown, request_timeout);
-        // Where a response and its length prefix are joined into one write, so
-        // they leave as one TLS record. Kept across requests: a connection
-        // that answers small requests never allocates for it again.
-        let mut scratch = Vec::new();
+        let mut reader = FrameReader::new();
+        let mut writer = FrameWriter::new();
 
-        loop {
-            // A shutdown ends the session between requests: the peer
-            // gets a close_notify and a clean EOF, instead of a socket
-            // that dies under it and leaves it stuck in CLOSE_WAIT.
-            let read = match guard
-                .run(
-                    crate::common::read_message_limited(&mut tls_stream, max_message_size),
-                    true,
-                )
+        'connection: loop {
+            // Nothing is owed to the peer at this point, so this is where the
+            // connection may sit idle, and where a shutdown ends it: the peer
+            // gets a close_notify and a clean EOF, instead of a socket that
+            // dies under it and leaves it stuck in CLOSE_WAIT.
+            let mut next = match guard
+                .run(reader.frame(&mut tls_stream, max_message_size), true)
                 .await
             {
-                Ok(read) => read,
+                Ok(next) => next,
                 Err(Interrupted::Stopping) => {
                     debug!("Shutting down, closing connection to {}", peer_addr);
                     break;
@@ -911,51 +943,97 @@ impl TcpServer {
                 Err(Interrupted::TimedOut) => Err(RastcpError::ConnectionTimeout),
             };
 
-            match read {
-                Ok(data) => {
-                    debug!("Received {} bytes from {}", data.len(), peer_addr);
+            // Then every request that has already arrived is served before
+            // anything is written back, so a peer that sent several gets them
+            // answered with one write. They are still handled one at a time
+            // and in order: the replies carry nothing to match them to their
+            // requests but their position.
+            let mut served = 0usize;
 
-                    // Not stoppable from here on: a request that was read is
-                    // answered, which is what lets a shutdown drain.
-                    let response = match guard.run(handler(principal.clone(), data), false).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            error!("Handler timed out for {}", peer_addr);
-                            break;
+            loop {
+                let data = match next {
+                    Ok(data) => data,
+                    Err(e) => {
+                        // The requests before this one were served, and their
+                        // replies are still owed.
+                        if let Err(e) = Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await {
+                            debug!("Failed to write response to {}: {}", peer_addr, e);
                         }
-                    };
-
-                    debug!("Replying with {} bytes to {}", response.len(), peer_addr);
-
-                    let written = match guard
-                        .run(write_message_with(&mut tls_stream, &mut scratch, &response), false)
-                        .await
-                    {
-                        Ok(written) => written,
-                        Err(_) => Err(RastcpError::ConnectionTimeout),
-                    };
-
-                    if let Err(e) = written {
-                        error!("Failed to write response to {}: {}", peer_addr, e);
-                        break;
+                        Self::log_read_end(peer_addr, e);
+                        break 'connection;
                     }
+                };
+
+                debug!("Received {} bytes from {}", data.len(), peer_addr);
+
+                // Not stoppable from here on: a request that was read is
+                // answered, which is what lets a shutdown drain.
+                let mut call = std::pin::pin!(handler(principal.clone(), data));
+
+                let response = match poll_once(call.as_mut()).await {
+                    Some(response) => response,
+                    None => {
+                        // This one has to wait for something. The replies
+                        // already made do not wait with it.
+                        if let Err(e) = Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await {
+                            error!("Failed to write response to {}: {}", peer_addr, e);
+                            break 'connection;
+                        }
+
+                        match guard.run(call, false).await {
+                            Ok(response) => response,
+                            Err(_) => {
+                                error!("Handler timed out for {}", peer_addr);
+                                break 'connection;
+                            }
+                        }
+                    }
+                };
+
+                debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+
+                let queued = match writer.queue(&response) {
+                    Ok(true) if !writer.is_full() => Ok(()),
+                    Ok(true) => Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await,
+                    Ok(false) => guard
+                        .run(writer.send_large(&mut tls_stream, &response), false)
+                        .await
+                        .unwrap_or(Err(RastcpError::ConnectionTimeout)),
+                    Err(e) => Err(e),
+                };
+
+                if let Err(e) = queued {
+                    error!("Failed to write response to {}: {}", peer_addr, e);
+                    break 'connection;
                 }
-                Err(RastcpError::ConnectionClosed) => {
-                    info!("Connection closed by peer: {}", peer_addr);
+
+                // A stopping server finishes what it has read and reads no
+                // more; the wait at the top of the outer loop closes.
+                if guard.is_stopping() {
                     break;
                 }
-                Err(RastcpError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                    info!("Connection reset by peer: {}", peer_addr);
+
+                served += 1;
+
+                // Asking the connection for more costs a trip through the TLS
+                // stream and the reactor even when the answer is no, and for a
+                // peer that sends one request and waits it always is no. So
+                // the question is put only to a peer that has shown it sends
+                // ahead: more bytes are already here, or this batch is
+                // already more than one request.
+                if !reader.has_buffered() && served < 2 {
                     break;
                 }
-                Err(RastcpError::Tls(e)) => {
-                    warn!("TLS error from {}: {}", peer_addr, e);
-                    break;
+
+                match reader.frame_now(&mut tls_stream, max_message_size).await {
+                    Some(frame) => next = frame,
+                    None => break,
                 }
-                Err(e) => {
-                    error!("Error reading from {}: {}", peer_addr, e);
-                    break;
-                }
+            }
+
+            if let Err(e) = Self::send_replies(&mut guard, &mut writer, &mut tls_stream).await {
+                error!("Failed to write response to {}: {}", peer_addr, e);
+                break;
             }
         }
 
@@ -967,6 +1045,19 @@ impl TcpServer {
         debug!("Connection handler completed for {}", peer_addr);
         Ok(())
     }
+}
+
+/// Polls `future` once: its output if it had one ready, `None` if it has to
+/// wait. The task is left registered with whatever the future is waiting for,
+/// so polling it again later loses nothing.
+async fn poll_once<F: Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+    std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(match future.as_mut().poll(cx) {
+            std::task::Poll::Ready(output) => Some(output),
+            std::task::Poll::Pending => None,
+        })
+    })
+    .await
 }
 
 #[cfg(test)]

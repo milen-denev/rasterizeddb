@@ -98,12 +98,18 @@ impl StopSignal {
     fn lock(&self) -> std::sync::MutexGuard<'_, Waiters> {
         // Nothing run under this lock can panic halfway through an update, so
         // a poisoned lock still guards a consistent list.
-        self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[cfg(test)]
     fn registered(&self) -> usize {
-        self.lock().slots.iter().filter(|slot| slot.is_some()).count()
+        self.lock()
+            .slots
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
     }
 
     #[cfg(test)]
@@ -133,7 +139,11 @@ impl StopListener {
             return Poll::Ready(());
         }
 
-        if self.waker.as_ref().is_some_and(|waker| waker.will_wake(cx.waker())) {
+        if self
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()))
+        {
             return Poll::Pending;
         }
 
@@ -216,7 +226,10 @@ impl Deadline {
     /// Ready when the wait has outlived it. Otherwise the timer is known to be
     /// registered to wake `cx`'s task no later than `expires`.
     fn poll_expired(&mut self, cx: &mut Context<'_>, expires: Instant) -> Poll<()> {
-        let listening = self.waker.as_ref().is_some_and(|waker| waker.will_wake(cx.waker()));
+        let listening = self
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()));
 
         if expires < self.armed {
             // Waits on one connection start in order with one period, so this
@@ -297,6 +310,10 @@ impl Guard {
             stop,
             deadline: Deadline::new(period),
         }
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stop.is_stopping()
     }
 
     /// Runs `future` to completion unless it stays pending past the deadline
@@ -382,11 +399,17 @@ mod tests {
         let mut deadline = Deadline::new(PERIOD);
 
         // Parks at 0 and arms the timer for one period.
-        assert_eq!(deadline.run(tokio::time::sleep(PERIOD * 4 / 5)).await, Ok(()));
+        assert_eq!(
+            deadline.run(tokio::time::sleep(PERIOD * 4 / 5)).await,
+            Ok(())
+        );
 
         // Parks at 0.8 and runs to 1.4: the timer fires in the middle of it,
         // for a wait that is over, and has to move rather than interrupt.
-        assert_eq!(deadline.run(tokio::time::sleep(PERIOD * 3 / 5)).await, Ok(()));
+        assert_eq!(
+            deadline.run(tokio::time::sleep(PERIOD * 3 / 5)).await,
+            Ok(())
+        );
 
         // And the moved timer is still a deadline: a wait parked now is
         // interrupted one period later, neither sooner nor never.
@@ -453,7 +476,9 @@ mod tests {
         });
 
         // In flight: runs to its end although the stop lands halfway through.
-        let outcome = guard.run(tokio::time::sleep(Duration::from_millis(150)), false).await;
+        let outcome = guard
+            .run(tokio::time::sleep(Duration::from_millis(150)), false)
+            .await;
         assert_eq!(outcome, Ok(()));
         assert!(signal.is_stopping());
 
@@ -467,9 +492,8 @@ mod tests {
         let signal = StopSignal::new();
         let mut guard = Guard::new(signal.listen(), Duration::from_secs(30));
 
-        let waiting = tokio::spawn(async move {
-            guard.run(std::future::pending::<()>(), true).await
-        });
+        let waiting =
+            tokio::spawn(async move { guard.run(std::future::pending::<()>(), true).await });
 
         while signal.registered() == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -503,6 +527,10 @@ mod tests {
         }
 
         assert_eq!(signal.registered(), 0);
-        assert_eq!(signal.slots(), 1, "a hundred connections in turn need one slot, not a hundred");
+        assert_eq!(
+            signal.slots(),
+            1,
+            "a hundred connections in turn need one slot, not a hundred"
+        );
     }
 }
