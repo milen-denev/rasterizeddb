@@ -254,9 +254,16 @@ async fn inserts_keep_their_pace_while_another_session_updates() {
     // stream holds the uniqueness lock for most of its cycle. The regression
     // this test exists for, inserts queueing behind an update's *scan*,
     // measured 0.06 against the old, much slower baseline and would measure
-    // lower against this one, so 0.10 still catches it.
+    // lower against this one, so 0.10 still caught it.
+    //
+    // It sat at that floor (0.09-0.14 alone, 2026-11-14) because the update
+    // still held every key stripe across its rewrite. An update that assigns
+    // no key column now takes none, and the insert's check samples again
+    // when it meets a version replaced after its snapshot (`Supersessions`
+    // in table.rs): 0.99-1.03, with 2.5x the updates completing. 0.5 catches
+    // a return of either wait.
     assert!(
-        ratio >= 0.10,
+        ratio >= 0.5,
         "inserts slowed to {:.0}% of their pace while another session updated other rows \
          ({with} rows against {without})",
         ratio * 100.0
@@ -360,6 +367,211 @@ async fn a_key_whose_row_is_being_relocated_is_never_inserted_twice() {
     assert!(relocations >= 10 && attempts >= 100, "the race barely ran: the test proves nothing");
     assert_eq!(admitted, 0, "an insert of an existing key was reported as inserted");
     assert_eq!((rows, dups), (N as i64, 0), "a duplicate key was stored");
+}
+
+/// The same race through a composite key and plain `INSERT`s: a composite
+/// key is checked by its own finder (`find_row_with_tuple`), and without
+/// `ON CONFLICT` every attempt must fail with 23505 rather than be skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_composite_key_whose_row_is_being_relocated_is_never_inserted_twice() {
+    let dir = root("dup2");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("start");
+    let url = server.url();
+    const N: u64 = 200;
+    let mut setup = sqlx::PgConnection::connect(&url).await.expect("connect");
+    setup
+        .execute("CREATE TABLE p (a BIGINT NOT NULL, b BIGINT NOT NULL, tag TEXT NOT NULL, n BIGINT NOT NULL, PRIMARY KEY (a, b))")
+        .await
+        .expect("create");
+    let values = (0..N).map(|i| format!("({i}, {}, 'x', {i})", i % 3)).collect::<Vec<_>>().join(",");
+    setup
+        .execute(AssertSqlSafe(format!("INSERT INTO p (a, b, tag, n) VALUES {values}")))
+        .await
+        .expect("seed");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let admitted = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
+    let other_errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let relocations = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for u in 0..2u64 {
+        let (url, stop, relocations) = (url.clone(), stop.clone(), relocations.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = u;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let start = (k * 37) % (N - 20);
+                let sql = format!(
+                    "UPDATE p SET tag = '{}' WHERE a >= {start} AND a < {}",
+                    "y".repeat((k % 40) as usize + 1),
+                    start + 20
+                );
+                if conn.execute(AssertSqlSafe(sql)).await.is_ok() {
+                    relocations.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for w in 0..4u64 {
+        let (url, stop, admitted, refused, other_errors) =
+            (url.clone(), stop.clone(), admitted.clone(), refused.clone(), other_errors.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = w * 53;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let a = k % N;
+                let sql = format!("INSERT INTO p (a, b, tag, n) VALUES ({a}, {}, 'dup', -1)", a % 3);
+                match conn.execute(AssertSqlSafe(sql)).await {
+                    Ok(r) => {
+                        admitted.fetch_add(r.rows_affected(), Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let code = e.as_database_error().and_then(|d| d.code()).map(|c| c.into_owned());
+                        if code.as_deref() == Some("23505") {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            other_errors.lock().unwrap().push(format!("{code:?}: {e}"));
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    stop.store(true, Ordering::Relaxed);
+    for t in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
+    }
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM p").fetch_one(&mut setup).await.expect("count");
+    let dups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM p WHERE n = -1")
+        .fetch_one(&mut setup)
+        .await
+        .expect("count dups");
+    let (refused, relocations, admitted) = (
+        refused.load(Ordering::Relaxed),
+        relocations.load(Ordering::Relaxed),
+        admitted.load(Ordering::Relaxed),
+    );
+    let other_errors = other_errors.lock().unwrap().clone();
+    println!(
+        "{refused} refused with 23505, {relocations} relocating updates, {admitted} rows admitted, \
+         {rows} rows, {dups} duplicates, {} other errors",
+        other_errors.len()
+    );
+    assert!(relocations >= 10 && refused >= 100, "the race barely ran: the test proves nothing");
+    assert!(other_errors.is_empty(), "an insert failed other than as a duplicate: {:?}", &other_errors[..other_errors.len().min(5)]);
+    assert_eq!(admitted, 0, "an insert of an existing key was reported as inserted");
+    assert_eq!((rows, dups), (N as i64, 0), "a duplicate key was stored");
+}
+
+/// An `UPDATE` that gives its rows new keys still keeps inserts of those
+/// keys out while it writes them. Its check of a new key and an insert's
+/// check of the same key could otherwise each find nothing and each write:
+/// no old version ever held the key, so nothing tells either check to look
+/// again. Blocks of keys move up by 1000 and back while other sessions insert
+/// keys from both ranges; whatever succeeds, no key may be stored twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_update_assigning_keys_and_inserts_of_them_never_store_one_twice() {
+    let dir = root("shift");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("start");
+    let url = server.url();
+    const N: u64 = 200;
+    let mut setup = sqlx::PgConnection::connect(&url).await.expect("connect");
+    setup
+        .execute("CREATE TABLE p (id BIGINT PRIMARY KEY, tag TEXT NOT NULL, n BIGINT NOT NULL)")
+        .await
+        .expect("create");
+    let values = (0..N).map(|i| format!("({i}, 'x', {i})")).collect::<Vec<_>>().join(",");
+    setup
+        .execute(AssertSqlSafe(format!("INSERT INTO p (id, tag, n) VALUES {values}")))
+        .await
+        .expect("seed");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let shifts = Arc::new(AtomicU64::new(0));
+    let admitted = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for u in 0..2u64 {
+        let (url, stop, shifts) = (url.clone(), stop.clone(), shifts.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = u * 5;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let start = (k * 37) % (N - 20);
+                let up = format!("UPDATE p SET id = id + 1000 WHERE id >= {start} AND id < {}", start + 20);
+                let down = format!(
+                    "UPDATE p SET id = id - 1000 WHERE id >= {} AND id < {}",
+                    start + 1000,
+                    start + 1020
+                );
+                for sql in [up, down] {
+                    if conn.execute(AssertSqlSafe(sql)).await.is_ok() {
+                        shifts.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+    // Seen by an inserter right after its insert: a key held twice.
+    let seen_twice = Arc::new(AtomicU64::new(0));
+    for w in 0..4u64 {
+        let (url, stop, admitted, seen_twice) = (url.clone(), stop.clone(), admitted.clone(), seen_twice.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = w * 53;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let key = (k * 7 + 3) % N + if k % 2 == 0 { 1000 } else { 0 };
+                // A marker of its own, so the row can be taken out again and
+                // the key left free for the next shift.
+                let marker = -((w * 10_000_000 + k) as i64) - 1;
+                let sql = format!("INSERT INTO p (id, tag, n) VALUES ({key}, 'new', {marker})");
+                if conn.execute(AssertSqlSafe(sql)).await.is_ok_and(|r| r.rows_affected() == 1) {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                    let holders: i64 = sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) FROM p WHERE id = {key}")))
+                        .fetch_one(&mut conn)
+                        .await
+                        .expect("count the key");
+                    if holders > 1 {
+                        seen_twice.fetch_add(1, Ordering::Relaxed);
+                    }
+                    conn.execute(AssertSqlSafe(format!("DELETE FROM p WHERE n = {marker}")))
+                        .await
+                        .expect("take the row out again");
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    stop.store(true, Ordering::Relaxed);
+    for t in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
+    }
+
+    let twice: Vec<(i64, i64)> = sqlx::query_as("SELECT id, COUNT(*) FROM p GROUP BY id HAVING COUNT(*) > 1")
+        .fetch_all(&mut setup)
+        .await
+        .expect("group");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM p").fetch_one(&mut setup).await.expect("count");
+    let (shifts, admitted, seen_twice) = (
+        shifts.load(Ordering::Relaxed),
+        admitted.load(Ordering::Relaxed),
+        seen_twice.load(Ordering::Relaxed),
+    );
+    println!(
+        "{shifts} key-assigning updates, {admitted} rows admitted, {seen_twice} seen held twice, {rows} rows, \
+         {} keys stored twice at the end",
+        twice.len()
+    );
+    assert!(shifts >= 100 && admitted >= 100, "the race barely ran: the test proves nothing");
+    assert_eq!(seen_twice, 0, "an inserted key was held by two rows");
+    assert!(twice.is_empty(), "keys stored twice: {:?}", &twice[..twice.len().min(10)]);
+    assert_eq!(rows, N as i64, "every inserted row was taken out again; the seeded ones stay");
 }
 
 #[ignore = "measurement: env-driven, see the module docs"]

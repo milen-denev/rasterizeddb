@@ -125,6 +125,20 @@ impl Visibility {
         }
     }
 
+    /// Whether the delete `xmax` made has happened, as this snapshot sees it:
+    /// committed before the snapshot was taken, or made by the reader itself.
+    /// A version created for everyone (`FROZEN_TX`) and deleted by `xmax` is
+    /// visible exactly when it has not. `true` for [`Visibility::All`], which
+    /// has no snapshot to have missed anything.
+    pub fn sees_delete(&self, xmax: TxId) -> bool {
+        match self {
+            Visibility::All => true,
+            Visibility::AsOf { snapshot, manager } => {
+                xmax != NO_TX && !snapshot.sees(FROZEN_TX, xmax, &|id| manager.outcome(id))
+            }
+        }
+    }
+
     /// True when this rule admits every untombstoned row without consulting the
     /// stamps. See [`Visibility::All`] for why a snapshot never reaches this.
     #[inline]

@@ -160,9 +160,10 @@ pub struct Table<S: StorageIO> {
     ///
     /// Striped by key (`KeyLocks`): an insert takes the stripe of each key it
     /// writes, so inserts of different keys no longer take turns. An `UPDATE`
-    /// takes every stripe, since it learns its rows' keys only as it rewrites
-    /// them, except a point update, which takes its key's stripe *before* its
-    /// scan and the stripes of the row's other keys before its rewrite.
+    /// that assigns a key column takes every stripe, since it learns its rows'
+    /// keys only as it rewrites them; one that assigns none takes none. A
+    /// point update takes its key's stripe *before* its scan and the stripes
+    /// of the row's other keys before its rewrite.
     ///
     /// It used to be `write_lock`, which an `UPDATE` holds across its whole
     /// scan. A multi-row `INSERT` takes the lock once per tuple, so each tuple
@@ -171,15 +172,17 @@ pub struct Table<S: StorageIO> {
     /// and a 50,000-row statement sat for minutes. An insert does not need to
     /// exclude the scan — on a table without a constraint it never did.
     ///
-    /// It does need to exclude the rewrite, even one that assigns no UNIQUE
-    /// column. A relocated row's new version gets its filter entry only once
-    /// the batch is durable (`PendingFilterOp`), while the old version keeps
-    /// the value. A check that sampled the filter in that window, then read the
-    /// old version after the update committed, would find neither version and
-    /// admit a duplicate of a key nobody changed. Holding this across the
-    /// rewrite and the filter application closes the window. Past it, the
-    /// in-flight rule in `find_row_with_value` covers the transaction's
-    /// remaining life, lock or no lock. Order: `write_lock`, then this.
+    /// A rewrite that assigns no key column does not take it either, though it
+    /// has a window an insert's check must not fall into. A relocated row's
+    /// new version gets its filter entry only once the batch is durable
+    /// (`PendingFilterOp`), while the old version keeps the value. A check
+    /// that sampled the filter in that window, then read the old version after
+    /// the update committed, would find neither version and admit a duplicate
+    /// of a key nobody changed. Holding every stripe across the rewrite closed
+    /// it, and starved inserts under a stream of range updates (11% of their
+    /// pace). The check closes it instead: a version deleted after its
+    /// snapshot makes it sample again (`Supersessions`). Order: `write_lock`,
+    /// then this.
     unique_lock: StdArc<crate::core::row::key_locks::KeyLocks>,
     /// Held shared by every read and write, exclusively by full compaction.
     ///
@@ -2259,8 +2262,15 @@ impl<S: StorageIO> Table<S> {
             if manager.outcome(pointer.xmax) == TxOutcome::Committed {
                 // Deleted, unless the delete's commit is recorded and not yet
                 // retired: until then a snapshot still shows the version.
+                // Retired, it is free, and decided here, unfetched — unless
+                // the check's snapshot does not see the delete: then the
+                // version that replaced it may have entered the index after
+                // the check sampled it (`Superseded`, `Supersessions`).
                 if floor.retired(manager, pointer.xmax) {
-                    return None;
+                    if visibility.sees_delete(pointer.xmax) {
+                        return None;
+                    }
+                    return Some(Occupancy::Superseded(pointer.xmax));
                 }
                 return Some(Occupancy::DeletedBy(pointer.xmax));
             }
@@ -2310,7 +2320,7 @@ impl<S: StorageIO> Table<S> {
             Occupancy::Committed(creator) if manager.is_running(creator) => creator,
             Occupancy::Committed(_) => return Some(false),
             Occupancy::DeletedBy(deleter) if manager.is_running(deleter) => deleter,
-            Occupancy::DeletedBy(_) => return None,
+            Occupancy::DeletedBy(_) | Occupancy::Superseded(_) => return None,
         };
         // The writer of a key in flight is the transaction the replay waits
         // for (slice B6, finding L1).
@@ -3474,6 +3484,31 @@ impl<S: StorageIO> Table<S> {
         tuple: &[(&SchemaField, &[u8])],
         exclude_id: Option<u64>,
         stale: Option<&std::collections::HashSet<u64>>,
+        visibility: &Visibility,
+        written_by: TxId,
+        predicate: Option<&crate::core::rql::expr::Cond>,
+    ) -> Result<Option<(u64, bool)>> {
+        // As for one column: sampled again while a round meets a version
+        // replaced after the snapshot (see `Supersessions`).
+        let mut supersessions = Supersessions::default();
+        for _ in 0..Supersessions::MAX_ROUNDS {
+            let found = self
+                .find_row_with_tuple_once(tuple, exclude_id, stale, visibility, written_by, predicate, &mut supersessions)
+                .await?;
+            if found.is_some() || !supersessions.take_fresh() {
+                return Ok(found);
+            }
+        }
+        Err(Supersessions::exhausted(Self::CONFLICT_RETRYABLE).into())
+    }
+
+    /// One sample of [`Self::find_row_with_tuple`].
+    #[allow(clippy::too_many_arguments)]
+    async fn find_row_with_tuple_once(
+        &self,
+        tuple: &[(&SchemaField, &[u8])],
+        exclude_id: Option<u64>,
+        stale: Option<&std::collections::HashSet<u64>>,
         // Only rows this statement can see may block it, exactly as for a
         // single-column check: under MVCC a deleted row keeps its `deleted`
         // flag clear until reclamation, and would otherwise go on reserving the
@@ -3485,6 +3520,7 @@ impl<S: StorageIO> Table<S> {
         // A partial key's predicate: a row holding the tuple conflicts only
         // when the predicate holds for it too.
         predicate: Option<&crate::core::rql::expr::Cond>,
+        supersessions: &mut Supersessions,
     ) -> Result<Option<(u64, bool)>> {
         let d = self.data()?;
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
@@ -3591,7 +3627,15 @@ impl<S: StorageIO> Table<S> {
 
         let mut row = Row::default();
         let mut floor = RunningFloor::default();
-        while let Ok(Some(pointer)) = iterator.next_row_pointer().await {
+        loop {
+            // A read that fails is an error, never the end of the table, as
+            // in `find_row_with_value`: `while let Ok(..)` ended the walk on
+            // one and answered "no duplicate" for a tuple that may be there.
+            let pointer = match iterator.next_row_pointer().await {
+                Ok(Some(pointer)) => pointer,
+                Ok(None) => break,
+                Err(e) => return Err(e.into()),
+            };
             if Some(pointer.row_id()) == exclude_id || stale.is_some_and(|s| s.contains(&pointer.row_id())) {
                 continue;
             }
@@ -3617,11 +3661,15 @@ impl<S: StorageIO> Table<S> {
                     None
                 }
             };
+            let superseded = Occupancy::superseded(occupancy, visibility);
             if pointer
                 .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
                 .await
                 .is_err()
             {
+                if superseded {
+                    supersessions.note(&pointer);
+                }
                 continue;
             }
 
@@ -3654,6 +3702,9 @@ impl<S: StorageIO> Table<S> {
                 }
             }
             let Some(in_flight) = Self::settle_occupancy(manager.as_deref(), occupancy) else {
+                if superseded {
+                    supersessions.note(&pointer);
+                }
                 continue;
             };
             return Ok(Some((pointer.row_id(), in_flight)));
@@ -3919,7 +3970,33 @@ impl<S: StorageIO> Table<S> {
     }
 
     /// Id of a live row whose `field` equals `value`, other than `exclude_id`.
+    ///
+    /// Sampled again while a round meets a version replaced after the
+    /// snapshot (see [`Supersessions`]).
     async fn find_row_with_value(
+        &self,
+        field: &SchemaField,
+        value: &[u8],
+        exclude_id: Option<u64>,
+        stale: Option<&std::collections::HashSet<u64>>,
+        visibility: &Visibility,
+        written_by: TxId,
+    ) -> Result<Option<(u64, bool)>> {
+        let mut supersessions = Supersessions::default();
+        for _ in 0..Supersessions::MAX_ROUNDS {
+            let found = self
+                .find_row_with_value_once(field, value, exclude_id, stale, visibility, written_by, &mut supersessions)
+                .await?;
+            if found.is_some() || !supersessions.take_fresh() {
+                return Ok(found);
+            }
+        }
+        Err(Supersessions::exhausted(Self::CONFLICT_RETRYABLE).into())
+    }
+
+    /// One sample of [`Self::find_row_with_value`].
+    #[allow(clippy::too_many_arguments)]
+    async fn find_row_with_value_once(
         &self,
         field: &SchemaField,
         value: &[u8],
@@ -3935,6 +4012,7 @@ impl<S: StorageIO> Table<S> {
         // in-flight rule and leaves the plain snapshot test, which is what a
         // database with no transaction manager wants.
         written_by: TxId,
+        supersessions: &mut Supersessions,
     ) -> Result<Option<(u64, bool)>> {
         let d = self.data()?;
         use crate::core::filter::sarg::{MaskExpr, SargPredicate, SargProgram};
@@ -4118,11 +4196,16 @@ impl<S: StorageIO> Table<S> {
                     None
                 }
             };
+            let superseded = Occupancy::superseded(occupancy, visibility);
             if pointer
                 .fetch_row_reuse_async(&*d.io_rows, &fetch, &mut row)
                 .await
                 .is_err()
             {
+                // Its value unknown: it may have been the key's holder.
+                if superseded {
+                    supersessions.note(&pointer);
+                }
                 continue;
             }
             let stored_null = flag_id.is_some_and(|id| {
@@ -4141,6 +4224,9 @@ impl<S: StorageIO> Table<S> {
                     })
             {
                 let Some(in_flight) = Self::settle_occupancy(manager.as_deref(), occupancy) else {
+                    if superseded {
+                        supersessions.note(&pointer);
+                    }
                     continue;
                 };
                 return Ok(Some((pointer.row_id(), in_flight)));
@@ -5917,8 +6003,29 @@ impl<S: StorageIO> Table<S> {
         // The row cannot change those keys under the stripe held, since
         // giving a row a key takes every stripe. Mutation-tested: without
         // this, `point_update_concurrency.rs` forks rows until it stalls.
+        //
+        // Any other update takes every stripe only when it assigns a column
+        // some unique key covers (or a partial key's predicate may read): its
+        // rows' new keys are checked as it writes them, against inserts of
+        // the same keys. One that changes no key needs none. It used to take
+        // them all regardless, for the window in which a relocated row's new
+        // version is not yet in the index and the old one is about to be
+        // deleted; an insert's check now samples again when it meets a
+        // version deleted that way (`Supersessions`). The write lock above,
+        // held exclusively, still keeps every other writer of these rows out.
+        let changes_keys = self.has_unique && {
+            let assigned: std::collections::HashSet<u32> = updates.iter().map(|u| u.write_order).collect();
+            self.assigns_unique(&assigned)
+        };
+        // The check notices only a version that keeps its deleter in `xmax`
+        // until it is retired. A write outside a transaction (no manager,
+        // `NO_TX`) or a frozen one marks the old version deleted outright,
+        // which the check skips unseen: such an update still keeps inserts out.
+        let versioned = written_by != crate::core::mvcc::transaction::NO_TX
+            && written_by != FROZEN_TX
+            && self.versions.load().is_some();
         let _unique = match point_keys {
-            None if self.has_unique => Some(self.unique_lock.lock_all().await),
+            None if changes_keys || (self.has_unique && !versioned) => Some(self.unique_lock.lock_all().await),
             None => None,
             Some(mut keys) => {
                 let constraints = self.schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted).count()
@@ -5965,10 +6072,7 @@ impl<S: StorageIO> Table<S> {
         // partial key's predicate may), since no other statement's check
         // reads it. Every row id of a large UPDATE was otherwise kept.
         let mut own_keys = OwnKeys::default();
-        let checks_own_keys = self.has_unique && {
-            let assigned: std::collections::HashSet<u32> = updates.iter().map(|u| u.write_order).collect();
-            self.assigns_unique(&assigned)
-        };
+        let checks_own_keys = changes_keys;
         let mut row = Row::default();
         // Each row is marked as being written before it is stamped
         // (`RowLocks::mark_row_writes`); see the DELETE.
@@ -6881,6 +6985,78 @@ enum Occupancy {
     Committed(TxId),
     /// Its deleter's commit is recorded: free, once that is retired.
     DeletedBy(TxId),
+    /// Free: its deleter committed after the check's snapshot and is retired.
+    Superseded(TxId),
+}
+
+impl Occupancy {
+    /// Deleted by a transaction that committed after the check's snapshot was
+    /// taken: free, but the version that replaced it may be one the check's
+    /// sample of the index or filter predates ([`Supersessions`]). A delete
+    /// the snapshot sees was applied, replacement and all, before the sample.
+    fn superseded(occupancy: Option<Occupancy>, visibility: &Visibility) -> bool {
+        match occupancy {
+            Some(Occupancy::Superseded(_)) => true,
+            Some(Occupancy::DeletedBy(deleter)) => !visibility.sees_delete(deleter),
+            _ => false,
+        }
+    }
+}
+
+/// The versions a uniqueness check skipped as [`Occupancy::superseded`], so
+/// the check can tell when its sample may have missed a replacement.
+///
+/// A check samples the candidates (an index descent, a filter bitmap, the
+/// pointer file's length), then reads each. An `UPDATE` relocating a row
+/// writes the new version, applies its index and filter entries once its
+/// batch is durable, and commits after that. So a delete the check's snapshot
+/// shows was applied before the sample and its replacement is among the
+/// candidates. One the snapshot does not show may have been applied after the
+/// sample: reading the old version then finds it free, and the new one was
+/// never a candidate, so the key's holder is missed and a duplicate admitted.
+/// Every such version is noted here, and the check samples again whenever a
+/// round meets one it had not seen. The new sample starts after the old
+/// version read as free, so after its deleter's entries were applied: it
+/// finds the replacement, or that replacement superseded in turn, which
+/// is new and starts another round. Finitely many, since each needs a commit.
+///
+/// It replaces holding every key stripe across an `UPDATE`'s rewrite, which
+/// closed the same window by keeping inserts out of it: under a stream of
+/// range updates, inserts of new keys ran at a tenth of their pace.
+#[derive(Default)]
+struct Supersessions {
+    seen: std::collections::HashSet<(u64, TxId, TxId)>,
+    fresh: bool,
+}
+
+impl Supersessions {
+    /// A bound no real workload reaches: each round needs another commit
+    /// replacing a version of this very key while the check runs.
+    const MAX_ROUNDS: usize = 1_000;
+
+    fn note(&mut self, pointer: &RowPointer) {
+        if self.seen.insert((pointer.row_id(), pointer.xmin, pointer.xmax)) {
+            self.fresh = true;
+        }
+    }
+
+    /// Whether the round just finished met a version it had not seen, and
+    /// starts the next one.
+    fn take_fresh(&mut self) -> bool {
+        std::mem::take(&mut self.fresh)
+    }
+
+    /// Retryable, as a key in flight is: the statement replays.
+    fn exhausted(retryable: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "a uniqueness check met a key replaced {} times while it ran{}",
+                Self::MAX_ROUNDS,
+                retryable
+            ),
+        )
+    }
 }
 
 /// The running set's minimum, read once per uniqueness check, the first time
@@ -6960,6 +7136,39 @@ mod occupancy_floor_tests {
         // And settled: both retired, so free and held.
         assert_eq!(T::settle_occupancy(Some(&m), Some(Occupancy::DeletedBy(later))), None);
         assert_eq!(T::settle_occupancy(Some(&m), Some(Occupancy::Committed(later))), Some(false));
+        let _ = running;
+    }
+
+    /// A retired delete the check's snapshot does not see is `Superseded`,
+    /// the one case that makes the check sample again (`Supersessions`); one
+    /// it sees is still decided unfetched. Every old delete came back
+    /// `Superseded` when this keyed on retirement alone, so every insert of a
+    /// key with history fetched dead versions and sampled twice.
+    #[test]
+    fn only_a_delete_the_snapshot_missed_is_superseded() {
+        let m = std::sync::Arc::new(TransactionManager::in_memory());
+        let inserted = m.begin();
+        m.commit(inserted);
+        let seen = m.begin();
+        m.commit(seen);
+        // Running when the writer's snapshot is taken, committed after it.
+        let missed = m.begin();
+        let running = m.begin();
+        let writer = m.begin();
+        let visibility = crate::core::mvcc::Visibility::for_snapshot(m.snapshot(writer), m.clone());
+        m.commit(missed);
+        assert_eq!(m.oldest_active(), running, "both deletes are below the floor");
+
+        let mut floor = RunningFloor::default();
+        assert_eq!(T::occupancy(&m, &version(inserted, seen), writer, &visibility, &mut floor), None);
+        assert_eq!(
+            T::occupancy(&m, &version(inserted, missed), writer, &visibility, &mut floor),
+            Some(Occupancy::Superseded(missed))
+        );
+        assert!(Occupancy::superseded(Some(Occupancy::Superseded(missed)), &visibility));
+        // A recorded delete is told apart the same way once it settles free.
+        assert!(Occupancy::superseded(Some(Occupancy::DeletedBy(missed)), &visibility));
+        assert!(!Occupancy::superseded(Some(Occupancy::DeletedBy(seen)), &visibility));
         let _ = running;
     }
 }
