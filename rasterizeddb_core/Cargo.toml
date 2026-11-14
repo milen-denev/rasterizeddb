@@ -24,7 +24,7 @@ hashbrown = { version = "0.16.1", default-features = false }
 memchr = "2"
 # NUMERIC exp/ln/log/power (`rql::pg_numeric_math`): their working precision
 # runs past an i128 before the result is rounded back into one.
-num-bigint = "0.4.8"
+num-bigint = "0.5.1"
 num-traits = "0.2"
 # Shortest round-trip float digits for PostgreSQL's float text (`value_codec::pg_float8_text`);
 # already in the tree through serde_json.
