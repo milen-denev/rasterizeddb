@@ -19,7 +19,7 @@ byteorder = "1.5"
 itertools = "0.15"
 ahash = "0.8"
 # `HashTable<u32>` for the hash-join build side: indices only, keys read back from the rows.
-hashbrown = { version = "0.16.1", default-features = false }
+hashbrown = { version = "0.17", default-features = false }
 # Bulk scanning of SQL text for the next quote/placeholder byte.
 memchr = "2"
 # NUMERIC exp/ln/log/power (`rql::pg_numeric_math`): their working precision
@@ -65,7 +65,7 @@ rclite = "0.4.2"
 opool = "0.2.0"
 cacheguard = "0.1.0"
 xutex = "0.2.1"
-branches = "0.4.6"
+branches = "0.5.1"
 
 # pgwire TLS
 rustls = "0.23"
@@ -89,7 +89,7 @@ serde_json = "1"
 # zstd carries the whole snapshot and every archived log segment. It is the
 # only new code pulled in: the S3 client is built on rustls/tokio-rustls/sha2/
 # hmac/base64, which the pgwire listener already required.
-zstd = { version = "0.13.3", optional = true, features = ["zstdmt"] }
+zstd = { version = "0.14", optional = true, features = ["zstdmt"] }
 # Root certificates for the *client* side of TLS. `rustls` ships none, and
 # rustls-native-certs would add a platform dependency for a store the server
 # has no other use for.
@@ -99,7 +99,7 @@ webpki-roots = { version = "1", optional = true }
 criterion = { version = "0.8" }
 tempfile = "3"
 # The write gate's source test parses `src/` (core/index_store/gate_source_tests.rs).
-syn = { version = "2.0.119", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 proc-macro2 = "1"
 quote = "1"
 

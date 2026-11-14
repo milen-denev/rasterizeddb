@@ -823,7 +823,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
             self.fail(format!("unsafe impl for {self_ty}"));
         }
         if TOKENS.contains(&self_ty.as_str())
-            && let Some((_, tr, _)) = &i.trait_
+            && let Some((tr, _)) = &i.trait_
         {
             let tr_name = tr
                 .segments
@@ -851,7 +851,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         let tr = i
             .trait_
             .as_ref()
-            .and_then(|(_, tr, _)| tr.segments.last())
+            .and_then(|(tr, _)| tr.segments.last())
             .map(short)
             .unwrap_or_default();
         let proof_from = self.rel == GATE
@@ -861,7 +861,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         if (self_ty == "Proof" || self_ty == "ProofKind") && !tr.is_empty() && !proof_from {
             self.fail(format!("impl {tr} for {self_ty}: Proof implements only From<&token>"));
         }
-        if let Some((_, path, _)) = &i.trait_
+        if let Some((path, _)) = &i.trait_
             && mentions(path, &["Proof", "ProofKind"])
             && !proof_from
         {
