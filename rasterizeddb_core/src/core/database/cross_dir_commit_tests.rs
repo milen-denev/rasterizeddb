@@ -1407,3 +1407,41 @@ async fn partitions_a_root_only_outcome_flush_cannot_tear_a_transaction() {
         seen.events
     );
 }
+
+// ---------------------------------------------------------------------------
+// A failed status-file copy after a durable log is not a failed commit.
+// ---------------------------------------------------------------------------
+
+/// The log synced and only the copy of the outcomes into the status file
+/// failed. The commit is durable, so the client is told it worked and the row
+/// stays: every commit path used to abort here, taking back rows readers had
+/// seen from a transaction a crash then brought back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_status_copy_after_a_durable_log_commits() {
+    let fx = Fixture::new().await;
+    let sql = insert_sql(ROOT_TABLE, 7, "alpha_root");
+    let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(&sql)
+        .unwrap_or_else(|| panic!("could not parse {sql}"));
+    super::test_hooks::FAIL_STAGED_COPY.with(|h| h.set(true));
+    let out = crate::core::rql::executor::execute_with_sync(purpose, fx.db.clone(), true).await;
+    let fired = !super::test_hooks::FAIL_STAGED_COPY.with(|h| h.replace(false));
+    assert!(fired, "the status-file copy was never attempted");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert_ne!(
+        out.first(),
+        Some(&3),
+        "a commit whose log was durable was reported as failed: {text}"
+    );
+    let live = labels(&fx.db, ROOT_TABLE, &["alpha_root"]).await;
+    assert!(
+        live.contains("alpha_root"),
+        "a commit whose log was durable was taken back"
+    );
+
+    let seen = fx.crash_and_recover(CANDIDATES).await;
+    assert!(
+        seen.in_root.contains("alpha_root"),
+        "the committed row did not survive a crash: {:?}",
+        seen.in_root
+    );
+}

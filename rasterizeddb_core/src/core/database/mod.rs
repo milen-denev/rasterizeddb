@@ -1929,7 +1929,7 @@ impl Database {
             outcome = own;
         }
         if outcome.is_ok() {
-            outcome = self.apply_staged_outcomes();
+            self.copy_staged_outcomes();
         }
         outcome
     }
@@ -1976,9 +1976,30 @@ impl Database {
     /// whole post-commit sync for a transaction that went through
     /// [`Database::commit_written_transaction`], which has already made its
     /// rows on every other location durable.
+    ///
+    /// Only the log's sync can fail it. Once the log has synced, the commit
+    /// is durable and the copy is bookkeeping the log already covers (see
+    /// [`Database::copy_staged_outcomes`]).
     pub fn sync_own_location(&self) -> std::io::Result<()> {
         self.sync_own_log()?;
-        self.apply_staged_outcomes()
+        self.copy_staged_outcomes();
+        Ok(())
+    }
+
+    /// [`Database::apply_staged_outcomes`] for a caller whose log has just
+    /// synced, where a failed copy is not a failed commit.
+    ///
+    /// It used to be one. Every commit path aborted on the error, so a
+    /// transaction whose commit record was already durable in an unpoisoned
+    /// log was rolled back in memory: readers that had seen its rows lost
+    /// them, the client was told the commit failed, and replication never
+    /// published it — while a crash before the abort's own record reached the
+    /// disk had replay bring the commit back on this node alone. The ranges
+    /// stay staged, the next sync or the log writer's round retries them, and
+    /// a checkpoint writes them before discarding the log; the callee has
+    /// already logged the error for the operator.
+    fn copy_staged_outcomes(&self) {
+        let _ = self.apply_staged_outcomes();
     }
 
     /// Copies the outcomes the log has made durable into the status file.
