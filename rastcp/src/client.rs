@@ -331,7 +331,15 @@ struct Connection {
     /// because both belong to the runtime that opened it; `None` when the
     /// client has no timeout.
     deadline: Option<Deadline>,
+    /// When a request last finished on this connection.
+    last_used: std::time::Instant,
 }
+
+/// How long a connection sits unused before it is checked, ahead of the next
+/// request, for having been closed. A busy connection is never checked: the
+/// check costs a trip through the TLS stream, and a server does not close a
+/// connection it heard from a moment ago.
+const CHECK_WHEN_IDLE_FOR: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Runs `wait` under `deadline`, if there is one.
 async fn within<T, F>(deadline: &mut Option<Deadline>, wait: F) -> Result<T, RastcpError>
@@ -345,6 +353,27 @@ where
 }
 
 impl Connection {
+    /// Whether the server is known to have let go of this connection.
+    ///
+    /// A server closes a connection that has been quiet for its request
+    /// timeout. The close arrives while nobody is reading, so without this the
+    /// client would learn of it only by sending its next request into the
+    /// closed connection and failing — a failure that says nothing about
+    /// whether the request ran. Looking first costs nothing that matters and
+    /// turns that into a reconnect before anything is sent.
+    ///
+    /// Anything that can be read here is a reason to stop using the
+    /// connection: the end of the stream, an error, or a frame nobody asked
+    /// for, after which the two ends no longer agree on whose turn it is.
+    async fn has_gone(&mut self, max_message_size: usize) -> bool {
+        self.last_used.elapsed() >= CHECK_WHEN_IDLE_FOR
+            && self
+                .reader
+                .frame_now(&mut self.stream, max_message_size)
+                .await
+                .is_some()
+    }
+
     /// Sends one request and reads its response. Each half gets the whole
     /// timeout, as it did when each had a timer of its own.
     async fn exchange(
@@ -357,6 +386,7 @@ impl Connection {
             reader,
             writer,
             deadline,
+            last_used,
         } = self;
 
         within(deadline, async {
@@ -369,7 +399,9 @@ impl Connection {
         .await?;
         debug!("Sent {} bytes", request.len());
 
-        within(deadline, reader.frame(stream, max_message_size)).await
+        let response = within(deadline, reader.frame(stream, max_message_size)).await?;
+        *last_used = std::time::Instant::now();
+        Ok(response)
     }
 
     /// Sends every request and reads every response, both at once.
@@ -389,6 +421,7 @@ impl Connection {
             reader,
             writer,
             deadline,
+            last_used,
         } = self;
 
         let mut pump = Pump {
@@ -415,6 +448,7 @@ impl Connection {
             .await?;
         }
 
+        *last_used = std::time::Instant::now();
         Ok(pump.responses)
     }
 }
@@ -617,6 +651,7 @@ impl TcpClient {
                 reader: FrameReader::new(),
                 writer: FrameWriter::new(),
                 deadline: self.dialer.timeout.map(Deadline::new),
+                last_used: std::time::Instant::now(),
             });
         }
         Ok(())
@@ -635,12 +670,9 @@ impl TcpClient {
     /// one buffer it keeps, instead of allocating and growing a fresh one per
     /// request up to whatever its largest batch needs.
     pub async fn send_borrowed(&mut self, data: &[u8]) -> Result<Vec<u8>, RastcpError> {
-        // Connect if not connected
-        if !self.is_connected() {
-            self.connect().await?;
-        }
-
         let max_message_size = self.dialer.max_message_size;
+        self.ready(max_message_size).await?;
+
         let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange(data, max_message_size).await {
@@ -677,11 +709,9 @@ impl TcpClient {
             return Ok(Vec::new());
         }
 
-        if !self.is_connected() {
-            self.connect().await?;
-        }
-
         let max_message_size = self.dialer.max_message_size;
+        self.ready(max_message_size).await?;
+
         let connection = self.connection.as_mut().ok_or(RastcpError::NotConnected)?;
 
         match connection.exchange_batch(requests, max_message_size).await {
@@ -694,6 +724,23 @@ impl TcpClient {
                 Err(err)
             }
         }
+    }
+
+    /// Makes sure there is a connection to send on: opens one if there is
+    /// none, and replaces one the server closed while it sat idle.
+    async fn ready(&mut self, max_message_size: usize) -> Result<(), RastcpError> {
+        if let Some(connection) = self.connection.as_mut() {
+            if connection.has_gone(max_message_size).await {
+                debug!("The idle connection to the server was closed; opening another");
+                self.connection = None;
+            }
+        }
+
+        if !self.is_connected() {
+            self.connect().await?;
+        }
+
+        Ok(())
     }
 
     // Add a close method to explicitly close the connection

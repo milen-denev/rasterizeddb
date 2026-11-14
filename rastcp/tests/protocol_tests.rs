@@ -391,8 +391,18 @@ async fn test_a_connection_idle_for_longer_than_the_timeout_is_closed() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let request_timeout = Duration::from_millis(200);
-    let (addr, server_handle) =
-        echo_server_with_timeout(request_timeout, |data| async move { data }).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = Arc::new(
+        TcpServerBuilder::from_listener(listener)
+            .unwrap()
+            .request_timeout(request_timeout)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let serving = server.clone();
+    let server_handle = tokio::spawn(async move { serving.run(|data| async move { data }).await });
 
     let mut client = TcpClientBuilder::new(&addr)
         .timeout(Duration::from_secs(5))
@@ -401,15 +411,26 @@ async fn test_a_connection_idle_for_longer_than_the_timeout_is_closed() {
         .unwrap();
 
     assert_eq!(client.send(b"first".to_vec()).await.unwrap(), b"first".to_vec());
+    assert_eq!(server.active_connections(), 1);
 
     // Silent for three timeouts: the server has to have let go of the slot.
     sleep(request_timeout * 3).await;
-
-    let result = client.send(b"second".to_vec()).await;
-    assert!(
-        result.is_err(),
-        "the server kept serving a connection that had been idle past its timeout"
+    assert_eq!(
+        server.active_connections(),
+        0,
+        "the server kept a connection that had been idle past its timeout"
     );
+
+    // The client finds that out before it sends, not by sending: the request
+    // goes to a connection opened for it and is answered. Failing here would
+    // leave the caller with an error that does not say whether the request
+    // ran, for a request that was never sent.
+    assert_eq!(
+        client.send(b"second".to_vec()).await.unwrap(),
+        b"second".to_vec(),
+        "a request after an idle spell was sent into the closed connection"
+    );
+    assert_eq!(server.active_connections(), 1);
 
     server_handle.abort();
 }
