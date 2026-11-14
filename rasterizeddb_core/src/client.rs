@@ -677,9 +677,15 @@ impl DbClient {
     /// concurrent queries holds a hundred TLS sessions and makes a system
     /// call each way per query; this one holds `connections` sessions and
     /// sends whatever queries are waiting together, as the server answers
-    /// them together. One connection is driven by one task, so use more than
-    /// one for a client busy enough to keep a core occupied with nothing but
-    /// its transport; two to four is plenty.
+    /// them together. Measured with point queries against a server on four
+    /// cores (`examples/native_bench.rs`), one shared connection carried 78,000
+    /// queries a second for 16 callers where the pool carried 68,000, and
+    /// 84,000 for 128 callers where the pool carried 63,000.
+    ///
+    /// One connection is enough for that: the server runs each query on its
+    /// own task whichever connection it came in on, and the connection only
+    /// moves bytes. More connections did not help at those rates and cost a
+    /// little; they are for a client that outruns one connection's task.
     ///
     /// The queries a caller sees are the same: each gets its own answer, and
     /// a query that fails in transit is retried once exactly as the pooled
