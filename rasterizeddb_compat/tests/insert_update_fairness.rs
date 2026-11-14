@@ -139,13 +139,16 @@ fn root(tag: &str) -> Root {
 /// Rows inserted while the update stream ran, and while it did not, over
 /// alternating windows — so whatever else the machine is doing weighs on both
 /// sides alike — plus the number of updates that completed.
-async fn alternate(server: &TestServer, windows: u32, window: Duration) -> (u64, u64, u64) {
+async fn alternate(server: &TestServer, windows: u32, window: Duration, extra: &[&str]) -> (u64, u64, u64) {
     let url = server.url();
     let mut setup = sqlx::PgConnection::connect(&url).await.expect("connect");
     setup
         .execute("CREATE TABLE p (id BIGINT PRIMARY KEY, tag TEXT NOT NULL, n BIGINT NOT NULL)")
         .await
         .expect("create");
+    for ddl in extra {
+        setup.execute(AssertSqlSafe(ddl.to_string())).await.expect(ddl);
+    }
     // Rows for the updates to land on.
     const SEED: u64 = 20_000;
     const BATCH: u64 = 100;
@@ -236,7 +239,7 @@ async fn inserts_keep_their_pace_while_another_session_updates() {
     let server = TestServer::start_file_backed(&dir.0).await.expect("start");
     let secs = env_u64("FAIR_WINDOW_SECS", 3);
     let windows = env_u64("FAIR_WINDOWS", 8) as u32;
-    let (with, without, updates) = alternate(&server, windows, Duration::from_secs(secs)).await;
+    let (with, without, updates) = alternate(&server, windows, Duration::from_secs(secs), &[]).await;
     let ratio = with as f64 / without.max(1) as f64;
     println!("inserted {with} with updates running, {without} without ({ratio:.2}); {updates} updates");
     assert!(updates >= 10, "the update stream barely ran ({updates} updates): the test proves nothing");
@@ -572,6 +575,244 @@ async fn an_update_assigning_keys_and_inserts_of_them_never_store_one_twice() {
     assert_eq!(seen_twice, 0, "an inserted key was held by two rows");
     assert!(twice.is_empty(), "keys stored twice: {:?}", &twice[..twice.len().min(10)]);
     assert_eq!(rows, N as i64, "every inserted row was taken out again; the seeded ones stay");
+}
+
+/// The pace again, on a table with a partial unique index the update does
+/// not touch: neither its column nor the column its predicate reads. Any
+/// partial key used to count every update as a key change, so the update
+/// kept every insert out while it wrote, as before the stripes were split.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn inserts_keep_their_pace_beside_a_partial_unique_key() {
+    let dir = root("pace_partial");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("start");
+    let secs = env_u64("FAIR_WINDOW_SECS", 3);
+    let windows = env_u64("FAIR_WINDOWS", 8) as u32;
+    let (with, without, updates) = alternate(
+        &server,
+        windows,
+        Duration::from_secs(secs),
+        &["CREATE UNIQUE INDEX p_id_live ON p (id) WHERE tag = 'live'"],
+    )
+    .await;
+    let ratio = with as f64 / without.max(1) as f64;
+    println!("partial key: inserted {with} with updates running, {without} without ({ratio:.2}); {updates} updates");
+    assert!(updates >= 10, "the update stream barely ran ({updates} updates): the test proves nothing");
+    assert!(
+        ratio >= 0.5,
+        "inserts slowed to {:.0}% of their pace beside a partial key the update does not touch \
+         ({with} rows against {without})",
+        ratio * 100.0
+    );
+}
+
+/// The soft-delete shape, `UNIQUE (email) WHERE deleted_at IS NULL`, while
+/// range updates move its rows without touching the key or the predicate:
+/// every insert of a live email must still fail with 23505. The check finds
+/// the moved row through the partial key's own finder, sampling again when
+/// it meets a version replaced after its snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_live_email_whose_row_is_being_relocated_is_never_inserted_twice() {
+    let dir = root("dup_partial");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("start");
+    let url = server.url();
+    const N: u64 = 200;
+    let mut setup = sqlx::PgConnection::connect(&url).await.expect("connect");
+    setup
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, note TEXT NOT NULL, deleted_at TIMESTAMPTZ)")
+        .await
+        .expect("create");
+    setup
+        .execute("CREATE UNIQUE INDEX users_email_live ON users (email) WHERE deleted_at IS NULL")
+        .await
+        .expect("index");
+    let values = (0..N).map(|i| format!("({i}, 'e{i}', 'x', NULL)")).collect::<Vec<_>>().join(",");
+    setup
+        .execute(AssertSqlSafe(format!("INSERT INTO users (id, email, note, deleted_at) VALUES {values}")))
+        .await
+        .expect("seed");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let admitted = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
+    let other_errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let relocations = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for u in 0..2u64 {
+        let (url, stop, relocations) = (url.clone(), stop.clone(), relocations.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = u;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let start = (k * 37) % (N - 20);
+                let sql = format!(
+                    "UPDATE users SET note = '{}' WHERE id >= {start} AND id < {}",
+                    "y".repeat((k % 40) as usize + 1),
+                    start + 20
+                );
+                if conn.execute(AssertSqlSafe(sql)).await.is_ok() {
+                    relocations.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for w in 0..4u64 {
+        let (url, stop, admitted, refused, other_errors) =
+            (url.clone(), stop.clone(), admitted.clone(), refused.clone(), other_errors.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = w * 53;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let id = 1_000_000 + w * 10_000_000 + k;
+                let sql = format!("INSERT INTO users (id, email, note, deleted_at) VALUES ({id}, 'e{}', 'dup', NULL)", k % N);
+                match conn.execute(AssertSqlSafe(sql)).await {
+                    Ok(r) => {
+                        admitted.fetch_add(r.rows_affected(), Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let code = e.as_database_error().and_then(|d| d.code()).map(|c| c.into_owned());
+                        if code.as_deref() == Some("23505") {
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            other_errors.lock().unwrap().push(format!("{code:?}: {e}"));
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    stop.store(true, Ordering::Relaxed);
+    for t in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
+    }
+
+    let twice: Vec<(String, i64)> =
+        sqlx::query_as("SELECT email, COUNT(*) FROM users WHERE deleted_at IS NULL GROUP BY email HAVING COUNT(*) > 1")
+            .fetch_all(&mut setup)
+            .await
+            .expect("group");
+    let (refused, relocations, admitted) = (
+        refused.load(Ordering::Relaxed),
+        relocations.load(Ordering::Relaxed),
+        admitted.load(Ordering::Relaxed),
+    );
+    let other_errors = other_errors.lock().unwrap().clone();
+    println!(
+        "{refused} refused with 23505, {relocations} relocating updates, {admitted} rows admitted, \
+         {} live emails twice, {} other errors",
+        twice.len(),
+        other_errors.len()
+    );
+    assert!(relocations >= 10 && refused >= 100, "the race barely ran: the test proves nothing");
+    assert!(other_errors.is_empty(), "an insert failed other than as a duplicate: {:?}", &other_errors[..other_errors.len().min(5)]);
+    assert_eq!(admitted, 0, "an insert of a live email was reported as inserted");
+    assert!(twice.is_empty(), "live emails stored twice: {:?}", &twice[..twice.len().min(10)]);
+}
+
+/// An update that writes the predicate's column still keeps inserts of the
+/// keys it brings back out while it writes them. Blocks of rows are deleted
+/// and undeleted (`deleted_at`) while other sessions insert those emails
+/// live; whatever succeeds, no email may ever be live twice. An undelete's
+/// check and an insert's check of one email could otherwise each find
+/// nothing and each write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_undelete_and_an_insert_of_its_email_never_both_land() {
+    let dir = root("undelete");
+    let server = TestServer::start_file_backed(&dir.0).await.expect("start");
+    let url = server.url();
+    const N: u64 = 200;
+    let mut setup = sqlx::PgConnection::connect(&url).await.expect("connect");
+    setup
+        .execute("CREATE TABLE users (id BIGINT PRIMARY KEY, email TEXT NOT NULL, note TEXT NOT NULL, deleted_at TIMESTAMPTZ)")
+        .await
+        .expect("create");
+    setup
+        .execute("CREATE UNIQUE INDEX users_email_live ON users (email) WHERE deleted_at IS NULL")
+        .await
+        .expect("index");
+    let values = (0..N).map(|i| format!("({i}, 'e{i}', 'x', NULL)")).collect::<Vec<_>>().join(",");
+    setup
+        .execute(AssertSqlSafe(format!("INSERT INTO users (id, email, note, deleted_at) VALUES {values}")))
+        .await
+        .expect("seed");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let toggles = Arc::new(AtomicU64::new(0));
+    let admitted = Arc::new(AtomicU64::new(0));
+    let seen_twice = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for u in 0..2u64 {
+        let (url, stop, toggles) = (url.clone(), stop.clone(), toggles.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = u * 5;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let start = (k * 37) % (N - 20);
+                let range = format!("id >= {start} AND id < {}", start + 20);
+                for sql in [
+                    format!("UPDATE users SET deleted_at = '2026-01-01 00:00:00+00' WHERE {range}"),
+                    format!("UPDATE users SET deleted_at = NULL WHERE {range}"),
+                ] {
+                    if conn.execute(AssertSqlSafe(sql)).await.is_ok() {
+                        toggles.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+    for w in 0..4u64 {
+        let (url, stop, admitted, seen_twice) = (url.clone(), stop.clone(), admitted.clone(), seen_twice.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
+            let mut k = w * 53;
+            while !stop.load(Ordering::Relaxed) {
+                k += 1;
+                let id = 1_000_000 + w * 10_000_000 + k;
+                let email = format!("e{}", (k * 7 + 3) % N);
+                let sql = format!("INSERT INTO users (id, email, note, deleted_at) VALUES ({id}, '{email}', 'new', NULL)");
+                if conn.execute(AssertSqlSafe(sql)).await.is_ok_and(|r| r.rows_affected() == 1) {
+                    admitted.fetch_add(1, Ordering::Relaxed);
+                    let live: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT COUNT(*) FROM users WHERE email = '{email}' AND deleted_at IS NULL"
+                    )))
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect("count the email");
+                    if live > 1 {
+                        seen_twice.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Out again, so the seeded row can come back.
+                    conn.execute(AssertSqlSafe(format!("DELETE FROM users WHERE id = {id}")))
+                        .await
+                        .expect("take the row out again");
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    stop.store(true, Ordering::Relaxed);
+    for t in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
+    }
+
+    let twice: Vec<(String, i64)> =
+        sqlx::query_as("SELECT email, COUNT(*) FROM users WHERE deleted_at IS NULL GROUP BY email HAVING COUNT(*) > 1")
+            .fetch_all(&mut setup)
+            .await
+            .expect("group");
+    let (toggles, admitted, seen_twice) =
+        (toggles.load(Ordering::Relaxed), admitted.load(Ordering::Relaxed), seen_twice.load(Ordering::Relaxed));
+    println!(
+        "{toggles} delete/undelete updates, {admitted} rows admitted, {seen_twice} seen live twice, \
+         {} live twice at the end",
+        twice.len()
+    );
+    assert!(toggles >= 100 && admitted >= 100, "the race barely ran: the test proves nothing");
+    assert_eq!(seen_twice, 0, "an inserted email was live in two rows");
+    assert!(twice.is_empty(), "live emails stored twice: {:?}", &twice[..twice.len().min(10)]);
 }
 
 #[ignore = "measurement: env-driven, see the module docs"]

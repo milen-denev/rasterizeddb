@@ -3777,22 +3777,30 @@ impl<S: StorageIO> Table<S> {
 
     /// Whether a statement assigning the columns `assigned` (by
     /// `write_order`) can change a unique key: a UNIQUE column, a column of a
-    /// table-level key, or any column of a table with a partial key, whose
-    /// predicate may bring a row under it.
+    /// table-level key, or a column a partial key's predicate reads, which
+    /// may bring a row under it. The same rule `check_unique` uses to decide
+    /// which constraints a statement can violate.
     fn assigns_unique(&self, assigned: &std::collections::HashSet<u32>) -> bool {
         self.schema
             .fields
             .iter()
             .any(|f| f.is_unique && !f.is_deleted && assigned.contains(&(f.write_order as u32)))
             || self.schema.unique_keys.iter().any(|key| {
-                key.predicate.is_some()
-                    || key.columns.iter().any(|name| {
-                        self.schema.fields.iter().any(|f| {
-                            !f.is_deleted
-                                && f.name.eq_ignore_ascii_case(name)
-                                && assigned.contains(&(f.write_order as u32))
-                        })
+                key.columns.iter().any(|name| {
+                    self.schema.fields.iter().any(|f| {
+                        !f.is_deleted && f.name.eq_ignore_ascii_case(name) && assigned.contains(&(f.write_order as u32))
                     })
+                }) || (key.predicate.is_some()
+                    // A partial key also covers the columns its predicate
+                    // reads, NULL flags included: writing one can move a row
+                    // under the key (an undelete), as `check_unique` judges
+                    // it. Every update of a table with a partial key counted
+                    // as a key change before, so `SET last_seen = now()`
+                    // kept every insert out while it wrote. A predicate that
+                    // does not compile still counts, as before.
+                    && key
+                        .predicate_columns(&self.schema.fields)
+                        .map_or(true, |columns| columns.iter().any(|wo| assigned.contains(&(*wo as u32)))))
             })
     }
 
