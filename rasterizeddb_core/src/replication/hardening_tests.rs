@@ -1221,3 +1221,162 @@ async fn a_stream_the_peer_refuses_keeps_its_link_between_offers() {
     peer.server.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), peer.task).await;
 }
+
+/// A node with a cluster token, a little data in its stream, and a raw client
+/// connected to its replication listener that has said nothing yet.
+async fn node_with_a_token() -> (Arc<Database>, rastcp::client::TcpClient) {
+    let (socket, port) = listener();
+    let one = super::test_support::in_memory_database().await;
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: port,
+        token: "s3cret".to_string(),
+        ..Default::default()
+    };
+    brisk(&mut config);
+    one.replication.set_config(config).expect("a valid configuration");
+    one.replication.serve_on(socket);
+    Database::start_replication(one.clone()).expect("replication should start");
+
+    run_ok(&one, "CREATE TABLE repl_private (id INTEGER, name VARCHAR)").await;
+    run_ok(&one, "INSERT INTO repl_private (id, name) VALUES (1, 'private')").await;
+    eventually("the log to hold the writes", || async {
+        one.replication.released_through() >= 2
+    })
+    .await;
+
+    let client = rastcp::client::TcpClientBuilder::new(&format!("127.0.0.1:{port}"))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .await
+        .expect("a client");
+
+    (one, client)
+}
+
+fn hello_frame(node_id: u64, token: &str) -> Vec<u8> {
+    let hello = super::protocol::Hello {
+        node_id,
+        cluster_id: ReplicationConfig::default().cluster_id(),
+        codecs: super::config::Codec::local_mask(),
+        clock: 1,
+        token: token.to_string(),
+        advertised_addr: "127.0.0.1:1".to_string(),
+    };
+    let mut payload = Vec::new();
+    hello.encode(&mut payload);
+    super::protocol::plain_frame(super::protocol::FrameKind::Hello, 0, &payload)
+}
+
+fn pull_frame(as_node: u64) -> Vec<u8> {
+    let pull = super::protocol::Pull {
+        node_id: as_node,
+        origin: 1,
+        after_seq: 0,
+        max_records: 100,
+        max_bytes: 1 << 20,
+    };
+    let mut payload = Vec::new();
+    pull.encode(&mut payload);
+    super::protocol::plain_frame(super::protocol::FrameKind::Pull, 0, &payload)
+}
+
+/// The kind of a reply, and how much it carries.
+fn reply(frame: &[u8]) -> (super::protocol::FrameKind, usize) {
+    let mut scratch = Vec::new();
+    let (header, body) = super::protocol::FrameCodec::default()
+        .decode_frame(frame, &mut scratch)
+        .expect("a readable reply");
+    (header.kind, body.len())
+}
+
+/// The cluster token guards the stream, not only the greeting.
+///
+/// The token used to be checked when a caller presented it and at no other
+/// time: each frame was answered on its own, with nothing known of the
+/// connection it came in on. So a caller refused for a wrong token could ask
+/// for this node's records in its very next frame and be given them, and so
+/// could one that never greeted at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_without_the_token_is_given_nothing() {
+    use super::protocol::FrameKind;
+
+    // Greets with the wrong token: told so, and then not served.
+    let (_one, mut wrong) = node_with_a_token().await;
+    let refused = wrong.send(hello_frame(9, "not-the-token")).await.expect("an answer");
+    assert_eq!(reply(&refused).0, FrameKind::Error, "a wrong token was accepted");
+
+    let after = wrong.send(pull_frame(9)).await;
+    assert!(
+        !matches!(&after, Ok(frame) if reply(frame).0 == FrameKind::PullAck),
+        "a caller refused for its token was then given the stream"
+    );
+
+    // Does not greet at all: the first thing it says is a request.
+    let (_one, mut silent) = node_with_a_token().await;
+    let first = silent.send(pull_frame(9)).await;
+    assert!(
+        !matches!(&first, Ok(frame) if reply(frame).0 == FrameKind::PullAck),
+        "a caller that never greeted was given the stream"
+    );
+    let second = silent.send(pull_frame(9)).await;
+    assert!(
+        !matches!(&second, Ok(frame) if reply(frame).0 == FrameKind::PullAck),
+        "a caller that never greeted was given the stream on asking twice"
+    );
+
+    // And the one that has the token is served, so the above is the token's
+    // doing and not a listener that serves nobody.
+    let (_one, mut right) = node_with_a_token().await;
+    let greeted = right.send(hello_frame(9, "s3cret")).await.expect("an answer");
+    assert_eq!(reply(&greeted).0, FrameKind::HelloAck);
+    let stream = right.send(pull_frame(9)).await.expect("an answer");
+    let (kind, bytes) = reply(&stream);
+    assert_eq!(kind, FrameKind::PullAck);
+    assert!(bytes > 0, "the stream held nothing to give");
+}
+
+/// A connection belongs to the node that opened it.
+///
+/// Who sends a batch decides what is applied and what is taken as already
+/// held, and a `PULL` says who is asking. Neither may name a node other than
+/// the one whose greeting — and token — opened the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_greeted_node_cannot_speak_as_another() {
+    use super::protocol::{self, FrameKind};
+
+    let (one, mut client) = node_with_a_token().await;
+    let greeted = client.send(hello_frame(9, "s3cret")).await.expect("an answer");
+    assert_eq!(reply(&greeted).0, FrameKind::HelloAck);
+
+    // Asking as another node.
+    let as_other = client.send(pull_frame(8)).await.expect("an answer");
+    assert_eq!(reply(&as_other).0, FrameKind::Error, "a PULL made as another node was answered");
+
+    // Pushing as another node: an empty batch, which is enough to be refused
+    // for who it claims to come from before anything in it is looked at.
+    let mut payload = Vec::new();
+    protocol::encode_push(8, std::iter::empty(), 0, &mut payload);
+    let pushed = client
+        .send(protocol::plain_frame(FrameKind::Push, 0, &payload))
+        .await
+        .expect("an answer");
+    assert_eq!(reply(&pushed).0, FrameKind::Error, "a PUSH sent as another node was accepted");
+
+    // Greeting again as another node does not move the connection to it.
+    let again = client.send(hello_frame(8, "s3cret")).await.expect("an answer");
+    assert_eq!(reply(&again).0, FrameKind::Error, "a connection was taken over by a second greeting");
+
+    // As itself it is served, on the same connection, after all of that.
+    let own = client.send(pull_frame(9)).await.expect("an answer");
+    assert_eq!(reply(&own).0, FrameKind::PullAck);
+    let mut payload = Vec::new();
+    protocol::encode_push(9, std::iter::empty(), 0, &mut payload);
+    let pushed = client
+        .send(protocol::plain_frame(FrameKind::Push, 0, &payload))
+        .await
+        .expect("an answer");
+    assert_eq!(reply(&pushed).0, FrameKind::PushAck);
+
+    assert_eq!(one.replication.applied().high_water(8), 0);
+}

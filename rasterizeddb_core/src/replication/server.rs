@@ -92,6 +92,12 @@ pub fn bind_on(
         builder = builder.with_listener(listener);
     }
 
+    // Who is calling is settled once, when the connection opens, and then
+    // known for every frame on it. See [`Greeter`].
+    builder = builder.authenticator(StdArc::new(Greeter {
+        replication: replication.clone(),
+    }));
+
     // Present this node's own certificate rather than a freshly generated one,
     // so the fingerprint the peers pinned stays the same across restarts.
     match config
@@ -166,7 +172,7 @@ pub async fn serve(
     });
 
     let outcome = server
-        .run_with_context(database, handle_frame)
+        .run_with_context_and_principal(database, handle_frame)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()));
 
@@ -179,9 +185,113 @@ pub async fn serve(
     outcome
 }
 
-/// Answers one frame.
-async fn handle_frame(database: Arc<Database>, request: Vec<u8>) -> Vec<u8> {
+/// Greets a connection before anything else is served on it.
+///
+/// A sender's first frame on every connection it opens is a `HELLO`: which
+/// node it is, which cluster it belongs to, and the cluster's token. That used
+/// to be answered like any other request, by a handler that knew nothing of
+/// the connection a frame arrived on — so the token was checked when a caller
+/// chose to present it and at no other time. A caller that never greeted, or
+/// greeted with the wrong token and was refused, could go on to `PULL` this
+/// node's stream or `PUSH` into it on the same connection.
+///
+/// The transport runs this once per connection, before the first request, and
+/// serves nothing on a connection it refuses. It reads the first frame, which
+/// has to be a `HELLO`, checks it exactly as before, and answers it exactly as
+/// before — so a sender, which sends its `HELLO` and waits for the answer,
+/// cannot tell the difference, and a node with this talks to one without it in
+/// either direction. What it adds is the caller's node id, handed to
+/// [`handle_frame`] with every frame that follows.
+#[derive(Debug)]
+struct Greeter {
+    replication: StdArc<Replication>,
+}
+
+impl rastcp::session::ServerAuthenticator for Greeter {
+    fn authenticate<'a>(
+        &'a self,
+        channel: &'a mut rastcp::session::AuthChannel<'_>,
+    ) -> rastcp::session::AuthFuture<'a, rastcp::session::Principal> {
+        Box::pin(async move {
+            let frame = channel.recv().await?;
+
+            let greeting = {
+                let mut scratch = Vec::new();
+                FrameCodec::default()
+                    .decode_frame(&frame, &mut scratch)
+                    .map(|(header, payload)| (header.kind, payload.to_vec()))
+                    .map_err(|e| e.to_string())
+            };
+
+            let (reply, caller) = match greeting {
+                Ok((FrameKind::Hello, payload)) => {
+                    let reply = handle_hello(&self.replication, &payload);
+                    let caller = acknowledged_caller(&payload, &reply);
+                    (reply, caller)
+                }
+                Ok((other, _)) => (
+                    protocol::error_frame(&format!(
+                        "a connection opens with HELLO; this one opened with {}",
+                        other
+                    )),
+                    None,
+                ),
+                Err(e) => {
+                    warn!("Rejecting a replication greeting: {}", e);
+                    (protocol::error_frame(&e), None)
+                }
+            };
+
+            // Answered either way: a caller that is refused is told why, as
+            // it was when the greeting was an ordinary request.
+            channel.send(&reply).await?;
+
+            match caller {
+                Some(node) => Ok(rastcp::session::Principal::new(session_name(node), false)),
+                None => Err(rastcp::error::RastcpError::AuthenticationError(format!(
+                    "the replication greeting from {} was refused",
+                    channel.peer_addr()
+                ))),
+            }
+        })
+    }
+}
+
+/// The node a `HELLO` named, if `reply` — this node's answer to it — is an
+/// acknowledgement and not a refusal.
+fn acknowledged_caller(hello: &[u8], reply: &[u8]) -> Option<NodeId> {
+    let acknowledged =
+        protocol::parse_header(reply).is_ok_and(|header| header.kind == FrameKind::HelloAck);
+    if !acknowledged {
+        return None;
+    }
+
+    Hello::decode(&mut Reader::new(hello)).ok().map(|hello| hello.node_id)
+}
+
+/// The name a greeted connection's caller goes by in the transport.
+fn session_name(node: NodeId) -> String {
+    format!("node:{node}")
+}
+
+/// The node a connection was greeted as, or `None` for a connection that was
+/// served without a greeting — which this listener does not do, and which is
+/// refused all the same rather than trusted on that account.
+fn greeted_node(principal: &rastcp::session::Principal) -> Option<NodeId> {
+    principal.user.strip_prefix("node:")?.parse().ok()
+}
+
+/// Answers one frame from the node `principal` was greeted as.
+async fn handle_frame(
+    database: Arc<Database>,
+    principal: StdArc<rastcp::session::Principal>,
+    request: Vec<u8>,
+) -> Vec<u8> {
     let replication = database.replication.clone();
+
+    let Some(caller) = greeted_node(&principal) else {
+        return protocol::error_frame("this connection was not opened with HELLO");
+    };
 
     // Decode with the thread's codec, then let go of it: the borrow cannot be
     // held across the `await`s below, and the payload has to outlive it, so it
@@ -204,9 +314,19 @@ async fn handle_frame(database: Arc<Database>, request: Vec<u8>) -> Vec<u8> {
     };
 
     match header.kind {
-        FrameKind::Hello => handle_hello(&replication, &payload),
-        FrameKind::Push => handle_push(&database, &replication, &payload).await,
-        FrameKind::Pull => handle_pull(&replication, &payload),
+        // Greeting again on a connection already greeted changes nothing
+        // about who is on it, so it may only be the same node saying so.
+        FrameKind::Hello => {
+            match Hello::decode(&mut Reader::new(&payload)) {
+                Ok(hello) if hello.node_id != caller => protocol::error_frame(&format!(
+                    "this connection was opened by node {}, and cannot be taken over by node {}",
+                    caller, hello.node_id
+                )),
+                _ => handle_hello(&replication, &payload),
+            }
+        }
+        FrameKind::Push => handle_push(&database, &replication, caller, &payload).await,
+        FrameKind::Pull => handle_pull(&replication, caller, &payload),
         FrameKind::Digest => super::check::answer(&database, &payload).await,
         FrameKind::Ping => {
             let mut out = Vec::with_capacity(8);
@@ -286,12 +406,27 @@ fn handle_hello(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
 async fn handle_push(
     database: &Arc<Database>,
     replication: &StdArc<Replication>,
+    caller: NodeId,
     payload: &[u8],
 ) -> Vec<u8> {
     let (sender, records) = match protocol::decode_push(&mut Reader::new(payload)) {
         Ok(decoded) => decoded,
         Err(e) => return protocol::error_frame(&format!("unreadable PUSH: {}", e)),
     };
+
+    // A batch says who sends it, and that decides what is applied and what is
+    // taken as already held. It has to be the node the connection was opened
+    // by, not whichever node the batch would like to be taken for.
+    if sender != caller {
+        warn!(
+            "Refusing a PUSH sent as node {} on a connection opened by node {}",
+            sender, caller
+        );
+        return protocol::error_frame(&format!(
+            "this connection was opened by node {}; a PUSH on it cannot be sent as node {}",
+            caller, sender
+        ));
+    }
 
     // In a task of its own. The transport drops this future when its request
     // timeout passes or the connection goes, and an apply dropped between two
@@ -321,11 +456,18 @@ async fn handle_push(
 }
 
 /// Serves history from the log.
-fn handle_pull(replication: &StdArc<Replication>, payload: &[u8]) -> Vec<u8> {
+fn handle_pull(replication: &StdArc<Replication>, caller: NodeId, payload: &[u8]) -> Vec<u8> {
     let request = match Pull::decode(&mut Reader::new(payload)) {
         Ok(request) => request,
         Err(e) => return protocol::error_frame(&format!("unreadable PULL: {}", e)),
     };
+
+    if request.node_id != caller {
+        return protocol::error_frame(&format!(
+            "this connection was opened by node {}; a PULL on it cannot be made as node {}",
+            caller, request.node_id
+        ));
+    }
 
     let Some(log) = replication.log() else {
         return protocol::error_frame("this node keeps no replication log");
@@ -1933,11 +2075,44 @@ mod tests {
     #[tokio::test]
     async fn a_garbled_frame_is_answered_with_an_error_not_a_panic() {
         let database = database().await;
-        let response = handle_frame(database, vec![0xde, 0xad, 0xbe, 0xef]).await;
+        let greeted = StdArc::new(rastcp::session::Principal::new(session_name(2), false));
+        let response = handle_frame(database, greeted, vec![0xde, 0xad, 0xbe, 0xef]).await;
         assert_eq!(
             protocol::parse_header(&response).unwrap().kind,
             FrameKind::Error
         );
+    }
+
+    #[tokio::test]
+    async fn a_frame_on_a_connection_that_was_not_greeted_is_refused() {
+        // The listener greets every connection, so this is not reachable
+        // through it. It is refused all the same: a handler that served
+        // whoever it was handed would be one configuration change away from
+        // serving everyone.
+        let database = database().await;
+        let nobody = StdArc::new(rastcp::session::Principal::anonymous());
+
+        let ping = protocol::plain_frame(FrameKind::Ping, 0, &[]);
+        let response = handle_frame(database, nobody, ping).await;
+
+        assert_eq!(
+            protocol::parse_header(&response).unwrap().kind,
+            FrameKind::Error
+        );
+    }
+
+    #[test]
+    fn a_session_name_gives_back_the_node_it_was_made_from() {
+        for node in [1u64, 2, 61171, u64::MAX] {
+            let principal = rastcp::session::Principal::new(session_name(node), false);
+            assert_eq!(greeted_node(&principal), Some(node));
+        }
+        // Anything else is nobody, including the transport's own anonymous
+        // caller and a name that only looks like one of these.
+        assert_eq!(greeted_node(&rastcp::session::Principal::anonymous()), None);
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("node:", false)), None);
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("node:two", false)), None);
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("alice", true)), None);
     }
 
     #[test]
