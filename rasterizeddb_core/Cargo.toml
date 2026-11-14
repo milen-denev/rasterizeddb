@@ -57,7 +57,7 @@ memory-stats = "1.2"
 smallvec = { version = "1.16", features = ["union", "write"]}
 arc-swap = "1.9"
 fastrand = "2.5"
-parking_lot = "0.12.5"
+parking_lot = "0.13"
 libc = "0.2"
 clap = { version = "4.6", features = ["derive"] }
 kanal = "0.1"
