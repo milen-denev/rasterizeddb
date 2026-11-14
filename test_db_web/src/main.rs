@@ -22,13 +22,10 @@ use tokio::sync::OnceCell;
 
 static CLIENT: async_lazy::Lazy<Arc<DbClient>> = async_lazy::Lazy::new(|| {
     Box::pin(async {
-        let client = DbClient::with_pool_settings_and_timeouts(
-            Some("127.0.0.1"),
-            64,
-            128,
-            Duration::from_secs(2),
-            Duration::from_millis(250),
-        )
+        // One connection shared by every request this server is handling,
+        // in place of a pool of up to 128: the database runs each query on a
+        // task of its own whichever connection it arrives on.
+        let client = DbClient::multiplexed(Some("127.0.0.1"), 1, Duration::from_secs(2), None)
             .await
             .unwrap();
 

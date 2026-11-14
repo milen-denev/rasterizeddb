@@ -53,7 +53,7 @@ async fn main() -> std::io::Result<()> {
         let choice = prompt_menu_choice();
         match choice {
             1 => {
-                let client = Arc::new(DbClient::with_pool_settings(Some("127.0.0.1"), 10, 100).await.unwrap());
+                let client = Arc::new(DbClient::new_multiplexed(Some("127.0.0.1")).await.unwrap());
 
                 let create_result = create_table(&client).await;
                 println!("Create result: {:?}", create_result);
@@ -63,7 +63,7 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             2 => {
-                let client = Arc::new(DbClient::with_pool_settings(Some("127.0.0.1"), 10, 100).await.unwrap());
+                let client = Arc::new(DbClient::new_multiplexed(Some("127.0.0.1")).await.unwrap());
 
                 pause("Press any key to continue...");
                 insert_rows(&client).await;
@@ -71,7 +71,7 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             3 => {
-                let client = Arc::new(DbClient::with_pool_settings(Some("127.0.0.1"), 1, 100).await.unwrap());
+                let client = Arc::new(DbClient::new_multiplexed(Some("127.0.0.1")).await.unwrap());
 
                 pause("Press any key to continue...");
                 run_queries(&client).await;

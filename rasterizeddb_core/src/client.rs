@@ -461,6 +461,39 @@ impl DbClientPool {
 pub struct DbClient {
     transport: Transport,
     connected: AtomicBool,
+    retry: QueryRetry,
+}
+
+/// What a client does with a query whose connection failed under it.
+///
+/// A query can fail in transit after the server has received it: the
+/// connection drops, or the answer does not come within the timeout. The
+/// client cannot tell which side of the server's work the failure fell on, so
+/// sending the query again may carry it out a second time. For a `SELECT`
+/// that costs nothing; for an `INSERT` it is a duplicate row that nothing
+/// reports.
+///
+/// Set with [`DbClient::with_retry`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueryRetry {
+    /// Report the failure and send nothing again. The default: whether a
+    /// query is safe to repeat is something only its caller knows.
+    #[default]
+    Never,
+    /// Send the query once more when the failure is one of transport — a
+    /// dropped or reset connection, or a timeout. For a caller whose queries
+    /// are safe to run twice.
+    Once,
+}
+
+impl QueryRetry {
+    /// How many times a query is sent in all.
+    fn attempts(self) -> usize {
+        match self {
+            QueryRetry::Never => 1,
+            QueryRetry::Once => 2,
+        }
+    }
 }
 
 /// How a client's queries reach the server.
@@ -667,6 +700,7 @@ impl DbClient {
         Ok(DbClient {
             transport: Transport::Pooled(pool_arc),
             connected: AtomicBool::new(true),
+            retry: QueryRetry::default(),
         })
     }
 
@@ -678,9 +712,11 @@ impl DbClient {
     /// call each way per query; this one holds `connections` sessions and
     /// sends whatever queries are waiting together, as the server answers
     /// them together. Measured with point queries against a server on four
-    /// cores (`examples/native_bench.rs`), one shared connection carried 78,000
-    /// queries a second for 16 callers where the pool carried 68,000, and
-    /// 84,000 for 128 callers where the pool carried 63,000.
+    /// cores (`examples/native_bench.rs`), one shared connection carried 47,000
+    /// queries a second for 4 callers where the pool carried 42,500, and
+    /// 84,000 for 128 callers where the pool carried 63,000. A single caller
+    /// sending one query at a time has nothing to share and is about 4%
+    /// slower this way, 65 µs a query against 62.
     ///
     /// One connection is enough for that: the server runs each query on its
     /// own task whichever connection it came in on, and the connection only
@@ -688,11 +724,11 @@ impl DbClient {
     /// little; they are for a client that outruns one connection's task.
     ///
     /// The queries a caller sees are the same: each gets its own answer, and
-    /// a query that fails in transit is retried once exactly as the pooled
-    /// client retries it. What differs is that queries on a shared connection
-    /// run side by side on the server, so two sent together may be carried
-    /// out in either order — as they already may be when a pool sends them on
-    /// two connections.
+    /// one that fails in transit is treated as [`QueryRetry`] says, exactly as
+    /// on the pooled client. What differs is that queries on a shared
+    /// connection run side by side on the server, so two sent together may be
+    /// carried out in either order — as they already may be when a pool sends
+    /// them on two connections.
     ///
     /// Needs a server that speaks `rastcp/2`. Against an older one the
     /// handshake is refused and this returns that error; use
@@ -739,7 +775,37 @@ impl DbClient {
                 next: CacheGuard::new(AtomicUsize::new(0)),
             }),
             connected: AtomicBool::new(true),
+            retry: QueryRetry::default(),
         })
+    }
+
+    /// [`DbClient::multiplexed`] with one connection, the default timeout and
+    /// no credentials: the shared-connection counterpart of
+    /// [`DbClient::new`].
+    pub async fn new_multiplexed(addr: Option<&str>) -> io::Result<Self> {
+        Self::multiplexed(addr, 1, DEFAULT_TRANSPORT_TIMEOUT, None).await
+    }
+
+    /// As [`DbClient::new_multiplexed`], logging in as `user`.
+    pub async fn new_multiplexed_authenticated(
+        addr: Option<&str>,
+        user: &str,
+        password: &str,
+    ) -> io::Result<Self> {
+        Self::multiplexed(
+            addr,
+            1,
+            DEFAULT_TRANSPORT_TIMEOUT,
+            Some(DbCredentials::new(user, password)),
+        )
+        .await
+    }
+
+    /// Sets what this client does with a query that fails in transit. See
+    /// [`QueryRetry`]; the default is to report the failure.
+    pub fn with_retry(mut self, retry: QueryRetry) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Connect to the database server
@@ -779,51 +845,32 @@ impl DbClient {
             ));
         }
 
-        let query_bytes = query.as_bytes().to_vec();
+        let attempts = self.retry.attempts();
         let mut last_error = None;
 
-        let pool = match &self.transport {
-            Transport::Pooled(pool) => pool,
-            Transport::Shared(shared) => return Self::execute_shared(shared, query).await,
-        };
+        for attempt in 1..=attempts {
+            let sent = match &self.transport {
+                Transport::Pooled(pool) => {
+                    let mut client_guard = pool.get_client().await?;
+                    client_guard.send(query.as_bytes().to_vec()).await
+                }
+                // A second attempt goes to the next connection, which is not
+                // the one that just failed unless there is only one.
+                Transport::Shared(shared) => shared
+                    .pick()
+                    .send(query.as_bytes())
+                    .await
+                    .map_err(rastcp_error_to_io_error),
+            };
 
-        for attempt in 0..=1 {
-            let mut client_guard = pool.get_client().await?;
-
-            match client_guard.send(query_bytes.clone()).await {
+            match sent {
                 Ok(response) => return Self::parse_query_response(response),
-                Err(err) if attempt == 0 && is_retryable_transport_error(err.kind()) => {
+                // Only a failure of transport is worth another attempt, and
+                // only if this client was told its queries can take one.
+                Err(err) if attempt < attempts && is_retryable_transport_error(err.kind()) => {
                     last_error = Some(err);
-                    continue;
                 }
                 Err(err) => return Err(err),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| io::Error::other("Query execution failed")))
-    }
-
-    /// One query over the shared connections, with the pooled client's retry:
-    /// once, and only for an error that says the query may not have arrived.
-    async fn execute_shared(
-        shared: &SharedConnections,
-        query: &str,
-    ) -> io::Result<QueryExecutionResult> {
-        let mut last_error = None;
-
-        for attempt in 0..=1 {
-            // The retry goes to the next connection, which is not the one
-            // that just failed unless there is only one.
-            match shared.pick().send(query.as_bytes()).await {
-                Ok(response) => return Self::parse_query_response(response),
-                Err(err) => {
-                    let err = rastcp_error_to_io_error(err);
-                    if attempt == 0 && is_retryable_transport_error(err.kind()) {
-                        last_error = Some(err);
-                        continue;
-                    }
-                    return Err(err);
-                }
             }
         }
 
@@ -988,6 +1035,7 @@ mod tests {
                 .unwrap(),
             )),
             connected: AtomicBool::new(true),
+            retry: QueryRetry::Once,
         };
 
         let result = client.execute_query("SELECT 1").await.unwrap();
@@ -1119,7 +1167,8 @@ mod tests {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .with_retry(QueryRetry::Once);
 
         let result = tokio::time::timeout(Duration::from_secs(20), client.execute_query("SELECT 1"))
             .await
@@ -1128,6 +1177,90 @@ mod tests {
 
         assert!(matches!(result, QueryExecutionResult::Ok));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        server_handle.abort();
+    }
+
+    /// A server whose first answer takes longer than the clients below wait,
+    /// counting how many times it was asked.
+    async fn stalling_server() -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+
+        let server = TcpServerBuilder::from_listener(listener)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            server
+                .run(move |_| {
+                    let counter = counter.clone();
+                    async move {
+                        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                        }
+                        vec![0]
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        (port, asked, handle)
+    }
+
+    #[tokio::test]
+    async fn a_query_that_fails_in_transit_is_not_sent_again_unless_asked() {
+        // The default, on both transports. The query below reached the server
+        // and timed out here; a client that sent it again would have run it
+        // twice, and for an INSERT that is a row nobody asked for.
+        let (port, asked, server_handle) = stalling_server().await;
+        let address = format!("127.0.0.1:{port}");
+
+        let shared = DbClient::multiplexed(Some(&address), 1, Duration::from_millis(500), None)
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            shared.execute_query("INSERT INTO t VALUES (1)"),
+        )
+        .await
+        .expect("the query never came back");
+
+        // The kind of failure a second attempt is made for, when one is
+        // allowed: otherwise this would only show that some other error is
+        // not retried.
+        assert!(is_retryable_transport_error(outcome.unwrap_err().kind()));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "the shared client sent the query again");
+
+        server_handle.abort();
+
+        let (port, asked, server_handle) = stalling_server().await;
+        let address = format!("127.0.0.1:{port}");
+
+        let pooled = DbClient::with_pool_settings_and_timeouts(
+            Some(&address),
+            1,
+            4,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            pooled.execute_query("INSERT INTO t VALUES (1)"),
+        )
+        .await
+        .expect("the query never came back");
+
+        assert!(is_retryable_transport_error(outcome.unwrap_err().kind()));
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "the pooled client sent the query again");
 
         server_handle.abort();
     }
