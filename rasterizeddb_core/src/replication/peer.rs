@@ -594,7 +594,38 @@ async fn stream(
                 } else {
                     (refusal_pause * 2).min(config.reconnect_max)
                 };
-                let _ = tokio::time::timeout(refusal_pause, peer.kick.notified()).await;
+
+                // The pause is waited out on a link that is still spoken on.
+                // It grows to `reconnect_max`, which is as long as the other
+                // end waits before closing a link it has not heard from: left
+                // silent, a stalled stream would find its link gone at every
+                // offer, and be reported down between them although the peer
+                // is there and answering.
+                //
+                // Listening for a kick from before the first keep-alive, so
+                // one that lands while a keep-alive is in flight is not lost.
+                let kicked = peer.kick.notified();
+                tokio::pin!(kicked);
+                kicked.as_mut().enable();
+                let resume = tokio::time::Instant::now() + refusal_pause;
+
+                loop {
+                    let left = resume.saturating_duration_since(tokio::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+
+                    let wait = match quiet_allowance(replication, peer, link, codec, &config).await? {
+                        Quiet::Pinged => continue,
+                        Quiet::For(allowed) => left.min(allowed),
+                        Quiet::Unlimited => left,
+                    };
+
+                    if tokio::time::timeout(wait, kicked.as_mut()).await.is_ok() {
+                        // Stopped, resumed, readdressed: look again now.
+                        break;
+                    }
+                }
             }
             Sent::Nothing => {
                 let mut poll = if replication.unreleased() > 0 {
@@ -605,15 +636,12 @@ async fn stream(
 
                 // A link with nothing to carry is spoken on anyway, often
                 // enough that the other end does not take it for abandoned.
-                if let Some(every) = config.keepalive_interval() {
-                    let quiet = link.last_exchange.elapsed();
-                    if quiet >= every {
-                        keep_alive(replication, peer, link, codec).await?;
-                        // Whatever became sendable while that was in flight
-                        // goes before any waiting.
-                        continue;
-                    }
-                    poll = poll.min(every.saturating_sub(quiet));
+                match quiet_allowance(replication, peer, link, codec, &config).await? {
+                    // Whatever became sendable while that was in flight goes
+                    // before any waiting.
+                    Quiet::Pinged => continue,
+                    Quiet::For(allowed) => poll = poll.min(allowed),
+                    Quiet::Unlimited => {}
                 }
 
                 tokio::select! {
@@ -624,6 +652,40 @@ async fn stream(
             }
         }
     }
+}
+
+/// How long a link may still be left with nothing said on it.
+enum Quiet {
+    /// As long as it likes: the keep-alive is off.
+    Unlimited,
+    /// This much longer before a keep-alive is due.
+    For(Duration),
+    /// One was due, and has just been answered.
+    Pinged,
+}
+
+/// Sends the keep-alive if it is due, and otherwise says how long the link may
+/// still be left alone. Every wait a link makes with nothing to send — because
+/// there is nothing, or because the peer is refusing what there is — asks this
+/// first and waits no longer than it says.
+async fn quiet_allowance(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    link: &mut Link,
+    codec: &mut FrameCodec,
+    config: &super::config::ReplicationConfig,
+) -> Result<Quiet, String> {
+    let Some(every) = config.keepalive_interval() else {
+        return Ok(Quiet::Unlimited);
+    };
+
+    let quiet = link.last_exchange.elapsed();
+    if quiet >= every {
+        keep_alive(replication, peer, link, codec).await?;
+        return Ok(Quiet::Pinged);
+    }
+
+    Ok(Quiet::For(every - quiet))
 }
 
 /// Asks the peer whether it is there, on a link that has had nothing to carry.

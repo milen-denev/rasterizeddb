@@ -535,8 +535,9 @@ under a live cluster makes its stream ambiguous. The token is never echoed by
 `SHOW`; it reports `(set)` or `(unset)`.
 
 **A quiet link is kept alive.** A node's link to a peer carries transactions
-when there are some; when there are none for `keepalive_ms` (10 seconds by
-default) it sends a `PING` instead. Two things follow. The receiving end closes
+when there are some; when it has carried nothing for `keepalive_ms` (10 seconds
+by default) — because there is nothing to send, or because the peer is refusing
+what there is and the next offer is not yet due — it sends a `PING` instead. Two things follow. The receiving end closes
 a connection it has not heard from for its request timeout, so without this the
 first write after a quiet spell would find the link closed, rebuild it, and
 arrive late by the reconnect delay. And a peer that has gone is reported down

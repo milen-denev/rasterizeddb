@@ -995,6 +995,97 @@ async fn with_the_keepalive_off_a_quiet_link_is_closed_and_built_again() {
     );
 }
 
+/// Something that stands in for a peer: it greets a caller as node 2 of the
+/// default cluster, answers pings, and takes nothing it is pushed. A test can
+/// count what it was asked and can take it away, neither of which a real node
+/// in the same process allows.
+struct StandIn {
+    port: u16,
+    server: std::sync::Arc<rastcp::server::TcpServer>,
+    task: tokio::task::JoinHandle<()>,
+    pings: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pushes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Starts a [`StandIn`] that closes a connection it has not heard from for
+/// `request_timeout`, as a node's replication listener does.
+async fn stand_in_peer(request_timeout: Duration) -> StandIn {
+    use super::protocol::{self, FrameCodec, FrameKind, HelloAck, PushAck};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (socket, port) = listener();
+    let cluster_id = ReplicationConfig::default().cluster_id();
+    let pings = std::sync::Arc::new(AtomicU64::new(0));
+    let pushes = std::sync::Arc::new(AtomicU64::new(0));
+
+    let server = std::sync::Arc::new(
+        rastcp::server::TcpServerBuilder::from_listener(socket)
+            .expect("a bound listener")
+            .request_timeout(request_timeout)
+            .build()
+            .await
+            .expect("the stand-in peer should build"),
+    );
+
+    let serving = server.clone();
+    let (ping_count, push_count) = (pings.clone(), pushes.clone());
+    let task = tokio::spawn(async move {
+        let _ = serving
+            .run(move |frame: Vec<u8>| {
+                let (ping_count, push_count) = (ping_count.clone(), push_count.clone());
+                async move {
+                    let mut scratch = Vec::new();
+                    let kind = FrameCodec::default()
+                        .decode_frame(&frame, &mut scratch)
+                        .map(|(header, _)| header.kind);
+
+                    match kind {
+                        Ok(FrameKind::Hello) => {
+                            let ack = HelloAck {
+                                node_id: 2,
+                                cluster_id,
+                                codec: super::config::Codec::None,
+                                clock: 1,
+                                applied: Vec::new(),
+                            };
+                            let mut out = Vec::new();
+                            ack.encode(&mut out);
+                            protocol::plain_frame(FrameKind::HelloAck, 0, &out)
+                        }
+                        Ok(FrameKind::Ping) => {
+                            ping_count.fetch_add(1, Ordering::SeqCst);
+                            protocol::plain_frame(FrameKind::Pong, 0, &1u64.to_le_bytes())
+                        }
+                        Ok(FrameKind::Push) => {
+                            // Received, and none of it taken: its account of
+                            // what it holds does not move.
+                            push_count.fetch_add(1, Ordering::SeqCst);
+                            let ack = PushAck {
+                                node_id: 2,
+                                clock: 1,
+                                outcomes: Vec::new(),
+                                applied: Vec::new(),
+                            };
+                            let mut out = Vec::new();
+                            ack.encode(&mut out);
+                            protocol::plain_frame(FrameKind::PushAck, 0, &out)
+                        }
+                        _ => protocol::error_frame("the stand-in peer does not answer that"),
+                    }
+                }
+            })
+            .await;
+    });
+
+    StandIn {
+        port,
+        server,
+        task,
+        pings,
+        pushes,
+    }
+}
+
 /// A peer that has gone is reported gone, without waiting for a transaction
 /// to need it.
 ///
@@ -1003,51 +1094,12 @@ async fn with_the_keepalive_off_a_quiet_link_is_closed_and_built_again() {
 /// nothing is written, which on a standby is for as long as it matters.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_that_goes_away_is_reported_down_with_nothing_to_send_it() {
-    use super::protocol::{self, FrameCodec, FrameKind, HelloAck};
-
     const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
     // The other end of the link: something that greets and answers pings as a
     // node does, and that the test can take away.
-    let (peer_socket, peer_port) = listener();
-    let cluster_id = ReplicationConfig::default().cluster_id();
-    let peer_server = std::sync::Arc::new(
-        rastcp::server::TcpServerBuilder::from_listener(peer_socket)
-            .expect("a bound listener")
-            .build()
-            .await
-            .expect("the stand-in peer should build"),
-    );
-    let serving = peer_server.clone();
-    let peer_task = tokio::spawn(async move {
-        let _ = serving
-            .run(move |frame: Vec<u8>| async move {
-                let mut scratch = Vec::new();
-                let kind = FrameCodec::default()
-                    .decode_frame(&frame, &mut scratch)
-                    .map(|(header, _)| header.kind);
-
-                match kind {
-                    Ok(FrameKind::Hello) => {
-                        let ack = HelloAck {
-                            node_id: 2,
-                            cluster_id,
-                            codec: super::config::Codec::None,
-                            clock: 1,
-                            applied: Vec::new(),
-                        };
-                        let mut out = Vec::new();
-                        ack.encode(&mut out);
-                        protocol::plain_frame(FrameKind::HelloAck, 0, &out)
-                    }
-                    Ok(FrameKind::Ping) => {
-                        protocol::plain_frame(FrameKind::Pong, 0, &1u64.to_le_bytes())
-                    }
-                    _ => protocol::error_frame("the stand-in peer only greets and answers pings"),
-                }
-            })
-            .await;
-    });
+    let peer = stand_in_peer(Duration::from_secs(30)).await;
+    let peer_port = peer.port;
 
     let (socket, port) = listener();
     let one = super::test_support::in_memory_database().await;
@@ -1072,9 +1124,9 @@ async fn a_peer_that_goes_away_is_reported_down_with_nothing_to_send_it() {
     assert_eq!(to_two.links_established(), 1, "a quiet link to a live peer was rebuilt");
 
     // The peer goes. Nothing is written on this node, before or after.
-    peer_server.shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(10), peer_task).await;
-    drop(peer_server);
+    peer.server.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), peer.task).await;
+    drop(peer.server);
 
     let noticed = tokio::time::Instant::now();
     eventually("the lost peer to be reported down", || async { !to_two.is_connected() }).await;
@@ -1105,4 +1157,67 @@ fn the_keepalive_is_never_less_often_than_a_third_of_the_request_timeout() {
     // And zero is off, whatever the request timeout.
     config.keepalive = Duration::ZERO;
     assert_eq!(config.keepalive_interval(), None);
+}
+
+/// A stream the peer keeps refusing keeps its link.
+///
+/// A batch the peer takes none of is offered again after a pause, and the
+/// pause grows to `reconnect_max` — as long as the other end waits before
+/// closing a link it has not heard from. Waited out in silence, every offer
+/// would find the link closed and have to build another, and between offers
+/// the peer would read as down although it is there, answering, and saying
+/// exactly what is wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_the_peer_refuses_keeps_its_link_between_offers() {
+    use std::sync::atomic::Ordering;
+
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+    // Three request timeouts between one offer and the next.
+    const PAUSE: Duration = Duration::from_millis(1500);
+
+    let peer = stand_in_peer(REQUEST_TIMEOUT).await;
+
+    let (socket, port) = listener();
+    let one = super::test_support::in_memory_database().await;
+    let mut config = ReplicationConfig {
+        node_id: 1,
+        listen_port: port,
+        peers: vec![PeerConfig::new("two", format!("127.0.0.1:{}", peer.port))],
+        ..Default::default()
+    };
+    brisk(&mut config);
+    config.request_timeout = REQUEST_TIMEOUT;
+    config.reconnect_base = PAUSE;
+    config.reconnect_max = PAUSE;
+    one.replication.set_config(config).expect("a valid configuration");
+    one.replication.serve_on(socket);
+    Database::start_replication(one.clone()).expect("replication should start");
+
+    let to_two = one.replication.peer("two").expect("the peer is configured");
+    eventually("the link to come up", || async { to_two.is_connected() }).await;
+
+    // Something to send, which the stand-in will not take.
+    run_ok(&one, "CREATE TABLE repl_refused (id INTEGER, name VARCHAR)").await;
+
+    // Offered, refused, and offered again after each pause: three offers is
+    // two whole pauses waited out on the one link.
+    eventually("the stream to be offered three times", || async {
+        peer.pushes.load(Ordering::SeqCst) >= 3
+    })
+    .await;
+
+    assert_eq!(
+        to_two.links_established(),
+        1,
+        "the link was closed during a pause between offers and built again"
+    );
+    assert!(to_two.is_connected(), "a peer that was answering was reported down");
+    assert!(
+        peer.pings.load(Ordering::SeqCst) >= 4,
+        "only {} keep-alives in two pauses of three request timeouts each",
+        peer.pings.load(Ordering::SeqCst)
+    );
+
+    peer.server.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), peer.task).await;
 }
