@@ -1,0 +1,17 @@
+[package]
+name = "rasterizeddb_client"
+version = "0.1.0"
+edition = "2024"
+description = "A client for RasterizedDB's native protocol that does not compile the engine"
+
+# What a client needs and nothing else: the transport, a runtime, and libc for
+# the operating-system user a peer login names. The row format and the literal
+# rules are this crate's own copies of the server's; the tests in `tests/`
+# run them against a real server so the copies cannot drift unnoticed.
+[dependencies]
+rastcp = { path = "../rastcp" }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }

@@ -4494,6 +4494,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterizeddb_client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rastcp",
+ "tokio",
+]
+
+[[package]]
 name = "rasterizeddb_compat"
 version = "0.1.0"
 dependencies = [
