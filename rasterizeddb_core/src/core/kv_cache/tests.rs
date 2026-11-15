@@ -613,16 +613,28 @@ fn sql_rows_have_the_described_shape() {
 // Over TCP
 // ---------------------------------------------------------------------------
 
+/// What a test client talks over: TCP or a unix socket.
+trait TestIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TestIo for T {}
+
 /// A minimal RESP client: sends commands, reads whole replies.
 struct Client {
-    sock: tokio::net::TcpStream,
+    sock: Box<dyn TestIo>,
     buf: Vec<u8>,
 }
 
 impl Client {
     async fn connect(port: u16) -> Client {
         Client {
-            sock: tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect"),
+            sock: Box::new(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect")),
+            buf: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    async fn connect_unix(path: &std::path::Path) -> Client {
+        Client {
+            sock: Box::new(tokio::net::UnixStream::connect(path).await.expect("connect")),
             buf: Vec::new(),
         }
     }
@@ -715,12 +727,13 @@ async fn start_server() -> (u16, KvCacheHandle) {
     let handle = database.kv_cache.clone();
     let config = super::resp::RespConfig {
         addr: "127.0.0.1".into(),
-        port: 0,
+        port: Some(0),
+        socket: None,
         auth: super::resp::RespAuth::Trust,
         threads: Some(2),
     };
     let listener = super::resp::bind(&config).await.expect("bind");
-    let port = listener.local_addr().unwrap().port();
+    let port = listener.tcp_port().unwrap();
     tokio::spawn(super::resp::serve(listener, database, handle.clone(), config));
     (port, handle)
 }
@@ -979,7 +992,158 @@ async fn trust_is_refused_on_a_public_address() {
     let _settings = default_settings();
     let config = super::resp::RespConfig {
         addr: "0.0.0.0".into(),
-        port: 0,
+        port: Some(0),
+        socket: None,
+        auth: super::resp::RespAuth::Trust,
+        threads: None,
+    };
+    assert!(super::resp::bind(&config).await.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Over a unix socket
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn socket_path(name: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    std::path::PathBuf::from(format!(
+        "/tmp/rdb-kv-{}-{}-{}.sock",
+        std::process::id(),
+        name,
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+/// A server on a unix socket only, under `auth` and `mode`; the task serving it
+/// holds the socket file, which goes when the task does.
+#[cfg(unix)]
+async fn start_unix_server(
+    path: &std::path::Path,
+    mode: u32,
+    auth: super::resp::RespAuth,
+) -> std::io::Result<(tokio::task::JoinHandle<std::io::Result<()>>, KvCacheHandle)> {
+    let database = rclite::Arc::new(crate::core::database::Database::new_with_backend("kvtest", true).await);
+    let handle = database.kv_cache.clone();
+    let config = super::resp::RespConfig {
+        addr: "127.0.0.1".into(),
+        port: None,
+        socket: Some(super::resp::RespSocket {
+            path: path.to_path_buf(),
+            mode,
+            group: None,
+        }),
+        auth,
+        threads: Some(2),
+    };
+    let listeners = super::resp::bind(&config).await?;
+    assert_eq!(listeners.tcp_port(), None, "a socket-only listener bound a TCP port");
+    let task = tokio::spawn(super::resp::serve(listeners, database, handle.clone(), config));
+    Ok((task, handle))
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_redis_protocol_on_a_unix_socket() {
+    let _settings = default_settings();
+    let path = socket_path("serve");
+    let (task, handle) = start_unix_server(&path, 0o660, super::resp::RespAuth::Trust)
+        .await
+        .expect("trust on an owner-and-group socket is allowed");
+
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o660);
+
+    let mut c = Client::connect_unix(&path).await;
+    assert_eq!(c.call(&["PING"]).await, "+PONG");
+
+    // A pipeline: one write, replies in order.
+    let mut batch = Client::encode(&["SET", "a", "1"]);
+    batch.extend(Client::encode(&["INCR", "a"]));
+    batch.extend(Client::encode(&["GET", "a"]));
+    c.send_raw(&batch).await;
+    assert_eq!(c.read().await, "+OK");
+    assert_eq!(c.read().await, ":2");
+    assert_eq!(c.read().await, "2");
+
+    // A large value, past every buffer's first size.
+    let large = "x".repeat(300_000);
+    assert_eq!(c.call(&["SET", "big", &large]).await, "+OK");
+    assert_eq!(c.call(&["GET", "big"]).await, large);
+
+    // Transactions.
+    assert_eq!(c.call(&["MULTI"]).await, "+OK");
+    assert_eq!(c.call(&["INCR", "a"]).await, "+QUEUED");
+    assert_eq!(c.call(&["EXEC"]).await, "[:3]");
+
+    // A blocking pop woken by another client on the socket.
+    let mut waiter = Client::connect_unix(&path).await;
+    waiter.send(&["BLPOP", "jobs", "5"]).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(c.call(&["RPUSH", "jobs", "job-1"]).await, ":1");
+    assert_eq!(waiter.read().await, "[jobs,job-1]");
+
+    // A blocked client that hangs up is noticed — through a peek at the
+    // socket, which a unix stream does differently from a TCP one — and
+    // stops counting as blocked rather than waiting out its timeout.
+    let mut leaver = Client::connect_unix(&path).await;
+    leaver.send(&["BLPOP", "never", "30"]).await;
+    let stats = &handle.inner().stats;
+    for _ in 0..200 {
+        if stats.blocked.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(stats.blocked.load(std::sync::atomic::Ordering::Relaxed), 1);
+    drop(leaver);
+    let mut noticed = false;
+    for _ in 0..400 {
+        if stats.blocked.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            noticed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(noticed, "a client that hung up mid-BLPOP was still counted as blocked");
+
+    // No TCP port at all.
+    let info = c.call(&["INFO", "server"]).await;
+    assert!(info.contains("tcp_port:0"), "{info}");
+
+    // The socket file goes with its server.
+    task.abort();
+    let _ = task.await;
+    assert!(!path.exists(), "the socket file outlived its server");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_on_a_socket_everyone_can_reach_is_refused() {
+    let _settings = default_settings();
+    let path = socket_path("world");
+    let refused = start_unix_server(&path, 0o666, super::resp::RespAuth::Trust).await;
+    assert!(refused.is_err(), "trust was served on a world-writable socket");
+    assert!(!path.exists(), "the refused socket was created anyway");
+
+    // With authentication, the same mode is the operator's business.
+    let path = socket_path("world-auth");
+    let auth = super::resp::RespAuth::Roles { default_user: "rasterized".into() };
+    let (task, _) = start_unix_server(&path, 0o666, auth).await.expect("authenticated");
+    let mut c = Client::connect_unix(&path).await;
+    assert!(c.call(&["GET", "a"]).await.starts_with("-NOAUTH"), "an unauthenticated GET was served");
+    task.abort();
+    let _ = task.await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_needs_a_port_or_a_socket() {
+    let _settings = default_settings();
+    let config = super::resp::RespConfig {
+        addr: "127.0.0.1".into(),
+        port: None,
+        socket: None,
         auth: super::resp::RespAuth::Trust,
         threads: None,
     };

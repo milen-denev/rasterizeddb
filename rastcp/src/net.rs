@@ -278,7 +278,7 @@ pub(crate) fn unix_peer(stream: &tokio::net::UnixStream) -> io::Result<UnixPeer>
 /// replaced while it shuts down — a restart that binds the path again before
 /// the old process is gone — must not take the new server's socket with it.
 #[cfg(unix)]
-pub(crate) struct SocketFile {
+pub struct SocketFile {
     path: std::path::PathBuf,
     device: u64,
     inode: u64,
@@ -286,15 +286,20 @@ pub(crate) struct SocketFile {
 
 #[cfg(unix)]
 impl SocketFile {
-    /// Binds a listener on `path`, readable and writable as `mode` says.
+    /// Binds a listener on `path`, readable and writable as `mode` says, and
+    /// owned by `group` when one is given.
     ///
     /// A socket file left behind by a server that did not shut down cleanly is
     /// replaced. A socket somebody is listening on is not, and neither is a
     /// path that holds anything other than a socket: a mistyped path must not
     /// cost an operator a file.
-    pub(crate) fn bind(
+    ///
+    /// Every listener in this workspace that serves a unix socket binds it
+    /// here, so they all treat a path the same way.
+    pub fn bind(
         path: &std::path::Path,
         mode: u32,
+        group: Option<u32>,
     ) -> Result<(std::os::unix::net::UnixListener, SocketFile), RastcpError> {
         use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
@@ -333,10 +338,15 @@ impl SocketFile {
             .set_nonblocking(true)
             .map_err(|e| failed("could not make non-blocking the listener on", e))?;
 
-        // Set at once. The file is created with the process's umask, which by
-        // default lets only the owner write to it — and connecting needs write
-        // permission — so the moment before this is not a wider opening than
-        // the default one.
+        // The group first, then the mode, so that a group-writable mode never
+        // applies to a group other than the one asked for. The file is
+        // created with the process's umask, which by default lets only the
+        // owner write to it — and connecting needs write permission — so the
+        // moment before these is not a wider opening than the default one.
+        if let Some(group) = group {
+            std::os::unix::fs::chown(path, None, Some(group))
+                .map_err(|e| failed(&format!("could not give group {} the socket", group), e))?;
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .map_err(|e| failed("could not set the permissions of", e))?;
 
@@ -352,8 +362,45 @@ impl SocketFile {
         ))
     }
 
-    pub(crate) fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+}
+
+/// The id of the group called `name`, or of the group whose id `name` is.
+#[cfg(unix)]
+pub fn group_id(name: &str) -> Result<u32, RastcpError> {
+    if let Ok(id) = name.parse::<u32>() {
+        return Ok(id);
+    }
+
+    let wanted = std::ffi::CString::new(name)
+        .map_err(|_| RastcpError::SocketBindingError(format!("{:?} is not a group name", name)))?;
+    let mut entry: libc::group = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::group = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 4096];
+
+    loop {
+        // SAFETY: every pointer is to memory owned here and live for the call;
+        // the entry's strings land in `buffer`, which is not read afterwards.
+        let status = unsafe {
+            libc::getgrnam_r(
+                wanted.as_ptr(),
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+
+        if status == libc::ERANGE && buffer.len() < 1 << 20 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if status != 0 || found.is_null() {
+            return Err(RastcpError::SocketBindingError(format!("there is no group {:?}", name)));
+        }
+        return Ok(entry.gr_gid);
     }
 }
 

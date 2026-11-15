@@ -162,6 +162,9 @@ pub const NATIVE_LISTEN_ADDR: &str = "127.0.0.1";
 pub struct NativeListen {
     pub addr: String,
     pub port: u16,
+    /// Whether the TCP address is served at all. Off serves the unix socket
+    /// alone, which then has to be configured.
+    pub tcp: bool,
     /// A unix socket served alongside the TCP address, for clients on the
     /// same machine. `None` serves TCP only.
     pub socket: Option<NativeSocket>,
@@ -176,6 +179,8 @@ pub struct NativeSocket {
     /// `0o600` admits the server's own user only and `0o660` its group too.
     /// With authentication off, a mode that admits anyone else is refused.
     pub mode: u32,
+    /// The group that owns the socket file, so that its members may connect.
+    pub group: Option<u32>,
     /// How callers on the socket authenticate. `None` uses the TCP listener's
     /// method. [`crate::auth::AuthMethod::Peer`] is offered here and nowhere
     /// else.
@@ -187,6 +192,7 @@ impl NativeSocket {
         Self {
             path: path.into(),
             mode: rastcp::server::DEFAULT_UNIX_MODE,
+            group: None,
             method: None,
         }
     }
@@ -207,6 +213,7 @@ impl Default for NativeListen {
         Self {
             addr: NATIVE_LISTEN_ADDR.to_string(),
             port: SERVER_PORT,
+            tcp: true,
             socket: None,
         }
     }
@@ -217,6 +224,7 @@ impl NativeListen {
         Self {
             addr: addr.into(),
             port,
+            tcp: true,
             socket: None,
         }
     }
@@ -4456,6 +4464,9 @@ impl Database {
         }
 
         let mut builder = TcpServerBuilder::unix(&socket.path).unix_mode(socket.mode);
+        if let Some(group) = socket.group {
+            builder = builder.unix_group(group);
+        }
         if authenticates {
             builder = builder.authenticator(
                 StdArc::new(RoleAuthenticator::new(database.clone(), method))
@@ -4538,9 +4549,17 @@ impl Database {
 
         let authentication_required = authenticator.is_some();
 
+        if !listen.tcp && listen.socket.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the native protocol's TCP listener is off and no unix socket is configured, so \
+                 there would be nothing to connect to: set --rdb-socket, or leave TCP on",
+            ));
+        }
+
         // The listener is about to accept anyone, so it may only do so where
         // only this machine can reach it.
-        if !authentication_required && !listen.is_loopback() {
+        if listen.tcp && !authentication_required && !listen.is_loopback() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -4561,12 +4580,18 @@ impl Database {
             None => None,
         };
 
-        let server = Arc::new(bind_native_listener(&listen, authenticator).await);
+        let server = if listen.tcp {
+            let server = Arc::new(bind_native_listener(&listen, authenticator).await);
 
-        // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
-        // finish, rather than dropping every connection where it stands.
-        let shutdown = server.shutdown_handle();
-        crate::shutdown::on_termination(move || shutdown.shutdown());
+            // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
+            // finish, rather than dropping every connection where it stands.
+            let shutdown = server.shutdown_handle();
+            crate::shutdown::on_termination(move || shutdown.shutdown());
+            Some(server)
+        } else {
+            info!("Native protocol TCP listener is off; serving the unix socket only");
+            None
+        };
 
         let context = NativeContext {
             database,
@@ -4593,18 +4618,20 @@ impl Database {
             })
         });
 
-        let fut = async move {
-            info!("Database started, listening on {}", listen);
-            if let Err(e) = server
-                .run_with_context_and_principal(context, process_incoming_queries)
-                .await
-            {
-                error!("Server stopped with an error: {}", e);
-            }
-        };
+        if let Some(server) = server {
+            let fut = async move {
+                info!("Database started, listening on {}", listen);
+                if let Err(e) = server
+                    .run_with_context_and_principal(context, process_incoming_queries)
+                    .await
+                {
+                    error!("Server stopped with an error: {}", e);
+                }
+            };
 
-        if let Err(e) = tokio::spawn(fut).await {
-            warn!("Server task did not stop cleanly: {}", e);
+            if let Err(e) = tokio::spawn(fut).await {
+                warn!("Server task did not stop cleanly: {}", e);
+            }
         }
         if let Some(socket_task) = socket_task {
             if let Err(e) = socket_task.await {

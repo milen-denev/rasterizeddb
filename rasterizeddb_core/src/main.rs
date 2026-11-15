@@ -424,12 +424,25 @@ struct Args {
     #[arg(long = "rdb-socket", value_name = "PATH")]
     rdb_socket: Option<std::path::PathBuf>,
 
+    /// `off` serves the native protocol on `--rdb-socket` alone, with no TCP
+    /// listener: a deployment whose clients are all on this machine has no
+    /// port open at all. Default `on`.
+    #[arg(long = "rdb-tcp", value_name = "on|off", default_value = "on")]
+    rdb_tcp: String,
+
     /// Permissions of every unix socket this server serves, in octal (default
     /// 600: this server's user only; 660 admits its group too). Connecting
     /// needs write permission. A socket that admits users outside its owner
     /// and group must authenticate its callers.
     #[arg(long = "socket-mode", value_name = "MODE", default_value = "600")]
     socket_mode: String,
+
+    /// Group to give every unix socket this server serves, by name or id.
+    /// With `--socket-mode 660` its members may connect: how a socket is
+    /// shared with a service running as another user. This server's user must
+    /// belong to the group.
+    #[arg(long = "socket-group", value_name = "GROUP")]
+    socket_group: Option<String>,
 
     /// How callers on `--rdb-socket` authenticate: `scram-sha-256`, `trust`,
     /// or `peer` — a role may log in without a password when its name is the
@@ -880,6 +893,42 @@ fn apply_saved_settings(args: &mut Args) {
     one("index.residency", &mut args.index_residency, &stored, "memory");
     one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
     one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
+}
+
+/// `--socket-mode` and `--socket-group`, checked, for every unix socket the
+/// server serves. Exits with the reason if either is wrong, as the other flags
+/// do: a socket with permissions an operator did not ask for is worse than no
+/// start-up.
+fn socket_permissions(args: &Args) -> (u32, Option<u32>) {
+    let mode = match u32::from_str_radix(args.socket_mode.trim_start_matches("0o"), 8) {
+        Ok(mode) if mode <= 0o777 => mode,
+        _ => {
+            eprintln!(
+                "--socket-mode {:?} is not a file mode: expected octal such as 600 or 660",
+                args.socket_mode
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let group = match args.socket_group.as_deref() {
+        None => None,
+        #[cfg(unix)]
+        Some(name) => match rastcp::net::group_id(name) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("--socket-group: {e}");
+                std::process::exit(2);
+            }
+        },
+        #[cfg(not(unix))]
+        Some(_) => {
+            eprintln!("--socket-group: unix sockets are not supported on this platform");
+            std::process::exit(2);
+        }
+    };
+
+    (mode, group)
 }
 
 fn main() -> std::io::Result<()> {
@@ -1368,12 +1417,15 @@ fn main() -> std::io::Result<()> {
                 eprintln!("{e}");
                 std::process::exit(2);
             }
-            match args.kv.listener(&args.pg_user) {
+            let (socket_mode, socket_group) = socket_permissions(&args);
+            match args.kv.listener(&args.pg_user, socket_mode, socket_group) {
                 Ok(Some(config)) => {
                     match rasterizeddb_core::core::kv_cache::resp::bind(&config).await {
                         Ok(listener) => {
                             let database = arc_database.clone();
                             let handle = arc_database.kv_cache.clone();
+                            // Moved into the task: the socket file is removed
+                            // when the listener is dropped.
                             tokio::spawn(async move {
                                 if let Err(e) =
                                     rasterizeddb_core::core::kv_cache::resp::serve(listener, database, handle, config)
@@ -1432,19 +1484,23 @@ fn main() -> std::io::Result<()> {
                 if let Some(port) = args.rdb_port {
                     listen.port = port;
                 }
+                listen.tcp = match args.rdb_tcp.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    other => {
+                        eprintln!("--rdb-tcp {other:?}: expected on or off");
+                        std::process::exit(2);
+                    }
+                };
+                if !listen.tcp && args.rdb_socket.is_none() {
+                    eprintln!("--rdb-tcp off needs --rdb-socket: there would be nothing to connect to");
+                    std::process::exit(2);
+                }
                 if let Some(path) = args.rdb_socket.clone() {
                     let mut socket = rasterizeddb_core::core::database::NativeSocket::new(path);
-
-                    match u32::from_str_radix(args.socket_mode.trim_start_matches("0o"), 8) {
-                        Ok(mode) if mode <= 0o777 => socket.mode = mode,
-                        _ => {
-                            eprintln!(
-                                "--socket-mode {:?} is not a file mode: expected octal such as 600 or 660",
-                                args.socket_mode
-                            );
-                            std::process::exit(2);
-                        }
-                    }
+                    let (mode, group) = socket_permissions(&args);
+                    socket.mode = mode;
+                    socket.group = group;
 
                     if let Some(text) = args.rdb_socket_auth.as_deref() {
                         let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(text) else {

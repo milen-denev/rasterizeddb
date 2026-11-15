@@ -93,6 +93,7 @@ fn server(dir: String, port: u16, threads: usize, socket: Option<String>) {
             NativeListen {
                 addr: "127.0.0.1".to_string(),
                 port,
+                tcp: true,
                 socket: socket.map(rasterizeddb_core::core::database::NativeSocket::new),
             },
         )

@@ -509,6 +509,7 @@ mod unix_socket {
             let listen = NativeListen {
                 addr: "127.0.0.1".to_string(),
                 port: free_port(),
+                tcp: true,
                 socket: Some(socket),
             };
             let auth = NativeAuthConfig {
@@ -542,6 +543,7 @@ mod unix_socket {
             let listen = NativeListen {
                 addr: "127.0.0.1".to_string(),
                 port: free_port(),
+                tcp: true,
                 socket: Some(socket),
             };
             let auth = NativeAuthConfig {
@@ -575,6 +577,80 @@ mod unix_socket {
             let _ = server.await;
         }
 
+        #[tokio::test]
+        async fn tcp_off_with_no_socket_is_refused() {
+            let listen = NativeListen {
+                addr: "127.0.0.1".to_string(),
+                port: free_port(),
+                tcp: false,
+                socket: None,
+            };
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(30),
+                Database::start_db_with_auth_on(
+                    database_with_roles(&[]).await,
+                    NativeAuthConfig::default(),
+                    listen,
+                ),
+            )
+            .await
+            .expect("a refusal is immediate, not a server that runs");
+            assert_eq!(outcome.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn tcp_off_serves_the_socket_and_opens_no_port() {
+            let _ = rasterizeddb_core::MAX_PERMITS_THREADS.get_or_init(|| 4);
+            let _ = rasterizeddb_core::BATCH_SIZE.get_or_init(|| 1024);
+
+            // A port of our own, held until the server has started: if the
+            // server bound TCP anyway it would fail to start on it, and if it
+            // did not, the port is still ours afterwards.
+            let (held, port) = loopback();
+            drop(held);
+
+            let path = socket_path("notcp");
+            let mut socket = NativeSocket::new(&path);
+            socket.method = Some(AuthMethod::Trust);
+            let listen = NativeListen {
+                addr: "127.0.0.1".to_string(),
+                port,
+                tcp: false,
+                socket: Some(socket),
+            };
+            let auth = NativeAuthConfig {
+                method: AuthMethod::Trust,
+                ..NativeAuthConfig::default()
+            };
+
+            let server = tokio::spawn(Database::start_db_with_auth_on(
+                database_with_roles(&[]).await,
+                auth,
+                listen,
+            ));
+            for _ in 0..200 {
+                if path.exists() || server.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(!server.is_finished(), "a socket-only listener did not start");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+                "something answers on the TCP port with --rdb-tcp off"
+            );
+
+            let client = DbClient::new_multiplexed(Some(&format!("unix:{}", path.display())))
+                .await
+                .expect("connected over the socket");
+            assert!(client.execute_query("SELECT 1").await.is_ok());
+
+            server.abort();
+            let _ = server.await;
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_query_on_the_socket_runs_as_the_connecting_user() {
             let _ = rasterizeddb_core::MAX_PERMITS_THREADS.get_or_init(|| 4);
@@ -589,6 +665,7 @@ mod unix_socket {
             let listen = NativeListen {
                 addr: "127.0.0.1".to_string(),
                 port: free_port(),
+                tcp: true,
                 socket: Some(socket),
             };
             // The TCP side asks for a password, which exists: the socket's

@@ -476,3 +476,35 @@ async fn an_idle_unix_connection_is_closed_and_replaced_like_a_tcp_one() {
     })
     .await
 }
+
+#[tokio::test]
+async fn the_socket_file_can_be_given_to_a_group() {
+    use std::os::unix::fs::MetadataExt;
+
+    bounded(async {
+        // A group this process belongs to: its own primary one, looked up by
+        // name to exercise the name lookup too.
+        let gid = unsafe { libc::getgid() };
+        let name = unsafe {
+            let entry = libc::getgrgid(gid);
+            assert!(!entry.is_null(), "this process's group has no name");
+            std::ffi::CStr::from_ptr((*entry).gr_name).to_string_lossy().into_owned()
+        };
+        assert_eq!(rastcp::net::group_id(&name).unwrap(), gid);
+        assert_eq!(rastcp::net::group_id(&gid.to_string()).unwrap(), gid);
+        assert!(rastcp::net::group_id("no-such-group-anywhere").is_err());
+
+        let path = socket_path("grp");
+        let server = TcpServerBuilder::unix(&path)
+            .unix_mode(0o660)
+            .unix_group(gid)
+            .build()
+            .await
+            .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.gid(), gid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        drop(server);
+    })
+    .await
+}

@@ -142,6 +142,7 @@ pub struct TcpServerBuilder {
     /// [`TcpServerBuilder::unix`].
     unix_path: Option<PathBuf>,
     unix_mode: u32,
+    unix_group: Option<u32>,
 }
 
 /// Who may connect to a unix socket unless a server is told otherwise: its
@@ -208,6 +209,7 @@ impl TcpServerBuilder {
             reuse_port: false,
             unix_path: None,
             unix_mode: DEFAULT_UNIX_MODE,
+            unix_group: None,
         }
     }
 
@@ -242,6 +244,15 @@ impl TcpServerBuilder {
     /// Default `0o600`: the owner only.
     pub fn unix_mode(mut self, mode: u32) -> Self {
         self.unix_mode = mode;
+        self
+    }
+
+    /// The group that owns the socket file of a [`TcpServerBuilder::unix`]
+    /// server, by id ([`crate::net::group_id`] looks one up by name). With a
+    /// mode such as `0o660`, it is the group whose members may connect. The
+    /// server's user has to be a member of it.
+    pub fn unix_group(mut self, group: u32) -> Self {
+        self.unix_group = Some(group);
         self
     }
 
@@ -469,7 +480,7 @@ impl TcpServerBuilder {
                 ));
             }
 
-            let (listener, file) = SocketFile::bind(path, self.unix_mode)?;
+            let (listener, file) = SocketFile::bind(path, self.unix_mode, self.unix_group)?;
             let listener = tokio::net::UnixListener::from_std(listener)
                 .map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
 

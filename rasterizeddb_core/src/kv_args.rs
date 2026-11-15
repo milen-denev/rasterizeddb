@@ -1,7 +1,7 @@
 //! Flags for the Redis-compatible key/value store.
 
 use rasterizeddb_core::core::kv_cache::{self, EvictionPolicy};
-use rasterizeddb_core::core::kv_cache::resp::{RespAuth, RespConfig};
+use rasterizeddb_core::core::kv_cache::resp::{RespAuth, RespConfig, RespSocket};
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct KvArgs {
@@ -9,6 +9,13 @@ pub struct KvArgs {
     /// the PostgreSQL port work either way.
     #[arg(long = "kv-port", value_name = "PORT")]
     pub kv_port: Option<u16>,
+
+    /// Serve the Redis protocol on this unix socket, beside `--kv-port` or
+    /// instead of it (`redis-cli -s PATH`). Its permissions and group are
+    /// `--socket-mode` and `--socket-group`; `--kv-auth trust` is allowed on
+    /// it only when those admit nobody outside the owner and group.
+    #[arg(long = "kv-socket", value_name = "PATH")]
+    pub kv_socket: Option<std::path::PathBuf>,
 
     /// Address the Redis protocol listens on.
     #[arg(long = "kv-addr", default_value = "127.0.0.1")]
@@ -67,11 +74,17 @@ impl KvArgs {
         Ok(())
     }
 
-    /// The listener's settings, or `None` when no port was given.
-    pub fn listener(&self, pg_user: &str) -> Result<Option<RespConfig>, String> {
-        let Some(port) = self.kv_port else {
+    /// The listener's settings, or `None` when neither a port nor a socket
+    /// was given.
+    pub fn listener(
+        &self,
+        pg_user: &str,
+        socket_mode: u32,
+        socket_group: Option<u32>,
+    ) -> Result<Option<RespConfig>, String> {
+        if self.kv_port.is_none() && self.kv_socket.is_none() {
             return Ok(None);
-        };
+        }
         let auth = match self.kv_auth.trim().to_ascii_lowercase().as_str() {
             "password" | "roles" | "scram-sha-256" => RespAuth::Roles {
                 default_user: self.kv_user.clone().unwrap_or_else(|| pg_user.to_string()),
@@ -81,7 +94,12 @@ impl KvArgs {
         };
         Ok(Some(RespConfig {
             addr: self.kv_addr.clone(),
-            port,
+            port: self.kv_port,
+            socket: self.kv_socket.clone().map(|path| RespSocket {
+                path,
+                mode: socket_mode,
+                group: socket_group,
+            }),
             auth,
             threads: self.kv_threads,
         }))

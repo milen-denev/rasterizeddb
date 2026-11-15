@@ -16,7 +16,16 @@
 //! client authenticates it may send only `AUTH`, `HELLO`, `PING`, `QUIT` and
 //! `RESET`, and its frames are capped (10 arguments, 16 KiB each), as Redis
 //! caps unauthenticated clients. `--kv-auth trust` turns authentication off;
-//! the listener then refuses to bind anything but loopback.
+//! the listener then refuses to bind anything but loopback, and a unix
+//! socket that admits anyone outside its owner and group.
+//!
+//! # Unix socket
+//!
+//! `--kv-socket PATH` serves the protocol on a unix socket, beside the TCP
+//! port or instead of it. Redis clients connect to a path directly
+//! (`redis-cli -s PATH`, `redis+unix://` URLs). Who may connect is decided by
+//! the file's permissions and group, so `trust` is allowed on a socket only
+//! its owner and group can reach.
 
 use std::io;
 use std::sync::Arc;
@@ -48,10 +57,45 @@ pub enum RespAuth {
 #[derive(Clone, Debug)]
 pub struct RespConfig {
     pub addr: String,
-    pub port: u16,
+    /// The TCP port; `None` serves no TCP at all.
+    pub port: Option<u16>,
+    /// A unix socket served beside the port, or instead of it.
+    pub socket: Option<RespSocket>,
     pub auth: RespAuth,
     /// I/O threads; `None` is one per CPU this process may run on.
     pub threads: Option<usize>,
+}
+
+/// Where and how the protocol is served on a unix socket.
+#[derive(Clone, Debug)]
+pub struct RespSocket {
+    pub path: std::path::PathBuf,
+    /// The file's permissions; connecting needs write permission.
+    pub mode: u32,
+    /// The group that owns the file, so that its members may connect.
+    pub group: Option<u32>,
+}
+
+impl RespSocket {
+    /// Whether users outside the file's owner and group can connect.
+    pub fn admits_others(&self) -> bool {
+        self.mode & 0o007 != 0
+    }
+}
+
+/// What [`bind`] bound: a TCP listener, a unix socket, or both.
+pub struct RespListeners {
+    tcp: Option<TcpListener>,
+    #[cfg(unix)]
+    unix: Option<(tokio::net::UnixListener, rastcp::net::SocketFile)>,
+}
+
+impl RespListeners {
+    /// The TCP port actually bound, if any — the kernel's choice when `0`
+    /// was asked for.
+    pub fn tcp_port(&self) -> Option<u16> {
+        self.tcp.as_ref().and_then(|l| l.local_addr().ok()).map(|a| a.port())
+    }
 }
 
 /// Arguments in one frame, and bytes in one argument, before `AUTH`.
@@ -78,15 +122,22 @@ const WINDOW_KEYS: usize = 32;
 
 static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 
-/// Binds the listener, refusing an unauthenticated one on a public address.
-pub async fn bind(config: &RespConfig) -> io::Result<TcpListener> {
+/// Binds the listeners, refusing an unauthenticated one anyone can reach.
+pub async fn bind(config: &RespConfig) -> io::Result<RespListeners> {
+    if config.port.is_none() && config.socket.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the Redis protocol needs --kv-port, --kv-socket, or both",
+        ));
+    }
+
     if matches!(config.auth, RespAuth::Trust) {
         let loopback = config
             .addr
             .parse::<std::net::IpAddr>()
             .map(|ip| ip.is_loopback())
             .unwrap_or(config.addr == "localhost");
-        if !loopback {
+        if config.port.is_some() && !loopback {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -96,28 +147,219 @@ pub async fn bind(config: &RespConfig) -> io::Result<TcpListener> {
                 ),
             ));
         }
+        if let Some(socket) = config.socket.as_ref().filter(|s| s.admits_others()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--kv-auth trust on unix:{} with mode {:o} would let every user on the machine \
+                     read and write the store; use a --socket-mode that admits only the owner and \
+                     group, such as 660, or authenticate with database roles",
+                    socket.path.display(),
+                    socket.mode
+                ),
+            ));
+        }
     }
-    TcpListener::bind((config.addr.as_str(), config.port)).await
+
+    // The socket first: it is the one most likely to be refused (a live
+    // server on the path, a file that is not a socket), and refusing it should
+    // not leave a TCP port bound behind.
+    #[cfg(unix)]
+    let unix = match config.socket.as_ref() {
+        Some(socket) => {
+            let (listener, file) =
+                rastcp::net::SocketFile::bind(&socket.path, socket.mode, socket.group)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+            Some((tokio::net::UnixListener::from_std(listener)?, file))
+        }
+        None => None,
+    };
+    #[cfg(not(unix))]
+    if config.socket.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix sockets are not supported on this platform",
+        ));
+    }
+
+    let tcp = match config.port {
+        Some(port) => Some(TcpListener::bind((config.addr.as_str(), port)).await?),
+        None => None,
+    };
+
+    Ok(RespListeners {
+        tcp,
+        #[cfg(unix)]
+        unix,
+    })
 }
 
-/// Accepts connections until the listener fails.
+/// A connection on its way to the I/O thread that will own it, out of the
+/// accepting runtime's reactor.
+enum StdSock {
+    Tcp(std::net::TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+/// A client connection: TCP or a unix socket.
+enum Sock {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl Sock {
+    fn from_std(socket: StdSock) -> io::Result<Sock> {
+        Ok(match socket {
+            StdSock::Tcp(socket) => Sock::Tcp(TcpStream::from_std(socket)?),
+            #[cfg(unix)]
+            StdSock::Unix(socket) => Sock::Unix(tokio::net::UnixStream::from_std(socket)?),
+        })
+    }
+
+    async fn readable(&self) -> io::Result<()> {
+        match self {
+            Sock::Tcp(sock) => sock.readable().await,
+            #[cfg(unix)]
+            Sock::Unix(sock) => sock.readable().await,
+        }
+    }
+
+    /// Looks at the next byte without taking it: `0` when the client has
+    /// closed its end.
+    async fn peek_byte(&self) -> io::Result<usize> {
+        let mut byte = [0u8; 1];
+        match self {
+            Sock::Tcp(sock) => sock.peek(&mut byte).await,
+            // tokio's unix stream has no `peek`; the socket has, through
+            // `recv` with MSG_PEEK on its descriptor.
+            #[cfg(unix)]
+            Sock::Unix(sock) => {
+                use std::os::fd::AsRawFd;
+                loop {
+                    sock.readable().await?;
+                    let peeked = sock.try_io(tokio::io::Interest::READABLE, || {
+                        // SAFETY: a one-byte buffer owned here, and a
+                        // descriptor the stream keeps open for the call.
+                        let n = unsafe {
+                            libc::recv(
+                                sock.as_raw_fd(),
+                                byte.as_mut_ptr().cast(),
+                                1,
+                                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                            )
+                        };
+                        if n < 0 {
+                            Err(io::Error::last_os_error())
+                        } else {
+                            Ok(n as usize)
+                        }
+                    });
+                    match peeked {
+                        Ok(n) => return Ok(n),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Sock {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_read(cx, buf),
+            #[cfg(unix)]
+            Sock::Unix(sock) => std::pin::Pin::new(sock).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Sock {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_write(cx, buf),
+            #[cfg(unix)]
+            Sock::Unix(sock) => std::pin::Pin::new(sock).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_flush(cx),
+            #[cfg(unix)]
+            Sock::Unix(sock) => std::pin::Pin::new(sock).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_shutdown(cx),
+            #[cfg(unix)]
+            Sock::Unix(sock) => std::pin::Pin::new(sock).poll_shutdown(cx),
+        }
+    }
+}
+
+/// The next connection on `listener`, or never if there is none.
+async fn accept_tcp(listener: Option<&TcpListener>) -> io::Result<(StdSock, String)> {
+    let Some(listener) = listener else {
+        return std::future::pending().await;
+    };
+    let (socket, peer) = listener.accept().await?;
+    let _ = socket.set_nodelay(true);
+    // Leaves this runtime's epoll; the worker registers it with its own.
+    Ok((StdSock::Tcp(socket.into_std()?), peer.to_string()))
+}
+
+#[cfg(unix)]
+async fn accept_unix(
+    listener: Option<&(tokio::net::UnixListener, rastcp::net::SocketFile)>,
+) -> io::Result<(StdSock, String)> {
+    let Some((listener, file)) = listener else {
+        return std::future::pending().await;
+    };
+    let (socket, _) = listener.accept().await?;
+    // Named as Redis names a unix client in CLIENT LIST: the path, port 0.
+    Ok((StdSock::Unix(socket.into_std()?), format!("{}:0", file.path().display())))
+}
+
+/// Accepts connections until a listener fails.
 pub async fn serve(
-    listener: TcpListener,
+    listeners: RespListeners,
     database: rclite::Arc<Database>,
     handle: KvCacheHandle,
     config: RespConfig,
 ) -> io::Result<()> {
-    let port = listener.local_addr()?.port();
+    let port = listeners.tcp_port().unwrap_or(0);
     handle.inner().port.store(port as u64, Ordering::Relaxed);
-    info!(
-        "kv cache: Redis protocol on {}:{} ({})",
-        config.addr,
-        port,
-        match &config.auth {
-            RespAuth::Trust => "no authentication".to_string(),
-            RespAuth::Roles { default_user } => format!("database roles, default user {default_user}"),
-        }
-    );
+    let auth = match &config.auth {
+        RespAuth::Trust => "no authentication".to_string(),
+        RespAuth::Roles { default_user } => format!("database roles, default user {default_user}"),
+    };
+    if listeners.tcp.is_some() {
+        info!("kv cache: Redis protocol on {}:{} ({})", config.addr, port, auth);
+    }
+    #[cfg(unix)]
+    if let Some((_, file)) = listeners.unix.as_ref() {
+        info!("kv cache: Redis protocol on unix:{} ({})", file.path().display(), auth);
+    }
     // Build database 0 now, so the sweeper is running before the first key.
     handle.db(0);
     let config = Arc::new(config);
@@ -132,13 +374,13 @@ pub async fn serve(
     // between a request and its reply. On a shared work-stealing runtime one
     // worker owns epoll and passes readiness to the others, which costs more
     // per unpipelined request than the command does. The accept loop deals
-    // connections out round-robin. Work that must run on the main runtime
-    // (`AUTH`'s role lookup, which runs SQL through the engine) is sent back
-    // to it through `main`.
+    // connections out round-robin, from either listener. Work that must run on
+    // the main runtime (`AUTH`'s role lookup, which runs SQL through the
+    // engine) is sent back to it through `main`.
     let main = tokio::runtime::Handle::current();
     let mut workers = Vec::with_capacity(threads);
     for i in 0..threads {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(std::net::TcpStream, std::net::SocketAddr)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(StdSock, String)>();
         let (database, handle, config, main) = (database.clone(), handle.clone(), config.clone(), main.clone());
         std::thread::Builder::new()
             .name(format!("kv-io-{i}"))
@@ -152,7 +394,7 @@ pub async fn serve(
                 };
                 runtime.block_on(async move {
                     while let Some((socket, peer)) = rx.recv().await {
-                        let Ok(socket) = TcpStream::from_std(socket) else {
+                        let Ok(socket) = Sock::from_std(socket) else {
                             continue;
                         };
                         let (database, handle, config, main) =
@@ -165,20 +407,28 @@ pub async fn serve(
     }
     let mut next = 0usize;
     loop {
-        let (socket, peer) = listener.accept().await?;
-        let _ = socket.set_nodelay(true);
-        // Leaves this runtime's epoll; the worker registers it with its own.
-        let socket = socket.into_std()?;
-        if workers[next % threads].send((socket, peer)).is_err() {
-            log::error!("kv cache: I/O thread {} is gone; refusing a connection from {peer}", next % threads);
+        #[cfg(unix)]
+        let (socket, peer) = tokio::select! {
+            accepted = accept_tcp(listeners.tcp.as_ref()) => accepted?,
+            accepted = accept_unix(listeners.unix.as_ref()) => accepted?,
+        };
+        #[cfg(not(unix))]
+        let (socket, peer) = accept_tcp(listeners.tcp.as_ref()).await?;
+
+        if let Err(refused) = workers[next % threads].send((socket, peer)) {
+            log::error!(
+                "kv cache: I/O thread {} is gone; refusing a connection from {}",
+                next % threads,
+                refused.0.1
+            );
         }
         next = next.wrapping_add(1);
     }
 }
 
 async fn connection(
-    socket: TcpStream,
-    peer: std::net::SocketAddr,
+    socket: Sock,
+    peer: String,
     database: rclite::Arc<Database>,
     handle: KvCacheHandle,
     config: Arc<RespConfig>,
@@ -187,7 +437,7 @@ async fn connection(
     let stats = &handle.inner().stats;
     stats.connected.fetch_add(1, Ordering::Relaxed);
     stats.connections_total.fetch_add(1, Ordering::Relaxed);
-    let mut conn = Conn::new(handle.clone(), database, &config, peer.to_string(), main);
+    let mut conn = Conn::new(handle.clone(), database, &config, peer.clone(), main);
     if let Err(e) = conn.run(socket).await {
         if e.kind() != io::ErrorKind::ConnectionReset && e.kind() != io::ErrorKind::BrokenPipe {
             warn!("kv cache: connection from {peer} ended: {e}");
@@ -506,7 +756,7 @@ impl Conn {
         }
     }
 
-    async fn run(&mut self, mut sock: TcpStream) -> io::Result<()> {
+    async fn run(&mut self, mut sock: Sock) -> io::Result<()> {
         let mut inbuf: Vec<u8> = Vec::with_capacity(16 * 1024);
         let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
         let mut need = 0usize;
@@ -764,7 +1014,7 @@ impl Conn {
         spec: Option<&'static Spec>,
         args: &[&[u8]],
         out: &mut Vec<u8>,
-        sock: &mut TcpStream,
+        sock: &mut Sock,
     ) -> io::Result<Flow> {
         let v3 = self.v3;
         let mut r = Resp { out, v3 };
@@ -1290,7 +1540,7 @@ impl Conn {
         }
     }
 
-    async fn blocking(&mut self, spec: &Spec, args: &[&[u8]], out: &mut Vec<u8>, sock: &mut TcpStream) -> io::Result<Flow> {
+    async fn blocking(&mut self, spec: &Spec, args: &[&[u8]], out: &mut Vec<u8>, sock: &mut Sock) -> io::Result<Flow> {
         let timeout_arg = args[args.len() - 1];
         let timeout = match commands::parse_float(timeout_arg) {
             Some(t) if t < 0.0 => {
@@ -1346,8 +1596,7 @@ impl Conn {
                     r?;
                     // Data or EOF. Data is the client's next command, which
                     // waits its turn; EOF means nobody is left to answer.
-                    let mut peek = [0u8; 1];
-                    match sock.peek(&mut peek).await {
+                    match sock.peek_byte().await {
                         Ok(0) => {
                             waiters.unregister(&keys, &notify);
                             stats.blocked.fetch_sub(1, Ordering::Relaxed);
