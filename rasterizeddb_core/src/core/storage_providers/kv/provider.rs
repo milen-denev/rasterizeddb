@@ -70,6 +70,10 @@ use super::layout::{self, DeltaBatch, Meta, Record, RecordKind};
 use super::overlay::Overlay;
 use super::store::KvStore;
 
+/// What a file's snapshot sidecar is named after it: `<name>.ixs`, in the
+/// same family (docs/kv-partitions.md §2).
+pub const SIDECAR_SUFFIX: &str = ".ixs";
+
 /// How the provider trades requests, bandwidth and memory against each other.
 #[derive(Clone, Debug)]
 pub struct KvConfig {
@@ -934,6 +938,22 @@ impl KvFamily {
                 handle.spawn(self.clone().sweep(file, gate));
             }
             Err(_) => error!("kv: no runtime to sweep {name}; it stays pending and held"),
+        }
+    }
+
+    /// Drops `name`'s snapshot sidecar (`<name>.ixs`) if it stands, opened
+    /// or only recovered, without waiting: synchronous, as `drop_io` is, so
+    /// its sweep is recorded in `pending` with the file's.
+    fn drop_sidecar_of(self: &Arc<Self>, name: &str) {
+        if name.ends_with(SIDECAR_SUFFIX) {
+            return;
+        }
+        let side = format!("{name}{SIDECAR_SUFFIX}");
+        if let Some(file) = self.files.get(&side).map(|e| e.value().clone()) {
+            let hash = super::super::CRC.checksum(side.as_bytes());
+            KvStorageProvider { family: self.clone(), file, hash }.drop_io();
+        } else if self.recovered.lock().contains_key(&side) {
+            self.sweep_blank(&side);
         }
     }
 
@@ -2983,6 +3003,82 @@ impl KvStorageProvider {
         self.file.len.load(Ordering::Acquire)
     }
 
+    /// [`StorageIO::kv_state_now`].
+    pub(crate) fn kv_state_now(&self) -> Option<super::super::traits::KvState> {
+        let file = &self.file;
+        Some(super::super::traits::KvState {
+            generation: file.generation.load(Ordering::Acquire),
+            next_seq: file.next_seq.load(Ordering::Acquire),
+            len: file.len.load(Ordering::Acquire),
+        })
+    }
+
+    /// [`StorageIO::kv_settled_state`]: under the flush lock, so no batch of
+    /// this file is in flight while it is read.
+    pub(crate) async fn kv_settled_state(&self) -> io::Result<Option<super::super::traits::KvState>> {
+        let file = &self.file;
+        let _serialised = file.flush.lock().await;
+        if file.dropped.load(Ordering::Acquire) || file.is_temp || file.poisoned {
+            return Ok(None);
+        }
+        file.flush_locked(None).await?;
+        let settled = {
+            let state = file.state.read();
+            state.pending.is_empty()
+                && state.committing.is_empty()
+                && state.aborting.is_empty()
+                && state.open_txns.is_empty()
+                && state.frozen.is_none()
+                && state.reserved_seq.is_none()
+                && !file.compacting.load(Ordering::Acquire)
+        };
+        Ok(settled.then(|| self.kv_state_now()).flatten())
+    }
+
+    /// The sidecar of this file, `<name>.ixs`, opened (made if `create`).
+    async fn sidecar(&self, create: bool) -> io::Result<Option<KvStorageProvider>> {
+        let name = format!("{}{SIDECAR_SUFFIX}", self.file.name);
+        if create {
+            KvStorageProvider::open(self.family.clone(), &name).await.map(Some)
+        } else {
+            KvStorageProvider::open_existing(self.family.clone(), &name).await
+        }
+    }
+
+    /// [`StorageIO::kv_write_sidecar`]: cut to nothing, then the bytes in
+    /// one transaction of the sidecar's own, committed durably (one object
+    /// that only the sidecar holds, so no file of the table takes a
+    /// sequence for it), then folded into base chunks so a restart does not
+    /// hold it in memory as a recovered delta. A crash in between leaves a
+    /// sidecar that fails its checks, and the open rebuilds.
+    pub(crate) async fn kv_write_sidecar(&self, bytes: Vec<u8>) -> io::Result<()> {
+        let Some(side) = self.sidecar(true).await? else {
+            return Err(io::Error::other("the sidecar could not be made"));
+        };
+        if side.get_len().await > 0 {
+            side.truncate(0).await?;
+        }
+        let txn = side.begin_txn();
+        let token = side.write_data_txn(txn, 0, &bytes).await;
+        side.commit_durable(token).await?;
+        if let Err(e) = side.compact_now().await {
+            warn!("kv: the snapshot sidecar {} stays a delta: {e}", side.file.name);
+        }
+        Ok(())
+    }
+
+    /// [`StorageIO::kv_read_sidecar`].
+    pub(crate) async fn kv_read_sidecar(&self) -> io::Result<Option<Vec<u8>>> {
+        let Some(side) = self.sidecar(false).await? else {
+            return Ok(None);
+        };
+        let len = side.get_len().await;
+        let mut bytes = vec![0u8; usize::try_from(len).map_err(io::Error::other)?];
+        let mut at = 0u64;
+        side.read_data_into_buffer(&mut at, &mut bytes).await?;
+        Ok(Some(bytes))
+    }
+
     /// The family this file belongs to, for cache statistics and for opening
     /// siblings without going through the trait.
     pub fn family(&self) -> &Arc<KvFamily> {
@@ -3407,6 +3503,10 @@ impl StorageIO for KvStorageProvider {
             }
             return;
         }
+        // Its snapshot sidecar goes with it, its sweep recorded before this
+        // returns: a sidecar outliving its file could describe a file made
+        // later under the same name (docs/kv-partitions.md §2).
+        self.family.drop_sidecar_of(&self.file.name);
         let file = self.file.clone();
         // Registered before the file leaves the map, so a reopen that races
         // this finds either the dropped file (and waits for it to go) or the

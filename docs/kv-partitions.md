@@ -1,7 +1,7 @@
 # Partitioned tables on a key/value store
 
-Status: **§1 (placement) and §3 (auto-compaction per partition) built**;
-§2 design, not built (branch
+Status: **§1 (placement), §2 (snapshots validated by the store) and §3
+(auto-compaction per partition) built** (branch
 `feat/kv-partitions`, from `feat/secondary-indexes` at 538d4590,
 2026-11-15). See "§1 as built" at the end.
 
@@ -194,8 +194,7 @@ table's name in `db_storage.cfg`), and lists the stores this process opened
   key/value store(s) … are not copied by backups yet"), with a warning; a
   restore in place reads whatever the store holds then, as for any
   uncovered key/value table.
-- **Not built** in §1. Snapshots for store partitions (§2: a store
-  partition always rebuilds its indexes at open). Opening a table
+- **Not built** in §1 (§2 below). Opening a table
   opens every materialized store partition's two files (the family already
   holds their recovered deltas in memory).
 
@@ -235,3 +234,73 @@ Tests: `auto_compact_tests.rs` (update-heavy partitions on files and on a
 directory store, each compacted by one pass, the cooldown, the store's
 bytes bounded by a chunk per file; a locked table and an open writer each
 make the pass skip, not wait).
+
+## §2 as built
+
+Any table whose rows and pointers are key/value files is sealed this way,
+partition or plain table: the store arm is the provider's, not the
+partitions'.
+
+- **State.** `StorageIO::kv_state_now` / `kv_settled_state` give a key/value
+  file's `KvState` `(generation, next_seq, len)`. The settled read flushes
+  the file's pending records under its flush lock, then answers only when
+  nothing is pending, committing or aborting, no open or in-doubt
+  transaction wrote the file, and no compaction is folding it. A recovered
+  file's `next_seq` is one past the highest stored batch, which is what the
+  running file's is once everything is stored; a reserved sequence that
+  never landed (a failed put) makes the two differ, and the open rebuilds.
+- **Seal** (`SealParts::seal_on_store`, from `Table::seal_snapshot` under
+  the instance's `maintenance_tick`, so no vacuum sweep changes the
+  structures without a write): structures ready and no revocation since
+  open; both files settled (`before`); already clean when `before` is what
+  the snapshot this instance stands on recorded and its sections are
+  current; the sections captured; the outcomes barrier (the status log
+  flushed and the root log synced: a version the structures dropped as dead
+  stays dead); both files settled again and equal to `before`, else
+  `Busy`. Any write in that window either left a transaction open (not
+  settled) or stored a batch (a state moved). Stored as
+  `kv_snapshot::encode`: magic, both states, crc32c, then the ordinary
+  snapshot bytes, with the slot epoch fixed at 0 (a detached gate's epoch
+  is per process; the sequences already move with every renumbering).
+- **Where.** `<rows file>.ixs` in the table's family, written by
+  `kv_write_sidecar`: cut to nothing, then one transaction only the sidecar
+  holds, committed durably (so neither table file takes a sequence for
+  it), then folded into base chunks so a restart does not hold it in memory
+  as a recovered delta. A crash in between leaves a sidecar that fails its
+  checks.
+- **When.** Shutdown's seal, a partition's close, and
+  `rdb_index_checkpoint`. Not the idle checkpoint: its watcher keys on the
+  marker word a detached gate does not keep, so a store table idle for a
+  long time is sealed when it closes or the server stops.
+- **Open** (`Table::assemble`): both files' `kv_state_now`, read before
+  this instance writes; the sidecar read whole (`kv_read_sidecar`, never
+  made); `kv_snapshot::prove`: the header's crc, the recorded states equal
+  to the recovered ones (`Reject::StoreState`, counted as `store_state`),
+  the snapshot streamed and checked as a file's is, its identity equal to
+  the files' and this binary's, and the FILTER section present exactly when
+  the table has a filter. The INDEX sections are read from the held bytes
+  (`SnapshotSource::Bytes`) by the ordinary load, so the snapshot's size is
+  held in memory from the open until the load ends.
+- **Drop.** `KvStorageProvider::drop_io` drops the file's sidecar with it,
+  synchronously (a registered sidecar is dropped, a recovered one swept),
+  so its sweep is recorded in `pending` before the drop returns: a sidecar
+  never outlives its file to describe a later one of the same name.
+- **INDEX sections** are written and loaded only under
+  `index_snapshot.index_storage = snapshot` (`--index-storage snapshot`),
+  as for file sets; the FILTER section always.
+- **Rebuilds that cost only time.** A store compaction of a file after the
+  seal (it reserves a sequence), any `VACUUM FULL` (every compacted
+  partition writes), a failed put, or a write to a file: the open finds
+  other states and rebuilds.
+- **Why the states and not the lengths.** A delete, a `VACUUM FULL` and an
+  insert of a row of the same size leave both files at the lengths the
+  seal recorded, slots renumbered under them. With the state check removed,
+  `sealed_store_partitions_load_their_indexes_and_a_later_write_rebuilds`
+  loads all four compacted partitions' stale snapshots.
+
+Tests: `kv_snapshot` (the codec and the proof's refusals),
+`partition_store_tests` (sealed partitions load; a write after the seal
+rebuilds and answers through its index; the same-lengths rewrite; a plain
+table on a store; DROP sweeps the sidecar), `tests/partition_kv_snapshot.rs`
+(over the wire at the store's default tuning: the shutdown seal, two
+restarts, written partitions rebuild, a reseal loads again).

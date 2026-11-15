@@ -388,6 +388,43 @@ impl std::fmt::Display for StreamError {
 /// Reads one section of the snapshot at `path` and checks it against its
 /// entry (length and crc32c): what the index load does per section, after
 /// the open's proof streamed the whole file once.
+/// Where a proven snapshot's bytes are, for the index load's second read of
+/// its sections: a file set's `.ixs`, or a key/value table's snapshot, read
+/// from its store whole at open and held until the load ends
+/// (docs/kv-partitions.md §2).
+#[derive(Debug, Clone)]
+pub enum SnapshotSource {
+    File(std::path::PathBuf),
+    Bytes(std::sync::Arc<Vec<u8>>),
+}
+
+impl SnapshotSource {
+    /// One section's bytes, checked against its crc32c.
+    pub fn read_section(&self, entry: &SectionEntry) -> std::io::Result<Vec<u8>> {
+        match self {
+            SnapshotSource::File(path) => read_section(path, entry),
+            SnapshotSource::Bytes(all) => {
+                let start = usize::try_from(entry.offset).map_err(std::io::Error::other)?;
+                let end = start
+                    .checked_add(usize::try_from(entry.len).map_err(std::io::Error::other)?)
+                    .filter(|&end| end <= all.len())
+                    .ok_or_else(|| std::io::Error::other("a section runs past the snapshot's end"))?;
+                let bytes = all[start..end].to_vec();
+                verify_section(entry, &bytes).map_err(std::io::Error::other)?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// The file's path, for a file set's snapshot.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        match self {
+            SnapshotSource::File(path) => Some(path),
+            SnapshotSource::Bytes(_) => None,
+        }
+    }
+}
+
 pub fn read_section(path: &std::path::Path, entry: &SectionEntry) -> std::io::Result<Vec<u8>> {
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(path)?;

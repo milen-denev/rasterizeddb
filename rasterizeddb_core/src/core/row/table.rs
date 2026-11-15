@@ -1471,7 +1471,16 @@ impl<S: StorageIO> Table<S> {
             .filter(|f| !f.is_empty());
         // Only a file set that can be sealed pays for it: a statement's
         // temporary relation is memory-backed and opens per statement.
-        let shape_hash = if gate.has_files() { crate::core::index::shape_of(&schema) } else { 0 };
+        // A key/value table is sealed too, validated by its store
+        // (docs/kv-partitions.md §2): its two files' states as recovered,
+        // read before anything of this instance writes.
+        let on_store = !gate.has_files()
+            && match (io_pointers.kv_state_now(), io_rows.kv_state_now()) {
+                (Some(_), Some(_)) => true,
+                _ => false,
+            };
+        let shape_hash = if gate.has_files() || on_store { crate::core::index::shape_of(&schema) } else { 0 };
+        let mut kv_loaded = None;
 
         // The open's proof (§4): every check, writing nothing. When it
         // passes, the snapshot's FILTER section is loaded instead of
@@ -1522,6 +1531,56 @@ impl<S: StorageIO> Table<S> {
                     // This open's structures are not the snapshot's, whatever
                     // a live word said of the instance before it (§3 rule 2).
                     gate.set_vouched(false);
+                    None
+                }
+            }
+        } else if on_store {
+            use crate::core::index_store::{kv_snapshot, open_proof};
+            let now = io_pointers.kv_state_now().zip(io_rows.kv_state_now()).map(|(pointers, rows)| {
+                kv_snapshot::KvIdentity { pointers, rows }
+            });
+            let expected = crate::core::index_store::identity::Identity {
+                incarnation: schema.incarnation,
+                slot_epoch: 0,
+                n_slots: existing_slots,
+                pointers_len: io_pointers.get_len().await,
+                rows_len: io_rows.get_len().await,
+                versions: crate::core::index_store::identity::VersionTuple::current(
+                    crate::core::filter::persist::FORMAT_VER,
+                ),
+                shape_hash,
+                filter_config_hash: template.as_ref().map_or(0, |f| f.config_hash()),
+            };
+            let stored = match io_rows.kv_read_sidecar().await {
+                Ok(stored) => Ok(stored),
+                Err(e) => Err(open_proof::Reject::SnapshotUnreadable(e.to_string())),
+            };
+            let outcome = stored.and_then(|stored| {
+                let now = now.ok_or(open_proof::Reject::Excluded)?;
+                let mut proven = kv_snapshot::prove(stored, &now, &expected, template.is_some())?;
+                let filter = proven.filter.take();
+                let l = match (filter, template.as_ref()) {
+                    (Some(bytes), Some(t)) => t
+                        .load_sealed(&bytes, existing_slots)
+                        .map(Some)
+                        .map_err(|e| open_proof::Reject::FilterLoad(format!("{e:?}")))?,
+                    _ => None,
+                };
+                proven_indexes = Some(proven);
+                kv_loaded = Some(now);
+                Ok(l)
+            });
+            match outcome {
+                Ok(l) => {
+                    open_proof::note_loaded();
+                    info!(
+                        "{}: loaded the filter from its key/value snapshot ({} slots); no rebuild",
+                        stem, existing_slots
+                    );
+                    Some(l)
+                }
+                Err(why) => {
+                    open_proof::note_rejected(stem, &why);
                     None
                 }
             }
@@ -1583,7 +1642,7 @@ impl<S: StorageIO> Table<S> {
         let mut starts: Vec<DeferredStart> = Vec::new();
         if let Some(indexes) = indexes.clone() {
             use crate::core::index_store::load;
-            let storage = load::settings::index_storage_for(gate.dir());
+            let storage = load::settings::index_storage_of(gate.dir(), stem);
             let plan = load::plan(&indexes, storage, proven_indexes.as_ref());
             let loading = matches!(plan, load::Plan::Load { .. });
             // A snapshot whose INDEX sections this open does not load is not
@@ -1812,6 +1871,8 @@ impl<S: StorageIO> Table<S> {
             retired: AtomicBool::new(false),
             index_sections,
             index_origin,
+            on_store,
+            kv_sealed: parking_lot::Mutex::new(kv_loaded),
         });
         // A scan-only open whose snapshot proved loadable, with the budget's
         // room, opens full after all (`PartitionOpen::load_if_proven`).

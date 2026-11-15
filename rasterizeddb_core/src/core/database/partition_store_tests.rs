@@ -399,3 +399,196 @@ async fn a_snapshot_records_store_partitions_as_not_contained() {
     assert!(entry.reason.contains("not copied by backups yet") && entry.reason.contains("'logs'"), "{}", entry.reason);
     assert!(copy.files.iter().all(|(name, _)| !name.contains("__pt_")), "a partition file was copied");
 }
+
+/// Runs `sql` through the executor, panicking on an error frame.
+async fn sql(db: &Arc<Database>, sql: &str) -> Vec<u8> {
+    let purpose = crate::core::rql::lexer_s1::recognize_query_purpose(sql).unwrap_or_else(|| panic!("{sql}"));
+    let r = crate::core::rql::executor::execute(purpose, db.clone()).await;
+    assert_ne!(r.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&r));
+    r
+}
+
+/// The rows a SELECT answers.
+async fn rows_of(db: &Arc<Database>, query: &str) -> usize {
+    let r = sql(db, query).await;
+    assert_eq!(r.first(), Some(&2), "{query}");
+    crate::core::row::row::vec_into_rows(&r[1..]).expect("rows").len()
+}
+
+/// Every partition of `t` opened, its index load or build finished, with
+/// how its indexes came to be.
+async fn origins(t: &PartitionedTable) -> Vec<(u32, crate::core::index_store::load::Origin)> {
+    let mut out = Vec::new();
+    for (pid, part) in t.all_partitions().await.unwrap() {
+        part.index_load_settled().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while part.index_origin() == crate::core::index_store::load::Origin::Pending {
+            assert!(std::time::Instant::now() < deadline, "partition {pid}'s indexes never settled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        out.push((pid, part.index_origin()));
+    }
+    out.sort_by_key(|(pid, _)| *pid);
+    out
+}
+
+/// docs/kv-partitions.md §2: a store partition sealed (here by
+/// `rdb_index_checkpoint`) loads its FILTER and INDEX sections at the next
+/// open instead of rebuilding them, validated by its files' store states. A
+/// partition written after its seal recovers other states and rebuilds,
+/// and the row written then is found through its index; a seal with
+/// nothing written since writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sealed_store_partitions_load_their_indexes_and_a_later_write_rebuilds() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    use crate::core::index_store::seal::SealOutcome;
+    let d = dirs();
+    let db = open(&d).await;
+    place(&db, &d, "acct").await;
+    let uid = create(&db, "acct", 4).await;
+    let _snapshot = storage_override::set_stem(&format!("__pt_{uid:016x}"), IndexStorage::Snapshot);
+    sql(&db, "CREATE INDEX acct_n ON acct (n)").await;
+    for tenant in 0..96 {
+        sql(&db, &format!("INSERT INTO acct (tenant_id, n, label) VALUES ({tenant}, {}, 'x')", tenant * 10)).await;
+    }
+    let t = partitioned(&db, "acct");
+    assert_eq!(t.materialized_pids().unwrap().len(), 4);
+    let report = db.index_checkpoint("acct", None).await.unwrap();
+    assert_eq!(report.sealed.len(), 4, "{:?}", report.sealed.iter().map(|s| &s.name).collect::<Vec<_>>());
+    for s in &report.sealed {
+        assert!(matches!(s.outcome, SealOutcome::Published), "{}: {}", s.name, s.outcome.describe());
+    }
+    // Nothing written since: nothing to write.
+    let again = db.index_checkpoint("acct", None).await.unwrap();
+    for s in &again.sealed {
+        assert!(matches!(s.outcome, SealOutcome::AlreadyClean), "{}: {}", s.name, s.outcome.describe());
+    }
+    drop(t);
+    close(db, &d);
+
+    let db = open(&d).await;
+    let t = partitioned(&db, "acct");
+    let loaded = origins(&t).await;
+    assert!(loaded.iter().all(|(_, o)| *o == Origin::Loaded), "{loaded:?}");
+    assert_eq!(rows_of(&db, "SELECT tenant_id FROM acct WHERE n = 470").await, 1);
+    assert_eq!(rows_of(&db, "SELECT tenant_id FROM acct").await, 96);
+    // A reopen with no write in between still matches: the same states.
+    let reloaded = db.index_checkpoint("acct", None).await.unwrap();
+    for s in &reloaded.sealed {
+        assert!(matches!(s.outcome, SealOutcome::AlreadyClean), "{}: {}", s.name, s.outcome.describe());
+    }
+
+    // One row written after the seal, and no seal after it.
+    sql(&db, "INSERT INTO acct (tenant_id, n, label) VALUES (5000, 77777, 'late')").await;
+    let written = t.partition_for_point(t.point_of_write(&row(&t, 5000, 77777)).unwrap()).await.unwrap();
+    let written_pid = t
+        .open_partitions_now()
+        .into_iter()
+        .find(|(_, p)| std::ptr::eq(&**p, &*written))
+        .map(|(pid, _)| pid)
+        .expect("the written partition is open");
+    drop(written);
+    drop(t);
+    close(db, &d);
+
+    let db = open(&d).await;
+    let t = partitioned(&db, "acct");
+    for (pid, origin) in origins(&t).await {
+        if pid == written_pid {
+            assert_eq!(origin, Origin::Built, "partition {pid} was written after its seal and must rebuild");
+        } else {
+            assert_eq!(origin, Origin::Loaded, "partition {pid}");
+        }
+    }
+    assert_eq!(rows_of(&db, "SELECT tenant_id FROM acct WHERE n = 77777").await, 1, "the late row");
+    assert_eq!(rows_of(&db, "SELECT tenant_id FROM acct").await, 97);
+
+    // Sealed again, then a row deleted, the table compacted and a row of
+    // the same size put back with another value: both files end at the
+    // lengths the seal recorded, the slots renumbered under them, so only
+    // the store states tell the snapshot is stale. Loaded anyway, the index
+    // would map the old value to whatever row now sits at its slot.
+    for s in &db.index_checkpoint("acct", None).await.unwrap().sealed {
+        assert!(s.outcome.is_clean(), "{}: {}", s.name, s.outcome.describe());
+    }
+    let lens = |t: &PartitionedTable| -> Vec<(u32, u64)> {
+        t.open_partitions_now().into_iter().map(|(pid, p)| (pid, p.data().unwrap().io_pointers.kv_state_now().unwrap().len)).collect()
+    };
+    let before = lens(&t);
+    sql(&db, "DELETE FROM acct WHERE tenant_id = 7").await;
+    sql(&db, "VACUUM FULL acct").await;
+    sql(&db, "INSERT INTO acct (tenant_id, n, label) VALUES (7, 99999, 'x')").await;
+    let in_place = lens(&t) == before;
+    drop(t);
+    close(db, &d);
+    let db = open(&d).await;
+    let t = partitioned(&db, "acct");
+    let rebuilt: Vec<u32> = origins(&t).await.into_iter().filter(|(_, o)| *o != Origin::Loaded).map(|(p, _)| p).collect();
+    // VACUUM FULL wrote every partition (each compaction stores its slot
+    // moves and its truncation), so every one rebuilds.
+    assert_eq!(rebuilt.len(), 4, "the compacted partitions rebuild: {rebuilt:?}");
+    assert_eq!(rows_of(&db, "SELECT tenant_id FROM acct WHERE n = 99999").await, 1, "the updated row");
+    assert_eq!(rows_of(&db, "SELECT tenant_id FROM acct WHERE n = 70").await, 0, "its old value");
+    assert!(in_place, "the lengths moved: this no longer tests the store states alone");
+    drop(t);
+    close(db, &d);
+}
+
+/// A partition's sidecar goes when its files do: DROP leaves no `.ixs` on
+/// the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_store_partition_takes_its_snapshot_with_it() {
+    let d = dirs();
+    let db = open(&d).await;
+    place(&db, &d, "acct").await;
+    let uid = create(&db, "acct", 2).await;
+    for tenant in 0..16 {
+        sql(&db, &format!("INSERT INTO acct (tenant_id, n, label) VALUES ({tenant}, {tenant}, 'x')")).await;
+    }
+    db.index_checkpoint("acct", None).await.unwrap();
+    let sidecars = |d: &Dirs| -> Vec<String> {
+        files_in(&store_files(d))
+            .into_iter()
+            .filter(|n| n.ends_with(".ixs") && n.contains(&format!("{uid:016x}")) && holds_objects(&store_files(d).join(n)))
+            .collect()
+    };
+    assert!(!sidecars(&d).is_empty(), "the seal stored no sidecar");
+    sql(&db, "DROP TABLE acct").await;
+    eventually("the sidecars are swept", || sidecars(&d).is_empty()).await;
+    close(db, &d);
+}
+
+/// A plain table on a store is sealed and loaded the same way (§2 is the
+/// key/value driver's, not the partitions'), and DROP takes its sidecar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_store_table_loads_its_snapshot_after_a_restart() {
+    use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
+    let d = dirs();
+    let db = open(&d).await;
+    place(&db, &d, "plain").await;
+    let _snapshot = storage_override::set_stem("plain", IndexStorage::Snapshot);
+    sql(&db, "CREATE TABLE plain (id BIGINT PRIMARY KEY, n INT, label TEXT)").await;
+    sql(&db, "CREATE INDEX plain_n ON plain (n)").await;
+    for i in 0..64 {
+        sql(&db, &format!("INSERT INTO plain (id, n, label) VALUES ({i}, {}, 'x')", i % 8)).await;
+    }
+    let report = db.index_checkpoint("plain", None).await.unwrap();
+    assert_eq!(report.sealed.len(), 1);
+    assert!(report.sealed[0].outcome.is_clean(), "{}", report.sealed[0].outcome.describe());
+    close(db, &d);
+
+    let db = open(&d).await;
+    let table = match db.relation("plain") {
+        Some(Relation::Plain(t)) => t,
+        _ => panic!("plain is not a plain table"),
+    };
+    table.index_load_settled().await;
+    assert_eq!(table.index_origin(), Origin::Loaded);
+    assert_eq!(rows_of(&db, "SELECT id FROM plain WHERE n = 3").await, 8);
+    drop(table);
+    let sidecar = || holds_objects(&store_files(&d).join("plain.db.ixs"));
+    assert!(sidecar(), "no sidecar at {:?}: {:?}", store_files(&d), files_in(&store_files(&d)));
+    sql(&db, "DROP TABLE plain").await;
+    eventually("the sidecar is swept", || !sidecar()).await;
+    close(db, &d);
+}

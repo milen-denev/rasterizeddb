@@ -346,4 +346,49 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     fn land_background(&self) -> impl Future<Output = bool> + Send + Sync {
         async move { false }
     }
+
+    /// A key/value file's state as it stands, without storing anything:
+    /// what an open compares a snapshot's record against before anything
+    /// wrote (docs/kv-partitions.md §2). `None` for every other provider.
+    fn kv_state_now(&self) -> Option<KvState> {
+        None
+    }
+
+    /// A key/value file's state once everything written to it is stored:
+    /// its pending records flushed, and then `Some` only when nothing of it
+    /// is in flight or undecided (no open or in-doubt transaction wrote it,
+    /// no compaction is folding it). `None` when it is not settled now, and
+    /// for every other provider.
+    fn kv_settled_state(&self) -> impl Future<Output = IOResult<Option<KvState>>> + Send + Sync {
+        async move { Ok(None) }
+    }
+
+    /// Stores `bytes` as this key/value file's snapshot sidecar
+    /// (`<name>.ixs` in its family), whole: read back only once its own
+    /// checks pass. `Unsupported` for every other provider.
+    fn kv_write_sidecar(&self, _bytes: Vec<u8>) -> impl Future<Output = IOResult<()>> + Send + Sync {
+        async move {
+            Err(IOError::new(
+                std::io::ErrorKind::Unsupported,
+                "only a key/value file keeps a snapshot sidecar",
+            ))
+        }
+    }
+
+    /// The sidecar's bytes, `None` when it does not stand (or this is not a
+    /// key/value file). Never makes it.
+    fn kv_read_sidecar(&self) -> impl Future<Output = IOResult<Option<Vec<u8>>>> + Send + Sync {
+        async move { Ok(None) }
+    }
+}
+
+/// A key/value file's durable state, as a snapshot of the indexes over it
+/// records it (docs/kv-partitions.md §2). Every record stored for the file
+/// takes the next sequence, and a compaction or a new generation moves one
+/// of these too, so a file whose state is unchanged holds what it held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvState {
+    pub generation: u64,
+    pub next_seq: u64,
+    pub len: u64,
 }

@@ -59,6 +59,9 @@ pub enum Reject {
     NoFilterSection,
     UnexpectedFilterSection,
     FilterLoad(String),
+    /// A key/value table's files are not in the states its snapshot
+    /// recorded (docs/kv-partitions.md §2).
+    StoreState,
 }
 
 impl Reject {
@@ -85,6 +88,7 @@ impl Reject {
             Reject::NoFilterSection => 16,
             Reject::UnexpectedFilterSection => 17,
             Reject::FilterLoad(_) => 18,
+            Reject::StoreState => 19,
         }
     }
 
@@ -94,7 +98,7 @@ impl Reject {
     }
 }
 
-const NAMES: [&str; 19] = [
+const NAMES: [&str; 20] = [
     "excluded",
     "flt_evidence",
     "not_clean",
@@ -114,9 +118,10 @@ const NAMES: [&str; 19] = [
     "no_filter_section",
     "unexpected_filter_section",
     "filter_load",
+    "store_state",
 ];
 
-static REJECTED: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+static REJECTED: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 static LOADED: AtomicU64 = AtomicU64::new(0);
 
 /// Opens that rejected their snapshot for `reason` (by [`Reject::name`]).
@@ -161,8 +166,8 @@ pub struct Proven {
     /// Whether the snapshot holds a GIN section (none is written in phase
     /// 2: a table with a gin index rebuilds its indexes).
     pub has_gin: bool,
-    /// The snapshot's path, for that read.
-    pub path: std::path::PathBuf,
+    /// Where the snapshot is, for that read.
+    pub source: snapshot::SnapshotSource,
 }
 
 /// Runs the checks of the module documentation against `expected`, the
@@ -241,7 +246,7 @@ fn prove_now(gate: &FileGate, flt: &FltAtOpen, expected: &Identity, has_filter: 
         filter,
         index,
         has_gin,
-        path: ixs.clone(),
+        source: snapshot::SnapshotSource::File(ixs.clone()),
     };
     match (section, has_filter) {
         (Some(b), true) => Ok(proven(Some(b))),

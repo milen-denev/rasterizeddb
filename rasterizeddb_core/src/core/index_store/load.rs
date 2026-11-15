@@ -78,7 +78,6 @@
 use std::cmp::Reverse;
 use std::future::Future;
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -159,6 +158,18 @@ pub mod settings {
         index_storage()
     }
 
+    /// [`index_storage_for`] for the file set `stem`: a key/value table has
+    /// no directory, so a test's override can name its stem's prefix
+    /// instead (`storage_override::set_stem`).
+    pub fn index_storage_of(dir: Option<&std::path::Path>, stem: &str) -> IndexStorage {
+        #[cfg(test)]
+        if let Some(s) = super::storage_override::get_stem(stem) {
+            return s;
+        }
+        let _ = stem;
+        index_storage_for(dir)
+    }
+
     /// How many loads run at once, process-wide. 0 (unset) is half the
     /// cores, at least two.
     pub fn max_concurrent_loads() -> usize {
@@ -223,6 +234,27 @@ pub(crate) mod storage_override {
 
     pub(super) fn get(dir: &Path) -> Option<IndexStorage> {
         OVERRIDES.lock().iter().find(|(d, _)| dir.starts_with(d)).map(|(_, s)| *s)
+    }
+
+    static STEMS: Mutex<Vec<(String, IndexStorage)>> = Mutex::new(Vec::new());
+
+    /// Removes a stem override when dropped.
+    pub(crate) struct StemGuard(String);
+
+    impl Drop for StemGuard {
+        fn drop(&mut self) {
+            STEMS.lock().retain(|(p, _)| *p != self.0);
+        }
+    }
+
+    /// `index_storage` for every file set whose stem starts with `prefix`.
+    pub(crate) fn set_stem(prefix: &str, s: IndexStorage) -> StemGuard {
+        STEMS.lock().push((prefix.to_string(), s));
+        StemGuard(prefix.to_string())
+    }
+
+    pub(super) fn get_stem(stem: &str) -> Option<IndexStorage> {
+        STEMS.lock().iter().find(|(p, _)| stem.starts_with(p.as_str())).map(|(_, s)| *s)
     }
 }
 
@@ -561,7 +593,7 @@ impl Drop for Pending<'_> {
 pub enum Plan {
     /// Load these INDEX sections from the snapshot at `path`, entry per
     /// index ordinal.
-    Load { path: PathBuf, sections: Vec<SectionEntry> },
+    Load { source: snapshot::SnapshotSource, sections: Vec<SectionEntry> },
     /// Build from rows.
     Build,
     /// Build from rows; a snapshot was proven, but its INDEX sections are
@@ -604,7 +636,7 @@ pub fn plan(indexes: &TableIndexes, storage: settings::IndexStorage, proven: Opt
         return Plan::BuildInstead("the snapshot has more INDEX sections than indexes");
     }
     Plan::Load {
-        path: p.path.clone(),
+        source: p.source.clone(),
         sections,
     }
 }
@@ -766,14 +798,14 @@ enum Decoded {
 /// longest install, of any one index.
 fn load_now(
     o: &OpenIndexes,
-    path: &std::path::Path,
+    source: &snapshot::SnapshotSource,
     sections: &[SectionEntry],
     proof: Proof<'_>,
 ) -> Result<(Duration, Duration), LoadError> {
     let n_slots = o.n_slots;
     let decode_one = |e: &SectionEntry| -> Result<_, LoadError> {
         let at = std::time::Instant::now();
-        let bytes = snapshot::read_section(path, e).map_err(|err| LoadError::Read(e.ordinal, err))?;
+        let bytes = source.read_section(e).map_err(|err| LoadError::Read(e.ordinal, err))?;
         let read = at.elapsed();
         // A paged index's run reference is checked by the index that takes
         // it; an in-memory index meets it as a version it refuses, below.
@@ -867,7 +899,7 @@ where
             log::info!("{}: the index snapshot's sections are not loaded ({why}); rebuilding", o.name);
             false
         }
-        Plan::Load { path, sections } => {
+        Plan::Load { source, sections } => {
             let cost = o.n_slots.saturating_mul(o.indexes.list.len() as u64);
             #[cfg(test)]
             let queue = o.gate.dir().and_then(hooks::queue_for).unwrap_or(&QUEUE);
@@ -882,7 +914,7 @@ where
                 }
             }
             let started = std::time::Instant::now();
-            let loaded = blocking(|| load_now(&o, &path, &sections, proof));
+            let loaded = blocking(|| load_now(&o, &source, &sections, proof));
             drop(slot);
             match loaded {
                 Ok((decoded, installed)) => {

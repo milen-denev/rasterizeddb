@@ -27,6 +27,7 @@ use crate::core::index_store::gate_word::{GateState, SealKind, Word};
 use crate::core::index_store::identity::{Identity, VersionTuple};
 use crate::core::index_store::load;
 use crate::core::index_store::seal::{self, Capture, SealOutcome, SealTarget};
+use crate::core::index_store::kv_snapshot::{self, KvIdentity};
 use crate::core::index_store::snapshot::SectionKind;
 use crate::core::mvcc::TransactionManager;
 use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
@@ -65,6 +66,14 @@ pub(crate) struct SealParts<S: StorageIO> {
     pub(super) index_sections: StdArc<AtomicBool>,
     /// How the indexes came to be at open (`index_store::load::Origin`).
     pub(super) index_origin: StdArc<AtomicU8>,
+    /// Whether the rows and pointers are key/value files, sealed by
+    /// [`SealParts::seal_on_store`] (docs/kv-partitions.md §2).
+    pub(super) on_store: bool,
+    /// The store states the snapshot this instance stands on recorded: the
+    /// one its open loaded, or its last seal wrote. A seal finding the
+    /// files still in them, with the sections it would write in that
+    /// snapshot, has nothing to write.
+    pub(super) kv_sealed: parking_lot::Mutex<Option<crate::core::index_store::kv_snapshot::KvIdentity>>,
 }
 
 impl<S: StorageIO> SealParts<S> {
@@ -72,11 +81,121 @@ impl<S: StorageIO> SealParts<S> {
         self.gate.dir().map(|d| d.to_path_buf())
     }
 
+    /// §3 step 3's checks of the structures themselves: the indexes and the
+    /// filter complete and current. Shared by a file set's seal and a
+    /// key/value table's.
+    fn structures_unready(&self) -> Option<String> {
+        if let Some(ix) = &self.indexes
+            && !ix.is_ready()
+        {
+            return Some("an index is not ready (building, or demoted by a renumbering)".into());
+        }
+        if let Some(f) = &self.filters {
+            if !self.filters_ready.load(Ordering::Acquire) {
+                return Some("the filter is still backfilling".into());
+            }
+            if crate::core::filter::renumbering(f.renumber_epoch()) {
+                return Some("a renumbering is running".into());
+            }
+            if !f.is_complete() {
+                return Some(
+                    "the filter has an unindexed prefix (demoted by a failed renumbering, or \
+                     filter.backfill_on_open = off)"
+                        .into(),
+                );
+            }
+        }
+        None
+    }
+
+    /// Both files' states once settled (`kv_settled_state`), `None` when
+    /// either is not.
+    async fn settled_on_store(&self) -> io::Result<Option<KvIdentity>> {
+        let Some(pointers) = self.io_pointers.kv_settled_state().await? else {
+            return Ok(None);
+        };
+        let Some(rows) = self.io_rows.kv_settled_state().await? else {
+            return Ok(None);
+        };
+        Ok(Some(KvIdentity { pointers, rows }))
+    }
+
+    /// The outcomes the structures were built under, durable: what §3 step
+    /// 4's barrier does for a file set, without the directory's log a
+    /// key/value table has none of. A version the structures dropped as
+    /// dead must stay dead after a crash.
+    fn outcomes_barrier(&self) -> io::Result<()> {
+        if let Some(tm) = self.versions.load_full() {
+            tm.flush()?;
+            if let Some(root) = tm.status_wal() {
+                root.sync_issued()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Seals a key/value table (docs/kv-partitions.md §2): both files
+    /// settled, the sections captured, the outcomes made durable, both
+    /// files settled again in the same states, and the snapshot stored as
+    /// the rows file's sidecar. The two reads bracket the capture: a write
+    /// to either file that started before the first is an open
+    /// transaction there (not settled), one that ended between them stored
+    /// a batch (a state moved), and one still running at the second is not
+    /// settled; any of them abandons the seal, so the sections describe the
+    /// bytes those states recover. The caller holds the instance's
+    /// maintenance, so no vacuum changes the structures without a write.
+    pub(super) async fn seal_on_store(&self) -> SealOutcome {
+        use crate::core::index_store::seal::Skip;
+        if self.retired() {
+            return SealOutcome::Skipped(Skip::Retired);
+        }
+        self.settle().await;
+        if let Some(why) = self.structures_unready() {
+            return SealOutcome::Skipped(Skip::Ineligible(why));
+        }
+        if self.revoked_since_open() {
+            return SealOutcome::Skipped(Skip::Revoked);
+        }
+        let before = match self.settled_on_store().await {
+            Ok(Some(states)) => states,
+            Ok(None) => return SealOutcome::Skipped(Skip::Busy),
+            Err(e) => return SealOutcome::Failed(e),
+        };
+        if *self.kv_sealed.lock() == Some(before) && self.snapshot_current() {
+            return SealOutcome::AlreadyClean;
+        }
+        let mut capture = match self.capture().await {
+            Ok(c) => c,
+            Err(e) => return SealOutcome::Failed(e),
+        };
+        if let Err(e) = self.outcomes_barrier() {
+            return SealOutcome::Failed(e);
+        }
+        match self.settled_on_store().await {
+            Ok(Some(after)) if after == before => {}
+            Ok(_) => return SealOutcome::Skipped(Skip::Busy),
+            Err(e) => return SealOutcome::Failed(e),
+        }
+        if capture.identity.pointers_len != before.pointers.len || capture.identity.rows_len != before.rows.len {
+            return SealOutcome::Skipped(Skip::Busy);
+        }
+        capture.identity.slot_epoch = 0;
+        let sections: Vec<(SectionKind, u16, &[u8])> =
+            capture.sections.iter().map(|(k, o, b)| (*k, *o, b.as_slice())).collect();
+        let bytes = kv_snapshot::encode(&before, &crate::core::index_store::snapshot::encode(capture.identity, &sections));
+        if let Err(e) = self.io_rows.kv_write_sidecar(bytes).await {
+            log::warn!("index snapshot of {} on its key/value store failed: {e}", self.name);
+            return SealOutcome::Failed(e);
+        }
+        *self.kv_sealed.lock() = Some(before);
+        SealOutcome::Published
+    }
+
     /// Whether a seal of this instance writes INDEX sections now (B17).
     fn captures_indexes(&self) -> bool {
         self.indexes
             .as_ref()
-            .is_some_and(|ix| load::captures(ix, load::settings::index_storage_for(self.gate.dir())))
+            .is_some_and(|ix| load::captures(ix, load::settings::index_storage_of(self.gate.dir(), &self.name)))
     }
 }
 
@@ -131,25 +250,8 @@ impl<S: StorageIO> SealTarget for SealParts<S> {
         if !self.gate.epoch_proven() {
             return Some("rdb.ixe could not be read, so no slot epoch is proven".into());
         }
-        if let Some(ix) = &self.indexes
-            && !ix.is_ready()
-        {
-            return Some("an index is not ready (building, or demoted by a renumbering)".into());
-        }
-        if let Some(f) = &self.filters {
-            if !self.filters_ready.load(Ordering::Acquire) {
-                return Some("the filter is still backfilling".into());
-            }
-            if crate::core::filter::renumbering(f.renumber_epoch()) {
-                return Some("a renumbering is running".into());
-            }
-            if !f.is_complete() {
-                return Some(
-                    "the filter has an unindexed prefix (demoted by a failed renumbering, or \
-                     filter.backfill_on_open = off)"
-                        .into(),
-                );
-            }
+        if let Some(why) = self.structures_unready() {
+            return Some(why);
         }
         let dir = self.dir()?;
         let dir = dir.to_string_lossy();
@@ -270,6 +372,13 @@ impl<S: StorageIO> Table<S> {
     /// A partition shell has no file set and is excluded.
     pub async fn seal_snapshot(&self, kind: SealKind) -> SealOutcome {
         match self.data() {
+            // A key/value table (docs/kv-partitions.md §2), under the
+            // instance's maintenance: no vacuum sweep between its two reads.
+            Ok(d) if d.seal_parts().on_store => {
+                let _ = kind;
+                let _tick = self.maintenance_tick.lock().await;
+                d.seal_parts().seal_on_store().await
+            }
             Ok(d) => seal::seal(&**d.seal_parts(), kind).await,
             Err(_) => SealOutcome::Excluded,
         }

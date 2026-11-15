@@ -51,6 +51,7 @@ pub mod gated_io;
 pub mod gate_word;
 pub mod identity;
 pub mod index_section;
+pub mod kv_snapshot;
 pub mod load;
 pub mod marker;
 pub mod open_proof;

@@ -538,6 +538,40 @@ impl StorageIO for DbStorageProvider {
             _ => false,
         }
     }
+    fn kv_state_now(&self) -> Option<super::traits::KvState> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_state_now(),
+            _ => None,
+        }
+    }
+
+    async fn kv_settled_state(&self) -> io::Result<Option<super::traits::KvState>> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_settled_state().await,
+            _ => Ok(None),
+        }
+    }
+
+    async fn kv_write_sidecar(&self, bytes: Vec<u8>) -> io::Result<()> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_write_sidecar(bytes).await,
+            _ => {
+                let _ = bytes;
+                Err(io::Error::new(io::ErrorKind::Unsupported, "only a key/value file keeps a snapshot sidecar"))
+            }
+        }
+    }
+
+    async fn kv_read_sidecar(&self) -> io::Result<Option<Vec<u8>>> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_read_sidecar().await,
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
