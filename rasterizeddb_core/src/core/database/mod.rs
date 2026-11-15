@@ -6,6 +6,8 @@ mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;
 #[cfg(test)]
+mod native_catalog_tests;
+#[cfg(test)]
 mod name_guard_tests;
 #[cfg(test)]
 mod sidecar_clash_tests;
@@ -5952,6 +5954,29 @@ pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Databa
 }
 
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
+    // The catalogue relations (`pg_tables`, `pg_class`,
+    // `information_schema.tables` and the rest) exist only per statement:
+    // built from the live catalogue into temporary relations the text is
+    // pointed at, as the pgwire listener builds them for an autocommit
+    // statement (under `FROZEN_TX`). Left out here, a native client asking
+    // `pg_tables` whether a table exists was told "Table not found" for the
+    // view itself. `pg_database` lists this database alone: a native session
+    // has no catalogue of databases to read.
+    let tx = crate::core::mvcc::transaction::FROZEN_TX;
+    let catalog = match crate::core::rql::catalog_views::materialize(query, &database, tx, None).await {
+        Ok(catalog) => catalog,
+        Err(e) => return error_response(&e),
+    };
+    let Some(catalog) = catalog else {
+        return run_native_statement(query, database).await;
+    };
+    crate::core::rql::prepared::note_rewritten();
+    let response = run_native_statement(&catalog.rewritten, database.clone()).await;
+    crate::core::rql::cte::drop_temps(&database, &catalog.temps, tx).await;
+    response
+}
+
+async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
     if let Some(query_purpose) = recognize_query_purpose(query) {
         info!("Recognized query purpose: {:?}", query_purpose);
         // A named owner for the native protocol's statements (§7 Owner;

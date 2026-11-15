@@ -42,6 +42,7 @@ const VIEWS: &[&str] = &[
     "pg_index",
     "pg_indexes",
     "pg_database",
+    "pg_tables",
     "columns",
     "tables",
 ];
@@ -99,6 +100,11 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("materialised_ms", F64),
         ],
         "pg_namespace" => &[("oid", I64), ("nspname", STRING)],
+        // `pg_tables`' two columns a client asks "does this table exist" by.
+        // The rest (`tableowner`, `tablespace`, `hasindexes`, `hasrules`,
+        // `hastriggers`, `rowsecurity`) are omitted, as `tables` omits the
+        // standard's, rather than filled with plausible constants.
+        "pg_tables" => &[("schemaname", STRING), ("tablename", STRING)],
         "pg_class" => &[
             ("oid", I64),
             ("relname", STRING),
@@ -883,6 +889,20 @@ async fn build(
         .collect();
 
     let (create, inserts) = match view {
+        "pg_tables" => (
+            format!("CREATE TABLE {} (schemaname TEXT, tablename TEXT)", temp),
+            tables
+                .iter()
+                .map(|name| {
+                    format!(
+                        "INSERT INTO {} (schemaname, tablename) VALUES ('{}', '{}')",
+                        temp,
+                        SCHEMA,
+                        escape(name)
+                    )
+                })
+                .collect(),
+        ),
         "pg_namespace" => (
             format!("CREATE TABLE {} (oid BIGINT, nspname TEXT)", temp),
             vec![format!(
