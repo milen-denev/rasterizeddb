@@ -4467,6 +4467,13 @@ impl Database {
         if let Some(group) = socket.group {
             builder = builder.unix_group(group);
         }
+        if !authenticates {
+            info!(
+                "Native protocol on unix:{} accepts any caller its mode {:o} admits",
+                socket.path.display(),
+                socket.mode
+            );
+        }
         if authenticates {
             builder = builder.authenticator(
                 StdArc::new(RoleAuthenticator::new(database.clone(), method))
@@ -4537,7 +4544,10 @@ impl Database {
                     as StdArc<dyn rastcp::session::ServerAuthenticator>,
             )
         } else {
-            if auth.authenticates() {
+            // Only about the TCP listener: with it off there is no address to
+            // warn about, and a warning naming one reads as an open port. The
+            // socket's own authentication is decided in `bind_native_socket`.
+            if auth.authenticates() && listen.tcp {
                 warn!(
                     "No password is configured and no role has one, so {} accepts any caller. \
                      Pass --rdb-password, or run CREATE USER ... PASSWORD to require one.",

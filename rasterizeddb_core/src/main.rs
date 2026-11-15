@@ -302,6 +302,30 @@ struct Args {
     #[arg(long = "pg-port", default_value_t = 5432)]
     pg_port: u16,
 
+    /// Also serve the PostgreSQL protocol on a unix socket in this directory,
+    /// named `.s.PGSQL.<pg-port>` as every PostgreSQL client expects: libpq,
+    /// psql and tokio-postgres connect with `host=<DIR> port=<pg-port>`.
+    ///
+    /// No TLS on it: an `SSLRequest` is answered "no" whatever `--pg-tls`
+    /// says, as PostgreSQL does. Its permissions and group are
+    /// `--socket-mode` and `--socket-group`. The whole path, file name
+    /// included, has to fit a socket address: about 107 bytes on Linux.
+    #[arg(long = "pg-socket-dir", value_name = "DIR")]
+    pg_socket_dir: Option<std::path::PathBuf>,
+
+    /// `off` serves the PostgreSQL protocol on `--pg-socket-dir` alone, with no
+    /// TCP port open. Default `on`.
+    #[arg(long = "pg-tcp", value_name = "on|off", default_value = "on")]
+    pg_tcp: String,
+
+    /// How callers on `--pg-socket-dir` authenticate: trust, password, md5,
+    /// scram-sha-256, or peer — a role may log in without a password when its
+    /// name is the operating-system user connecting, as the kernel reports it.
+    /// Defaults to `--pg-auth`. trust is refused on a socket that admits users
+    /// outside its owner and group.
+    #[arg(long = "pg-socket-auth", value_name = "METHOD")]
+    pg_socket_auth: Option<String>,
+
     /// pgwire TLS mode (default: require)
     #[arg(long = "pg-tls", value_enum, default_value_t = PgTlsMode::Require)]
     pg_tls: PgTlsMode,
@@ -421,6 +445,7 @@ struct Args {
     /// who may connect is decided by the file's permissions. A socket file
     /// left behind by a server that did not shut down is replaced; one another
     /// server is listening on, or a path that is not a socket, is refused.
+    /// The path has to fit a socket address: about 107 bytes on Linux.
     #[arg(long = "rdb-socket", value_name = "PATH")]
     rdb_socket: Option<std::path::PathBuf>,
 
@@ -1562,11 +1587,56 @@ fn main() -> std::io::Result<()> {
                 };
                 if method == rasterizeddb_core::auth::AuthMethod::Peer {
                     eprintln!(
-                        "--pg-auth peer is not offered: peer authentication needs a unix socket, \
-                         and the PostgreSQL listener serves TCP only"
+                        "--pg-auth peer is not offered: over TCP the user would be the caller's \
+                         word. Peer authentication is for the unix socket: --pg-socket-auth peer"
                     );
                     std::process::exit(2);
                 }
+
+                let pg_tcp = match args.pg_tcp.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" => true,
+                    "off" | "false" | "no" => false,
+                    other => {
+                        eprintln!("--pg-tcp {other:?}: expected on or off");
+                        std::process::exit(2);
+                    }
+                };
+                if !pg_tcp && args.pg_socket_dir.is_none() {
+                    eprintln!("--pg-tcp off needs --pg-socket-dir: there would be nothing to connect to");
+                    std::process::exit(2);
+                }
+                if args.pg_socket_auth.is_some() && args.pg_socket_dir.is_none() {
+                    eprintln!("--pg-socket-auth needs --pg-socket-dir");
+                    std::process::exit(2);
+                }
+
+                let pg_socket = match args.pg_socket_dir.clone() {
+                    Some(dir) => {
+                        let socket_method = match args.pg_socket_auth.as_deref() {
+                            None => None,
+                            Some(text) => match rasterizeddb_core::auth::AuthMethod::parse(text) {
+                                Some(method) => Some(method),
+                                None => {
+                                    eprintln!(
+                                        "unknown --pg-socket-auth {:?}: expected peer, trust, \
+                                         password, md5 or scram-sha-256",
+                                        text
+                                    );
+                                    std::process::exit(2);
+                                }
+                            },
+                        };
+                        let (mode, group) = socket_permissions(&args);
+                        Some(rasterizeddb_core::pgwire::PgSocket {
+                            dir,
+                            port: args.pg_port,
+                            mode,
+                            group,
+                            method: socket_method,
+                        })
+                    }
+                    None => None,
+                };
 
                 let auth = rasterizeddb_core::pgwire::AuthConfig {
                     method,
@@ -1584,11 +1654,12 @@ fn main() -> std::io::Result<()> {
                 // — and every row after it — on the wire in the clear. Said
                 // loudly rather than refused: an operator may terminate TLS in
                 // front of the process.
-                let public = args
-                    .pg_addr
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| !ip.is_loopback())
-                    .unwrap_or(true);
+                let public = pg_tcp
+                    && args
+                        .pg_addr
+                        .parse::<std::net::IpAddr>()
+                        .map(|ip| !ip.is_loopback())
+                        .unwrap_or(true);
                 if public && tls_mode != rasterizeddb_core::pgwire::TlsMode::Require {
                     log::warn!(
                         "pgwire is bound to {} with --pg-tls {:?}: clients may connect \
@@ -1612,10 +1683,13 @@ fn main() -> std::io::Result<()> {
                 // discarded here, and the process exited 0 having served
                 // nothing, which a supervisor reads as a clean stop.
                 let sealing = catalog.clone();
-                if let Err(e) = rasterizeddb_core::pgwire::start_pgwire_with_limits(
+                let listen = rasterizeddb_core::pgwire::PgListen {
+                    tcp: pg_tcp.then(|| (args.pg_addr.clone(), args.pg_port)),
+                    socket: pg_socket,
+                };
+                if let Err(e) = rasterizeddb_core::pgwire::start_pgwire_on(
                     catalog,
-                    &args.pg_addr,
-                    args.pg_port,
+                    listen,
                     tls,
                     auth,
                     limits,

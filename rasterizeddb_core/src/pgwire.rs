@@ -364,9 +364,308 @@ pub async fn start_pgwire_with_limits(
     auth: AuthConfig,
     limits: ConnectionLimits,
 ) -> io::Result<()> {
+    let listen = PgListen {
+        tcp: Some((addr.to_string(), port)),
+        socket: None,
+    };
+    start_pgwire_on(catalog, listen, tls, auth, limits).await
+}
+
+/// Where the PostgreSQL protocol is served: a TCP address, a unix socket, or
+/// both. One server either way — one connection limit, one shutdown.
+#[derive(Clone, Debug)]
+pub struct PgListen {
+    /// `(address, port)`; `None` opens no TCP port at all.
+    pub tcp: Option<(String, u16)>,
+    pub socket: Option<PgSocket>,
+}
+
+/// The PostgreSQL protocol on a unix socket, named as every PostgreSQL client
+/// expects to find it: `<dir>/.s.PGSQL.<port>`. libpq, tokio-postgres and the
+/// rest connect with `host=<dir> port=<port>`.
+///
+/// No TLS on it: an `SSLRequest` is answered "no" whatever `--pg-tls` says,
+/// as PostgreSQL does, and libpq never asks on a socket anyway. Who may
+/// connect is decided by the file's permissions and group.
+#[derive(Clone, Debug)]
+pub struct PgSocket {
+    pub dir: std::path::PathBuf,
+    /// The port in the file name. The TCP port when there is one, so a
+    /// client's `port=` means the same server either way.
+    pub port: u16,
+    pub mode: u32,
+    pub group: Option<u32>,
+    /// How callers on the socket authenticate; `None` uses the TCP method.
+    /// [`crate::auth::AuthMethod::Peer`] is offered here and nowhere else.
+    pub method: Option<crate::auth::AuthMethod>,
+}
+
+impl PgSocket {
+    /// The socket file: `<dir>/.s.PGSQL.<port>`.
+    pub fn path(&self) -> std::path::PathBuf {
+        self.dir.join(format!(".s.PGSQL.{}", self.port))
+    }
+
+    /// Whether users outside the file's owner and group can connect.
+    pub fn admits_others(&self) -> bool {
+        self.mode & 0o007 != 0
+    }
+}
+
+/// Serves the PostgreSQL protocol on the TCP address, the unix socket, or
+/// both, that `listen` describes. See [`start_pgwire_with_limits`] for what is
+/// returned.
+pub async fn start_pgwire_on(
+    catalog: Arc<DatabaseCatalog>,
+    listen: PgListen,
+    tls: TlsConfig,
+    auth: AuthConfig,
+    limits: ConnectionLimits,
+) -> io::Result<()> {
+    if listen.tcp.is_none() && listen.socket.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the PostgreSQL protocol has neither a TCP address nor a unix socket to serve",
+        ));
+    }
+
     let limits = prepare_pgwire(&catalog, &auth, limits).await?;
-    let listener = TcpListener::bind(format!("{}:{}", addr, port)).await?;
-    serve_pgwire(catalog, listener, tls, auth, limits).await
+
+    // The socket's own authentication, checked and its roles prepared before
+    // anything is bound.
+    let socket_auth = match listen.socket.as_ref() {
+        Some(socket) => Some(prepare_socket(&catalog, &auth, socket).await?),
+        None => None,
+    };
+
+    // The socket first: it is the likelier refusal (a live server on the
+    // path, a file that is not a socket), and refusing it should not leave a
+    // TCP port bound behind.
+    #[cfg(unix)]
+    let unix = match (listen.socket.as_ref(), socket_auth) {
+        (Some(socket), Some(socket_auth)) => {
+            let (listener, file) =
+                rastcp::net::SocketFile::bind(&socket.path(), socket.mode, socket.group)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+            Some(UnixSide {
+                listener: tokio::net::UnixListener::from_std(listener)?,
+                file,
+                auth: socket_auth,
+            })
+        }
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    if listen.socket.is_some() {
+        let _ = socket_auth;
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix sockets are not supported on this platform",
+        ));
+    }
+
+    let tcp = match listen.tcp {
+        Some((addr, port)) => Some(TcpListener::bind(format!("{}:{}", addr, port)).await?),
+        None => None,
+    };
+
+    serve_pgwire(
+        catalog,
+        PgListeners {
+            tcp,
+            #[cfg(unix)]
+            unix,
+        },
+        tls,
+        auth,
+        limits,
+    )
+    .await
+}
+
+/// The authentication a unix socket serves under, refused if it would let
+/// in callers the socket's permissions do not already limit.
+async fn prepare_socket(
+    catalog: &Arc<DatabaseCatalog>,
+    auth: &AuthConfig,
+    socket: &PgSocket,
+) -> io::Result<AuthConfig> {
+    use crate::auth::AuthMethod;
+
+    let method = socket.method.unwrap_or(auth.method);
+
+    if method == AuthMethod::Trust && socket.admits_others() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to serve the PostgreSQL protocol on {} with mode {:o} and trust \
+                 authentication: every user on the machine would have unauthenticated access. \
+                 Use a --socket-mode that admits only the owner and group, such as 660, or \
+                 another --pg-socket-auth.",
+                socket.path().display(),
+                socket.mode
+            ),
+        ));
+    }
+
+    let socket_auth = AuthConfig {
+        method,
+        ..auth.clone()
+    };
+
+    // Peer needs the role catalogue even when the TCP side runs under trust
+    // and so never made one.
+    for database in catalog.all() {
+        if let Err(e) = seed_roles(&database, &socket_auth).await {
+            return Err(io::Error::new(io::ErrorKind::Other, e));
+        }
+    }
+
+    Ok(socket_auth)
+}
+
+/// What a server listens on.
+struct PgListeners {
+    tcp: Option<TcpListener>,
+    #[cfg(unix)]
+    unix: Option<UnixSide>,
+}
+
+/// The unix socket, its file (removed when the server goes), and the
+/// authentication its callers are held to.
+#[cfg(unix)]
+struct UnixSide {
+    listener: tokio::net::UnixListener,
+    file: rastcp::net::SocketFile,
+    auth: AuthConfig,
+}
+
+/// A PostgreSQL client connection: TCP, or the unix socket.
+enum PgSock {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
+}
+
+impl PgSock {
+    fn is_unix(&self) -> bool {
+        match self {
+            PgSock::Tcp(_) => false,
+            #[cfg(unix)]
+            PgSock::Unix(_) => true,
+        }
+    }
+}
+
+impl AsyncRead for PgSock {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            PgSock::Tcp(sock) => std::pin::Pin::new(sock).poll_read(cx, buf),
+            #[cfg(unix)]
+            PgSock::Unix(sock) => std::pin::Pin::new(sock).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for PgSock {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            PgSock::Tcp(sock) => std::pin::Pin::new(sock).poll_write(cx, buf),
+            #[cfg(unix)]
+            PgSock::Unix(sock) => std::pin::Pin::new(sock).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match self.get_mut() {
+            PgSock::Tcp(sock) => std::pin::Pin::new(sock).poll_write_vectored(cx, bufs),
+            #[cfg(unix)]
+            PgSock::Unix(sock) => std::pin::Pin::new(sock).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            PgSock::Tcp(sock) => sock.is_write_vectored(),
+            #[cfg(unix)]
+            PgSock::Unix(sock) => sock.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            PgSock::Tcp(sock) => std::pin::Pin::new(sock).poll_flush(cx),
+            #[cfg(unix)]
+            PgSock::Unix(sock) => std::pin::Pin::new(sock).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match self.get_mut() {
+            PgSock::Tcp(sock) => std::pin::Pin::new(sock).poll_shutdown(cx),
+            #[cfg(unix)]
+            PgSock::Unix(sock) => std::pin::Pin::new(sock).poll_shutdown(cx),
+        }
+    }
+}
+
+/// A connection just accepted: the stream, who it is from (for logs), the
+/// kernel-reported user of a unix caller, and which side it came in on.
+struct Accepted {
+    sock: PgSock,
+    peer: String,
+    peer_uid: Option<u32>,
+}
+
+/// The next connection on the TCP listener, or never if there is none.
+async fn accept_tcp(listener: Option<&TcpListener>) -> io::Result<Accepted> {
+    let Some(listener) = listener else {
+        return std::future::pending().await;
+    };
+    let (stream, peer) = listener.accept().await?;
+    Ok(Accepted {
+        sock: PgSock::Tcp(stream),
+        peer: peer.to_string(),
+        peer_uid: None,
+    })
+}
+
+#[cfg(unix)]
+async fn accept_unix(side: Option<&UnixSide>) -> io::Result<Accepted> {
+    let Some(side) = side else {
+        return std::future::pending().await;
+    };
+    let (stream, _) = side.listener.accept().await?;
+    // The caller's user, from the kernel: what peer authentication checks,
+    // and what the logs name the connection by.
+    let credentials = stream.peer_cred()?;
+    let peer = match credentials.pid() {
+        Some(pid) => format!("unix socket (uid {}, pid {})", credentials.uid(), pid),
+        None => format!("unix socket (uid {})", credentials.uid()),
+    };
+    Ok(Accepted {
+        sock: PgSock::Unix(stream),
+        peer,
+        peer_uid: Some(credentials.uid()),
+    })
 }
 
 /// [`start_pgwire_with_limits`], serving a listener the caller already bound.
@@ -389,7 +688,12 @@ pub async fn start_pgwire_on_listener(
     limits: ConnectionLimits,
 ) -> io::Result<()> {
     let limits = prepare_pgwire(&catalog, &auth, limits).await?;
-    serve_pgwire(catalog, listener, tls, auth, limits).await
+    let listeners = PgListeners {
+        tcp: Some(listener),
+        #[cfg(unix)]
+        unix: None,
+    };
+    serve_pgwire(catalog, listeners, tls, auth, limits).await
 }
 
 /// What has to hold before the first connection is accepted: valid limits,
@@ -417,22 +721,31 @@ async fn prepare_pgwire(
 /// The accept loop, shared by every way of starting the server.
 async fn serve_pgwire(
     catalog: Arc<DatabaseCatalog>,
-    listener: TcpListener,
+    listeners: PgListeners,
     tls: TlsConfig,
     auth: AuthConfig,
     limits: ConnectionLimits,
 ) -> io::Result<()> {
-    let bind_addr = listener.local_addr()?;
-    log::info!(
-        "pgwire server listening on {} ({} authentication, TLS {})",
-        bind_addr,
-        auth.method.name(),
-        match tls.mode {
-            TlsMode::Disable => "disabled",
-            TlsMode::Prefer => "optional",
-            TlsMode::Require => "required",
-        }
-    );
+    if let Some(listener) = listeners.tcp.as_ref() {
+        log::info!(
+            "pgwire server listening on {} ({} authentication, TLS {})",
+            listener.local_addr()?,
+            auth.method.name(),
+            match tls.mode {
+                TlsMode::Disable => "disabled",
+                TlsMode::Prefer => "optional",
+                TlsMode::Require => "required",
+            }
+        );
+    }
+    #[cfg(unix)]
+    if let Some(side) = listeners.unix.as_ref() {
+        log::info!(
+            "pgwire server listening on {} ({} authentication, no TLS)",
+            side.file.path().display(),
+            side.auth.method.name()
+        );
+    }
 
     let acceptor = match tls.mode {
         TlsMode::Disable => None,
@@ -464,12 +777,22 @@ async fn serve_pgwire(
     let mut last_capacity_warning: Option<tokio::time::Instant> = None;
 
     loop {
+        #[cfg(unix)]
         let accepted = tokio::select! {
             biased;
 
             _ = shutdown_rx.changed() => break,
 
-            accepted = listener.accept() => accepted,
+            accepted = accept_tcp(listeners.tcp.as_ref()) => accepted,
+            accepted = accept_unix(listeners.unix.as_ref()) => accepted,
+        };
+        #[cfg(not(unix))]
+        let accepted = tokio::select! {
+            biased;
+
+            _ = shutdown_rx.changed() => break,
+
+            accepted = accept_tcp(listeners.tcp.as_ref()) => accepted,
         };
 
         // An accept error is about this process or this one connection, never
@@ -477,7 +800,11 @@ async fn serve_pgwire(
         // error was returned with `?`, the caller discarded it, and the process
         // exited — so the `EMFILE` a connection storm produces shut the
         // database down for everyone, including the sessions already running.
-        let (stream, peer) = match accepted {
+        let Accepted {
+            sock: stream,
+            peer,
+            peer_uid,
+        } = match accepted {
             Ok(accepted) => {
                 if failed_accepts > 0 {
                     log::info!(
@@ -567,19 +894,30 @@ async fn serve_pgwire(
         // whatever it actually cost. `psql` saw it too, so it was never a
         // client's fault. `rastcp` has had this since it hit the same wall;
         // pgwire was simply missed.
-        let _ = stream.set_nodelay(true);
+        if let PgSock::Tcp(stream) = &stream {
+            let _ = stream.set_nodelay(true);
 
-        // Without keepalive a peer that vanishes — a client host powered off,
-        // a NAT entry expiring — leaves the socket established forever, still
-        // holding a connection slot and, if it was inside a block, an open
-        // transaction. Best-effort: a socket that refuses it still works.
-        if let Err(e) = enable_keepalive(&stream) {
-            log::debug!("pgwire could not enable TCP keepalive for {}: {}", peer, e);
+            // Without keepalive a peer that vanishes — a client host powered
+            // off, a NAT entry expiring — leaves the socket established
+            // forever, still holding a connection slot and, if it was inside
+            // a block, an open transaction. Best-effort: a socket that refuses
+            // it still works. A unix socket's peer is on this machine, and
+            // its end is seen at once.
+            if let Err(e) = enable_keepalive(stream) {
+                log::debug!("pgwire could not enable TCP keepalive for {}: {}", peer, e);
+            }
         }
 
         let catalog = catalog.clone();
         let tls_mode = tls.mode;
         let acceptor = acceptor.clone();
+        // The socket's own authentication for a caller on it.
+        #[cfg(unix)]
+        let auth = match (&stream, listeners.unix.as_ref()) {
+            (PgSock::Unix(_), Some(side)) => side.auth.clone(),
+            _ => auth.clone(),
+        };
+        #[cfg(not(unix))]
         let auth = auth.clone();
         let registered = sessions.admit(&stream);
 
@@ -588,6 +926,7 @@ async fn serve_pgwire(
                 too_many: matches!(admission, Admission::TooMany(_)),
                 handshake_finished: StdArc::new(AtomicBool::new(false)),
                 limits,
+                peer_uid,
             };
             if let Err(e) =
                 handle_connection(catalog, stream, acceptor, tls_mode, auth, &context).await
@@ -802,7 +1141,7 @@ struct SessionsEnd {
 struct ServerSessions {
     ending: AtomicBool,
     next: std::sync::atomic::AtomicU64,
-    open: parking_lot::Mutex<Vec<(u64, std::net::TcpStream)>>,
+    open: parking_lot::Mutex<Vec<(u64, WatchSocket)>>,
 }
 
 static SERVERS: parking_lot::Mutex<Vec<(usize, StdArc<ServerSessions>)>> = parking_lot::Mutex::new(Vec::new());
@@ -830,11 +1169,10 @@ impl SessionsEnd {
 
     /// Records an admitted session's socket. `None` when its descriptor
     /// cannot be duplicated (the session then just runs to its end).
-    fn admit(&self, stream: &TcpStream) -> Option<SessionEntry> {
-        use std::os::fd::AsFd;
-        let dup = stream.as_fd().try_clone_to_owned().ok()?;
+    fn admit(&self, stream: &PgSock) -> Option<SessionEntry> {
+        let dup = watch_socket(stream).ok()?;
         let id = self.server.next.fetch_add(1, Ordering::Relaxed);
-        self.server.open.lock().push((id, std::net::TcpStream::from(dup)));
+        self.server.open.lock().push((id, dup));
         Some(SessionEntry {
             server: self.server.clone(),
             id,
@@ -846,7 +1184,7 @@ impl SessionsEnd {
     fn end_all(&self) {
         self.server.ending.store(true, Ordering::Release);
         for (_, socket) in self.server.open.lock().iter() {
-            let _ = socket.shutdown(std::net::Shutdown::Read);
+            shutdown_read(socket);
         }
     }
 
@@ -947,6 +1285,9 @@ struct ConnectionContext {
     /// deadline on the stream.
     handshake_finished: StdArc<AtomicBool>,
     limits: ConnectionLimits,
+    /// The operating-system user of a caller on the unix socket, as the
+    /// kernel reports it. `None` over TCP. What peer authentication checks.
+    peer_uid: Option<u32>,
 }
 
 /// A stream that fails with `TimedOut` once the handshake deadline passes,
@@ -1237,12 +1578,12 @@ fn test_release_delay(stmt: &str) -> Option<std::time::Duration> {
 /// `input_buffered` restores the old answer: bytes still unread anywhere mean
 /// the client is not known to have gone.
 pub(crate) struct PeerWatch {
-    socket: std::net::TcpStream,
+    socket: WatchSocket,
     input_buffered: std::sync::atomic::AtomicBool,
 }
 
 impl PeerWatch {
-    fn new(socket: std::net::TcpStream) -> Self {
+    fn new(socket: WatchSocket) -> Self {
         Self {
             socket,
             input_buffered: std::sync::atomic::AtomicBool::new(false),
@@ -1261,30 +1602,60 @@ impl PeerWatch {
     }
 }
 
-/// The client's socket, and a duplicate of it to watch.
-///
-/// `try_clone` dups the descriptor, so the copy sees the same connection: a
-/// `peek` on it reports end-of-file when the peer sends FIN, and reports it
-/// whether or not the session is inside TLS, because it is watching the TCP
-/// stream underneath.
-///
-/// Watching is best-effort. If the descriptor cannot be duplicated the session
-/// runs exactly as it did before, with `statement_timeout` as its only bound.
-fn duplicate_for_watch(
-    tcp: TcpStream,
-) -> io::Result<(TcpStream, Option<StdArc<PeerWatch>>)> {
-    let standard = tcp.into_std()?;
-    // Kept as a *std* socket, in non-blocking mode, because it is peeked from
-    // inside the scan rather than awaited: see `StatementCancel::gone`.
-    let watch = standard
-        .try_clone()
-        .and_then(|copy| {
+/// A duplicate of a client's descriptor, kept to look at the connection from
+/// outside the session: whether the client has gone, and to end the session
+/// at shutdown. The same descriptor for TCP and a unix socket; peeking and
+/// shutting down work the same on both.
+#[cfg(unix)]
+type WatchSocket = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+type WatchSocket = std::net::TcpStream;
+
+/// A duplicate of `stream`'s descriptor. It sees the same connection: a peek
+/// on it reports end-of-file when the peer goes, whether or not the session is
+/// inside TLS, because it is watching the socket underneath.
+#[cfg(unix)]
+fn watch_socket(stream: &PgSock) -> io::Result<WatchSocket> {
+    use std::os::fd::AsFd;
+    match stream {
+        PgSock::Tcp(sock) => sock.as_fd().try_clone_to_owned(),
+        PgSock::Unix(sock) => sock.as_fd().try_clone_to_owned(),
+    }
+}
+
+#[cfg(not(unix))]
+fn watch_socket(stream: &PgSock) -> io::Result<WatchSocket> {
+    use std::os::windows::io::AsSocket;
+    match stream {
+        PgSock::Tcp(sock) => {
+            let copy = std::net::TcpStream::from(sock.as_socket().try_clone_to_owned()?);
             copy.set_nonblocking(true)?;
             Ok(copy)
-        })
-        .map(|copy| StdArc::new(PeerWatch::new(copy)))
-        .ok();
-    Ok((TcpStream::from_std(standard)?, watch))
+        }
+    }
+}
+
+/// Ends the read half of a watched session's socket, which its next read sees
+/// as the end of the stream.
+fn shutdown_read(socket: &WatchSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a live descriptor owned by `socket` for the call.
+        unsafe {
+            libc::shutdown(socket.as_raw_fd(), libc::SHUT_RD);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket.shutdown(std::net::Shutdown::Read);
+    }
+}
+
+/// Watching is best-effort. If the descriptor cannot be duplicated the session
+/// runs exactly as it did before, with `statement_timeout` as its only bound.
+fn duplicate_for_watch(stream: &PgSock) -> Option<StdArc<PeerWatch>> {
+    watch_socket(stream).map(|copy| StdArc::new(PeerWatch::new(copy))).ok()
 }
 
 /// Whether the client on `socket` has gone, without blocking and without
@@ -1293,7 +1664,41 @@ fn duplicate_for_watch(
 /// `MSG_PEEK` leaves the bytes where they are, which it must: the extended
 /// protocol pipelines Parse/Bind/Describe/Execute/Sync, and a check that
 /// consumed them would steal protocol messages from the session.
-fn client_has_gone(socket: &std::net::TcpStream) -> bool {
+#[cfg(unix)]
+fn client_has_gone(socket: &WatchSocket) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = [0u8; 1];
+    // SAFETY: a one-byte buffer owned here, and a descriptor `socket` keeps
+    // open for the call. MSG_DONTWAIT: this is asked from inside a scan, and
+    // must answer at once.
+    let peeked = unsafe {
+        libc::recv(
+            socket.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    let result = if peeked < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(peeked as usize)
+    };
+    match result {
+        // Readable and empty is end-of-file: the peer has closed.
+        Ok(0) => true,
+        // Bytes waiting, so the client is still there.
+        Ok(_) => false,
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => false,
+        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => false,
+        // A reset — which is what an abandoned client with unread data sends —
+        // or any other error: this socket will not come back.
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn client_has_gone(socket: &WatchSocket) -> bool {
     let mut byte = [0u8; 1];
     match socket.peek(&mut byte) {
         // Readable and empty is end-of-file: the peer sent FIN.
@@ -1309,13 +1714,15 @@ fn client_has_gone(socket: &std::net::TcpStream) -> bool {
 
 async fn handle_connection(
     catalog: Arc<DatabaseCatalog>,
-    tcp: TcpStream,
+    tcp: PgSock,
     acceptor: Option<TlsAcceptor>,
     tls_mode: TlsMode,
     auth: AuthConfig,
     context: &ConnectionContext,
 ) -> io::Result<()> {
-    let (tcp, watch) = duplicate_for_watch(tcp)?;
+    let watch = duplicate_for_watch(&tcp);
+    // No TLS on a unix socket, whatever `--pg-tls` says: see `PgSocket`.
+    let tls_mode = if tcp.is_unix() { TlsMode::Disable } else { tls_mode };
     // The deadline sits underneath everything, TLS included, and is disarmed
     // once the session is established (`finish_startup`).
     let tcp = HandshakeDeadline::new(
@@ -1333,7 +1740,7 @@ async fn handle_connection(
 
 async fn handle_connection_inner(
     catalog: Arc<DatabaseCatalog>,
-    mut tcp: HandshakeDeadline<TcpStream>,
+    mut tcp: HandshakeDeadline<PgSock>,
     acceptor: Option<TlsAcceptor>,
     tls_mode: TlsMode,
     auth: AuthConfig,
@@ -1564,7 +1971,7 @@ async fn authenticate_and_serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let principal = match authenticate(database, stream, parameters, auth).await {
+    let principal = match authenticate(database, stream, parameters, auth, context.peer_uid).await {
         Ok(principal) => {
             log::debug!(
                 "authenticated {} via {}",
@@ -1641,6 +2048,8 @@ mod peer_watch_tests {
 
         let watch = accepted.try_clone().expect("dup");
         watch.set_nonblocking(true).expect("nonblocking");
+        #[cfg(unix)]
+        let watch = std::os::fd::OwnedFd::from(watch);
 
         assert!(!client_has_gone(&watch), "the client is still connected");
 
@@ -1653,6 +2062,30 @@ mod peer_watch_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("a departed client was never noticed on the duplicate descriptor");
+    }
+
+    /// The same on a unix socket, where the check is how a statement learns
+    /// that the client on the PostgreSQL socket has gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_duplicate_descriptor_sees_a_unix_client_go() {
+        let (client, accepted) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let watch = std::os::fd::OwnedFd::from(accepted.try_clone().expect("dup"));
+
+        assert!(!client_has_gone(&watch), "the client is still connected");
+
+        // Bytes waiting are a client that is there, not one that has gone.
+        use std::io::Write;
+        (&client).write_all(b"Q").expect("write");
+        assert!(!client_has_gone(&watch), "a client with a message waiting was taken for gone");
+
+        drop(client);
+        // The bytes left unread still say nothing about the client; once
+        // they are read, what is left is the end of the stream.
+        let mut byte = [0u8; 1];
+        use std::io::Read;
+        (&accepted).read_exact(&mut byte).expect("the waiting byte");
+        assert!(client_has_gone(&watch), "a departed unix client was not noticed");
     }
 }
 
@@ -12021,6 +12454,7 @@ async fn authenticate<S>(
     stream: &mut S,
     parameters: &HashMap<String, String>,
     config: &AuthConfig,
+    peer_uid: Option<u32>,
 ) -> io::Result<Principal>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -12065,15 +12499,24 @@ where
     match config.method {
         AuthMethod::Trust => unreachable!("handled above"),
 
-        // The PostgreSQL listener has no unix socket yet, and over TCP the
-        // caller's operating-system user is something it says, not something
-        // the kernel vouches for. Refused at start-up; refused here too, so
-        // a configuration that slipped past that check serves nobody.
+        // The role named after the operating-system user the kernel says
+        // connected, with no password asked for. Only a caller on the unix
+        // socket has such a user; over TCP it would be the caller's word, so
+        // a TCP caller is refused even if the method somehow reaches it.
         AuthMethod::Peer => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "peer authentication is offered only on a unix socket",
-            ));
+            #[cfg(unix)]
+            let connected_as = peer_uid.and_then(crate::native_auth::os_user_name);
+            #[cfg(not(unix))]
+            let connected_as: Option<String> = {
+                let _ = peer_uid;
+                None
+            };
+            if connected_as.as_deref() != Some(user.as_str()) || !may_login {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("Peer authentication failed for user \"{}\"", user),
+                ));
+            }
         }
 
         AuthMethod::Password => {
@@ -13007,6 +13450,7 @@ mod session_end_tests {
                 idle_session_timeout: Duration::from_millis(100),
                 ..ConnectionLimits::default()
             },
+            peer_uid: None,
         };
         let parameters = HashMap::from([("user".to_string(), "rasterized".to_string())]);
 
@@ -14064,7 +14508,8 @@ mod index_store_wire_tests {
         // A real loopback socket: the shutdown ends a session through it.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-        let (mut server, _) = listener.accept().await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut server = PgSock::Tcp(server);
         let sessions = SessionsEnd::register(&catalog);
         let entry = sessions.admit(&server).expect("the socket is registered");
         let session_db = db.clone();
@@ -14123,7 +14568,8 @@ mod index_store_wire_tests {
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-        let (mut server, _) = listener.accept().await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut server = PgSock::Tcp(server);
         let sessions = SessionsEnd::register(&catalog);
         let entry = sessions.admit(&server).expect("the socket is registered");
         let session_db = db.clone();

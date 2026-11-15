@@ -13,7 +13,8 @@ pub struct KvArgs {
     /// Serve the Redis protocol on this unix socket, beside `--kv-port` or
     /// instead of it (`redis-cli -s PATH`). Its permissions and group are
     /// `--socket-mode` and `--socket-group`; `--kv-auth trust` is allowed on
-    /// it only when those admit nobody outside the owner and group.
+    /// it only when those admit nobody outside the owner and group. The path
+    /// has to fit a socket address: about 107 bytes on Linux.
     #[arg(long = "kv-socket", value_name = "PATH")]
     pub kv_socket: Option<std::path::PathBuf>,
 
