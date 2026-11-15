@@ -693,6 +693,10 @@ default floor a run takes about 0.4 s. A database that already holds a
 table far past it (472 k slots on the production node) pays one longer run,
 about 10 s for that table, the first time.
 
-Partitioned tables are not compacted automatically: their `VACUUM FULL`
-compacts every partition and opens closed ones. `AUTO_COMPACT_ENABLED`
-(default on) turns the task off.
+A partitioned table is compacted partition by partition
+(`docs/kv-partitions.md` §3). Every partition open at the pass is measured
+by the same rule, and a due one is compacted alone, under the partitioned
+table's ACCESS EXCLUSIVE with the same 100 ms wait, its cooldown its own. A
+closed partition is not opened for this; it is measured once it is open
+again and a sweep has counted its rows. `AUTO_COMPACT_ENABLED` (default on)
+turns the task off.

@@ -21820,6 +21820,50 @@ async fn vacuum_targets(
         .collect())
 }
 
+/// `VACUUM FULL` of one partition, `pid` of partitioned table `name`, for the
+/// automatic compaction (`core::auto_compact`, `docs/kv-partitions.md` §3).
+///
+/// The lock is the one an operator's `VACUUM FULL name` takes, ACCESS
+/// EXCLUSIVE on the partitioned table, under an owner of its own released
+/// when this returns: locks are per table name, and a transaction that wrote
+/// the partition holds ROW EXCLUSIVE on that name until it ends, its slots
+/// still in its write set, so nothing weaker keeps a compaction from moving
+/// them. Only the one partition is compacted, so the hold is that
+/// partition's compaction, not the table's. A wait for the lock is bounded
+/// by the caller's `STATEMENT_CANCEL` scope (its `lock_timeout`).
+///
+/// `Ok(None)` when the table is gone or no longer partitioned, or the
+/// partition closed in the meantime (it is measured again when it reopens
+/// and a sweep counts its rows): nothing is opened to compact it.
+pub(crate) async fn compact_partition(
+    database: &Arc<Database>,
+    name: &str,
+    pid: u32,
+) -> Result<Option<crate::core::vacuum::CompactReport>, String> {
+    use crate::core::mvcc::owner::{OwnerKind, StatementOwner};
+    let Some(own) = crate::core::mvcc::table_locks::LockOwner::autocommit(database.transactions.begin_owner()) else {
+        return Err("internal error: no lock owner for VACUUM".to_string());
+    };
+    let _owner = VacuumOwner {
+        database: database.clone(),
+        owner: StatementOwner {
+            owner: own,
+            kind: OwnerKind::Statement,
+        },
+    };
+    let relation = database
+        .relation_for(name, Some(_owner.owner), TableMode::AccessExclusive)
+        .await?;
+    let Some(crate::core::database::Relation::Partitioned(pt)) = relation else {
+        return Ok(None);
+    };
+    pt.check().map_err(|e| e.to_string())?;
+    let Some((_, part)) = pt.open_partitions_now().into_iter().find(|(p, _)| *p == pid) else {
+        return Ok(None);
+    };
+    part.compact().await.map(Some).map_err(|e| e.to_string())
+}
+
 /// What the partitioned `UPDATE` and `DELETE` check before they write, in
 /// common: a `RETURNING` list that resolves against the shell's schema,
 /// which every partition shares. A bad list fails as it does on a plain

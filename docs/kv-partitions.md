@@ -1,6 +1,7 @@
 # Partitioned tables on a key/value store
 
-Status: **§1 (placement) built**; §2 and §3 design, not built (branch
+Status: **§1 (placement) and §3 (auto-compaction per partition) built**;
+§2 design, not built (branch
 `feat/kv-partitions`, from `feat/secondary-indexes` at 538d4590,
 2026-11-15). See "§1 as built" at the end.
 
@@ -193,8 +194,8 @@ table's name in `db_storage.cfg`), and lists the stores this process opened
   key/value store(s) … are not copied by backups yet"), with a warning; a
   restore in place reads whatever the store holds then, as for any
   uncovered key/value table.
-- **Not built.** Snapshots for store partitions (§2: a store partition
-  always rebuilds its indexes at open) and reclaim (§3). Opening a table
+- **Not built** in §1. Snapshots for store partitions (§2: a store
+  partition always rebuilds its indexes at open). Opening a table
   opens every materialized store partition's two files (the family already
   holds their recovered deltas in memory).
 
@@ -204,3 +205,33 @@ partitions not dropped, an empty materialization surviving a restart),
 `tests/partition_kv.rs` (the statement kinds against a plain twin over the
 wire, restart, idle close, MOVE PARTITION both ways, DROP), and the twin's
 `*_on_kv_store` configurations.
+
+## §3 as built
+
+`auto_compact` measures every partition open at the pass
+(`measure_partitions`: `Table::data`'s pointer length against the sweep's
+live count, as for a plain table) and compacts a due one alone through
+`executor::compact_partition`. A closed partition is never opened to be
+measured or compacted.
+
+- **Lock.** ACCESS EXCLUSIVE on the partitioned table, under an owner of
+  its own, waiting at most `LOCK_WAIT_MS` (100 ms). Locks are per table
+  name, and a transaction that wrote a partition holds ROW EXCLUSIVE on the
+  name until it ends with that partition's slots in its write set, so
+  nothing weaker keeps the compaction from moving them (a mutation to ROW
+  EXCLUSIVE fails `a_busy_partitioned_table_is_skipped`). The hold is one
+  partition's compaction, not the table's.
+- **Cooldown** per `(database, table, pid)`.
+- **On a store.** `Table::compact` truncates both files, and `truncate_to`
+  deletes the chunk objects wholly past the new end. The chunk straddling
+  the end keeps its tail (by design: rewriting it would cost a request to
+  change bytes nothing reads), so a compacted file holds at most one chunk
+  past its live bytes: 4 MiB at the default `CHUNK_SIZE`, per file, not
+  growing.
+- **Hole punching** is not built: with the partition compacted the
+  remaining waste is that one chunk.
+
+Tests: `auto_compact_tests.rs` (update-heavy partitions on files and on a
+directory store, each compacted by one pass, the cooldown, the store's
+bytes bounded by a chunk per file; a locked table and an open writer each
+make the pass skip, not wait).

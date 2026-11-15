@@ -16,8 +16,17 @@
 //! [`crate::auto_compact_cooldown_secs`] per table. It is the statement
 //! itself, through the executor: the same ACCESS EXCLUSIVE and the same
 //! interaction with backups and replication as an operator's `VACUUM FULL
-//! <table>`, nothing of its own. Plain tables only: a partitioned table is
-//! left to its operator ([`measure`]).
+//! <table>`, nothing of its own.
+//!
+//! A partitioned table is measured and compacted partition by partition
+//! ([`measure_partitions`], `docs/kv-partitions.md` §3): every partition open
+//! now is measured as a plain table is, and a due one is compacted alone
+//! (`executor::compact_partition`), under the partitioned table's ACCESS
+//! EXCLUSIVE as `VACUUM FULL` takes it, with the same short wait. A closed
+//! partition is never opened for this: it is measured once it is open again
+//! and a sweep has counted its rows. So a retention-heavy partition gives its
+//! dead slots and rows back, its pointer file stops growing, and on a
+//! key/value store the chunk objects past its new end are deleted.
 //!
 //! Compaction stops the table while it runs, so a busy table is skipped
 //! rather than queued for: the statement runs with a short `lock_timeout`
@@ -61,15 +70,53 @@ impl Measure {
     }
 }
 
-/// The table's measure, `None` when it cannot be read, its live rows were
-/// never measured, or it is partitioned: a partitioned table's `VACUUM FULL`
-/// compacts every partition and would open closed ones to do it, which is an
-/// operator's call, not this task's.
+/// The policy one pass applies: the settings, read once per pass.
+#[derive(Debug, Clone, Copy)]
+struct Policy {
+    min_slots: u64,
+    ratio: u64,
+    cooldown: Duration,
+}
+
+impl Policy {
+    fn current() -> Self {
+        Policy {
+            min_slots: crate::auto_compact_min_slots(),
+            ratio: crate::auto_compact_ratio(),
+            cooldown: Duration::from_secs(crate::auto_compact_cooldown_secs()),
+        }
+    }
+}
+
+/// The plain table's measure, `None` when it cannot be read, its live rows
+/// were never measured, or it is partitioned (see [`measure_partitions`]).
 pub async fn measure(database: &Database, name: &str) -> Option<Measure> {
     use crate::core::database::Relation;
+    let Relation::Plain(table) = database.relation(name)? else { return None };
+    measure_table(&table).await
+}
+
+/// The measure of every partition of partitioned table `name` that is open
+/// now and whose live rows a sweep has counted, by pid. None is opened.
+pub async fn measure_partitions(database: &Database, name: &str) -> Vec<(u32, Measure)> {
+    use crate::core::database::Relation;
+    let Some(Relation::Partitioned(pt)) = database.relation(name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (pid, part) in pt.open_partitions_now() {
+        if let Some(m) = measure_table(&part).await {
+            out.push((pid, m));
+        }
+    }
+    out
+}
+
+async fn measure_table(
+    table: &crate::core::row::table::Table<crate::core::storage_providers::backend::DbStorageProvider>,
+) -> Option<Measure> {
     use crate::core::row::row_pointer::ROW_POINTER_RECORD_LEN;
     use crate::core::storage_providers::traits::StorageIO;
-    let Relation::Plain(table) = database.relation(name)? else { return None };
     let data = table.data().ok()?;
     let slots = data.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
     let live = data.vacuum_stats.live_rows()?;
@@ -88,7 +135,7 @@ where
         return;
     };
     handle.spawn(async move {
-        let mut last: HashMap<(u64, String), Instant> = HashMap::new();
+        let mut last: Last = HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_secs(crate::auto_compact_interval_secs().max(1))).await;
             let Some(map) = databases.upgrade() else { return };
@@ -101,11 +148,21 @@ where
     });
 }
 
-/// One pass over one database.
-async fn tick(database: &rclite::Arc<Database>, last: &mut HashMap<(u64, String), Instant>) {
-    let (min_slots, ratio) = (crate::auto_compact_min_slots(), crate::auto_compact_ratio());
-    let cooldown = Duration::from_secs(crate::auto_compact_cooldown_secs());
-    let mut names: Vec<String> = database.table_names();
+/// When each table (pid `None`) or partition was last compacted or failed.
+type Last = HashMap<(u64, String, Option<u32>), Instant>;
+
+/// One pass over one database. Returns how many compactions it ran.
+async fn tick(database: &rclite::Arc<Database>, last: &mut Last) -> usize {
+    tick_with(database, last, Policy::current()).await
+}
+
+async fn tick_with(database: &rclite::Arc<Database>, last: &mut Last, policy: Policy) -> usize {
+    let mut ran = 0;
+    let mut names: Vec<String> = database
+        .table_names()
+        .into_iter()
+        .chain(database.partitioned_tables_all().iter().map(|t| t.name().to_string()))
+        .collect();
     names.sort();
     names.dedup();
     for name in names {
@@ -116,35 +173,67 @@ async fn tick(database: &rclite::Arc<Database>, last: &mut HashMap<(u64, String)
         {
             continue;
         }
-        let key = (database.id, name.clone());
-        if last.get(&key).is_some_and(|at| at.elapsed() < cooldown) {
+        if database.is_partitioned(&name) {
+            for (pid, m) in measure_partitions(database, &name).await {
+                let key = (database.id, name.clone(), Some(pid));
+                if last.get(&key).is_some_and(|at| at.elapsed() < policy.cooldown) || !m.due(policy.min_slots, policy.ratio) {
+                    continue;
+                }
+                let what = format!("partition {pid} of \"{name}\"");
+                let outcome = compact_part(database, &name, pid).await;
+                ran += usize::from(matches!(outcome, Outcome::Done));
+                let after = match outcome {
+                    Outcome::Done => {
+                        measure_partitions(database, &name).await.into_iter().find(|(p, _)| *p == pid).map(|(_, m)| m.slots)
+                    }
+                    _ => None,
+                };
+                settle(outcome, &what, m, after, key, last);
+            }
+            continue;
+        }
+        let key = (database.id, name.clone(), None);
+        if last.get(&key).is_some_and(|at| at.elapsed() < policy.cooldown) {
             continue;
         }
         let Some(m) = measure(database, &name).await else { continue };
-        if !m.due(min_slots, ratio) {
+        if !m.due(policy.min_slots, policy.ratio) {
             continue;
         }
-        match compact(database, &name).await {
-            Outcome::Done => {
-                RUNS.fetch_add(1, Ordering::Relaxed);
-                let after = measure(database, &name).await.map(|m| m.slots);
-                info!(
-                    "auto-compacted \"{name}\": {} slots for {} live rows, now {}",
-                    m.slots,
-                    m.live,
-                    after.map_or_else(|| "?".to_string(), |s| s.to_string())
-                );
-                last.insert(key, Instant::now());
-            }
-            Outcome::Busy => {
-                SKIPPED_BUSY.fetch_add(1, Ordering::Relaxed);
-            }
-            Outcome::Failed(e) => {
-                warn!("auto-compaction of \"{name}\" failed: {e}");
-                // Not retried every interval: a failure that recurs would
-                // otherwise log once a minute for ever.
-                last.insert(key, Instant::now());
-            }
+        let what = format!("\"{name}\"");
+        let outcome = compact(database, &name).await;
+        ran += usize::from(matches!(outcome, Outcome::Done));
+        let after = match outcome {
+            Outcome::Done => measure(database, &name).await.map(|m| m.slots),
+            _ => None,
+        };
+        settle(outcome, &what, m, after, key, last);
+    }
+    ran
+}
+
+/// Counts and logs one compaction's outcome (`after`: the slots it left),
+/// and starts its cooldown.
+fn settle(outcome: Outcome, what: &str, m: Measure, after: Option<u64>, key: (u64, String, Option<u32>), last: &mut Last) {
+    match outcome {
+        Outcome::Done => {
+            RUNS.fetch_add(1, Ordering::Relaxed);
+            info!(
+                "auto-compacted {what}: {} slots for {} live rows, now {}",
+                m.slots,
+                m.live,
+                after.map_or_else(|| "?".to_string(), |s| s.to_string())
+            );
+            last.insert(key, Instant::now());
+        }
+        Outcome::Busy => {
+            SKIPPED_BUSY.fetch_add(1, Ordering::Relaxed);
+        }
+        Outcome::Failed(e) => {
+            warn!("auto-compaction of {what} failed: {e}");
+            // Not retried every interval: a failure that recurs would
+            // otherwise log once a minute for ever.
+            last.insert(key, Instant::now());
         }
     }
 }
@@ -175,6 +264,27 @@ async fn compact(database: &rclite::Arc<Database>, name: &str) -> Outcome {
             }
         }
         _ => Outcome::Done,
+    }
+}
+
+/// Partition `pid` of `name` compacted alone (`executor::compact_partition`),
+/// its lock wait bounded by [`LOCK_WAIT_MS`] as [`compact`]'s is. A
+/// partition that closed or a table that went away in the meantime is
+/// `Done` with nothing to do.
+async fn compact_part(database: &rclite::Arc<Database>, name: &str, pid: u32) -> Outcome {
+    let cancel = std::sync::Arc::new(crate::core::cancel::StatementCancel::new(None).with_lock_timeout(LOCK_WAIT_MS));
+    let result = crate::core::cancel::STATEMENT_CANCEL
+        .scope(cancel, crate::core::rql::executor::compact_partition(database, name, pid))
+        .await;
+    match result {
+        Ok(report) => {
+            if let Some(why) = report.and_then(|r| r.truncation_skipped) {
+                warn!("auto-compaction of partition {pid} of \"{name}\" kept its tail: {why}");
+            }
+            Outcome::Done
+        }
+        Err(e) if e.contains("lock timeout") => Outcome::Busy,
+        Err(e) => Outcome::Failed(e),
     }
 }
 
