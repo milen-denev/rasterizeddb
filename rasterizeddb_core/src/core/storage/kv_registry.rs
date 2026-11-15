@@ -571,6 +571,17 @@ impl KvRegistry {
         }
     }
 
+    /// Every family this server has built so far, by store name: what a
+    /// partitioned table's drop sweeps for its partitions (a partition on a
+    /// store opens that store's family before anything is written to it, so
+    /// a store no family was built for holds none of this process's).
+    pub async fn open_families(&self) -> Vec<(String, Arc<KvFamily>)> {
+        let open = self.open.lock().await;
+        let mut out: Vec<(String, Arc<KvFamily>)> = open.iter().map(|(n, f)| (n.clone(), f.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// The family for `name`, building it the first time.
     pub async fn family(&self, name: &str) -> io::Result<Arc<KvFamily>> {
         let mut open = self.open.lock().await;

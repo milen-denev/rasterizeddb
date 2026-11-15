@@ -36,6 +36,17 @@ impl DbStorageProvider {
         }
     }
 
+    /// The file's length without awaiting, where that is an atomic (a
+    /// key/value file); `None` for a provider whose length is asked of the
+    /// file system.
+    pub(crate) fn len_now(&self) -> Option<u64> {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(kv) => Some(kv.len_now()),
+            _ => None,
+        }
+    }
+
     pub async fn new_file(location: &str, table_name: Option<&str>) -> Self {
         Self::File(LocalStorageProvider::new(location, table_name).await)
     }

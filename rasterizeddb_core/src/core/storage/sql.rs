@@ -619,7 +619,12 @@ async fn move_table(tokens: &[String], database: &Arc<Database>) -> Result<Vec<S
         .get(2)
         .is_some_and(|word| word.eq_ignore_ascii_case("PARTITION"))
     {
-        return Err("STORAGE MOVE PARTITION is not supported yet: partitions move with reshaping, in a later version".to_string());
+        // The statement path runs it as a reshape before this surface sees
+        // it (`executor::execute_storage`, `reshape::parse_move`); this one
+        // has no ACCESS EXCLUSIVE to run it under.
+        return Err("STORAGE MOVE PARTITION is not supported through this storage command surface: it is a reshape, \
+                    run as an SQL statement"
+            .to_string());
     }
     let (table, target) = table_and_path(tokens, "TO")?;
     let destination = super::TableBackend::parse(&target);

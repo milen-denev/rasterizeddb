@@ -303,6 +303,14 @@ impl Database {
         }
         let synced = self.sync_durable();
         point(self, "rename_after_commit");
+        // A store the table is placed on (docs/kv-partitions.md §1) is where
+        // its next partitions are dealt: the placement follows the name the
+        // catalogue now holds. Lost to a crash here, the next partitions go
+        // to directories, beside the ones on the store.
+        if super::pool_spec_of(&self.storage, old_name).is_some() {
+            super::pool_rename(&self.storage, old_name, new_name);
+            super::pool_forget(&self.storage, old_name);
+        }
 
         // Step 3, best effort: the row is what names the table.
         if let Err(e) = self.rewrite_partitioned_header(&old, new_name).await {

@@ -81,6 +81,7 @@ use super::guard::RangeGuard;
 use super::maintenance::{MaintenanceMode, Scheduler};
 use super::pins::{BoardFiles, PinBoard};
 use super::serial::SerialSource;
+use super::store::{self as part_store, BoxFut, PartStore, StoreFiles};
 use super::key::KeySpec;
 use super::log::{MapHeader, ROUTE_V1, Record};
 use super::map::{PointRange, RangeMap, SPACE_END};
@@ -198,11 +199,45 @@ struct SlotLive {
     /// the catalogs only (never a DDL's population check, which reads the
     /// files: `PartitionedTable::rows_len_exact`). See [`KeptSizes`].
     sizes: parking_lot::Mutex<KeptSizes>,
-    /// The directory its files are in, once it is materialized somewhere
-    /// other than the root (phase 4, §6.1): set from the replayed map at
-    /// open or by [`Parts::materialize`], before the flag. Unset means the
-    /// root. Never changes: a move is a reshape, to a new pid.
-    dir: OnceLock<PathBuf>,
+    /// Where its files are, once it is materialized somewhere other than
+    /// the root (phase 4, §6.1): another directory, or a key/value store
+    /// with its two files open (docs/kv-partitions.md §1). Set from the
+    /// replayed map at open or by [`Parts::materialize`], before the flag.
+    /// Unset means the root. Never changes: a move is a reshape, to a new
+    /// pid.
+    place: OnceLock<Place>,
+}
+
+/// Where a partition off the root keeps its files.
+#[derive(Clone)]
+enum Place {
+    Dir(PathBuf),
+    Store(StoreFiles),
+}
+
+/// Where a slot's files are, borrowed: [`Slot::at`].
+#[derive(Clone, Copy)]
+enum At<'a> {
+    Dir(&'a Path),
+    Store(&'a StoreFiles),
+}
+
+impl At<'_> {
+    /// As introspection shows it: the directory, or the store's spec.
+    fn shown(&self) -> String {
+        match self {
+            At::Dir(d) => d.to_string_lossy().into_owned(),
+            At::Store(s) => s.spec().to_string(),
+        }
+    }
+
+    /// As a reshape carries it.
+    fn loc(&self) -> super::reshape::PartLoc {
+        match self {
+            At::Dir(d) => super::reshape::PartLoc::Dir(d.to_path_buf()),
+            At::Store(s) => super::reshape::PartLoc::Store(s.spec().to_string()),
+        }
+    }
 }
 
 /// A closed partition's kept file lengths (P5b-2a): what the catalogs read
@@ -236,10 +271,10 @@ impl KeptSizes {
 }
 
 impl Slot {
-    fn new(pid: u32, range: PointRange, materialized: bool, dir: Option<PathBuf>) -> Self {
+    fn new(pid: u32, range: PointRange, materialized: bool, place: Option<Place>) -> Self {
         let slot = Slot { pid, range, materialized: AtomicBool::new(materialized), live: OnceLock::new() };
-        if let Some(dir) = dir {
-            slot.set_dir(dir);
+        if let Some(place) = place {
+            slot.set_place(place);
         }
         slot
     }
@@ -262,20 +297,32 @@ impl Slot {
         self.peek().is_some_and(|live| live.open.lock().is_some())
     }
 
-    /// The directory its files are in: its own, or `root`.
-    fn dir<'a>(&'a self, root: &'a Path) -> &'a Path {
-        self.dir_get().map_or(root, PathBuf::as_path)
+    /// Where its files are: its own directory or store, or `root`.
+    fn at<'a>(&'a self, root: &'a Path) -> At<'a> {
+        match self.place_get() {
+            None => At::Dir(root),
+            Some(Place::Dir(d)) => At::Dir(d),
+            Some(Place::Store(s)) => At::Store(s),
+        }
     }
 
-    /// Its own directory, unset for the root.
-    fn dir_get(&self) -> Option<&PathBuf> {
-        self.peek()?.dir.get()
+    /// Its own place, unset for the root.
+    fn place_get(&self) -> Option<&Place> {
+        self.peek()?.place.get()
     }
 
-    /// Sets its own directory, once; a later call is ignored, as the
-    /// directory never changes (a move is a reshape, to a new pid).
-    fn set_dir(&self, dir: PathBuf) {
-        let _ = self.live().dir.set(dir);
+    /// Its store, when it is on one.
+    fn store_get(&self) -> Option<&StoreFiles> {
+        match self.place_get() {
+            Some(Place::Store(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Sets its own place, once; a later call is ignored, as the place
+    /// never changes (a move is a reshape, to a new pid).
+    fn set_place(&self, place: Place) {
+        let _ = self.live().place.set(place);
     }
 
     fn referenced_now(&self) -> bool {
@@ -336,9 +383,15 @@ impl Slot {
             }
             (!sizes.closing).then_some(sizes.epoch)
         };
-        let read = closed_lens(root, uid, self.pid)?;
+        let read = closed_lens(self.at(root), uid, self.pid)?;
         #[cfg(test)]
-        kept_sizes_hooks::read(root, self.pid);
+        kept_sizes_hooks::read(
+            match self.at(root) {
+                At::Dir(dir) => dir,
+                At::Store(_) => root,
+            },
+            self.pid,
+        );
         if let Some(epoch) = epoch {
             let mut sizes = self.live().sizes.lock();
             if sizes.epoch == epoch && !sizes.closing && sizes.kept.is_none() {
@@ -420,11 +473,24 @@ pub(crate) type MirrorsConfigured = StdArc<dyn Fn() -> bool + Send + Sync>;
 /// database's storage pool, behind a trait so this module builds without
 /// `storage_pools`, where every partition stays in the root ([`RootOnly`]).
 pub(crate) trait Placement: Send + Sync {
-    /// The directory the next partition of `uid` to materialize goes to,
-    /// counted there at once (the pool's dealer); `None` for the root.
-    fn deal(&self, uid: u64) -> Option<String>;
+    /// Where the next partition of `uid` (table `table`) to materialize goes:
+    /// a directory, counted there at once (the pool's dealer), or the
+    /// key/value store the table is placed on, as `kv:<store>`
+    /// (docs/kv-partitions.md §1); `None` for the root.
+    fn deal(&self, uid: u64, table: &str) -> Option<String>;
     /// Takes back a [`Placement::deal`] whose materialization failed.
     fn undeal(&self, uid: u64, dir: &str);
+    /// The store `table`'s partitions are placed on, as `kv:<store>`, or
+    /// `None` when they go to directories.
+    fn table_store(&self, table: &str) -> Option<String>;
+    /// Whether `spec` (`kv:<store>`) names a store this database configures.
+    fn store_known(&self, spec: &str) -> bool;
+    /// The store `spec` (`kv:<store>`) names, opened; an error when it is
+    /// not configured, cannot be opened, or this build has no stores.
+    fn store<'a>(&'a self, spec: &'a str) -> BoxFut<'a, io::Result<StdArc<dyn PartStore>>>;
+    /// Every store this process has opened: the only ones that can hold a
+    /// partition this process materialized or opened.
+    fn open_stores(&self) -> BoxFut<'_, Vec<StdArc<dyn PartStore>>>;
     /// Replaces what is counted for `uid`: its materialized partitions per
     /// directory, the root's included, as the table opens.
     fn register(&self, uid: u64, counts: std::collections::HashMap<String, u64>);
@@ -440,10 +506,22 @@ pub(crate) trait Placement: Send + Sync {
 pub(crate) struct RootOnly;
 
 impl Placement for RootOnly {
-    fn deal(&self, _uid: u64) -> Option<String> {
+    fn deal(&self, _uid: u64, _table: &str) -> Option<String> {
         None
     }
     fn undeal(&self, _uid: u64, _dir: &str) {}
+    fn table_store(&self, _table: &str) -> Option<String> {
+        None
+    }
+    fn store_known(&self, _spec: &str) -> bool {
+        false
+    }
+    fn store<'a>(&'a self, spec: &'a str) -> BoxFut<'a, io::Result<StdArc<dyn PartStore>>> {
+        Box::pin(async move { Err(no_stores(spec)) })
+    }
+    fn open_stores(&self) -> BoxFut<'_, Vec<StdArc<dyn PartStore>>> {
+        Box::pin(async { Vec::new() })
+    }
     fn register(&self, _uid: u64, _counts: std::collections::HashMap<String, u64>) {}
     fn resolve(&self, _dir: &str) -> Option<String> {
         None
@@ -451,6 +529,14 @@ impl Placement for RootOnly {
     fn others(&self) -> Vec<PathBuf> {
         Vec::new()
     }
+}
+
+/// A store location in a database that cannot have one.
+pub(crate) fn no_stores(spec: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("partitions on key/value store '{}' need the kv_storage and storage_pools features", part_store::store_name(spec)),
+    )
 }
 
 /// What [`PartitionedTable::open`] needs from the database.
@@ -648,21 +734,104 @@ fn refuse_torn_leftovers(root: &Path, uid: u64, generation: u64, pid: u32, torn:
     )))
 }
 
-/// The directory of a partition recorded at interned location `loc`:
-/// `None` for the root (location 0, wherever the database now is), else
-/// the interned path, which must be a location of this database's pool. A
-/// map copied or restored from elsewhere names another installation's
-/// directory, whose files are not this database's to read or write, so the
-/// table is refused rather than opened over them.
-fn partition_dir(locations: &[String], loc: u32, placement: &dyn Placement) -> Result<Option<PathBuf>, String> {
+/// [`refuse_torn_leftovers`] on a store: the same refusal for a partition
+/// whose files there hold data with no `MATERIALIZE`.
+async fn refuse_torn_leftovers_on(
+    store: &StdArc<dyn PartStore>,
+    uid: u64,
+    generation: u64,
+    pid: u32,
+    torn: &str,
+) -> io::Result<()> {
+    let mut found = Vec::new();
+    for name in files::data_files(uid, pid) {
+        if let Some(file) = store.open_existing(&name).await?
+            && file.len_now().unwrap_or(1) > 0
+        {
+            found.push(name);
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "the map log was torn ({torn}), and partition {pid} has files with data but no MATERIALIZE on {} ({}): \
+         they may hold committed rows whose record was lost; examine them and the torn tail in \
+         {}{}, and remove that file once resolved",
+        store.spec(),
+        found.join(", "),
+        files::map_file(uid, generation),
+        files::TORN,
+    )))
+}
+
+/// The stores a partition of table `name` may have leftover files on: every
+/// store `state` interns, and the one the table is placed on. An error when
+/// one cannot be opened: then a leftover there can be neither checked nor
+/// ruled out.
+async fn leftover_stores(
+    locations: &[String],
+    placement: &dyn Placement,
+    name: &str,
+) -> io::Result<Vec<StdArc<dyn PartStore>>> {
+    let mut specs: Vec<String> = locations.iter().filter_map(|l| part_store::store_spec(l)).collect();
+    specs.extend(placement.table_store(name));
+    specs.sort();
+    specs.dedup();
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        out.push(placement.store(&spec).await?);
+    }
+    Ok(out)
+}
+
+/// Where a partition recorded at an interned location is now.
+enum Located {
+    /// The root (location 0, wherever the database now is).
+    Root,
+    Dir(PathBuf),
+    Store(StdArc<dyn PartStore>),
+}
+
+/// The stores a table's open has resolved, by spec: each opened once.
+type Stores = std::collections::HashMap<String, StdArc<dyn PartStore>>;
+
+/// The store `spec` names, through `stores` so each resolves once.
+async fn resolve_store(placement: &dyn Placement, stores: &mut Stores, spec: &str) -> io::Result<StdArc<dyn PartStore>> {
+    if let Some(store) = stores.get(spec) {
+        return Ok(store.clone());
+    }
+    let store = placement.store(spec).await?;
+    stores.insert(spec.to_string(), store.clone());
+    Ok(store)
+}
+
+/// Where a partition recorded at interned location `loc` is: the root for
+/// location 0, a key/value store for a location spelled `kv:<store>`
+/// (docs/kv-partitions.md §1), else the interned path, which must be a
+/// location of this database's pool. A map copied or restored from
+/// elsewhere names another installation's directory, whose files are not
+/// this database's to read or write, so the table is refused rather than
+/// opened over them; a store this database does not configure (or cannot
+/// open) refuses it too.
+async fn locate(locations: &[String], loc: u32, placement: &dyn Placement, stores: &mut Stores) -> Result<Located, String> {
     if loc == ROOT_LOC {
-        return Ok(None);
+        return Ok(Located::Root);
     }
     let Some(path) = locations.get(loc as usize) else {
         return Err(format!("is at location {loc}, but only {} are interned", locations.len()));
     };
+    if let Some(spec) = part_store::store_spec(path) {
+        return match resolve_store(placement, stores, &spec).await {
+            Ok(store) => Ok(Located::Store(store)),
+            Err(e) => Err(format!(
+                "is on key/value store '{}', which cannot be opened: {e}",
+                part_store::store_name(&spec)
+            )),
+        };
+    }
     match placement.resolve(path) {
-        Some(now) => Ok(Some(PathBuf::from(now))),
+        Some(now) => Ok(Located::Dir(PathBuf::from(now))),
         None => Err(format!(
             "is in {path}, which is not a storage location of this database; add it back with \
              STORAGE ADD LOCATION '{path}', or restore the partition's files there"
@@ -670,17 +839,36 @@ fn partition_dir(locations: &[String], loc: u32, placement: &dyn Placement) -> R
     }
 }
 
+/// A materialized partition's files where `located` says, checked to exist
+/// (I9; on a directory a stat per file, never a provider, which would
+/// create it; on a store from the family's names, never "reads as empty"):
+/// its slot's place, `None` for the root.
+async fn place_existing(located: Located, root: &Path, uid: u64, pid: u32) -> io::Result<Option<Place>> {
+    match located {
+        Located::Root => {
+            files::require_existing(root, &files::data_files(uid, pid))?;
+            Ok(None)
+        }
+        Located::Dir(dir) => {
+            files::require_existing(&dir, &files::data_files(uid, pid))?;
+            Ok(Some(Place::Dir(dir)))
+        }
+        Located::Store(store) => Ok(Some(Place::Store(part_store::require_existing(&store, uid, pid).await?))),
+    }
+}
+
 /// The slots of `state`'s live partitions, in map order, and the pid index
-/// over them (`Parts::index`): each materialized one with the directory its
-/// location is in now, checked to hold its two data files (I9; a stat per
-/// file, never a provider, which would create it). Also the dealer's count
-/// per directory (§6.1).
-fn slots_of(
+/// over them (`Parts::index`): each materialized one with the place its
+/// location is now, checked to hold its two data files ([`place_existing`]).
+/// Also the dealer's count per directory (§6.1); a partition on a store is
+/// in no directory's count.
+async fn slots_of(
     state: &super::log::MapState,
     root: &Path,
     uid: u64,
     placement: &dyn Placement,
 ) -> Result<(Box<[Slot]>, Box<[u32]>, std::collections::HashMap<String, u64>), String> {
+    let mut stores = Stores::new();
     let entries = state.map().entries();
     let n = usize::try_from(state.next_pid()).map_err(|e| e.to_string())?;
     let mut index = vec![u32::MAX; n];
@@ -690,21 +878,28 @@ fn slots_of(
     for (j, &(lo, pid)) in entries.iter().enumerate() {
         let range = PointRange { lo, hi: entries.get(j + 1).map_or(SPACE_END, |&(next, _)| next as u128) };
         let part = state.part(pid).ok_or_else(|| format!("live partition {pid} has no state"))?;
-        let (materialized, dir) = match part.location {
+        let (materialized, place) = match part.location {
             None => (false, None),
             Some(loc) => {
-                let dir = partition_dir(state.locations(), loc, placement).map_err(|why| format!("partition {pid} {why}"))?;
-                files::require_existing(dir.as_deref().unwrap_or(root), &files::data_files(uid, pid))
-                    .map_err(|e| e.to_string())?;
-                let key = dir.as_ref().map_or_else(|| root_key.clone(), |d| files::dir_key(&d.to_string_lossy()));
-                *counts.entry(key).or_insert(0) += 1;
-                (true, dir)
+                let located = locate(state.locations(), loc, placement, &mut stores)
+                    .await
+                    .map_err(|why| format!("partition {pid} {why}"))?;
+                let place = place_existing(located, root, uid, pid).await.map_err(|e| e.to_string())?;
+                let key = match &place {
+                    None => Some(root_key.clone()),
+                    Some(Place::Dir(d)) => Some(files::dir_key(&d.to_string_lossy())),
+                    Some(Place::Store(_)) => None,
+                };
+                if let Some(key) = key {
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+                (true, place)
             }
         };
         *index
             .get_mut(pid as usize)
             .ok_or_else(|| format!("live partition {pid} is past the map's next pid {n}"))? = j as u32;
-        slots.push(Slot::new(pid, range, materialized, dir));
+        slots.push(Slot::new(pid, range, materialized, place));
     }
     Ok((slots.into_boxed_slice(), index.into_boxed_slice(), counts))
 }
@@ -1052,6 +1247,12 @@ impl PartitionedTable {
         // retired partition is never placed). Before any partition opens,
         // so nothing reads either.
         let state = board.finish_reshapes().await.map_err(e)?;
+        // The stores a crashed materialize may have been dealt: any the map
+        // interns, and the one the table is placed on.
+        let torn_stores = match torn.as_deref() {
+            Some(_) => leftover_stores(state.locations(), &*ctx.placement, name).await.map_err(e)?,
+            None => Vec::new(),
+        };
         for (pid, part) in state.parts() {
             if part.location.is_some() || part.retired {
                 continue;
@@ -1064,6 +1265,9 @@ impl PartitionedTable {
                 for other in ctx.placement.others() {
                     refuse_torn_leftovers(&other, uid, generation, pid, why).map_err(e)?;
                 }
+                for store in &torn_stores {
+                    refuse_torn_leftovers_on(store, uid, generation, pid, why).await.map_err(e)?;
+                }
             }
         }
         let map = state.map().clone();
@@ -1071,7 +1275,7 @@ impl PartitionedTable {
         // Nothing opens here (phase 3 P5b: a partition opens on demand), but
         // a materialized partition's missing file still refuses the table
         // now, as it did when every partition opened (I9).
-        let (slots, index, counts) = slots_of(&state, root, uid, &*ctx.placement)?;
+        let (slots, index, counts) = slots_of(&state, root, uid, &*ctx.placement).await?;
         // The dealer's counts (§6.1), every location's, the root's included.
         ctx.placement.register(uid, counts);
         let parts = StdArc::new_cyclic(|me| Parts {
@@ -1182,7 +1386,7 @@ impl PartitionedTable {
                         let state = old.board.state.lock().await;
                         declared = Some(state.map().len() as u32);
                         old.board.grow(&state);
-                        let (slots, index, counts) = slots_of(&state, &self.root, self.uid, &*old.placement)?;
+                        let (slots, index, counts) = slots_of(&state, &self.root, self.uid, &*old.placement).await?;
                         // The dealer's counts from the map as it is now: a
                         // reshape's targets, wherever `TO` put them, count
                         // where they are (the pool's location guards read
@@ -1401,7 +1605,7 @@ impl PartitionedTable {
             match slot.open_now() {
                 Some(table) => total += table.data()?.len.load(Ordering::Relaxed),
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    total += closed_lens(slot.dir(&self.root), self.uid, slot.pid)?.0;
+                    total += closed_lens(slot.at(&self.root), self.uid, slot.pid)?.0;
                 }
                 None => {}
             }
@@ -1425,7 +1629,7 @@ impl PartitionedTable {
             let _life = lock.lock().await;
             total += match slot.open_now() {
                 Some(table) => table.data()?.len.load(Ordering::Relaxed),
-                None => closed_lens(slot.dir(&self.root), self.uid, slot.pid)?.0,
+                None => closed_lens(slot.at(&self.root), self.uid, slot.pid)?.0,
             };
         }
         Ok(total)
@@ -1846,7 +2050,7 @@ impl PartitionedTable {
             let lens = match &open {
                 Some(table) => Some(Self::file_lens(table).await?),
                 // A closed partition, from its files' metadata.
-                None if slot.materialized.load(Ordering::SeqCst) => Some(slot.closed_sizes(slot.dir(&self.root), self.uid)?),
+                None if slot.materialized.load(Ordering::SeqCst) => Some(slot.closed_sizes(&self.root, self.uid)?),
                 None => None,
             };
             if let Some((rows, pointers, filters)) = lens {
@@ -1883,15 +2087,15 @@ impl PartitionedTable {
         let live = self.live()?;
         let mut out = Vec::with_capacity(live.parts.slots.len());
         for slot in live.parts.slots.iter() {
-            let dir = slot.dir(&self.root);
-            let shown = || Some(dir.to_string_lossy().into_owned());
+            let at = slot.at(&self.root);
+            let shown = || Some(at.shown());
             let (location, state, slots, bytes) = match slot.open_now() {
                 Some(table) => {
                     let (slots, bytes) = Self::sizes(&table).await?;
                     (shown(), "materialized", slots, bytes)
                 }
                 None if slot.materialized.load(Ordering::SeqCst) => {
-                    let (rows, pointers, filters) = slot.closed_sizes(dir, self.uid)?;
+                    let (rows, pointers, filters) = slot.closed_sizes(&self.root, self.uid)?;
                     (shown(), "materialized", pointers / ROW_POINTER_RECORD_LEN as u64, rows + pointers + filters)
                 }
                 None => (None, "unmaterialized", 0, 0),
@@ -1907,6 +2111,18 @@ impl PartitionedTable {
             });
         }
         Ok(out)
+    }
+
+    /// The key/value stores this table's materialized partitions are on,
+    /// as `kv:<store>`, sorted (docs/kv-partitions.md §1): what a store's
+    /// removal must not leave behind.
+    pub fn stores_in_use(&self) -> Vec<String> {
+        let Ok(live) = self.live() else { return Vec::new() };
+        let mut out: Vec<String> =
+            live.parts.slots.iter().filter_map(|s| s.store_get().map(|f| f.spec().to_string())).collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The table's pins, map log and forget handle (§7.2).
@@ -2041,18 +2257,34 @@ impl PartitionedTable {
     }
 
     /// `dir` if it is a storage location of this database (the root or
-    /// another), as the pool now names it.
-    fn location_dir(&self, dir: &str) -> io::Result<PathBuf> {
+    /// another), as the pool now names it, or a key/value store it
+    /// configures, spelled `kv:<store>` (docs/kv-partitions.md §1).
+    fn location_dir(&self, dir: &str) -> io::Result<super::reshape::PartLoc> {
+        use super::reshape::PartLoc;
         let live = self.live()?;
+        if let Some(spec) = part_store::store_spec(dir) {
+            if !live.parts.placement.store_known(&spec) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "cannot reshape: '{dir}' names key/value store '{}', which this database does not configure; \
+                         add it with STORAGE ADD STORE",
+                        part_store::store_name(&spec)
+                    ),
+                ));
+            }
+            return Ok(PartLoc::Store(spec));
+        }
         let key = files::dir_key(dir);
         if key == files::dir_key(&self.root.to_string_lossy()) {
-            return Ok(self.root.clone());
+            return Ok(PartLoc::Dir(self.root.clone()));
         }
         live.parts
             .placement
             .others()
             .into_iter()
             .find(|p| files::dir_key(&p.to_string_lossy()) == key)
+            .map(PartLoc::Dir)
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -2186,7 +2418,7 @@ impl PartitionedTable {
         &self,
         plan: &super::reshape::ReshapePlan,
     ) -> Result<super::reshape::ReshapeFiles, (io::Error, super::reshape::ReshapeFiles)> {
-        use super::reshape::{CopyTarget, ReshapeFiles, copy, land};
+        use super::reshape::{CopyTarget, PartLoc, ReshapeFiles, copy, land};
         let none = |e: io::Error| (e, ReshapeFiles::default());
         let live = self.live().map_err(none)?;
         let parts = &live.parts;
@@ -2196,13 +2428,13 @@ impl PartitionedTable {
         // 1. The sources, opened, then the instance retired: maintenance
         // stopped and joined, each source's scheduler unit quiesced.
         let mut sources: Vec<(u32, Arc<Table<DbStorageProvider>>)> = Vec::new();
-        let mut source_dirs: Vec<(u32, PointRange, Option<PathBuf>)> = Vec::new();
+        let mut source_dirs: Vec<(u32, PointRange, Option<PartLoc>)> = Vec::new();
         for &pid in &plan.sources {
             let slot = parts.slot_at(pid).map_err(none)?;
             if slot.materialized.load(Ordering::SeqCst) {
                 let table = parts.open(pid, false).await.map_err(none)?;
                 sources.push((pid, table));
-                source_dirs.push((pid, slot.range, Some(slot.dir(&self.root).to_path_buf())));
+                source_dirs.push((pid, slot.range, Some(slot.at(&self.root).loc())));
             } else {
                 source_dirs.push((pid, slot.range, None));
             }
@@ -2215,7 +2447,7 @@ impl PartitionedTable {
         // 2. RESHAPE_BEGIN, durable, its locations interned first.
         let mut state = board.state.lock().await;
         let mut dealt: Vec<String> = Vec::new();
-        let mut targets: Vec<(super::log::ReshapeTarget, PointRange, PathBuf)> = Vec::new();
+        let mut targets: Vec<(super::log::ReshapeTarget, PointRange, PartLoc)> = Vec::new();
         let span_hi = source_dirs.iter().map(|(_, r, _)| r.hi).max().unwrap_or(0);
         let begun: io::Result<super::log::ReshapeBegin> = async {
             let mut next_pid = u32::try_from(state.next_pid()).map_err(|_| io::Error::other("partition ids exhausted"))?;
@@ -2225,12 +2457,15 @@ impl PartitionedTable {
                     Some(d) => d.clone(),
                     None => match source_dirs.iter().find(|(_, r, _)| r.contains(*lo)).and_then(|(_, _, d)| d.clone()) {
                         Some(d) => d,
-                        None => match parts.placement.deal(self.uid) {
+                        None => match parts.placement.deal(self.uid, &parts.name) {
                             Some(d) => {
                                 dealt.push(d.clone());
-                                PathBuf::from(d)
+                                match part_store::store_spec(&d) {
+                                    Some(spec) => PartLoc::Store(spec),
+                                    None => PartLoc::Dir(PathBuf::from(d)),
+                                }
                             }
-                            None => self.root.clone(),
+                            None => PartLoc::Dir(self.root.clone()),
                         },
                     },
                 };
@@ -2269,14 +2504,27 @@ impl PartitionedTable {
         // 3 to 5: the targets' files, the copy, the check.
         let copied: io::Result<()> = async {
             let mut copying = Vec::with_capacity(targets.len());
-            for (t, range, dir) in &targets {
-                files::create_partition_files(dir, self.uid, t.pid)?;
+            let mut stores = Stores::new();
+            for (t, range, loc) in &targets {
+                let (seed, dir) = match loc {
+                    PartLoc::Dir(dir) => {
+                        files::create_partition_files(dir, self.uid, t.pid)?;
+                        (parts.seed.clone(), (!super::reshape::is_root(dir, &self.root)).then(|| dir.to_string_lossy().into_owned()))
+                    }
+                    PartLoc::Store(spec) => {
+                        let store = resolve_store(&*parts.placement, &mut stores, spec).await?;
+                        let made = part_store::create_partition_files(&store, self.uid, t.pid).await?;
+                        store.start_service(&made.rows);
+                        store.start_service(&made.pointers);
+                        (Arc::new(made.rows), None)
+                    }
+                };
                 let physical = files::data_stem(self.uid, t.pid);
                 let table = Table::open_partition(PartitionOpen {
                     cache_scope: format!("{}\u{0}{}", self.db_id, physical),
                     physical,
-                    seed: parts.seed.clone(),
-                    dir: (!super::reshape::is_root(dir, &self.root)).then(|| dir.to_string_lossy().into_owned()),
+                    seed,
+                    dir,
                     io_schema: self.shell.io_schema.clone(),
                     schema: self.shell.schema.clone(),
                     ids: parts.ids.clone(),
@@ -2380,15 +2628,35 @@ async fn intern_location(
     board: &PinBoard,
     state: &mut super::log::MapState,
     root: &Path,
-    dir: &Path,
+    loc: &super::reshape::PartLoc,
 ) -> io::Result<u32> {
-    let key = files::dir_key(&dir.to_string_lossy());
-    if key == files::dir_key(&root.to_string_lossy()) {
-        return Ok(ROOT_LOC);
-    }
-    if let Some(i) = state.locations().iter().skip(1).position(|l| files::dir_key(l) == key) {
-        return Ok(i as u32 + 1);
-    }
+    use super::reshape::PartLoc;
+    let key = match loc {
+        // A store by its spec as spelled, never through the path rules.
+        PartLoc::Store(spec) => {
+            if let Some(i) =
+                state.locations().iter().skip(1).position(|l| part_store::store_spec(l).as_deref() == Some(spec.as_str()))
+            {
+                return Ok(i as u32 + 1);
+            }
+            spec.clone()
+        }
+        PartLoc::Dir(dir) => {
+            let key = files::dir_key(&dir.to_string_lossy());
+            if key == files::dir_key(&root.to_string_lossy()) {
+                return Ok(ROOT_LOC);
+            }
+            if let Some(i) = state
+                .locations()
+                .iter()
+                .skip(1)
+                .position(|l| part_store::store_spec(l).is_none() && files::dir_key(l) == key)
+            {
+                return Ok(i as u32 + 1);
+            }
+            key
+        }
+    };
     let mut paths = state.locations().to_vec();
     paths.push(key);
     let rec = Record::Locations(paths);
@@ -2439,7 +2707,14 @@ pub type Planned = SmallVec<[(u32, Option<Arc<Table<DbStorageProvider>>>); 1]>;
 /// metadata: each data file with its staged `.tmp`, which its next open
 /// lands, and the index-store files. A missing data file is an error (I9);
 /// a missing `.tmp` or index-store file counts 0.
-fn closed_lens(root: &Path, uid: u64, pid: u32) -> io::Result<(u64, u64, u64)> {
+///
+/// On a store, its open files' lengths: they were checked to exist when the
+/// slot was placed, and a store has no staging or index-store files.
+fn closed_lens(at: At<'_>, uid: u64, pid: u32) -> io::Result<(u64, u64, u64)> {
+    let root = match at {
+        At::Dir(dir) => dir,
+        At::Store(files) => return Ok(files.lens()),
+    };
     let len = |name: String, required: bool| -> io::Result<u64> {
         match std::fs::metadata(root.join(&name)) {
             Ok(m) => Ok(m.len()),
@@ -2674,12 +2949,14 @@ impl Parts {
             // the record applies), but the files are this partition's, and a
             // second record would be refused at every later open.
             Some((Some(loc), locations)) => {
-                let dir = partition_dir(&locations, loc, &*self.placement)
+                let located = locate(&locations, loc, &*self.placement, &mut Stores::new())
+                    .await
                     .map_err(|why| io::Error::other(format!("partition {pid} {why}")))?;
-                files::require_existing(dir.as_deref().unwrap_or(&self.root), &files::data_files(self.uid, pid))
+                let place = place_existing(located, &self.root, self.uid, pid)
+                    .await
                     .map_err(|e| out_of_resources(e, &self.name, pid))?;
-                if let Some(dir) = dir {
-                    slot.set_dir(dir);
+                if let Some(place) = place {
+                    slot.set_place(place);
                 }
             }
             Some((None, _)) => {
@@ -2691,10 +2968,16 @@ impl Parts {
                     for other in self.placement.others() {
                         refuse_torn_leftovers(&other, self.uid, generation, pid, why)?;
                     }
+                    let locations = self.board.state.lock().await.locations().to_vec();
+                    let stores = leftover_stores(&locations, &*self.placement, &self.name).await?;
+                    for store in &stores {
+                        refuse_torn_leftovers_on(store, self.uid, generation, pid, why).await?;
+                    }
                 }
                 // The pool's dealer (§6.1), which counts it there at once;
-                // taken back if anything below fails.
-                let dealt = self.placement.deal(self.uid);
+                // taken back if anything below fails. A table placed on a
+                // store is dealt that store.
+                let dealt = self.placement.deal(self.uid, &self.name);
                 let placed = self.materialize_at(slot, dealt.as_deref()).await;
                 if placed.is_err()
                     && let Some(dir) = &dealt
@@ -2723,10 +3006,25 @@ impl Parts {
     async fn materialize_at(&self, slot: &Slot, dealt: Option<&str>) -> io::Result<u64> {
         let pid = slot.pid;
         let root_key = files::dir_key(&self.root.to_string_lossy());
-        let off_root = dealt.map(files::dir_key).filter(|d| *d != root_key);
-        let dir = off_root.as_ref().map(PathBuf::from);
-        files::create_partition_files(dir.as_deref().unwrap_or(&self.root), self.uid, pid)
-            .map_err(|e| out_of_resources(e, &self.name, pid))?;
+        // A store (docs/kv-partitions.md §1): its spec is the location
+        // interned, compared as spelled; a directory by its pool key.
+        let store_spec = dealt.and_then(part_store::store_spec);
+        let off_root = match &store_spec {
+            Some(spec) => Some(spec.clone()),
+            None => dealt.map(files::dir_key).filter(|d| *d != root_key),
+        };
+        let place = match &store_spec {
+            Some(spec) => {
+                let store = self.placement.store(spec).await?;
+                Some(Place::Store(part_store::create_partition_files(&store, self.uid, pid).await?))
+            }
+            None => {
+                let dir = off_root.as_ref().map(PathBuf::from);
+                files::create_partition_files(dir.as_deref().unwrap_or(&self.root), self.uid, pid)
+                    .map_err(|e| out_of_resources(e, &self.name, pid))?;
+                dir.map(Place::Dir)
+            }
+        };
         let floor = self.transactions.status().forgotten_below();
         let mut state = self.board.state.lock().await;
         let loc = match &off_root {
@@ -2734,7 +3032,10 @@ impl Parts {
             // Never location 0, whatever path it was interned as: it is the
             // root wherever the database now is, and a directory the root
             // was created in that is now another location is not it.
-            Some(path) => match state.locations().iter().skip(1).position(|l| files::dir_key(l) == *path) {
+            Some(path) => match state.locations().iter().skip(1).position(|l| match &store_spec {
+                Some(spec) => part_store::store_spec(l).as_deref() == Some(spec.as_str()),
+                None => part_store::store_spec(l).is_none() && files::dir_key(l) == *path,
+            }) {
                 Some(i) => i as u32 + 1,
                 None => {
                     // Interned first, and installed as soon as it is
@@ -2780,8 +3081,8 @@ impl Parts {
             state.restore_part(pid, saved);
             return Err(e);
         }
-        if let Some(dir) = dir {
-            slot.set_dir(dir);
+        if let Some(place) = place {
+            slot.set_place(place);
         }
         Ok(floor)
     }
@@ -2803,15 +3104,33 @@ impl Parts {
         let load_if_proven = load_if_proven && !scan_open_hooks::loads_deferred(&self.root);
         // Never a provider over a missing file, which it would create (I9).
         // Out of descriptors here is insufficient resources too: the check
-        // opens the files it checks.
-        files::require_existing(slot.dir(&self.root), &files::data_files(self.uid, slot.pid))
-            .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
+        // opens the files it checks. On a store, the files are opened from
+        // the family's names, never made, and the partition's providers are
+        // those files: the seed is its rows file, whose `create_new` of the
+        // two names hands back the files that stand.
+        let (seed, dir) = match slot.at(&self.root) {
+            At::Dir(dir) => {
+                files::require_existing(dir, &files::data_files(self.uid, slot.pid))
+                    .map_err(|e| out_of_resources(e, &self.name, slot.pid))?;
+                let own = match slot.place_get() {
+                    Some(Place::Dir(d)) => Some(d.to_string_lossy().into_owned()),
+                    _ => None,
+                };
+                (self.seed.clone(), own)
+            }
+            At::Store(on) => {
+                let opened = part_store::require_existing(&on.store, self.uid, slot.pid).await?;
+                on.store.start_service(&opened.rows);
+                on.store.start_service(&opened.pointers);
+                (Arc::new(opened.rows), None)
+            }
+        };
         let physical = files::data_stem(self.uid, slot.pid);
         let table = Table::open_partition(PartitionOpen {
             cache_scope: format!("{}\u{0}{}", self.db_id, physical),
             physical,
-            seed: self.seed.clone(),
-            dir: slot.dir_get().map(|d| d.to_string_lossy().into_owned()),
+            seed,
+            dir,
             io_schema: self.shell.io_schema.clone(),
             schema: self.shell.schema.clone(),
             ids: self.ids.clone(),

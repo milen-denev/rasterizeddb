@@ -441,6 +441,15 @@ pub fn tables_on(database: &Arc<Database>, store: &str) -> Vec<String> {
         })
         .map(|(table, _)| table)
         .collect();
+    // A partitioned table with partitions there, placed there or moved
+    // there (docs/kv-partitions.md §1): its map names the store, and the
+    // table would not open without it.
+    let spec = format!("{}{store}", crate::core::partition::store::STORE_SCHEME);
+    for table in database.partitioned_tables_all() {
+        if table.stores_in_use().contains(&spec) && !out.iter().any(|t| t == table.name()) {
+            out.push(table.name().to_string());
+        }
+    }
     out.sort_unstable();
     out
 }

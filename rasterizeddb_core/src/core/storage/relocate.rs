@@ -352,6 +352,12 @@ async fn plan_partitions(database: &Arc<Database>, pool: &StorageManager) -> Res
                 continue;
             }
             let Some(at) = p.location else { continue };
+            // On a key/value store (docs/kv-partitions.md §1): not on any
+            // disk of the pool, so nothing to balance, and evacuating it to
+            // one would undo its placement.
+            if crate::core::partition::store::store_spec(&at).is_some() {
+                continue;
+            }
             parts.push((table.name().to_string(), p.pid, at, p.bytes));
         }
     }

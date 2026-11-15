@@ -19,6 +19,8 @@ mod drop_recreate_replay_tests;
 mod cross_dir_commit_tests;
 #[cfg(all(test, feature = "storage_pools"))]
 mod partition_placement_tests;
+#[cfg(all(test, feature = "storage_pools", feature = "kv_storage"))]
+mod partition_store_tests;
 #[cfg(test)]
 mod txid_reuse_tests;
 mod create_intent;
@@ -1719,6 +1721,9 @@ impl Database {
         if !in_memory {
             let mut live = tables_names.clone();
             live.extend(spared.iter().map(|(old, _)| (String::new(), *old)));
+            // Stores first: the directory reaper deletes a dead uid's map
+            // log, the only record of which stores its partitions were on.
+            partitioned::reap_stores_at_startup(location, &storage, &kv_stores, &live).await;
             partitioned::reap_at_startup(location, &io_pointers, &storage, &live);
         }
         // No forgetting until every table holding rows is registered: plain

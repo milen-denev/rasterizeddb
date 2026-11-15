@@ -319,21 +319,40 @@ impl ReshapeOp {
     }
 }
 
-/// A planned reshape: its sources and its targets' starts and directories
+/// Where one of a reshape's partitions is: a directory (the root's own path
+/// for the root), or a key/value store by its spec `kv:<store>`
+/// (docs/kv-partitions.md §1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PartLoc {
+    Dir(PathBuf),
+    Store(String),
+}
+
+impl PartLoc {
+    /// As the map interns it and as messages show it.
+    pub fn display(&self) -> String {
+        match self {
+            PartLoc::Dir(d) => d.to_string_lossy().into_owned(),
+            PartLoc::Store(spec) => spec.clone(),
+        }
+    }
+}
+
+/// A planned reshape: its sources and its targets' starts and locations
 /// (`None`: the source's own location, or the dealer's for a source never
 /// materialized).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReshapePlan {
     pub sources: Vec<u32>,
-    pub targets: Vec<(u64, Option<PathBuf>)>,
+    pub targets: Vec<(u64, Option<PartLoc>)>,
 }
 
 /// What a reshape left for the caller: the committed sources' files to
 /// delete, or, on failure, the targets' files.
 #[derive(Debug, Default)]
 pub struct ReshapeFiles {
-    /// `(pid, directory)` of each partition whose files go.
-    pub doomed: Vec<(u32, PathBuf)>,
+    /// `(pid, location)` of each partition whose files go.
+    pub doomed: Vec<(u32, PartLoc)>,
 }
 
 /// The cut points of `[lo, hi)` at `cuts` (each strictly inside, sorted),

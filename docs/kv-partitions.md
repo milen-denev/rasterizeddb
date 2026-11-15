@@ -1,7 +1,8 @@
 # Partitioned tables on a key/value store
 
-Status: **design, not built** (branch `feat/kv-partitions`, from
-`feat/secondary-indexes` at 538d4590, 2026-11-15).
+Status: **§1 (placement) built**; §2 and §3 design, not built (branch
+`feat/kv-partitions`, from `feat/secondary-indexes` at 538d4590,
+2026-11-15). See "§1 as built" at the end.
 
 Asked for by oxyredox-v2: its per-PoP logger keeps `charges`,
 `cache_results` and `access_logs`, each `PARTITION BY HASH (domain)`, on an
@@ -127,3 +128,79 @@ compaction reserves one too. So:
 2. Auto-compaction per partition (§3), on files and on KV.
 3. KV snapshots (§2), with a twin of reopen-after-write-after-seal and a
    mutation that skips the identity check.
+
+## §1 as built
+
+`partition/store.rs` holds the store arm: `PartStore`, an object-safe trait
+the partition code reaches a store through (so `partition/` builds without
+`kv_storage`), implemented by `KvPartStore` over a `KvFamily`. The pool's
+`Placement` resolves a `kv:<store>` spec to one (`Placement::store`), deals a
+table placed on a store that store (`Placement::deal(uid, table)`, by the
+table's name in `db_storage.cfg`), and lists the stores this process opened
+(`Placement::open_stores`).
+
+- **Location.** A map location string that parses as `kv:<store>`
+  (`store::store_spec`) is a store; anything else is a directory, as before.
+  A slot's place is `Place::Dir(path)` or `Place::Store(StoreFiles)`, the
+  latter holding the partition's two files open, so its lengths are atomics
+  (`closed_lens`, `rows_len`, `totals`, `SHOW PARTITIONS` read them without
+  awaiting).
+- **Exists** (I9). `KvFamily::stands` / `standing_names` answer from the
+  names recovered from the store and the files opened since;
+  `KvStorageProvider::open_existing` never makes a name. The table's open
+  (`slots_of`), `materialize`'s recorded branch and `open_instance` all
+  open through it, and a missing file refuses the table with "partition
+  file … is missing from key/value store '…'".
+- **Create.** `store::create_partition_files` drops any standing leftover of
+  the pid (the reopen waits out its sweep), opens each file fresh, and
+  `KvStorageProvider::persist_existence` stores an object for it (a
+  truncation to its own length) before `MATERIALIZE` is appended: a partition
+  materialized with no row still stands after a restart.
+- **Open.** The partition's providers are the store files themselves (the
+  seed is its rows file). `External` partitions get no provider services, so
+  `PartStore::start_service` starts the KV flush/compaction loop on the
+  runtime the store was resolved on.
+- **Delete.** DROP (`discard_uid_files`, now async) drops every standing
+  name under the uid on every store the process opened, before the
+  directories and the root; reshape (`discard_pid_files`) drops by pid.
+  Drops are the family's: recorded on local disk before the sweep starts,
+  resumed by the next start. DROP also forgets the name's placement.
+- **Reaper.** `reap_stores_at_startup` runs before the directory reaper
+  (which deletes a dead uid's map log, the only record of its stores), on
+  every store a map in the root interns or a partitioned table is placed on:
+  drops a live uid's data file the map does not place on that store, and
+  every file of a uid with parent files in the root but no catalogue row. A
+  uid with no trace in the root is never touched (one prefix, one
+  database). Off while any live map cannot be relied on.
+- **uid.** `CREATE` opens the placed store first (an unopenable store
+  refuses the CREATE, not the first INSERT) and avoids uids already named
+  there.
+- **Reshape / MOVE.** `ReshapePlan` and `ReshapeFiles` carry
+  `reshape::PartLoc` (`Dir` or `Store`); `TO 'kv:<store>'` is accepted when
+  the store is configured; targets inherit a store source's place; the
+  copy is `StorageIO` to `StorageIO` unchanged. `STORAGE MOVE PARTITION t
+  FOR (…) TO 'kv:logs'` and back to a directory work.
+- **Refusals kept.** `CREATE … PARTITION BY` after a directory or memory
+  placement is still refused by name; `STORAGE PLACE TABLE` / `MOVE TABLE`
+  of an existing partitioned table are still refused. `STORAGE DROP STORE`
+  is refused while any partitioned table has a partition on the store.
+  `REBALANCE PARTITIONS` skips store partitions.
+- **RENAME** carries the placement to the new name after the catalogue
+  commit point (lost to a crash there, later partitions go to directories).
+- **Backup: not contained.** A snapshot does not copy store partitions. The
+  cold copy reads every map log in the database directory and records each
+  partitioned table with a store location as uncovered ("its partitions on
+  key/value store(s) … are not copied by backups yet"), with a warning; a
+  restore in place reads whatever the store holds then, as for any
+  uncovered key/value table.
+- **Not built.** Snapshots for store partitions (§2: a store partition
+  always rebuilds its indexes at open) and reclaim (§3). Opening a table
+  opens every materialized store partition's two files (the family already
+  holds their recovered deltas in memory).
+
+Tests: `database/partition_store_tests.rs` (placement, restart, close and
+reopen, a missing store file refused, DROP, the reaper, a store with
+partitions not dropped, an empty materialization surviving a restart),
+`tests/partition_kv.rs` (the statement kinds against a plain twin over the
+wire, restart, idle close, MOVE PARTITION both ways, DROP), and the twin's
+`*_on_kv_store` configurations.

@@ -770,6 +770,26 @@ impl KvFamily {
         self.standing_locked(name)
     }
 
+    /// [`Self::standing`], for callers outside the driver: whether `name` is
+    /// a file of this family that stands, answered from what the family
+    /// knows (the names it recovered from the store, and the files opened
+    /// since), never by opening it. A name never written reads as an empty
+    /// file when opened, so "it opens" is no proof it exists.
+    pub(crate) async fn stands(&self, name: &str) -> bool {
+        self.standing(name).await
+    }
+
+    /// Every name that stands in this family now ([`Self::stands`]), sorted.
+    pub(crate) async fn standing_names(&self) -> Vec<String> {
+        let _one = self.opening.lock().await;
+        let mut names: Vec<String> = self.recovered.lock().keys().cloned().collect();
+        names.extend(self.files.iter().filter(|e| !e.value().dropped.load(Ordering::Acquire)).map(|e| e.key().clone()));
+        names.retain(|n| !self.erasing.contains_key(n));
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     fn standing_locked(&self, name: &str) -> bool {
         if self.erasing.contains_key(name) {
             return false;
@@ -2924,6 +2944,43 @@ impl KvStorageProvider {
         let file = family.open_file(name).await?;
         let hash = super::super::CRC.checksum(name.as_bytes());
         Ok(Self { family, file, hash })
+    }
+
+    /// `name` in `family` if it stands there, opened; `None` if the store
+    /// holds no such file or it is being swept. Never makes the name: a file
+    /// that must already exist (a materialized partition's, I9) is opened
+    /// through this, and a missing one is the caller's error to raise, not
+    /// an empty file to read.
+    pub(crate) async fn open_existing(family: Arc<KvFamily>, name: &str) -> io::Result<Option<Self>> {
+        let Some(file) = family.open_standing(name).await? else {
+            return Ok(None);
+        };
+        let hash = super::super::CRC.checksum(name.as_bytes());
+        Ok(Some(Self { family, file, hash }))
+    }
+
+    /// Puts an object for this file now, so it stands in the store across a
+    /// restart even while it holds no byte: a file never written is in no
+    /// listing, and [`KvFamily::stands`] would answer no for it after the
+    /// next start. A truncation to its own length, which changes nothing.
+    pub(crate) async fn persist_existence(&self) -> io::Result<()> {
+        let file = &self.file;
+        let _serialised = file.flush.lock().await;
+        if file.dropped.load(Ordering::Acquire) {
+            return Err(io::Error::other(format!("{} was dropped; it cannot be made to stand", file.name)));
+        }
+        {
+            let mut state = file.state.write();
+            let len = file.len.load(Ordering::Acquire);
+            state.pending.push(Record::truncate(0, len));
+            state.pending_bytes += 21;
+        }
+        file.flush_locked(None).await
+    }
+
+    /// The file's length now, without awaiting: an atomic.
+    pub(crate) fn len_now(&self) -> u64 {
+        self.file.len.load(Ordering::Acquire)
     }
 
     /// The family this file belongs to, for cache statistics and for opening

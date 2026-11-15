@@ -242,7 +242,7 @@ impl Database {
         }
         #[cfg(feature = "storage_pools")]
         self.storage.forget_partitions(uid);
-        if let Err(d) = self.discard_uid_files(root, uid) {
+        if let Err(d) = self.discard_uid_files(root, uid).await {
             error!("... and the new files under uid {uid:016x} were kept for the startup reaper: {d}");
         }
         self.clear_conversion_intent();

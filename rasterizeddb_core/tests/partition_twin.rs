@@ -411,6 +411,12 @@ struct Config {
     /// idle close every second: opens past it close what nobody holds, by
     /// the CLOCK, inside statements and blocks.
     budget: Option<usize>,
+    /// docs/kv-partitions.md §1: the partitioned tables (this one and the
+    /// side's two others) are placed on a key/value store before their
+    /// CREATE (a directory store, which behaves as S3 does), so every
+    /// partition's files are on the store: every kind, the restart, the
+    /// reshapes, the rewrites and the closes run over store partitions.
+    kv: bool,
 }
 
 /// What a [`Config::few_open`] run keeps open between statements, at most.
@@ -2649,6 +2655,16 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         }
         server.extra_dirs.push(disk);
     }
+    let kv_dir = cfg.kv.then(|| tempfile::tempdir().expect("a temp dir for the store"));
+    if let Some(kv) = &kv_dir {
+        setup.ok(&format!(
+            "STORAGE ADD STORE twinkv DIRECTORY WITH (PATH = '{}', PREFIX = 'twin')",
+            kv.path().display()
+        ));
+        for t in [PART, SIDE_PART.u, SIDE_PART.k] {
+            setup.ok(&format!("STORAGE PLACE TABLE {t} AT 'kv:twinkv'"));
+        }
+    }
     setup.ok(&format!(
         "CREATE TABLE {PART} {COLUMNS} PARTITION BY HASH ({}) PARTITIONS {}",
         cfg.key.join(", "),
@@ -2850,6 +2866,22 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
     assert_eq!(files_of_table(dir.path(), PART), Vec::<String>::new(), "{label}: files under the logical name");
     let bytes = dir_bytes(dir.path());
     assert!(bytes < 50 * 1024 * 1024, "{label}: the run wrote {bytes} bytes");
+    // A store run compared something only if the partitions really were on
+    // the store, and none in the root.
+    if let Some(kv) = &kv_dir {
+        let prefix = format!("__pt_{:016x}_", twin.uid);
+        let on_store = std::fs::read_dir(kv.path().join("twin"))
+            .expect("the store's directory")
+            .flatten()
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with("_pointers.db")))
+            .count();
+        assert!(on_store > 0, "{label}: no partition of the table is on the store");
+        let in_root: Vec<String> = files_starting(dir.path(), &prefix)
+            .into_iter()
+            .filter(|n| n.ends_with("_pointers.db") || n.ends_with("_pointers.db.tmp"))
+            .collect();
+        assert_eq!(in_root, Vec::<String>::new(), "{label}: partition files in the root of a store run");
+    }
     // Spread mode compared something only if partitions really were dealt
     // to the second location.
     if let Some(disk) = server.extra_dirs.first() {
@@ -2889,22 +2921,22 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
 
 #[test]
 fn twin_hash_tenant_7() {
-    run_twin(Config { key: &["tenant_id"], partitions: 7, few_open: false, budget: None });
+    run_twin(Config { key: &["tenant_id"], partitions: 7, few_open: false, budget: None, kv: false });
 }
 
 #[test]
 fn twin_hash_tenant_64() {
-    run_twin(Config { key: &["tenant_id"], partitions: 64, few_open: false, budget: None });
+    run_twin(Config { key: &["tenant_id"], partitions: 64, few_open: false, budget: None, kv: false });
 }
 
 #[test]
 fn twin_hash_tenant_grp_64() {
-    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false, budget: None });
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false, budget: None, kv: false });
 }
 
 #[test]
 fn twin_hash_full_key_7() {
-    run_twin(Config { key: &["tenant_id", "grp", "id"], partitions: 7, few_open: false, budget: None });
+    run_twin(Config { key: &["tenant_id", "grp", "id"], partitions: 7, few_open: false, budget: None, kv: false });
 }
 
 /// Phase 3 P5b: many partitions, few open. 1024 declared, the tenants'
@@ -2913,13 +2945,13 @@ fn twin_hash_full_key_7() {
 /// and writes through partitions closed and reopened.
 #[test]
 fn twin_hash_tenant_1024_few_open() {
-    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: true, budget: None });
+    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: true, budget: None, kv: false });
 }
 
 /// The same over a two-level key, 64 partitions.
 #[test]
 fn twin_hash_tenant_grp_64_few_open() {
-    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: true, budget: None });
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: true, budget: None, kv: false });
 }
 
 /// Phase 3 P5b-2: a budget of three open partitions, idle close every
@@ -2927,13 +2959,26 @@ fn twin_hash_tenant_grp_64_few_open() {
 /// evicts one first.
 #[test]
 fn twin_hash_tenant_1024_budget_3() {
-    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: false, budget: Some(3) });
+    run_twin(Config { key: &["tenant_id"], partitions: 1024, few_open: false, budget: Some(3), kv: false });
 }
 
 /// The same over a composite key.
 #[test]
 fn twin_hash_tenant_grp_64_budget_3() {
-    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false, budget: Some(3) });
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: false, budget: Some(3), kv: false });
+}
+
+/// docs/kv-partitions.md §1: every partition on a key/value store.
+#[test]
+fn twin_hash_tenant_64_on_kv_store() {
+    run_twin(Config { key: &["tenant_id"], partitions: 64, few_open: false, budget: None, kv: true });
+}
+
+/// The same over a composite key with few partitions open: every statement
+/// reads and writes through store partitions closed and reopened.
+#[test]
+fn twin_hash_tenant_grp_64_few_open_on_kv_store() {
+    run_twin(Config { key: &["tenant_id", "grp"], partitions: 64, few_open: true, budget: None, kv: true });
 }
 
 /// The two lists name each kind at most once, and only real kinds.

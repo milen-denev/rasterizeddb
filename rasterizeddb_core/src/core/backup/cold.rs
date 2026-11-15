@@ -11,8 +11,10 @@
 //! it has no log to replay further.
 //!
 //! What still cannot be copied — an in-memory table, a store this server
-//! cannot reach — is recorded on the snapshot as uncovered, so the catalogue
-//! says the backup is incomplete instead of a restore finding out.
+//! cannot reach, the partitions of a partitioned table placed on a store
+//! (docs/kv-partitions.md §1: not copied yet) — is recorded on the snapshot as
+//! uncovered, so the catalogue says the backup is incomplete instead of a
+//! restore finding out.
 //!
 //! [`kv::export`]: crate::core::storage_providers::kv::export
 
@@ -23,6 +25,10 @@ use log::warn;
 
 use super::manifest::{ColdTable, UncoveredTable};
 use crate::core::storage::{POOL_FILE, TableBackend};
+
+/// `storage::kv_registry::KV_FILE`, which a build without `kv_storage` does
+/// not have: a directory carrying one has stores configured.
+const KV_FILE: &str = "db_kv.cfg";
 
 /// Where cold tables are copied to while a snapshot is taken: inside the
 /// backed-up directory, left out of every snapshot by name, emptied before
@@ -51,7 +57,9 @@ impl Drop for ColdCopy {
 /// database `CREATE DATABASE` made beside it, as `(directory, relative name)`.
 fn databases(location: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
-    if location.join(POOL_FILE).is_file() {
+    // A store's configuration too: a partition moved onto a store needs no
+    // placement, and its table must still be reported (docs/kv-partitions.md §1).
+    if location.join(POOL_FILE).is_file() || location.join(KV_FILE).is_file() {
         out.push((location.to_path_buf(), String::new()));
     }
     if let Ok(entries) = std::fs::read_dir(location) {
@@ -60,7 +68,7 @@ fn databases(location: &Path) -> Vec<(PathBuf, String)> {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if path.is_dir() && name != COLD_DIR && path.join(POOL_FILE).is_file() {
+            if path.is_dir() && name != COLD_DIR && (path.join(POOL_FILE).is_file() || path.join(KV_FILE).is_file()) {
                 out.push((path, name));
             }
         }
@@ -83,6 +91,37 @@ fn placements(database: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The partitioned tables of `database` whose map names a key/value store
+/// (docs/kv-partitions.md §1), by uid, with the stores' names: read from
+/// every map log generation in the directory. A map that does not read is
+/// passed over here; the table it belongs to does not open either.
+fn partitioned_on_stores(database: &Path) -> BTreeMap<u64, Vec<String>> {
+    use crate::core::partition::files::{PartFile, parse_name};
+    use crate::core::partition::store::{store_name, store_spec};
+    let mut out: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let Ok(listing) = std::fs::read_dir(database) else {
+        return out;
+    };
+    for entry in listing.flatten() {
+        let Some(PartFile::Map { uid, .. }) = entry.file_name().to_str().and_then(parse_name) else {
+            continue;
+        };
+        let Ok(buf) = std::fs::read(entry.path()) else { continue };
+        let Ok(replay) = crate::core::partition::log::replay(&buf) else { continue };
+        if replay.state.dropped() {
+            continue;
+        }
+        for spec in replay.state.locations().iter().filter_map(|l| store_spec(l)) {
+            let stores = out.entry(uid).or_default();
+            let name = store_name(&spec).to_string();
+            if !stores.contains(&name) {
+                stores.push(name);
+            }
+        }
+    }
+    out
+}
+
 /// Copies every table under `location` that is not in a directory, or
 /// records why it could not. `now` stamps the copy.
 pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCopy {
@@ -97,6 +136,22 @@ pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCop
     };
 
     for (database_dir, database) in databases(location) {
+        // Partitions on a store are not copied (docs/kv-partitions.md §1):
+        // said, per table, never left silently out.
+        let partitioned = partitioned_on_stores(&database_dir);
+        for (uid, stores) in &partitioned {
+            let reason = format!(
+                "its partitions on key/value store(s) {} are not copied by backups yet; a restore does not bring them \
+                 back",
+                stores.iter().map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ")
+            );
+            warn!("snapshot: partitioned table {uid:016x} of {} is not contained: {reason}", database_dir.display());
+            copy.uncovered.push(UncoveredTable {
+                database: database.clone(),
+                table: format!("partitioned table {uid:016x}"),
+                reason,
+            });
+        }
         // Stores, each with its tables.
         let mut on_store: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (table, spec) in placements(&database_dir) {
@@ -122,10 +177,18 @@ pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCop
                         let mine: Vec<&(String, PathBuf, u64)> =
                             files.iter().filter(|(file, _, _)| owner(&tables, file) == Some(table)).collect();
                         if mine.is_empty() {
+                            let partitions_there = partitioned.values().any(|stores| stores.contains(&store));
                             copy.uncovered.push(UncoveredTable {
                                 database: database.clone(),
                                 table: table.clone(),
-                                reason: format!("store '{store}' holds no files for it"),
+                                reason: if partitions_there {
+                                    format!(
+                                        "store '{store}' holds no files under its name; if it is a partitioned \
+                                         table, its partitions there are not copied by backups yet"
+                                    )
+                                } else {
+                                    format!("store '{store}' holds no files for it")
+                                },
                             });
                             continue;
                         }

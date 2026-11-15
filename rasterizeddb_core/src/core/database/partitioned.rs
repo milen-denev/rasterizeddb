@@ -279,14 +279,146 @@ pub(super) fn reap_at_startup(
     report
 }
 
+/// The startup reaper (§12) for partitions on key/value stores
+/// (docs/kv-partitions.md §1), run before [`reap_at_startup`] (which deletes
+/// a dead uid's map log, the only record of which stores its partitions were
+/// on) and before any table opens. On every store a map in the root interns,
+/// or a live table is placed on, drops the partition files of
+///
+/// - a live uid whose map does not place that partition on this store (a
+///   materialize a crash cut before its `MATERIALIZE`, a reshape's
+///   uncommitted target or retired source), and
+/// - a uid no catalogue row holds but whose parent files are still in the
+///   root (a DROP or a failed CREATE a crash cut short).
+///
+/// A uid with no trace in the root is left alone: a store's prefix is meant
+/// for one database, and files this database cannot account for are not
+/// proven to be its own. Nothing is dropped when any live map cannot be
+/// relied on, as the directory reaper. A store that cannot be opened is
+/// skipped, its leftovers kept for a later start. Store files have no log
+/// to void, and a drop's sweep is recorded on local disk before it starts.
+pub(super) async fn reap_stores_at_startup(
+    location: &str,
+    pool: &super::StoragePool,
+    kv: &super::KvStores,
+    rows: &[(String, u64)],
+) -> files::ReapReport {
+    // Written only in a build with stores.
+    #[allow(unused_mut)]
+    let mut report = files::ReapReport::default();
+    #[cfg(all(feature = "kv_storage", feature = "storage_pools"))]
+    {
+        use crate::core::partition::store::{KvPartStore, PartStore, store_name, store_spec};
+        let root = Path::new(location);
+        let live: HashMap<u64, Result<files::LiveMap, String>> = rows
+            .iter()
+            .filter(|(_, c)| *c != 0)
+            .map(|(_, uid)| (*uid, files::read_live_map(root, *uid)))
+            .collect();
+        if let Some((uid, Err(why))) = live.iter().find(|(_, m)| m.is_err()) {
+            report.kept = Some(format!("partitioned table {uid:016x}'s map cannot be relied on ({why})"));
+            return report;
+        }
+        // Uids with parent files here and no catalogue row, and the stores
+        // every map in the root names.
+        let mut dead: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut specs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let listing = match std::fs::read_dir(root) {
+            Ok(listing) => listing,
+            Err(e) => {
+                report.kept = Some(format!("{location} cannot be listed: {e}"));
+                return report;
+            }
+        };
+        for entry in listing.flatten() {
+            let Ok(name) = entry.file_name().into_string() else { continue };
+            let Some(file) = files::parse_name(&name) else { continue };
+            if !live.contains_key(&file.uid()) {
+                dead.insert(file.uid());
+            }
+            if matches!(file, files::PartFile::Map { .. })
+                && let Ok(buf) = std::fs::read(entry.path())
+                && let Ok(replay) = crate::core::partition::log::replay(&buf)
+            {
+                specs.extend(replay.state.locations().iter().filter_map(|l| store_spec(l)));
+            }
+        }
+        for (name, uid) in rows.iter().filter(|(_, c)| *c != 0) {
+            let _ = uid;
+            if let Some(crate::core::storage::TableBackend::KeyValue(store)) = pool.backend_of(name) {
+                specs.insert(format!("{}{store}", crate::core::partition::store::STORE_SCHEME));
+            }
+        }
+        for spec in specs {
+            let store_named = store_name(&spec);
+            if !kv.has(store_named) {
+                warn!("Partition reaping skipped key/value store '{store_named}': it is not configured");
+                continue;
+            }
+            let family = match kv.family(store_named).await {
+                Ok(family) => family,
+                Err(e) => {
+                    warn!("Partition reaping skipped key/value store '{store_named}': it cannot be opened: {e}");
+                    report.kept.get_or_insert_with(|| format!("key/value store '{store_named}' cannot be opened: {e}"));
+                    continue;
+                }
+            };
+            let store = KvPartStore::new(store_named, family);
+            for name in store.names().await {
+                let Some(file) = files::parse_name(&name) else { continue };
+                let doomed = match live.get(&file.uid()) {
+                    Some(Ok(map)) => match file {
+                        files::PartFile::Data { pid, .. } => {
+                            let placed = map
+                                .state
+                                .part(pid)
+                                .filter(|p| !p.retired)
+                                .and_then(|p| p.location)
+                                .and_then(|loc| map.state.locations().get(loc as usize))
+                                .and_then(|l| store_spec(l));
+                            placed.as_deref() != Some(spec.as_str())
+                        }
+                        // Only partitions' files are written off the root.
+                        _ => false,
+                    },
+                    Some(Err(_)) => false,
+                    None => dead.contains(&file.uid()),
+                };
+                if doomed {
+                    store.remove(&name).await;
+                    report.deleted.push(format!("{spec}/{name}"));
+                }
+            }
+        }
+        if !report.deleted.is_empty() {
+            info!(
+                "Reaped {} partition file(s) on key/value stores no table holds: {}",
+                report.deleted.len(),
+                report.deleted.join(", ")
+            );
+        }
+    }
+    #[cfg(not(all(feature = "kv_storage", feature = "storage_pools")))]
+    {
+        let _ = (location, pool, kv, rows);
+    }
+    report
+}
+
 /// The storage pool as partitions see it (phase 4, docs/partitioning.md
-/// §6.1): its dealer, its counts, and which directories it names.
+/// §6.1): its dealer, its counts, and which directories it names; and the
+/// database's key/value stores (docs/kv-partitions.md §1).
 #[cfg(feature = "storage_pools")]
-struct PoolPlacement(super::StoragePool);
+struct PoolPlacement(super::StoragePool, super::KvStores);
 
 #[cfg(feature = "storage_pools")]
 impl Placement for PoolPlacement {
-    fn deal(&self, uid: u64) -> Option<String> {
+    fn deal(&self, uid: u64, table: &str) -> Option<String> {
+        // A table placed on a store before its CREATE keeps every partition
+        // there: no directory is counted.
+        if let Some(spec) = self.table_store(table) {
+            return Some(spec);
+        }
         // Placed by the pool's policy with or without a backup service: a
         // restore into a new directory records where it moved each location
         // (`storage::repoint_restored_pool`'s aliases), and the restored map
@@ -295,7 +427,84 @@ impl Placement for PoolPlacement {
     }
 
     fn undeal(&self, uid: u64, dir: &str) {
+        if crate::core::partition::store::store_spec(dir).is_some() {
+            return;
+        }
         self.0.undeal_partition(uid, dir)
+    }
+
+    fn table_store(&self, table: &str) -> Option<String> {
+        match self.0.backend_of(table)? {
+            crate::core::storage::TableBackend::KeyValue(store) => {
+                Some(format!("{}{store}", crate::core::partition::store::STORE_SCHEME))
+            }
+            _ => None,
+        }
+    }
+
+    fn store_known(&self, spec: &str) -> bool {
+        #[cfg(feature = "kv_storage")]
+        {
+            self.1.has(crate::core::partition::store::store_name(spec))
+        }
+        #[cfg(not(feature = "kv_storage"))]
+        {
+            let _ = spec;
+            false
+        }
+    }
+
+    fn store<'a>(
+        &'a self,
+        spec: &'a str,
+    ) -> crate::core::partition::store::BoxFut<'a, io::Result<StdArc<dyn crate::core::partition::store::PartStore>>> {
+        Box::pin(async move {
+            #[cfg(feature = "kv_storage")]
+            {
+                let name = crate::core::partition::store::store_name(spec);
+                if !self.1.has(name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "key/value store '{name}' is not configured in {}",
+                            crate::core::storage::kv_registry::KV_FILE
+                        ),
+                    ));
+                }
+                let family = self.1.family(name).await?;
+                let store: StdArc<dyn crate::core::partition::store::PartStore> =
+                    StdArc::new(crate::core::partition::store::KvPartStore::new(name, family));
+                Ok(store)
+            }
+            #[cfg(not(feature = "kv_storage"))]
+            {
+                Err(crate::core::partition::table::no_stores(spec))
+            }
+        })
+    }
+
+    fn open_stores(
+        &self,
+    ) -> crate::core::partition::store::BoxFut<'_, Vec<StdArc<dyn crate::core::partition::store::PartStore>>> {
+        Box::pin(async move {
+            #[cfg(feature = "kv_storage")]
+            {
+                self.1
+                    .open_families()
+                    .await
+                    .into_iter()
+                    .map(|(name, family)| {
+                        let store: StdArc<dyn crate::core::partition::store::PartStore> =
+                            StdArc::new(crate::core::partition::store::KvPartStore::new(&name, family));
+                        store
+                    })
+                    .collect()
+            }
+            #[cfg(not(feature = "kv_storage"))]
+            {
+                Vec::new()
+            }
+        })
     }
 
     fn register(&self, uid: u64, counts: HashMap<String, u64>) {
@@ -377,10 +586,10 @@ impl Database {
     }
 
     /// Where this database's partitions materialize (phase 4, §6.1).
-    fn partition_placement(&self) -> StdArc<dyn Placement> {
+    pub(super) fn partition_placement(&self) -> StdArc<dyn Placement> {
         #[cfg(feature = "storage_pools")]
         {
-            StdArc::new(PoolPlacement(self.storage.clone()))
+            StdArc::new(PoolPlacement(self.storage.clone(), self.kv.clone()))
         }
         #[cfg(not(feature = "storage_pools"))]
         {
@@ -451,7 +660,15 @@ impl Database {
         // may put it (or its row) back, without a claim. On disk its files
         // refuse the name above; on a key/value or memory backend there are
         // none to find, but its placement stays recorded throughout.
-        if let Some(spec) = super::pool_spec_of(&self.storage, name) {
+        //
+        // Except a key/value placement recorded ahead of the CREATE (`STORAGE
+        // PLACE TABLE t AT 'kv:<store>'`), which is how a partitioned table's
+        // partitions go to a store (docs/kv-partitions.md §1): the name is
+        // free when no table, plain or partitioned, holds it (checked above),
+        // and a plain table being moved or reloaded holds its name claim.
+        if let Some(spec) = super::pool_spec_of(&self.storage, name)
+            && crate::core::partition::store::store_spec(&spec).is_none()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("table \"{name}\" has a storage placement recorded ({spec}), so the name is taken"),
@@ -558,10 +775,21 @@ impl Database {
         }
         let _changed = SchemaChanged::unless_internal(&self.schema_generation, &ct.table_name);
         let root = self.partition_root()?;
+        // A table placed on a store opens it now, so a store that cannot be
+        // opened refuses the CREATE rather than its first INSERT, and the
+        // uid is not one the store already holds files under.
+        let placement = self.partition_placement();
+        let mut store_uids = std::collections::HashSet::new();
+        if let Some(spec) = placement.table_store(&ct.table_name) {
+            let store = placement.store(&spec).await.map_err(|e| {
+                io::Error::new(e.kind(), format!("CREATE TABLE {} PARTITION BY: {e}", ct.table_name))
+            })?;
+            store_uids.extend(store.names().await.iter().filter_map(|n| files::parse_name(n)).map(|f| f.uid()));
+        }
         // A uid no live table holds and no file in the root is under, so
         // §12's step 1 (delete orphans of the uid) has nothing to delete.
         let open = self.partitioned_tables_all();
-        let uid = files::new_uid(&root, |u| open.iter().any(|t| t.uid() == u))?;
+        let uid = files::new_uid(&root, |u| open.iter().any(|t| t.uid() == u) || store_uids.contains(&u))?;
 
         let columns = std::mem::take(&mut ct.columns);
         let (io_schema, schema) = match self.write_partitioned_files(&root, &ct, columns, key, partitions, uid).await {
@@ -671,7 +899,17 @@ impl Database {
     /// Partitions on other storage locations go first (phase 4): voided in
     /// their location's log and deleted there, so the parent files in the
     /// root, which say what the rest were, go last (§12's DROP order).
-    fn discard_uid_files(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
+    /// First of all, partitions on key/value stores (docs/kv-partitions.md
+    /// §1): every store this process opened, which every store a partition
+    /// of the uid was materialized or opened on is, dropped by name. They
+    /// have no log to void; a drop's sweep is recorded on local disk before
+    /// it starts and resumed by the next start.
+    async fn discard_uid_files(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
+        for store in self.partition_placement().open_stores().await {
+            for name in crate::core::partition::store::uid_names(&*store, uid).await {
+                store.remove(&name).await;
+            }
+        }
         let root_key = files::dir_key(&root.to_string_lossy());
         for dir in super::pool_table_paths(&self.storage) {
             if files::dir_key(&dir) == root_key {
@@ -726,7 +964,7 @@ impl Database {
     /// does not already hold it: a CREATE cleaning up after itself.
     async fn discard_uid_files_gated(&self, root: &Path, uid: u64) -> Result<(), DiscardFailure> {
         let _snapshot_gate = self.uid_deletion_permit().await;
-        self.discard_uid_files(root, uid)
+        self.discard_uid_files(root, uid).await
     }
 
     /// DROP of a partitioned table (§12's DROP order): the catalogue
@@ -773,6 +1011,10 @@ impl Database {
             return Err(e);
         }
         self.take_partitioned(name, &table);
+        // A placement recorded for the name (a store its partitions were
+        // dealt, docs/kv-partitions.md §1) goes with the table, as a plain
+        // DROP forgets its own: a later CREATE of the name decides afresh.
+        super::pool_forget(&self.storage, name);
 
         let uid = table.uid();
         #[cfg(feature = "storage_pools")]
@@ -792,7 +1034,7 @@ impl Database {
         }
         match self.partition_root() {
             Ok(root) => {
-                if let Err(failure) = self.discard_uid_files(&root, uid) {
+                if let Err(failure) = self.discard_uid_files(&root, uid).await {
                     kept("voiding its log records or deleting its files", &failure);
                     return unconfirmed(failure.into_error());
                 }
@@ -983,7 +1225,7 @@ impl Database {
                     return Ok("crashed after the commit".to_string());
                 }
                 let pids: Vec<u32> = sources.doomed.iter().map(|(pid, _)| *pid).collect();
-                match self.discard_pid_files(uid, &sources.doomed) {
+                match self.discard_pid_files(uid, &sources.doomed).await {
                     Ok(()) => {
                         if let Err(e) = table.retired_gone(&pids).await {
                             warn!("{} of \"{name}\": recording partitions {pids:?} gone failed; the next open does: {e}", op.verb());
@@ -1007,7 +1249,7 @@ impl Database {
                 ))
             }
             Err((e, targets)) => {
-                if let Err(d) = self.discard_pid_files(uid, &targets.doomed) {
+                if let Err(d) = self.discard_pid_files(uid, &targets.doomed).await {
                     warn!(
                         "{} of \"{name}\" failed, and deleting its targets' files failed too; the startup reaper \
                          deletes them: {d}",
@@ -1063,7 +1305,7 @@ impl Database {
         self.storage.forget_partitions(new_uid);
         if let Err(e) = current.mark_dropped().await {
             warn!("Put \"{name}\" back before its rewrite; closing the rewrite's map log failed, the startup reaper deletes it: {e}");
-        } else if let Err(e) = self.discard_uid_files(&root, new_uid) {
+        } else if let Err(e) = self.discard_uid_files(&root, new_uid).await {
             warn!("Put \"{name}\" back before its rewrite; deleting uid {new_uid:016x}'s files failed, the startup reaper deletes them: {e}");
         }
         info!("Put partitioned table {name} back before a rolled-back rewrite: uid {new_uid:016x} -> {old_uid:016x}");
@@ -1086,7 +1328,7 @@ impl Database {
             warn!("Rewrote partitioned table {name}; closing the old map log failed, the startup reaper deletes it: {e}");
             return;
         }
-        if let Err(e) = self.discard_uid_files(&root, old_uid) {
+        if let Err(e) = self.discard_uid_files(&root, old_uid).await {
             warn!("Rewrote partitioned table {name}; deleting the old files under uid {old_uid:016x} failed, the startup reaper deletes them: {e}");
         }
     }
@@ -1097,11 +1339,28 @@ impl Database {
     /// directory synced. The caller holds the deletion gate. A failure
     /// leaves the rest for the startup reaper, which deletes every file of a
     /// pid the map does not place.
-    fn discard_pid_files(&self, uid: u64, doomed: &[(u32, PathBuf)]) -> io::Result<()> {
+    async fn discard_pid_files(
+        &self,
+        uid: u64,
+        doomed: &[(u32, crate::core::partition::reshape::PartLoc)],
+    ) -> io::Result<()> {
+        use crate::core::partition::reshape::PartLoc;
         let root = self.partition_root()?;
         let root_key = files::dir_key(&root.to_string_lossy());
         let mut by_dir: HashMap<String, (PathBuf, Vec<u32>)> = HashMap::new();
-        for (pid, dir) in doomed {
+        // On a store: dropped by name, no log to void (docs/kv-partitions.md §1).
+        let placement = self.partition_placement();
+        for (pid, loc) in doomed {
+            let PartLoc::Store(spec) = loc else { continue };
+            let store = placement.store(spec).await?;
+            for name in crate::core::partition::store::uid_names(&*store, uid).await {
+                if matches!(files::parse_name(&name), Some(files::PartFile::Data { pid: p, .. }) if p == *pid) {
+                    store.remove(&name).await;
+                }
+            }
+        }
+        for (pid, loc) in doomed {
+            let PartLoc::Dir(dir) = loc else { continue };
             by_dir
                 .entry(files::dir_key(&dir.to_string_lossy()))
                 .or_insert_with(|| (dir.clone(), Vec::new()))
@@ -1253,7 +1512,7 @@ impl Database {
                 }
                 #[cfg(feature = "storage_pools")]
                 self.storage.forget_partitions(new_uid);
-                if let Err(d) = self.discard_uid_files(&root, new_uid) {
+                if let Err(d) = self.discard_uid_files(&root, new_uid).await {
                     error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
                 }
                 reopen_old().await;
@@ -1278,7 +1537,7 @@ impl Database {
                         drop(table);
                         #[cfg(feature = "storage_pools")]
                         self.storage.forget_partitions(new_uid);
-                        if let Err(d) = self.discard_uid_files(&root, new_uid) {
+                        if let Err(d) = self.discard_uid_files(&root, new_uid).await {
                             error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
                         }
                         reopen_old().await;
@@ -1298,7 +1557,7 @@ impl Database {
             drop(table);
             #[cfg(feature = "storage_pools")]
             self.storage.forget_partitions(new_uid);
-            if let Err(d) = self.discard_uid_files(&root, new_uid) {
+            if let Err(d) = self.discard_uid_files(&root, new_uid).await {
                 error!("... and the new files under uid {new_uid:016x} were kept for the startup reaper: {d}");
             }
             reopen_old().await;
@@ -1324,7 +1583,7 @@ impl Database {
         self.storage.forget_partitions(old_uid);
         if let Err(e) = old.mark_dropped().await {
             warn!("Rewrote partitioned table {name}; closing the old map log failed, the startup reaper deletes it: {e}");
-        } else if let Err(e) = self.discard_uid_files(&root, old_uid) {
+        } else if let Err(e) = self.discard_uid_files(&root, old_uid).await {
             warn!("Rewrote partitioned table {name}; deleting the old files under uid {old_uid:016x} failed, the startup reaper deletes them: {e}");
         }
         info!("Rewrote partitioned table {name}: uid {old_uid:016x} -> {new_uid:016x}");

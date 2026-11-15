@@ -87,6 +87,7 @@ pub mod reshape;
 mod pin_tests;
 pub mod route;
 pub mod serial;
+pub mod store;
 pub mod table;
 #[cfg(test)]
 mod table_tests;
