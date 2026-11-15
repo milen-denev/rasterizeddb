@@ -162,6 +162,44 @@ pub const NATIVE_LISTEN_ADDR: &str = "127.0.0.1";
 pub struct NativeListen {
     pub addr: String,
     pub port: u16,
+    /// A unix socket served alongside the TCP address, for clients on the
+    /// same machine. `None` serves TCP only.
+    pub socket: Option<NativeSocket>,
+}
+
+/// The native protocol on a unix socket: no TLS, no TCP stack, and the
+/// caller's operating-system user known from the kernel.
+#[derive(Debug, Clone)]
+pub struct NativeSocket {
+    pub path: std::path::PathBuf,
+    /// The socket file's permissions. Connecting needs write permission, so
+    /// `0o600` admits the server's own user only and `0o660` its group too.
+    /// With authentication off, a mode that admits anyone else is refused.
+    pub mode: u32,
+    /// How callers on the socket authenticate. `None` uses the TCP listener's
+    /// method. [`crate::auth::AuthMethod::Peer`] is offered here and nowhere
+    /// else.
+    pub method: Option<crate::auth::AuthMethod>,
+}
+
+impl NativeSocket {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            mode: rastcp::server::DEFAULT_UNIX_MODE,
+            method: None,
+        }
+    }
+
+    /// Whether users outside the socket file's owner and group can connect.
+    ///
+    /// The owner and the group are people an operator chose: putting a
+    /// service's user in the server's group is how a socket is shared on
+    /// purpose. Anyone else is not, so a socket that admits them has to
+    /// authenticate.
+    pub fn admits_others(&self) -> bool {
+        self.mode & 0o007 != 0
+    }
 }
 
 impl Default for NativeListen {
@@ -169,6 +207,7 @@ impl Default for NativeListen {
         Self {
             addr: NATIVE_LISTEN_ADDR.to_string(),
             port: SERVER_PORT,
+            socket: None,
         }
     }
 }
@@ -178,6 +217,7 @@ impl NativeListen {
         Self {
             addr: addr.into(),
             port,
+            socket: None,
         }
     }
 
@@ -4357,6 +4397,101 @@ impl Database {
     /// The loopback exemption in [`Database::start_db_with_auth`] therefore
     /// stays exactly that: an exemption for the address only the machine
     /// itself can reach.
+    /// Binds the native protocol's unix socket, with the authentication its
+    /// configuration asks for. Returns the server and whether a caller on it
+    /// has to authenticate.
+    ///
+    /// The same rule as the TCP address: a listener that accepts anyone may
+    /// only be one nobody else can reach. For a socket that means one only its
+    /// owner and group can connect to; a socket every user can reach has to
+    /// authenticate its callers.
+    #[cfg(unix)]
+    async fn bind_native_socket(
+        database: &Arc<Database>,
+        auth: &crate::native_auth::NativeAuthConfig,
+        socket: &NativeSocket,
+        credential_exists: bool,
+    ) -> io::Result<(TcpServer, bool)> {
+        use crate::auth::AuthMethod;
+        use crate::native_auth::{NativeAuthConfig, RoleAuthenticator};
+
+        let method = socket.method.unwrap_or(auth.method);
+        if let Err(e) = NativeAuthConfig::validate_socket_method(method) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+        }
+
+        // Peer authentication needs no password to exist, only the role
+        // catalogue: the role's name is what is checked.
+        let authenticates = match method {
+            AuthMethod::Trust => false,
+            AuthMethod::Peer => true,
+            _ => credential_exists,
+        };
+
+        if !authenticates && socket.admits_others() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to serve the native protocol on unix:{} with mode {:o} and \
+                     authentication off: every user on the machine would have unauthenticated \
+                     access. Set a password, use --rdb-socket-auth peer, or a --socket-mode that \
+                     admits only the owner and group, such as 660.",
+                    socket.path.display(),
+                    socket.mode
+                ),
+            ));
+        }
+
+        if authenticates {
+            let seeding = NativeAuthConfig {
+                method,
+                ..auth.clone()
+            };
+            if let Err(e) = crate::native_auth::seed_roles(database, &seeding).await {
+                return Err(io::Error::other(format!(
+                    "could not prepare the role catalogue: {}",
+                    e
+                )));
+            }
+        }
+
+        let mut builder = TcpServerBuilder::unix(&socket.path).unix_mode(socket.mode);
+        if authenticates {
+            builder = builder.authenticator(
+                StdArc::new(RoleAuthenticator::new(database.clone(), method))
+                    as StdArc<dyn rastcp::session::ServerAuthenticator>,
+            );
+            info!(
+                "Native protocol on unix:{} requires {} authentication",
+                socket.path.display(),
+                method.name()
+            );
+        }
+
+        let server = builder.build().await.map_err(|e| {
+            io::Error::other(format!(
+                "could not serve the native protocol on unix:{}: {}",
+                socket.path.display(),
+                e
+            ))
+        })?;
+
+        Ok((server, authenticates))
+    }
+
+    #[cfg(not(unix))]
+    async fn bind_native_socket(
+        _database: &Arc<Database>,
+        _auth: &crate::native_auth::NativeAuthConfig,
+        _socket: &NativeSocket,
+        _credential_exists: bool,
+    ) -> io::Result<(TcpServer, bool)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix sockets are not supported on this platform",
+        ))
+    }
+
     pub async fn start_db_with_auth_on(
         database: Arc<Database>,
         auth: crate::native_auth::NativeAuthConfig,
@@ -4417,6 +4552,15 @@ impl Database {
             ));
         }
 
+        // The unix socket, decided and bound before the TCP listener so that
+        // a socket that cannot be served stops start-up before anything does.
+        let socket_server = match listen.socket.as_ref() {
+            Some(socket) => Some(
+                Self::bind_native_socket(&database, &auth, socket, credential_exists).await?,
+            ),
+            None => None,
+        };
+
         let server = Arc::new(bind_native_listener(&listen, authenticator).await);
 
         // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
@@ -4428,6 +4572,26 @@ impl Database {
             database,
             authentication_required,
         };
+
+        let socket_task = socket_server.map(|(socket_server, socket_requires_auth)| {
+            let socket_server = Arc::new(socket_server);
+            let shutdown = socket_server.shutdown_handle();
+            crate::shutdown::on_termination(move || shutdown.shutdown());
+
+            let context = NativeContext {
+                database: context.database.clone(),
+                authentication_required: socket_requires_auth,
+            };
+            tokio::spawn(async move {
+                info!("Also listening on {}", socket_server.local_endpoint());
+                if let Err(e) = socket_server
+                    .run_with_context_and_principal(context, process_incoming_queries)
+                    .await
+                {
+                    error!("The unix socket listener stopped with an error: {}", e);
+                }
+            })
+        });
 
         let fut = async move {
             info!("Database started, listening on {}", listen);
@@ -4441,6 +4605,11 @@ impl Database {
 
         if let Err(e) = tokio::spawn(fut).await {
             warn!("Server task did not stop cleanly: {}", e);
+        }
+        if let Some(socket_task) = socket_task {
+            if let Err(e) = socket_task.await {
+                warn!("The unix socket listener did not stop cleanly: {}", e);
+            }
         }
 
         info!("Database stopped");

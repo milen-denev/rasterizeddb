@@ -7,14 +7,15 @@
 //! handler behind the same listener the server binary starts.
 //!
 //! ```text
-//! native_bench server <dir> <port> <threads>
+//! native_bench server <dir> <port> <threads> [unix-socket-path]
 //! native_bench setup  <host:port> <rows>
 //! native_bench pooled <host:port> <callers> <seconds> <threads> <rows>
 //! native_bench shared <host:port> <callers> <seconds> <threads> <rows> <connections>
 //! ```
 //!
 //! Server and clients are separate processes so each can be confined to its
-//! own cores.
+//! own cores. With a socket path the server serves it alongside the port, and
+//! a client given `unix:<path>` as its address uses it.
 
 use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,7 +48,12 @@ fn main() {
     let target = args.get(2).cloned().unwrap_or_default();
 
     match args.get(1).map(String::as_str) {
-        Some("server") => server(target, arg(&args, 3, 61999u16), arg(&args, 4, 4usize)),
+        Some("server") => server(
+            target,
+            arg(&args, 3, 61999u16),
+            arg(&args, 4, 4usize),
+            args.get(5).cloned(),
+        ),
         Some("setup") => setup(target, arg(&args, 3, 1000u64)),
         Some(mode @ ("pooled" | "shared")) => load(
             mode == "shared",
@@ -72,7 +78,7 @@ fn main() {
     }
 }
 
-fn server(dir: String, port: u16, threads: usize) {
+fn server(dir: String, port: u16, threads: usize, socket: Option<String>) {
     let _ = MAX_PERMITS_THREADS.set(threads.max(1));
     let _ = BATCH_SIZE.set(10_000);
     let _ = ENABLE_CACHE.set(false);
@@ -87,6 +93,7 @@ fn server(dir: String, port: u16, threads: usize) {
             NativeListen {
                 addr: "127.0.0.1".to_string(),
                 port,
+                socket: socket.map(rasterizeddb_core::core::database::NativeSocket::new),
             },
         )
         .await

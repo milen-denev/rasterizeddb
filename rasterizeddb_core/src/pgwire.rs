@@ -12065,6 +12065,17 @@ where
     match config.method {
         AuthMethod::Trust => unreachable!("handled above"),
 
+        // The PostgreSQL listener has no unix socket yet, and over TCP the
+        // caller's operating-system user is something it says, not something
+        // the kernel vouches for. Refused at start-up; refused here too, so
+        // a configuration that slipped past that check serves nobody.
+        AuthMethod::Peer => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer authentication is offered only on a unix socket",
+            ));
+        }
+
         AuthMethod::Password => {
             // AuthenticationCleartextPassword
             send_message(stream, b'R', &3i32.to_be_bytes()).await?;

@@ -23,6 +23,15 @@
 //!
 //! The password itself never crosses the wire in either direction, and the
 //! server stores nothing that can be replayed as one.
+//!
+//! # On a unix socket
+//!
+//! A unix socket has no TLS and needs none: only root can watch it, and who
+//! may connect is decided by its file's permissions. SCRAM runs there exactly
+//! as over TCP, bound to [`rastcp::session::UNIX_CHANNEL_BINDING`] in place of
+//! the exporter. A socket can also be set to [`AuthMethod::Peer`]: the kernel
+//! reports which operating-system user connected, and a role of that name may
+//! log in without a password — what PostgreSQL calls peer authentication.
 
 use std::fmt;
 use std::time::Duration;
@@ -93,14 +102,36 @@ impl Default for NativeAuthConfig {
 }
 
 impl NativeAuthConfig {
-    /// Rejects the methods this protocol deliberately does not offer.
+    /// Rejects the methods this protocol deliberately does not offer, for the
+    /// TCP listener.
     pub fn validate(&self) -> Result<(), String> {
         match self.method {
-            AuthMethod::Trust | AuthMethod::ScramSha256 => Ok(()),
+            AuthMethod::Peer => Err(
+                "peer authentication is offered only on a unix socket, where the kernel says \
+                 who is connecting; over TCP the caller would only be saying so. Set it for the \
+                 socket with --rdb-socket-auth peer."
+                    .to_string(),
+            ),
+            method => Self::validate_method(method),
+        }
+    }
+
+    /// Rejects the methods the native protocol does not offer on a unix
+    /// socket, which is all of the TCP listener's and [`AuthMethod::Peer`].
+    pub fn validate_socket_method(method: AuthMethod) -> Result<(), String> {
+        match method {
+            AuthMethod::Peer => Ok(()),
+            method => Self::validate_method(method),
+        }
+    }
+
+    fn validate_method(method: AuthMethod) -> Result<(), String> {
+        match method {
+            AuthMethod::Trust | AuthMethod::ScramSha256 | AuthMethod::Peer => Ok(()),
             AuthMethod::Md5 | AuthMethod::Password => Err(format!(
                 "the native protocol does not offer {}: it exists in the PostgreSQL listener \
                  only for drivers that speak nothing else. Use scram-sha-256.",
-                self.method.name()
+                method.name()
             )),
         }
     }
@@ -126,6 +157,59 @@ pub async fn seed_roles(database: &Arc<Database>, config: &NativeAuthConfig) -> 
 }
 
 // ----------------------------------------------------------------- server
+
+/// The operating-system user at the other end of `peer`, if it is a unix
+/// socket and the user has a name.
+fn peer_user(peer: &rastcp::net::Peer) -> Option<String> {
+    #[cfg(unix)]
+    if let rastcp::net::Peer::Unix(peer) = peer {
+        return os_user_name(peer.uid);
+    }
+    let _ = peer;
+    None
+}
+
+/// The login name of `uid`, from the password database.
+#[cfg(unix)]
+pub fn os_user_name(uid: u32) -> Option<String> {
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 4096];
+
+    loop {
+        // SAFETY: every pointer is to memory owned here and live for the call;
+        // `getpwuid_r` writes the entry's strings into `buffer`, which outlives
+        // the read of `pw_name` below.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+
+        if status == libc::ERANGE && buffer.len() < 1 << 20 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if status != 0 || found.is_null() || entry.pw_name.is_null() {
+            return None;
+        }
+
+        // SAFETY: `pw_name` points into `buffer`, NUL-terminated by getpwuid_r.
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
+        return name.to_str().ok().map(str::to_string);
+    }
+}
+
+/// The login name of the user this process runs as.
+#[cfg(unix)]
+pub fn current_os_user() -> Option<String> {
+    // SAFETY: getuid cannot fail and has no preconditions.
+    os_user_name(unsafe { libc::getuid() })
+}
 
 /// Checks callers against the role catalogue.
 pub struct RoleAuthenticator {
@@ -174,6 +258,19 @@ impl RoleAuthenticator {
         let superuser = role.as_ref().map(|r| r.is_superuser).unwrap_or(false);
 
         if self.method == AuthMethod::Trust {
+            channel.send(&[S_OK]).await?;
+            return Ok(Principal::new(user, superuser));
+        }
+
+        if self.method == AuthMethod::Peer {
+            // Who the kernel says connected, not who the caller says it is.
+            // A caller on TCP has no such answer, and is refused: this
+            // authenticator is only ever put on a unix socket, and if it is
+            // put anywhere else it must not let anyone in.
+            let connected_as = peer_user(&channel.peer());
+            if connected_as.as_deref() != Some(user.as_str()) || !may_login {
+                return Err(Self::refuse(channel, &user).await);
+            }
             channel.send(&[S_OK]).await?;
             return Ok(Principal::new(user, superuser));
         }
@@ -322,15 +419,7 @@ impl PasswordAuthenticator {
     }
 
     async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<(), RastcpError> {
-        let mut hello = Vec::with_capacity(4 + self.user.len());
-        hello.push(C_HELLO);
-        hello.push(PROTOCOL_VERSION);
-        let len = u16::try_from(self.user.len()).map_err(|_| {
-            RastcpError::AuthenticationError("the user name is too long".to_string())
-        })?;
-        hello.extend_from_slice(&len.to_le_bytes());
-        hello.extend_from_slice(self.user.as_bytes());
-        channel.send(&hello).await?;
+        channel.send(&hello_message(&self.user)?).await?;
 
         match server_reply(channel).await? {
             (S_OK, _) if !self.require_scram => return Ok(()),
@@ -381,6 +470,72 @@ impl ClientAuthenticator for PasswordAuthenticator {
     fn authenticate<'a>(&'a self, channel: &'a mut AuthChannel<'_>) -> AuthFuture<'a, ()> {
         Box::pin(self.run(channel))
     }
+}
+
+/// Logs in as the operating-system user this process runs as, on a unix
+/// socket whose server is set to [`AuthMethod::Peer`]. No password: the
+/// server asks the kernel who connected.
+#[derive(Clone)]
+pub struct PeerAuthenticator {
+    user: String,
+}
+
+impl fmt::Debug for PeerAuthenticator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerAuthenticator")
+            .field("user", &self.user)
+            .finish()
+    }
+}
+
+impl PeerAuthenticator {
+    /// Logs in as `user`, which the server accepts only if it is the name of
+    /// the operating-system user this process runs as.
+    pub fn new(user: impl Into<String>) -> Self {
+        Self { user: user.into() }
+    }
+
+    /// Logs in as the operating-system user this process runs as.
+    #[cfg(unix)]
+    pub fn current_user() -> Result<Self, RastcpError> {
+        current_os_user().map(Self::new).ok_or_else(|| {
+            RastcpError::AuthenticationError(
+                "this process's user has no name in the password database".to_string(),
+            )
+        })
+    }
+
+    async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<(), RastcpError> {
+        channel.send(&hello_message(&self.user)?).await?;
+
+        match server_reply(channel).await? {
+            (S_OK, _) => Ok(()),
+            (S_SASL, _) => Err(RastcpError::AuthenticationError(
+                "the server asks for a password: peer authentication needs a unix socket whose \
+                 server is set to --rdb-socket-auth peer"
+                    .to_string(),
+            )),
+            (_, message) => Err(RastcpError::AuthenticationError(message)),
+        }
+    }
+}
+
+impl ClientAuthenticator for PeerAuthenticator {
+    fn authenticate<'a>(&'a self, channel: &'a mut AuthChannel<'_>) -> AuthFuture<'a, ()> {
+        Box::pin(self.run(channel))
+    }
+}
+
+/// The opening message: who the caller wants to be.
+fn hello_message(user: &str) -> Result<Vec<u8>, RastcpError> {
+    let mut hello = Vec::with_capacity(4 + user.len());
+    hello.push(C_HELLO);
+    hello.push(PROTOCOL_VERSION);
+    let len = u16::try_from(user.len())
+        .map_err(|_| RastcpError::AuthenticationError("the user name is too long".to_string()))?;
+    hello.extend_from_slice(&len.to_le_bytes());
+    hello.extend_from_slice(user.as_bytes());
+    Ok(hello)
 }
 
 /// Reads one tagged message from the server.

@@ -37,6 +37,12 @@ pub enum AuthMethod {
     Md5,
     /// SCRAM-SHA-256. The default, and what modern drivers negotiate.
     ScramSha256,
+    /// The caller is whoever the kernel says is at the other end of a unix
+    /// socket: a role may log in without a password if its name is the name
+    /// of the operating-system user connecting. Offered only on a unix
+    /// socket, where that answer comes from the kernel rather than from the
+    /// caller. A password, if a role has one, is stored as for SCRAM.
+    Peer,
 }
 
 impl AuthMethod {
@@ -47,6 +53,7 @@ impl AuthMethod {
                 "password" | "cleartext" => AuthMethod::Password,
                 "md5" => AuthMethod::Md5,
                 "scram" | "scramsha256" => AuthMethod::ScramSha256,
+                "peer" => AuthMethod::Peer,
                 _ => return None,
             },
         )
@@ -58,6 +65,7 @@ impl AuthMethod {
             AuthMethod::Password => "password",
             AuthMethod::Md5 => "md5",
             AuthMethod::ScramSha256 => "scram-sha-256",
+            AuthMethod::Peer => "peer",
         }
     }
 }
@@ -1501,6 +1509,8 @@ mod tests {
         );
         assert_eq!(AuthMethod::parse("SCRAM"), Some(AuthMethod::ScramSha256));
         assert_eq!(AuthMethod::parse("md5"), Some(AuthMethod::Md5));
+        assert_eq!(AuthMethod::parse("peer"), Some(AuthMethod::Peer));
+        assert_eq!(AuthMethod::Peer.name(), "peer");
         assert_eq!(AuthMethod::parse("trust"), Some(AuthMethod::Trust));
         assert_eq!(AuthMethod::parse("nonsense"), None);
     }

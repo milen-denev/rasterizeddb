@@ -414,6 +414,30 @@ struct Args {
     #[arg(long = "rdb-port", value_name = "PORT")]
     rdb_port: Option<u16>,
 
+    /// Also serve the native protocol on this unix socket, for clients on the
+    /// same machine (`DbClient` address `unix:<path>`).
+    ///
+    /// No TLS and no TCP stack on it: only root can watch a local socket, and
+    /// who may connect is decided by the file's permissions. A socket file
+    /// left behind by a server that did not shut down is replaced; one another
+    /// server is listening on, or a path that is not a socket, is refused.
+    #[arg(long = "rdb-socket", value_name = "PATH")]
+    rdb_socket: Option<std::path::PathBuf>,
+
+    /// Permissions of every unix socket this server serves, in octal (default
+    /// 600: this server's user only; 660 admits its group too). Connecting
+    /// needs write permission. A socket that admits users outside its owner
+    /// and group must authenticate its callers.
+    #[arg(long = "socket-mode", value_name = "MODE", default_value = "600")]
+    socket_mode: String,
+
+    /// How callers on `--rdb-socket` authenticate: `scram-sha-256`, `trust`,
+    /// or `peer` — a role may log in without a password when its name is the
+    /// operating-system user connecting, which the kernel reports. Defaults to
+    /// `--rdb-auth`.
+    #[arg(long = "rdb-socket-auth", value_name = "METHOD")]
+    rdb_socket_auth: Option<String>,
+
     /// Role created for the native protocol when the role catalogue is empty.
     #[arg(long = "rdb-user", default_value = "rasterized")]
     rdb_user: String,
@@ -1408,6 +1432,44 @@ fn main() -> std::io::Result<()> {
                 if let Some(port) = args.rdb_port {
                     listen.port = port;
                 }
+                if let Some(path) = args.rdb_socket.clone() {
+                    let mut socket = rasterizeddb_core::core::database::NativeSocket::new(path);
+
+                    match u32::from_str_radix(args.socket_mode.trim_start_matches("0o"), 8) {
+                        Ok(mode) if mode <= 0o777 => socket.mode = mode,
+                        _ => {
+                            eprintln!(
+                                "--socket-mode {:?} is not a file mode: expected octal such as 600 or 660",
+                                args.socket_mode
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+
+                    if let Some(text) = args.rdb_socket_auth.as_deref() {
+                        let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(text) else {
+                            eprintln!(
+                                "unknown --rdb-socket-auth {:?}: expected peer, scram-sha-256 or trust",
+                                text
+                            );
+                            std::process::exit(2);
+                        };
+                        if let Err(e) =
+                            rasterizeddb_core::native_auth::NativeAuthConfig::validate_socket_method(
+                                method,
+                            )
+                        {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        }
+                        socket.method = Some(method);
+                    }
+
+                    listen.socket = Some(socket);
+                } else if args.rdb_socket_auth.is_some() {
+                    eprintln!("--rdb-socket-auth needs --rdb-socket");
+                    std::process::exit(2);
+                }
 
                 if let Err(e) =
                     Database::start_db_with_auth_on(arc_database, auth, listen).await
@@ -1442,6 +1504,13 @@ fn main() -> std::io::Result<()> {
                     );
                     std::process::exit(2);
                 };
+                if method == rasterizeddb_core::auth::AuthMethod::Peer {
+                    eprintln!(
+                        "--pg-auth peer is not offered: peer authentication needs a unix socket, \
+                         and the PostgreSQL listener serves TCP only"
+                    );
+                    std::process::exit(2);
+                }
 
                 let auth = rasterizeddb_core::pgwire::AuthConfig {
                     method,

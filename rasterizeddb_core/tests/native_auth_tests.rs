@@ -338,3 +338,302 @@ async fn a_shared_connection_authenticates_and_serves_every_request_as_that_user
         "the connection opened after a close must be authenticated too"
     );
 }
+
+// ------------------------------------------------------------ unix socket
+
+#[cfg(unix)]
+mod unix_socket {
+    use super::*;
+    use rasterizeddb_core::native_auth::{PeerAuthenticator, current_os_user};
+
+    fn socket_path(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        std::path::PathBuf::from(format!(
+            "/tmp/rdb-auth-{}-{}-{}.sock",
+            std::process::id(),
+            name,
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    /// Serves `database`'s roles on a unix socket under `method`, answering
+    /// with the caller's name as `serve` does. The server is returned so the
+    /// socket lasts as long as the test holds it.
+    async fn serve_socket(
+        path: &std::path::Path,
+        database: Arc<Database>,
+        method: AuthMethod,
+    ) -> tokio::task::JoinHandle<()> {
+        let authenticator = StdArc::new(RoleAuthenticator::new(database, method))
+            as StdArc<dyn ServerAuthenticator>;
+        let server = TcpServerBuilder::unix(path)
+            .authenticator(authenticator)
+            .build()
+            .await
+            .expect("the server should build");
+
+        tokio::spawn(async move {
+            let _ = server
+                .run_with_principal(|principal, _request| async move {
+                    format!("{}:{}", principal, principal.superuser).into_bytes()
+                })
+                .await;
+        })
+    }
+
+    async fn login_with(
+        path: &std::path::Path,
+        authenticator: StdArc<dyn ClientAuthenticator>,
+    ) -> Result<String, String> {
+        let mut client = TcpClientBuilder::new(&format!("unix:{}", path.display()))
+            .timeout(Duration::from_secs(5))
+            .authenticator(authenticator)
+            .build()
+            .await
+            .map_err(|e| e.to_string())?;
+        let response = client
+            .send(b"SELECT 1".to_vec())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&response).to_string())
+    }
+
+    #[tokio::test]
+    async fn a_password_works_on_a_unix_socket_and_a_wrong_one_does_not() {
+        let path = socket_path("scram");
+        let task = serve_socket(&path, database_with_roles(&[]).await, AuthMethod::ScramSha256).await;
+
+        let right = login_with(&path, StdArc::new(PasswordAuthenticator::new("alice", "hunter2"))).await;
+        assert_eq!(right.as_deref(), Ok("alice:true"));
+
+        let wrong = login_with(&path, StdArc::new(PasswordAuthenticator::new("alice", "hunter3"))).await;
+        assert!(wrong.is_err(), "a wrong password was accepted on a unix socket: {wrong:?}");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_lets_in_the_role_named_after_the_connecting_user_and_nobody_else() {
+        let me = current_os_user().expect("the test runs as a named user");
+        let path = socket_path("peer");
+        let database =
+            database_with_roles(&[&format!("CREATE ROLE \"{me}\" LOGIN")]).await;
+        let task = serve_socket(&path, database, AuthMethod::Peer).await;
+
+        // As myself: in, with no password anywhere.
+        let mine = login_with(&path, StdArc::new(PeerAuthenticator::new(me.clone()))).await;
+        assert_eq!(mine.as_deref(), Ok(format!("{me}:false").as_str()));
+
+        // As anyone else, even a role that exists and is a superuser: the
+        // kernel says who connected, and it is not them.
+        let other = login_with(&path, StdArc::new(PeerAuthenticator::new("alice"))).await;
+        assert!(other.is_err(), "peer let a caller in as a user it is not: {other:?}");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_needs_a_role_that_may_log_in() {
+        let me = current_os_user().expect("the test runs as a named user");
+        let path = socket_path("nologin");
+
+        // No such role at all.
+        let task = serve_socket(&path, database_with_roles(&[]).await, AuthMethod::Peer).await;
+        let missing = login_with(&path, StdArc::new(PeerAuthenticator::new(me.clone()))).await;
+        assert!(missing.is_err(), "peer let in a user with no role: {missing:?}");
+        task.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A role that may not log in.
+        let path = socket_path("nologin2");
+        let database = database_with_roles(&[&format!("CREATE ROLE \"{me}\" NOLOGIN")]).await;
+        let task = serve_socket(&path, database, AuthMethod::Peer).await;
+        let barred = login_with(&path, StdArc::new(PeerAuthenticator::new(me))).await;
+        assert!(barred.is_err(), "peer let in a role that may not log in: {barred:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn peer_on_a_tcp_listener_lets_nobody_in() {
+        // Never configured that way — start-up refuses it — but if it were,
+        // a caller over TCP has no kernel-reported user, and must not be
+        // taken at its word.
+        let me = current_os_user().expect("the test runs as a named user");
+        let (listener, port) = loopback();
+        let database = database_with_roles(&[&format!("CREATE ROLE \"{me}\" LOGIN")]).await;
+
+        let authenticator = StdArc::new(RoleAuthenticator::new(database, AuthMethod::Peer))
+            as StdArc<dyn ServerAuthenticator>;
+        let server = TcpServerBuilder::from_listener(listener)
+            .unwrap()
+            .authenticator(authenticator)
+            .build()
+            .await
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.run(|data| async move { data }).await;
+        });
+
+        let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{port}"))
+            .timeout(Duration::from_secs(5))
+            .authenticator(StdArc::new(PeerAuthenticator::new(me)) as StdArc<dyn ClientAuthenticator>)
+            .build()
+            .await
+            .unwrap();
+        assert!(client.send(b"SELECT 1".to_vec()).await.is_err());
+
+        task.abort();
+    }
+
+    /// The real listener, as the server binary starts it.
+    mod listener {
+        use super::*;
+        use rasterizeddb_core::client::DbClient;
+        use rasterizeddb_core::core::database::{NativeListen, NativeSocket};
+        use rasterizeddb_core::core::support_types::QueryExecutionResult;
+        use rasterizeddb_core::native_auth::NativeAuthConfig;
+
+        /// Port 0: the kernel picks a free one at the server's own bind, so
+        /// no number is let go and handed to a parallel test in between.
+        fn free_port() -> u16 {
+            0
+        }
+
+        #[tokio::test]
+        async fn a_socket_every_user_can_reach_is_refused_without_authentication() {
+            let path = socket_path("shared");
+            let mut socket = NativeSocket::new(&path);
+            socket.mode = 0o666;
+            socket.method = Some(AuthMethod::Trust);
+
+            let listen = NativeListen {
+                addr: "127.0.0.1".to_string(),
+                port: free_port(),
+                socket: Some(socket),
+            };
+            let auth = NativeAuthConfig {
+                method: AuthMethod::Trust,
+                ..NativeAuthConfig::default()
+            };
+
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(30),
+                Database::start_db_with_auth_on(database_with_roles(&[]).await, auth, listen),
+            )
+            .await
+            .expect("a refusal is immediate, not a server that runs");
+
+            let error = outcome.expect_err("a world-writable socket was served with trust");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!path.exists(), "the refused socket was created anyway");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_socket_shared_with_a_group_may_run_without_authentication() {
+            // The group is an operator's choice of who may connect, as the
+            // owner is: trust is allowed on a socket only they can reach.
+            let _ = rasterizeddb_core::MAX_PERMITS_THREADS.get_or_init(|| 4);
+            let _ = rasterizeddb_core::BATCH_SIZE.get_or_init(|| 1024);
+
+            let path = socket_path("group");
+            let mut socket = NativeSocket::new(&path);
+            socket.mode = 0o660;
+            socket.method = Some(AuthMethod::Trust);
+            let listen = NativeListen {
+                addr: "127.0.0.1".to_string(),
+                port: free_port(),
+                socket: Some(socket),
+            };
+            let auth = NativeAuthConfig {
+                method: AuthMethod::Trust,
+                ..NativeAuthConfig::default()
+            };
+
+            let server = tokio::spawn(Database::start_db_with_auth_on(
+                database_with_roles(&[]).await,
+                auth,
+                listen,
+            ));
+            for _ in 0..200 {
+                if path.exists() || server.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert!(!server.is_finished(), "a group-only socket with trust was refused");
+
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o660);
+
+            let client = DbClient::new_multiplexed(Some(&format!("unix:{}", path.display())))
+                .await
+                .expect("connected with no credentials");
+            let reply = client.execute_query("SELECT 1").await;
+            assert!(reply.is_ok(), "{reply:?}");
+
+            server.abort();
+            let _ = server.await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_query_on_the_socket_runs_as_the_connecting_user() {
+            let _ = rasterizeddb_core::MAX_PERMITS_THREADS.get_or_init(|| 4);
+            let _ = rasterizeddb_core::BATCH_SIZE.get_or_init(|| 1024);
+
+            let me = current_os_user().expect("the test runs as a named user");
+            let path = socket_path("listener");
+            let database = database_with_roles(&[&format!("CREATE ROLE \"{me}\" LOGIN")]).await;
+
+            let mut socket = NativeSocket::new(&path);
+            socket.method = Some(AuthMethod::Peer);
+            let listen = NativeListen {
+                addr: "127.0.0.1".to_string(),
+                port: free_port(),
+                socket: Some(socket),
+            };
+            // The TCP side asks for a password, which exists: the socket's
+            // method is its own.
+            let auth = NativeAuthConfig::default();
+
+            let server = tokio::spawn(Database::start_db_with_auth_on(database, auth, listen));
+
+            for _ in 0..200 {
+                if path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            let client = DbClient::new_peer(path.to_str().unwrap())
+                .await
+                .expect("logged in as this process's user");
+
+            let created = client
+                .execute_query("CREATE TABLE peer_t (id INTEGER, name VARCHAR)")
+                .await
+                .expect("a reply");
+            assert!(
+                !matches!(created, QueryExecutionResult::Error(_)),
+                "CREATE TABLE failed: {created:?}"
+            );
+            let inserted = client
+                .execute_query("INSERT INTO peer_t (id, name) VALUES (1, 'over a unix socket')")
+                .await
+                .expect("a reply");
+            assert!(!matches!(inserted, QueryExecutionResult::Error(_)), "{inserted:?}");
+
+            let rows = client
+                .execute_query("SELECT id, name FROM peer_t")
+                .await
+                .expect("a reply");
+            let rows = DbClient::extract_rows(rows).expect("rows").expect("a row set");
+            let rasterizeddb_core::core::row::row::ReturnResult::Rows(rows) = rows else {
+                panic!("not rows");
+            };
+            assert_eq!(rows.len(), 1);
+
+            server.abort();
+            let _ = server.await;
+        }
+    }
+}

@@ -565,6 +565,11 @@ impl std::fmt::Debug for DbCredentials {
 fn resolve_server_address(address: &str) -> String {
     let address = address.trim();
 
+    // A unix socket's path, which has no port to add.
+    if address.starts_with(rastcp::net::UNIX_PREFIX) {
+        return address.to_string();
+    }
+
     // Bracketed already: `[::1]:61170` carries a port, `[::1]` does not.
     if address.starts_with('[') {
         return if address.contains("]:") {
@@ -778,6 +783,43 @@ impl DbClient {
         Ok(DbClient {
             transport: Transport::Shared(SharedConnections {
                 clients,
+                next: CacheGuard::new(AtomicUsize::new(0)),
+            }),
+            connected: AtomicBool::new(true),
+            retry: QueryRetry::default(),
+        })
+    }
+
+    /// A client on the server's unix socket, logged in as the operating-system
+    /// user this process runs as, with no password.
+    ///
+    /// `socket` is the path given to the server's `--rdb-socket`, with or
+    /// without the `unix:` prefix. The server must be set to
+    /// `--rdb-socket-auth peer`, and a role named after this process's user
+    /// must exist and be allowed to log in. One shared connection, as
+    /// [`DbClient::new_multiplexed`].
+    #[cfg(unix)]
+    pub async fn new_peer(socket: &str) -> io::Result<Self> {
+        let address = if socket.starts_with(rastcp::net::UNIX_PREFIX) {
+            socket.to_string()
+        } else {
+            format!("{}{}", rastcp::net::UNIX_PREFIX, socket)
+        };
+
+        let login = crate::native_auth::PeerAuthenticator::current_user()
+            .map_err(rastcp_error_to_io_error)?;
+
+        let client = TcpClientBuilder::new(&address)
+            .timeout(DEFAULT_TRANSPORT_TIMEOUT)
+            .authenticator(Arc::new(login) as Arc<dyn ClientAuthenticator>)
+            .build_multiplexed()
+            .await
+            .map_err(rastcp_error_to_io_error)?;
+        client.connect().await.map_err(rastcp_error_to_io_error)?;
+
+        Ok(DbClient {
+            transport: Transport::Shared(SharedConnections {
+                clients: vec![client],
                 next: CacheGuard::new(AtomicUsize::new(0)),
             }),
             connected: AtomicBool::new(true),
@@ -1391,6 +1433,13 @@ mod tests {
 #[cfg(test)]
 mod address_tests {
     use super::{SERVER_PORT, resolve_server_address};
+
+    #[test]
+    fn a_unix_socket_path_is_kept_as_it_is() {
+        for address in ["unix:/run/rasterizeddb/rdb.sock", "unix:relative.sock", "  unix:/tmp/x.sock  "] {
+            assert_eq!(resolve_server_address(address), address.trim());
+        }
+    }
 
     #[test]
     fn a_bare_host_gets_the_default_port() {
