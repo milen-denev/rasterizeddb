@@ -5909,6 +5909,21 @@ pub(crate) async fn process_incoming_queries(
         crate::core::redact::statement(&query)
     );
 
+    // `SELECT rdb_index_checkpoint('t')` (docs/persistent-indexes.md §3):
+    // a clean point, answered above the engine as the pgwire listener
+    // answers it, under the role statements' gate. A native client that
+    // cannot open pgwire (a proxy on the unix socket alone) seals its tables
+    // through this between restarts, so a killed process loads its
+    // snapshots instead of rebuilding every index.
+    if let Some(name) = crate::pgwire::parse_index_checkpoint(&query) {
+        if context.authentication_required && !principal.superuser {
+            return error_response(&format!(
+                "permission denied: rdb_index_checkpoint requires superuser ({principal} is not one)"
+            ));
+        }
+        return native_index_checkpoint(&context.database, name).await;
+    }
+
     #[cfg(not(feature = "query_stats"))]
     {
         run_native_query(&query, context.database).await
@@ -5944,6 +5959,45 @@ pub(crate) async fn process_incoming_queries(
         );
         response
     }
+}
+
+/// `rdb_index_checkpoint(name)` over the native protocol: one row, one
+/// text column, `"<clean> of <file sets> clean"` as pgwire's row reads, then
+/// for each file set not left clean `"; <file set>: <why>"` (the native
+/// protocol has no notices to carry them). Each statement is its own: no
+/// block holds a ticket, so `own_writes` stays empty.
+async fn native_index_checkpoint(database: &Arc<Database>, name: Result<String, String>) -> Vec<u8> {
+    use crate::core::row::row::{Column, Row};
+    let name = match name {
+        Ok(name) => name,
+        Err(e) => return error_response(&e),
+    };
+    let report = match database.index_checkpoint(&name, None).await {
+        Ok(report) => report,
+        Err(e) => return error_response(&e),
+    };
+    let (clean, of) = report.clean();
+    let mut line = format!("{clean} of {of} clean");
+    for own in &report.own_writes {
+        line.push_str(&format!("; {own}: not checkpointed, written by this transaction"));
+    }
+    for sealed in report.sealed.iter().filter(|s| !s.outcome.is_clean()) {
+        line.push_str(&format!("; {}: {}", sealed.name, sealed.outcome.describe()));
+    }
+    let mut block = crate::memory_pool::MEMORY_POOL.acquire(line.len());
+    block.into_slice_mut().copy_from_slice(line.as_bytes());
+    let row = Row {
+        position: 0,
+        columns: smallvec::smallvec![Column {
+            schema_id: 0,
+            data: block,
+            column_type: crate::core::db_type::DbType::STRING,
+        }],
+        length: 0,
+    };
+    let mut result = vec![2u8];
+    row.extend_serialized(&mut result);
+    result
 }
 
 /// Runs one recognised statement from the native protocol.

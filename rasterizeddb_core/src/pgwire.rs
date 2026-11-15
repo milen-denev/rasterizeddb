@@ -10722,7 +10722,7 @@ where
 /// names, as a `Result` so a malformed argument is an error rather than a
 /// statement the engine misreads; `None` for any other statement. A
 /// function, not grammar (§3: new grammar has repeatedly mis-parsed here).
-fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
+pub(crate) fn parse_index_checkpoint(stmt: &str) -> Option<Result<String, String>> {
     parse_regclass_call(stmt, "rdb_index_checkpoint")
 }
 
