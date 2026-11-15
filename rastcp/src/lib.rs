@@ -6,6 +6,7 @@ pub mod error;
 mod frame;
 mod interrupt;
 pub mod mux;
+pub mod net;
 pub mod server;
 pub mod session;
 pub mod tls;

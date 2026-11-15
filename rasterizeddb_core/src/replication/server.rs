@@ -129,10 +129,13 @@ pub fn bind_on(
     );
     // Printed so setting a cluster up does not need a detour through
     // `openssl`: this is the value the other nodes pin.
-    info!(
-        "Replication certificate fingerprint: {}",
-        rastcp::tls::format_fingerprint(&server.certificate_fingerprint())
-    );
+    // A replication listener is always TCP, and so always has one.
+    if let Some(fingerprint) = server.certificate_fingerprint() {
+        info!(
+            "Replication certificate fingerprint: {}",
+            rastcp::tls::format_fingerprint(&fingerprint)
+        );
+    }
     if !config.auth.authenticates() {
         warn!(
             "Replication authentication is off. The link is encrypted but not authenticated, \
@@ -250,7 +253,7 @@ impl rastcp::session::ServerAuthenticator for Greeter {
                 Some(node) => Ok(rastcp::session::Principal::new(session_name(node), false)),
                 None => Err(rastcp::error::RastcpError::AuthenticationError(format!(
                     "the replication greeting from {} was refused",
-                    channel.peer_addr()
+                    channel.peer()
                 ))),
             }
         })

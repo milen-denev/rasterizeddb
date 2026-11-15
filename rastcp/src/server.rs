@@ -8,21 +8,25 @@ use rustls::server::ServerSessionMemoryCache;
 use socket2::{Domain, Protocol, SockAddr, Socket, TcpKeepalive, Type};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::cert::generate_self_signed_cert;
 use crate::interrupt::{Guard, Interrupted, StopListener, StopSignal};
+use crate::net::{Accepted, Listener, Peer, ServerStream, Version};
 use crate::session::{AuthChannel, Principal, ServerAuthenticator};
 use crate::tls::{ClientAuth, Fingerprint};
 use crate::frame::{FrameReader, FrameWriter, KIND_DATA, KIND_FAILED, KIND_TIMED_OUT, Tag};
 use crate::error::RastcpError;
 use crate::{ALPN_MULTIPLEXED, ALPN_PROTOCOL};
+#[cfg(unix)]
+use crate::net::{PREAMBLE_LEN, SocketFile};
 
 const DEFAULT_MAX_CONNECTIONS: usize = 512;
 const HARD_MAX_CONNECTIONS: usize = 4_096;
@@ -107,7 +111,7 @@ impl ShutdownHandle {
 
 /// What one turn of an accept loop produced.
 enum AcceptStep {
-    Connection(TcpStream, SocketAddr),
+    Connection(Accepted, Peer),
     Retry,
     Shutdown,
 }
@@ -134,11 +138,21 @@ pub struct TcpServerBuilder {
     /// `addr:port`. See [`TcpServerBuilder::with_listener`].
     listener: Option<std::net::TcpListener>,
     reuse_port: bool,
+    /// Listen on this unix socket instead of a TCP address. See
+    /// [`TcpServerBuilder::unix`].
+    unix_path: Option<PathBuf>,
+    unix_mode: u32,
 }
 
+/// Who may connect to a unix socket unless a server is told otherwise: its
+/// owner, and nobody else.
+pub const DEFAULT_UNIX_MODE: u32 = 0o600;
+
 pub struct TcpServer {
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
+    listener: Listener,
+    /// The TLS a TCP connection is opened with. `None` for a unix socket,
+    /// which carries none.
+    acceptor: Option<TlsAcceptor>,
     max_connections: usize,
     /// Padded inside the `Arc`, not outside it. An `Arc<AtomicUsize>` lays the
     /// counter out directly after the strong and weak reference counts, and this
@@ -158,8 +172,9 @@ pub struct TcpServer {
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
     stop: Arc<StopSignal>,
     /// SHA-256 of the certificate this server presents, so an operator can pin
-    /// it on the other nodes without going and finding the file.
-    certificate_fingerprint: Fingerprint,
+    /// it on the other nodes without going and finding the file. `None` for a
+    /// unix socket, which presents none.
+    certificate_fingerprint: Option<Fingerprint>,
 }
 
 impl TcpServerBuilder {
@@ -191,7 +206,43 @@ impl TcpServerBuilder {
             early_data: false,
             listener: None,
             reuse_port: false,
+            unix_path: None,
+            unix_mode: DEFAULT_UNIX_MODE,
         }
+    }
+
+    /// A builder for a server on the unix socket at `path`.
+    ///
+    /// Connections carry no TLS: see [`crate::net`] for why that is the right
+    /// choice on one machine. Who may connect is decided by the socket file's
+    /// permissions ([`TcpServerBuilder::unix_mode`], owner only by default),
+    /// and an authenticator, if one is set, runs as it does on TCP — with the
+    /// caller's user and process, as the kernel reports them, available to it
+    /// in [`crate::session::AuthChannel::peer`].
+    ///
+    /// A socket file left behind by a server that stopped without cleaning up
+    /// is replaced; one that a server is listening on, or a path that is not a
+    /// socket, is refused. The file is removed when the server is dropped.
+    ///
+    /// The options that only mean something with TLS — certificates, TLS 1.2,
+    /// early data, sharing a port — have no effect. A client certificate
+    /// requirement is refused rather than ignored, because ignoring it would
+    /// serve callers it was meant to keep out.
+    #[cfg(unix)]
+    pub fn unix(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let mut builder = Self::new("127.0.0.1", 0);
+        builder.addr = format!("unix:{}", path.display());
+        builder.unix_path = Some(path);
+        builder
+    }
+
+    /// The permissions of the socket file of a [`TcpServerBuilder::unix`]
+    /// server, as a mode such as `0o660`. Connecting needs write permission.
+    /// Default `0o600`: the owner only.
+    pub fn unix_mode(mut self, mode: u32) -> Self {
+        self.unix_mode = mode;
+        self
     }
 
     /// A builder that serves `listener` rather than binding an address itself.
@@ -402,6 +453,49 @@ impl TcpServerBuilder {
             }
         }
 
+        #[cfg(unix)]
+        if let Some(path) = self.unix_path.as_ref() {
+            if self.client_auth.authenticates() {
+                return Err(RastcpError::SocketBindingError(
+                    "a unix socket carries no TLS, so it cannot ask its callers for a \
+                     certificate; who may connect to one is decided by its file's permissions"
+                        .to_string(),
+                ));
+            }
+            if self.listener.is_some() {
+                return Err(RastcpError::SocketBindingError(
+                    "a server cannot be given a TCP listener and a unix socket path at once"
+                        .to_string(),
+                ));
+            }
+
+            let (listener, file) = SocketFile::bind(path, self.unix_mode)?;
+            let listener = tokio::net::UnixListener::from_std(listener)
+                .map_err(|e| RastcpError::SocketBindingError(e.to_string()))?;
+
+            info!("Server built to listen on {}", self.addr);
+
+            return Ok(TcpServer {
+                listener: Listener::Unix { listener, file },
+                acceptor: None,
+                max_connections,
+                current_connections: Arc::new(CacheGuard::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                )),
+                connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
+                handshake_timeout: self.handshake_timeout,
+                request_timeout: self.request_timeout,
+                max_message_size: self.max_message_size,
+                max_in_flight: self.max_in_flight,
+                inline_handlers: self.inline_handlers,
+                shutdown_grace: self.shutdown_grace,
+                auth_timeout: self.auth_timeout,
+                authenticator: self.authenticator,
+                stop: StopSignal::new(),
+                certificate_fingerprint: None,
+            });
+        }
+
         // Load TLS certificates
         let (certs, private_key) = match self.custom_certs {
             Some(certs_key) => certs_key,
@@ -409,10 +503,7 @@ impl TcpServerBuilder {
                 .map_err(|e| RastcpError::CertificateLoading(e.to_string()))?,
         };
 
-        let certificate_fingerprint = certs
-            .first()
-            .map(crate::tls::fingerprint)
-            .unwrap_or([0u8; 32]);
+        let certificate_fingerprint = certs.first().map(crate::tls::fingerprint);
 
         if self.allow_tls12 && self.authenticator.is_some() {
             return Err(RastcpError::AuthenticationError(
@@ -470,8 +561,8 @@ impl TcpServerBuilder {
         info!("Server built to listen on {}:{}", self.addr, self.port);
 
         Ok(TcpServer {
-            listener: tokio_listener,
-            acceptor,
+            listener: Listener::Tcp(tokio_listener),
+            acceptor: Some(acceptor),
             max_connections,
             current_connections: Arc::new(CacheGuard::new(std::sync::atomic::AtomicUsize::new(0))),
             connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
@@ -563,9 +654,15 @@ impl TcpServer {
     /// SHA-256 of the certificate this server presents.
     ///
     /// What the other nodes pin. Printed at start-up so setting a cluster up
-    /// does not need a detour through `openssl`.
-    pub fn certificate_fingerprint(&self) -> Fingerprint {
+    /// does not need a detour through `openssl`. `None` for a server on a unix
+    /// socket, which presents no certificate.
+    pub fn certificate_fingerprint(&self) -> Option<Fingerprint> {
         self.certificate_fingerprint
+    }
+
+    /// What this server listens on: `host:port`, or `unix:<path>`.
+    pub fn local_endpoint(&self) -> String {
+        self.listener.describe()
     }
 
     /// Hands out a trigger for a graceful shutdown of this server.
@@ -602,7 +699,7 @@ impl TcpServer {
 
             accepted = tokio::time::timeout(ACCEPT_POLL_INTERVAL, self.listener.accept()) => {
                 match accepted {
-                    Ok(Ok((stream, addr))) => AcceptStep::Connection(stream, addr),
+                    Ok(Ok((stream, peer))) => AcceptStep::Connection(stream, peer),
                     Ok(Err(e)) => {
                         error!("Failed to accept connection: {}", e);
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -678,7 +775,7 @@ impl TcpServer {
     /// quietly be written without them.
     async fn accept_loop<S, Fut>(&self, serve: S) -> Result<(), RastcpError>
     where
-        S: Fn(TcpStream, StopListener) -> Fut + Send + Sync,
+        S: Fn(Accepted, Peer, StopListener) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let mut shutdown = self.stop.listen();
@@ -719,7 +816,7 @@ impl TcpServer {
             }
 
             let (stream, addr) = match self.next_connection(&mut shutdown).await {
-                AcceptStep::Connection(stream, addr) => (stream, addr),
+                AcceptStep::Connection(stream, peer) => (stream, peer),
                 AcceptStep::Retry => continue,
                 AcceptStep::Shutdown => break,
             };
@@ -735,7 +832,7 @@ impl TcpServer {
             let current = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!("Active connections: {}", current + 1);
 
-            let connection = serve(stream, connection_shutdown);
+            let connection = serve(stream, addr, connection_shutdown);
 
             // Given back when the task ends, however it ends. A handler that
             // panics unwinds this task, and a count decremented only on the
@@ -773,7 +870,7 @@ impl TcpServer {
         let inline_handlers = self.inline_handlers;
         let authenticator = self.authenticator.clone();
 
-        self.accept_loop(move |stream, connection_shutdown| {
+        self.accept_loop(move |stream, peer, connection_shutdown| {
             let acceptor = acceptor.clone();
             let handler = handler.clone();
             let authenticator = authenticator.clone();
@@ -781,6 +878,7 @@ impl TcpServer {
             async move {
                 if let Err(e) = Self::serve_connection(
                     stream,
+                    peer,
                     acceptor,
                     handshake_timeout,
                     auth_timeout,
@@ -876,10 +974,10 @@ impl TcpServer {
     /// cannot reach the request loop without a principal, because the only way
     /// past this function is a principal or an error.
     async fn authenticate_connection(
-        tls_stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+        tls_stream: &mut ServerStream,
         authenticator: Option<&Arc<dyn ServerAuthenticator>>,
         auth_timeout: Duration,
-        peer_addr: SocketAddr,
+        peer_addr: Peer,
     ) -> Result<Principal, RastcpError> {
         let Some(authenticator) = authenticator else {
             return Ok(Principal::anonymous());
@@ -888,7 +986,7 @@ impl TcpServer {
         // Derived before the stream is borrowed mutably, and derived at all
         // because an exchange that cannot bind itself to this connection must
         // fail rather than run unbound.
-        let binding = crate::session::channel_binding_from(tls_stream.get_ref().1)?;
+        let binding = tls_stream.channel_binding()?;
 
         let mut channel = AuthChannel::new(tls_stream, auth_timeout, binding, peer_addr);
 
@@ -908,7 +1006,7 @@ impl TcpServer {
     async fn send_replies(
         guard: &mut Guard,
         writer: &mut FrameWriter,
-        tls_stream: &mut ServerTls,
+        tls_stream: &mut ServerStream,
     ) -> Result<(), RastcpError> {
         if writer.is_empty() {
             return Ok(());
@@ -923,7 +1021,7 @@ impl TcpServer {
     /// Records why a connection stopped yielding requests, at the level each
     /// reason deserves: a peer hanging up is ordinary, a malformed stream is
     /// not.
-    fn log_read_end(peer_addr: SocketAddr, e: RastcpError) {
+    fn log_read_end(peer_addr: Peer, e: RastcpError) {
         match e {
             RastcpError::ConnectionClosed => {
                 info!("Connection closed by peer: {}", peer_addr);
@@ -943,9 +1041,9 @@ impl TcpServer {
     /// The request loop of a plain (`rastcp/1`) connection: requests are
     /// handled one at a time, and answered in the order they arrived.
     async fn serve_in_order<H, Fut>(
-        tls_stream: &mut ServerTls,
+        tls_stream: &mut ServerStream,
         guard: &mut Guard,
-        peer_addr: SocketAddr,
+        peer_addr: Peer,
         principal: Arc<Principal>,
         handler: &H,
         max_message_size: usize,
@@ -1073,7 +1171,7 @@ impl TcpServer {
     async fn reply(
         guard: &mut Guard,
         writer: &mut FrameWriter,
-        tls_stream: &mut ServerTls,
+        tls_stream: &mut ServerStream,
         tag: Tag,
         payload: &[u8],
     ) -> Result<(), RastcpError> {
@@ -1093,7 +1191,7 @@ impl TcpServer {
     /// Finished handlers first: a reply that is ready is a caller waiting.
     fn poll_event(
         reader: &mut FrameReader,
-        tls_stream: &mut ServerTls,
+        tls_stream: &mut ServerStream,
         in_flight: &mut InFlight,
         cx: &mut std::task::Context<'_>,
         reading: bool,
@@ -1129,9 +1227,9 @@ impl TcpServer {
     /// good idea.
     #[allow(clippy::too_many_arguments)]
     async fn serve_multiplexed<H, Fut>(
-        tls_stream: &mut ServerTls,
+        tls_stream: &mut ServerStream,
         guard: &mut Guard,
-        peer_addr: SocketAddr,
+        peer_addr: Peer,
         principal: Arc<Principal>,
         handler: &H,
         max_message_size: usize,
@@ -1335,10 +1433,98 @@ impl TcpServer {
 
     }
 
+    /// Opens a TCP connection's TLS, or reads a unix connection's preamble:
+    /// either way, what the connection is and which protocol it speaks.
+    /// `None` when it was not opened properly, which has been logged.
+    async fn open_connection(
+        stream: Accepted,
+        peer: Peer,
+        acceptor: Option<TlsAcceptor>,
+        handshake_timeout: Duration,
+    ) -> Option<(ServerStream, Version)> {
+        match stream {
+            Accepted::Tcp(stream) => {
+                // Disable Nagle's algorithm on the accepted connection. Linux
+                // does NOT inherit TCP_NODELAY from the listener, so without
+                // this an idle reused connection waits ~40 ms for the
+                // delayed-ACK timer before the server's response is flushed.
+                let _ = stream.set_nodelay(true);
+
+                let Some(acceptor) = acceptor else {
+                    error!("A TCP connection from {} reached a server with no TLS", peer);
+                    return None;
+                };
+
+                debug!("Accepting TLS connection from {}", peer);
+
+                // Apply timeout to TLS handshake to prevent hanging connections
+                let tls_stream =
+                    match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => tls_stream,
+                        Ok(Err(e)) => {
+                            error!("TLS handshake failed with {}: {}", peer, e);
+                            return None;
+                        }
+                        Err(_) => {
+                            error!("TLS handshake timed out with {}", peer);
+                            return None;
+                        }
+                    };
+                debug!("TLS handshake completed with {}", peer);
+
+                // The handshake settled which protocol this connection speaks.
+                let version = if tls_stream.get_ref().1.alpn_protocol() == Some(ALPN_MULTIPLEXED) {
+                    Version::Multiplexed
+                } else {
+                    Version::Plain
+                };
+
+                Some((ServerStream::Tls(tls_stream), version))
+            }
+            #[cfg(unix)]
+            Accepted::Unix(mut stream) => {
+                use tokio::io::AsyncReadExt;
+
+                // What the TLS handshake would have named: which protocol the
+                // client speaks. Under the same timeout, so a connection that
+                // says nothing does not hold its slot.
+                let mut preamble = [0u8; PREAMBLE_LEN];
+                let read =
+                    tokio::time::timeout(handshake_timeout, stream.read_exact(&mut preamble))
+                        .await;
+
+                match read {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        debug!("{} closed before naming a protocol: {}", peer, e);
+                        return None;
+                    }
+                    Err(_) => {
+                        error!("{} did not name a protocol in time", peer);
+                        return None;
+                    }
+                }
+
+                match Version::from_identifier(&preamble) {
+                    Some(version) => Some((ServerStream::Unix(stream), version)),
+                    None => {
+                        warn!(
+                            "{} opened with {:?}, which is not a protocol this server speaks",
+                            peer,
+                            String::from_utf8_lossy(&preamble)
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     /// One accepted socket, from handshake to close.
     async fn serve_connection<H, Fut>(
-        stream: TcpStream,
-        acceptor: TlsAcceptor,
+        stream: Accepted,
+        peer_addr: Peer,
+        acceptor: Option<TlsAcceptor>,
         handshake_timeout: Duration,
         auth_timeout: Duration,
         request_timeout: Duration,
@@ -1353,36 +1539,11 @@ impl TcpServer {
         H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
-        // Disable Nagle's algorithm on the accepted connection. Linux does
-        // NOT inherit TCP_NODELAY from the listener, so without this an
-        // idle reused connection waits ~40 ms for the delayed-ACK timer
-        // before the server's response is flushed.
-        let _ = stream.set_nodelay(true);
-
-        let peer_addr = match stream.peer_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                error!("Failed to get peer address: {}", e);
-                return Err(RastcpError::Io(e));
-            }
+        let Some((mut tls_stream, version)) =
+            Self::open_connection(stream, peer_addr, acceptor, handshake_timeout).await
+        else {
+            return Ok(());
         };
-        debug!("Accepting TLS connection from {}", peer_addr);
-
-        // Apply timeout to TLS handshake to prevent hanging connections
-        let mut tls_stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
-            .await
-        {
-            Ok(Ok(tls_stream)) => tls_stream,
-            Ok(Err(e)) => {
-                error!("TLS handshake failed with {}: {}", peer_addr, e);
-                return Ok(());
-            }
-            Err(_) => {
-                error!("TLS handshake timed out with {}", peer_addr);
-                return Ok(());
-            }
-        };
-        debug!("TLS handshake completed with {}", peer_addr);
 
         let principal = match Self::authenticate_connection(
             &mut tls_stream,
@@ -1414,8 +1575,7 @@ impl TcpServer {
         // place of a timer per read, per handler call and per write.
         let mut guard = Guard::new(shutdown, request_timeout);
 
-        // The handshake settled which protocol this connection speaks.
-        if tls_stream.get_ref().1.alpn_protocol() == Some(ALPN_MULTIPLEXED) {
+        if version == Version::Multiplexed {
             Self::serve_multiplexed(
                 &mut tls_stream,
                 &mut guard,
@@ -1459,9 +1619,6 @@ impl Drop for OpenConnection {
         debug!("Connection closed. Active connections: {}", remaining);
     }
 }
-
-/// A server-side TLS connection.
-type ServerTls = tokio_rustls::server::TlsStream<TcpStream>;
 
 /// The handlers of one multiplexed connection that are running as tasks: each
 /// yields the id of its request and its reply, or `None` if it ran out of

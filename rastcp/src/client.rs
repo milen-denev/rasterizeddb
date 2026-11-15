@@ -9,14 +9,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::TlsConnector;
 
 use crate::mux::MuxClient;
-use crate::{ALPN_MULTIPLEXED, ALPN_PROTOCOL};
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
 use crate::frame::{FrameReader, FrameWriter};
 use crate::interrupt::Deadline;
+use crate::net::{ClientStream, Endpoint, Version};
 use crate::session::{AuthChannel, ClientAuthenticator};
 use crate::tls::{ClientIdentity, Trust};
 
@@ -103,8 +103,13 @@ pub struct TcpClient {
 /// a client keeps so it can open the connection again.
 pub(crate) struct Dialer {
     addr: String,
-    connector: TlsConnector,
-    server_name: ServerName<'static>,
+    endpoint: Endpoint,
+    /// What a TCP connection's TLS is opened with. `None` for a unix socket,
+    /// which carries none.
+    tls: Option<(TlsConnector, ServerName<'static>)>,
+    /// The protocol this client speaks: offered in the TLS handshake, or as
+    /// the preamble on a unix socket.
+    version: Version,
     pub(crate) timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
     auth_timeout: std::time::Duration,
@@ -236,7 +241,7 @@ impl TcpClientBuilder {
 
     pub async fn build(self) -> Result<TcpClient, RastcpError> {
         Ok(TcpClient {
-            dialer: self.dialer(ALPN_PROTOCOL)?,
+            dialer: self.dialer(Version::Plain)?,
             connection: None,
         })
     }
@@ -247,12 +252,42 @@ impl TcpClientBuilder {
     /// Must be called, and the client used, inside a Tokio runtime: the
     /// connection is driven by a task of its own.
     pub async fn build_multiplexed(self) -> Result<MuxClient, RastcpError> {
-        Ok(MuxClient::new(self.dialer(ALPN_MULTIPLEXED)?))
+        Ok(MuxClient::new(self.dialer(Version::Multiplexed)?))
     }
 
     /// The TLS configuration and limits this builder describes, offering
     /// `alpn` as the protocol to speak.
-    fn dialer(self, alpn: &[u8]) -> Result<Dialer, RastcpError> {
+    fn dialer(self, version: Version) -> Result<Dialer, RastcpError> {
+        let endpoint = Endpoint::parse(&self.addr)?;
+
+        #[cfg(unix)]
+        if let Endpoint::Unix(_) = endpoint {
+            // A unix socket carries no TLS, so nothing can be verified or
+            // presented through it. A client that asked for either is refused
+            // rather than connected without what it asked for.
+            if self.trust.is_some() || self.verify_certificate || self.identity.is_some() {
+                return Err(RastcpError::CertificateLoading(
+                    "a unix socket carries no TLS: a server certificate cannot be checked over \
+                     one, nor a client certificate presented"
+                        .to_string(),
+                ));
+            }
+
+            return Ok(Dialer {
+                addr: self.addr,
+                endpoint,
+                tls: None,
+                version,
+                timeout: self.timeout,
+                authenticator: self.authenticator,
+                auth_timeout: self.auth_timeout,
+                max_message_size: self.max_message_size,
+                max_in_flight: self.max_in_flight,
+                reconnect_when_idle_closed: self.reconnect_when_idle_closed,
+            });
+        }
+
+        let alpn = version.identifier();
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // `trust` when given; otherwise the older boolean, which chose between
@@ -334,8 +369,9 @@ impl TcpClientBuilder {
 
         Ok(Dialer {
             addr: self.addr,
-            connector: TlsConnector::from(Arc::new(config)),
-            server_name,
+            endpoint,
+            tls: Some((TlsConnector::from(Arc::new(config)), server_name)),
+            version,
             timeout: self.timeout,
             authenticator: self.authenticator,
             auth_timeout: self.auth_timeout,
@@ -352,7 +388,7 @@ impl TcpClientBuilder {
 /// request half written and a timer armed for the old socket are all wrong for
 /// the connection that replaces it.
 struct Connection {
-    stream: TlsStream<TcpStream>,
+    stream: ClientStream,
     reader: FrameReader,
     writer: FrameWriter,
     /// The one timer behind every timeout on this connection. Made with it,
@@ -503,7 +539,7 @@ impl<B: AsRef<[u8]>> Pump<'_, B> {
     /// the stream is; ready once every request has been written and flushed.
     fn poll_send(
         &mut self,
-        stream: &mut TlsStream<TcpStream>,
+        stream: &mut ClientStream,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), RastcpError>> {
         loop {
@@ -559,7 +595,7 @@ impl<B: AsRef<[u8]>> Pump<'_, B> {
     /// Moves the batch along. Ready once more responses are in than `before`.
     fn poll_progress(
         &mut self,
-        stream: &mut TlsStream<TcpStream>,
+        stream: &mut ClientStream,
         cx: &mut Context<'_>,
         before: usize,
     ) -> Poll<Result<(), RastcpError>> {
@@ -598,13 +634,43 @@ impl<B: AsRef<[u8]>> Pump<'_, B> {
 impl Dialer {
     /// Opens a connection: TCP, the TLS handshake, then the credential
     /// exchange if this client was given credentials.
-    pub(crate) async fn open(&self) -> Result<TlsStream<TcpStream>, RastcpError> {
-        let stream = match self.timeout {
-            Some(timeout) => tokio::time::timeout(timeout, TcpStream::connect(&self.addr))
-                .await
-                .map_err(|_| RastcpError::ConnectionTimeout)??,
-            None => TcpStream::connect(&self.addr).await?,
+    pub(crate) async fn open(&self) -> Result<ClientStream, RastcpError> {
+        let mut stream = match &self.endpoint {
+            Endpoint::Tcp(addr) => self.open_tcp(addr).await?,
+            #[cfg(unix)]
+            Endpoint::Unix(path) => self.open_unix(path).await?,
         };
+
+        self.authenticate(&mut stream).await?;
+
+        Ok(stream)
+    }
+
+    /// Runs `step` under this client's timeout, if it has one.
+    async fn bounded<T, F>(&self, step: F, timed_out: RastcpError) -> Result<T, RastcpError>
+    where
+        F: Future<Output = Result<T, RastcpError>>,
+    {
+        match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, step).await.map_err(|_| timed_out)?,
+            None => step.await,
+        }
+    }
+
+    /// TCP, then the TLS handshake, which names the protocol.
+    async fn open_tcp(&self, addr: &str) -> Result<ClientStream, RastcpError> {
+        let Some((connector, server_name)) = self.tls.as_ref() else {
+            return Err(RastcpError::CertificateLoading(
+                "this client has no TLS configuration for a TCP address".to_string(),
+            ));
+        };
+
+        let stream = self
+            .bounded(
+                async { Ok(TcpStream::connect(addr).await?) },
+                RastcpError::ConnectionTimeout,
+            )
+            .await?;
 
         // Disable Nagle's algorithm: small request/response RPCs over a
         // long-lived connection otherwise hit Linux's ~40 ms
@@ -613,24 +679,39 @@ impl Dialer {
 
         info!("Connected to {}", self.addr);
 
-        let mut tls_stream = match self.timeout {
-            Some(timeout) => tokio::time::timeout(
-                timeout,
-                self.connector.connect(self.server_name.clone(), stream),
+        let tls_stream = self
+            .bounded(
+                async { Ok(connector.connect(server_name.clone(), stream).await?) },
+                RastcpError::TlsHandshakeTimeout,
             )
-            .await
-            .map_err(|_| RastcpError::TlsHandshakeTimeout)??,
-            None => {
-                self.connector
-                    .connect(self.server_name.clone(), stream)
-                    .await?
-            }
-        };
+            .await?;
         debug!("TLS connection established");
 
-        self.authenticate(&mut tls_stream).await?;
+        Ok(ClientStream::Tls(tls_stream))
+    }
 
-        Ok(tls_stream)
+    /// The socket, then the preamble that names the protocol in place of the
+    /// TLS handshake.
+    #[cfg(unix)]
+    async fn open_unix(&self, path: &std::path::Path) -> Result<ClientStream, RastcpError> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = self
+            .bounded(
+                async { Ok(tokio::net::UnixStream::connect(path).await?) },
+                RastcpError::ConnectionTimeout,
+            )
+            .await?;
+
+        info!("Connected to {}", self.addr);
+
+        self.bounded(
+            async { Ok(stream.write_all(self.version.identifier()).await?) },
+            RastcpError::ConnectionTimeout,
+        )
+        .await?;
+
+        Ok(ClientStream::Unix(stream))
     }
 
     /// Presents credentials, if this client was given any.
@@ -641,18 +722,18 @@ impl Dialer {
     /// unauthenticated session.
     async fn authenticate(
         &self,
-        tls_stream: &mut TlsStream<TcpStream>,
+        tls_stream: &mut ClientStream,
     ) -> Result<(), RastcpError> {
         let Some(authenticator) = self.authenticator.as_ref() else {
             return Ok(());
         };
 
-        let binding = crate::session::channel_binding_from(tls_stream.get_ref().1)?;
-        let peer = tls_stream
-            .get_ref()
-            .0
-            .peer_addr()
-            .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        let binding = tls_stream.channel_binding()?;
+        let peer = tls_stream.peer().ok_or_else(|| {
+            RastcpError::AuthenticationError(
+                "the connection closed before it could be authenticated".to_string(),
+            )
+        })?;
 
         let mut channel = AuthChannel::new(tls_stream, self.auth_timeout, binding, peer);
 

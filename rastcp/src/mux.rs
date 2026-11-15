@@ -34,15 +34,14 @@ use std::task::{Context, Poll, Waker};
 
 use log::{debug, warn};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use tokio_rustls::client::TlsStream;
 
 use crate::client::Dialer;
 use crate::error::RastcpError;
 use crate::frame::{FrameReader, FrameWriter, KIND_DATA, KIND_FAILED, KIND_TIMED_OUT, Tag};
 use crate::interrupt::Deadline;
+use crate::net::ClientStream;
 
 /// How many responses the connection's task takes off the wire before it
 /// stops to hand them out. Bounds what it holds, not what a connection can
@@ -416,7 +415,7 @@ impl Shared {
 
 /// The task that owns a connection: writes what callers queue, reads what the
 /// server answers, and times out what it does not.
-async fn drive(shared: Arc<Shared>, mut stream: TlsStream<TcpStream>, epoch: u64) {
+async fn drive(shared: Arc<Shared>, mut stream: ClientStream, epoch: u64) {
     let mut link = Link {
         epoch,
         reader: FrameReader::tagged(),
@@ -501,7 +500,7 @@ impl Link {
     fn poll(
         &mut self,
         shared: &Shared,
-        stream: &mut TlsStream<TcpStream>,
+        stream: &mut ClientStream,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), RastcpError>> {
         loop {

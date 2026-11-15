@@ -29,7 +29,6 @@
 
 use std::fmt;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -37,6 +36,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::common::{read_message_limited_timeout, write_message_timeout};
 use crate::error::RastcpError;
+use crate::net::Peer;
 
 /// Cap on a single authentication message.
 ///
@@ -53,6 +53,17 @@ pub const CHANNEL_BINDING_LEN: usize = 32;
 /// The value that identifies one TLS connection to the exchange running inside
 /// it. See [`AuthChannel::channel_binding`].
 pub type ChannelBinding = [u8; CHANNEL_BINDING_LEN];
+
+/// What an exchange on a unix socket binds itself to, in place of the TLS
+/// exporter a unix socket does not have.
+///
+/// Channel binding is there to stop a man in the middle relaying an exchange
+/// onto a connection of his own. A unix socket has no middle to stand in:
+/// who may connect to it is decided by the socket file's permissions, and the
+/// kernel names the process at each end. The exchange still mixes this in,
+/// so a proof made on a unix socket is never one that verifies on a TLS
+/// connection, where the binding is that connection's exporter.
+pub const UNIX_CHANNEL_BINDING: ChannelBinding = *b"rastcp unix socket: no exporter.";
 
 /// Who a connection turned out to belong to.
 ///
@@ -120,7 +131,7 @@ pub struct AuthChannel<'a> {
     io: &'a mut dyn AuthIo,
     timeout: Duration,
     binding: ChannelBinding,
-    peer: SocketAddr,
+    peer: Peer,
 }
 
 impl<'a> AuthChannel<'a> {
@@ -128,7 +139,7 @@ impl<'a> AuthChannel<'a> {
         io: &'a mut dyn AuthIo,
         timeout: Duration,
         binding: ChannelBinding,
-        peer: SocketAddr,
+        peer: Peer,
     ) -> Self {
         Self {
             io,
@@ -161,8 +172,10 @@ impl<'a> AuthChannel<'a> {
         &self.binding
     }
 
-    /// Where the caller is dialling from, for rate limiting and logs.
-    pub fn peer_addr(&self) -> SocketAddr {
+    /// Who is at the other end: an address for a TCP caller, and for a caller
+    /// on a unix socket the user and process the kernel reports — which an
+    /// exchange can rely on, because the caller did not say it.
+    pub fn peer(&self) -> Peer {
         self.peer
     }
 }
