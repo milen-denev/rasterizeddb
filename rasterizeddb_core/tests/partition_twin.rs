@@ -2883,8 +2883,10 @@ fn run_twin_seed(cfg: &Config, seed: u64) {
         assert_eq!(in_root, Vec::<String>::new(), "{label}: partition files in the root of a store run");
     }
     // Spread mode compared something only if partitions really were dealt
-    // to the second location.
-    if let Some(disk) = server.extra_dirs.first() {
+    // to the second location. Not on a store run: a table placed on a store
+    // keeps every partition there (docs/kv-partitions.md §1), and the store
+    // checks above stand in for this one.
+    if let Some(disk) = server.extra_dirs.first().filter(|_| kv_dir.is_none()) {
         let spread = std::fs::read_dir(disk)
             .expect("the second location")
             .flatten()
