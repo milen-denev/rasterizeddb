@@ -40,7 +40,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(String::as_str) {
-        Some("server") => server(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
+        Some("server") => match args.get(2).and_then(|a| a.strip_prefix("unix:")) {
+            Some(path) => server_unix(path.to_string(), arg(&args, 3, 4usize)),
+            None => server(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
+        },
         Some("server-percore") => server_per_core(arg(&args, 2, 7878u16), arg(&args, 3, 4usize)),
         Some("client") => client(
             args.get(2)
@@ -87,6 +90,23 @@ fn server(port: u16, threads: usize) {
             .expect("server");
 
         println!("listening on 127.0.0.1:{port} with {threads} worker thread(s)");
+
+        server.run(|data| async move { data }).await.expect("run");
+    });
+}
+
+/// The echo server on a unix socket: `server unix:<path> <threads>`, and a
+/// client address of `unix:<path>`.
+fn server_unix(path: String, threads: usize) {
+    runtime(threads).block_on(async move {
+        let server = TcpServerBuilder::unix(&path)
+            .max_connections(4096)
+            .inline_handlers(std::env::var("RASTCP_BENCH_INLINE").as_deref() != Ok("0"))
+            .build()
+            .await
+            .expect("server");
+
+        println!("listening on unix:{path} with {threads} worker thread(s)");
 
         server.run(|data| async move { data }).await.expect("run");
     });
