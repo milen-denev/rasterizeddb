@@ -214,3 +214,88 @@ fn a_partitioned_table_on_a_store_answers_like_a_plain_one() {
     assert!(files_starting(dir.path(), &format!("__pt_{uid:016x}_")).is_empty(), "DROP left files in the root");
     assert!(started.elapsed() < Duration::from_secs(300), "the run took {:?}", started.elapsed());
 }
+
+/// Bytes of every object under `dir`, recursively.
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => tree_bytes(&e.path()),
+            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Err(_) => 0,
+        })
+        .sum()
+}
+
+/// What a logger does to these tables: additive upserts into counters, a
+/// retention DELETE of most rows, then `VACUUM FULL`. The answers stay a plain
+/// twin's through the compaction and a restart, and the compaction gives the
+/// store its bytes back (the truncation deletes the chunk objects past the new
+/// end).
+#[test]
+fn vacuum_full_on_a_store_compacts_and_keeps_the_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = tempfile::tempdir().unwrap();
+    let mut server = Server::start(dir.path().to_str().unwrap());
+    let started = Instant::now();
+    {
+        let mut c = server.connect();
+        c.ok(&format!(
+            "STORAGE ADD STORE logs DIRECTORY WITH (PATH = '{}', PREFIX = 'logs', CHUNK_SIZE = '64KiB', PAGE_SIZE = '16KiB', MAX_DELTAS = '4', COMPACT_CHUNK_BYTES = '8KiB')",
+            kv.path().display()
+        ));
+        c.ok(&format!("STORAGE PLACE TABLE {P} AT 'kv:logs'"));
+        c.ok(&format!("CREATE TABLE {P} {COLUMNS} PARTITION BY HASH (domain) PARTITIONS 4"));
+        c.ok(&format!("CREATE TABLE {Q} {COLUMNS}"));
+        // Additive upserts: the counter a charge accumulates into.
+        for round in 0..3 {
+            for (i, d) in DOMAINS.iter().enumerate() {
+                both(
+                    &mut c,
+                    &format!(
+                        "INSERT INTO {{t}} (domain, ts, seq, path) VALUES ('{d}', 1, 0, '{}') \
+                         ON CONFLICT (domain, ts, seq) DO UPDATE SET path = {{t}}.path || EXCLUDED.path",
+                        i + round
+                    ),
+                );
+            }
+        }
+        compare_reads(&mut c, "after the additive upserts");
+        // A log's worth of rows, most of which retention then deletes.
+        let filler = "x".repeat(200);
+        for batch in 0..20 {
+            let values: Vec<String> = (0..100)
+                .map(|i| format!("('{}', {}, {}, '{filler}')", DOMAINS[i % 6], 100 + batch * 100 + i, i % 2))
+                .collect();
+            both(&mut c, &format!("INSERT INTO {{t}} (domain, ts, seq, path) VALUES {}", values.join(", ")));
+        }
+        compare_reads(&mut c, "after the log rows");
+    }
+    let before = tree_bytes(kv.path());
+    {
+        let mut c = server.connect();
+        both(&mut c, "DELETE FROM {t} WHERE ts >= 100 AND ts < 1900");
+        c.ok(&format!("VACUUM FULL {P}"));
+        c.ok(&format!("VACUUM FULL {Q}"));
+        compare_reads(&mut c, "after the retention delete and VACUUM FULL");
+        both(&mut c, "INSERT INTO {t} (domain, ts, seq, path) VALUES ('a.example', 50000, 0, '/after-full')");
+        both(&mut c, "UPDATE {t} SET path = '/upd' WHERE domain = 'b.example' AND ts >= 1900");
+        compare_reads(&mut c, "writes after VACUUM FULL");
+    }
+    // The truncation's deletes and the store's compaction run behind the
+    // statement; give them a bounded while.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut after = tree_bytes(kv.path());
+    while after * 2 > before && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        after = tree_bytes(kv.path());
+    }
+    assert!(after * 2 <= before, "VACUUM FULL left the store at {after} bytes of {before}");
+    server = server.restart();
+    {
+        let mut c = server.connect();
+        compare_reads(&mut c, "after VACUUM FULL and a restart");
+    }
+    assert!(started.elapsed() < Duration::from_secs(300), "the run took {:?}", started.elapsed());
+}
