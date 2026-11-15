@@ -70,9 +70,8 @@ use super::layout::{self, DeltaBatch, Meta, Record, RecordKind};
 use super::overlay::Overlay;
 use super::store::KvStore;
 
-/// What a file's snapshot sidecar is named after it: `<name>.ixs`, in the
-/// same family (docs/kv-partitions.md §2).
-pub const SIDECAR_SUFFIX: &str = ".ixs";
+/// What a file's snapshot sidecar is named after it.
+pub const SIDECAR_SUFFIX: &str = super::super::traits::KV_SIDECAR_SUFFIX;
 
 /// How the provider trades requests, bandwidth and memory against each other.
 #[derive(Clone, Debug)]

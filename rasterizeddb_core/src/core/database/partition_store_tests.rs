@@ -324,13 +324,26 @@ async fn the_reaper_drops_a_store_leftover() {
         let name = format!("{}.db", files::data_stem(uid, unplaced));
         let file = store.create_fresh(&name).await.unwrap();
         file.write_data(0, b"leftover").await;
+        // And an index-snapshot sidecar whose file is gone (§2): of another
+        // unmaterialized partition, with no data file beside it.
+        let orphan_pid = (0..8u32).rev().find(|p| !materialized.contains(p) && *p != unplaced).unwrap();
+        let orphan = format!("{}.db.ixs", files::data_stem(uid, orphan_pid));
+        let side = store.create_fresh(&orphan).await.unwrap();
+        side.write_data(0, b"stale snapshot").await;
     }
+    let orphan_dir = || {
+        files_in(&store_files(&d))
+            .into_iter()
+            .any(|n| n.ends_with(".db.ixs") && holds_objects(&store_files(&d).join(&n)))
+    };
+    assert!(orphan_dir(), "the orphan sidecar was not stored");
     assert!(store_pids(&d, uid).contains(&unplaced));
     drop(t);
     close(db, &d);
 
     let db = open(&d).await;
     eventually("the leftover is dropped", || !store_pids(&d, uid).contains(&unplaced)).await;
+    eventually("the orphan sidecar is dropped", || !orphan_dir()).await;
     assert_eq!(store_pids(&d, uid), materialized, "the reaper dropped a materialized partition");
     let t = partitioned(&db, "acct");
     assert_eq!(count(&t).await, 1);

@@ -382,6 +382,10 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
     }
 }
 
+/// What a key/value file's snapshot sidecar is named after it: `<name>.ixs`,
+/// in the same family (docs/kv-partitions.md §2).
+pub const KV_SIDECAR_SUFFIX: &str = ".ixs";
+
 /// A key/value file's durable state, as a snapshot of the indexes over it
 /// records it (docs/kv-partitions.md §2). Every record stored for the file
 /// takes the next sequence, and a compaction or a new generation moves one

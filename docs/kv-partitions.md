@@ -284,7 +284,10 @@ partitions'.
 - **Drop.** `KvStorageProvider::drop_io` drops the file's sidecar with it,
   synchronously (a registered sidecar is dropped, a recovered one swept),
   so its sweep is recorded in `pending` before the drop returns: a sidecar
-  never outlives its file to describe a later one of the same name.
+  never outlives its file to describe a later one of the same name. Should
+  a lost sweep record leave one anyway, a partition's create drops its
+  pid's sidecars with its other leftover names, and the store reaper drops
+  a sidecar whose file does not stand.
 - **INDEX sections** are written and loaded only under
   `index_snapshot.index_storage = snapshot` (`--index-storage snapshot`),
   as for file sets; the FILTER section always.

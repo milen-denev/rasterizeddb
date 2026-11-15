@@ -364,7 +364,20 @@ pub(super) async fn reap_stores_at_startup(
                 }
             };
             let store = KvPartStore::new(store_named, family);
-            for name in store.names().await {
+            let names = store.names().await;
+            for name in &names {
+                // A partition file's index-snapshot sidecar whose file is
+                // gone (docs/kv-partitions.md §2): dropped with its file as a
+                // rule, so only a lost sweep record leaves one.
+                if let Some(base) = name.strip_suffix(crate::core::storage_providers::traits::KV_SIDECAR_SUFFIX)
+                    && files::parse_name(base).is_some()
+                    && names.binary_search_by(|n| n.as_str().cmp(base)).is_err()
+                {
+                    store.remove(name).await;
+                    report.deleted.push(format!("{spec}/{name}"));
+                }
+            }
+            for name in names {
                 let Some(file) = files::parse_name(&name) else { continue };
                 let doomed = match live.get(&file.uid()) {
                     Some(Ok(map)) => match file {

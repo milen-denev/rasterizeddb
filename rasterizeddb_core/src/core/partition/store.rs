@@ -142,6 +142,14 @@ fn partition_names(uid: u64, pid: u32) -> Vec<String> {
     names.extend(files::OPTIONAL_SUFFIXES.iter().map(|s| format!("{stem}{s}")));
     let tmps: Vec<String> = names.iter().map(|n| format!("{n}.tmp")).collect();
     names.extend(tmps);
+    // The data files' index-snapshot sidecars (§2). Dropped with their file,
+    // so normally gone already; one a lost sweep record left behind would
+    // otherwise describe the file made next under its name.
+    let sidecars: Vec<String> = files::data_files(uid, pid)
+        .iter()
+        .map(|n| format!("{n}{}", crate::core::storage_providers::traits::KV_SIDECAR_SUFFIX))
+        .collect();
+    names.extend(sidecars);
     names
 }
 
