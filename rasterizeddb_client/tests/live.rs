@@ -391,3 +391,61 @@ async fn peer_login_names_this_process_user() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_over_the_message_limit_fails_whole() {
+    bounded(async {
+        let Some(server) = server("limit", "trust").await else {
+            return;
+        };
+        let client = connect(&server, 1).await;
+        client
+            .run("CREATE TABLE big (id BIGINT NOT NULL, body BYTEA, PRIMARY KEY (id))")
+            .await
+            .unwrap();
+        let body = vec![0xabu8; 128 * 1024];
+        for id in 0..80i64 {
+            client
+                .execute(
+                    "INSERT INTO big (id, body) VALUES ($1, $2)",
+                    &[Param::I64(id), Param::Bytes(&body)],
+                )
+                .await
+                .unwrap();
+        }
+        // 80 x 128 KiB = 10 MiB of answer, past the default 8 MiB.
+        match client.run("SELECT id, body FROM big").await {
+            Err(e) => {
+                assert!(e.is_transport(), "{e}");
+                eprintln!("over the default limit: {e}");
+            }
+            Ok(rows) => panic!(
+                "a 10 MiB answer under an 8 MiB limit returned {} rows",
+                rows.len()
+            ),
+        }
+        // The refusal costs the connection (the client drops it mid-answer),
+        // and the next statement goes out on a new one.
+        let rows = client.query("SELECT count(*) FROM big", &[]).await.unwrap();
+        assert_eq!(rows.get(0).unwrap().get_i64(0).unwrap(), 80);
+
+        // The limit is the client's: the server sends an answer of any size,
+        // and a client that accepts more gets all of it.
+        let roomy = Client::connect(
+            &server.socket,
+            Options {
+                max_message_size: 32 * 1024 * 1024,
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
+        let rows = roomy.run("SELECT id, body FROM big").await.unwrap();
+        assert_eq!(rows.len(), 80);
+        assert!(
+            rows.iter()
+                .all(|r| r.get_bytes(1).unwrap() == body.as_slice())
+        );
+    })
+    .await;
+}

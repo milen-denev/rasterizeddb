@@ -20,9 +20,12 @@ pub struct Options {
     /// handshake. `None` waits indefinitely.
     pub timeout: Option<Duration>,
     pub login: Login,
-    /// The largest answer accepted, in bytes. Rastcp's default is 8 MiB; an
-    /// answer larger than this fails rather than arriving cut short, so page a
-    /// large read (`ORDER BY … LIMIT`) instead of raising this far.
+    /// The largest answer accepted, in bytes (rastcp's default, 8 MiB). The
+    /// limit is this side's: the server sends an answer of any size. One past
+    /// it fails whole with [`Error::Transport`], never arriving cut short, and
+    /// costs the connection, which the next statement reopens. Raise it for a
+    /// big read, or page the read (`ORDER BY … LIMIT`); the whole answer is
+    /// held in memory either way.
     pub max_message_size: usize,
 }
 
