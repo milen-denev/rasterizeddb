@@ -34,10 +34,15 @@ impl<M, T> fmt::Debug for Column<M, T> {
 }
 
 impl<M, T> Column<M, T> {
+    /// The column named `name`. The derive declares these; write one by hand for a column a model does not map.
     pub const fn new(name: &'static str) -> Self {
-        Column { name, _model: PhantomData }
+        Column {
+            name,
+            _model: PhantomData,
+        }
     }
 
+    /// The column's name.
     pub const fn name(&self) -> &'static str {
         self.name
     }
@@ -50,26 +55,32 @@ impl<M, T> Column<M, T> {
         })
     }
 
+    /// `column = value`.
     pub fn eq(&self, value: impl ToSql) -> Expr {
         self.compare(" = ", &value)
     }
 
+    /// `column <> value`.
     pub fn ne(&self, value: impl ToSql) -> Expr {
         self.compare(" <> ", &value)
     }
 
+    /// `column < value`.
     pub fn lt(&self, value: impl ToSql) -> Expr {
         self.compare(" < ", &value)
     }
 
+    /// `column <= value`.
     pub fn le(&self, value: impl ToSql) -> Expr {
         self.compare(" <= ", &value)
     }
 
+    /// `column > value`.
     pub fn gt(&self, value: impl ToSql) -> Expr {
         self.compare(" > ", &value)
     }
 
+    /// `column >= value`.
     pub fn ge(&self, value: impl ToSql) -> Expr {
         self.compare(" >= ", &value)
     }
@@ -84,6 +95,7 @@ impl<M, T> Column<M, T> {
         self.compare(" ILIKE ", &pattern)
     }
 
+    /// `column BETWEEN low AND high` (both ends included).
     pub fn between(&self, low: impl ToSql, high: impl ToSql) -> Expr {
         Expr::build(|out| {
             push_ident(out, self.name)?;
@@ -94,6 +106,7 @@ impl<M, T> Column<M, T> {
         })
     }
 
+    /// `column IS NULL`.
     pub fn is_null(&self) -> Expr {
         Expr::build(|out| {
             push_ident(out, self.name)?;
@@ -102,6 +115,7 @@ impl<M, T> Column<M, T> {
         })
     }
 
+    /// `column IS NOT NULL`.
     pub fn is_not_null(&self) -> Expr {
         Expr::build(|out| {
             push_ident(out, self.name)?;
@@ -141,10 +155,12 @@ impl<M, T> Column<M, T> {
         })
     }
 
+    /// Ascending, for [`Select::order_by`].
     pub fn asc(&self) -> Order {
         Order::new(self.name, "ASC")
     }
 
+    /// Descending, for [`Select::order_by`].
     pub fn desc(&self) -> Order {
         Order::new(self.name, "DESC")
     }
@@ -169,7 +185,9 @@ impl Expr {
     }
 
     fn raw_unchecked(sql: &str) -> Expr {
-        Expr { sql: Ok(sql.to_string()) }
+        Expr {
+            sql: Ok(sql.to_string()),
+        }
     }
 
     /// SQL of your own, with `$n` placeholders for `params`, for what the
@@ -183,21 +201,28 @@ impl Expr {
 
     fn combine(self, op: &str, other: Expr) -> Expr {
         Expr {
-            sql: self.sql.and_then(|a| other.sql.map(|b| format!("({a}) {op} ({b})"))),
+            sql: self
+                .sql
+                .and_then(|a| other.sql.map(|b| format!("({a}) {op} ({b})"))),
         }
     }
 
+    /// Both predicates (`&` does the same).
     pub fn and(self, other: Expr) -> Expr {
         self.combine("AND", other)
     }
 
+    /// Either predicate (`|` does the same).
     pub fn or(self, other: Expr) -> Expr {
         self.combine("OR", other)
     }
 
+    /// The predicate's negation (`!` does the same).
     #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Expr {
-        Expr { sql: self.sql.map(|s| format!("NOT ({s})")) }
+        Expr {
+            sql: self.sql.map(|s| format!("NOT ({s})")),
+        }
     }
 
     /// Every predicate (`AND`); no predicates match every row.
@@ -253,14 +278,20 @@ pub struct Order {
 
 impl Order {
     fn new(column: &'static str, direction: &'static str) -> Self {
-        Order { column, direction, nulls: None }
+        Order {
+            column,
+            direction,
+            nulls: None,
+        }
     }
 
+    /// NULLs before every value.
     pub fn nulls_first(mut self) -> Self {
         self.nulls = Some("NULLS FIRST");
         self
     }
 
+    /// NULLs after every value.
     pub fn nulls_last(mut self) -> Self {
         self.nulls = Some("NULLS LAST");
         self
@@ -319,6 +350,7 @@ impl<M: Model> Default for Select<M> {
 }
 
 impl<M: Model> Select<M> {
+    /// Every row of the table, in no order.
     pub fn new() -> Self {
         Select {
             filter: None,
@@ -339,16 +371,19 @@ impl<M: Model> Select<M> {
         self
     }
 
+    /// Sorts by `order`; several sort by the first, then the next.
     pub fn order_by(mut self, order: Order) -> Self {
         self.order.push(order);
         self
     }
 
+    /// At most `n` rows.
     pub fn limit(mut self, n: u64) -> Self {
         self.limit = Some(n);
         self
     }
 
+    /// Skips the first `n` rows (with an order, for a stable page).
     pub fn offset(mut self, n: u64) -> Self {
         self.offset = Some(n);
         self
@@ -392,6 +427,7 @@ impl<M: Model> Select<M> {
         Ok(sql)
     }
 
+    /// Every matching row.
     pub async fn all(&self, client: &Client) -> Result<Vec<M>> {
         client.run(&self.to_sql()?).await?.decode_all()
     }
@@ -407,7 +443,10 @@ impl<M: Model> Select<M> {
         let rows = client.run(&self.clone().limit(2).to_sql()?).await?;
         match rows.len() {
             1 => Ok(rows.decode_first()?.expect("one row")),
-            got => Err(Error::RowCount { expected: "exactly 1", got }),
+            got => Err(Error::RowCount {
+                expected: "exactly 1",
+                got,
+            }),
         }
     }
 
@@ -415,9 +454,13 @@ impl<M: Model> Select<M> {
     pub async fn count(&self, client: &Client) -> Result<u64> {
         let mut sql = format!("SELECT COUNT(*) FROM {}", ident(M::TABLE)?);
         self.push_where(&mut sql)?;
-        client.fetch_scalar::<i64>(&sql, &[]).await.map(|n| n as u64)
+        client
+            .fetch_scalar::<i64>(&sql, &[])
+            .await
+            .map(|n| n as u64)
     }
 
+    /// Whether any row matches.
     pub async fn exists(&self, client: &Client) -> Result<bool> {
         let mut sql = format!(
             "SELECT {} FROM {}",
@@ -455,7 +498,10 @@ impl<M: Model> Select<M> {
     /// An `UPDATE` of the filtered rows: add [`set`](Update::set)s, then
     /// [`run`](Update::run) it.
     pub fn update(&self) -> Update<M> {
-        Update { select: self.clone(), sets: Ok(Vec::new()) }
+        Update {
+            select: self.clone(),
+            sets: Ok(Vec::new()),
+        }
     }
 }
 
@@ -470,11 +516,10 @@ impl<M: Model> Update<M> {
     pub fn set<T>(mut self, column: Column<M, T>, value: impl ToSql) -> Self {
         if let Ok(sets) = &mut self.sets {
             let mut out = String::new();
-            let written = push_ident(&mut out, column.name)
-                .and_then(|()| {
-                    out.push_str(" = ");
-                    push_param(&mut out, &value.to_param())
-                });
+            let written = push_ident(&mut out, column.name).and_then(|()| {
+                out.push_str(" = ");
+                push_param(&mut out, &value.to_param())
+            });
             match written {
                 Ok(()) => sets.push(out),
                 Err(e) => self.sets = Err(e.to_string()),
@@ -501,11 +546,14 @@ impl<M: Model> Update<M> {
         self
     }
 
+    /// The statement [`run`](Self::run) sends.
     pub fn to_sql(&self) -> Result<String> {
         self.select.check_scope("UPDATE")?;
         let sets = self.sets.as_ref().map_err(|e| Error::Param(e.clone()))?;
         if sets.is_empty() {
-            return Err(Error::Param("an UPDATE needs at least one set()".to_string()));
+            return Err(Error::Param(
+                "an UPDATE needs at least one set()".to_string(),
+            ));
         }
         let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, sets.join(", "));
         self.select.push_where(&mut sql)?;

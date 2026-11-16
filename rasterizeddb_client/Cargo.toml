@@ -3,6 +3,22 @@ name = "rasterizeddb_client"
 version = "0.2.0"
 edition = "2024"
 description = "A client SDK and ORM for RasterizedDB's native protocol that does not compile the engine"
+repository = "https://github.com/milen-denev/rasterizeddb"
+documentation = "https://docs.rs/rasterizeddb_client"
+readme = "README.md"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["database", "client", "orm", "rasterizeddb", "migrations"]
+categories = ["database", "asynchronous"]
+rust-version = "1.88"
+
+# docs.rs documents every feature, labels feature-gated items with the
+# feature they need (`--cfg docsrs` turns on `doc_cfg`), and shows the
+# examples' calls under the items they use.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 
 # What a client needs and nothing else: the transport, a runtime, and libc for
 # the operating-system user a peer login names (and the OS random source for
@@ -34,3 +50,24 @@ serde_json = ["dep:serde", "dep:serde_json"]
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time"] }
 serde = { version = "1", features = ["derive"] }
+
+# Scraped into the documentation by docs.rs (they use dev-dependencies, so
+# each opts in).
+[[example]]
+name = "quickstart"
+doc-scrape-examples = true
+
+[[example]]
+name = "orm"
+doc-scrape-examples = true
+required-features = ["derive"]
+
+[[example]]
+name = "migrations"
+doc-scrape-examples = true
+required-features = ["derive"]
+
+[[example]]
+name = "kv"
+doc-scrape-examples = true
+required-features = ["derive"]

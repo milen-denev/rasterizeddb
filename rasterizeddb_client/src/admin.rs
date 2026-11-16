@@ -45,8 +45,13 @@ pub struct Admin<'c> {
 fn bare_word<'n>(name: &'n str, what: &str) -> Result<&'n str> {
     let ok = !name.is_empty()
         && name.len() <= 128
-        && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
     if ok {
         Ok(name)
     } else {
@@ -139,7 +144,10 @@ impl fmt::Debug for Store {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("options", &self.options)
-            .field("credentials", &self.access_key_id.as_ref().map(|_| "<redacted>"))
+            .field(
+                "credentials",
+                &self.access_key_id.as_ref().map(|_| "<redacted>"),
+            )
             .field("if_not_exists", &self.if_not_exists)
             .finish()
     }
@@ -186,6 +194,7 @@ impl Store {
         self.option("PREFIX", prefix)
     }
 
+    /// `ADDRESSING`: how the bucket is addressed (the server's default is virtual-hosted).
     pub fn addressing(self, addressing: Addressing) -> Self {
         self.option(
             "ADDRESSING",
@@ -229,22 +238,27 @@ impl Store {
         self.option("SPILL_BYTES", bytes.to_string())
     }
 
+    /// `COMPACT_CHUNK_BYTES`: the chunk size compaction rewrites to.
     pub fn compact_chunk_bytes(self, bytes: u64) -> Self {
         self.option("COMPACT_CHUNK_BYTES", bytes.to_string())
     }
 
+    /// `CHUNK_FETCH_PAGES`: pages fetched together when a chunk is read.
     pub fn chunk_fetch_pages(self, pages: u64) -> Self {
         self.option("CHUNK_FETCH_PAGES", pages.to_string())
     }
 
+    /// `READAHEAD_CHUNKS`: chunks read ahead of a sequential scan.
     pub fn readahead_chunks(self, chunks: u64) -> Self {
         self.option("READAHEAD_CHUNKS", chunks.to_string())
     }
 
+    /// `MAX_DELTAS`: delta objects a chunk may gather before it is compacted.
     pub fn max_deltas(self, deltas: u64) -> Self {
         self.option("MAX_DELTAS", deltas.to_string())
     }
 
+    /// `FLUSH_INTERVAL_MS`: how often buffered writes are flushed to the store.
     pub fn flush_interval_ms(self, ms: u64) -> Self {
         self.option("FLUSH_INTERVAL_MS", ms.to_string())
     }
@@ -271,7 +285,9 @@ impl Store {
             ));
         }
         if self.kind == StoreKind::Directory && self.access_key_id.is_some() {
-            return Err(Error::Param("a directory store takes no credentials".to_string()));
+            return Err(Error::Param(
+                "a directory store takes no credentials".to_string(),
+            ));
         }
         let mut sql = String::from("STORAGE ADD STORE ");
         if self.if_not_exists {
@@ -311,22 +327,29 @@ impl Store {
 /// One row of `SHOW STORAGE STORES`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoreInfo {
+    /// The store's name, as tables are placed on it (`kv:<name>`).
     pub name: String,
     /// `dir`, `s3`, or the name of a kind this server build cannot open.
     pub kind: String,
     /// An S3 store's endpoint; a directory store's path.
     pub endpoint: String,
+    /// An S3 store's region; empty for a directory store.
     pub region: String,
+    /// An S3 store's bucket; empty for a directory store.
     pub bucket: String,
+    /// The key prefix (S3) or subdirectory (directory store) its data sits under.
     pub prefix: String,
     /// `path` or `virtual` (S3 only).
     pub addressing: String,
+    /// Its tunables, as the server prints them.
     pub settings: String,
     /// `store` when it has its own credentials, `environment` otherwise.
     pub credentials: String,
     /// Tables placed on it.
     pub tables: i64,
+    /// Whether the server has it open (a table on it has been used).
     pub opened: bool,
+    /// Whether this server build can open a store of its kind.
     pub supported: bool,
 }
 
@@ -363,10 +386,12 @@ pub enum Placement {
 }
 
 impl Placement {
+    /// On the key/value store `store`.
     pub fn kv(store: &str) -> Self {
         Placement::Kv(store.to_string())
     }
 
+    /// In the directory `path` on the server.
     pub fn directory(path: &str) -> Self {
         Placement::Directory(path.to_string())
     }
@@ -374,7 +399,9 @@ impl Placement {
     fn spec(&self) -> Result<String> {
         match self {
             Placement::Memory => Ok("'memory:'".to_string()),
-            Placement::Kv(store) => quote_text(&format!("kv:{}", bare_word(store, "a store name")?)),
+            Placement::Kv(store) => {
+                quote_text(&format!("kv:{}", bare_word(store, "a store name")?))
+            }
             Placement::Directory(path) => {
                 if path.starts_with("kv:") || path.starts_with("memory") {
                     return Err(Error::Param(format!(
@@ -392,8 +419,10 @@ impl Placement {
 /// How an index is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexMethod {
+    /// A B-tree: equality and ranges (`=`, `<`, `BETWEEN`, `ORDER BY`).
     #[default]
     BTree,
+    /// A hash index: equality only, smaller and faster for it.
     Hash,
     /// Over a `jsonb` column, with the `jsonb_ops` operator class.
     Gin,
@@ -425,11 +454,13 @@ impl Index {
         }
     }
 
+    /// The index's name (otherwise `<table>_<columns>_idx`, or `_key` when unique).
     pub fn name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
         self
     }
 
+    /// How the index is built (B-tree when not set).
     pub fn using(mut self, method: IndexMethod) -> Self {
         self.method = method;
         self
@@ -442,6 +473,7 @@ impl Index {
         self
     }
 
+    /// Succeed without doing anything when an index of this name exists.
     pub fn if_not_exists(mut self) -> Self {
         self.if_not_exists = true;
         self
@@ -456,9 +488,12 @@ impl Index {
         })
     }
 
+    /// The statement [`Admin::create_index`] sends.
     pub fn to_sql(&self) -> Result<String> {
         if self.columns.is_empty() {
-            return Err(Error::Param("an index needs at least one column".to_string()));
+            return Err(Error::Param(
+                "an index needs at least one column".to_string(),
+            ));
         }
         let columns = self
             .columns
@@ -468,7 +503,11 @@ impl Index {
             .join(", ");
         let name = ident(&self.index_name())?;
         let table = ident(&self.table)?;
-        let exists = if self.if_not_exists { "IF NOT EXISTS " } else { "" };
+        let exists = if self.if_not_exists {
+            "IF NOT EXISTS "
+        } else {
+            ""
+        };
         if self.unique {
             if self.method != IndexMethod::BTree {
                 return Err(Error::Unsupported(
@@ -496,77 +535,113 @@ impl Index {
 /// One row of `SHOW TABLES`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
+    /// The table's name.
     pub name: String,
     /// `file`, `memory`, `kv`, …
     pub storage: String,
+    /// Row slots in use, live rows and those vacuum has yet to reclaim.
     pub row_slots: i64,
+    /// Columns, dropped ones included.
     pub columns: i64,
+    /// Bytes of row data.
     pub data_bytes: i64,
+    /// Bytes of row pointers.
     pub pointer_bytes: i64,
+    /// Bytes of index data.
     pub index_bytes: i64,
+    /// All of the table's bytes.
     pub total_bytes: i64,
     /// Bytes vacuum could give back.
     pub reclaimable_bytes: i64,
+    /// Whether the filter index has caught up with the table.
     pub filters_ready: bool,
+    /// Whether the table is read-only.
     pub immutable: bool,
+    /// The primary key's columns, comma-separated; empty for none.
     pub primary_key: String,
 }
 
 /// One row of `DESCRIBE <table>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnInfo {
+    /// The column's position, from 1.
     pub position: i64,
+    /// The column's name.
     pub name: String,
     /// As the engine names it: `BIGINT`, `TEXT`, `NUMERIC(10,2)`, …
     pub data_type: String,
+    /// Its stored width in bytes (0 for a variable-width type).
     pub size: i64,
+    /// Its offset within a row, for a fixed-width column.
     pub offset: i64,
+    /// Whether it may hold NULL.
     pub nullable: bool,
+    /// Whether a unique constraint covers it alone.
     pub unique: bool,
+    /// Whether it is (part of) the primary key.
     pub primary_key: bool,
+    /// Its `DEFAULT` expression, if it has one.
     pub default: Option<String>,
+    /// Whether the filter index covers it.
     pub indexed: bool,
+    /// Whether per-zone minimum and maximum are kept for it.
     pub zone_bounds: bool,
+    /// For a shredded JSON column, the table holding its keys.
     pub json_table: Option<String>,
+    /// Whether it was dropped (a dropped column keeps its slot until a rewrite).
     pub dropped: bool,
 }
 
 /// One row of `SHOW CONFIG`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigEntry {
+    /// The setting's section (`wal`, `filter`, `vacuum`, …).
     pub section: String,
+    /// The setting's name within its section.
     pub key: String,
+    /// Its current value, if it has one to show.
     pub value: Option<String>,
     /// Whether `SET CONFIG` changes it without a restart.
     pub hot_reload: bool,
     /// How to change it: a `SET CONFIG` statement or a flag.
     pub set_with: String,
+    /// What it does.
     pub help: String,
     /// A value set for the next start, if one is waiting.
     pub pending: Option<String>,
     /// The values it takes, when they are a list.
     pub options: Option<String>,
+    /// Where its value came from (a flag, the config file, `SET CONFIG`).
     pub source: Option<String>,
 }
 
 /// A `metric, value, detail` row: the `STATS` and `STATUS` forms.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Metric {
+    /// What is measured.
     pub metric: String,
+    /// Its value, as text.
     pub value: Option<String>,
+    /// What the value means, or where it came from.
     pub detail: Option<String>,
 }
 
 /// One row of `SHOW PARTITIONS <table>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartitionInfo {
+    /// The partition's id.
     pub pid: i64,
     /// The hash range's bounds, in hex.
     pub lo: String,
+    /// The hash range's upper bound, in hex.
     pub hi: String,
+    /// Where it is stored, when not in the table's own directory.
     pub location: Option<String>,
+    /// Its state (`open`, `closed`, `moving`, …).
     pub state: String,
+    /// Row slots in use.
     pub row_slots: i64,
+    /// Its bytes on disk.
     pub total_bytes: i64,
 }
 
@@ -575,26 +650,40 @@ pub struct PartitionInfo {
 pub struct BackupInfo {
     /// `snapshot` or `wal`.
     pub kind: String,
+    /// The backup's id, as `RESTORE … FROM SNAPSHOT` takes it.
     pub id: String,
+    /// When it was taken.
     pub created_at: String,
+    /// The first log position it covers.
     pub start_lsn: i64,
+    /// The last log position it covers.
     pub end_lsn: i64,
+    /// Its size before compression.
     pub uncompressed_bytes: i64,
+    /// Its size as stored.
     pub compressed_bytes: i64,
+    /// Anything else the server reports about it.
     pub detail: Option<String>,
 }
 
 /// One row of `SHOW STORAGE LOCATIONS`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocationInfo {
+    /// The directory.
     pub location: String,
     /// `primary` or `backup`.
     pub role: String,
+    /// Its share of new tables under a weighted policy.
     pub weight: i64,
+    /// Whether new tables may be placed in it.
     pub enabled: bool,
+    /// Whether it is the database's own directory.
     pub is_database_directory: bool,
+    /// Tables stored in it.
     pub tables: i64,
+    /// Free bytes on its filesystem.
     pub available_bytes: i64,
+    /// Total bytes of its filesystem.
     pub total_bytes: i64,
 }
 
@@ -602,11 +691,14 @@ pub struct LocationInfo {
 /// whose shape is less settled (`SHOW REPLICATION PEER STATUS`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
+    /// The columns' names, in order.
     pub columns: &'static [&'static str],
+    /// The values, in the order of [`columns`](Self::columns).
     pub values: Vec<Value>,
 }
 
 impl Record {
+    /// The value of the column named `column`.
     pub fn get(&self, column: &str) -> Option<&Value> {
         let i = self.columns.iter().position(|c| *c == column)?;
         self.values.get(i)
@@ -629,13 +721,21 @@ pub enum RestoreTarget {
 /// What a restore did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RestoreReport {
+    /// The snapshot restored from.
     pub snapshot_id: String,
+    /// The directory the database was restored into.
     pub target_dir: String,
+    /// The log position recovery reached.
     pub recovered_to_lsn: String,
+    /// Files restored from the snapshot.
     pub files_restored: i64,
+    /// Bytes restored from the snapshot.
     pub bytes_restored: i64,
+    /// Log segments replayed on top of it.
     pub segments_replayed: i64,
+    /// Log records applied.
     pub records_applied: i64,
+    /// Log records past the target, not applied.
     pub records_discarded: i64,
 }
 
@@ -662,19 +762,31 @@ impl fmt::Debug for Role {
 impl Role {
     /// A role that can log in (PostgreSQL's `CREATE USER`).
     pub fn user(name: &str) -> Self {
-        Role { name: name.to_string(), password: None, login: true, superuser: false }
+        Role {
+            name: name.to_string(),
+            password: None,
+            login: true,
+            superuser: false,
+        }
     }
 
     /// A role that cannot log in until given LOGIN.
     pub fn group(name: &str) -> Self {
-        Role { name: name.to_string(), password: None, login: false, superuser: false }
+        Role {
+            name: name.to_string(),
+            password: None,
+            login: false,
+            superuser: false,
+        }
     }
 
+    /// Its password, turned into a SCRAM-SHA-256 verifier by the server.
     pub fn password(mut self, password: &str) -> Self {
         self.password = Some(password.to_string());
         self
     }
 
+    /// Make it a superuser.
     pub fn superuser(mut self) -> Self {
         self.superuser = true;
         self
@@ -684,7 +796,11 @@ impl Role {
 /// A role name the role grammar reads: one whitespace-free token, quotes
 /// stripped, no escapes.
 fn role_name(name: &str) -> Result<&str> {
-    if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '\0') {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '\0')
+    {
         return Err(Error::Param(format!(
             "role name {name:?} must not be empty or hold whitespace or quotes"
         )));
@@ -713,7 +829,9 @@ impl<'c> Admin<'c> {
     pub async fn alter_store(&self, name: &str, settings: &[(&str, &str)]) -> Result<Vec<String>> {
         let name = bare_word(name, "a store name")?;
         if settings.is_empty() {
-            return Err(Error::Param("ALTER STORE needs at least one setting".to_string()));
+            return Err(Error::Param(
+                "ALTER STORE needs at least one setting".to_string(),
+            ));
         }
         let mut list = Vec::new();
         for (key, value) in settings {
@@ -729,7 +847,10 @@ impl<'c> Admin<'c> {
         }
         text_lines(
             self.client
-                .run(&format!("STORAGE ALTER STORE {name} SET {}", list.join(", ")))
+                .run(&format!(
+                    "STORAGE ALTER STORE {name} SET {}",
+                    list.join(", ")
+                ))
                 .await?,
         )
     }
@@ -743,7 +864,10 @@ impl<'c> Admin<'c> {
     ) -> Result<Vec<String>> {
         self.alter_store(
             name,
-            &[("ACCESS_KEY_ID", access_key_id), ("SECRET_ACCESS_KEY", secret_access_key)],
+            &[
+                ("ACCESS_KEY_ID", access_key_id),
+                ("SECRET_ACCESS_KEY", secret_access_key),
+            ],
         )
         .await
     }
@@ -752,7 +876,11 @@ impl<'c> Admin<'c> {
     /// deleted.
     pub async fn drop_store(&self, name: &str) -> Result<Vec<String>> {
         let name = bare_word(name, "a store name")?;
-        text_lines(self.client.run(&format!("STORAGE DROP STORE {name}")).await?)
+        text_lines(
+            self.client
+                .run(&format!("STORAGE DROP STORE {name}"))
+                .await?,
+        )
     }
 
     /// Drops a store if there is one (the grammar has no `IF EXISTS`, so this
@@ -765,11 +893,13 @@ impl<'c> Admin<'c> {
         Ok(true)
     }
 
+    /// Every key/value store: `SHOW STORAGE STORES`.
     pub async fn stores(&self) -> Result<Vec<StoreInfo>> {
         let rows = self.client.run("SHOW STORAGE STORES").await?;
         rows.iter().map(|r| StoreInfo::read(&r)).collect()
     }
 
+    /// The store named `name`, if there is one.
     pub async fn store(&self, name: &str) -> Result<Option<StoreInfo>> {
         Ok(self.stores().await?.into_iter().find(|s| s.name == name))
     }
@@ -779,7 +909,10 @@ impl<'c> Admin<'c> {
         let table = bare_word(table, "a table name")?;
         text_lines(
             self.client
-                .run(&format!("STORAGE PLACE TABLE {table} AT {}", placement.spec()?))
+                .run(&format!(
+                    "STORAGE PLACE TABLE {table} AT {}",
+                    placement.spec()?
+                ))
                 .await?,
         )
     }
@@ -790,11 +923,15 @@ impl<'c> Admin<'c> {
         let table = bare_word(table, "a table name")?;
         text_lines(
             self.client
-                .run(&format!("STORAGE MOVE TABLE {table} TO {}", placement.spec()?))
+                .run(&format!(
+                    "STORAGE MOVE TABLE {table} TO {}",
+                    placement.spec()?
+                ))
                 .await?,
         )
     }
 
+    /// The directories tables are stored in: `SHOW STORAGE LOCATIONS`.
     pub async fn storage_locations(&self) -> Result<Vec<LocationInfo>> {
         let rows = self.client.run("SHOW STORAGE LOCATIONS").await?;
         rows.iter()
@@ -813,6 +950,7 @@ impl<'c> Admin<'c> {
             .collect()
     }
 
+    /// Storage figures: `SHOW STORAGE STATS`.
     pub async fn storage_stats(&self) -> Result<Vec<Metric>> {
         self.metrics("SHOW STORAGE STATS").await
     }
@@ -824,6 +962,7 @@ impl<'c> Admin<'c> {
         self.client.run(&index.to_sql()?).await.map(drop)
     }
 
+    /// Drops an index by name (`IF EXISTS` when `if_exists`).
     pub async fn drop_index(&self, name: &str, if_exists: bool) -> Result<()> {
         let exists = if if_exists { "IF EXISTS " } else { "" };
         self.client
@@ -838,7 +977,10 @@ impl<'c> Admin<'c> {
     pub async fn index_checkpoint(&self, table: &str) -> Result<String> {
         let rows = self
             .client
-            .run(&format!("SELECT rdb_index_checkpoint({})", quote_text(table)?))
+            .run(&format!(
+                "SELECT rdb_index_checkpoint({})",
+                quote_text(table)?
+            ))
             .await?;
         rows.get(0)
             .ok_or_else(|| Error::Protocol("rdb_index_checkpoint answered no row".to_string()))?
@@ -856,9 +998,15 @@ impl<'c> Admin<'c> {
         partitions: Option<u32>,
     ) -> Result<()> {
         if columns.is_empty() || columns.len() > 3 {
-            return Err(Error::Param("a hash partition key has one to three columns".to_string()));
+            return Err(Error::Param(
+                "a hash partition key has one to three columns".to_string(),
+            ));
         }
-        let key = columns.iter().map(|c| ident(c)).collect::<Result<Vec<_>>>()?.join(", ");
+        let key = columns
+            .iter()
+            .map(|c| ident(c))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
         let mut sql = format!("ALTER TABLE {} PARTITION BY HASH ({key})", ident(table)?);
         if let Some(n) = partitions {
             sql.push_str(&format!(" PARTITIONS {n}"));
@@ -866,8 +1014,12 @@ impl<'c> Admin<'c> {
         self.client.run(&sql).await.map(drop)
     }
 
+    /// A partitioned table's partitions: `SHOW PARTITIONS`.
     pub async fn partitions(&self, table: &str) -> Result<Vec<PartitionInfo>> {
-        let rows = self.client.run(&format!("SHOW PARTITIONS {}", ident(table)?)).await?;
+        let rows = self
+            .client
+            .run(&format!("SHOW PARTITIONS {}", ident(table)?))
+            .await?;
         rows.iter()
             .map(|r| {
                 Ok(PartitionInfo {
@@ -899,6 +1051,7 @@ impl<'c> Admin<'c> {
         Ok(ack_count(&self.client.run(&sql).await?))
     }
 
+    /// Every table, with its size and state: `SHOW TABLES`.
     pub async fn tables(&self) -> Result<Vec<TableInfo>> {
         let rows = self.client.run("SHOW TABLES").await?;
         rows.iter()
@@ -924,7 +1077,10 @@ impl<'c> Admin<'c> {
     /// A table's columns as the engine describes them, including dropped ones
     /// (see [`ColumnInfo::dropped`]).
     pub async fn columns(&self, table: &str) -> Result<Vec<ColumnInfo>> {
-        let rows = self.client.run(&format!("DESCRIBE {}", ident(table)?)).await?;
+        let rows = self
+            .client
+            .run(&format!("DESCRIBE {}", ident(table)?))
+            .await?;
         let blank = |v: Option<String>| v.filter(|s| !s.is_empty());
         rows.iter()
             .map(|r| {
@@ -971,9 +1127,9 @@ impl<'c> Admin<'c> {
     /// `SET CONFIG section.key = value`. A setting that is not hot-reloadable
     /// is saved for the next start. The server's answer.
     pub async fn set_config(&self, key: &str, value: &str) -> Result<String> {
-        let (section, name) = key.split_once('.').ok_or_else(|| {
-            Error::Param(format!("{key:?} is not section.key"))
-        })?;
+        let (section, name) = key
+            .split_once('.')
+            .ok_or_else(|| Error::Param(format!("{key:?} is not section.key")))?;
         bare_word(section, "a config section")?;
         bare_word(name, "a config key")?;
         // The value is read unquoted, to the end of the statement.
@@ -986,16 +1142,22 @@ impl<'c> Admin<'c> {
                 "config value {value:?} must be letters, digits and . _ : - + /"
             )));
         }
-        let rows = self.client.run(&format!("SET CONFIG {key} = {value}")).await?;
+        let rows = self
+            .client
+            .run(&format!("SET CONFIG {key} = {value}"))
+            .await?;
         Ok(text_lines(rows)?.join("\n"))
     }
 
+    /// Database-wide figures: `SHOW STATS`.
     pub async fn database_stats(&self) -> Result<Vec<Metric>> {
         self.metrics("SHOW STATS").await
     }
 
+    /// One table's figures: `SHOW TABLE STATS`.
     pub async fn table_stats(&self, table: &str) -> Result<Vec<Metric>> {
-        self.metrics(&format!("SHOW TABLE STATS {}", ident(table)?)).await
+        self.metrics(&format!("SHOW TABLE STATS {}", ident(table)?))
+            .await
     }
 
     async fn metrics(&self, sql: &str) -> Result<Vec<Metric>> {
@@ -1018,7 +1180,11 @@ impl<'c> Admin<'c> {
     pub async fn create_role(&self, role: &Role) -> Result<()> {
         let mut sql = format!("CREATE ROLE {}", role_name(&role.name)?);
         sql.push_str(if role.login { " LOGIN" } else { " NOLOGIN" });
-        sql.push_str(if role.superuser { " SUPERUSER" } else { " NOSUPERUSER" });
+        sql.push_str(if role.superuser {
+            " SUPERUSER"
+        } else {
+            " NOSUPERUSER"
+        });
         if let Some(password) = &role.password {
             sql.push_str(" PASSWORD ");
             push_text(&mut sql, password)?;
@@ -1026,6 +1192,7 @@ impl<'c> Admin<'c> {
         self.client.run(&sql).await.map(drop)
     }
 
+    /// Sets a role's password, or removes it (`None`).
     pub async fn set_role_password(&self, name: &str, password: Option<&str>) -> Result<()> {
         let mut sql = format!("ALTER ROLE {} PASSWORD ", role_name(name)?);
         match password {
@@ -1035,6 +1202,7 @@ impl<'c> Admin<'c> {
         self.client.run(&sql).await.map(drop)
     }
 
+    /// Drops a role (`IF EXISTS` when `if_exists`).
     pub async fn drop_role(&self, name: &str, if_exists: bool) -> Result<()> {
         let exists = if if_exists { "IF EXISTS " } else { "" };
         self.client
@@ -1061,6 +1229,7 @@ impl<'c> Admin<'c> {
         Ok(ack_count(&self.client.run("BACKUP PRUNE").await?))
     }
 
+    /// Every backup at the destination: `SHOW BACKUPS`.
     pub async fn backups(&self) -> Result<Vec<BackupInfo>> {
         let rows = self.client.run("SHOW BACKUPS").await?;
         rows.iter()
@@ -1079,6 +1248,7 @@ impl<'c> Admin<'c> {
             .collect()
     }
 
+    /// The backup subsystem's state: `SHOW BACKUP STATUS`.
     pub async fn backup_status(&self) -> Result<Vec<Metric>> {
         self.metrics("SHOW BACKUP STATUS").await
     }
@@ -1094,7 +1264,10 @@ impl<'c> Admin<'c> {
         };
         let rows = self
             .client
-            .run(&format!("RESTORE DATABASE {from} TO {}", quote_text(to_dir)?))
+            .run(&format!(
+                "RESTORE DATABASE {from} TO {}",
+                quote_text(to_dir)?
+            ))
             .await?;
         let r = rows
             .get(0)
@@ -1113,6 +1286,7 @@ impl<'c> Admin<'c> {
 
     // -------------------------------------------------------- replication
 
+    /// Replication figures: `SHOW REPLICATION STATS`.
     pub async fn replication_stats(&self) -> Result<Vec<Metric>> {
         self.metrics("SHOW REPLICATION STATS").await
     }
@@ -1123,12 +1297,30 @@ impl<'c> Admin<'c> {
     /// `state`.
     pub async fn replication_peers(&self) -> Result<Vec<Record>> {
         const COLUMNS: &[&str] = &[
-            "peer", "address", "remote_node", "connected", "paused", "acked_seq", "lag", "queued",
-            "records_sent", "batches_sent", "dropped", "codec", "last_ratio", "last_error", "state",
+            "peer",
+            "address",
+            "remote_node",
+            "connected",
+            "paused",
+            "acked_seq",
+            "lag",
+            "queued",
+            "records_sent",
+            "batches_sent",
+            "dropped",
+            "codec",
+            "last_ratio",
+            "last_error",
+            "state",
         ];
         let rows = self.client.run("SHOW REPLICATION PEER STATUS").await?;
         rows.iter()
-            .map(|r| Ok(Record { columns: COLUMNS, values: r.values()? }))
+            .map(|r| {
+                Ok(Record {
+                    columns: COLUMNS,
+                    values: r.values()?,
+                })
+            })
             .collect()
     }
 
@@ -1166,7 +1358,10 @@ mod tests {
              BUCKET = 'bucket', REGION = 'eu-central-1', PREFIX = \"pop-1/it's\", \
              ADDRESSING = 'virtual', ACCESS_KEY_ID = 'AKIA', SECRET_ACCESS_KEY = 'se,cr=et)')"
         );
-        assert!(!format!("{store:?}").contains("se,cr"), "Debug redacts the secret");
+        assert!(
+            !format!("{store:?}").contains("se,cr"),
+            "Debug redacts the secret"
+        );
     }
 
     #[test]
@@ -1174,13 +1369,31 @@ mod tests {
         let both = Store::s3("s", "e", "b").credentials("k", "a'b\"c");
         let e = both.to_sql().unwrap_err().to_string();
         assert!(!e.contains("a'b"), "{e}");
-        assert!(Store::s3("s", "e", "b").credentials("k", "x\ny").to_sql().is_err());
+        assert!(
+            Store::s3("s", "e", "b")
+                .credentials("k", "x\ny")
+                .to_sql()
+                .is_err()
+        );
         assert!(Store::s3("bad name", "e", "b").to_sql().is_err());
         assert!(Store::s3("s;drop", "e", "b").to_sql().is_err());
-        assert!(Store::directory("d", "/x").credentials("k", "s").to_sql().is_err());
-        assert!(Store::s3("s", "e", "b").session_token("t").to_sql().is_err());
+        assert!(
+            Store::directory("d", "/x")
+                .credentials("k", "s")
+                .to_sql()
+                .is_err()
+        );
+        assert!(
+            Store::s3("s", "e", "b")
+                .session_token("t")
+                .to_sql()
+                .is_err()
+        );
         assert_eq!(
-            Store::directory("local", "/var/kv").prefix("p").to_sql().unwrap(),
+            Store::directory("local", "/var/kv")
+                .prefix("p")
+                .to_sql()
+                .unwrap(),
             "STORAGE ADD STORE local dir WITH (PATH = '/var/kv', PREFIX = 'p')"
         );
     }
@@ -1189,7 +1402,10 @@ mod tests {
     fn placements() {
         assert_eq!(Placement::Memory.spec().unwrap(), "'memory:'");
         assert_eq!(Placement::kv("telemetry").spec().unwrap(), "'kv:telemetry'");
-        assert_eq!(Placement::directory("/data/o'k").spec().unwrap(), "'/data/o''k'");
+        assert_eq!(
+            Placement::directory("/data/o'k").spec().unwrap(),
+            "'/data/o''k'"
+        );
         assert!(Placement::kv("x y").spec().is_err());
         assert!(Placement::directory("kv:x").spec().is_err());
     }
@@ -1197,19 +1413,36 @@ mod tests {
     #[test]
     fn indexes() {
         assert_eq!(
-            Index::on("users", &["email"]).unique().if_not_exists().to_sql().unwrap(),
+            Index::on("users", &["email"])
+                .unique()
+                .if_not_exists()
+                .to_sql()
+                .unwrap(),
             "ALTER TABLE users ADD CONSTRAINT IF NOT EXISTS users_email_key UNIQUE (email)"
         );
         assert_eq!(
-            Index::on("users", &["name", "order"]).using(IndexMethod::Hash).to_sql().unwrap(),
+            Index::on("users", &["name", "order"])
+                .using(IndexMethod::Hash)
+                .to_sql()
+                .unwrap(),
             "CREATE INDEX users_name_order_idx ON users USING hash (name, \"order\")"
         );
         assert_eq!(
-            Index::on("docs", &["body"]).name("docs_body").using(IndexMethod::GinPathOps).to_sql().unwrap(),
+            Index::on("docs", &["body"])
+                .name("docs_body")
+                .using(IndexMethod::GinPathOps)
+                .to_sql()
+                .unwrap(),
             "CREATE INDEX docs_body ON docs USING gin (body jsonb_path_ops)"
         );
         assert!(Index::on("t", &[]).to_sql().is_err());
-        assert!(Index::on("t", &["a"]).unique().using(IndexMethod::Hash).to_sql().is_err());
+        assert!(
+            Index::on("t", &["a"])
+                .unique()
+                .using(IndexMethod::Hash)
+                .to_sql()
+                .is_err()
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub struct Options {
     /// How long a statement may wait for its answer, and a connection for its
     /// handshake. `None` waits indefinitely.
     pub timeout: Option<Duration>,
+    /// Who the connections log in as.
     pub login: Login,
     /// The largest answer accepted, in bytes (rastcp's default, 8 MiB). The
     /// limit is this side's: the server sends an answer of any size. One past
@@ -117,7 +118,10 @@ impl Client {
     /// A client with no connection, for tests that build statements only.
     #[cfg(all(test, feature = "derive"))]
     pub(crate) fn detached() -> Self {
-        Client { connections: Vec::new(), next: AtomicUsize::new(0) }
+        Client {
+            connections: Vec::new(),
+            next: AtomicUsize::new(0),
+        }
     }
 
     fn pick(&self) -> &MuxClient {
@@ -182,7 +186,10 @@ impl Client {
         let rows = self.query_with(sql, params).await?;
         match rows.len() {
             1 => rows.decode_first().map(|row| row.expect("one row")),
-            got => Err(Error::RowCount { expected: "exactly 1", got }),
+            got => Err(Error::RowCount {
+                expected: "exactly 1",
+                got,
+            }),
         }
     }
 
@@ -195,7 +202,10 @@ impl Client {
         let rows = self.query_with(sql, params).await?;
         match rows.len() {
             0 | 1 => rows.decode_first(),
-            got => Err(Error::RowCount { expected: "at most 1", got }),
+            got => Err(Error::RowCount {
+                expected: "at most 1",
+                got,
+            }),
         }
     }
 
@@ -209,14 +219,20 @@ impl Client {
         let rows = self.query_with(sql, params).await?;
         match rows.len() {
             1 => rows.get(0).expect("one row").get(0),
-            got => Err(Error::RowCount { expected: "exactly 1", got }),
+            got => Err(Error::RowCount {
+                expected: "exactly 1",
+                got,
+            }),
         }
     }
 
     /// Whether a table of this name exists.
     pub async fn table_exists(&self, name: &str) -> Result<bool> {
         let rows = self
-            .query_with("SELECT tablename FROM pg_tables WHERE tablename = $1", &[&name])
+            .query_with(
+                "SELECT tablename FROM pg_tables WHERE tablename = $1",
+                &[&name],
+            )
             .await?;
         Ok(!rows.is_empty())
     }

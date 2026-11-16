@@ -52,7 +52,10 @@ fn columns_describe_the_struct() {
     assert_eq!(Account::TABLE, "accounts");
     assert_eq!(OrderLine::TABLE, "order_line");
     let names: Vec<&str> = Account::COLUMNS.iter().map(|c| c.name).collect();
-    assert_eq!(names, ["id", "email", "name", "balance", "tags", "order", "status"]);
+    assert_eq!(
+        names,
+        ["id", "email", "name", "balance", "tags", "order", "status"]
+    );
     let c = &Account::COLUMNS;
     assert!(c[0].primary_key && c[0].serial && c[0].sql_type == "BIGINT");
     assert!(c[1].unique && !c[1].nullable);
@@ -78,20 +81,42 @@ fn statements() {
          RETURNING id, email, name, balance::text, tags::text, \"order\", status"
     );
     let upsert = upsert_sql(&account()).unwrap();
-    assert!(upsert.contains("ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, "), "{upsert}");
-    assert!(upsert.starts_with("INSERT INTO accounts (id, email,"), "{upsert}");
+    assert!(
+        upsert.contains("ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, "),
+        "{upsert}"
+    );
+    assert!(
+        upsert.starts_with("INSERT INTO accounts (id, email,"),
+        "{upsert}"
+    );
     assert_eq!(
         update_sql(&account()).unwrap(),
         "UPDATE accounts SET email = 'o''neil@example.com', name = NULL, balance = (-10.50), \
          tags = '{\"a b\",\"q\\\"z\"}', \"order\" = 3, status = 'on-hold' WHERE id = 0 \
          RETURNING id, email, name, balance::text, tags::text, \"order\", status"
     );
-    assert_eq!(delete_sql(&account()).unwrap(), "DELETE FROM accounts WHERE id = 0");
-    let line = OrderLine { order_id: 7, line: -1 };
-    assert_eq!(delete_sql(&line).unwrap(), "DELETE FROM order_line WHERE order_id = 7 AND line = (-1)");
-    assert!(upsert_sql(&line).unwrap().contains("ON CONFLICT (order_id, line) DO NOTHING"));
+    assert_eq!(
+        delete_sql(&account()).unwrap(),
+        "DELETE FROM accounts WHERE id = 0"
+    );
+    let line = OrderLine {
+        order_id: 7,
+        line: -1,
+    };
+    assert_eq!(
+        delete_sql(&line).unwrap(),
+        "DELETE FROM order_line WHERE order_id = 7 AND line = (-1)"
+    );
+    assert!(
+        upsert_sql(&line)
+            .unwrap()
+            .contains("ON CONFLICT (order_id, line) DO NOTHING")
+    );
     assert!(update_sql(&line).is_err(), "nothing outside the key");
-    assert!(find_sql::<OrderLine>(&[&7i64]).is_err(), "half a composite key");
+    assert!(
+        find_sql::<OrderLine>(&[&7i64]).is_err(),
+        "half a composite key"
+    );
 }
 
 #[test]
@@ -106,7 +131,8 @@ fn ddl() {
                 .to_string(),
             "ALTER TABLE accounts ADD CONSTRAINT IF NOT EXISTS accounts_email_key UNIQUE (email)"
                 .to_string(),
-            "CREATE INDEX IF NOT EXISTS accounts_name_idx ON accounts USING hash (name)".to_string(),
+            "CREATE INDEX IF NOT EXISTS accounts_name_idx ON accounts USING hash (name)"
+                .to_string(),
         ]
     );
 }
@@ -126,8 +152,20 @@ fn the_query_builder() {
          (id IN (1, 2, 3))) ORDER BY \"order\" DESC NULLS LAST LIMIT 10 OFFSET 20"
     );
     let none: [i64; 0] = [];
-    assert!(Account::query().filter(Account::id.is_in(none)).to_sql().unwrap().ends_with("WHERE 1 = 0"));
-    assert!(Account::query().filter(Account::email.eq("a\0")).to_sql().is_err(), "a NUL surfaces");
+    assert!(
+        Account::query()
+            .filter(Account::id.is_in(none))
+            .to_sql()
+            .unwrap()
+            .ends_with("WHERE 1 = 0")
+    );
+    assert!(
+        Account::query()
+            .filter(Account::email.eq("a\0"))
+            .to_sql()
+            .is_err(),
+        "a NUL surfaces"
+    );
     let raw = Expr::raw("lower(email) = $1", crate::params!["x"]);
     assert_eq!(raw.to_sql().unwrap(), "lower(email) = 'x'");
     let update = Account::query()
@@ -140,9 +178,31 @@ fn the_query_builder() {
         "UPDATE accounts SET status = 'active', \"order\" = \"order\" + 1 WHERE id = 1 \
          RETURNING id, email, name, balance::text, tags::text, \"order\", status"
     );
-    assert!(Account::query().update().set(Account::position, 1).to_sql().is_err(), "no filter");
-    assert!(Account::query().every_row().update().set(Account::position, 1).to_sql().is_ok());
-    assert!(Account::query().filter(Account::id.eq(1i64)).limit(1).update().set(Account::position, 1).to_sql().is_err());
+    assert!(
+        Account::query()
+            .update()
+            .set(Account::position, 1)
+            .to_sql()
+            .is_err(),
+        "no filter"
+    );
+    assert!(
+        Account::query()
+            .every_row()
+            .update()
+            .set(Account::position, 1)
+            .to_sql()
+            .is_ok()
+    );
+    assert!(
+        Account::query()
+            .filter(Account::id.eq(1i64))
+            .limit(1)
+            .update()
+            .set(Account::position, 1)
+            .to_sql()
+            .is_err()
+    );
 }
 
 /// A row as the server would send it for `select_list::<Account>()`.
@@ -187,7 +247,10 @@ fn rows_read_into_the_struct() {
         }
     );
     let short = wire_row(&[(tag::I64, &5i64.to_le_bytes())]);
-    assert!(short.get(0).unwrap().decode::<Account>().is_err(), "a drifted select list fails");
+    assert!(
+        short.get(0).unwrap().decode::<Account>().is_err(),
+        "a drifted select list fails"
+    );
     let bad_enum = wire_row(&[(tag::STRING, b"gone")]);
     assert!(bad_enum.get(0).unwrap().get::<Status>(0).is_err());
     let _ = Timestamp::now();

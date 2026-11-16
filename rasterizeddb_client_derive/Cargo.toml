@@ -3,6 +3,12 @@ name = "rasterizeddb_client_derive"
 version = "0.2.0"
 edition = "2024"
 description = "#[derive(Model)], #[derive(FromRow)] and #[derive(SqlEnum)] for rasterizeddb_client"
+repository = "https://github.com/milen-denev/rasterizeddb"
+documentation = "https://docs.rs/rasterizeddb_client"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["database", "orm", "derive", "rasterizeddb"]
+categories = ["database"]
 
 [lib]
 proc-macro = true

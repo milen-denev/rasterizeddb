@@ -7,29 +7,106 @@ use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 
-/// `#[derive(Model)]`: the struct is a table. See `rasterizeddb_client::orm`.
+/// The struct is a table.
+///
+/// Implements `Model` (the table's name, its columns, and how each field is
+/// written) and `FromRow` (reading the model's select list), and gives the
+/// struct one associated constant per column, named as the field and typed
+/// `Column<Self, FieldType>`, for the query builder: `Account::email.eq("…")`.
+///
+/// ```ignore
+/// use rasterizeddb_client::prelude::*;
+///
+/// #[derive(Model, Debug, Clone)]
+/// #[rdb(table = "accounts")]
+/// struct Account {
+///     #[rdb(primary_key, serial)]
+///     id: i64,
+///     #[rdb(unique)]
+///     email: String,
+///     #[rdb(index = "hash", renamed_from = "full_name")]
+///     name: Option<String>,
+///     balance: Numeric,
+///     #[rdb(skip)]
+///     cached: Option<u32>,
+/// }
+/// ```
+///
+/// # Field attributes
+///
+/// | attribute | meaning |
+/// |---|---|
+/// | `primary_key` | part of the primary key; several fields make a composite key |
+/// | `serial` | assigned by the server's sequence: left out of inserts, read back |
+/// | `unique` | a `UNIQUE` constraint |
+/// | `index`, `index = "hash"` | a secondary index: `btree` (default), `hash`, `gin`, `jsonb_path_ops` |
+/// | `column = "name"` | the column's name, when it is not the field's |
+/// | `sql_type = "VARCHAR(64)"` | the DDL type, when the field type's default is not wanted |
+/// | `default = "…"` | a `DEFAULT` expression for the DDL |
+/// | `renamed_from = "old"` | an earlier column name, for the migrator to rename (may repeat) |
+/// | `json` | any `Serialize + Deserialize` type, stored as `jsonb` (feature `serde_json`) |
+/// | `text` | read as `col::text` and parsed (for a type of your own) |
+/// | `skip` | not a column: `Default::default()` on reads |
+///
+/// # Struct attributes
+///
+/// | attribute | meaning |
+/// |---|---|
+/// | `table = "name"` | the table's name (otherwise the struct's in snake case) |
+/// | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
+///
+/// A field's type must implement `SqlType` (every type the client maps does)
+/// unless it has `sql_type` or `json`.
 #[proc_macro_derive(Model, attributes(rdb))]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    model(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+    model(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
-/// `#[derive(FromRow)]`: a row read into the struct, column `i` into field
-/// `i` (fields marked `#[rdb(skip)]` take their `Default` and no column).
+/// A row read into the struct by position: column `i` into field `i`.
+///
+/// For the result of a statement you write yourself; a `Model` derives this
+/// already. A row with more or fewer columns than the struct has fields is an
+/// error. Field attributes: `skip` (no column; `Default::default()`) and
+/// `json` (the column holds JSON text, deserialized; feature `serde_json`).
+///
+/// ```ignore
+/// #[derive(FromRow)]
+/// struct Total { customer: String, orders: i64, spent: Numeric }
+///
+/// let totals: Vec<Total> = client
+///     .fetch_all("SELECT customer, COUNT(*), SUM(total)::text FROM orders GROUP BY customer", params![])
+///     .await?;
+/// ```
 #[proc_macro_derive(FromRow, attributes(rdb))]
 pub fn derive_from_row(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    from_row_only(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+    from_row_only(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
-/// `#[derive(SqlEnum)]`: an enum of unit variants stored as text, each
-/// variant as its name in snake case (`#[rdb(rename_all = "…")]` for another
-/// case: `lowercase`, `UPPERCASE`, `snake_case`, `SCREAMING_SNAKE_CASE`,
-/// `kebab-case`, `PascalCase`; `#[rdb(rename = "…")]` on a variant).
+/// An enum of unit variants stored as text.
+///
+/// Each variant is stored as its name in snake case. `#[rdb(rename_all =
+/// "…")]` on the enum picks another case (`lowercase`, `UPPERCASE`,
+/// `snake_case`, `SCREAMING_SNAKE_CASE`, `kebab-case`, `PascalCase`), and
+/// `#[rdb(rename = "…")]` on a variant names it outright. Implements `ToSql`,
+/// `FromSql` (an unknown text is an error naming the variants) and `SqlType`
+/// (`TEXT`), and adds `as_sql_str()`.
+///
+/// ```ignore
+/// #[derive(SqlEnum, Clone, Copy, PartialEq, Debug)]
+/// enum Plan { Free, Pro, #[rdb(rename = "enterprise-2026")] Enterprise }
+/// ```
 #[proc_macro_derive(SqlEnum, attributes(rdb))]
 pub fn derive_sql_enum(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    sql_enum(&input).unwrap_or_else(syn::Error::into_compile_error).into()
+    sql_enum(&input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
 
 // ----------------------------------------------------------------- attributes
@@ -56,7 +133,11 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
             let string = |meta: &syn::meta::ParseNestedMeta<'_>| -> syn::Result<String> {
                 Ok(meta.value()?.parse::<LitStr>()?.value())
             };
-            let key = meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+            let key = meta
+                .path
+                .get_ident()
+                .map(|i| i.to_string())
+                .unwrap_or_default();
             match key.as_str() {
                 "primary_key" => out.primary_key = true,
                 "serial" => out.serial = true,
@@ -86,7 +167,10 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
         })?;
     }
     if out.skip && (out.primary_key || out.serial || out.unique || out.index.is_some()) {
-        return Err(syn::Error::new(Span::call_site(), "a skipped field is not a column"));
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "a skipped field is not a column",
+        ));
     }
     Ok(out)
 }
@@ -97,12 +181,19 @@ fn struct_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<Vec<(
     let mut out = Vec::new();
     for attr in attrs.iter().filter(|a| a.path().is_ident("rdb")) {
         attr.parse_nested_meta(|meta| {
-            let key = meta.path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+            let key = meta
+                .path
+                .get_ident()
+                .map(|i| i.to_string())
+                .unwrap_or_default();
             if allowed.contains(&key.as_str()) {
                 out.push((key, meta.value()?.parse::<LitStr>()?.value()));
                 Ok(())
             } else {
-                Err(meta.error(format!("unknown rdb attribute here; expected one of {}", allowed.join(", "))))
+                Err(meta.error(format!(
+                    "unknown rdb attribute here; expected one of {}",
+                    allowed.join(", ")
+                )))
             }
         })?;
     }
@@ -110,7 +201,10 @@ fn struct_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<Vec<(
 }
 
 fn struct_attr(attrs: &[syn::Attribute], wanted: &str) -> syn::Result<Option<String>> {
-    Ok(struct_attrs(attrs, &[wanted])?.into_iter().map(|(_, v)| v).next_back())
+    Ok(struct_attrs(attrs, &[wanted])?
+        .into_iter()
+        .map(|(_, v)| v)
+        .next_back())
 }
 
 fn snake_case(name: &str) -> String {
@@ -118,8 +212,11 @@ fn snake_case(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
         if c.is_uppercase() {
-            let after_lower = i > 0 && (chars[i - 1].is_lowercase() || chars[i - 1].is_ascii_digit());
-            let before_lower = i > 0 && chars.get(i + 1).is_some_and(|n| n.is_lowercase()) && chars[i - 1].is_uppercase();
+            let after_lower =
+                i > 0 && (chars[i - 1].is_lowercase() || chars[i - 1].is_ascii_digit());
+            let before_lower = i > 0
+                && chars.get(i + 1).is_some_and(|n| n.is_lowercase())
+                && chars[i - 1].is_uppercase();
             if after_lower || before_lower {
                 out.push('_');
             }
@@ -145,7 +242,12 @@ fn index_method(name: &str, span: Span) -> syn::Result<Tokens> {
         "hash" => quote!(Hash),
         "gin" => quote!(Gin),
         "gin_path" | "jsonb_path_ops" => quote!(GinPathOps),
-        _ => return Err(syn::Error::new(span, "index is btree, hash, gin or jsonb_path_ops")),
+        _ => {
+            return Err(syn::Error::new(
+                span,
+                "index is btree, hash, gin or jsonb_path_ops",
+            ));
+        }
     };
     Ok(quote!(::rasterizeddb_client::admin::IndexMethod::#variant))
 }
@@ -161,7 +263,10 @@ struct Field<'a> {
 
 fn fields(input: &DeriveInput) -> syn::Result<(Vec<Field<'_>>, bool)> {
     let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new(input.span(), "only a struct can be derived"));
+        return Err(syn::Error::new(
+            input.span(),
+            "only a struct can be derived",
+        ));
     };
     let named = matches!(data.fields, Fields::Named(_));
     let mut out = Vec::new();
@@ -233,7 +338,10 @@ fn from_row_only(input: &DeriveInput) -> syn::Result<Tokens> {
 fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     let (fields, named) = fields(input)?;
     if !named {
-        return Err(syn::Error::new(input.span(), "a Model needs named fields: they name its columns"));
+        return Err(syn::Error::new(
+            input.span(),
+            "a Model needs named fields: they name its columns",
+        ));
     }
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
@@ -257,7 +365,11 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     for f in fields.iter().filter(|f| !f.attrs.skip) {
         let ident = f.ident.expect("named");
         let ty = f.ty;
-        let column = f.attrs.column.clone().unwrap_or_else(|| ident.to_string().trim_start_matches("r#").to_string());
+        let column = f
+            .attrs
+            .column
+            .clone()
+            .unwrap_or_else(|| ident.to_string().trim_start_matches("r#").to_string());
         let i = defs.len();
         let nullable = is_option(ty);
         let sql_type = match (&f.attrs.sql_type, f.attrs.json) {
@@ -336,7 +448,11 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             }
         };
         texts.push(quote!(#i => #text,));
-        let const_name = format_ident!("{}", ident.to_string().trim_start_matches("r#"), span = ident.span());
+        let const_name = format_ident!(
+            "{}",
+            ident.to_string().trim_start_matches("r#"),
+            span = ident.span()
+        );
         let doc = format!("The `{column}` column.");
         consts.push(quote! {
             #[doc = #doc]
@@ -391,13 +507,21 @@ fn rename(name: &str, rule: &str, span: Span) -> syn::Result<String> {
         "lowercase" => name.to_lowercase(),
         "UPPERCASE" => name.to_uppercase(),
         "PascalCase" => name.to_string(),
-        _ => return Err(syn::Error::new(span, "rename_all is snake_case, SCREAMING_SNAKE_CASE, kebab-case, lowercase, UPPERCASE or PascalCase")),
+        _ => {
+            return Err(syn::Error::new(
+                span,
+                "rename_all is snake_case, SCREAMING_SNAKE_CASE, kebab-case, lowercase, UPPERCASE or PascalCase",
+            ));
+        }
     })
 }
 
 fn sql_enum(input: &DeriveInput) -> syn::Result<Tokens> {
     let Data::Enum(data) = &input.data else {
-        return Err(syn::Error::new(input.span(), "SqlEnum is for an enum of unit variants"));
+        return Err(syn::Error::new(
+            input.span(),
+            "SqlEnum is for an enum of unit variants",
+        ));
     };
     let name = &input.ident;
     let rule = struct_attr(&input.attrs, "rename_all")?.unwrap_or_else(|| "snake_case".to_string());

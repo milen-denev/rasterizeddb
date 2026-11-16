@@ -44,7 +44,7 @@
 //!
 //! # What the derive writes
 //!
-//! `#[derive(Model)]` implements [`Model`] and [`FromRow`](crate::FromRow),
+//! `#[derive(Model)]` implements [`Model`] and [`FromRow`],
 //! and gives the struct one associated constant per column, named as the
 //! field (`Account::email`), for the query builder. Field attributes:
 //!
@@ -89,14 +89,19 @@ use crate::{Error, Result};
 /// One column of a [`Model`], as the derive describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnDef {
+    /// The column's name.
     pub name: &'static str,
     /// The DDL type: `BIGINT`, `TEXT`, `NUMERIC`, `JSONB`, `BIGINT[]`, …
     pub sql_type: &'static str,
+    /// Whether it may hold NULL (the field is an `Option`).
     pub nullable: bool,
+    /// Whether it is (part of) the primary key.
     pub primary_key: bool,
     /// Assigned by the server: never written by an insert.
     pub serial: bool,
+    /// Whether a unique key covers it.
     pub unique: bool,
+    /// The secondary index on it, if any.
     pub index: Option<IndexMethod>,
     /// A `DEFAULT` expression for the DDL.
     pub default: Option<&'static str>,
@@ -110,6 +115,7 @@ pub struct ColumnDef {
 
 /// A struct stored as a table's rows. Derive it: `#[derive(Model)]`.
 pub trait Model: FromRow + Sized {
+    /// The table's name.
     const TABLE: &'static str;
     /// In select-list order: column `i` of every row this trait reads is
     /// `COLUMNS[i]`.
@@ -130,7 +136,9 @@ pub trait Model: FromRow + Sized {
 /// Implemented for the types the derive maps by itself; give a field of any
 /// other type `#[rdb(sql_type = "…")]`.
 pub trait SqlType {
+    /// The column type a `CREATE TABLE` gives this Rust type.
     const SQL_TYPE: &'static str;
+    /// Whether the type holds NULL (`Option<T>`).
     const NULLABLE: bool = false;
     /// See [`ColumnDef::read_as_text`].
     const READ_AS_TEXT: bool = false;
@@ -385,6 +393,7 @@ pub fn update_sql<M: Model>(m: &M) -> Result<String> {
     Ok(sql)
 }
 
+/// `DELETE FROM t WHERE <primary key>`.
 pub fn delete_sql<M: Model>(m: &M) -> Result<String> {
     let mut sql = format!("DELETE FROM {} WHERE ", ident(M::TABLE)?);
     key_predicate(m, &mut sql)?;
@@ -401,7 +410,11 @@ fn find_sql<M: Model>(key: &[&dyn ToSql]) -> Result<String> {
             key.len()
         )));
     }
-    let mut sql = format!("SELECT {} FROM {} WHERE ", select_list::<M>()?, ident(M::TABLE)?);
+    let mut sql = format!(
+        "SELECT {} FROM {} WHERE ",
+        select_list::<M>()?,
+        ident(M::TABLE)?
+    );
     for (n, (&i, value)) in columns.iter().zip(key).enumerate() {
         if n > 0 {
             sql.push_str(" AND ");
@@ -423,12 +436,16 @@ pub fn create_table_sql<M: Model>() -> Result<Vec<String>> {
 /// syncs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableSchema {
+    /// The table's name.
     pub table: &'static str,
+    /// Names the table had before.
     pub renamed_from: &'static [&'static str],
+    /// The columns, in select-list order.
     pub columns: &'static [ColumnDef],
 }
 
 impl TableSchema {
+    /// The schema of model `M`.
     pub fn of<M: Model>() -> Self {
         TableSchema {
             table: M::TABLE,
@@ -467,6 +484,7 @@ impl TableSchema {
         Ok(line)
     }
 
+    /// `CREATE TABLE IF NOT EXISTS`, then the unique keys and indexes.
     pub fn create_sql(&self) -> Result<Vec<String>> {
         let mut lines = Vec::new();
         for column in self.columns {
@@ -570,8 +588,10 @@ impl ModelExt for Client {
 
     async fn insert<M: Model>(&self, row: &M) -> Result<M> {
         let rows = self.run(&insert_sql(&[row])?).await?;
-        rows.decode_first()?
-            .ok_or(Error::RowCount { expected: "exactly 1", got: 0 })
+        rows.decode_first()?.ok_or(Error::RowCount {
+            expected: "exactly 1",
+            got: 0,
+        })
     }
 
     async fn insert_many<M: Model>(&self, rows: &[M]) -> Result<Vec<M>> {
@@ -586,7 +606,8 @@ impl ModelExt for Client {
             // A full chunk goes before this row joins it; a row past the
             // byte bound on its own still goes, alone.
             if in_chunk > 0
-                && (in_chunk == INSERT_CHUNK_ROWS || sql.len() + 2 + tuple.len() > INSERT_CHUNK_BYTES)
+                && (in_chunk == INSERT_CHUNK_ROWS
+                    || sql.len() + 2 + tuple.len() > INSERT_CHUNK_BYTES)
             {
                 sql.push_str(&tail);
                 out.extend(self.run(&sql).await?.decode_all::<M>()?);
@@ -614,12 +635,19 @@ impl ModelExt for Client {
             // `DO NOTHING` (a model that is all key) returns no row: the one
             // already there is the answer.
             None => {
-                let mut sql = format!("SELECT {} FROM {} WHERE ", select_list::<M>()?, ident(M::TABLE)?);
+                let mut sql = format!(
+                    "SELECT {} FROM {} WHERE ",
+                    select_list::<M>()?,
+                    ident(M::TABLE)?
+                );
                 key_predicate(row, &mut sql)?;
                 self.run(&sql)
                     .await?
                     .decode_first()?
-                    .ok_or(Error::RowCount { expected: "exactly 1", got: 0 })
+                    .ok_or(Error::RowCount {
+                        expected: "exactly 1",
+                        got: 0,
+                    })
             }
         }
     }
@@ -628,7 +656,10 @@ impl ModelExt for Client {
         let rows = self.run(&update_sql(row)?).await?;
         match rows.len() {
             1 => Ok(rows.decode_first()?.expect("one row")),
-            got => Err(Error::RowCount { expected: "exactly 1", got }),
+            got => Err(Error::RowCount {
+                expected: "exactly 1",
+                got,
+            }),
         }
     }
 
@@ -645,7 +676,10 @@ impl ModelExt for Client {
         let rows = self.run(&find_sql::<M>(key)?).await?;
         match rows.len() {
             0 | 1 => rows.decode_first(),
-            got => Err(Error::RowCount { expected: "at most 1", got }),
+            got => Err(Error::RowCount {
+                expected: "at most 1",
+                got,
+            }),
         }
     }
 

@@ -16,10 +16,15 @@ use crate::{Error, Result};
 #[derive(Clone, Copy)]
 #[non_exhaustive]
 pub enum Param<'a> {
+    /// SQL `NULL`.
     Null,
+    /// `true` or `false`.
     Bool(bool),
+    /// A `SMALLINT`.
     I16(i16),
+    /// An `INTEGER`.
     I32(i32),
+    /// A `BIGINT`.
     I64(i64),
     /// Rendered as a single-quoted literal. Must not contain a NUL, which no
     /// text value can hold.
@@ -40,13 +45,17 @@ pub enum Param<'a> {
     /// An exact decimal, as text (`-12.50`, `1e-9`, `NaN`). Checked to be a
     /// number before it is written: it is not quoted.
     Numeric(&'a str),
+    /// A UUID, as its canonical text.
     Uuid(Uuid),
     /// Written in UTC with an explicit `+00`, so a `timestamptz` column reads
     /// the same instant whatever the server's zone, and a `timestamp` column
     /// the same wall-clock time (PostgreSQL drops the zone there).
     Timestamp(Timestamp),
+    /// A calendar date, `'YYYY-MM-DD'`.
     Date(Date),
+    /// A time of day, `'HH:MM:SS[.ffffff]'`.
     Time(Time),
+    /// An interval, in its three parts.
     Interval(Interval),
     /// A JSON document's text, for a `json` or `jsonb` column.
     Json(&'a str),
@@ -73,6 +82,7 @@ unsafe impl Send for ArrayRef<'_> {}
 unsafe impl Sync for ArrayRef<'_> {}
 
 impl<'a> ArrayRef<'a> {
+    /// A view of `slice`.
     pub fn new<T: ToSql + 'a>(slice: &'a [T]) -> Self {
         /// # Safety
         /// `data` is the start of a live `[T]` and `i` is within it.
@@ -90,10 +100,12 @@ impl<'a> ArrayRef<'a> {
         }
     }
 
+    /// How many elements.
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether there are none.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -233,6 +245,7 @@ pub fn quote_ident(name: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Appends `name` as an identifier (see [`quote_ident`]).
 pub fn push_ident(out: &mut String, name: &str) -> Result<()> {
     if name.is_empty() || name.contains('\0') {
         return Err(Error::Param(format!("{name:?} is not a usable identifier")));
@@ -260,17 +273,102 @@ pub fn push_ident(out: &mut String, name: &str) -> Result<()> {
 /// reserved keywords, plus the few this engine's parsers read as keywords.
 fn is_keyword(name: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "between",
-        "both", "by", "case", "cast", "check", "collate", "column", "constraint", "create",
-        "current_date", "current_role", "current_time", "current_timestamp", "current_user",
-        "default", "deferrable", "delete", "desc", "distinct", "do", "else", "end", "except",
-        "exists", "false", "fetch", "filter", "for", "foreign", "from", "grant", "group", "having",
-        "ilike", "in", "index", "initially", "inner", "insert", "intersect", "into", "is", "join",
-        "key", "lateral", "leading", "left", "like", "limit", "localtime", "localtimestamp", "not",
-        "null", "offset", "on", "only", "or", "order", "outer", "partition", "placing", "primary",
-        "references", "returning", "right", "select", "session_user", "set", "some", "symmetric",
-        "table", "then", "to", "trailing", "true", "union", "unique", "update", "user", "using",
-        "values", "variadic", "when", "where", "window", "with",
+        "all",
+        "analyse",
+        "analyze",
+        "and",
+        "any",
+        "array",
+        "as",
+        "asc",
+        "asymmetric",
+        "between",
+        "both",
+        "by",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "column",
+        "constraint",
+        "create",
+        "current_date",
+        "current_role",
+        "current_time",
+        "current_timestamp",
+        "current_user",
+        "default",
+        "deferrable",
+        "delete",
+        "desc",
+        "distinct",
+        "do",
+        "else",
+        "end",
+        "except",
+        "exists",
+        "false",
+        "fetch",
+        "filter",
+        "for",
+        "foreign",
+        "from",
+        "grant",
+        "group",
+        "having",
+        "ilike",
+        "in",
+        "index",
+        "initially",
+        "inner",
+        "insert",
+        "intersect",
+        "into",
+        "is",
+        "join",
+        "key",
+        "lateral",
+        "leading",
+        "left",
+        "like",
+        "limit",
+        "localtime",
+        "localtimestamp",
+        "not",
+        "null",
+        "offset",
+        "on",
+        "only",
+        "or",
+        "order",
+        "outer",
+        "partition",
+        "placing",
+        "primary",
+        "references",
+        "returning",
+        "right",
+        "select",
+        "session_user",
+        "set",
+        "some",
+        "symmetric",
+        "table",
+        "then",
+        "to",
+        "trailing",
+        "true",
+        "union",
+        "unique",
+        "update",
+        "user",
+        "using",
+        "values",
+        "variadic",
+        "when",
+        "where",
+        "window",
+        "with",
     ];
     KEYWORDS.binary_search(&name).is_ok()
 }
@@ -329,7 +427,11 @@ fn push_float(out: &mut String, text: String, negative: bool, finite: bool, nan:
     if nan {
         out.push_str("'NaN'");
     } else if !finite {
-        out.push_str(if negative { "'-Infinity'" } else { "'Infinity'" });
+        out.push_str(if negative {
+            "'-Infinity'"
+        } else {
+            "'Infinity'"
+        });
     } else if negative {
         let _ = write!(out, "({text})");
     } else {
@@ -347,6 +449,7 @@ fn check_year(year: i64, what: &str) -> Result<()> {
     }
 }
 
+/// Appends `param`'s literal (see [`render`]).
 pub fn push_param(out: &mut String, param: &Param<'_>) -> Result<()> {
     match *param {
         Param::Null => out.push_str("NULL"),
@@ -618,7 +721,7 @@ fn first_word(sql: &str) -> String {
 }
 
 /// Refuses what the native protocol cannot run as written, before it is sent:
-/// a second statement (see [`second_statement`]), and transaction control,
+/// a second statement (the server would run only the first), and transaction control,
 /// which the native protocol does not recognise: every statement there
 /// commits on its own.
 pub fn check_statement(sql: &str) -> Result<()> {
@@ -868,13 +971,25 @@ mod tests {
             r#"SELECT '{"a\\b","c,d","{e}","NULL","","q\"z","it''s"}'"#
         );
         let ints = vec![Some(1i64), None, Some(-3)];
-        assert_eq!(r("SELECT $1", &[Param::Array(ArrayRef::new(&ints))]), "SELECT '{1,NULL,-3}'");
+        assert_eq!(
+            r("SELECT $1", &[Param::Array(ArrayRef::new(&ints))]),
+            "SELECT '{1,NULL,-3}'"
+        );
         let nested = [vec![1i32, 2], vec![3, 4]];
-        assert_eq!(r("SELECT $1", &[Param::Array(ArrayRef::new(&nested))]), "SELECT '{{1,2},{3,4}}'");
+        assert_eq!(
+            r("SELECT $1", &[Param::Array(ArrayRef::new(&nested))]),
+            "SELECT '{{1,2},{3,4}}'"
+        );
         let empty: [i64; 0] = [];
-        assert_eq!(r("SELECT $1", &[Param::Array(ArrayRef::new(&empty))]), "SELECT '{}'");
+        assert_eq!(
+            r("SELECT $1", &[Param::Array(ArrayRef::new(&empty))]),
+            "SELECT '{}'"
+        );
         let floats = [f64::NAN, 1.5, f64::INFINITY];
-        assert_eq!(r("SELECT $1", &[Param::Array(ArrayRef::new(&floats))]), "SELECT '{NaN,1.5,Infinity}'");
+        assert_eq!(
+            r("SELECT $1", &[Param::Array(ArrayRef::new(&floats))]),
+            "SELECT '{NaN,1.5,Infinity}'"
+        );
         assert!(render("SELECT $1", &[Param::Array(ArrayRef::new(&["a\0"]))]).is_err());
     }
 
@@ -906,8 +1021,14 @@ mod tests {
             "SELECT 1;SELECT 2",
             "UPDATE t SET a = 1; -- x\n DELETE FROM t",
         ] {
-            assert!(matches!(render(sql, &[]), Err(Error::Unsupported(_))), "{sql}");
-            assert!(matches!(check_statement(sql), Err(Error::Unsupported(_))), "{sql}");
+            assert!(
+                matches!(render(sql, &[]), Err(Error::Unsupported(_))),
+                "{sql}"
+            );
+            assert!(
+                matches!(check_statement(sql), Err(Error::Unsupported(_))),
+                "{sql}"
+            );
         }
         for sql in [
             "INSERT INTO t VALUES (1);",
@@ -921,17 +1042,34 @@ mod tests {
         }
         // A value holding a `;` is a literal, not a second statement.
         assert_eq!(
-            r("INSERT INTO t VALUES ($1)", &[Param::Text("1); DROP TABLE t; --")]),
+            r(
+                "INSERT INTO t VALUES ($1)",
+                &[Param::Text("1); DROP TABLE t; --")]
+            ),
             "INSERT INTO t VALUES ('1); DROP TABLE t; --')"
         );
     }
 
     #[test]
     fn transaction_control_is_refused() {
-        for sql in ["BEGIN", "  begin;", "START TRANSACTION", "commit", "/* c */ ROLLBACK", "SAVEPOINT a"] {
-            assert!(matches!(check_statement(sql), Err(Error::Unsupported(_))), "{sql}");
+        for sql in [
+            "BEGIN",
+            "  begin;",
+            "START TRANSACTION",
+            "commit",
+            "/* c */ ROLLBACK",
+            "SAVEPOINT a",
+        ] {
+            assert!(
+                matches!(check_statement(sql), Err(Error::Unsupported(_))),
+                "{sql}"
+            );
         }
-        for sql in ["SELECT begin FROM t", "INSERT INTO commits VALUES (1)", "VACUUM t"] {
+        for sql in [
+            "SELECT begin FROM t",
+            "INSERT INTO commits VALUES (1)",
+            "VACUUM t",
+        ] {
             assert!(check_statement(sql).is_ok(), "{sql}");
         }
     }

@@ -15,31 +15,49 @@ use crate::types::{Date, Interval, Json, Numeric, Time, Timestamp, Uuid};
 #[derive(Clone, PartialEq, Debug)]
 #[non_exhaustive]
 pub enum Value {
+    /// SQL NULL.
     Null,
+    /// A boolean.
     Bool(bool),
+    /// A `SMALLINT` (or a `TINYINT`).
     I16(i16),
+    /// An `INTEGER` (or a `USMALLINT`).
     I32(i32),
+    /// A `BIGINT` (or a `UINT`).
     I64(i64),
+    /// A `UBIGINT`.
     U64(u64),
     /// An integer wider than 64 bits (`HUGEINT`, `UHUGEINT`), or an unsigned
     /// one past `u64`.
     I128(i128),
+    /// A `REAL`.
     F32(f32),
+    /// A `DOUBLE PRECISION`.
     F64(f64),
+    /// An exact decimal.
     Numeric(Numeric),
     /// Text. A cell under the text tag that is not UTF-8 is [`Value::Bytes`].
     Text(String),
+    /// Bytes.
     Bytes(Vec<u8>),
+    /// A UUID.
     Uuid(Uuid),
+    /// A point in time.
     Timestamp(Timestamp),
+    /// A calendar date.
     Date(Date),
+    /// A time of day.
     Time(Time),
+    /// An interval.
     Interval(Interval),
+    /// A JSON document's text.
     Json(Json),
+    /// An array's elements.
     Array(Vec<Value>),
 }
 
 impl Value {
+    /// Whether this is NULL.
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -80,6 +98,7 @@ impl Value {
         })
     }
 
+    /// Text, JSON text or a number's text.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Text(s) => Some(s),
@@ -101,6 +120,7 @@ impl Value {
         }
     }
 
+    /// Any number, as `f64` (a `Numeric` parsed, rounding).
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::F32(v) => Some((*v).into()),
@@ -110,6 +130,7 @@ impl Value {
         }
     }
 
+    /// A boolean.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
@@ -117,6 +138,7 @@ impl Value {
         }
     }
 
+    /// Bytes, or text's bytes.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Bytes(b) => Some(b),

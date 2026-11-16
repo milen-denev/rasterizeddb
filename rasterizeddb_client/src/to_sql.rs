@@ -14,6 +14,7 @@ use crate::types::{Date, Interval, Json, Numeric, Time, Timestamp, Uuid};
 /// `Sync`, so that a parameter list (`&[&dyn ToSql]`) can be held across an
 /// `.await` in a task that must be `Send`.
 pub trait ToSql: Sync {
+    /// The value as a parameter, borrowing from `self`.
     fn to_param(&self) -> Param<'_>;
 }
 
@@ -174,11 +175,44 @@ macro_rules! array_to_sql {
 }
 
 array_to_sql!(
-    bool, i8, i16, i32, i64, u16, u32, u64, f32, f64, String, &str, Uuid, Timestamp, Date, Time,
-    Interval, Numeric, Json, crate::Value,
-    Option<bool>, Option<i16>, Option<i32>, Option<i64>, Option<u64>, Option<f32>, Option<f64>,
-    Option<String>, Option<&str>, Option<Uuid>, Option<Timestamp>, Option<Date>, Option<Numeric>,
-    Vec<i16>, Vec<i32>, Vec<i64>, Vec<f64>, Vec<String>,
+    bool,
+    i8,
+    i16,
+    i32,
+    i64,
+    u16,
+    u32,
+    u64,
+    f32,
+    f64,
+    String,
+    &str,
+    Uuid,
+    Timestamp,
+    Date,
+    Time,
+    Interval,
+    Numeric,
+    Json,
+    crate::Value,
+    Option<bool>,
+    Option<i16>,
+    Option<i32>,
+    Option<i64>,
+    Option<u64>,
+    Option<f32>,
+    Option<f64>,
+    Option<String>,
+    Option<&str>,
+    Option<Uuid>,
+    Option<Timestamp>,
+    Option<Date>,
+    Option<Numeric>,
+    Vec<i16>,
+    Vec<i32>,
+    Vec<i64>,
+    Vec<f64>,
+    Vec<String>,
 );
 
 #[cfg(feature = "uuid")]

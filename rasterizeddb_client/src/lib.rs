@@ -1,39 +1,64 @@
-//! A client SDK and ORM for RasterizedDB's native protocol (rastcp) that does
-//! not compile the engine.
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+//! A client SDK and ORM for [RasterizedDB]'s native protocol (rastcp) that
+//! does not compile the engine.
 //!
-//! [`rasterizeddb_core::client::DbClient`] lives inside the server crate and
-//! pulls the whole engine in with it. This crate is the same conversation with
-//! only the transport underneath: a statement goes out as text, and the answer
-//! comes back as a row count, rows, or the server's error message.
+//! [RasterizedDB]: https://github.com/milen-denev/rasterizeddb
 //!
-//! Three layers, each usable alone:
+//! Four layers, each usable on its own:
 //!
-//! * **SQL**: [`Client::query`]/[`Client::execute`] with `$n` parameters, and
-//!   typed reads with [`Row::get`], [`Client::fetch_all`] and the rest.
-//! * **Administration**: [`Client::admin`] turns the server's own statements
-//!   (stores, placement, indexes, partitions, roles, backups, configuration,
-//!   the key/value cache) into typed calls. See [`admin`].
-//! * **ORM**: `#[derive(Model)]` maps a struct to a table, with typed column
-//!   constants, a query builder, inserts/upserts/updates/deletes that read
-//!   back what was stored, DDL and migrations. See [`orm`].
+//! | layer | what | start at |
+//! |---|---|---|
+//! | **SQL** | statements with `$n` parameters, typed rows | [`Client`], [`params!`], [`FromRow`] |
+//! | **Administration** | stores, placement, indexes, partitions, roles, backups, configuration | [`Client::admin`], [`admin`] |
+//! | **ORM** | `#[derive(Model)]`, a query builder, migrations run on connect | [`orm`], [`Model`](derive@Model) |
+//! | **Key/value** | the server's cache, typed: maps, closure queries, models as hashes | [`Client::kv`], [`kv`] |
 //!
 //! ```no_run
-//! # async fn demo() -> Result<(), rasterizeddb_client::Error> {
-//! use rasterizeddb_client::{Client, Options, Param, params};
+//! use rasterizeddb_client::prelude::*;
 //!
-//! let client = Client::connect("unix:/run/oxyredox/rdb.sock", Options::default()).await?;
-//! client
-//!     .execute(
-//!         "INSERT INTO items (domain, key, body) VALUES ($1, $2, $3)",
-//!         &[Param::Text("example.com"), Param::I64(-7), Param::Bytes(b"\x00\xff")],
-//!     )
+//! #[derive(Model, Debug)]
+//! struct Note {
+//!     #[rdb(primary_key, serial)]
+//!     id: i64,
+//!     body: String,
+//!     pinned: bool,
+//! }
+//!
+//! # async fn demo() -> rasterizeddb_client::Result<()> {
+//! let client = Client::connect("unix:/run/rdb/rdb.sock", Options::default()).await?;
+//! client.create_table::<Note>().await?;
+//!
+//! let note = client.insert(&Note { id: 0, body: "hello".into(), pinned: false }).await?;
+//! let pinned = Note::query().filter(Note::pinned.eq(true)).all(&client).await?;
+//!
+//! // Plain SQL, typed rows:
+//! let rows: Vec<(i64, String)> = client
+//!     .fetch_all("SELECT id, body FROM note WHERE id >= $1", params![note.id])
 //!     .await?;
-//! let items: Vec<(i64, Option<Vec<u8>>)> = client
-//!     .fetch_all("SELECT key, body FROM items WHERE domain = $1", params!["example.com"])
-//!     .await?;
-//! # let _ = items;
-//! # Ok(()) }
+//! # let _ = (pinned, rows); Ok(()) }
 //! ```
+//!
+//! # The guide
+//!
+//! | chapter | |
+//! |---|---|
+//! | [Getting started](guide::getting_started) | connecting, sharing a client, what the native protocol cannot do |
+//! | [Types](guide::types) | the Rust ⇄ SQL mapping, and the three types that need `::text` |
+//! | [Queries](guide::queries) | the calls, rows, atomic writes, errors |
+//! | [The ORM](guide::orm) | `#[derive(Model)]`, CRUD, the query builder |
+//! | [Migrations](guide::migrations) | steps, scenarios, model sync, the `auto_migrate` knob |
+//! | [Key/value](guide::kv) | typed values, maps, queries, models as hashes |
+//! | [Administration](guide::admin) | stores, indexes, partitions, roles, backups |
+//!
+//! # Features
+//!
+//! | feature | default | adds |
+//! |---|---|---|
+//! | `derive` | yes | `#[derive(Model)]`, `#[derive(FromRow)]`, `#[derive(SqlEnum)]` |
+//! | `chrono` | | `chrono`'s date and time types as parameters and results |
+//! | `uuid` | | `uuid::Uuid` as a parameter and a result |
+//! | `serde_json` | | `serde_json::Value` results, `#[rdb(json)]` fields, [`kv::KvJson`] |
 //!
 //! # Parameters are rendered, not bound
 //!
@@ -62,14 +87,6 @@
 //! of the statement's select list (or `RETURNING` list), so read rows by the
 //! position your SQL put each value in. The ORM writes its select lists itself,
 //! so its models read correctly by construction.
-//!
-//! # Types
-//!
-//! See [`FromSql`] for what each column type arrives as. Two need a cast to be
-//! read exactly: `jsonb` and array columns arrive in the engine's binary
-//! forms, and a `NUMERIC(p, s)` column without its scale; select them as
-//! `col::text`, which reads back as [`Json`], `Vec<T>` or [`Numeric`]. Reading
-//! them directly is an error naming that fix, never a wrong value.
 
 // The derive macros name this crate by its path; this lets its own tests use
 // them.
@@ -88,6 +105,25 @@ mod value;
 pub mod admin;
 pub mod kv;
 pub mod orm;
+
+/// The guide: how to use this crate, chapter by chapter. Documentation only;
+/// every example in it is compiled by `cargo test`.
+pub mod guide {
+    #[doc = include_str!("../docs/getting_started.md")]
+    pub mod getting_started {}
+    #[doc = include_str!("../docs/types.md")]
+    pub mod types {}
+    #[doc = include_str!("../docs/queries.md")]
+    pub mod queries {}
+    #[doc = include_str!("../docs/orm.md")]
+    pub mod orm {}
+    #[doc = include_str!("../docs/migrations.md")]
+    pub mod migrations {}
+    #[doc = include_str!("../docs/kv.md")]
+    pub mod kv {}
+    #[doc = include_str!("../docs/admin.md")]
+    pub mod admin {}
+}
 
 pub use client::{Client, Options};
 pub use error::Error;

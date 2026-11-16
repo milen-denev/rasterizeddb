@@ -13,37 +13,64 @@ use crate::{Error, Result};
 
 /// The type tags a cell can carry (`DbType::to_byte` in the server).
 pub mod tag {
+    /// `TINYINT`: an `i8`.
     pub const I8: u8 = 1;
+    /// `SMALLINT`: an `i16`, little-endian.
     pub const I16: u8 = 2;
+    /// `INTEGER`: an `i32`, little-endian.
     pub const I32: u8 = 3;
+    /// `BIGINT`: an `i64`, little-endian (also `count(*)`).
     pub const I64: u8 = 4;
+    /// `HUGEINT`: an `i128`, little-endian.
     pub const I128: u8 = 5;
+    /// `UTINYINT`: a `u8`.
     pub const U8: u8 = 6;
+    /// `USMALLINT`: a `u16`, little-endian.
     pub const U16: u8 = 7;
+    /// `UINT`: a `u32`, little-endian.
     pub const U32: u8 = 8;
+    /// `UBIGINT`: a `u64`, little-endian.
     pub const U64: u8 = 9;
+    /// `UHUGEINT`: a `u128`, little-endian.
     pub const U128: u8 = 10;
+    /// `REAL`: an `f32`, little-endian.
     pub const F32: u8 = 11;
+    /// `DOUBLE PRECISION`: an `f64`, little-endian.
     pub const F64: u8 = 12;
+    /// A legacy fixed-width character column.
     pub const CHAR: u8 = 13;
+    /// Text, and also `bytea`, `char(n)`, `jsonb` and arrays, which the native protocol sends under this tag.
     pub const STRING: u8 = 14;
     /// `timestamptz` and `timestamp` alike: `i64` µs since 1970, little-endian.
     pub const DATETIME: u8 = 15;
+    /// `BOOLEAN`: one byte, 0 or 1.
     pub const BOOL: u8 = 16;
+    /// `UUID`: 16 octets.
     pub const UUID: u8 = 17;
+    /// `INET`: family, 16 address bytes (big-endian), prefix length.
     pub const INET: u8 = 18;
     /// `NUMERIC`: an `i128`, little-endian, then a scale byte when the wire
     /// carries it (see [`Numeric`](crate::Numeric)).
     pub const DECIMAL: u8 = 19;
+    /// `bytea` from an expression (a stored `bytea` column arrives as [`STRING`]).
     pub const BYTEA: u8 = 20;
+    /// An array in PostgreSQL's binary form (a stored array column arrives as [`STRING`]).
     pub const ARRAY: u8 = 21;
+    /// A JSONB document in the engine's binary form.
     pub const JSONB: u8 = 22;
+    /// JSON text from an expression.
     pub const JSON: u8 = 23;
+    /// `INTERVAL`: µs, days, months, big-endian.
     pub const INTERVAL: u8 = 24;
+    /// `DATE`: days since 2000-01-01, big-endian `i32`.
     pub const DATE: u8 = 29;
+    /// `TIME`: µs since midnight, big-endian `i64`.
     pub const TIME: u8 = 30;
+    /// `timestamp` from an expression; stored ones arrive as [`DATETIME`].
     pub const TIMESTAMP: u8 = 46;
+    /// A `json` column's text.
     pub const JSONTEXT: u8 = 47;
+    /// SQL NULL.
     pub const NULL: u8 = 253;
 }
 
@@ -127,6 +154,7 @@ impl Rows {
         self.rows.len()
     }
 
+    /// Whether the answer holds no rows.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -140,6 +168,7 @@ impl Rows {
         })
     }
 
+    /// The rows, in order.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Row<'_>> + '_ {
         (0..self.rows.len()).map(|i| self.get(i).unwrap())
     }
@@ -193,6 +222,7 @@ impl<'a> Row<'a> {
         self.cells.len()
     }
 
+    /// Whether the row has no columns.
     pub fn is_empty(&self) -> bool {
         self.cells.is_empty()
     }
@@ -260,22 +290,27 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
+    /// An integer column, if it fits `i32`.
     pub fn get_opt_i32(&self, i: usize) -> Result<Option<i32>> {
         self.get(i)
     }
 
+    /// An integer column, if it fits `i16`.
     pub fn get_opt_i16(&self, i: usize) -> Result<Option<i16>> {
         self.get(i)
     }
 
+    /// An integer column, if it fits `i64`; NULL is an error.
     pub fn get_i64(&self, i: usize) -> Result<i64> {
         self.get(i)
     }
 
+    /// An integer column, if it fits `i32`; NULL is an error.
     pub fn get_i32(&self, i: usize) -> Result<i32> {
         self.get(i)
     }
 
+    /// An integer column, if it fits `i16`; NULL is an error.
     pub fn get_i16(&self, i: usize) -> Result<i16> {
         self.get(i)
     }
@@ -286,6 +321,7 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
+    /// [`get_opt_f64`](Self::get_opt_f64); NULL is an error.
     pub fn get_f64(&self, i: usize) -> Result<f64> {
         self.get(i)
     }
@@ -296,14 +332,17 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
+    /// [`get_opt_f32`](Self::get_opt_f32); NULL is an error.
     pub fn get_f32(&self, i: usize) -> Result<f32> {
         self.get(i)
     }
 
+    /// A `BOOLEAN` column.
     pub fn get_opt_bool(&self, i: usize) -> Result<Option<bool>> {
         self.get(i)
     }
 
+    /// A `BOOLEAN` column; NULL is an error.
     pub fn get_bool(&self, i: usize) -> Result<bool> {
         self.get(i)
     }
@@ -314,6 +353,7 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
+    /// [`get_opt_text`](Self::get_opt_text); NULL is an error.
     pub fn get_text(&self, i: usize) -> Result<&'a str> {
         self.get(i)
     }
@@ -325,6 +365,7 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
+    /// [`get_opt_bytes`](Self::get_opt_bytes); NULL is an error.
     pub fn get_bytes(&self, i: usize) -> Result<&'a [u8]> {
         self.get(i)
     }
@@ -337,6 +378,7 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
+    /// [`get_numeric`](Self::get_numeric), NULL as `None`.
     pub fn get_opt_numeric(&self, i: usize) -> Result<Option<crate::Numeric>> {
         self.get(i)
     }
@@ -348,6 +390,7 @@ impl<'a> Row<'a> {
 ///
 /// Columns are matched by position: field or element `i` is column `i`.
 pub trait FromRow: Sized {
+    /// The row as `Self`.
     fn from_row(row: &Row<'_>) -> Result<Self>;
 }
 

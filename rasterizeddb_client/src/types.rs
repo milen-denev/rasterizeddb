@@ -145,10 +145,12 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 pub struct Uuid(pub [u8; 16]);
 
 impl Uuid {
+    /// From its 16 octets.
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Uuid(bytes)
     }
 
+    /// Its 16 octets.
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
@@ -172,13 +174,8 @@ fn fill_random(out: &mut [u8]) -> Result<()> {
     let mut filled = 0;
     while filled < out.len() {
         // SAFETY: the pointer and length describe the unfilled tail of `out`.
-        let n = unsafe {
-            libc::getrandom(
-                out[filled..].as_mut_ptr().cast(),
-                out.len() - filled,
-                0,
-            )
-        };
+        let n =
+            unsafe { libc::getrandom(out[filled..].as_mut_ptr().cast(), out.len() - filled, 0) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -238,20 +235,27 @@ impl fmt::Debug for Uuid {
 /// wall-clock time.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Timestamp {
+    /// Microseconds since 1970-01-01 00:00:00 UTC.
     pub micros: i64,
 }
 
 impl Timestamp {
+    /// 1970-01-01 00:00:00 UTC.
     pub const UNIX_EPOCH: Timestamp = Timestamp { micros: 0 };
 
+    /// From microseconds since the Unix epoch.
     pub const fn from_micros(micros: i64) -> Self {
         Timestamp { micros }
     }
 
+    /// From seconds since the Unix epoch.
     pub const fn from_unix_seconds(seconds: i64) -> Self {
-        Timestamp { micros: seconds * US_PER_SEC }
+        Timestamp {
+            micros: seconds * US_PER_SEC,
+        }
     }
 
+    /// Microseconds since the Unix epoch.
     pub const fn as_micros(self) -> i64 {
         self.micros
     }
@@ -263,25 +267,33 @@ impl Timestamp {
 
     /// From the eight little-endian bytes the native protocol carries.
     pub fn from_wire(bytes: &[u8]) -> Option<Self> {
-        fixed(bytes).map(|b| Timestamp { micros: i64::from_le_bytes(b) })
+        fixed(bytes).map(|b| Timestamp {
+            micros: i64::from_le_bytes(b),
+        })
     }
 
+    /// From a calendar date and time of day (UTC); `None` for one that does not exist.
     pub fn from_ymd_hms(year: i64, month: u32, day: u32, h: u32, m: u32, s: u32) -> Option<Self> {
         let date = Date::from_ymd(year, month, day)?;
         if h > 23 || m > 59 || s > 59 {
             return None;
         }
         Some(Timestamp {
-            micros: date.unix_days() as i64 * US_PER_DAY + ((h as i64 * 60 + m as i64) * 60 + s as i64) * US_PER_SEC,
+            micros: date.unix_days() as i64 * US_PER_DAY
+                + ((h as i64 * 60 + m as i64) * 60 + s as i64) * US_PER_SEC,
         })
     }
 
+    /// The calendar date (UTC).
     pub fn date(self) -> Date {
         Date::from_unix_days(self.micros.div_euclid(US_PER_DAY) as i32)
     }
 
+    /// The time of day (UTC).
     pub fn time(self) -> Time {
-        Time { micros: self.micros.rem_euclid(US_PER_DAY) }
+        Time {
+            micros: self.micros.rem_euclid(US_PER_DAY),
+        }
     }
 }
 
@@ -383,19 +395,24 @@ pub struct Date {
 }
 
 impl Date {
+    /// From days since 1970-01-01.
     pub const fn from_unix_days(days: i32) -> Self {
         Date { days }
     }
 
+    /// Days since 1970-01-01.
     pub const fn unix_days(self) -> i32 {
         self.days
     }
 
+    /// From year, month and day; `None` for a date that does not exist.
     pub fn from_ymd(year: i64, month: u32, day: u32) -> Option<Self> {
         if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
             return None;
         }
-        i32::try_from(days_from_civil(year, month, day)).ok().map(Date::from_unix_days)
+        i32::try_from(days_from_civil(year, month, day))
+            .ok()
+            .map(Date::from_unix_days)
     }
 
     /// `(year, month, day)`.
@@ -440,12 +457,17 @@ pub struct Time {
 }
 
 impl Time {
+    /// 00:00:00.
     pub const MIDNIGHT: Time = Time { micros: 0 };
 
+    /// From microseconds since midnight; `None` past 24:00:00.
     pub fn from_micros(micros: i64) -> Option<Self> {
-        (0..=US_PER_DAY).contains(&micros).then_some(Time { micros })
+        (0..=US_PER_DAY)
+            .contains(&micros)
+            .then_some(Time { micros })
     }
 
+    /// From hours, minutes, seconds and microseconds; `None` for a time that does not exist.
     pub fn from_hms_micro(h: u32, m: u32, s: u32, micro: u32) -> Option<Self> {
         if h > 23 || m > 59 || s > 59 || micro > 999_999 {
             return None;
@@ -453,6 +475,7 @@ impl Time {
         Self::from_micros(((h as i64 * 60 + m as i64) * 60 + s as i64) * US_PER_SEC + micro as i64)
     }
 
+    /// Microseconds since midnight.
     pub const fn as_micros(self) -> i64 {
         self.micros
     }
@@ -466,7 +489,9 @@ impl Time {
 impl FromStr for Time {
     type Err = Error;
     fn from_str(text: &str) -> Result<Self> {
-        parse_clock(text.trim()).map(|micros| Time { micros }).ok_or_else(|| bad("time", text))
+        parse_clock(text.trim())
+            .map(|micros| Time { micros })
+            .ok_or_else(|| bad("time", text))
     }
 }
 
@@ -489,18 +514,31 @@ impl fmt::Debug for Time {
 /// daylight-saving change) a fixed number of microseconds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 pub struct Interval {
+    /// Whole months.
     pub months: i32,
+    /// Whole days.
     pub days: i32,
+    /// Microseconds.
     pub micros: i64,
 }
 
 impl Interval {
+    /// From its three parts.
     pub const fn new(months: i32, days: i32, micros: i64) -> Self {
-        Interval { months, days, micros }
+        Interval {
+            months,
+            days,
+            micros,
+        }
     }
 
+    /// Microseconds only.
     pub const fn from_micros(micros: i64) -> Self {
-        Interval { months: 0, days: 0, micros }
+        Interval {
+            months: 0,
+            days: 0,
+            micros,
+        }
     }
 
     /// From the sixteen big-endian bytes the native protocol carries.
@@ -560,27 +598,44 @@ impl FromStr for Interval {
                     None => (false, word.strip_prefix('+').unwrap_or(word)),
                 };
                 let us = parse_clock_unbounded(clock).ok_or_else(err)?;
-                iv.micros = iv.micros.checked_add(if negative { -us } else { us }).ok_or_else(err)?;
+                iv.micros = iv
+                    .micros
+                    .checked_add(if negative { -us } else { us })
+                    .ok_or_else(err)?;
                 continue;
             }
             let number: f64 = word.parse().map_err(|_| err())?;
             let unit = words.next().ok_or_else(err)?.to_ascii_lowercase();
             let unit = unit.trim_end_matches(',');
             let whole = |n: f64| -> Result<i64> {
-                (n.fract() == 0.0 && n.abs() < 9.2e18).then_some(n as i64).ok_or_else(err)
+                (n.fract() == 0.0 && n.abs() < 9.2e18)
+                    .then_some(n as i64)
+                    .ok_or_else(err)
             };
             match unit {
                 "year" | "years" | "yr" | "yrs" | "y" => {
-                    iv.months = iv.months.checked_add(i32::try_from(whole(number * 12.0)?).map_err(|_| err())?).ok_or_else(err)?
+                    iv.months = iv
+                        .months
+                        .checked_add(i32::try_from(whole(number * 12.0)?).map_err(|_| err())?)
+                        .ok_or_else(err)?
                 }
                 "mon" | "mons" | "month" | "months" => {
-                    iv.months = iv.months.checked_add(i32::try_from(whole(number)?).map_err(|_| err())?).ok_or_else(err)?
+                    iv.months = iv
+                        .months
+                        .checked_add(i32::try_from(whole(number)?).map_err(|_| err())?)
+                        .ok_or_else(err)?
                 }
                 "week" | "weeks" | "w" => {
-                    iv.days = iv.days.checked_add(i32::try_from(whole(number * 7.0)?).map_err(|_| err())?).ok_or_else(err)?
+                    iv.days = iv
+                        .days
+                        .checked_add(i32::try_from(whole(number * 7.0)?).map_err(|_| err())?)
+                        .ok_or_else(err)?
                 }
                 "day" | "days" | "d" => {
-                    iv.days = iv.days.checked_add(i32::try_from(whole(number)?).map_err(|_| err())?).ok_or_else(err)?
+                    iv.days = iv
+                        .days
+                        .checked_add(i32::try_from(whole(number)?).map_err(|_| err())?)
+                        .ok_or_else(err)?
                 }
                 _ => {
                     let per = match unit {
@@ -636,10 +691,12 @@ impl Numeric {
         }
     }
 
+    /// The number's text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// The number's text, owned.
     pub fn into_string(self) -> String {
         self.0
     }
@@ -703,14 +760,17 @@ numeric_from_int!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128);
 pub struct Json(pub String);
 
 impl Json {
+    /// From a document's text (not checked here; the server checks it).
     pub fn new(text: impl Into<String>) -> Self {
         Json(text.into())
     }
 
+    /// The document's text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// The document's text, owned.
     pub fn into_string(self) -> String {
         self.0
     }
@@ -753,9 +813,16 @@ mod tests {
         let text = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
         let u: Uuid = text.parse().unwrap();
         assert_eq!(u.to_string(), text);
-        assert_eq!("A0EEBC999C0B4EF8BB6D6BB9BD380A11".parse::<Uuid>().unwrap(), u);
+        assert_eq!(
+            "A0EEBC999C0B4EF8BB6D6BB9BD380A11".parse::<Uuid>().unwrap(),
+            u
+        );
         assert!("a0eebc99".parse::<Uuid>().is_err());
-        assert!("g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11".parse::<Uuid>().is_err());
+        assert!(
+            "g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+                .parse::<Uuid>()
+                .is_err()
+        );
         let v4 = Uuid::new_v4().unwrap();
         assert_eq!(v4.0[6] >> 4, 4);
         assert_ne!(v4, Uuid::new_v4().unwrap());
@@ -765,16 +832,29 @@ mod tests {
     fn timestamps_parse_and_print() {
         let t: Timestamp = "2026-11-16 12:34:56.789".parse().unwrap();
         assert_eq!(t.to_string(), "2026-11-16 12:34:56.789");
-        assert_eq!("2026-11-16T14:34:56.789+02:00".parse::<Timestamp>().unwrap(), t);
+        assert_eq!(
+            "2026-11-16T14:34:56.789+02:00"
+                .parse::<Timestamp>()
+                .unwrap(),
+            t
+        );
         assert_eq!("2026-11-16 12:34:56.789Z".parse::<Timestamp>().unwrap(), t);
-        assert_eq!("1970-01-01".parse::<Timestamp>().unwrap(), Timestamp::UNIX_EPOCH);
+        assert_eq!(
+            "1970-01-01".parse::<Timestamp>().unwrap(),
+            Timestamp::UNIX_EPOCH
+        );
         let before: Timestamp = "1969-12-31 23:59:59.5".parse().unwrap();
         assert_eq!(before.micros, -500_000);
         assert_eq!(before.to_string(), "1969-12-31 23:59:59.5");
         assert!("2026-02-30".parse::<Timestamp>().is_err());
         assert!("2026-01-01 25:00".parse::<Timestamp>().is_err());
         assert!("2026-01-01 10:00:00.1234567".parse::<Timestamp>().is_err());
-        assert_eq!(Timestamp::from_ymd_hms(2026, 11, 16, 12, 34, 56).unwrap().to_string(), "2026-11-16 12:34:56");
+        assert_eq!(
+            Timestamp::from_ymd_hms(2026, 11, 16, 12, 34, 56)
+                .unwrap()
+                .to_string(),
+            "2026-11-16 12:34:56"
+        );
         let wire = t.micros.to_le_bytes();
         assert_eq!(Timestamp::from_wire(&wire), Some(t));
         let st: std::time::SystemTime = before.into();
@@ -786,7 +866,10 @@ mod tests {
         let d: Date = "2000-01-01".parse().unwrap();
         assert_eq!(d.unix_days(), PG_EPOCH_DAYS);
         assert_eq!(Date::from_wire(&0i32.to_be_bytes()), Some(d));
-        assert_eq!(Date::from_wire(&(-1i32).to_be_bytes()).unwrap().to_string(), "1999-12-31");
+        assert_eq!(
+            Date::from_wire(&(-1i32).to_be_bytes()).unwrap().to_string(),
+            "1999-12-31"
+        );
         assert!("2023-02-29".parse::<Date>().is_err());
         assert_eq!("2024-02-29".parse::<Date>().unwrap().ymd(), (2024, 2, 29));
         let t: Time = "13:05:09.25".parse().unwrap();
@@ -807,14 +890,21 @@ mod tests {
             assert_eq!(iv.to_string().parse::<Interval>().unwrap(), iv, "{iv}");
         }
         assert_eq!(
-            "1 year 2 mons 3 days 04:05:06.5".parse::<Interval>().unwrap(),
+            "1 year 2 mons 3 days 04:05:06.5"
+                .parse::<Interval>()
+                .unwrap(),
             Interval::new(14, 3, 14_706_500_000)
         );
         assert_eq!(
             "-5 days +01:00:00".parse::<Interval>().unwrap(),
             Interval::new(0, -5, 3_600_000_000)
         );
-        let wire = [7i64.to_be_bytes().as_slice(), &2i32.to_be_bytes(), &1i32.to_be_bytes()].concat();
+        let wire = [
+            7i64.to_be_bytes().as_slice(),
+            &2i32.to_be_bytes(),
+            &1i32.to_be_bytes(),
+        ]
+        .concat();
         assert_eq!(Interval::from_wire(&wire), Some(Interval::new(1, 2, 7)));
     }
 

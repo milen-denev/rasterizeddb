@@ -7,7 +7,7 @@
 //!   is a key or a value.
 //! * [`KvMap<K, V>`]: a typed map under a key prefix (`sessions:<key>`).
 //!   Keys and values are any type with a text form: [`ToSql`] +
-//!   [`FromSql`] types (`String`, integers, floats, `bool`, `Vec<u8>`,
+//!   [`FromSql`](crate::FromSql) types (`String`, integers, floats, `bool`, `Vec<u8>`,
 //!   [`Uuid`](crate::Uuid), [`Timestamp`](crate::Timestamp),
 //!   [`Numeric`](crate::Numeric), `#[derive(SqlEnum)]` enums, arrays), or
 //!   [`KvJson<T>`] for a serde type.
@@ -141,8 +141,14 @@ impl<'c> Kv<'c> {
     /// Any command, every argument after its name sent as bytes; value
     /// columns come back as `bytea` (`KV BINARY`).
     pub async fn command(&self, command: &str, args: &[&[u8]]) -> Result<Rows> {
-        if command.is_empty() || !command.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(Error::Param(format!("{command:?} is not a KV command name")));
+        if command.is_empty()
+            || !command
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(Error::Param(format!(
+                "{command:?} is not a KV command name"
+            )));
         }
         let mut sql = format!("KV BINARY {command}");
         for arg in args {
@@ -165,8 +171,14 @@ impl<'c> Kv<'c> {
 
     // ------------------------------------------------------------ strings
 
+    /// The value at `key`.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.bytes_column("GET", &[key]).await?.into_iter().next().flatten())
+        Ok(self
+            .bytes_column("GET", &[key])
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     /// `SET key value [PX ttl]`.
@@ -175,13 +187,20 @@ impl<'c> Kv<'c> {
             None => self.command("SET", &[key, value]).await.map(drop),
             Some(ttl) => {
                 let ms = millis(ttl);
-                self.command("SET", &[key, value, b"PX", ms.as_bytes()]).await.map(drop)
+                self.command("SET", &[key, value, b"PX", ms.as_bytes()])
+                    .await
+                    .map(drop)
             }
         }
     }
 
     /// `SET key value NX [PX ttl]`: whether the key was absent and is now set.
-    pub async fn set_if_absent(&self, key: &[u8], value: &[u8], ttl: Option<Duration>) -> Result<bool> {
+    pub async fn set_if_absent(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> Result<bool> {
         let ms = ttl.map(millis);
         let mut args: Vec<&[u8]> = vec![key, value, b"NX"];
         if let Some(ms) = &ms {
@@ -215,10 +234,12 @@ impl<'c> Kv<'c> {
         self.int("DEL", keys).await
     }
 
+    /// Whether `key` exists.
     pub async fn exists(&self, key: &[u8]) -> Result<bool> {
         Ok(self.int("EXISTS", &[key]).await? > 0)
     }
 
+    /// Adds `by` to the integer at `key` (0 when absent): its new value.
     pub async fn incr_by(&self, key: &[u8], by: i64) -> Result<i64> {
         let by = by.to_string();
         self.int("INCRBY", &[key, by.as_bytes()]).await
@@ -249,7 +270,10 @@ impl<'c> Kv<'c> {
         let mut cursor = "0".to_string();
         loop {
             let rows = self
-                .command("SCAN", &[cursor.as_bytes(), b"MATCH", pattern, b"COUNT", b"500"])
+                .command(
+                    "SCAN",
+                    &[cursor.as_bytes(), b"MATCH", pattern, b"COUNT", b"500"],
+                )
                 .await?;
             let mut next = None;
             for row in rows.iter() {
@@ -277,8 +301,14 @@ impl<'c> Kv<'c> {
         self.int("HSET", &args).await
     }
 
+    /// A hash field's value.
     pub async fn hget(&self, key: &[u8], field: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.bytes_column("HGET", &[key, field]).await?.into_iter().next().flatten())
+        Ok(self
+            .bytes_column("HGET", &[key, field])
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     /// Every field and value; empty for a missing key.
@@ -297,6 +327,7 @@ impl<'c> Kv<'c> {
         self.int("HDEL", &args).await
     }
 
+    /// Adds `by` to a hash field's integer: its new value.
     pub async fn hincr_by(&self, key: &[u8], field: &[u8], by: i64) -> Result<i64> {
         let by = by.to_string();
         self.int("HINCRBY", &[key, field, by.as_bytes()]).await
@@ -318,21 +349,36 @@ impl<'c> Kv<'c> {
         self.int("LPUSH", &args).await
     }
 
+    /// Removes and returns a list's first element.
     pub async fn lpop(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.bytes_column("LPOP", &[key]).await?.into_iter().next().flatten())
+        Ok(self
+            .bytes_column("LPOP", &[key])
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
+    /// Removes and returns a list's last element.
     pub async fn rpop(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.bytes_column("RPOP", &[key]).await?.into_iter().next().flatten())
+        Ok(self
+            .bytes_column("RPOP", &[key])
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     /// `LRANGE key start stop` (negative counts from the end; `0, -1` is all).
     pub async fn lrange(&self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Vec<u8>>> {
         let (start, stop) = (start.to_string(), stop.to_string());
-        let values = self.bytes_column("LRANGE", &[key, start.as_bytes(), stop.as_bytes()]).await?;
+        let values = self
+            .bytes_column("LRANGE", &[key, start.as_bytes(), stop.as_bytes()])
+            .await?;
         Ok(values.into_iter().flatten().collect())
     }
 
+    /// A list's length (0 for no list).
     pub async fn llen(&self, key: &[u8]) -> Result<i64> {
         self.int("LLEN", &[key]).await
     }
@@ -346,20 +392,29 @@ impl<'c> Kv<'c> {
         self.int("SADD", &args).await
     }
 
+    /// Removes members from a set: how many were there.
     pub async fn srem(&self, key: &[u8], members: &[&[u8]]) -> Result<i64> {
         let mut args: Vec<&[u8]> = vec![key];
         args.extend_from_slice(members);
         self.int("SREM", &args).await
     }
 
+    /// Whether `member` is in the set.
     pub async fn sismember(&self, key: &[u8], member: &[u8]) -> Result<bool> {
         Ok(self.int("SISMEMBER", &[key, member]).await? == 1)
     }
 
+    /// Every member of a set.
     pub async fn smembers(&self, key: &[u8]) -> Result<Vec<Vec<u8>>> {
-        Ok(self.bytes_column("SMEMBERS", &[key]).await?.into_iter().flatten().collect())
+        Ok(self
+            .bytes_column("SMEMBERS", &[key])
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
+    /// A set's size.
     pub async fn scard(&self, key: &[u8]) -> Result<i64> {
         self.int("SCARD", &[key]).await
     }
@@ -377,13 +432,23 @@ impl<'c> Kv<'c> {
         self.int("ZADD", &args).await
     }
 
+    /// A sorted-set member's score.
     pub async fn zscore(&self, key: &[u8], member: &[u8]) -> Result<Option<f64>> {
         let rows = self.command("ZSCORE", &[key, member]).await?;
-        rows.get(0).map(|r| r.get::<Option<f64>>(0)).transpose().map(Option::flatten)
+        rows.get(0)
+            .map(|r| r.get::<Option<f64>>(0))
+            .transpose()
+            .map(Option::flatten)
     }
 
     /// `ZRANGE key start stop WITHSCORES` (by rank, `REV` for highest first).
-    pub async fn zrange(&self, key: &[u8], start: i64, stop: i64, rev: bool) -> Result<Vec<(Vec<u8>, f64)>> {
+    pub async fn zrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        rev: bool,
+    ) -> Result<Vec<(Vec<u8>, f64)>> {
         let (start, stop) = (start.to_string(), stop.to_string());
         let mut args: Vec<&[u8]> = vec![key, start.as_bytes(), stop.as_bytes()];
         if rev {
@@ -394,15 +459,19 @@ impl<'c> Kv<'c> {
         rows.iter().map(|r| Ok((r.get(0)?, r.get(1)?))).collect()
     }
 
+    /// Removes members from a sorted set: how many were there.
     pub async fn zrem(&self, key: &[u8], members: &[&[u8]]) -> Result<i64> {
         let mut args: Vec<&[u8]> = vec![key];
         args.extend_from_slice(members);
         self.int("ZREM", &args).await
     }
 
+    /// Adds `by` to a member's score: its new score.
     pub async fn zincr_by(&self, key: &[u8], member: &[u8], by: f64) -> Result<f64> {
         let by = format!("{by:?}");
-        let rows = self.command("ZINCRBY", &[key, by.as_bytes(), member]).await?;
+        let rows = self
+            .command("ZINCRBY", &[key, by.as_bytes(), member])
+            .await?;
         rows.get(0)
             .ok_or_else(|| Error::Protocol("KV ZINCRBY answered no row".to_string()))?
             .get(0)
@@ -437,12 +506,20 @@ impl<'c> Kv<'c> {
     /// A typed map under `prefix:` (see [`KvMap`]); an empty prefix is the
     /// whole keyspace.
     pub fn map<K: KvKey, V: KvValue>(&self, prefix: &str) -> KvMap<'c, K, V> {
-        KvMap { kv: *self, prefix: prefix.to_string(), _types: PhantomData }
+        KvMap {
+            kv: *self,
+            prefix: prefix.to_string(),
+            _types: PhantomData,
+        }
     }
 
     /// Model `M`'s rows as hashes under `<table>:` (see [`KvRepo`]).
     pub fn repo<M: Model>(&self) -> KvRepo<'c, M> {
-        KvRepo { kv: *self, prefix: M::TABLE.to_string(), _model: PhantomData }
+        KvRepo {
+            kv: *self,
+            prefix: M::TABLE.to_string(),
+            _model: PhantomData,
+        }
     }
 }
 
@@ -458,6 +535,7 @@ impl Client {
 /// A key of a [`KvMap`]: its text form. Implemented for every [`ToSql`]
 /// type.
 pub trait KvKey {
+    /// The key's bytes: its text form.
     fn key_bytes(&self) -> Result<Vec<u8>>;
 }
 
@@ -472,7 +550,9 @@ impl<T: ToSql + ?Sized> KvKey for T {
 /// every type that is both [`ToSql`] and [`FromSql`](crate::FromSql), by its
 /// text form; [`KvJson`] for a serde type.
 pub trait KvValue: Sized {
+    /// The bytes stored for this value.
     fn encode(&self) -> Result<Vec<u8>>;
+    /// The value stored as `bytes`.
     fn decode(bytes: &[u8]) -> Result<Self>;
 }
 
@@ -496,13 +576,17 @@ pub struct KvJson<T>(pub T);
 #[cfg(feature = "serde_json")]
 impl<T: serde::Serialize + serde::de::DeserializeOwned> KvValue for KvJson<T> {
     fn encode(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&self.0).map_err(|e| Error::Param(format!("a value did not serialize: {e}")))
+        serde_json::to_vec(&self.0)
+            .map_err(|e| Error::Param(format!("a value did not serialize: {e}")))
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
         serde_json::from_slice(bytes)
             .map(KvJson)
-            .map_err(|e| Error::Column { index: 0, message: format!("a value did not deserialize: {e}") })
+            .map_err(|e| Error::Column {
+                index: 0,
+                message: format!("a value did not deserialize: {e}"),
+            })
     }
 }
 
@@ -532,6 +616,7 @@ impl<K: KvKey + ?Sized, V: KvValue> KvMap<'_, K, V> {
         out
     }
 
+    /// The value at `key`.
     pub async fn get(&self, key: &K) -> Result<Option<V>> {
         match self.kv.get(&self.full_key(key)?).await? {
             None => Ok(None),
@@ -539,18 +624,26 @@ impl<K: KvKey + ?Sized, V: KvValue> KvMap<'_, K, V> {
         }
     }
 
+    /// Stores `value` at `key`, with no TTL.
     pub async fn set(&self, key: &K, value: &V) -> Result<()> {
-        self.kv.set(&self.full_key(key)?, &value.encode()?, None).await
+        self.kv
+            .set(&self.full_key(key)?, &value.encode()?, None)
+            .await
     }
 
+    /// Stores `value` at `key`, expiring after `ttl`.
     pub async fn set_with_ttl(&self, key: &K, value: &V, ttl: Duration) -> Result<()> {
-        self.kv.set(&self.full_key(key)?, &value.encode()?, Some(ttl)).await
+        self.kv
+            .set(&self.full_key(key)?, &value.encode()?, Some(ttl))
+            .await
     }
 
     /// Sets it only when absent: whether it was set. With a TTL, a lease or
     /// a lock: the first caller wins until it expires.
     pub async fn set_if_absent(&self, key: &K, value: &V, ttl: Option<Duration>) -> Result<bool> {
-        self.kv.set_if_absent(&self.full_key(key)?, &value.encode()?, ttl).await
+        self.kv
+            .set_if_absent(&self.full_key(key)?, &value.encode()?, ttl)
+            .await
     }
 
     /// Whether there was one to remove.
@@ -558,21 +651,27 @@ impl<K: KvKey + ?Sized, V: KvValue> KvMap<'_, K, V> {
         Ok(self.kv.del(&[&self.full_key(key)?]).await? > 0)
     }
 
+    /// Whether `key` has a value.
     pub async fn contains(&self, key: &K) -> Result<bool> {
         self.kv.exists(&self.full_key(key)?).await
     }
 
+    /// Sets `key`'s TTL: whether it existed to be given one.
     pub async fn expire(&self, key: &K, ttl: Duration) -> Result<bool> {
         self.kv.expire(&self.full_key(key)?, ttl).await
     }
 
+    /// `key`'s time left: `None` without a TTL or a value.
     pub async fn ttl(&self, key: &K) -> Result<Option<Duration>> {
         self.kv.ttl(&self.full_key(key)?).await
     }
 
     /// Each key's value (`None` for a missing one), in one `MGET`.
     pub async fn get_many(&self, keys: &[&K]) -> Result<Vec<Option<V>>> {
-        let full: Vec<Vec<u8>> = keys.iter().map(|k| self.full_key(k)).collect::<Result<_>>()?;
+        let full: Vec<Vec<u8>> = keys
+            .iter()
+            .map(|k| self.full_key(k))
+            .collect::<Result<_>>()?;
         let refs: Vec<&[u8]> = full.iter().map(Vec::as_slice).collect();
         self.kv
             .get_many(&refs)
@@ -594,7 +693,13 @@ impl<K: KvKey + ?Sized, V: KvValue> KvMap<'_, K, V> {
         let mut pattern = glob_escape(&prefix);
         pattern.push(b'*');
         let cut = prefix.len();
-        Ok(self.kv.keys(&pattern).await?.into_iter().map(|k| k[cut.min(k.len())..].to_vec()).collect())
+        Ok(self
+            .kv
+            .keys(&pattern)
+            .await?
+            .into_iter()
+            .map(|k| k[cut.min(k.len())..].to_vec())
+            .collect())
     }
 
     /// Removes every key under the prefix: the number removed. A `SCAN`, then
@@ -625,7 +730,11 @@ impl<'c, K: KvKey + KvValue, V: KvValue> KvMap<'c, K, V> {
     /// [`filter`](KvQuery::filter)).
     pub fn query(&self) -> KvQuery<'c, K, V> {
         KvQuery {
-            map: KvMap { kv: self.kv, prefix: self.prefix.clone(), _types: PhantomData },
+            map: KvMap {
+                kv: self.kv,
+                prefix: self.prefix.clone(),
+                _types: PhantomData,
+            },
             suffix: Vec::new(),
             key_filter: None,
             filter: None,
@@ -770,13 +879,19 @@ impl<K: KvKey + KvValue, V: KvValue> KvQuery<'_, K, V> {
         if self.filter.is_some() {
             return Ok(self.all().await?.into_iter().map(|(k, _)| k).collect());
         }
-        let mut keys: Vec<K> = self.matching_keys().await?.into_iter().map(|(_, k)| k).collect();
+        let mut keys: Vec<K> = self
+            .matching_keys()
+            .await?
+            .into_iter()
+            .map(|(_, k)| k)
+            .collect();
         if let Some(n) = self.limit {
             keys.truncate(n);
         }
         Ok(keys)
     }
 
+    /// The matching values.
     pub async fn values(&self) -> Result<Vec<V>> {
         Ok(self.all().await?.into_iter().map(|(_, v)| v).collect())
     }
@@ -786,6 +901,7 @@ impl<K: KvKey + KvValue, V: KvValue> KvQuery<'_, K, V> {
         Ok(self.entries(Some(1)).await?.into_iter().next())
     }
 
+    /// How many entries match.
     pub async fn count(&self) -> Result<usize> {
         if self.filter.is_some() {
             Ok(self.all().await?.len())
@@ -812,7 +928,12 @@ impl<K: KvKey + KvValue, V: KvValue> KvQuery<'_, K, V> {
                 .map(|(k, _)| self.map.full_key(k))
                 .collect::<Result<_>>()?
         } else {
-            let mut keys: Vec<Vec<u8>> = self.matching_keys().await?.into_iter().map(|(f, _)| f).collect();
+            let mut keys: Vec<Vec<u8>> = self
+                .matching_keys()
+                .await?
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
             if let Some(n) = self.limit {
                 keys.truncate(n);
             }
@@ -888,7 +1009,10 @@ impl<M: Model> KvRepo<'_, M> {
             .map(|i| {
                 let mut out = Vec::new();
                 if !m.write_text(i, &mut out)? {
-                    return Err(Error::Param(format!("key column {} is NULL", M::COLUMNS[i].name)));
+                    return Err(Error::Param(format!(
+                        "key column {} is NULL",
+                        M::COLUMNS[i].name
+                    )));
                 }
                 Ok(out)
             })
@@ -907,7 +1031,10 @@ impl<M: Model> KvRepo<'_, M> {
                 key.len()
             )));
         }
-        let parts = key.iter().map(|k| k.key_bytes()).collect::<Result<Vec<_>>>()?;
+        let parts = key
+            .iter()
+            .map(|k| k.key_bytes())
+            .collect::<Result<Vec<_>>>()?;
         Ok(self.key_of(&parts))
     }
 
@@ -988,14 +1115,17 @@ impl<M: Model> KvRepo<'_, M> {
         Ok(self.kv.del(&[&self.key_for_model(m)?]).await? > 0)
     }
 
+    /// Deletes the row whose primary key is `key`: whether there was one.
     pub async fn delete_key(&self, key: &[&dyn ToSql]) -> Result<bool> {
         Ok(self.kv.del(&[&self.key_for(key)?]).await? > 0)
     }
 
+    /// Whether the row whose primary key is `key` is stored.
     pub async fn exists(&self, key: &[&dyn ToSql]) -> Result<bool> {
         self.kv.exists(&self.key_for(key)?).await
     }
 
+    /// Sets a TTL on the row's hash: whether it was stored to be given one.
     pub async fn expire(&self, m: &M, ttl: Duration) -> Result<bool> {
         self.kv.expire(&self.key_for_model(m)?, ttl).await
     }
@@ -1016,7 +1146,11 @@ impl<M: Model> KvRepo<'_, M> {
         Ok(self.scan(Some(&keep), Some(1)).await?.into_iter().next())
     }
 
-    async fn scan(&self, keep: Option<&dyn Fn(&M) -> bool>, limit: Option<usize>) -> Result<Vec<M>> {
+    async fn scan(
+        &self,
+        keep: Option<&dyn Fn(&M) -> bool>,
+        limit: Option<usize>,
+    ) -> Result<Vec<M>> {
         let mut pattern = glob_escape(self.prefix.as_bytes());
         pattern.extend_from_slice(b":*");
         let mut out = Vec::new();
@@ -1086,8 +1220,16 @@ mod tests {
     #[test]
     fn composite_keys_cannot_collide() {
         let client_free = |a: &str, b: &str| {
-            let repo = KvRepo::<Pair> { kv: keys_only_kv(), prefix: "p".into(), _model: PhantomData };
-            repo.key_for_model(&Pair { a: a.into(), b: b.into() }).unwrap()
+            let repo = KvRepo::<Pair> {
+                kv: keys_only_kv(),
+                prefix: "p".into(),
+                _model: PhantomData,
+            };
+            repo.key_for_model(&Pair {
+                a: a.into(),
+                b: b.into(),
+            })
+            .unwrap()
         };
         assert_ne!(client_free("a:b", "c"), client_free("a", "b:c"));
         assert_eq!(client_free("x\\", ":"), b"p:x\\\\:\\:".to_vec());

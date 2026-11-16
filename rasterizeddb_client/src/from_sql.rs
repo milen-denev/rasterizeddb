@@ -79,7 +79,9 @@ fn numeric_parts(raw: &[u8]) -> Result<(i128, u32), String> {
             u32::from(raw[16]),
         )),
         16 => Err(NUMERIC_NO_SCALE.to_string()),
-        n => Err(format!("a NUMERIC cell of {n} bytes is not one this client reads")),
+        n => Err(format!(
+            "a NUMERIC cell of {n} bytes is not one this client reads"
+        )),
     }
 }
 
@@ -153,7 +155,9 @@ macro_rules! int_from_sql {
         }
     )*};
 }
-int_from_sql!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize);
+int_from_sql!(
+    i8, i16, i32, i64, i128, u8, u16, u32, u64, u128, isize, usize
+);
 
 impl FromSql<'_> for f64 {
     fn from_sql(t: u8, raw: &[u8]) -> Result<Self, String> {
@@ -168,8 +172,7 @@ impl FromSql<'_> for f64 {
             }
             t if is_text_tag(t) => {
                 let s = text(t, raw, "a number")?.trim();
-                s.parse()
-                    .map_err(|_| format!("{s:?} is not a number"))
+                s.parse().map_err(|_| format!("{s:?} is not a number"))
             }
             _ => integer(t, raw).map(|v| v as f64),
         }
@@ -322,7 +325,11 @@ impl FromSql<'_> for Numeric {
 /// document, which is refused rather than returned as garbage.
 impl FromSql<'_> for Json {
     fn from_sql(t: u8, raw: &[u8]) -> Result<Self, String> {
-        if t == tag::JSONB || raw.first().is_some_and(|&b| b < 0x20 && !b.is_ascii_whitespace()) {
+        if t == tag::JSONB
+            || raw
+                .first()
+                .is_some_and(|&b| b < 0x20 && !b.is_ascii_whitespace())
+        {
             return Err(
                 "this is a stored JSONB document, not JSON text: select the column as col::text"
                     .to_string(),
@@ -468,7 +475,9 @@ pub(crate) fn parse_array_text(s: &str) -> Result<Vec<Option<String>>, String> {
 /// a NULL), as the engine stores it: elements are canonical text. `None` for
 /// bytes that are not one; one-dimensional arrays only.
 fn decode_binary_array(raw: &[u8]) -> Option<Result<Vec<Option<String>>, String>> {
-    let be = |at: usize| -> Option<i32> { Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?)) };
+    let be = |at: usize| -> Option<i32> {
+        Some(i32::from_be_bytes(raw.get(at..at + 4)?.try_into().ok()?))
+    };
     let ndim = be(0)?;
     let flags = be(4)?;
     if !(0..=6).contains(&ndim) || !(0..=1).contains(&flags) {
@@ -525,11 +534,38 @@ macro_rules! array_from_sql {
 }
 
 array_from_sql!(
-    bool, i16, i32, i64, u32, u64, f32, f64, String, Uuid, Timestamp, Date, Time, Interval, Numeric,
-    Json, Value,
-    Option<bool>, Option<i16>, Option<i32>, Option<i64>, Option<f64>, Option<String>, Option<Uuid>,
-    Option<Timestamp>, Option<Date>, Option<Numeric>,
-    Vec<i16>, Vec<i32>, Vec<i64>, Vec<f64>, Vec<String>,
+    bool,
+    i16,
+    i32,
+    i64,
+    u32,
+    u64,
+    f32,
+    f64,
+    String,
+    Uuid,
+    Timestamp,
+    Date,
+    Time,
+    Interval,
+    Numeric,
+    Json,
+    Value,
+    Option<bool>,
+    Option<i16>,
+    Option<i32>,
+    Option<i64>,
+    Option<f64>,
+    Option<String>,
+    Option<Uuid>,
+    Option<Timestamp>,
+    Option<Date>,
+    Option<Numeric>,
+    Vec<i16>,
+    Vec<i32>,
+    Vec<i64>,
+    Vec<f64>,
+    Vec<String>,
 );
 
 // ----------------------------------------------------------- optional crates
@@ -549,7 +585,8 @@ mod chrono_impls {
     impl FromSql<'_> for DateTime<Utc> {
         fn from_sql(t: u8, raw: &[u8]) -> Result<Self, String> {
             let ts = Timestamp::from_sql(t, raw)?;
-            DateTime::from_timestamp_micros(ts.micros).ok_or_else(|| format!("{ts} is out of chrono's range"))
+            DateTime::from_timestamp_micros(ts.micros)
+                .ok_or_else(|| format!("{ts} is out of chrono's range"))
         }
     }
 
@@ -607,7 +644,10 @@ mod tests {
     fn numerics_with_and_without_a_scale() {
         let mut raw = (-1i128).to_le_bytes().to_vec();
         raw.push(6);
-        assert_eq!(Numeric::from_sql(tag::DECIMAL, &raw).unwrap().as_str(), "-0.000001");
+        assert_eq!(
+            Numeric::from_sql(tag::DECIMAL, &raw).unwrap().as_str(),
+            "-0.000001"
+        );
         assert_eq!(f64::from_sql(tag::DECIMAL, &raw).unwrap(), -0.000001);
         assert!(i64::from_sql(tag::DECIMAL, &raw).is_err(), "not whole");
         let mut whole = 2800i128.to_le_bytes().to_vec();
@@ -620,20 +660,37 @@ mod tests {
         assert!(e.contains("::text"), "{e}");
         assert!(i64::from_sql(tag::DECIMAL, &ambiguous).is_err());
         assert!(f64::from_sql(tag::DECIMAL, &ambiguous).is_err());
-        assert_eq!(Numeric::from_sql(tag::STRING, b"12.34").unwrap().as_str(), "12.34");
-        assert_eq!(Numeric::from_sql(tag::I64, &7i64.to_le_bytes()).unwrap().as_str(), "7");
+        assert_eq!(
+            Numeric::from_sql(tag::STRING, b"12.34").unwrap().as_str(),
+            "12.34"
+        );
+        assert_eq!(
+            Numeric::from_sql(tag::I64, &7i64.to_le_bytes())
+                .unwrap()
+                .as_str(),
+            "7"
+        );
         assert!(Numeric::from_sql(tag::F64, &1.5f64.to_le_bytes()).is_err());
     }
 
     #[test]
     fn floats() {
-        assert_eq!(f64::from_sql(tag::F64, &(-2.25f64).to_le_bytes()).unwrap(), -2.25);
+        assert_eq!(
+            f64::from_sql(tag::F64, &(-2.25f64).to_le_bytes()).unwrap(),
+            -2.25
+        );
         assert_eq!(f64::from_sql(tag::F32, &1.5f32.to_le_bytes()).unwrap(), 1.5);
         assert_eq!(f32::from_sql(tag::F32, &0.1f32.to_le_bytes()).unwrap(), 0.1);
         assert_eq!(f32::from_sql(tag::F64, &1.5f64.to_le_bytes()).unwrap(), 1.5);
-        assert!(f32::from_sql(tag::F64, &0.1f64.to_le_bytes()).is_err(), "would round");
+        assert!(
+            f32::from_sql(tag::F64, &0.1f64.to_le_bytes()).is_err(),
+            "would round"
+        );
         assert!(f64::from_sql(tag::STRING, b"NaN").unwrap().is_nan());
-        assert_eq!(f64::from_sql(tag::STRING, b"-Infinity").unwrap(), f64::NEG_INFINITY);
+        assert_eq!(
+            f64::from_sql(tag::STRING, b"-Infinity").unwrap(),
+            f64::NEG_INFINITY
+        );
         assert_eq!(f64::from_sql(tag::I64, &3i64.to_le_bytes()).unwrap(), 3.0);
         assert!(f64::from_sql(tag::BOOL, &[1]).is_err());
     }
@@ -641,9 +698,20 @@ mod tests {
     #[test]
     fn times_from_their_tags_and_from_text() {
         let ts: Timestamp = "2026-11-16 12:34:56.789".parse().unwrap();
-        assert_eq!(Timestamp::from_sql(tag::DATETIME, &ts.micros.to_le_bytes()).unwrap(), ts);
-        assert_eq!(Timestamp::from_sql(tag::STRING, b"2026-11-16 12:34:56.789+00").unwrap(), ts);
-        assert_eq!(Date::from_sql(tag::DATE, &[0, 0, 0x26, 0x58]).unwrap().to_string(), "2026-11-16");
+        assert_eq!(
+            Timestamp::from_sql(tag::DATETIME, &ts.micros.to_le_bytes()).unwrap(),
+            ts
+        );
+        assert_eq!(
+            Timestamp::from_sql(tag::STRING, b"2026-11-16 12:34:56.789+00").unwrap(),
+            ts
+        );
+        assert_eq!(
+            Date::from_sql(tag::DATE, &[0, 0, 0x26, 0x58])
+                .unwrap()
+                .to_string(),
+            "2026-11-16"
+        );
         assert_eq!(
             Interval::from_sql(tag::STRING, b"1 year 2 mons -3 days +01:06:45.000006").unwrap(),
             Interval::new(14, -3, 4_005_000_006)
@@ -653,7 +721,10 @@ mod tests {
 
     #[test]
     fn json_refuses_a_stored_document() {
-        assert_eq!(Json::from_sql(tag::STRING, b"{\"b\":1}").unwrap().as_str(), "{\"b\":1}");
+        assert_eq!(
+            Json::from_sql(tag::STRING, b"{\"b\":1}").unwrap().as_str(),
+            "{\"b\":1}"
+        );
         assert!(Json::from_sql(tag::STRING, &[0x07, 0x01, 0, 0]).is_err());
         assert!(Json::from_sql(tag::JSONB, b"{}").is_err());
     }
@@ -697,7 +768,11 @@ mod tests {
         let v: Vec<Option<i32>> = Vec::from_sql(tag::STRING, &raw).unwrap();
         assert_eq!(v, vec![Some(1), Some(2), None]);
         let empty = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x17];
-        assert!(Vec::<i32>::from_sql(tag::STRING, &empty).unwrap().is_empty());
+        assert!(
+            Vec::<i32>::from_sql(tag::STRING, &empty)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -705,7 +780,9 @@ mod tests {
         assert_eq!(i64::from_sql(tag::STRING, b" 42 ").unwrap(), 42);
         assert!(bool::from_sql(tag::STRING, b"t").unwrap());
         assert_eq!(
-            Uuid::from_sql(tag::STRING, b"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11").unwrap().to_string(),
+            Uuid::from_sql(tag::STRING, b"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11")
+                .unwrap()
+                .to_string(),
             "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
         );
         assert!(u8::from_sql(tag::I64, &300i64.to_le_bytes()).is_err());

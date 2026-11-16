@@ -151,7 +151,10 @@ impl Default for SyncPolicy {
 impl SyncPolicy {
     /// Create and add only; never rename, alter or drop.
     pub fn additive() -> Self {
-        SyncPolicy { renames: false, ..SyncPolicy::default() }
+        SyncPolicy {
+            renames: false,
+            ..SyncPolicy::default()
+        }
     }
 
     /// Everything, dropping columns included: the table becomes exactly the
@@ -232,7 +235,9 @@ fn checksum(body: &Body) -> i64 {
 /// Where a step stands against a database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepState {
+    /// Recorded, with the checksum it has now.
     Applied,
+    /// Not recorded yet.
     Pending,
     /// Applied with other statements than it has now.
     Changed,
@@ -240,10 +245,14 @@ pub enum StepState {
     Unknown,
 }
 
+/// One step's standing, from [`Migrator::status`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepStatus {
+    /// The step's name.
     pub name: String,
+    /// Where it stands.
     pub state: StepState,
+    /// When it was recorded, if it was.
     pub applied_at: Option<Timestamp>,
 }
 
@@ -309,8 +318,11 @@ impl MigrationPlan {
 /// What [`Migrator::apply`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MigrationReport {
+    /// Steps run by this call.
     pub applied: Vec<String>,
+    /// Repeatable steps run again because their text changed.
     pub reapplied: Vec<String>,
+    /// Steps recorded without running them, by a [`baseline`](Migrator::baseline).
     pub baselined: Vec<String>,
     /// Edited steps whose new checksum was recorded
     /// ([`accept_changed`](Migrator::accept_changed)).
@@ -342,7 +354,10 @@ impl fmt::Debug for Migrator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Migrator")
             .field("steps", &self.steps)
-            .field("models", &self.models.iter().map(|m| m.table).collect::<Vec<_>>())
+            .field(
+                "models",
+                &self.models.iter().map(|m| m.table).collect::<Vec<_>>(),
+            )
             .field("table", &self.table)
             .field("baseline", &self.baseline)
             .field("policy", &self.policy)
@@ -360,6 +375,7 @@ impl Default for Migrator {
 pub const MIGRATIONS_TABLE: &str = "rdb_client_migrations";
 
 impl Migrator {
+    /// A migrator with no steps and no models, recording in `rdb_client_migrations`.
     pub fn new() -> Self {
         Migrator {
             steps: Vec::new(),
@@ -376,13 +392,22 @@ impl Migrator {
     }
 
     fn push(mut self, name: &str, body: Body, repeatable: bool) -> Self {
-        self.steps.push(Step { name: name.to_string(), body, down: None, repeatable });
+        self.steps.push(Step {
+            name: name.to_string(),
+            body,
+            down: None,
+            repeatable,
+        });
         self
     }
 
     /// A step of SQL statements, run once, in order with the others.
     pub fn step(self, name: &str, statements: &[&str]) -> Self {
-        self.push(name, Body::Sql(statements.iter().map(|s| s.to_string()).collect()), false)
+        self.push(
+            name,
+            Body::Sql(statements.iter().map(|s| s.to_string()).collect()),
+            false,
+        )
     }
 
     /// A step of Rust, run once. `version` stands for its body in the
@@ -391,21 +416,34 @@ impl Migrator {
     where
         F: for<'c> Fn(&'c Client) -> BoxFuture<'c, Result<()>> + Send + Sync + 'static,
     {
-        self.push(name, Body::Code { version: version.to_string(), run: Arc::new(run) }, false)
+        self.push(
+            name,
+            Body::Code {
+                version: version.to_string(),
+                run: Arc::new(run),
+            },
+            false,
+        )
     }
 
     /// A step run again whenever its statements change (and first when
     /// added), after the ordinary steps. For definitions that are replaced
     /// whole: settings, views, grants.
     pub fn repeatable(self, name: &str, statements: &[&str]) -> Self {
-        self.push(name, Body::Sql(statements.iter().map(|s| s.to_string()).collect()), true)
+        self.push(
+            name,
+            Body::Sql(statements.iter().map(|s| s.to_string()).collect()),
+            true,
+        )
     }
 
     /// The statements that undo the step added last, for
     /// [`rollback_to`](Self::rollback_to).
     pub fn down(mut self, statements: &[&str]) -> Self {
         if let Some(step) = self.steps.last_mut() {
-            step.down = Some(Body::Sql(statements.iter().map(|s| s.to_string()).collect()));
+            step.down = Some(Body::Sql(
+                statements.iter().map(|s| s.to_string()).collect(),
+            ));
         }
         self
     }
@@ -416,7 +454,10 @@ impl Migrator {
         F: for<'c> Fn(&'c Client) -> BoxFuture<'c, Result<()>> + Send + Sync + 'static,
     {
         if let Some(step) = self.steps.last_mut() {
-            step.down = Some(Body::Code { version: String::new(), run: Arc::new(run) });
+            step.down = Some(Body::Code {
+                version: String::new(),
+                run: Arc::new(run),
+            });
         }
         self
     }
@@ -436,6 +477,7 @@ impl Migrator {
         self
     }
 
+    /// What the model sync may change (the default: create, add, rename, keys).
     pub fn sync_policy(mut self, policy: SyncPolicy) -> Self {
         self.policy = policy;
         self
@@ -535,7 +577,10 @@ impl Migrator {
         }
         let rows: Vec<(String, i64, Timestamp)> = client
             .fetch_all(
-                &format!("SELECT name, checksum, applied_at FROM {}", ident(&self.table)?),
+                &format!(
+                    "SELECT name, checksum, applied_at FROM {}",
+                    ident(&self.table)?
+                ),
                 params![],
             )
             .await?;
@@ -557,11 +602,17 @@ impl Migrator {
                     Some((sum, _)) if *sum != checksum(&step.body) => StepState::Changed,
                     Some(_) => StepState::Applied,
                 };
-                StepStatus { name: step.name.clone(), state, applied_at: record.map(|r| r.1) }
+                StepStatus {
+                    name: step.name.clone(),
+                    state,
+                    applied_at: record.map(|r| r.1),
+                }
             })
             .collect();
-        let mut unknown: Vec<(&String, &(i64, Timestamp))> =
-            recorded.iter().filter(|(n, _)| !known.contains(n.as_str())).collect();
+        let mut unknown: Vec<(&String, &(i64, Timestamp))> = recorded
+            .iter()
+            .filter(|(n, _)| !known.contains(n.as_str()))
+            .collect();
         unknown.sort_by_key(|(n, _)| n.as_str());
         out.extend(unknown.into_iter().map(|(name, (_, at))| StepStatus {
             name: name.clone(),
@@ -598,8 +649,11 @@ impl Migrator {
             }
         }
         let known: HashSet<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
-        let mut unknown: Vec<String> =
-            recorded.keys().filter(|n| !known.contains(n.as_str())).cloned().collect();
+        let mut unknown: Vec<String> = recorded
+            .keys()
+            .filter(|n| !known.contains(n.as_str()))
+            .cloned()
+            .collect();
         unknown.sort();
         plan.unknown = unknown;
         // The last ordinary step already applied: a pending one before it
@@ -658,7 +712,9 @@ impl Migrator {
                 plan.unknown.join(", ")
             );
             if !self.ignore_unknown {
-                return Err(Error::Unsupported(format!("{message}; ignore_unknown(true) to start anyway")));
+                return Err(Error::Unsupported(format!(
+                    "{message}; ignore_unknown(true) to start anyway"
+                )));
             }
             report.warnings.push(message);
         }
@@ -711,7 +767,9 @@ impl Migrator {
             }
             let run = |statement: String| async move {
                 client.run(&statement).await.map_err(|e| match e {
-                    Error::Server(m) => Error::Server(format!("syncing {}: {statement}: {m}", model.table)),
+                    Error::Server(m) => {
+                        Error::Server(format!("syncing {}: {statement}: {m}", model.table))
+                    }
                     other => other,
                 })?;
                 Ok::<String, Error>(statement)
@@ -752,9 +810,13 @@ impl Migrator {
         let keep = match target {
             None => 0,
             Some(name) => {
-                self.steps.iter().position(|s| s.name == name).ok_or_else(|| {
-                    Error::Param(format!("rollback target {name:?} names no step"))
-                })? + 1
+                self.steps
+                    .iter()
+                    .position(|s| s.name == name)
+                    .ok_or_else(|| {
+                        Error::Param(format!("rollback target {name:?} names no step"))
+                    })?
+                    + 1
             }
         };
         self.ensure_tables(client).await?;
@@ -762,14 +824,21 @@ impl Migrator {
         let result = async {
             let recorded = self.recorded(client).await?;
             let known: HashSet<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
-            let mut unknown: Vec<&String> = recorded.keys().filter(|n| !known.contains(n.as_str())).collect();
+            let mut unknown: Vec<&String> = recorded
+                .keys()
+                .filter(|n| !known.contains(n.as_str()))
+                .collect();
             if !unknown.is_empty() && !self.ignore_unknown {
                 unknown.sort();
                 return Err(Error::Unsupported(format!(
                     "the database records steps this code does not have ({}), which a rollback \
                      could not undo; nothing was undone. ignore_unknown(true) to undo only the \
                      steps listed here",
-                    unknown.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    unknown
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )));
             }
             let undo: Vec<&Step> = self.steps[keep..]
@@ -785,7 +854,8 @@ impl Migrator {
             }
             let mut undone = Vec::new();
             for step in undo {
-                self.run_body(client, &step.name, step.down.as_ref().expect("checked")).await?;
+                self.run_body(client, &step.name, step.down.as_ref().expect("checked"))
+                    .await?;
                 client
                     .exec(
                         &format!("DELETE FROM {} WHERE name = $1", ident(&self.table)?),
@@ -804,7 +874,10 @@ impl Migrator {
     }
 
     fn find(&self, name: &str) -> &Step {
-        self.steps.iter().find(|s| s.name == name).expect("planned from these steps")
+        self.steps
+            .iter()
+            .find(|s| s.name == name)
+            .expect("planned from these steps")
     }
 
     async fn run_body(&self, client: &Client, name: &str, body: &Body) -> Result<()> {
@@ -960,7 +1033,15 @@ async fn existing_columns(client: &Client, table: &str) -> Result<HashMap<String
         .await?;
     Ok(rows
         .into_iter()
-        .map(|(name, data_type, nullable)| (name, Existing { data_type, nullable: nullable == "YES" }))
+        .map(|(name, data_type, nullable)| {
+            (
+                name,
+                Existing {
+                    data_type,
+                    nullable: nullable == "YES",
+                },
+            )
+        })
         .collect())
 }
 
@@ -973,7 +1054,11 @@ struct ModelSync {
 
 /// The statements that bring `model`'s table to the model under `policy`,
 /// and the differences it may not fix.
-async fn plan_model(client: &Client, model: &TableSchema, policy: &SyncPolicy) -> Result<ModelSync> {
+async fn plan_model(
+    client: &Client,
+    model: &TableSchema,
+    policy: &SyncPolicy,
+) -> Result<ModelSync> {
     let mut changes = Vec::new();
     let mut ensure = Vec::new();
     let mut drift = Vec::new();
@@ -996,7 +1081,11 @@ async fn plan_model(client: &Client, model: &TableSchema, policy: &SyncPolicy) -
         } else {
             drift.push(format!("table {} does not exist", model.table));
         }
-        return Ok(ModelSync { changes, ensure, drift });
+        return Ok(ModelSync {
+            changes,
+            ensure,
+            drift,
+        });
     };
     if found != model.table {
         if policy.renames {
@@ -1017,7 +1106,10 @@ async fn plan_model(client: &Client, model: &TableSchema, policy: &SyncPolicy) -
                 current
             }
             None => {
-                let old = column.renamed_from.iter().find(|old| existing.contains_key(**old));
+                let old = column
+                    .renamed_from
+                    .iter()
+                    .find(|old| existing.contains_key(**old));
                 match old {
                     Some(old) if policy.renames => {
                         accounted.insert(old);
@@ -1047,14 +1139,27 @@ async fn plan_model(client: &Client, model: &TableSchema, policy: &SyncPolicy) -
                 }
             }
         };
-        compare_column(model.table, &table, column, current, policy, &mut changes, &mut drift)?;
+        compare_column(
+            model.table,
+            &table,
+            column,
+            current,
+            policy,
+            &mut changes,
+            &mut drift,
+        )?;
     }
-    let mut extra: Vec<&String> =
-        existing.keys().filter(|n| !accounted.contains(n.as_str())).collect();
+    let mut extra: Vec<&String> = existing
+        .keys()
+        .filter(|n| !accounted.contains(n.as_str()))
+        .collect();
     extra.sort();
     for name in extra {
         if policy.drop_columns {
-            changes.push(format!("ALTER TABLE {table} DROP COLUMN IF EXISTS {}", ident(name)?));
+            changes.push(format!(
+                "ALTER TABLE {table} DROP COLUMN IF EXISTS {}",
+                ident(name)?
+            ));
         } else {
             drift.push(format!("{}.{name} is not in the model", model.table));
         }
@@ -1075,7 +1180,9 @@ async fn plan_model(client: &Client, model: &TableSchema, policy: &SyncPolicy) -
             let has_unique = names.clone().any(|n| unique.contains(n));
             if column.unique && !column.primary_key && !has_unique {
                 if policy.keys {
-                    let index = crate::admin::Index::on(model.table, &[column.name]).unique().if_not_exists();
+                    let index = crate::admin::Index::on(model.table, &[column.name])
+                        .unique()
+                        .if_not_exists();
                     changes.push(index.to_sql()?);
                 } else {
                     drift.push(format!("{}.{} has no unique key", model.table, column.name));
@@ -1084,12 +1191,18 @@ async fn plan_model(client: &Client, model: &TableSchema, policy: &SyncPolicy) -
             if let Some(method) = column.index
                 && policy.keys
             {
-                let index = crate::admin::Index::on(model.table, &[column.name]).using(method).if_not_exists();
+                let index = crate::admin::Index::on(model.table, &[column.name])
+                    .using(method)
+                    .if_not_exists();
                 ensure.push(index.to_sql()?);
             }
         }
     }
-    Ok(ModelSync { changes, ensure, drift })
+    Ok(ModelSync {
+        changes,
+        ensure,
+        drift,
+    })
 }
 
 fn compare_column(
@@ -1106,7 +1219,10 @@ fn compare_column(
         && wanted != current.data_type
     {
         if policy.retype && !column.serial {
-            changes.push(format!("ALTER TABLE {table} ALTER COLUMN {name} TYPE {}", column.sql_type));
+            changes.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {name} TYPE {}",
+                column.sql_type
+            ));
         } else {
             drift.push(format!(
                 "{table_name}.{} is {}, the model says {}",
@@ -1117,11 +1233,20 @@ fn compare_column(
     // A serial or key column is NOT NULL by construction; the model's Option
     // does not decide it.
     if !column.serial && !column.primary_key && column.nullable != current.nullable {
-        let (verb, says) = if column.nullable { ("DROP", "nullable") } else { ("SET", "NOT NULL") };
-        if policy.nullability {
-            changes.push(format!("ALTER TABLE {table} ALTER COLUMN {name} {verb} NOT NULL"));
+        let (verb, says) = if column.nullable {
+            ("DROP", "nullable")
         } else {
-            drift.push(format!("{table_name}.{}: the model says {says}", column.name));
+            ("SET", "NOT NULL")
+        };
+        if policy.nullability {
+            changes.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {name} {verb} NOT NULL"
+            ));
+        } else {
+            drift.push(format!(
+                "{table_name}.{}: the model says {says}",
+                column.name
+            ));
         }
     }
     Ok(())
@@ -1182,14 +1307,30 @@ mod tests {
 
     #[test]
     fn a_baseline_covers_a_prefix_of_an_empty_record() {
-        let m = Migrator::new().step("1", &["A"]).step("2", &["B"]).step("3", &["C"]).baseline("2");
+        let m = Migrator::new()
+            .step("1", &["A"])
+            .step("2", &["B"])
+            .step("3", &["C"])
+            .baseline("2");
         let p = plan(&m, &HashMap::new());
         assert_eq!(p.baseline, ["1", "2"]);
         assert_eq!(p.pending, ["3"]);
         let p = plan(&m, &rec(&[("1", &m)]));
         assert!(p.baseline.is_empty(), "only for a database with no records");
-        assert!(Migrator::new().step("1", &[]).baseline("x").check_names().is_err());
-        assert!(Migrator::new().step("1", &[]).step("1", &[]).check_names().is_err());
+        assert!(
+            Migrator::new()
+                .step("1", &[])
+                .baseline("x")
+                .check_names()
+                .is_err()
+        );
+        assert!(
+            Migrator::new()
+                .step("1", &[])
+                .step("1", &[])
+                .check_names()
+                .is_err()
+        );
     }
 
     #[test]
@@ -1197,9 +1338,16 @@ mod tests {
         let a = checksum(&Body::Sql(vec!["AB".into(), "C".into()]));
         let b = checksum(&Body::Sql(vec!["A".into(), "BC".into()]));
         assert_ne!(a, b);
-        let run: StepFn = Arc::new(|_c: &Client| Box::pin(async { Ok(()) }) as BoxFuture<'_, Result<()>>);
-        let v1 = checksum(&Body::Code { version: "v1".into(), run: run.clone() });
-        let v2 = checksum(&Body::Code { version: "v2".into(), run });
+        let run: StepFn =
+            Arc::new(|_c: &Client| Box::pin(async { Ok(()) }) as BoxFuture<'_, Result<()>>);
+        let v1 = checksum(&Body::Code {
+            version: "v1".into(),
+            run: run.clone(),
+        });
+        let v2 = checksum(&Body::Code {
+            version: "v2".into(),
+            run,
+        });
         assert_ne!(v1, v2);
     }
 
@@ -1209,7 +1357,10 @@ mod tests {
         assert_eq!(catalogue_type("NUMERIC(10,2)"), Some("numeric"));
         assert_eq!(catalogue_type("varchar(64)"), Some("character varying"));
         assert_eq!(catalogue_type("TEXT[]"), Some("ARRAY"));
-        assert_eq!(catalogue_type("TIMESTAMPTZ"), Some("timestamp with time zone"));
+        assert_eq!(
+            catalogue_type("TIMESTAMPTZ"),
+            Some("timestamp with time zone")
+        );
         assert_eq!(catalogue_type("POINT"), None);
     }
 }

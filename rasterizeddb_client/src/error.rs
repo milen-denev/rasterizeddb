@@ -20,14 +20,24 @@ pub enum Error {
     /// value, or a value no literal can carry (text holding a NUL).
     Param(String),
     /// A column could not be read as the type asked for.
-    Column { index: usize, message: String },
+    Column {
+        /// The column's position, from 0.
+        index: usize,
+        /// What was wrong with it.
+        message: String,
+    },
     /// Refused before anything was sent: a statement the native protocol
     /// cannot run as written (a second statement in one text, transaction
     /// control), or an operation the model or argument does not allow.
     Unsupported(String),
     /// A statement expected to return exactly one row, or at most one,
     /// returned some other number of rows.
-    RowCount { expected: &'static str, got: usize },
+    RowCount {
+        /// How many were expected: `"exactly 1"` or `"at most 1"`.
+        expected: &'static str,
+        /// How many there were.
+        got: usize,
+    },
 }
 
 impl Error {
@@ -78,7 +88,10 @@ impl fmt::Display for Error {
             Error::Column { index, message } => write!(f, "column {index}: {message}"),
             Error::Unsupported(message) => write!(f, "unsupported: {message}"),
             Error::RowCount { expected, got } => {
-                write!(f, "expected {expected} row(s), the statement returned {got}")
+                write!(
+                    f,
+                    "expected {expected} row(s), the statement returned {got}"
+                )
             }
         }
     }
