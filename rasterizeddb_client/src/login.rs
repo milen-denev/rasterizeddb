@@ -7,7 +7,9 @@ use rastcp::error::RastcpError;
 use rastcp::session::{AuthChannel, AuthFuture, ClientAuthenticator};
 
 /// Who a connection logs in as.
-#[derive(Debug, Clone, Default)]
+///
+/// `Debug` never prints a password.
+#[derive(Clone, Default)]
 pub enum Login {
     /// No exchange at all: for a server that asks for none, such as a unix
     /// socket under `--rdb-socket-auth trust`. Against a server that does ask,
@@ -21,6 +23,42 @@ pub enum Login {
     /// As `user`, by peer authentication. The server accepts it only when
     /// `user` is the name of the operating-system user connecting.
     PeerAs(String),
+    /// As `user` with `password`, by SCRAM-SHA-256 bound to the connection
+    /// (`tls-exporter` over TCP, rastcp's own binding on a unix socket). The
+    /// password never crosses the wire, and the server must prove it holds
+    /// the user's verifier: a server that lets the connection in without the
+    /// exchange (one run under `trust`) is refused, because it never proved
+    /// it is the server meant. Use [`Login::Trust`] for such a server.
+    Password {
+        /// The role to log in as.
+        user: String,
+        /// Its password.
+        password: String,
+    },
+}
+
+impl Login {
+    /// [`Login::Password`] for `user`.
+    pub fn password(user: impl Into<String>, password: impl Into<String>) -> Self {
+        Login::Password {
+            user: user.into(),
+            password: password.into(),
+        }
+    }
+}
+
+impl fmt::Debug for Login {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Login::Trust => f.write_str("Trust"),
+            Login::Peer => f.write_str("Peer"),
+            Login::PeerAs(user) => f.debug_tuple("PeerAs").field(user).finish(),
+            Login::Password { user, .. } => f
+                .debug_struct("Password")
+                .field("user", user)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Login {
@@ -29,6 +67,12 @@ impl Login {
     ) -> Result<Option<Arc<dyn ClientAuthenticator>>, RastcpError> {
         let user = match self {
             Login::Trust => return Ok(None),
+            Login::Password { user, password } => {
+                return Ok(Some(Arc::new(PasswordLogin {
+                    user: user.clone(),
+                    password: password.clone(),
+                }) as Arc<dyn ClientAuthenticator>));
+            }
             Login::Peer => current_os_user().ok_or_else(|| {
                 RastcpError::AuthenticationError(
                     "this process's user has no name in the password database".to_string(),
@@ -46,8 +90,100 @@ impl Login {
 // (`rasterizeddb_core::native_auth`).
 const PROTOCOL_VERSION: u8 = 1;
 const C_HELLO: u8 = 0x01;
+const C_SASL_INITIAL: u8 = 0x02;
+const C_SASL_FINAL: u8 = 0x03;
 const S_OK: u8 = 0x00;
 const S_SASL: u8 = 0x01;
+const S_CONTINUE: u8 = 0x02;
+
+/// The opening message: who the caller wants to be.
+fn hello(user: &str) -> Result<Vec<u8>, RastcpError> {
+    let len = u16::try_from(user.len())
+        .map_err(|_| RastcpError::AuthenticationError("the user name is too long".to_string()))?;
+    let mut hello = Vec::with_capacity(4 + user.len());
+    hello.push(C_HELLO);
+    hello.push(PROTOCOL_VERSION);
+    hello.extend_from_slice(&len.to_le_bytes());
+    hello.extend_from_slice(user.as_bytes());
+    Ok(hello)
+}
+
+/// One tagged message from the server: its tag, and the rest as text.
+async fn server_reply(channel: &mut AuthChannel<'_>) -> Result<(u8, String), RastcpError> {
+    let message = channel.recv().await?;
+    match message.split_first() {
+        Some((tag, rest)) => Ok((*tag, String::from_utf8_lossy(rest).into_owned())),
+        None => Err(RastcpError::AuthenticationError(
+            "the server sent an empty authentication message".to_string(),
+        )),
+    }
+}
+
+struct PasswordLogin {
+    user: String,
+    password: String,
+}
+
+impl fmt::Debug for PasswordLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordLogin")
+            .field("user", &self.user)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PasswordLogin {
+    async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<(), RastcpError> {
+        channel.send(&hello(&self.user)?).await?;
+        match server_reply(channel).await? {
+            (S_SASL, _) => {}
+            (S_OK, _) => {
+                return Err(RastcpError::AuthenticationError(
+                    "the server let the connection in without a password exchange, so it never \
+                     proved who it is; log in with Login::Trust if that server is meant"
+                        .to_string(),
+                ));
+            }
+            (_, message) => return Err(RastcpError::AuthenticationError(message)),
+        }
+
+        let (mut scram, client_first) =
+            crate::scram::ScramClient::start(&self.user, &self.password, channel.channel_binding())
+                .map_err(|e| {
+                    RastcpError::AuthenticationError(format!("no random bytes for a nonce: {e}"))
+                })?;
+        let mut message = vec![C_SASL_INITIAL];
+        message.extend_from_slice(client_first.as_bytes());
+        channel.send(&message).await?;
+
+        let server_first = match server_reply(channel).await? {
+            (S_CONTINUE, payload) => payload,
+            (_, message) => return Err(RastcpError::AuthenticationError(message)),
+        };
+        let client_final = scram
+            .respond(&server_first)
+            .map_err(RastcpError::AuthenticationError)?;
+        let mut message = vec![C_SASL_FINAL];
+        message.extend_from_slice(client_final.as_bytes());
+        channel.send(&message).await?;
+
+        let server_final = match server_reply(channel).await? {
+            (S_OK, payload) => payload,
+            (_, message) => return Err(RastcpError::AuthenticationError(message)),
+        };
+        // Not optional: without it this side has proved itself to whoever
+        // answered.
+        scram
+            .verify(&server_final)
+            .map_err(RastcpError::AuthenticationError)
+    }
+}
+
+impl ClientAuthenticator for PasswordLogin {
+    fn authenticate<'a>(&'a self, channel: &'a mut AuthChannel<'_>) -> AuthFuture<'a, ()> {
+        Box::pin(self.run(channel))
+    }
+}
 
 struct PeerLogin {
     user: String,

@@ -19,10 +19,12 @@ let peer = Client::connect(
     Options { login: Login::Peer, ..Options::default() },
 ).await?;
 
-// TCP, with more connections, a longer timeout and a larger answer limit.
+// TCP as a role with a password (SCRAM-SHA-256), with more connections, a
+// longer timeout and a larger answer limit.
 let remote = Client::connect(
     "db.internal:61170",
     Options {
+        login: Login::password("app", "<password>"),
         connections: 4,
         timeout: Some(Duration::from_secs(60)),
         max_message_size: 64 * 1024 * 1024,
@@ -42,7 +44,7 @@ run (or are verified) before it returns too: see the
 |---|---|---|
 | `connections` | 1 | connections shared by every caller; each carries many statements at once |
 | `timeout` | 30 s | how long a statement waits for its answer (`None`: forever) |
-| `login` | `Trust` | `Trust`, `Peer` or `PeerAs(name)` |
+| `login` | `Trust` | `Trust`, `Peer`, `PeerAs(name)` or `Password { user, password }` (`Login::password`) |
 | `max_message_size` | 8 MiB | the largest answer accepted; a larger one fails whole |
 | `migrations` | `None` | a [`Migrator`](crate::orm::Migrator) to run on connect |
 | `auto_migrate` | `Apply` | `Off`, `Apply` or `Verify` |

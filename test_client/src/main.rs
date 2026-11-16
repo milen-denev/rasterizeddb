@@ -4,16 +4,15 @@
 use futures::future::join_all;
 use log::LevelFilter;
 use rand::RngExt;
+use rasterizeddb_client::{Client, Options, Rows};
 use rasterizeddb_core::{
-    client::DbClient,
     core::{
         db_type::DbType,
         row::{
-            row::{vec_into_rows, ColumnWritePayload, RowWrite},
+            row::{ColumnWritePayload, RowWrite},
             row_pointer::RowPointer,
         },
         storage_providers::traits::StorageIO,
-        support_types::QueryExecutionResult,
     },
 };
 use std::{
@@ -53,7 +52,7 @@ async fn main() -> std::io::Result<()> {
         let choice = prompt_menu_choice();
         match choice {
             1 => {
-                let client = Arc::new(DbClient::new_multiplexed(Some("127.0.0.1")).await.unwrap());
+                let client = connect().await;
 
                 let create_result = create_table(&client).await;
                 println!("Create result: {:?}", create_result);
@@ -63,7 +62,7 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             2 => {
-                let client = Arc::new(DbClient::new_multiplexed(Some("127.0.0.1")).await.unwrap());
+                let client = connect().await;
 
                 pause("Press any key to continue...");
                 insert_rows(&client).await;
@@ -71,7 +70,7 @@ async fn main() -> std::io::Result<()> {
                 run_queries(&client).await;
             }
             3 => {
-                let client = Arc::new(DbClient::new_multiplexed(Some("127.0.0.1")).await.unwrap());
+                let client = connect().await;
 
                 pause("Press any key to continue...");
                 run_queries(&client).await;
@@ -425,7 +424,16 @@ fn pause(message: &str) {
     stdin().read_line(&mut buffer).unwrap();
 }
 
-async fn create_table(client: &Arc<DbClient>) -> Result<QueryExecutionResult, std::io::Error> {
+/// The server this drives: the native listener's default port on loopback,
+/// with no credentials (a server run under `--rdb-auth trust`, or one with no
+/// password set).
+const SERVER: &str = "127.0.0.1:61170";
+
+async fn connect() -> Arc<Client> {
+    Arc::new(Client::connect(SERVER, Options::default()).await.unwrap())
+}
+
+async fn create_table(client: &Arc<Client>) -> rasterizeddb_client::Result<Rows> {
     let query = r##"
         CREATE TABLE employees (
             id UBIGINT,
@@ -448,10 +456,10 @@ async fn create_table(client: &Arc<DbClient>) -> Result<QueryExecutionResult, st
         );
     "##;
 
-    client.execute_query(query).await
+    client.run(query).await
 }
 
-async fn insert_rows(client: &Arc<DbClient>) {
+async fn insert_rows(client: &Arc<Client>) {
     for _i in 0..1 {
         let mut features = vec![];
 
@@ -495,7 +503,7 @@ async fn insert_rows(client: &Arc<DbClient>) {
 
             features.push(tokio::spawn(async move {
                 let _permit = semaphore_clone.acquire().await.unwrap();
-                let _insert_result = client_clone.execute_query(&query).await;
+                let _insert_result = client_clone.run(&query).await;
             }));
         }
 
@@ -507,7 +515,7 @@ async fn insert_rows(client: &Arc<DbClient>) {
     println!("Finished inserting records.");
 }
 
-async fn run_queries(client: &Arc<DbClient>) {
+async fn run_queries(client: &Arc<Client>) {
     for _ in 0..5 {
         let query = format!(r##"
             SELECT id, salary, age, name FROM employees
@@ -515,22 +523,15 @@ async fn run_queries(client: &Arc<DbClient>) {
         "##, QUERY);
 
         let instant = std::time::Instant::now();
-        let select_result = client.execute_query(&query).await;
+        let select_result = client.run(&query).await;
         let elapsed = instant.elapsed().as_micros();
 
         println!("Query executed in {} μs", elapsed);
 
         match select_result {
-            Ok(QueryExecutionResult::RowsResult(rows)) => {
+            Ok(rows) => {
                 println!("Rows fetched successfully.");
-                let rows = vec_into_rows(&rows).unwrap();
                 println!("Total rows: {}", rows.len());
-            }
-            Ok(QueryExecutionResult::Error(err)) => {
-                eprintln!("Error occurred: {}", err);
-            }
-            Ok(_) => {
-                eprintln!("Unexpected result type");
             }
             Err(err) => {
                 eprintln!("Query failed: {}", err);

@@ -98,6 +98,7 @@ mod from_sql;
 mod login;
 mod params;
 mod row;
+mod scram;
 mod to_sql;
 mod types;
 mod value;

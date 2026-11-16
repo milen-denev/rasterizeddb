@@ -4497,12 +4497,16 @@ dependencies = [
 name = "rasterizeddb_client"
 version = "0.2.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
+ "hmac",
  "libc",
+ "pbkdf2",
  "rastcp",
  "rasterizeddb_client_derive",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
  "uuid",
 ]
@@ -4579,6 +4583,7 @@ dependencies = [
  "quote",
  "rand 0.10.3",
  "rastcp",
+ "rasterizeddb_client",
  "rclite",
  "regex",
  "rustls",
@@ -5823,6 +5828,7 @@ dependencies = [
  "futures",
  "log",
  "rand 0.10.3",
+ "rasterizeddb_client",
  "rasterizeddb_core",
  "rclite",
  "stopwatch",
@@ -5837,7 +5843,7 @@ dependencies = [
  "axum",
  "once_cell",
  "rand 0.10.3",
- "rasterizeddb_core",
+ "rasterizeddb_client",
  "tokio",
  "tower",
 ]

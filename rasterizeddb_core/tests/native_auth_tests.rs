@@ -17,8 +17,12 @@ use rasterizeddb_core::auth::{
     AuthMethod, ensure_role_catalogue, execute_role_statement, parse_role_statement,
 };
 use rasterizeddb_core::core::database::Database;
-use rasterizeddb_core::native_auth::{PasswordAuthenticator, RoleAuthenticator};
+use rasterizeddb_core::native_auth::RoleAuthenticator;
 use rclite::Arc;
+
+#[path = "support/native_login.rs"]
+mod native_login;
+use native_login::PasswordAuthenticator;
 
 /// A loopback listener on a port of the kernel's choosing, and that port.
 ///
@@ -344,7 +348,7 @@ async fn a_shared_connection_authenticates_and_serves_every_request_as_that_user
 #[cfg(unix)]
 mod unix_socket {
     use super::*;
-    use rasterizeddb_core::native_auth::{PeerAuthenticator, current_os_user};
+    use crate::native_login::{PeerAuthenticator, current_os_user};
 
     fn socket_path(name: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -488,10 +492,21 @@ mod unix_socket {
     /// The real listener, as the server binary starts it.
     mod listener {
         use super::*;
-        use rasterizeddb_core::client::DbClient;
+        use rasterizeddb_client::{Client, Login, Options};
         use rasterizeddb_core::core::database::{NativeListen, NativeSocket};
-        use rasterizeddb_core::core::support_types::QueryExecutionResult;
         use rasterizeddb_core::native_auth::NativeAuthConfig;
+
+        /// A client on `path` (a unix socket) logging in as `login`.
+        async fn connect(path: &std::path::Path, login: Login) -> rasterizeddb_client::Result<Client> {
+            Client::connect(
+                &format!("unix:{}", path.display()),
+                Options {
+                    login,
+                    ..Options::default()
+                },
+            )
+            .await
+        }
 
         /// Port 0: the kernel picks a free one at the server's own bind, so
         /// no number is let go and handed to a parallel test in between.
@@ -577,11 +592,11 @@ mod unix_socket {
             }
             assert_eq!(mode(), 0o660);
 
-            let client = DbClient::new_multiplexed(Some(&format!("unix:{}", path.display())))
+            let client = connect(&path, Login::Trust)
                 .await
                 .expect("connected with no credentials");
-            let reply = client.execute_query("SELECT 1").await;
-            assert!(reply.is_ok(), "{reply:?}");
+            let reply = client.run("SELECT 1").await;
+            assert!(reply.is_ok(), "{:?}", reply.err());
 
             server.abort();
             let _ = server.await;
@@ -652,10 +667,10 @@ mod unix_socket {
                 "something answers on the TCP port with --rdb-tcp off"
             );
 
-            let client = DbClient::new_multiplexed(Some(&format!("unix:{}", path.display())))
+            let client = connect(&path, Login::Trust)
                 .await
                 .expect("connected over the socket");
-            assert!(client.execute_query("SELECT 1").await.is_ok());
+            assert!(client.run("SELECT 1").await.is_ok());
 
             server.abort();
             let _ = server.await;
@@ -691,33 +706,24 @@ mod unix_socket {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
 
-            let client = DbClient::new_peer(path.to_str().unwrap())
+            let client = connect(&path, Login::Peer)
                 .await
                 .expect("logged in as this process's user");
 
-            let created = client
-                .execute_query("CREATE TABLE peer_t (id INTEGER, name VARCHAR)")
+            client
+                .run("CREATE TABLE peer_t (id INTEGER, name VARCHAR)")
                 .await
-                .expect("a reply");
-            assert!(
-                !matches!(created, QueryExecutionResult::Error(_)),
-                "CREATE TABLE failed: {created:?}"
-            );
-            let inserted = client
-                .execute_query("INSERT INTO peer_t (id, name) VALUES (1, 'over a unix socket')")
+                .expect("CREATE TABLE");
+            client
+                .run("INSERT INTO peer_t (id, name) VALUES (1, 'over a unix socket')")
                 .await
-                .expect("a reply");
-            assert!(!matches!(inserted, QueryExecutionResult::Error(_)), "{inserted:?}");
+                .expect("INSERT");
 
-            let rows = client
-                .execute_query("SELECT id, name FROM peer_t")
-                .await
-                .expect("a reply");
-            let rows = DbClient::extract_rows(rows).expect("rows").expect("a row set");
-            let rasterizeddb_core::core::row::row::ReturnResult::Rows(rows) = rows else {
-                panic!("not rows");
-            };
+            let rows = client.run("SELECT id, name FROM peer_t").await.expect("SELECT");
             assert_eq!(rows.len(), 1);
+            let row = rows.get(0).unwrap();
+            assert_eq!(row.get_i32(0).unwrap(), 1);
+            assert_eq!(row.get_text(1).unwrap(), "over a unix socket");
 
             server.abort();
             let _ = server.await;

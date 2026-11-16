@@ -15,7 +15,7 @@ use std::time::Duration;
 use rasterizeddb_core::auth::{AuthMethod, execute_role_statement, parse_role_statement};
 use rasterizeddb_core::core::database::DEFAULT_DATABASE_NAME;
 use rasterizeddb_core::core::database::catalog::DatabaseCatalog;
-use rasterizeddb_core::native_auth::current_os_user;
+use rasterizeddb_core::native_auth::os_user_name;
 use rasterizeddb_core::pgwire::{
     AuthConfig, ConnectionLimits, PgListen, PgSocket, TlsConfig, TlsMode, start_pgwire_on,
 };
@@ -255,7 +255,8 @@ async fn sqlx_connects_over_the_socket_too() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_lets_in_the_connecting_user_and_nobody_else() {
-    let me = current_os_user().expect("the test runs as a named user");
+    // SAFETY: getuid cannot fail and has no preconditions.
+    let me = os_user_name(unsafe { libc::getuid() }).expect("the test runs as a named user");
     let server = start(AuthMethod::Peer, 0o600, vec![format!("CREATE ROLE \"{me}\" LOGIN")])
         .expect("a peer server");
 

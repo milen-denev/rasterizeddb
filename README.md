@@ -339,8 +339,10 @@ adding a second index structure.
 
 ### Native protocol authentication
 
-The native protocol — what `DbClient` speaks — reads the same role catalogue as
-pgwire, so one `CREATE USER` works for both:
+The native protocol reads the same role catalogue as pgwire, so one
+`CREATE USER` works for both. Its client is the
+[`rasterizeddb_client`](rasterizeddb_client) crate, which does not compile the
+engine:
 
 ```sh
 cargo run -p rasterizeddb_core -- --location <PATH> \
@@ -348,21 +350,31 @@ cargo run -p rasterizeddb_core -- --location <PATH> \
 ```
 
 ```rust
-let client = DbClient::new_multiplexed_authenticated(Some("127.0.0.1"), "superuser", "<password>").await?;
+use rasterizeddb_client::{Client, Login, Options};
+
+let client = Client::connect(
+    "127.0.0.1:61170",
+    Options {
+        login: Login::password("superuser", "<password>"),
+        ..Options::default()
+    },
+)
+.await?;
 ```
 
-That client shares one connection between all the queries in flight, which is
-the faster arrangement whenever more than one is: 4 concurrent callers ran 12%
-more point queries a second over it than over a pool, and 128 ran 33% more. A
-caller that sends one query at a time gains nothing from sharing and pays for
-the hand-off, about 3 µs a query (65 µs against 62).
-`DbClient::new_authenticated` is the pooled client, one connection per query in
-flight; it is also what to use against a server too old to speak `rastcp/2`.
+`Login::Password` runs SCRAM-SHA-256 bound to the connection, so the password
+never crosses the wire, and it refuses a server that lets the connection in
+without proving it holds the verifier. On a unix socket (`--rdb-socket`),
+`Login::Peer` logs in as the operating-system user, and `Login::Trust` sends no
+credentials.
 
-A query that fails in transit — a dropped connection, a timeout — is reported,
-not sent again: the server may already have carried it out, and a repeated
-`INSERT` is a duplicate row. A client whose queries are safe to run twice can ask
-for one more attempt with `.with_retry(QueryRetry::Once)`.
+The client shares its connections (`Options::connections`, one by default)
+between all the statements in flight, which is the faster arrangement whenever
+more than one is: 4 concurrent callers ran 12% more point queries a second over
+one shared connection than over a pool of their own, and 128 ran 33% more. A
+statement that fails in transit (a dropped connection, a timeout) is reported,
+never sent again: the server may already have carried it out, and a repeated
+`INSERT` is a duplicate row.
 
 Prefer the `RASTERIZEDDB_PASSWORD` environment variable to `--rdb-password`: a
 password on the command line is visible in `ps` to every other user on the

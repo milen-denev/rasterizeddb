@@ -439,7 +439,7 @@ struct Args {
     rdb_port: Option<u16>,
 
     /// Also serve the native protocol on this unix socket, for clients on the
-    /// same machine (`DbClient` address `unix:<path>`).
+    /// same machine (`rasterizeddb_client` address `unix:<path>`).
     ///
     /// No TLS and no TCP stack on it: only root can watch a local socket, and
     /// who may connect is decided by the file's permissions. A socket file

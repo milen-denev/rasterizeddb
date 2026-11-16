@@ -171,6 +171,11 @@ impl Uuid {
 }
 
 fn fill_random(out: &mut [u8]) -> Result<()> {
+    random_bytes(out).map_err(|e| Error::Param(format!("no random bytes for a UUID: {e}")))
+}
+
+/// Fills `out` from the operating system's generator.
+pub(crate) fn random_bytes(out: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0;
     while filled < out.len() {
         // SAFETY: the pointer and length describe the unfilled tail of `out`.
@@ -181,7 +186,7 @@ fn fill_random(out: &mut [u8]) -> Result<()> {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(Error::Param(format!("no random bytes for a UUID: {e}")));
+            return Err(e);
         }
         filled += n as usize;
     }

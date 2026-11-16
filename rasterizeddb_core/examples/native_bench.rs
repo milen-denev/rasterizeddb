@@ -1,5 +1,5 @@
-//! Point queries through the real native listener, pooled against shared
-//! connections.
+//! Point queries through the real native listener, over one connection per
+//! caller against a few shared ones.
 //!
 //! The transport's own benchmark (`rastcp/examples/echo_bench.rs`) answers
 //! requests with an echo, which shows what the transport costs and nothing
@@ -13,6 +13,10 @@
 //! native_bench shared <host:port> <callers> <seconds> <threads> <rows> <connections>
 //! ```
 //!
+//! The clients are `rasterizeddb_client`'s. `pooled` gives every caller a
+//! connection of its own (as many connections as callers); `shared` spreads
+//! the callers over `<connections>`.
+//!
 //! Server and clients are separate processes so each can be confined to its
 //! own cores. With a socket path the server serves it alongside the port, and
 //! a client given `unix:<path>` as its address uses it.
@@ -21,10 +25,9 @@ use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rasterizeddb_core::client::DbClient;
+use rasterizeddb_client::{Client, Options, Rows};
 use rasterizeddb_core::core::database::{Database, NativeListen};
 use rasterizeddb_core::core::processor::concurrent_processor::ENABLE_CACHE;
-use rasterizeddb_core::core::support_types::QueryExecutionResult;
 use rasterizeddb_core::native_auth::NativeAuthConfig;
 use rasterizeddb_core::{BATCH_SIZE, MAX_PERMITS_THREADS};
 use rclite::Arc;
@@ -104,10 +107,10 @@ fn server(dir: String, port: u16, threads: usize, socket: Option<String>) {
 
 fn setup(addr: String, rows: u64) {
     runtime(2).block_on(async move {
-        let client = DbClient::new(Some(&addr)).await.expect("connect");
+        let client = connect(&addr, 1).await;
 
         let created = client
-            .execute_query("CREATE TABLE bench (id UBIGINT, name VARCHAR, salary REAL, age INTEGER);")
+            .run("CREATE TABLE bench (id UBIGINT, name VARCHAR, salary REAL, age INTEGER);")
             .await;
         println!("create table: {}", describe(&created));
 
@@ -117,28 +120,43 @@ fn setup(addr: String, rows: u64) {
                 1000 + id % 9000,
                 20 + id % 40
             );
-            if let Err(e) = client.execute_query(&insert).await {
+            if let Err(e) = client.run(&insert).await {
                 panic!("insert {id} failed: {e}");
             }
         }
 
-        let indexed = client.execute_query("CREATE INDEX bench_id ON bench (id);").await;
+        let indexed = client.run("CREATE INDEX bench_id ON bench (id);").await;
         println!("create index: {}", describe(&indexed));
 
         let probe = client
-            .execute_query(&format!("SELECT id, salary, age, name FROM bench WHERE id = {rows}"))
+            .run(&format!("SELECT id, salary, age, name FROM bench WHERE id = {rows}"))
             .await;
         println!("probe: {}", describe(&probe));
     });
 }
 
-fn describe(result: &std::io::Result<QueryExecutionResult>) -> String {
+/// `addr` (`host:port`, or `unix:<path>`) over `connections` connections,
+/// logging in with no credentials, as the server this example starts allows.
+async fn connect(addr: &str, connections: usize) -> Client {
+    Client::connect(
+        addr,
+        Options {
+            connections,
+            ..Options::default()
+        },
+    )
+    .await
+    .expect("connect")
+}
+
+fn describe(result: &rasterizeddb_client::Result<Rows>) -> String {
     match result {
-        Ok(QueryExecutionResult::Ok) => "ok".to_string(),
-        Ok(QueryExecutionResult::RowsAffected(n)) => format!("{n} row(s) affected"),
-        Ok(QueryExecutionResult::RowsResult(bytes)) => format!("rows, {} bytes", bytes.len()),
-        Ok(QueryExecutionResult::Error(message)) => format!("server error: {message}"),
-        Err(e) => format!("transport error: {e}"),
+        Ok(rows) => match rows.rows_affected() {
+            Some(n) => format!("{n} row(s) affected"),
+            None if rows.is_empty() => "ok".to_string(),
+            None => format!("{} row(s)", rows.len()),
+        },
+        Err(e) => format!("error: {e}"),
     }
 }
 
@@ -169,12 +187,8 @@ fn load(
     connections: usize,
 ) {
     runtime(threads).block_on(async move {
-        let client = if shared {
-            DbClient::multiplexed(Some(&addr), connections, Duration::from_secs(30), None).await
-        } else {
-            DbClient::with_pool_settings(Some(&addr), callers, callers).await
-        };
-        let client = StdArc::new(client.expect("connect"));
+        let connections = if shared { connections.max(1) } else { callers.max(1) };
+        let client = StdArc::new(connect(&addr, connections).await);
 
         let stop = StdArc::new(AtomicBool::new(false));
         let measuring = StdArc::new(AtomicBool::new(false));
@@ -204,10 +218,7 @@ fn load(
                     let query = format!("SELECT id, salary, age, name FROM bench WHERE id = {id}");
 
                     let started = Instant::now();
-                    let answered = matches!(
-                        client.execute_query(&query).await,
-                        Ok(QueryExecutionResult::RowsResult(_))
-                    );
+                    let answered = client.run(&query).await.is_ok();
 
                     if measuring.load(Ordering::Relaxed) {
                         if answered {
@@ -241,10 +252,9 @@ fn load(
         }
 
         let done = total.load(Ordering::Relaxed);
-        let (open, of) = client.get_pool_stats();
 
         println!(
-            "{} queries_per_sec={:.0} p50_us={} p99_us={} failed={} callers={callers} connections={open}/{of}",
+            "{} queries_per_sec={:.0} p50_us={} p99_us={} failed={} callers={callers} connections={connections}",
             if shared { "shared" } else { "pooled" },
             done as f64 / elapsed,
             percentile(&histogram, done, 0.50),

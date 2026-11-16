@@ -444,7 +444,6 @@ pub mod core;
 
 pub mod auth;
 pub mod cache;
-pub mod client;
 pub mod configuration;
 pub mod instructions;
 pub mod idle_trim;

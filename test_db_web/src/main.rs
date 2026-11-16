@@ -15,19 +15,23 @@ use once_cell::sync::Lazy;
 
 use rand::RngExt;
 
-use rasterizeddb_core::client::DbClient;
-use rasterizeddb_core::core::db_type::DbType;
-use rasterizeddb_core::core::row::row::ReturnResult;
+use rasterizeddb_client::{Client, Options, Rows};
 use tokio::sync::OnceCell;
 
-static CLIENT: async_lazy::Lazy<Arc<DbClient>> = async_lazy::Lazy::new(|| {
+static CLIENT: async_lazy::Lazy<Arc<Client>> = async_lazy::Lazy::new(|| {
     Box::pin(async {
         // One connection shared by every request this server is handling,
         // in place of a pool of up to 128: the database runs each query on a
         // task of its own whichever connection it arrives on.
-        let client = DbClient::multiplexed(Some("127.0.0.1"), 1, Duration::from_secs(2), None)
-            .await
-            .unwrap();
+        let client = Client::connect(
+            "127.0.0.1:61170",
+            Options {
+                timeout: Some(Duration::from_secs(2)),
+                ..Options::default()
+            },
+        )
+        .await
+        .unwrap();
 
         let _query = r##"
             CREATE TABLE employees (
@@ -51,12 +55,12 @@ static CLIENT: async_lazy::Lazy<Arc<DbClient>> = async_lazy::Lazy::new(|| {
             );
         "##;
 
-        client
-            .execute_query(_query)
-            .await
-            .unwrap();
-
-        _ = client.connect().await;
+        // A server error (the table is there from an earlier run) is fine; a
+        // dead connection is not.
+        match client.run(_query).await {
+            Ok(_) | Err(rasterizeddb_client::Error::Server(_)) => {}
+            Err(err) => panic!("create table: {err}"),
+        }
 
         Arc::new(client)
     })
@@ -96,61 +100,23 @@ fn build_query(id: u64) -> String {
     query
 }
 
-fn render_rows(result: ReturnResult) -> Result<Bytes, io::Error> {
+/// The labels of `build_query`'s select list, in its order: the native
+/// protocol sends no column names, so a row is read by position.
+const LABELS: [&str; 5] = ["id", "salary", "job title", "location", "project"];
+
+fn render_rows(rows: &Rows) -> Result<Bytes, io::Error> {
     let mut output = String::new();
-
-    match result {
-        ReturnResult::Rows(rows) => {
-            for row in &rows {
-                for (index, col) in row.columns.iter().enumerate() {
-                    match (index, col.column_type.clone()) {
-                        (0, DbType::U64) => {
-                            let value = u64::from_le_bytes(
-                                col.data
-                                    .into_slice()
-                                    .try_into()
-                                    .expect("Failed to convert bytes to u64"),
-                            );
-                            let _ = write!(&mut output, "id: {}\t", value);
-                        }
-                        (1, DbType::F64) => {
-                            let value = f64::from_le_bytes(
-                                col.data
-                                    .into_slice()
-                                    .try_into()
-                                    .expect("Failed to convert bytes to f64"),
-                            );
-                            let _ = write!(&mut output, "salary: {}\t", value);
-                        }
-                        (2, DbType::STRING) => {
-                            let _ = write!(
-                                &mut output,
-                                "job title: {}\t",
-                                String::from_utf8_lossy(&col.data.into_slice())
-                            );
-                        }
-                        (3, DbType::STRING) => {
-                            let _ = write!(
-                                &mut output,
-                                "location: {}\t",
-                                String::from_utf8_lossy(&col.data.into_slice())
-                            );
-                        }
-                        (4, DbType::STRING) => {
-                            let _ = write!(
-                                &mut output,
-                                "project: {}\t",
-                                String::from_utf8_lossy(&col.data.into_slice())
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => output.push_str("No rows returned."),
+    if rows.is_empty() {
+        output.push_str("No rows returned.");
     }
-
+    for row in rows.iter() {
+        let values = row
+            .values()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        for (label, value) in LABELS.iter().zip(&values) {
+            let _ = write!(&mut output, "{label}: {value}\t");
+        }
+    }
     Ok(Bytes::from(output))
 }
 
@@ -158,23 +124,16 @@ async fn fetch_response_body(id: u64) -> Result<Bytes, HttpResponseError> {
     let query = build_query(id);
     let client = CLIENT.force().await;
 
-    let db_response = client.execute_query(&query).await.map_err(|err| HttpResponseError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message: format!("db unavailable: {err}"),
+    let rows = client.run(&query).await.map_err(|err| HttpResponseError {
+        status: if matches!(err, rasterizeddb_client::Error::Server(_)) {
+            StatusCode::BAD_GATEWAY
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        message: format!("db error: {err}"),
     })?;
 
-    let result = match DbClient::extract_rows(db_response) {
-        Ok(Some(result)) => result,
-        Ok(None) => ReturnResult::Rows(Vec::new()),
-        Err(err) => {
-            return Err(HttpResponseError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!("invalid db response: {err}"),
-            });
-        }
-    };
-
-    render_rows(result).map_err(|err| HttpResponseError {
+    render_rows(&rows).map_err(|err| HttpResponseError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: format!("failed to render response: {err}"),
     })

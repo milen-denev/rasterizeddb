@@ -154,8 +154,10 @@ impl Client {
     /// [`Options::auto_migrate`] applies or verifies it.
     ///
     /// Over TCP the transport is TLS, and the server's certificate is not
-    /// verified, as with `rasterizeddb_core`'s own client: use a unix socket,
-    /// or a network you trust, until certificate options are added here.
+    /// verified: use a unix socket, or a network you trust, until certificate
+    /// options are added here. [`Login::Password`](crate::Login::Password)
+    /// still holds there: its exchange is bound to the connection, and the
+    /// server must prove it holds the password's verifier.
     pub async fn connect(addr: &str, options: Options) -> Result<Self> {
         let authenticator = options.login.authenticator()?;
         let mut connections = Vec::with_capacity(options.connections.max(1));

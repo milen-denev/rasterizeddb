@@ -1337,7 +1337,7 @@ in-place-update path all have to agree about it:
 
 ## Statements over the native protocol
 
-A statement sent over the native protocol (`DbClient`, `rasterizeddb_client`)
+A statement sent over the native protocol (`rasterizeddb_client`)
 gets the same preparation as an autocommit statement over pgwire: comments,
 typed literals (`DATE '…'`), `CREATE UNIQUE INDEX` as a unique constraint,
 constant folding, `IN`/`EXISTS`/scalar subqueries, a `SELECT` with no `FROM`
