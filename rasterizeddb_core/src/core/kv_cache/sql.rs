@@ -18,8 +18,18 @@
 //! its options, never on the data, so the extended protocol can describe a
 //! statement before it runs.
 //!
-//! Values are text. One that is not valid UTF-8 is refused with an error
-//! rather than sent mangled: a binary value is read over the Redis port.
+//! Values are text by default. One that is not valid UTF-8 is refused with an
+//! error rather than sent mangled. For binary data:
+//!
+//! ```sql
+//! KV SET x'00ff10' x'deadbeef';   -- any argument may be hex bytes: x'…'
+//! KV BINARY GET x'00ff10';        -- value columns come back as bytea
+//! KV BINARY HGETALL h;            -- field and value both bytea
+//! ```
+//!
+//! `x'…'` takes an even number of hex digits. `BINARY` changes the value
+//! columns (a value, key, field or member) to `bytea`; counts, scores and a
+//! scan's cursor keep their types.
 
 use super::commands::{self, CONN, Cmd, SERVER, Spec, eq};
 use super::reply::{Collect, Item, Reply};
@@ -72,6 +82,19 @@ pub fn tokenize(sql: &str) -> Result<Vec<Vec<u8>>, String> {
                 return Err("a quoted KV argument must be followed by a space".into());
             }
             args.push(value);
+        } else if matches!(body[i], b'x' | b'X') && body.get(i + 1) == Some(&b'\'') {
+            // `x'00ff'`: bytes written as hex, for a key or value that is not
+            // text. A quote inside a word was refused before this form
+            // existed, so no statement that used to run reads differently.
+            let start = i + 2;
+            let Some(len) = body[start..].iter().position(|&c| c == b'\'') else {
+                return Err("unterminated x'…' hex string in KV statement".into());
+            };
+            args.push(decode_hex(&body[start..start + len])?);
+            i = start + len + 1;
+            if body.get(i).is_some_and(|c| !c.is_ascii_whitespace()) {
+                return Err("an x'…' KV argument must be followed by a space".into());
+            }
         } else {
             let start = i;
             while i < body.len() && !body[i].is_ascii_whitespace() {
@@ -87,6 +110,35 @@ pub fn tokenize(sql: &str) -> Result<Vec<Vec<u8>>, String> {
         return Err("KV names no command".into());
     }
     Ok(args)
+}
+
+fn decode_hex(digits: &[u8]) -> Result<Vec<u8>, String> {
+    let nibble = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    if digits.len() % 2 != 0 {
+        return Err("an x'…' KV argument needs an even number of hex digits".into());
+    }
+    digits
+        .chunks(2)
+        .map(|pair| match (nibble(pair[0]), nibble(pair[1])) {
+            (Some(hi), Some(lo)) => Ok(hi << 4 | lo),
+            _ => Err("an x'…' KV argument holds a character that is not a hex digit".to_string()),
+        })
+        .collect()
+}
+
+/// `KV BINARY <command> …`: the statement's arguments, and whether `BINARY`
+/// asked for its values as `bytea` rather than text. `BINARY` names no Redis
+/// command, so the prefix cannot shadow one.
+fn statement(sql: &str) -> Result<(Vec<Vec<u8>>, bool), String> {
+    let mut args = tokenize(sql)?;
+    if eq(&args[0], b"BINARY") {
+        args.remove(0);
+        if args.is_empty() {
+            return Err("KV BINARY names no command".into());
+        }
+        return Ok((args, true));
+    }
+    Ok((args, false))
 }
 
 /// How a command's reply becomes rows.
@@ -111,6 +163,15 @@ enum Kind {
     Text,
     Int,
     Float,
+    /// What `Text` becomes under `KV BINARY`: the value's bytes as they are.
+    Bytes,
+}
+
+impl Kind {
+    /// `Text` as `Bytes` when the statement asked for binary values.
+    fn binary_if(self, binary: bool) -> Kind {
+        if binary && self == Kind::Text { Kind::Bytes } else { self }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +227,7 @@ fn kind_type(kind: Kind) -> DbType {
         Kind::Text => DbType::STRING,
         Kind::Int => DbType::I64,
         Kind::Float => DbType::F64,
+        Kind::Bytes => DbType::BYTEA,
     }
 }
 
@@ -195,24 +257,27 @@ fn plan(args: &[Vec<u8>]) -> Result<(&'static Spec, Shape), String> {
 /// The columns a `KV` statement returns, for `Describe`.
 pub fn result_fields(sql: &str) -> Vec<(String, DbType)> {
     let fallback = vec![("value".to_string(), DbType::STRING)];
-    let Ok(args) = tokenize(sql) else {
+    let Ok((args, binary)) = statement(sql) else {
         return fallback;
     };
     let Ok((_, shape)) = plan(&args) else {
         return fallback;
     };
     let text = |n: &str| (n.to_string(), DbType::STRING);
+    // A value column: `bytea` under `KV BINARY`. The cursor, a score and
+    // `INFO`'s lines are the server's own text and stay text.
+    let value = |n: &str| (n.to_string(), kind_type(Kind::Text.binary_if(binary)));
     match shape {
-        Shape::Value(kind) => vec![("value".to_string(), kind_type(kind))],
-        Shape::Pairs(a, b) => vec![text(a), text(b)],
-        Shape::MemberScore => vec![text("member"), ("score".to_string(), DbType::F64)],
+        Shape::Value(kind) => vec![("value".to_string(), kind_type(kind.binary_if(binary)))],
+        Shape::Pairs(a, b) => vec![value(a), value(b)],
+        Shape::MemberScore => vec![value("member"), ("score".to_string(), DbType::F64)],
         Shape::RankScore => vec![("rank".to_string(), DbType::I64), ("score".to_string(), DbType::F64)],
         Shape::Scan(kind) => match kind {
-            ScanKind::Keys => vec![text("cursor"), text("key")],
-            ScanKind::Fields => vec![text("cursor"), text("field")],
-            ScanKind::FieldValues => vec![text("cursor"), text("field"), text("value")],
-            ScanKind::Members => vec![text("cursor"), text("member")],
-            ScanKind::MemberScores => vec![text("cursor"), text("member"), ("score".to_string(), DbType::F64)],
+            ScanKind::Keys => vec![text("cursor"), value("key")],
+            ScanKind::Fields => vec![text("cursor"), value("field")],
+            ScanKind::FieldValues => vec![text("cursor"), value("field"), value("value")],
+            ScanKind::Members => vec![text("cursor"), value("member")],
+            ScanKind::MemberScores => vec![text("cursor"), value("member"), ("score".to_string(), DbType::F64)],
         },
         Shape::Info => vec![text("metric"), text("value")],
     }
@@ -228,7 +293,7 @@ pub async fn execute(sql: &str, handle: &super::KvCacheHandle) -> Vec<u8> {
 }
 
 async fn run(sql: &str, handle: &super::KvCacheHandle) -> Result<Vec<Vec<Cell>>, String> {
-    let args = tokenize(sql)?;
+    let (args, binary) = statement(sql)?;
     let (spec, shape) = plan(&args)?;
     let refs: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
     let mut out = Collect::default();
@@ -279,7 +344,7 @@ async fn run(sql: &str, handle: &super::KvCacheHandle) -> Result<Vec<Vec<Cell>>,
             commands::run(spec, &mut access, &refs, &mut out);
         }
     }
-    rows_of(out.take(), shape)
+    rows_of(out.take(), shape, binary)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +354,8 @@ async fn run(sql: &str, handle: &super::KvCacheHandle) -> Result<Vec<Vec<Cell>>,
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     Text(String),
+    /// A value under `KV BINARY`, sent as `bytea`.
+    Bytes(Vec<u8>),
     Int(i64),
     Float(f64),
     Null,
@@ -303,24 +370,36 @@ fn text(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn cell(item: &Item, kind: Kind) -> Result<Cell, String> {
+    if kind == Kind::Bytes {
+        // Every reply kind has a byte form; only a bulk string's is its own.
+        return Ok(match item {
+            Item::Null | Item::NullArray => Cell::Null,
+            Item::Bulk(b) => Cell::Bytes(b.clone()),
+            Item::Error(e) => return Err(e.clone()),
+            other => match cell(other, Kind::Text)? {
+                Cell::Text(t) => Cell::Bytes(t.into_bytes()),
+                other => other,
+            },
+        });
+    }
     Ok(match item {
         Item::Null | Item::NullArray => Cell::Null,
         Item::Int(n) => match kind {
             Kind::Float => Cell::Float(*n as f64),
-            Kind::Text => Cell::Text(n.to_string()),
+            Kind::Text | Kind::Bytes => Cell::Text(n.to_string()),
             Kind::Int => Cell::Int(*n),
         },
         Item::Double(f) => match kind {
-            Kind::Text => Cell::Text(String::from_utf8_lossy(&super::reply::double_string(*f)).into()),
+            Kind::Text | Kind::Bytes => Cell::Text(String::from_utf8_lossy(&super::reply::double_string(*f)).into()),
             _ => Cell::Float(*f),
         },
         Item::Bool(b) => match kind {
-            Kind::Text => Cell::Text(b.to_string()),
+            Kind::Text | Kind::Bytes => Cell::Text(b.to_string()),
             _ => Cell::Int(i64::from(*b)),
         },
         Item::Simple(s) => Cell::Text(s.clone()),
         Item::Bulk(b) => match kind {
-            Kind::Text => Cell::Text(text(b)?),
+            Kind::Text | Kind::Bytes => Cell::Text(text(b)?),
             Kind::Int => Cell::Int(commands::parse_int(b).ok_or("expected an integer reply")?),
             Kind::Float => Cell::Float(commands::parse_float(b).ok_or("expected a number reply")?),
         },
@@ -367,27 +446,39 @@ fn pairs_of(item: Item) -> Vec<(Item, Item)> {
     }
 }
 
-fn rows_of(reply: Item, shape: Shape) -> Result<Vec<Vec<Cell>>, String> {
+fn rows_of(reply: Item, shape: Shape, binary: bool) -> Result<Vec<Vec<Cell>>, String> {
     if let Item::Error(e) = &reply {
         return Err(e.clone());
     }
+    // A value column's kind: text, or bytes under `KV BINARY`.
+    let value = Kind::Text.binary_if(binary);
     Ok(match shape {
         Shape::Value(kind) => match reply {
             Item::Null | Item::NullArray => Vec::new(),
-            Item::Array(items) => items.iter().map(|i| cell(i, kind).map(|c| vec![c])).collect::<Result<_, _>>()?,
+            Item::Array(items) => items
+                .iter()
+                .map(|i| cell(i, kind.binary_if(binary)).map(|c| vec![c]))
+                .collect::<Result<_, _>>()?,
             Item::Map(pairs) => pairs
                 .iter()
-                .map(|(k, v)| Ok(vec![Cell::Text(format!("{}: {}", render(k), render(v)))]))
+                .map(|(k, v)| {
+                    let line = format!("{}: {}", render(k), render(v));
+                    Ok(vec![if kind.binary_if(binary) == Kind::Bytes {
+                        Cell::Bytes(line.into_bytes())
+                    } else {
+                        Cell::Text(line)
+                    }])
+                })
                 .collect::<Result<_, String>>()?,
-            other => vec![vec![cell(&other, kind)?]],
+            other => vec![vec![cell(&other, kind.binary_if(binary))?]],
         },
         Shape::Pairs(..) => pairs_of(reply)
             .iter()
-            .map(|(a, b)| Ok(vec![cell(a, Kind::Text)?, cell(b, Kind::Text)?]))
+            .map(|(a, b)| Ok(vec![cell(a, value)?, cell(b, value)?]))
             .collect::<Result<_, String>>()?,
         Shape::MemberScore => pairs_of(reply)
             .iter()
-            .map(|(m, s)| Ok(vec![cell(m, Kind::Text)?, cell(s, Kind::Float)?]))
+            .map(|(m, s)| Ok(vec![cell(m, value)?, cell(s, Kind::Float)?]))
             .collect::<Result<_, String>>()?,
         Shape::RankScore => match reply {
             Item::Array(items) if items.len() == 2 => {
@@ -418,11 +509,11 @@ fn rows_of(reply: Item, shape: Shape) -> Result<Vec<Vec<Cell>>, String> {
             let mut rows = Vec::new();
             for chunk in items.chunks(width) {
                 let mut row = vec![Cell::Text(cursor.clone())];
-                row.push(cell(&chunk[0], Kind::Text)?);
+                row.push(cell(&chunk[0], value)?);
                 if width == 2 {
                     row.push(cell(
                         &chunk[1],
-                        if kind == ScanKind::MemberScores { Kind::Float } else { Kind::Text },
+                        if kind == ScanKind::MemberScores { Kind::Float } else { value },
                     )?);
                 }
                 rows.push(row);
@@ -459,6 +550,7 @@ fn encode_rows(rows: Vec<Vec<Cell>>) -> Vec<u8> {
         for (index, c) in cells.iter().enumerate() {
             let (bytes, column_type): (Vec<u8>, DbType) = match c {
                 Cell::Text(t) => (t.as_bytes().to_vec(), DbType::STRING),
+                Cell::Bytes(b) => (b.clone(), DbType::BYTEA),
                 Cell::Int(n) => (n.to_le_bytes().to_vec(), DbType::I64),
                 Cell::Float(f) => (f.to_le_bytes().to_vec(), DbType::F64),
                 Cell::Null => (Vec::new(), DbType::NULL),
@@ -495,7 +587,7 @@ fn failure(message: &str) -> Vec<u8> {
 pub(crate) fn rows_for_test(reply: Item, args: &[&str]) -> Result<Vec<Vec<Cell>>, String> {
     let args: Vec<Vec<u8>> = args.iter().map(|a| a.as_bytes().to_vec()).collect();
     let (_, shape) = plan(&args)?;
-    rows_of(reply, shape)
+    rows_of(reply, shape, false)
 }
 
 #[cfg(test)]
@@ -527,6 +619,59 @@ mod tests {
         );
         assert_eq!(result_fields("KV HGETALL h").len(), 2);
         assert_eq!(result_fields("KV SCAN 0").len(), 2);
+    }
+
+    #[test]
+    fn hex_arguments_carry_any_bytes() {
+        let args = tokenize("KV SET x'00ff' X'DeAd' 'x''y'").unwrap();
+        assert_eq!(args, vec![b"SET".to_vec(), vec![0x00, 0xff], vec![0xde, 0xad], b"x'y".to_vec()]);
+        assert_eq!(tokenize("KV SET k x''").unwrap()[2], Vec::<u8>::new());
+        // A plain word that merely starts with x is still a word.
+        assert_eq!(tokenize("KV GET xkey").unwrap()[1], b"xkey".to_vec());
+        for bad in ["KV SET k x'0'", "KV SET k x'zz'", "KV SET k x'00", "KV SET k x'00'y"] {
+            assert!(tokenize(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn binary_values_are_bytea() {
+        let (args, binary) = statement("KV binary GET k").unwrap();
+        assert!(binary);
+        assert_eq!(args, vec![b"GET".to_vec(), b"k".to_vec()]);
+        assert!(!statement("KV GET k").unwrap().1);
+        assert!(statement("KV BINARY").is_err());
+        assert_eq!(result_fields("KV BINARY GET k"), vec![("value".to_string(), DbType::BYTEA)]);
+        assert_eq!(result_fields("KV BINARY INCR k"), vec![("value".to_string(), DbType::I64)]);
+        assert_eq!(
+            result_fields("KV BINARY HGETALL h"),
+            vec![("field".to_string(), DbType::BYTEA), ("value".to_string(), DbType::BYTEA)]
+        );
+        assert_eq!(
+            result_fields("KV BINARY SCAN 0"),
+            vec![("cursor".to_string(), DbType::STRING), ("key".to_string(), DbType::BYTEA)]
+        );
+        let raw = vec![0xff, 0x00, 0xfe];
+        let args = vec![b"GET".to_vec(), b"k".to_vec()];
+        let (_, shape) = plan(&args).unwrap();
+        assert_eq!(
+            rows_of(Item::Bulk(raw.clone()), shape, true).unwrap(),
+            vec![vec![Cell::Bytes(raw.clone())]]
+        );
+        assert!(rows_of(Item::Bulk(raw), shape, false).is_err(), "text mode still refuses it");
+        let args = vec![b"ZPOPMIN".to_vec(), b"z".to_vec()];
+        let (_, shape) = plan(&args).unwrap();
+        assert_eq!(
+            rows_of(Item::Array(vec![Item::Bulk(vec![0xff]), Item::Double(2.0)]), shape, true).unwrap(),
+            vec![vec![Cell::Bytes(vec![0xff]), Cell::Float(2.0)]]
+        );
+        // A status reply under BINARY is its text's bytes, so the column keeps
+        // one type.
+        let args = vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()];
+        let (_, shape) = plan(&args).unwrap();
+        assert_eq!(
+            rows_of(Item::Simple("OK".into()), shape, true).unwrap(),
+            vec![vec![Cell::Bytes(b"OK".to_vec())]]
+        );
     }
 
     #[test]

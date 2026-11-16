@@ -609,6 +609,30 @@ fn sql_rows_have_the_described_shape() {
     assert_eq!(rows, vec![vec![Cell::Text("0".into()), Cell::Null]]);
 }
 
+#[tokio::test]
+async fn sql_binary_values_round_trip() {
+    let _settings = default_settings();
+    let handle = KvCacheHandle::new(None);
+    let key = "x'00ff'";
+    let value = [0xfe, 0x00, 0x80, 0x27];
+    let set = super::sql::execute(&format!("KV SET {key} x'fe008027'"), &handle).await;
+    assert_eq!(set[0], 2, "{:?}", String::from_utf8_lossy(&set));
+    let text = super::sql::execute(&format!("KV GET {key}"), &handle).await;
+    assert_eq!(text[0], 3, "text mode refuses bytes that are not UTF-8");
+    let got = super::sql::execute(&format!("KV BINARY GET {key}"), &handle).await;
+    assert_eq!(got[0], 2, "{:?}", String::from_utf8_lossy(&got));
+    // One row, one cell: its bytes and then its type tag, `bytea`.
+    let tag = crate::core::db_type::DbType::BYTEA.to_byte();
+    assert!(
+        got.ends_with(&[value.as_slice(), &[tag]].concat()),
+        "{got:?}"
+    );
+    // The key really is the two bytes: a text key of the same spelling is
+    // another key.
+    let other = super::sql::execute("KV EXISTS '00ff'", &handle).await;
+    assert!(other.ends_with(&[&0i64.to_le_bytes()[..], &[crate::core::db_type::DbType::I64.to_byte()]].concat()));
+}
+
 // ---------------------------------------------------------------------------
 // Over TCP
 // ---------------------------------------------------------------------------
