@@ -8040,11 +8040,6 @@ tokio::task_local! {
 pub(crate) const CONFLICT_MOVE_REFUSAL: &str = "invalid ON UPDATE specification: the result tuple would appear in a \
      different partition than the original tuple (moving a row by ON CONFLICT DO UPDATE is not supported)";
 
-/// The columns of the unique constraint `name` on `schema`'s table, for `ON
-/// CONFLICT ON CONSTRAINT name`: a table-level key (a composite `PRIMARY KEY`
-/// among them, named `<table>_pkey`), a single-column `PRIMARY KEY`
-/// (`<table>_pkey`), or an inline `UNIQUE` column (`<table>_<column>_key`).
-/// `None` when no live constraint has that name.
 /// Whether the uniqueness violation `error` is one an `ON CONFLICT` naming
 /// `columns` or `constraint` absorbs: any, when it names neither; otherwise
 /// only a clash on that key. A clash on another key alone is the statement
@@ -8079,20 +8074,32 @@ fn conflict_is_on_arbiter(
         normalized(columns)
     } else {
         let Some(name) = constraint else { return true };
-        let schema = match database.schema_view(table_name) {
-            Some(view) => view.schema().clone(),
-            None => match database.partitioned_table(table_name) {
-                Some(pt) => pt.shell().schema.clone(),
-                None => return false,
-            },
-        };
-        match constraint_columns(&schema, table_name, name.trim_matches('"')) {
+        match arbiter_constraint_columns(database, table_name, name) {
             Some(columns) => normalized(&columns),
-            None => return false,
+            // A name no constraint has is the statement's error (42704),
+            // which the conflict branch reports; refusing here would pass
+            // the clash through as 23505 instead.
+            None => return true,
         }
     };
     violation.keys.iter().any(|key| normalized(key) == arbiter)
 }
+
+/// The columns of the constraint an `ON CONFLICT ON CONSTRAINT name` names on
+/// `table_name`, plain or partitioned; `None` when it names none.
+fn arbiter_constraint_columns(database: &Database, table_name: &str, name: &str) -> Option<Vec<String>> {
+    let schema = match database.schema_view(table_name) {
+        Some(view) => view.schema().clone(),
+        None => database.partitioned_table(table_name)?.shell().schema.clone(),
+    };
+    constraint_columns(&schema, table_name, name.trim_matches('"'))
+}
+
+/// The columns of the unique constraint `name` on `schema`'s table, for `ON
+/// CONFLICT ON CONSTRAINT name`: a table-level key (a composite `PRIMARY KEY`
+/// among them, named `<table>_pkey`), a single-column `PRIMARY KEY`
+/// (`<table>_pkey`), or an inline `UNIQUE` column (`<table>_<column>_key`).
+/// `None` when no live constraint has that name.
 
 fn constraint_columns(
     schema: &crate::core::row::schema::TableSchema,
@@ -20247,6 +20254,15 @@ async fn insert_row_resolved(
             // PostgreSQL still sends the RowDescription, and a bare
             // count sent only the command tag (as `INSERT … SELECT`
             // did before dedd503).
+            if let Some(name) = row_data.on_conflict_target.constraint.as_deref()
+                && arbiter_constraint_columns(&database, table_name, name).is_none()
+            {
+                return ddl_error(&format!(
+                    "constraint \"{}\" for table \"{}\" does not exist",
+                    name.trim_matches('"'),
+                    table_name
+                ));
+            }
             if returning.is_some() {
                 return vec![2u8];
             }

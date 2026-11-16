@@ -195,6 +195,11 @@ async fn the_arbiter_alone_is_absorbed_on(c: &NativeContext, t: &str) {
     );
     let m = refused(c, &format!("INSERT INTO {t} (rid, seq, c_domain) VALUES ('id2', 2, 'a.example') ON CONFLICT ON CONSTRAINT {t}_pkey DO NOTHING")).await;
     assert!(clash(&m), "{m}");
+    // A name no constraint has is that error (42704), not the clash and not absorbed.
+    for action in ["DO NOTHING", "DO UPDATE SET seq = 9"] {
+        let m = refused(c, &format!("INSERT INTO {t} (rid, seq, c_domain) VALUES ('id2', 2, 'a.example') ON CONFLICT ON CONSTRAINT nope {action}")).await;
+        assert!(m.contains("constraint \"nope\"") && m.contains("does not exist"), "{action}: {m}");
+    }
     // Several rows: the clash on the other key fails the statement.
     let m = refused(
         c,
