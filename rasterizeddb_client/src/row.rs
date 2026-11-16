@@ -7,6 +7,8 @@
 //! `serialized_cells`) for a server built without `enable_long_row`; the
 //! integration tests read real answers through it.
 
+use crate::from_sql::{FromSql, FromSqlOwned};
+use crate::value::Value;
 use crate::{Error, Result};
 
 /// The type tags a cell can carry (`DbType::to_byte` in the server).
@@ -25,9 +27,22 @@ pub mod tag {
     pub const F64: u8 = 12;
     pub const CHAR: u8 = 13;
     pub const STRING: u8 = 14;
+    /// `timestamptz` and `timestamp` alike: `i64` µs since 1970, little-endian.
+    pub const DATETIME: u8 = 15;
     pub const BOOL: u8 = 16;
+    pub const UUID: u8 = 17;
+    pub const INET: u8 = 18;
+    /// `NUMERIC`: an `i128`, little-endian, then a scale byte when the wire
+    /// carries it (see [`Numeric`](crate::Numeric)).
+    pub const DECIMAL: u8 = 19;
     pub const BYTEA: u8 = 20;
+    pub const ARRAY: u8 = 21;
+    pub const JSONB: u8 = 22;
     pub const JSON: u8 = 23;
+    pub const INTERVAL: u8 = 24;
+    pub const DATE: u8 = 29;
+    pub const TIME: u8 = 30;
+    pub const TIMESTAMP: u8 = 46;
     pub const JSONTEXT: u8 = 47;
     pub const NULL: u8 = 253;
 }
@@ -134,6 +149,24 @@ impl Rows {
     pub fn rows_affected(&self) -> Option<u64> {
         self.affected
     }
+
+    /// Every row as `T` (see [`FromRow`]).
+    pub fn decode_all<T: FromRow>(&self) -> Result<Vec<T>> {
+        self.iter().map(|row| T::from_row(&row)).collect()
+    }
+
+    /// The first row as `T`, if there is one.
+    pub fn decode_first<T: FromRow>(&self) -> Result<Option<T>> {
+        self.get(0).map(|row| T::from_row(&row)).transpose()
+    }
+}
+
+impl<'a> IntoIterator for &'a Rows {
+    type Item = Row<'a>;
+    type IntoIter = Box<dyn ExactSizeIterator<Item = Row<'a>> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
 }
 
 /// One row of an answer. Columns are positional: column `i` is item `i` of
@@ -192,140 +225,173 @@ impl<'a> Row<'a> {
         Ok(self.cell(i)?.tag == tag::NULL)
     }
 
-    fn non_null(&self, i: usize) -> Result<Option<(u8, &'a [u8])>> {
+    /// Column `i` as `T`: any [`FromSql`] type, `Option<T>` for a column that
+    /// may be NULL.
+    ///
+    /// ```no_run
+    /// # fn demo(row: rasterizeddb_client::Row<'_>) -> rasterizeddb_client::Result<()> {
+    /// let id: i64 = row.get(0)?;
+    /// let name: &str = row.get(1)?;
+    /// let score: Option<f64> = row.get(2)?;
+    /// # Ok(()) }
+    /// ```
+    pub fn get<T: FromSql<'a>>(&self, i: usize) -> Result<T> {
         let cell = self.cell(i)?;
         if cell.tag == tag::NULL {
-            return Ok(None);
+            return T::from_null().ok_or_else(|| Error::column(i, "is NULL"));
         }
-        Ok(Some((
-            cell.tag,
-            &self.data[cell.start..cell.start + cell.len],
-        )))
+        T::from_sql(cell.tag, &self.data[cell.start..cell.start + cell.len])
+            .map_err(|message| Error::column(i, message))
     }
 
-    fn required<T>(i: usize, value: Option<T>) -> Result<T> {
-        value.ok_or_else(|| Error::column(i, "is NULL"))
+    /// Every column as a [`Value`].
+    pub fn values(&self) -> Result<Vec<Value>> {
+        (0..self.len()).map(|i| self.get(i)).collect()
     }
 
-    /// Any integer cell, as `i128`, checked against its width.
-    fn integer(&self, i: usize) -> Result<Option<i128>> {
-        let Some((tag, bytes)) = self.non_null(i)? else {
-            return Ok(None);
-        };
-        fn fixed<const N: usize>(i: usize, tag: u8, bytes: &[u8]) -> Result<[u8; N]> {
-            bytes.try_into().map_err(|_| {
-                Error::column(
-                    i,
-                    format!(
-                        "type tag {tag} needs {N} bytes, the cell has {}",
-                        bytes.len()
-                    ),
-                )
-            })
-        }
-        let value = match tag {
-            tag::I8 => i8::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::I16 => i16::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::I32 => i32::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::I64 => i64::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::I128 => i128::from_le_bytes(fixed(i, tag, bytes)?),
-            tag::U8 => u8::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::U16 => u16::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::U32 => u32::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            tag::U64 => u64::from_le_bytes(fixed(i, tag, bytes)?) as i128,
-            other => {
-                return Err(Error::column(
-                    i,
-                    format!("type tag {other} is not an integer"),
-                ));
-            }
-        };
-        Ok(Some(value))
-    }
-
-    fn narrowed<T: TryFrom<i128>>(&self, i: usize, name: &str) -> Result<Option<T>> {
-        match self.integer(i)? {
-            None => Ok(None),
-            Some(v) => T::try_from(v)
-                .map(Some)
-                .map_err(|_| Error::column(i, format!("{v} does not fit {name}"))),
-        }
+    /// The row as `T`: a tuple of [`FromSql`] types, or a struct deriving
+    /// [`FromRow`].
+    pub fn decode<T: FromRow>(&self) -> Result<T> {
+        T::from_row(self)
     }
 
     /// An integer column of any width, if it fits `i64`.
     pub fn get_opt_i64(&self, i: usize) -> Result<Option<i64>> {
-        self.narrowed(i, "i64")
+        self.get(i)
     }
 
     pub fn get_opt_i32(&self, i: usize) -> Result<Option<i32>> {
-        self.narrowed(i, "i32")
+        self.get(i)
     }
 
     pub fn get_opt_i16(&self, i: usize) -> Result<Option<i16>> {
-        self.narrowed(i, "i16")
+        self.get(i)
     }
 
     pub fn get_i64(&self, i: usize) -> Result<i64> {
-        Self::required(i, self.get_opt_i64(i)?)
+        self.get(i)
     }
 
     pub fn get_i32(&self, i: usize) -> Result<i32> {
-        Self::required(i, self.get_opt_i32(i)?)
+        self.get(i)
     }
 
     pub fn get_i16(&self, i: usize) -> Result<i16> {
-        Self::required(i, self.get_opt_i16(i)?)
+        self.get(i)
+    }
+
+    /// A `double precision` or `real` column (or an integer, or a NUMERIC
+    /// that carries its scale).
+    pub fn get_opt_f64(&self, i: usize) -> Result<Option<f64>> {
+        self.get(i)
+    }
+
+    pub fn get_f64(&self, i: usize) -> Result<f64> {
+        self.get(i)
+    }
+
+    /// A `real` column, or a `double precision` one whose value is exactly
+    /// an `f32`.
+    pub fn get_opt_f32(&self, i: usize) -> Result<Option<f32>> {
+        self.get(i)
+    }
+
+    pub fn get_f32(&self, i: usize) -> Result<f32> {
+        self.get(i)
     }
 
     pub fn get_opt_bool(&self, i: usize) -> Result<Option<bool>> {
-        match self.non_null(i)? {
-            None => Ok(None),
-            Some((tag::BOOL, [b])) => Ok(Some(*b != 0)),
-            Some((tag, bytes)) => Err(Error::column(
-                i,
-                format!(
-                    "type tag {tag} with {} byte(s) is not a boolean",
-                    bytes.len()
-                ),
-            )),
-        }
+        self.get(i)
     }
 
     pub fn get_bool(&self, i: usize) -> Result<bool> {
-        Self::required(i, self.get_opt_bool(i)?)
+        self.get(i)
     }
 
     /// A text column (`text`, `varchar`, a JSON document's text), checked to
     /// be UTF-8.
     pub fn get_opt_text(&self, i: usize) -> Result<Option<&'a str>> {
-        match self.non_null(i)? {
-            None => Ok(None),
-            Some((tag::STRING | tag::JSON | tag::JSONTEXT, bytes)) => std::str::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| Error::column(i, "text is not valid UTF-8")),
-            Some((tag, _)) => Err(Error::column(i, format!("type tag {tag} is not text"))),
-        }
+        self.get(i)
     }
 
     pub fn get_text(&self, i: usize) -> Result<&'a str> {
-        Self::required(i, self.get_opt_text(i)?)
+        self.get(i)
     }
 
     /// A `bytea` column's bytes. The engine stores `bytea` as a string of
     /// bytes, so a stored one may arrive tagged [`tag::STRING`] as well as
     /// [`tag::BYTEA`]; both are accepted, other tags are not.
     pub fn get_opt_bytes(&self, i: usize) -> Result<Option<&'a [u8]>> {
-        match self.non_null(i)? {
-            None => Ok(None),
-            Some((tag::BYTEA | tag::STRING, bytes)) => Ok(Some(bytes)),
-            Some((tag, _)) => Err(Error::column(i, format!("type tag {tag} is not bytea"))),
-        }
+        self.get(i)
     }
 
     pub fn get_bytes(&self, i: usize) -> Result<&'a [u8]> {
-        Self::required(i, self.get_opt_bytes(i)?)
+        self.get(i)
+    }
+
+    /// A `NUMERIC` as exact decimal text. Reads one that carries its scale, an
+    /// integer, or a column selected as `col::text`; a `NUMERIC(p, s)` column
+    /// read directly is an error, because the native protocol does not send
+    /// its scale.
+    pub fn get_numeric(&self, i: usize) -> Result<crate::Numeric> {
+        self.get(i)
+    }
+
+    pub fn get_opt_numeric(&self, i: usize) -> Result<Option<crate::Numeric>> {
+        self.get(i)
     }
 }
+
+/// A type a whole row can be read as: a tuple of [`FromSql`] types (up to
+/// twelve), a [`Vec<Value>`], or a struct with `#[derive(FromRow)]` or
+/// `#[derive(Model)]`.
+///
+/// Columns are matched by position: field or element `i` is column `i`.
+pub trait FromRow: Sized {
+    fn from_row(row: &Row<'_>) -> Result<Self>;
+}
+
+impl FromRow for Vec<Value> {
+    fn from_row(row: &Row<'_>) -> Result<Self> {
+        row.values()
+    }
+}
+
+/// Fails when a row has more or fewer columns than the tuple, so a select list
+/// that drifted from the code is found at once.
+pub fn check_width(row: &Row<'_>, width: usize) -> Result<()> {
+    if row.len() == width {
+        Ok(())
+    } else {
+        Err(Error::Column {
+            index: width.min(row.len()),
+            message: format!("the row has {} column(s), {width} were expected", row.len()),
+        })
+    }
+}
+
+macro_rules! tuple_from_row {
+    ($width:literal: $($t:ident $i:tt),+) => {
+        impl<$($t: FromSqlOwned),+> FromRow for ($($t,)+) {
+            fn from_row(row: &Row<'_>) -> Result<Self> {
+                check_width(row, $width)?;
+                Ok(($(row.get::<$t>($i)?,)+))
+            }
+        }
+    };
+}
+tuple_from_row!(1: A 0);
+tuple_from_row!(2: A 0, B 1);
+tuple_from_row!(3: A 0, B 1, C 2);
+tuple_from_row!(4: A 0, B 1, C 2, D 3);
+tuple_from_row!(5: A 0, B 1, C 2, D 3, E 4);
+tuple_from_row!(6: A 0, B 1, C 2, D 3, E 4, F 5);
+tuple_from_row!(7: A 0, B 1, C 2, D 3, E 4, F 5, G 6);
+tuple_from_row!(8: A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+tuple_from_row!(9: A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
+tuple_from_row!(10: A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
+tuple_from_row!(11: A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
+tuple_from_row!(12: A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
 
 #[cfg(test)]
 mod tests {

@@ -4,9 +4,11 @@ use std::time::Duration;
 use rastcp::client::TcpClientBuilder;
 use rastcp::mux::MuxClient;
 
+use crate::from_sql::FromSqlOwned;
 use crate::login::Login;
-use crate::params::{Param, render};
-use crate::row::Rows;
+use crate::params::{Param, check_statement, render, render_dyn};
+use crate::row::{FromRow, Rows};
+use crate::to_sql::ToSql;
 use crate::{Error, Result};
 
 /// How a [`Client`] connects.
@@ -27,6 +29,14 @@ pub struct Options {
     /// big read, or page the read (`ORDER BY … LIMIT`); the whole answer is
     /// held in memory either way.
     pub max_message_size: usize,
+    /// Migrations [`connect`](Client::connect) handles as
+    /// [`auto_migrate`](Self::auto_migrate) says. `None` (the default):
+    /// nothing is migrated.
+    pub migrations: Option<crate::orm::Migrator>,
+    /// The knob for [`migrations`](Self::migrations): apply them when the
+    /// client connects (the default), only verify that nothing is pending, or
+    /// leave them to [`Client::migrate`].
+    pub auto_migrate: crate::orm::AutoMigrate,
 }
 
 impl Default for Options {
@@ -36,6 +46,8 @@ impl Default for Options {
             timeout: Some(Duration::from_secs(30)),
             login: Login::Trust,
             max_message_size: 8 * 1024 * 1024,
+            migrations: None,
+            auto_migrate: crate::orm::AutoMigrate::Apply,
         }
     }
 }
@@ -58,7 +70,9 @@ impl Client {
     /// server's `--rdb-socket`), or `host:port` for TCP.
     ///
     /// Every connection is opened and logged in before this returns, so a
-    /// wrong path or a refused login is this call's error.
+    /// wrong path or a refused login is this call's error. So is a migration
+    /// that fails, when [`Options::migrations`] is set and
+    /// [`Options::auto_migrate`] applies or verifies it.
     ///
     /// Over TCP the transport is TLS, and the server's certificate is not
     /// verified, as with `rasterizeddb_core`'s own client: use a unix socket,
@@ -81,10 +95,29 @@ impl Client {
             client.connect().await?;
             connections.push(client);
         }
-        Ok(Client {
+        let client = Client {
             connections,
             next: AtomicUsize::new(0),
-        })
+        };
+        if let Some(migrator) = &options.migrations {
+            use crate::orm::AutoMigrate;
+            match options.auto_migrate {
+                AutoMigrate::Off => {}
+                AutoMigrate::Apply => {
+                    migrator.apply(&client).await?;
+                }
+                AutoMigrate::Verify => {
+                    migrator.verify(&client).await?;
+                }
+            }
+        }
+        Ok(client)
+    }
+
+    /// A client with no connection, for tests that build statements only.
+    #[cfg(all(test, feature = "derive"))]
+    pub(crate) fn detached() -> Self {
+        Client { connections: Vec::new(), next: AtomicUsize::new(0) }
     }
 
     fn pick(&self) -> &MuxClient {
@@ -93,7 +126,17 @@ impl Client {
     }
 
     /// Runs `sql` exactly as given, with no placeholder rendering.
+    ///
+    /// Text holding a second statement, or transaction control, is refused
+    /// with [`Error::Unsupported`] before anything is sent (see
+    /// [`check_statement`](crate::check_statement)).
     pub async fn run(&self, sql: &str) -> Result<Rows> {
+        check_statement(sql)?;
+        self.send(sql).await
+    }
+
+    /// Sends text already checked (by [`check_statement`], or by rendering).
+    async fn send(&self, sql: &str) -> Result<Rows> {
         let response = self.pick().send(sql.as_bytes()).await?;
         decode_response(response)
     }
@@ -103,7 +146,85 @@ impl Client {
     /// [`Rows`] whose [`Rows::rows_affected`] says what it reported.
     pub async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Rows> {
         let statement = render(sql, params)?;
-        self.run(&statement).await
+        self.send(&statement).await
+    }
+
+    /// [`query`](Self::query) with values given as [`ToSql`], as
+    /// [`params!`](crate::params) builds them.
+    pub async fn query_with(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Rows> {
+        let statement = render_dyn(sql, params)?;
+        self.send(&statement).await
+    }
+
+    /// [`execute`](Self::execute) with values given as [`ToSql`].
+    pub async fn exec(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64> {
+        let rows = self.query_with(sql, params).await?;
+        Ok(rows.rows_affected().unwrap_or(rows.len() as u64))
+    }
+
+    /// Every row, each as `T`: a tuple, a [`Vec<Value>`](crate::Value), or a
+    /// struct deriving [`FromRow`](derive@crate::FromRow).
+    ///
+    /// ```no_run
+    /// # async fn demo(client: &rasterizeddb_client::Client) -> rasterizeddb_client::Result<()> {
+    /// use rasterizeddb_client::params;
+    /// let rows: Vec<(i64, String)> = client
+    ///     .fetch_all("SELECT id, name FROM users WHERE age > $1", params![30])
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn fetch_all<T: FromRow>(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<T>> {
+        self.query_with(sql, params).await?.decode_all()
+    }
+
+    /// Exactly one row; none, or more than one, is [`Error::RowCount`].
+    pub async fn fetch_one<T: FromRow>(&self, sql: &str, params: &[&dyn ToSql]) -> Result<T> {
+        let rows = self.query_with(sql, params).await?;
+        match rows.len() {
+            1 => rows.decode_first().map(|row| row.expect("one row")),
+            got => Err(Error::RowCount { expected: "exactly 1", got }),
+        }
+    }
+
+    /// At most one row; more than one is [`Error::RowCount`].
+    pub async fn fetch_optional<T: FromRow>(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSql],
+    ) -> Result<Option<T>> {
+        let rows = self.query_with(sql, params).await?;
+        match rows.len() {
+            0 | 1 => rows.decode_first(),
+            got => Err(Error::RowCount { expected: "at most 1", got }),
+        }
+    }
+
+    /// The first column of exactly one row: `SELECT count(*) …`,
+    /// `… RETURNING id`.
+    pub async fn fetch_scalar<T: FromSqlOwned>(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSql],
+    ) -> Result<T> {
+        let rows = self.query_with(sql, params).await?;
+        match rows.len() {
+            1 => rows.get(0).expect("one row").get(0),
+            got => Err(Error::RowCount { expected: "exactly 1", got }),
+        }
+    }
+
+    /// Whether a table of this name exists.
+    pub async fn table_exists(&self, name: &str) -> Result<bool> {
+        let rows = self
+            .query_with("SELECT tablename FROM pg_tables WHERE tablename = $1", &[&name])
+            .await?;
+        Ok(!rows.is_empty())
+    }
+
+    /// The server's administrative statements as typed calls: stores, table
+    /// placement, indexes, partitions, roles, backups, configuration.
+    pub fn admin(&self) -> crate::admin::Admin<'_> {
+        crate::admin::Admin::new(self)
     }
 
     /// Runs `sql` with `params` and returns how many rows it affected: the

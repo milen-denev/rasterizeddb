@@ -4495,11 +4495,25 @@ dependencies = [
 
 [[package]]
 name = "rasterizeddb_client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "chrono",
  "libc",
  "rastcp",
+ "rasterizeddb_client_derive",
+ "serde",
+ "serde_json",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "rasterizeddb_client_derive"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

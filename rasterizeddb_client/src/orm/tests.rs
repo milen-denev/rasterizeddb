@@ -1,0 +1,194 @@
+use super::*;
+use crate::{Numeric, Row, Rows, SqlEnum, Timestamp};
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "accounts")]
+struct Account {
+    #[rdb(primary_key, serial)]
+    id: i64,
+    #[rdb(unique)]
+    email: String,
+    #[rdb(index = "hash")]
+    name: Option<String>,
+    balance: Numeric,
+    tags: Vec<String>,
+    #[rdb(column = "order", default = "0")]
+    position: i32,
+    status: Status,
+    #[rdb(skip)]
+    cached: Option<u8>,
+}
+
+#[derive(SqlEnum, Debug, Clone, Copy, PartialEq)]
+enum Status {
+    Active,
+    #[rdb(rename = "on-hold")]
+    OnHold,
+}
+
+#[derive(crate::Model, Debug)]
+struct OrderLine {
+    #[rdb(primary_key)]
+    order_id: i64,
+    #[rdb(primary_key)]
+    line: i32,
+}
+
+fn account() -> Account {
+    Account {
+        id: 0,
+        email: "o'neil@example.com".into(),
+        name: None,
+        balance: Numeric::new("-10.50").unwrap(),
+        tags: vec!["a b".into(), "q\"z".into()],
+        position: 3,
+        status: Status::OnHold,
+        cached: Some(9),
+    }
+}
+
+#[test]
+fn columns_describe_the_struct() {
+    assert_eq!(Account::TABLE, "accounts");
+    assert_eq!(OrderLine::TABLE, "order_line");
+    let names: Vec<&str> = Account::COLUMNS.iter().map(|c| c.name).collect();
+    assert_eq!(names, ["id", "email", "name", "balance", "tags", "order", "status"]);
+    let c = &Account::COLUMNS;
+    assert!(c[0].primary_key && c[0].serial && c[0].sql_type == "BIGINT");
+    assert!(c[1].unique && !c[1].nullable);
+    assert!(c[2].nullable && c[2].index == Some(IndexMethod::Hash));
+    assert!(c[3].read_as_text && c[3].sql_type == "NUMERIC");
+    assert!(c[4].read_as_text && c[4].sql_type == "TEXT[]");
+    assert_eq!(c[5].default, Some("0"));
+    assert_eq!(c[6].sql_type, "TEXT");
+    assert_eq!(Account::email.name(), "email");
+    assert_eq!(Account::position.name(), "order");
+}
+
+#[test]
+fn statements() {
+    assert_eq!(
+        select_list::<Account>().unwrap(),
+        "id, email, name, balance::text, tags::text, \"order\", status"
+    );
+    assert_eq!(
+        insert_sql(&[&account()]).unwrap(),
+        "INSERT INTO accounts (email, name, balance, tags, \"order\", status) VALUES \
+         ('o''neil@example.com', NULL, (-10.50), '{\"a b\",\"q\\\"z\"}', 3, 'on-hold') \
+         RETURNING id, email, name, balance::text, tags::text, \"order\", status"
+    );
+    let upsert = upsert_sql(&account()).unwrap();
+    assert!(upsert.contains("ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, "), "{upsert}");
+    assert!(upsert.starts_with("INSERT INTO accounts (id, email,"), "{upsert}");
+    assert_eq!(
+        update_sql(&account()).unwrap(),
+        "UPDATE accounts SET email = 'o''neil@example.com', name = NULL, balance = (-10.50), \
+         tags = '{\"a b\",\"q\\\"z\"}', \"order\" = 3, status = 'on-hold' WHERE id = 0 \
+         RETURNING id, email, name, balance::text, tags::text, \"order\", status"
+    );
+    assert_eq!(delete_sql(&account()).unwrap(), "DELETE FROM accounts WHERE id = 0");
+    let line = OrderLine { order_id: 7, line: -1 };
+    assert_eq!(delete_sql(&line).unwrap(), "DELETE FROM order_line WHERE order_id = 7 AND line = (-1)");
+    assert!(upsert_sql(&line).unwrap().contains("ON CONFLICT (order_id, line) DO NOTHING"));
+    assert!(update_sql(&line).is_err(), "nothing outside the key");
+    assert!(find_sql::<OrderLine>(&[&7i64]).is_err(), "half a composite key");
+}
+
+#[test]
+fn ddl() {
+    let ddl = create_table_sql::<Account>().unwrap();
+    assert_eq!(
+        ddl,
+        vec![
+            "CREATE TABLE IF NOT EXISTS accounts (id BIGSERIAL, email TEXT NOT NULL, \
+             name TEXT, balance NUMERIC NOT NULL, tags TEXT[] NOT NULL, \"order\" INTEGER NOT NULL \
+             DEFAULT 0, status TEXT NOT NULL, PRIMARY KEY (id))"
+                .to_string(),
+            "ALTER TABLE accounts ADD CONSTRAINT IF NOT EXISTS accounts_email_key UNIQUE (email)"
+                .to_string(),
+            "CREATE INDEX IF NOT EXISTS accounts_name_idx ON accounts USING hash (name)".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn the_query_builder() {
+    let q = Account::query()
+        .filter(Account::balance.gt(Numeric::new("5").unwrap()) & !Account::name.is_null())
+        .filter(Account::email.like("%@x.com") | Account::id.is_in([1i64, 2, 3]))
+        .order_by(Account::position.desc().nulls_last())
+        .limit(10)
+        .offset(20);
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, email, name, balance::text, tags::text, \"order\", status FROM accounts \
+         WHERE ((balance > 5) AND (NOT (name IS NULL))) AND ((email LIKE '%@x.com') OR \
+         (id IN (1, 2, 3))) ORDER BY \"order\" DESC NULLS LAST LIMIT 10 OFFSET 20"
+    );
+    let none: [i64; 0] = [];
+    assert!(Account::query().filter(Account::id.is_in(none)).to_sql().unwrap().ends_with("WHERE 1 = 0"));
+    assert!(Account::query().filter(Account::email.eq("a\0")).to_sql().is_err(), "a NUL surfaces");
+    let raw = Expr::raw("lower(email) = $1", crate::params!["x"]);
+    assert_eq!(raw.to_sql().unwrap(), "lower(email) = 'x'");
+    let update = Account::query()
+        .filter(Account::id.eq(1i64))
+        .update()
+        .set(Account::status, Status::Active)
+        .set_raw(Account::position, "\"order\" + $1", crate::params![1]);
+    assert_eq!(
+        update.to_sql().unwrap(),
+        "UPDATE accounts SET status = 'active', \"order\" = \"order\" + 1 WHERE id = 1 \
+         RETURNING id, email, name, balance::text, tags::text, \"order\", status"
+    );
+    assert!(Account::query().update().set(Account::position, 1).to_sql().is_err(), "no filter");
+    assert!(Account::query().every_row().update().set(Account::position, 1).to_sql().is_ok());
+    assert!(Account::query().filter(Account::id.eq(1i64)).limit(1).update().set(Account::position, 1).to_sql().is_err());
+}
+
+/// A row as the server would send it for `select_list::<Account>()`.
+fn wire_row(cells: &[(u8, &[u8])]) -> Rows {
+    let mut payload = Vec::new();
+    for (t, d) in cells {
+        payload.extend_from_slice(&(d.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(d);
+        payload.push(*t);
+    }
+    let mut data = (payload.len() as u32).to_le_bytes().to_vec();
+    data.extend(payload);
+    Rows::decode(data).unwrap()
+}
+
+#[test]
+fn rows_read_into_the_struct() {
+    use crate::tag;
+    let rows = wire_row(&[
+        (tag::I64, &5i64.to_le_bytes()),
+        (tag::STRING, b"a@b.c"),
+        (tag::NULL, b""),
+        (tag::STRING, b"12.30"),
+        (tag::STRING, b"{x,\"y z\"}"),
+        (tag::I32, &4i32.to_le_bytes()),
+        (tag::STRING, b"active"),
+    ]);
+    let row: Row<'_> = rows.get(0).unwrap();
+    let a: Account = row.decode().unwrap();
+    assert_eq!(
+        a,
+        Account {
+            id: 5,
+            email: "a@b.c".into(),
+            name: None,
+            balance: Numeric::new("12.30").unwrap(),
+            tags: vec!["x".into(), "y z".into()],
+            position: 4,
+            status: Status::Active,
+            cached: None,
+        }
+    );
+    let short = wire_row(&[(tag::I64, &5i64.to_le_bytes())]);
+    assert!(short.get(0).unwrap().decode::<Account>().is_err(), "a drifted select list fails");
+    let bad_enum = wire_row(&[(tag::STRING, b"gone")]);
+    assert!(bad_enum.get(0).unwrap().get::<Status>(0).is_err());
+    let _ = Timestamp::now();
+}

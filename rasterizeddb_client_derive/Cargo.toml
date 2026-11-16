@@ -1,0 +1,13 @@
+[package]
+name = "rasterizeddb_client_derive"
+version = "0.2.0"
+edition = "2024"
+description = "#[derive(Model)], #[derive(FromRow)] and #[derive(SqlEnum)] for rasterizeddb_client"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

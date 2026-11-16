@@ -4,6 +4,7 @@ use rastcp::error::RastcpError;
 
 /// Everything a call can fail with.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// The connection failed: it could not be opened, it closed, or the answer
     /// did not come within the timeout. The statement may or may not have
@@ -20,6 +21,13 @@ pub enum Error {
     Param(String),
     /// A column could not be read as the type asked for.
     Column { index: usize, message: String },
+    /// Refused before anything was sent: a statement the native protocol
+    /// cannot run as written (a second statement in one text, transaction
+    /// control), or an operation the model or argument does not allow.
+    Unsupported(String),
+    /// A statement expected to return exactly one row, or at most one,
+    /// returned some other number of rows.
+    RowCount { expected: &'static str, got: usize },
 }
 
 impl Error {
@@ -35,6 +43,29 @@ impl Error {
     pub fn is_transport(&self) -> bool {
         matches!(self, Error::Transport(_))
     }
+
+    /// The server's message, when the server refused the statement.
+    pub fn server_message(&self) -> Option<&str> {
+        match self {
+            Error::Server(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    /// Whether the server refused a write for breaking a unique or primary
+    /// key. The native protocol carries no SQLSTATE, so this reads the
+    /// server's message.
+    pub fn is_unique_violation(&self) -> bool {
+        self.server_message().is_some_and(|m| {
+            let m = m.to_ascii_lowercase();
+            m.contains("duplicate") && (m.contains("unique") || m.contains("primary key"))
+        })
+    }
+
+    /// Whether a `fetch_one` found no row.
+    pub fn is_no_rows(&self) -> bool {
+        matches!(self, Error::RowCount { got: 0, .. })
+    }
 }
 
 impl fmt::Display for Error {
@@ -45,6 +76,10 @@ impl fmt::Display for Error {
             Error::Protocol(message) => write!(f, "protocol: {message}"),
             Error::Param(message) => write!(f, "parameter: {message}"),
             Error::Column { index, message } => write!(f, "column {index}: {message}"),
+            Error::Unsupported(message) => write!(f, "unsupported: {message}"),
+            Error::RowCount { expected, got } => {
+                write!(f, "expected {expected} row(s), the statement returned {got}")
+            }
         }
     }
 }
