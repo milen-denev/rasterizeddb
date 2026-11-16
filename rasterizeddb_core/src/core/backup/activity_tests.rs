@@ -14,12 +14,12 @@ use crate::core::database::Database;
 use crate::core::rql::executor::execute;
 use crate::core::rql::lexer_s1::recognize_query_purpose;
 
-fn init_globals() {
+pub(super) fn init_globals() {
     let _ = crate::MAX_PERMITS_THREADS.set(4);
     let _ = crate::BATCH_SIZE.set(1024);
 }
 
-fn config(s3: &fake_s3::FakeS3, snapshot_interval_secs: u64) -> BackupConfig {
+pub(super) fn config(s3: &fake_s3::FakeS3, snapshot_interval_secs: u64) -> BackupConfig {
     BackupConfig {
         bucket: "rdbtest".to_string(),
         prefix: format!("activity/{:016x}", fastrand::u64(..)),
@@ -48,11 +48,11 @@ fn config(s3: &fake_s3::FakeS3, snapshot_interval_secs: u64) -> BackupConfig {
     }
 }
 
-fn path_str(p: &Path) -> String {
+pub(super) fn path_str(p: &Path) -> String {
     p.to_str().unwrap().to_string()
 }
 
-async fn ok(db: &Arc<Database>, sql: &str) {
+pub(super) async fn ok(db: &Arc<Database>, sql: &str) {
     let purpose = recognize_query_purpose(sql).unwrap_or_else(|| panic!("unrecognised: {sql}"));
     let response = execute(purpose, db.clone()).await;
     assert_ne!(

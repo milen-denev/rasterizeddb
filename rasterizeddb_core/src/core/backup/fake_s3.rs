@@ -29,6 +29,10 @@ pub struct Store {
     /// bucket whose policy stopped allowing this server would. Reads still
     /// work. For a server of a test's own ([`start`]), never [`shared`].
     pub refuse_writes: bool,
+    /// Answer writes to a key containing this text with 403, and only those:
+    /// one object of a flush failing while the rest, and the catalogue, go
+    /// through.
+    pub refuse_writes_containing: Option<String>,
 }
 
 pub struct FakeS3 {
@@ -245,7 +249,11 @@ fn handle(
 
     let mut store = store.lock();
     store.requests += 1;
-    if store.refuse_writes && method != "GET" && method != "HEAD" {
+    let refused_key = store
+        .refuse_writes_containing
+        .as_deref()
+        .is_some_and(|needle| key.contains(needle));
+    if (store.refuse_writes || refused_key) && method != "GET" && method != "HEAD" {
         return Reply::new(403, "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>");
     }
 

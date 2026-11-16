@@ -84,6 +84,8 @@ use tokio::sync::{RwLock, Semaphore};
 pub mod activity;
 #[cfg(all(test, feature = "s3_backup"))]
 mod activity_tests;
+#[cfg(all(test, feature = "s3_backup"))]
+mod staging_ceiling_tests;
 pub mod archive;
 pub mod cold;
 pub mod manifest;
@@ -1891,6 +1893,10 @@ impl BackupService {
         let _one_at_a_time = self.archive_lock.lock().await;
         let attempt = self.activity.begin(activity::Operation::WalFlush);
         let result = self.flush_staged_segments_locked().await;
+        // After every flush, failed or not. A failed one is the case the
+        // ceiling exists for: checked only on success, a bucket that kept
+        // refusing filled the disk instead of suspending archiving.
+        self.enforce_staging_ceiling();
         attempt.finish(&result, |report| {
             if report.bundles == 0 {
                 "nothing staged".to_string()
@@ -1928,96 +1934,116 @@ impl BackupService {
         // Never across logs, though: each database's records name files by an
         // id derived from a table name, so two databases' streams cannot be
         // told apart once concatenated. One bundle belongs to exactly one.
-        for (database, paths) in staged {
-            for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
-                // Opened first and sized from the handles, so the body is
-                // allocated once at its final size rather than regrown per
-                // segment. A staged segment is never appended to, so the sum
-                // is exact; `read_to_end` still copes if it were not.
-                let mut files = Vec::with_capacity(group.len());
-                let mut total = 0usize;
-                for path in &group {
-                    let file = std::fs::File::open(path)?;
-                    total += file.metadata()?.len() as usize;
-                    files.push(file);
-                }
-                let mut body = Vec::with_capacity(total);
-                for mut file in files {
-                    file.read_to_end(&mut body)?;
-                }
+        // Each bundle's staged files are deleted once it is in S3, so a
+        // failure part-way leaves the bundles before it reachable only
+        // through the catalogue: publish it before reporting the failure, or
+        // a crash before the next flush loses them from every restore.
+        let uploaded: io::Result<()> = async {
+            for (database, paths) in staged {
+                for group in group_by_size(&paths, self.config.wal_bundle_bytes)? {
+                    // Opened first and sized from the handles, so the body is
+                    // allocated once at its final size rather than regrown per
+                    // segment. A staged segment is never appended to, so the sum
+                    // is exact; `read_to_end` still copes if it were not.
+                    let mut files = Vec::with_capacity(group.len());
+                    let mut total = 0usize;
+                    for path in &group {
+                        let file = std::fs::File::open(path)?;
+                        total += file.metadata()?.len() as usize;
+                        files.push(file);
+                    }
+                    let mut body = Vec::with_capacity(total);
+                    for mut file in files {
+                        file.read_to_end(&mut body)?;
+                    }
 
-                let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
-                let uncompressed = body.len() as u64;
-                let files = self.file_names_in(&database, &body);
+                    let (first_lsn, last_lsn, commits) = crate::core::wal::scan_commit_range(&body);
+                    let uncompressed = body.len() as u64;
+                    let files = self.file_names_in(&database, &body);
 
-                let sequence = self.next_segment_sequence().await;
-                // The root's bundles keep the flat layout an older build wrote, so
-                // its catalogue entries and objects line up across the upgrade.
-                let key = self.config.key(&if database.is_empty() {
-                    format!("wal/{sequence:016x}-{first_lsn:016x}.wseg.zst")
-                } else {
-                    format!("wal/{database}/{sequence:016x}-{first_lsn:016x}.wseg.zst")
-                });
+                    let sequence = self.next_segment_sequence().await;
+                    // The root's bundles keep the flat layout an older build wrote, so
+                    // its catalogue entries and objects line up across the upgrade.
+                    let key = self.config.key(&if database.is_empty() {
+                        format!("wal/{sequence:016x}-{first_lsn:016x}.wseg.zst")
+                    } else {
+                        format!("wal/{database}/{sequence:016x}-{first_lsn:016x}.wseg.zst")
+                    });
 
-                let level = self.config.segment_level;
-                let threads = self.compression_threads();
-                let long_range = self.config.long_range;
-                let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
-                    compress_bundle(&body, level, threads, long_range)
-                })
-                .await
-                .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
+                    let level = self.config.segment_level;
+                    let threads = self.compression_threads();
+                    let long_range = self.config.long_range;
+                    let compressed = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+                        compress_bundle(&body, level, threads, long_range)
+                    })
+                    .await
+                    .map_err(|e| io::Error::other(format!("segment compressor panicked: {e}")))??;
 
-                let compressed_bytes = compressed.len() as u64;
-                self.client.put_object(&key, &compressed).await?;
+                    let compressed_bytes = compressed.len() as u64;
+                    self.client.put_object(&key, &compressed).await?;
 
-                {
-                    let mut manifest = self.manifest.lock().await;
-                    manifest.record_segment(SegmentEntry {
-                        sequence,
-                        database: database.clone(),
-                        key,
-                        archived_at: timeutil::now_unix(),
+                    {
+                        let mut manifest = self.manifest.lock().await;
+                        manifest.record_segment(SegmentEntry {
+                            sequence,
+                            database: database.clone(),
+                            key,
+                            archived_at: timeutil::now_unix(),
+                            first_lsn,
+                            last_lsn,
+                            compressed_bytes,
+                            uncompressed_bytes: uncompressed,
+                            segment_count: group.len() as u32,
+                            files,
+                        });
+                    }
+
+                    report.bundles += 1;
+                    report.segments += group.len() as u32;
+                    report.uncompressed_bytes += uncompressed;
+                    report.compressed_bytes += compressed_bytes;
+                    if first_lsn != 0 && (report.first_lsn == 0 || first_lsn < report.first_lsn) {
+                        report.first_lsn = first_lsn;
+                    }
+                    report.last_lsn = report.last_lsn.max(last_lsn);
+
+                    debug!(
+                        "Archived {} segments of {} ({} commits, LSN {}..{}) as {} bytes",
+                        group.len(),
+                        if database.is_empty() {
+                            "the default database"
+                        } else {
+                            database.as_str()
+                        },
+                        commits,
                         first_lsn,
                         last_lsn,
-                        compressed_bytes,
-                        uncompressed_bytes: uncompressed,
-                        segment_count: group.len() as u32,
-                        files,
-                    });
-                }
+                        compressed_bytes
+                    );
 
-                report.bundles += 1;
-                report.segments += group.len() as u32;
-                report.uncompressed_bytes += uncompressed;
-                report.compressed_bytes += compressed_bytes;
-                if first_lsn != 0 && (report.first_lsn == 0 || first_lsn < report.first_lsn) {
-                    report.first_lsn = first_lsn;
-                }
-                report.last_lsn = report.last_lsn.max(last_lsn);
-
-                debug!(
-                    "Archived {} segments of {} ({} commits, LSN {}..{}) as {} bytes",
-                    group.len(),
-                    if database.is_empty() {
-                        "the default database"
-                    } else {
-                        database.as_str()
-                    },
-                    commits,
-                    first_lsn,
-                    last_lsn,
-                    compressed_bytes
-                );
-
-                // Only once the bundle is durably in S3. Deleting first and failing
-                // the upload would lose the records outright.
-                for path in &group {
-                    if let Err(e) = std::fs::remove_file(path) {
-                        warn!("Could not remove staged segment {}: {}", path.display(), e);
+                    // Only once the bundle is durably in S3. Deleting first and failing
+                    // the upload would lose the records outright.
+                    for path in &group {
+                        if let Err(e) = std::fs::remove_file(path) {
+                            warn!("Could not remove staged segment {}: {}", path.display(), e);
+                        }
                     }
                 }
             }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = uploaded {
+            if report.bundles > 0
+                && let Err(publish) = self.publish_manifest().await
+            {
+                warn!(
+                    "{} log bundle(s) were archived before a failure, and the catalogue listing \
+                     them could not be published: {publish}",
+                    report.bundles
+                );
+            }
+            return Err(e);
         }
 
         // Only now: every bundle holding records through the cut is recorded.
@@ -2025,10 +2051,6 @@ impl BackupService {
             Some(lsns) => self.record_cut(lsns, &staged_names).await,
             None => false,
         };
-
-        // Checked after every flush, successful or not: this is the only place
-        // that observes whether uploads are keeping up with checkpoints.
-        self.enforce_staging_ceiling();
 
         if report.bundles > 0 || recorded {
             self.publish_manifest().await?;
@@ -2504,7 +2526,11 @@ impl BackupService {
         // Staged bytes can cross the bundle threshold well before the interval
         // does on a write-heavy database. Checking often and uploading rarely
         // keeps the staging directory bounded without adding requests.
-        if self.config.wal_bundle_bytes > 0 {
+        //
+        // The same tick watches the ceiling, so it runs whenever there is one:
+        // with no bundle trigger and no flush interval nothing else checks it,
+        // and checkpoints go on staging regardless.
+        if self.config.wal_bundle_bytes > 0 || self.config.staging_max_bytes > 0 {
             let service = self.clone();
             tokio::spawn(async move {
                 loop {
@@ -2513,14 +2539,17 @@ impl BackupService {
                         return;
                     }
                     let staged = service.staged_bytes();
-                    if staged >= service.config.wal_bundle_bytes {
+                    let bundle = service.config.wal_bundle_bytes;
+                    if bundle > 0 && staged >= bundle {
                         if let Err(e) = service.flush_staged_segments().await {
                             error!("Log archive flush failed: {e}");
                         }
                     } else {
-                        // A flush would have done this on its way out; without
-                        // it a suspended service that has drained would stay
-                        // suspended until the next bundle-sized burst.
+                        // No flush this tick, so the ceiling is checked here:
+                        // to suspend a staging directory growing with nothing
+                        // uploading it, and to resume one that has drained,
+                        // which would otherwise stay suspended until the next
+                        // bundle-sized burst.
                         service.enforce_staging_ceiling();
                     }
                 }

@@ -400,6 +400,21 @@ retroactively.
 Losing point-in-time coverage is bad. Taking the database down to preserve it
 is worse.
 
+The ceiling is checked after every flush, failed or not, and by a 10-second
+tick whenever a ceiling is set, with or without a bundle trigger. Until
+2026-11-16 it was checked only after a flush that *succeeded*. The tick also
+checked it only while staging was below the bundle size, because above it the
+tick just retried the flush. So the one case it exists for, a bucket that keeps
+refusing, never suspended anything, and staging grew until the disk filled.
+`SHOW BACKUP STATUS` reports `staged_bytes` against the ceiling, along with
+`archiving_suspended` and `last_error`.
+
+A flush that fails part-way publishes the catalogue before it reports the
+failure. Each bundle's staged files are deleted as soon as it is in S3, and a
+restore finds bundles only through the catalogue. An unpublished catalogue
+would leave the bundles uploaded before the failure out of every restore if
+the server crashed before the next flush succeeded.
+
 ### 10.7 A snapshot is only recorded once its log is archived
 
 `Wal::checkpoint` returns `Ok(())` when it *declines* to run: a transaction
