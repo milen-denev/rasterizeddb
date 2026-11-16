@@ -183,6 +183,21 @@ pub struct BackupArgs {
     #[arg(long = "s3-backup-now", default_value_t = false)]
     pub backup_now: bool,
 
+    /// Start even when the bucket does not answer, instead of refusing to.
+    ///
+    /// Without it, a bucket that cannot be reached at boot stops the server
+    /// ("could not start backups"), so an S3 outage during a reboot keeps the
+    /// database down. With it, the server starts, holds the log in its
+    /// staging directory (under --s3-staging-max-mb), uploads nothing, and
+    /// reads the catalogue in the background until the bucket answers; then
+    /// the held log is uploaded and the schedules start. SHOW BACKUP STATUS
+    /// reports `catalogue = unreachable` meanwhile.
+    ///
+    /// A bucket that answers with another database's backups still refuses
+    /// the start: that is a misconfiguration, not an outage.
+    #[arg(long = "s3-start-offline", default_value_t = false)]
+    pub start_offline: bool,
+
     // ---- restore ----------------------------------------------------------
     /// Restore from S3 before opening any table, replacing the database at
     /// --location.

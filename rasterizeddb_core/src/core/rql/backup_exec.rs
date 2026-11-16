@@ -105,7 +105,20 @@ pub async fn execute(statement: BackupStatement) -> Vec<u8> {
 
         BackupStatement::Show => match require_service() {
             Err(response) => response,
-            Ok(service) => rows(show_rows(&service).await),
+            // The catalogue a start without the bucket runs on is an empty
+            // placeholder; listing it would read as "no backups exist".
+            Ok(service) => match service.catalogue_state() {
+                backup::CatalogueState::Loaded => rows(show_rows(&service).await),
+                _ => failure(&format!(
+                    "SHOW BACKUPS cannot list the catalogue: it has not been read from the bucket \
+                     ({}). SHOW BACKUP STATUS says why.",
+                    match service.catalogue_state() {
+                        backup::CatalogueState::Refused { reason, .. } => reason,
+                        backup::CatalogueState::Unreachable { last_error, .. } => last_error,
+                        backup::CatalogueState::Loaded => String::new(),
+                    }
+                )),
+            },
         },
 
         BackupStatement::Restore { target_dir, target } => match require_service() {

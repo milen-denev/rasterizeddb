@@ -86,6 +86,8 @@ pub mod activity;
 mod activity_tests;
 #[cfg(all(test, feature = "s3_backup"))]
 mod staging_ceiling_tests;
+#[cfg(all(test, feature = "s3_backup"))]
+mod offline_start_tests;
 pub mod archive;
 pub mod cold;
 pub mod manifest;
@@ -399,6 +401,50 @@ pub struct ArchiveReport {
     pub last_lsn: u64,
 }
 
+/// Whether the service has read its catalogue from the bucket.
+///
+/// A server started with `--s3-start-offline` while the bucket did not answer
+/// runs on a placeholder until it does. Until then every S3 write is refused:
+/// the first publish would replace the real catalogue — every snapshot and
+/// bundle it lists — with the empty placeholder. Checkpoints still stage the
+/// log, under the staging ceiling, so nothing written meanwhile is lost to
+/// the archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogueState {
+    Loaded,
+    /// Not reached yet; retried in the background.
+    Unreachable {
+        since: u64,
+        attempts: u32,
+        last_error: String,
+    },
+    /// The bucket answered with a catalogue this server must not write over
+    /// (another instance's, or one it cannot read). Not retried: it takes an
+    /// operator, as it would have refused the start.
+    Refused { at: u64, reason: String },
+}
+
+/// Why the catalogue could not be read.
+enum CatalogueError {
+    /// The bucket did not answer, or answered with an error: worth retrying.
+    Unreachable(io::Error),
+    /// It answered with something this server must not write over.
+    Refused(io::Error),
+}
+
+/// First wait before retrying a catalogue the start could not reach, and the
+/// slowest it backs off to.
+const CATALOGUE_RETRY_START: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
+const CATALOGUE_RETRY_CEILING: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(300)
+};
+
 pub struct BackupService {
     config: BackupConfig,
     client: Arc<S3Client>,
@@ -430,6 +476,8 @@ pub struct BackupService {
     /// The last attempt of each operation and the next scheduled one, for
     /// `SHOW BACKUP STATUS`; see [`activity`].
     activity: activity::ActivityLog,
+    /// See [`CatalogueState`].
+    catalogue: std::sync::Mutex<CatalogueState>,
 }
 
 impl BackupService {
@@ -439,6 +487,22 @@ impl BackupService {
     /// Returns an error rather than degrading: an operator who asked for
     /// backups and silently got none is worse off than one who fails to start.
     pub async fn connect(config: BackupConfig, location: &str) -> io::Result<Arc<Self>> {
+        Self::open(config, location, false).await
+    }
+
+    /// [`Self::connect`], except that a bucket which does not answer does not
+    /// stop the start (`--s3-start-offline`). The service then stages the log
+    /// locally, refuses every S3 write, and reads the catalogue in the
+    /// background ([`Self::spawn_background`]) until the bucket answers.
+    ///
+    /// A bucket that answers with another instance's catalogue, or one this
+    /// build cannot read, still fails: that is a misconfiguration, not an
+    /// outage, and waiting would not end it.
+    pub async fn connect_waiting(config: BackupConfig, location: &str) -> io::Result<Arc<Self>> {
+        Self::open(config, location, true).await
+    }
+
+    async fn open(config: BackupConfig, location: &str, wait_for_bucket: bool) -> io::Result<Arc<Self>> {
         if location.is_empty() {
             return Err(io::Error::other(
                 "backup needs a file-backed database; an in-memory one has nothing to snapshot",
@@ -459,35 +523,31 @@ impl BackupService {
         // One GET tells us whether this prefix is already in use and, if so, by
         // whom. Two servers sharing a prefix would overwrite each other's
         // catalogue and leave both unrestorable.
-        let manifest_key = config.key(manifest::MANIFEST_KEY);
-        let manifest = match client.get_object(&manifest_key).await {
-            Ok(bytes) => {
-                let existing = Manifest::decode(&bytes)?;
-                if existing.instance_id != instance_id {
-                    return Err(io::Error::other(format!(
-                        "s3://{}/{} already holds backups for instance {}, but this database is {}. \
-                         Point --s3-prefix somewhere else, or restore from that prefix instead.",
-                        config.bucket, manifest_key, existing.instance_id, instance_id
-                    )));
-                }
-                info!(
-                    "Backup catalogue found at s3://{}/{}: {} snapshots, {} segment bundles",
+        let (manifest, state) = match read_catalogue(&client, &config, &instance_id).await {
+            Ok(manifest) => (manifest, CatalogueState::Loaded),
+            Err(CatalogueError::Unreachable(e)) if wait_for_bucket => {
+                // `error!`: the server's default level, and backups not
+                // running is what an operator has to see at it.
+                error!(
+                    "The backup catalogue at s3://{}/{} could not be read ({e}). Starting anyway \
+                     (--s3-start-offline): the log is held in {} and nothing is uploaded until \
+                     the bucket answers; retrying in the background.",
                     config.bucket,
-                    manifest_key,
-                    existing.snapshots.len(),
-                    existing.segments.len()
+                    config.key(manifest::MANIFEST_KEY),
+                    Path::new(location).join(STAGING_DIR).display()
                 );
-                existing
+                (
+                    Manifest::new(instance_id.clone()),
+                    CatalogueState::Unreachable {
+                        since: timeutil::now_unix(),
+                        attempts: 1,
+                        last_error: e.to_string(),
+                    },
+                )
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                info!(
-                    "No backup catalogue at s3://{}/{}; starting a new one for instance {}",
-                    config.bucket, manifest_key, instance_id
-                );
-                Manifest::new(instance_id.clone())
-            }
-            Err(e) => return Err(e),
+            Err(CatalogueError::Unreachable(e) | CatalogueError::Refused(e)) => return Err(e),
         };
+        let loaded = state == CatalogueState::Loaded;
 
         let service = Arc::new(Self {
             config,
@@ -501,7 +561,14 @@ impl BackupService {
             archiving_suspended: AtomicBool::new(false).into(),
             attached: std::sync::Mutex::new(Vec::new()),
             activity: Default::default(),
+            catalogue: std::sync::Mutex::new(state.clone()),
         });
+        if let CatalogueState::Unreachable { last_error, .. } = &state {
+            service
+                .activity
+                .begin(activity::Operation::Catalogue)
+                .finish(&Err::<(), _>(io::Error::other(last_error.clone())), |_| String::new());
+        }
 
         // Sweep first, then hook, and the order is load-bearing rather than
         // stylistic. `DatabaseCatalog::open` installs the log of every existing
@@ -522,8 +589,148 @@ impl BackupService {
                 service.attach_new_log(dir, wal);
             }
         });
-        service.abandon_orphaned_uploads().await;
+        if loaded {
+            service.abandon_orphaned_uploads().await;
+        }
         Ok(service)
+    }
+
+    /// Where the catalogue stands; see [`CatalogueState`].
+    pub fn catalogue_state(&self) -> CatalogueState {
+        self.catalogue.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `Ok` once the catalogue is loaded; otherwise why nothing may be written
+    /// to the bucket yet.
+    fn require_catalogue(&self) -> io::Result<()> {
+        match self.catalogue_state() {
+            CatalogueState::Loaded => Ok(()),
+            CatalogueState::Unreachable {
+                since,
+                attempts,
+                last_error,
+            } => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!(
+                    "the backup catalogue at s3://{}/{} has not been read since this server started \
+                     at {} ({} attempt(s); last: {}). The log is held in {} and uploads start once \
+                     the bucket answers.",
+                    self.config.bucket,
+                    self.config.key(manifest::MANIFEST_KEY),
+                    timeutil::format_rfc3339(since),
+                    attempts,
+                    last_error,
+                    self.staging_dir().display()
+                ),
+            )),
+            CatalogueState::Refused { reason, .. } => Err(io::Error::other(format!(
+                "backups are stopped: {reason}"
+            ))),
+        }
+    }
+
+    /// One attempt at reading the catalogue the start could not reach.
+    /// `true` when there is nothing left to retry: loaded, or refused for good.
+    async fn retry_catalogue(self: &Arc<Self>) -> bool {
+        let attempt = self.activity.begin(activity::Operation::Catalogue);
+        let outcome = read_catalogue(&self.client, &self.config, &self.instance_id).await;
+        let mut state = self.catalogue.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(manifest) => {
+                // Nothing wrote to the placeholder: every path that records a
+                // snapshot or a bundle is behind `require_catalogue`.
+                let (snapshots, segments) = (manifest.snapshots.len(), manifest.segments.len());
+                // `try_lock`: nothing else takes it while the catalogue is
+                // unloaded, and a std lock is held here.
+                match self.manifest.try_lock() {
+                    Ok(mut current) => *current = manifest,
+                    Err(_) => {
+                        drop(state);
+                        attempt.finish(
+                            &Err::<(), _>(io::Error::other("the catalogue was busy; retrying")),
+                            |_| String::new(),
+                        );
+                        return false;
+                    }
+                }
+                *state = CatalogueState::Loaded;
+                drop(state);
+                info!(
+                    "Backup catalogue read at s3://{}/{} ({snapshots} snapshots, {segments} bundles); \
+                     uploads start now",
+                    self.config.bucket,
+                    self.config.key(manifest::MANIFEST_KEY)
+                );
+                attempt.finish(&Ok::<(), io::Error>(()), |_| {
+                    format!("{snapshots} snapshot(s), {segments} bundle(s)")
+                });
+                true
+            }
+            Err(CatalogueError::Unreachable(e)) => {
+                if let CatalogueState::Unreachable {
+                    attempts,
+                    last_error,
+                    ..
+                } = &mut *state
+                {
+                    *attempts += 1;
+                    *last_error = e.to_string();
+                }
+                drop(state);
+                debug!("The backup catalogue is still unreachable: {e}");
+                attempt.finish(&Err::<(), _>(e), |_| String::new());
+                false
+            }
+            Err(CatalogueError::Refused(e)) => {
+                *state = CatalogueState::Refused {
+                    at: timeutil::now_unix(),
+                    reason: e.to_string(),
+                };
+                drop(state);
+                error!(
+                    "The bucket answered, and backups are STOPPED: {e}. The log stays in staging \
+                     until the ceiling suspends archiving. Fix the prefix and restart."
+                );
+                attempt.finish(&Err::<(), _>(e), |_| String::new());
+                true
+            }
+        }
+    }
+
+    /// Reads the catalogue until it loads, watching the staging ceiling
+    /// meanwhile, then starts the schedules.
+    fn spawn_catalogue_retry(self: &Arc<Self>) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let mut wait = CATALOGUE_RETRY_START;
+            loop {
+                service.activity.schedule(activity::Operation::Catalogue, next_after(wait));
+                // In short steps, so the ceiling is checked while waiting:
+                // checkpoints stage the log the whole time.
+                let until = std::time::Instant::now() + wait;
+                loop {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(left.min(Duration::from_secs(10))).await;
+                    if service.shutting_down.load(Ordering::Acquire) {
+                        return;
+                    }
+                    service.enforce_staging_ceiling();
+                }
+                service.activity.schedule(activity::Operation::Catalogue, activity::Next::Now);
+                if service.retry_catalogue().await {
+                    service.activity.schedule(activity::Operation::Catalogue, activity::Next::NotScheduled);
+                    if service.catalogue_state() == CatalogueState::Loaded {
+                        service.abandon_orphaned_uploads().await;
+                        service.spawn_schedules();
+                    }
+                    return;
+                }
+                wait = (wait * 2).min(CATALOGUE_RETRY_CEILING);
+            }
+        });
     }
 
     /// Aborts multipart uploads left behind by a previous run.
@@ -884,6 +1091,7 @@ impl BackupService {
     /// result depends on no older object — what a rollover needs before it
     /// deletes every older generation.
     async fn take_snapshot(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
+        self.require_catalogue()?;
         let _one_at_a_time = self.snapshot_lock.lock().await;
         let attempt = self.activity.begin(activity::Operation::Snapshot);
         let result = self.take_snapshot_locked(full).await;
@@ -1890,6 +2098,11 @@ impl BackupService {
     /// location's log still held, and a restore came back with a later commit
     /// and without an earlier one.
     async fn flush_staged_segments(self: &Arc<Self>) -> io::Result<ArchiveReport> {
+        if let Err(e) = self.require_catalogue() {
+            // Staging goes on growing while nothing may be uploaded.
+            self.enforce_staging_ceiling();
+            return Err(e);
+        }
         let _one_at_a_time = self.archive_lock.lock().await;
         let attempt = self.activity.begin(activity::Operation::WalFlush);
         let result = self.flush_staged_segments_locked().await;
@@ -2238,6 +2451,9 @@ impl BackupService {
     // ---- catalogue ---------------------------------------------------------
 
     async fn publish_manifest(&self) -> io::Result<()> {
+        // The last line of defence: publishing the placeholder would replace
+        // every snapshot and bundle the real catalogue lists.
+        self.require_catalogue()?;
         let (key, body) = {
             let mut manifest = self.manifest.lock().await;
             manifest.updated_at = timeutil::now_unix();
@@ -2267,6 +2483,7 @@ impl BackupService {
     /// without the configured retention having to say so — the two are separate
     /// policies over the same mechanism.
     pub async fn prune_keeping(self: &Arc<Self>, keep: usize) -> io::Result<u32> {
+        self.require_catalogue()?;
         if keep == 0 {
             return Ok(0);
         }
@@ -2383,6 +2600,15 @@ impl BackupService {
     /// done, not from the moment this process started — see [`first_delay`] for
     /// what that fixes.
     pub fn spawn_background(self: &Arc<Self>) {
+        if self.catalogue_state() == CatalogueState::Loaded {
+            self.spawn_schedules();
+        } else {
+            self.spawn_catalogue_retry();
+        }
+    }
+
+    /// The schedules themselves, once the catalogue is loaded.
+    fn spawn_schedules(self: &Arc<Self>) {
         if self.config.wal_flush_secs > 0 {
             let service = self.clone();
             let interval = Duration::from_secs(service.config.wal_flush_secs);
@@ -2850,6 +3076,52 @@ pub async fn install(config: BackupConfig, location: &str) -> io::Result<Arc<Bac
     service.spawn_background();
     let _ = SERVICE.set(service.clone());
     Ok(service)
+}
+
+/// [`install`] for `--s3-start-offline`: a bucket that does not answer does
+/// not stop the start; see [`BackupService::connect_waiting`].
+pub async fn install_waiting(config: BackupConfig, location: &str) -> io::Result<Arc<BackupService>> {
+    let service = BackupService::connect_waiting(config, location).await?;
+    service.spawn_background();
+    let _ = SERVICE.set(service.clone());
+    Ok(service)
+}
+
+/// Reads the catalogue at the prefix, or a new one when there is none.
+async fn read_catalogue(
+    client: &S3Client,
+    config: &BackupConfig,
+    instance_id: &str,
+) -> Result<Manifest, CatalogueError> {
+    let manifest_key = config.key(manifest::MANIFEST_KEY);
+    match client.get_object(&manifest_key).await {
+        Ok(bytes) => {
+            let existing = Manifest::decode(&bytes).map_err(CatalogueError::Refused)?;
+            if existing.instance_id != instance_id {
+                return Err(CatalogueError::Refused(io::Error::other(format!(
+                    "s3://{}/{} already holds backups for instance {}, but this database is {}. \
+                     Point --s3-prefix somewhere else, or restore from that prefix instead.",
+                    config.bucket, manifest_key, existing.instance_id, instance_id
+                ))));
+            }
+            info!(
+                "Backup catalogue found at s3://{}/{}: {} snapshots, {} segment bundles",
+                config.bucket,
+                manifest_key,
+                existing.snapshots.len(),
+                existing.segments.len()
+            );
+            Ok(existing)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            info!(
+                "No backup catalogue at s3://{}/{}; starting a new one for instance {}",
+                config.bucket, manifest_key, instance_id
+            );
+            Ok(Manifest::new(instance_id.to_string()))
+        }
+        Err(e) => Err(CatalogueError::Unreachable(e)),
+    }
 }
 
 /// Restores from a prefix without a running service, for the CLI's pre-open
@@ -3578,6 +3850,7 @@ mod tests {
             archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
             attached: std::sync::Mutex::new(Vec::new()),
             activity: Default::default(),
+            catalogue: std::sync::Mutex::new(CatalogueState::Loaded),
         });
         service.attach_to_logs().unwrap();
 
@@ -3646,6 +3919,7 @@ mod tests {
             archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
             attached: std::sync::Mutex::new(Vec::new()),
             activity: Default::default(),
+            catalogue: std::sync::Mutex::new(CatalogueState::Loaded),
         })
     }
 

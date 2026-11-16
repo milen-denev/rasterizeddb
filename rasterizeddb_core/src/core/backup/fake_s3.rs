@@ -33,6 +33,8 @@ pub struct Store {
     /// one object of a flush failing while the rest, and the catalogue, go
     /// through.
     pub refuse_writes_containing: Option<String>,
+    /// Answer every request, reads included, with 503: an outage.
+    pub unavailable: bool,
 }
 
 pub struct FakeS3 {
@@ -249,6 +251,9 @@ fn handle(
 
     let mut store = store.lock();
     store.requests += 1;
+    if store.unavailable {
+        return Reply::new(503, "<Error><Code>ServiceUnavailable</Code></Error>");
+    }
     let refused_key = store
         .refuse_writes_containing
         .as_deref()

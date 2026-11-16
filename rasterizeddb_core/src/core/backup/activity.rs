@@ -26,6 +26,9 @@ pub enum Operation {
     WalFlush,
     /// A rollover: a full snapshot, then deleting every earlier generation.
     Rollover,
+    /// Reading the catalogue from the bucket, retried in the background when
+    /// the server started without reaching it (`--s3-start-offline`).
+    Catalogue,
 }
 
 impl Operation {
@@ -34,6 +37,7 @@ impl Operation {
             Operation::Snapshot => "snapshot",
             Operation::WalFlush => "wal_flush",
             Operation::Rollover => "rollover",
+            Operation::Catalogue => "catalogue_load",
         }
     }
 }
@@ -73,10 +77,12 @@ pub struct Activity {
     pub snapshot: Option<Attempt>,
     pub wal_flush: Option<Attempt>,
     pub rollover: Option<Attempt>,
+    pub catalogue: Option<Attempt>,
     pub last_error: Option<Failure>,
     pub next_snapshot: Next,
     pub next_wal_flush: Next,
     pub next_rollover: Next,
+    pub next_catalogue: Next,
     /// Why the next snapshot is when it is, when that is not the interval:
     /// the base snapshot is being retried after a failure.
     pub next_snapshot_reason: Option<String>,
@@ -88,6 +94,7 @@ impl Activity {
             Operation::Snapshot => self.snapshot.as_ref(),
             Operation::WalFlush => self.wal_flush.as_ref(),
             Operation::Rollover => self.rollover.as_ref(),
+            Operation::Catalogue => self.catalogue.as_ref(),
         }
     }
 
@@ -96,6 +103,7 @@ impl Activity {
             Operation::Snapshot => &mut self.snapshot,
             Operation::WalFlush => &mut self.wal_flush,
             Operation::Rollover => &mut self.rollover,
+            Operation::Catalogue => &mut self.catalogue,
         }
     }
 
@@ -104,6 +112,7 @@ impl Activity {
             Operation::Snapshot => self.next_snapshot,
             Operation::WalFlush => self.next_wal_flush,
             Operation::Rollover => self.next_rollover,
+            Operation::Catalogue => self.next_catalogue,
         }
     }
 
@@ -112,6 +121,7 @@ impl Activity {
             Operation::Snapshot => &mut self.next_snapshot,
             Operation::WalFlush => &mut self.next_wal_flush,
             Operation::Rollover => &mut self.next_rollover,
+            Operation::Catalogue => &mut self.next_catalogue,
         }
     }
 }

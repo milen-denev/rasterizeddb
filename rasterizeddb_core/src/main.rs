@@ -1401,13 +1401,25 @@ fn main() -> std::io::Result<()> {
         if args.backup.enabled() {
             match args.backup.to_config() {
                 Ok(config) => {
-                    match rasterizeddb_core::core::backup::install(config, db_location).await {
+                    let installed = if args.backup.start_offline {
+                        rasterizeddb_core::core::backup::install_waiting(config, db_location).await
+                    } else {
+                        rasterizeddb_core::core::backup::install(config, db_location).await
+                    };
+                    match installed {
                         Ok(service) => {
                             log::info!(
-                                "Backing up to s3://{}/{} as instance {}",
+                                "Backing up to s3://{}/{} as instance {}{}",
                                 service.config().bucket,
                                 service.config().normalized_prefix(),
-                                service.instance_id()
+                                service.instance_id(),
+                                if service.catalogue_state()
+                                    == rasterizeddb_core::core::backup::CatalogueState::Loaded
+                                {
+                                    ""
+                                } else {
+                                    " (bucket unreachable: holding the log locally until it answers)"
+                                }
                             );
                             // Flush what is still staged before the process
                             // leaves, so a clean stop costs no recovery window.
@@ -1431,7 +1443,10 @@ fn main() -> std::io::Result<()> {
                         }
                         // Refusing to start: an operator who asked for backups
                         // and silently got none is worse off than one who is
-                        // told why at boot.
+                        // told why at boot. With --s3-start-offline only a
+                        // bucket that answers wrongly (another instance's
+                        // catalogue) gets here; one that does not answer is
+                        // waited for instead.
                         Err(e) => {
                             eprintln!("could not start backups: {e}");
                             std::process::exit(2);

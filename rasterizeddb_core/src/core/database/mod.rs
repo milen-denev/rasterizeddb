@@ -259,12 +259,14 @@ impl fmt::Display for NativeListen {
 ///
 /// A predecessor that was killed mid-connection can keep the port busy for a
 /// moment while its sockets drain. SO_REUSEADDR covers the usual case, so a
-/// bind that still fails after a few retries means someone else holds the port
-/// - say so instead of dumping a backtrace on an unwrap.
+/// bind that still fails after a few retries means someone else holds the port.
+/// That is an error naming the way out, not a panic: a second server started
+/// on the same host without its own port died with a backtrace after its unix
+/// socket was already up, and the cause took a while to find.
 async fn bind_native_listener(
     listen: &NativeListen,
     authenticator: Option<StdArc<dyn rastcp::session::ServerAuthenticator>>,
-) -> TcpServer {
+) -> std::io::Result<TcpServer> {
     const BIND_ATTEMPTS: u32 = 5;
     const BIND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -277,9 +279,9 @@ async fn bind_native_listener(
         }
 
         match builder.build().await {
-            Ok(server) => return server,
+            Ok(server) => return Ok(server),
             Err(e) => {
-                error!(
+                warn!(
                     "Could not bind {} (attempt {}/{}): {}",
                     listen, attempt, BIND_ATTEMPTS, e
                 );
@@ -292,12 +294,22 @@ async fn bind_native_listener(
         }
     }
 
-    panic!(
-        "Could not bind {listen} after {BIND_ATTEMPTS} attempts: {error}. \
-         Another instance is most likely still running - check with `ss -ltnp | grep {port}`.",
-        port = listen.port,
-        error = last_error.expect("a failed bind always records an error"),
-    );
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "the native protocol's TCP listener could not bind {listen} after {BIND_ATTEMPTS} attempts \
+             ({error}). Another server most likely holds the port: check with `ss -ltnp | grep {port}`. \
+             To run a second server on this host, give it --rdb-port <another port>, or --rdb-tcp off \
+             to serve only its unix socket.{socket}",
+            port = listen.port,
+            error = last_error.expect("a failed bind always records an error"),
+            socket = match listen.socket.as_ref() {
+                Some(_) => " Its unix socket was already bound; the server stops rather than run \
+                            reachable on one listener and not the other.",
+                None => "",
+            },
+        ),
+    ))
 }
 
 /// The database a client reaches when its connection names none, and the one
@@ -4600,7 +4612,7 @@ impl Database {
         };
 
         let server = if listen.tcp {
-            let server = Arc::new(bind_native_listener(&listen, authenticator).await);
+            let server = Arc::new(bind_native_listener(&listen, authenticator).await?);
 
             // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
             // finish, rather than dropping every connection where it stands.

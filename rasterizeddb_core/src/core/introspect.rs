@@ -1963,63 +1963,95 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
             },
         );
 
-        let manifest = service.manifest_snapshot().await;
-        push("snapshots", manifest.snapshots.len().to_string(), "");
-        push("wal_bundles", manifest.segments.len().to_string(), "");
-        push(
-            "catalogue_updated_at",
-            crate::core::backup::timeutil::format_rfc3339(manifest.updated_at),
-            "",
-        );
-
-        match manifest.snapshots_newest_first().first().copied() {
-            None => push(
-                "newest_snapshot",
-                "none".to_string(),
-                "nothing to restore from yet; run BACKUP DATABASE",
+        // Whether the catalogue has been read. Until it has, the rows that come
+        // from it would describe the empty placeholder a start without the
+        // bucket runs on (--s3-start-offline), so they are left out rather
+        // than read as "no backups".
+        let catalogue = service.catalogue_state();
+        let loaded = catalogue == crate::core::backup::CatalogueState::Loaded;
+        match &catalogue {
+            crate::core::backup::CatalogueState::Loaded => push("catalogue", "loaded".to_string(), ""),
+            crate::core::backup::CatalogueState::Unreachable { since, attempts, last_error } => push(
+                "catalogue",
+                "unreachable".to_string(),
+                &format!(
+                    "not read since this server started at {} ({} attempt(s); last: {}); the log is \
+                     held locally and nothing is uploaded until the bucket answers",
+                    crate::core::backup::timeutil::format_rfc3339(*since),
+                    attempts,
+                    last_error
+                ),
             ),
-            Some(snapshot) => {
-                push(
-                    "newest_snapshot",
-                    snapshot.id.clone(),
-                    &crate::core::backup::timeutil::format_rfc3339(snapshot.finished_at),
-                );
-                push("newest_snapshot_end_lsn", snapshot.end_lsn.to_string(), "");
-                // Whether a restore of it brings every table back. A health
-                // check reading only the rows above saw a snapshot of a
-                // database whose cold tables were in no backup at all.
-                push(
-                    "newest_snapshot_complete",
-                    snapshot.uncovered.is_empty().to_string(),
-                    crate::core::rql::backup_exec::coverage_warning(snapshot).trim_end(),
-                );
-                push(
-                    "newest_snapshot_cold_tables",
-                    snapshot.cold_tables.len().to_string(),
-                    &match snapshot.cold_copied_at {
-                        Some(at) => format!(
-                            "tables on a key/value store, copied at {}; a restore brings them back as of then",
-                            crate::core::backup::timeutil::format_rfc3339(at)
-                        ),
-                        None => String::new(),
-                    },
-                );
-            }
+            crate::core::backup::CatalogueState::Refused { at, reason } => push(
+                "catalogue",
+                "refused".to_string(),
+                &format!(
+                    "backups STOPPED at {}: {}",
+                    crate::core::backup::timeutil::format_rfc3339(*at),
+                    reason
+                ),
+            ),
         }
 
-        // The furthest a point-in-time restore can currently reach. It is the
-        // question `SHOW BACKUPS` makes you work out by reading every row.
-        let recoverable = manifest
-            .segments
-            .iter()
-            .map(|segment| segment.last_lsn)
-            .max()
-            .unwrap_or(0);
-        push(
-            "recoverable_to_lsn",
-            recoverable.to_string(),
-            "the highest commit any archived log bundle covers",
-        );
+        if loaded {
+            let manifest = service.manifest_snapshot().await;
+            push("snapshots", manifest.snapshots.len().to_string(), "");
+            push("wal_bundles", manifest.segments.len().to_string(), "");
+            push(
+                "catalogue_updated_at",
+                crate::core::backup::timeutil::format_rfc3339(manifest.updated_at),
+                "",
+            );
+
+            match manifest.snapshots_newest_first().first().copied() {
+                None => push(
+                    "newest_snapshot",
+                    "none".to_string(),
+                    "nothing to restore from yet; run BACKUP DATABASE",
+                ),
+                Some(snapshot) => {
+                    push(
+                        "newest_snapshot",
+                        snapshot.id.clone(),
+                        &crate::core::backup::timeutil::format_rfc3339(snapshot.finished_at),
+                    );
+                    push("newest_snapshot_end_lsn", snapshot.end_lsn.to_string(), "");
+                    // Whether a restore of it brings every table back. A health
+                    // check reading only the rows above saw a snapshot of a
+                    // database whose cold tables were in no backup at all.
+                    push(
+                        "newest_snapshot_complete",
+                        snapshot.uncovered.is_empty().to_string(),
+                        crate::core::rql::backup_exec::coverage_warning(snapshot).trim_end(),
+                    );
+                    push(
+                        "newest_snapshot_cold_tables",
+                        snapshot.cold_tables.len().to_string(),
+                        &match snapshot.cold_copied_at {
+                            Some(at) => format!(
+                                "tables on a key/value store, copied at {}; a restore brings them back as of then",
+                                crate::core::backup::timeutil::format_rfc3339(at)
+                            ),
+                            None => String::new(),
+                        },
+                    );
+                }
+            }
+
+            // The furthest a point-in-time restore can currently reach. It is the
+            // question `SHOW BACKUPS` makes you work out by reading every row.
+            let recoverable = manifest
+                .segments
+                .iter()
+                .map(|segment| segment.last_lsn)
+                .max()
+                .unwrap_or(0);
+            push(
+                "recoverable_to_lsn",
+                recoverable.to_string(),
+                "the highest commit any archived log bundle covers",
+            );
+        }
 
         // What was last tried and how it went. The rows above come from the
         // catalogue, which only records what succeeded: a bucket refusing
@@ -2048,8 +2080,18 @@ pub(crate) fn backup_activity_rows(
         out.push((metric.to_string(), value, detail.to_string()));
     };
 
-    for operation in [Operation::Snapshot, Operation::WalFlush, Operation::Rollover] {
+    for operation in [
+        Operation::Snapshot,
+        Operation::WalFlush,
+        Operation::Rollover,
+        Operation::Catalogue,
+    ] {
         let name = operation.name();
+        // Only a start that could not reach the bucket reads the catalogue
+        // again; every other server would carry two rows reading "none".
+        if operation == Operation::Catalogue && activity.attempt(operation).is_none() {
+            continue;
+        }
         match activity.attempt(operation) {
             None => {
                 push(
@@ -2116,6 +2158,11 @@ pub(crate) fn backup_activity_rows(
             ),
         };
         push(&format!("next_{}_at", operation.name()), value, &detail);
+    }
+    match activity.next(Operation::Catalogue) {
+        Next::At(at) => push("next_catalogue_load_at", format_rfc3339(at), "the bucket has not answered yet"),
+        Next::Now => push("next_catalogue_load_at", "running now".to_string(), ""),
+        Next::NotScheduled => {}
     }
 
     out

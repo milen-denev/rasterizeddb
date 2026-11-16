@@ -288,3 +288,25 @@ async fn boolean_literals_are_predicates() {
     assert_eq!(affected(&c, "DELETE FROM s WHERE false").await, 0);
     assert_eq!(rows(&c, "SELECT id FROM s").await.len(), 2);
 }
+
+/// A port another server holds is an error naming the way out, not a panic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_taken_port_is_an_error_naming_the_way_out() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("a port to hold");
+    let port = holder.local_addr().unwrap().port();
+    let listen = NativeListen {
+        addr: "127.0.0.1".to_string(),
+        port,
+        ..NativeListen::default()
+    };
+    let error = match bind_native_listener(&listen, None).await {
+        Ok(_) => panic!("bound a port another listener holds"),
+        Err(e) => e,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    let message = error.to_string();
+    for needle in ["--rdb-port", "--rdb-tcp off", &format!("grep {port}")] {
+        assert!(message.contains(needle), "missing {needle:?}: {message}");
+    }
+    drop(holder);
+}

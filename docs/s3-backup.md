@@ -231,6 +231,7 @@ process list.
 | `--s3-rollover-hours` | 0 | Fresh snapshot, then delete every earlier generation. 0 = never |
 | `--s3-staging-max-mb` | 4096 | Safety valve; see §10.7. 0 = no ceiling |
 | `--s3-backup-now` | off | Snapshot at *every* start, on top of the schedule |
+| `--s3-start-offline` | off | Start even when the bucket does not answer; hold the log locally until it does. See §10.6a |
 
 Restore:
 
@@ -414,6 +415,39 @@ failure. Each bundle's staged files are deleted as soon as it is in S3, and a
 restore finds bundles only through the catalogue. An unpublished catalogue
 would leave the bundles uploaded before the failure out of every restore if
 the server crashed before the next flush succeeded.
+
+### 10.6a Starting without the bucket
+
+By default a server whose bucket does not answer at boot refuses to start
+("could not start backups"). An operator who asked for backups and silently
+got none is worse off than one who is told at boot. The cost is that an S3
+outage during a reboot keeps the database down.
+
+`--s3-start-offline` trades that for availability. When the catalogue cannot
+be read, the server starts on an empty placeholder catalogue and:
+
+- keeps staging the log locally, under the staging ceiling (§10.6), so writes
+  made during the outage are archived later rather than lost to point-in-time
+  recovery;
+- refuses every write to the bucket: snapshot, log flush, prune, rollover and
+  publishing the catalogue. The placeholder is empty, and publishing it would
+  replace every snapshot and bundle the real catalogue lists. `SHOW BACKUPS`
+  refuses too, rather than list the placeholder as "no backups";
+- reads the catalogue in the background, starting after 10 s and backing off
+  to every 5 minutes. Once it loads, the schedules start as on a normal boot:
+  the held log goes up on top of the real catalogue, and a missing base
+  snapshot is taken.
+
+`SHOW BACKUP STATUS` reports `catalogue = unreachable` with the time, the
+attempt count and the last error. It also shows `last_catalogue_load_attempt_at`
+/ `_outcome`, `next_catalogue_load_at`, and `last_error`. While the catalogue is
+unreachable it leaves out the rows that would come from the placeholder.
+
+A bucket that *answers* with another database's catalogue, or one this build
+cannot read, still refuses the start: that is a misconfiguration, not an
+outage, and waiting would not end it. If the bucket comes back like that after
+an offline start, backups stop (`catalogue = refused`), nothing is written to
+that prefix, and the log stays staged until the ceiling suspends archiving.
 
 ### 10.7 A snapshot is only recorded once its log is archived
 
