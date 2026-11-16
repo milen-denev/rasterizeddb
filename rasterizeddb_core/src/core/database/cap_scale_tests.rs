@@ -107,7 +107,7 @@ async fn declared_partition_scale() {
                 table_name: "acct".into(),
                 query: format!("INSERT INTO acct (tenant_id, n, label) VALUES ({tenant}, 1, 'x')"),
                 on_conflict_do_nothing: false,
-                on_conflict_target: Vec::new(),
+                on_conflict_target: Default::default(),
                 on_conflict_update: None,
             });
             let row =

@@ -2217,7 +2217,7 @@ impl Principal {
 /// every dispatch path, rather than in each handler where one could be
 /// forgotten. The `SHOW` forms are deliberately absent: reading the state is
 /// not administering it.
-fn privileged_statement(stmt: &str) -> Option<&'static str> {
+pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
     let upper = stmt.trim().to_ascii_uppercase();
     let mut words = upper.split_whitespace();
     let first = words.next()?;
@@ -6725,6 +6725,95 @@ where
     }
 }
 
+/// The rewrites every statement's text gets before anything parses it, in the
+/// order they have to run, or the code and message it is refused with.
+///
+/// Shared by the pgwire listener (`execute_single_statement`) and the native
+/// protocol (`database::run_native_query`). The native path used to have none
+/// of them, so `CREATE UNIQUE INDEX`, `DATE '…'`, a comment holding
+/// `IN (SELECT …)` and the rest were "Unrecognized query" there, or worse,
+/// read differently. One chain keeps the two from drifting apart again.
+pub(crate) fn rewrite_statement_text<'a>(
+    database: &Database,
+    stmt: &'a str,
+) -> Result<std::borrow::Cow<'a, str>, (&'static str, String)> {
+    use std::borrow::Cow;
+    fn take<'a>(current: &mut Cow<'a, str>, rewritten: Option<String>) {
+        if let Some(text) = rewritten {
+            *current = Cow::Owned(text);
+        }
+    }
+
+    // Comments are whitespace to PostgreSQL, and every parser downstream has
+    // to see them that way or it reads prose as SQL. A production statement
+    // carried a comment block explaining a rewrite, one line of which quoted
+    // `IN (SELECT ...)`; the subquery extractor found that inside the comment
+    // and tried to run `SELECT ...` — "cannot parse subquery 'SELECT ...'",
+    // the ellipsis being literal prose. Stripped once here, at the one place
+    // every statement passes through, rather than in each parser that scans
+    // for a keyword. `recognize_query_purpose` already stripped comments to
+    // *classify* a statement, but the text it carried onward kept them.
+    let mut stmt: Cow<'a, str> = if stmt.contains("--") || stmt.contains("/*") {
+        Cow::Owned(crate::core::rql::lexer_s1::strip_sql_comments(stmt))
+    } else {
+        Cow::Borrowed(stmt)
+    };
+    // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
+    // before anything reads one: a CTE or derived table is materialised from
+    // this text, and `jb.id AS ID` beside `ja.id` must be the second `id`
+    // there as it is to the parsers (`sql_scan::fold_core_statement`).
+    let folded = match crate::core::sql_scan::fold_core_statement(&stmt) {
+        Cow::Owned(text) => Some(text),
+        Cow::Borrowed(text) if text.len() != stmt.len() => Some(text.to_string()),
+        Cow::Borrowed(_) => None,
+    };
+    take(&mut stmt, folded);
+    // `DATE '2024-01-02'`: the cast it means, before any reader of a value
+    // sees the prefix form (`sql_scan::typed_literals_as_casts`).
+    let typed_literals = crate::core::sql_scan::typed_literals_as_casts(&stmt);
+    take(&mut stmt, typed_literals);
+    // `x = ANY (SELECT …)` as `x IN (SELECT …)`, `x <> ALL (…)` as `NOT IN`,
+    // before the scalar substitution reads the subquery as a value
+    // (`sql_scan::quantified_subqueries`).
+    let quantified = crate::core::sql_scan::quantified_subqueries(&stmt).map_err(|e| ("0A000", e))?;
+    take(&mut stmt, quantified);
+    // A window function over a join: the same statement over a derived
+    // table of the join's columns (`core::rql::window_join`). First, so a
+    // DISTINCT over it is then a single-table one for `distinct_on`.
+    let window_join =
+        crate::core::rql::window_join::rewrite_statement(&stmt, &|name| relation_column_names(database, name));
+    take(&mut stmt, window_join);
+    // A join operand that is an expression (`ON a.g = b.id::text`), computed
+    // by a derived table standing in for its relation (`core::rql::join_on`).
+    // After the window rewrite, whose inner query may hold the join.
+    let join_on = crate::core::rql::join_on::rewrite_statement(&stmt, &|name| relation_column_names(database, name));
+    take(&mut stmt, join_on);
+    // `DISTINCT ON` over a join or with an aggregate or a window: the same
+    // statement over a derived table, before anything reads its table set
+    // (`core::rql::distinct_on`).
+    let distinct_on = crate::core::rql::distinct_on::rewrite_statement(&stmt);
+    take(&mut stmt, distinct_on);
+
+    // A quoted identifier holding a quote (`"a""b"`) is refused before
+    // anything reads it: every reader below dropped the name at the first
+    // inner quote, so `CREATE TABLE "t"" x ""y"` created `t`.
+    if let Some(name) = crate::core::sql_scan::normalize_string_literals(&stmt)
+        .ok()
+        .and_then(|t| crate::core::sql_scan::identifier_with_doubled_quote(&t).map(str::to_string))
+    {
+        return Err((
+            "0A000",
+            format!("a quoted identifier containing a double quote is not supported yet: {}", name),
+        ));
+    }
+
+    // `INSERT INTO t WITH … SELECT …` puts its CTEs after the target; they are
+    // moved to the front, where everything below expects a `WITH` to be.
+    let hoisted = crate::core::rql::cte::hoist_insert_with(&stmt);
+    take(&mut stmt, hoisted);
+    Ok(stmt)
+}
+
 /// Runs one statement, materialising any `WITH` clause first.
 ///
 /// The temporary tables a CTE materialises into are dropped on **every** exit
@@ -6746,114 +6835,16 @@ async fn execute_single_statement<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Comments are whitespace to PostgreSQL, and every parser downstream has
-    // to see them that way or it reads prose as SQL. A production statement
-    // carried a comment block explaining a rewrite, one line of which quoted
-    // `IN (SELECT ...)`; the subquery extractor found that inside the comment
-    // and tried to run `SELECT ...` — "cannot parse subquery 'SELECT ...'",
-    // the ellipsis being literal prose. Stripped once here, at the one place
-    // every statement passes through, rather than in each parser that scans
-    // for a keyword. `recognize_query_purpose` already stripped comments to
-    // *classify* a statement, but the text it carried onward kept them.
-    let uncommented;
-    let stmt = if stmt.contains("--") || stmt.contains("/*") {
-        uncommented = crate::core::rql::lexer_s1::strip_sql_comments(stmt);
-        uncommented.as_str()
-    } else {
-        stmt
-    };
-    // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
-    // before anything reads one: a CTE or derived table is materialised from
-    // this text, and `jb.id AS ID` beside `ja.id` must be the second `id`
-    // there as it is to the parsers (`sql_scan::fold_core_statement`).
-    let folded = crate::core::sql_scan::fold_core_statement(stmt);
-    let stmt = folded.as_ref();
-    // `DATE '2024-01-02'`: the cast it means, before any reader of a value
-    // sees the prefix form (`sql_scan::typed_literals_as_casts`).
-    let typed_literals;
-    let stmt = match crate::core::sql_scan::typed_literals_as_casts(stmt) {
-        Some(rewritten) => {
-            typed_literals = rewritten;
-            typed_literals.as_str()
-        }
-        None => stmt,
-    };
-    // `x = ANY (SELECT …)` as `x IN (SELECT …)`, `x <> ALL (…)` as `NOT IN`,
-    // before the scalar substitution reads the subquery as a value
-    // (`sql_scan::quantified_subqueries`).
-    let quantified;
-    let stmt = match crate::core::sql_scan::quantified_subqueries(stmt) {
-        Ok(Some(rewritten)) => {
-            quantified = rewritten;
-            quantified.as_str()
-        }
-        Ok(None) => stmt,
-        Err(e) => {
-            fail_statement(state, stream, "0A000", &e).await?;
+    // The text-only rewrites, shared with the native protocol
+    // (`rewrite_statement_text`).
+    let rewritten = match rewrite_statement_text(database, stmt) {
+        Ok(text) => text,
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
             return Ok(());
         }
     };
-    // A window function over a join: the same statement over a derived
-    // table of the join's columns (`core::rql::window_join`). First, so a
-    // DISTINCT over it is then a single-table one for `distinct_on`.
-    let window_join;
-    let stmt = match crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name)) {
-        Some(rewritten) => {
-            window_join = rewritten;
-            window_join.as_str()
-        }
-        None => stmt,
-    };
-    // A join operand that is an expression (`ON a.g = b.id::text`), computed
-    // by a derived table standing in for its relation (`core::rql::join_on`).
-    // After the window rewrite, whose inner query may hold the join.
-    let join_on;
-    let stmt = match crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name)) {
-        Some(rewritten) => {
-            join_on = rewritten;
-            join_on.as_str()
-        }
-        None => stmt,
-    };
-    // `DISTINCT ON` over a join or with an aggregate or a window: the same
-    // statement over a derived table, before anything reads its table set
-    // (`core::rql::distinct_on`).
-    let distinct_on;
-    let stmt = match crate::core::rql::distinct_on::rewrite_statement(stmt) {
-        Some(rewritten) => {
-            distinct_on = rewritten;
-            distinct_on.as_str()
-        }
-        None => stmt,
-    };
-
-    // A quoted identifier holding a quote (`"a""b"`) is refused before
-    // anything reads it: every reader below dropped the name at the first
-    // inner quote, so `CREATE TABLE "t"" x ""y"` created `t`.
-    if let Some(name) = crate::core::sql_scan::normalize_string_literals(stmt)
-        .ok()
-        .and_then(|t| crate::core::sql_scan::identifier_with_doubled_quote(&t).map(str::to_string))
-    {
-        fail_statement(
-            state,
-            stream,
-            "0A000",
-            &format!("a quoted identifier containing a double quote is not supported yet: {}", name),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // `INSERT INTO t WITH … SELECT …` puts its CTEs after the target; they are
-    // moved to the front, where everything below expects a `WITH` to be.
-    let hoisted;
-    let stmt = match crate::core::rql::cte::hoist_insert_with(stmt) {
-        Some(rewritten) => {
-            hoisted = rewritten;
-            hoisted.as_str()
-        }
-        None => stmt,
-    };
+    let stmt = rewritten.as_ref();
 
     // A data-modifying CTE and the statement it feeds are one statement, so
     // they need one transaction. Outside an explicit block there is none yet —
@@ -8984,7 +8975,7 @@ where
 /// A `;` inside a string literal, a quoted identifier, or a comment is text,
 /// not a separator. Fragments that hold nothing but comments or whitespace are
 /// dropped rather than sent on to be rejected.
-fn split_statements(query: &str) -> Vec<String> {
+pub(crate) fn split_statements(query: &str) -> Vec<String> {
     let bytes = query.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;

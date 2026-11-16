@@ -5703,13 +5703,25 @@ async fn constant_select_insert(
 pub(crate) struct InsertConflict {
     pub do_nothing: bool,
     pub update: Option<crate::core::rql::lexer_s1::ConflictUpdate>,
+    /// `DO NOTHING`'s arbiter. Lost here, the rewritten statement absorbed a
+    /// violation of any unique key rather than of the one it names.
+    pub target: crate::core::rql::lexer_s1::ConflictTarget,
 }
 
 impl InsertConflict {
+    fn of(row_data: &crate::core::rql::lexer_s1::InsertRowData) -> Self {
+        InsertConflict {
+            do_nothing: row_data.on_conflict_do_nothing,
+            update: row_data.on_conflict_update.clone(),
+            target: row_data.on_conflict_target.clone(),
+        }
+    }
+
     fn restore(&self, purpose: &mut QueryPurpose) {
         if let QueryPurpose::InsertRow(data) = purpose {
             data.on_conflict_do_nothing = self.do_nothing;
             data.on_conflict_update = self.update.clone();
+            data.on_conflict_target = self.target.clone();
         }
     }
 }
@@ -8033,6 +8045,55 @@ pub(crate) const CONFLICT_MOVE_REFUSAL: &str = "invalid ON UPDATE specification:
 /// among them, named `<table>_pkey`), a single-column `PRIMARY KEY`
 /// (`<table>_pkey`), or an inline `UNIQUE` column (`<table>_<column>_key`).
 /// `None` when no live constraint has that name.
+/// Whether the uniqueness violation `error` is one an `ON CONFLICT` naming
+/// `columns` or `constraint` absorbs: any, when it names neither; otherwise
+/// only a clash on that key. A clash on another key alone is the statement
+/// failing, and PostgreSQL raises it (23505). Swallowing it reported 0 rows
+/// for `ON CONFLICT (rid) DO NOTHING` when a second unique column clashed,
+/// which a caller cannot tell from "the row is already there".
+///
+/// A violation carries every key the row clashed on (`UniqueViolation`), so
+/// a clash on the arbiter and another key at once is still the arbiter's, as
+/// PostgreSQL, which checks the arbiter first, has it. An `AlreadyExists`
+/// that carries none is not a clash on any key and is never absorbed.
+fn conflict_is_on_arbiter(
+    database: &Database,
+    table_name: &str,
+    error: &std::io::Error,
+    columns: &[String],
+    constraint: Option<&str>,
+) -> bool {
+    if columns.is_empty() && constraint.is_none() {
+        return true;
+    }
+    let Some(violation) = crate::core::row::table::UniqueViolation::of(error) else {
+        return false;
+    };
+    let normalized = |names: &[String]| -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|c| c.trim().trim_matches('"').to_ascii_lowercase()).collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let arbiter = if !columns.is_empty() {
+        normalized(columns)
+    } else {
+        let Some(name) = constraint else { return true };
+        let schema = match database.schema_view(table_name) {
+            Some(view) => view.schema().clone(),
+            None => match database.partitioned_table(table_name) {
+                Some(pt) => pt.shell().schema.clone(),
+                None => return false,
+            },
+        };
+        match constraint_columns(&schema, table_name, name.trim_matches('"')) {
+            Some(columns) => normalized(&columns),
+            None => return false,
+        }
+    };
+    violation.keys.iter().any(|key| normalized(key) == arbiter)
+}
+
 fn constraint_columns(
     schema: &crate::core::row::schema::TableSchema,
     table_name: &str,
@@ -10245,11 +10306,7 @@ fn supply_insert_column_list(
     // re-parse cannot find the clause and it is carried across instead.
     // Without this, `INSERT INTO t VALUES (…) ON CONFLICT DO NOTHING` raised
     // the very violation it was written to skip.
-    InsertConflict {
-        do_nothing: row_data.on_conflict_do_nothing,
-        update: row_data.on_conflict_update.clone(),
-    }
-    .restore(&mut purpose);
+    InsertConflict::of(row_data).restore(&mut purpose);
     Some(Ok(purpose))
 }
 
@@ -10265,11 +10322,7 @@ fn canonical_insert_column_list(
     let Some(mut purpose) = recognize_query_purpose(&rewritten) else {
         return Some(Err("could not parse the statement after folding its column list".to_string()));
     };
-    InsertConflict {
-        do_nothing: row_data.on_conflict_do_nothing,
-        update: row_data.on_conflict_update.clone(),
-    }
-    .restore(&mut purpose);
+    InsertConflict::of(row_data).restore(&mut purpose);
     Some(Ok(purpose))
 }
 
@@ -11160,8 +11213,8 @@ async fn insert_values_tuples(
                 query: stmt.clone(),
                 on_conflict_do_nothing: row_data.on_conflict_do_nothing,
                 on_conflict_update: row_data.on_conflict_update.clone(),
-                // Checked at the statement's first dispatch (see the field).
-                on_conflict_target: Vec::new(),
+                // Each row's conflict absorbs only the arbiter's (see the field).
+                on_conflict_target: row_data.on_conflict_target.clone(),
             });
             let QueryPurpose::InsertRow(tuple) = &purpose else {
                 unreachable!("built as an InsertRow just above");
@@ -11555,7 +11608,7 @@ fn check_conflict_target_infers_a_key(
 ) -> Result<(), String> {
     let target: &[String] = match &row_data.on_conflict_update {
         Some(spec) => &spec.arbiter,
-        None if row_data.on_conflict_do_nothing => &row_data.on_conflict_target,
+        None if row_data.on_conflict_do_nothing => &row_data.on_conflict_target.columns,
         None => return Ok(()),
     };
     if target.is_empty() {
@@ -11601,7 +11654,7 @@ fn check_partitioned_conflict_target(
     let table = &row_data.table_name;
     let target: &[String] = match &row_data.on_conflict_update {
         Some(spec) => &spec.arbiter,
-        None if row_data.on_conflict_do_nothing => &row_data.on_conflict_target,
+        None if row_data.on_conflict_do_nothing => &row_data.on_conflict_target.columns,
         None => return Ok(()),
     };
     if target.is_empty() {
@@ -19212,7 +19265,7 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
     // where it turned `ON CONFLICT DO NOTHING` into a duplicate-key error.
     let insert_conflict = match &query {
         QueryPurpose::InsertRow(data) => {
-            Some((data.on_conflict_do_nothing, data.on_conflict_update.clone()))
+            Some(InsertConflict::of(data))
         }
         _ => None,
     };
@@ -19259,11 +19312,8 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         let purpose = match pending.take() {
             Some(p) => Some(p),
             None => recognize_query_purpose(&retry_sql).map(|mut reparsed| {
-                if let Some((do_nothing, update)) = insert_conflict.clone() {
-                    if let QueryPurpose::InsertRow(data) = &mut reparsed {
-                        data.on_conflict_do_nothing = do_nothing;
-                        data.on_conflict_update = update;
-                    }
+                if let Some(conflict) = &insert_conflict {
+                    conflict.restore(&mut reparsed);
                 }
                 reparsed
             }),
@@ -19549,7 +19599,7 @@ pub(crate) async fn insert_loaded_row(
         table_name: table_name.to_string(),
         query: sql.to_string(),
         on_conflict_do_nothing: false,
-        on_conflict_target: Vec::new(),
+        on_conflict_target: Default::default(),
         on_conflict_update: None,
     };
     // Asked of the schema rather than by computing the values: computing them
@@ -19680,7 +19730,7 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
     // would turn `ON CONFLICT DO NOTHING` back into a duplicate-key error.
     let insert_conflict = match &query {
         QueryPurpose::InsertRow(data) => {
-            Some((data.on_conflict_do_nothing, data.on_conflict_update.clone()))
+            Some(InsertConflict::of(data))
         }
         _ => None,
     };
@@ -19730,11 +19780,8 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
         }
         query = match recognize_query_purpose(&retry_sql) {
             Some(mut reparsed) => {
-                if let Some((do_nothing, update)) = insert_conflict.clone() {
-                    if let QueryPurpose::InsertRow(data) = &mut reparsed {
-                        data.on_conflict_do_nothing = do_nothing;
-                        data.on_conflict_update = update;
-                    }
+                if let Some(conflict) = &insert_conflict {
+                    conflict.restore(&mut reparsed);
                 }
                 reparsed
             }
@@ -20162,11 +20209,11 @@ async fn insert_row_resolved(
             let mut result = vec![0u8];
             result.extend_from_slice(&1u64.to_le_bytes());
             return result;
-        } else if row_data.on_conflict_update.is_some()
-            && outcome
-                .as_ref()
-                .err()
-                .is_some_and(|e| is_uniqueness_violation(e))
+        } else if let Some(spec) = row_data.on_conflict_update.as_ref()
+            && outcome.as_ref().err().is_some_and(|e| {
+                is_uniqueness_violation(e)
+                    && conflict_is_on_arbiter(&database, table_name, e, &spec.arbiter, spec.constraint.as_deref())
+            })
         {
             // `ON CONFLICT … DO UPDATE`: the row is already there, so
             // the statement becomes an update of it. Built from the
@@ -20186,10 +20233,11 @@ async fn insert_row_resolved(
             ))
             .await;
         } else if row_data.on_conflict_do_nothing
-            && outcome
-                .as_ref()
-                .err()
-                .is_some_and(|e| is_uniqueness_violation(e))
+            && outcome.as_ref().err().is_some_and(|e| {
+                let target = &row_data.on_conflict_target;
+                is_uniqueness_violation(e)
+                    && conflict_is_on_arbiter(&database, table_name, e, &target.columns, target.constraint.as_deref())
+            })
         {
             // `ON CONFLICT DO NOTHING`: the duplicate is the statement
             // working, not failing. Reported as zero rows affected, which
@@ -20780,10 +20828,7 @@ pub(crate) async fn execute_with_need(
             if let Some(response) =
                 Box::pin(insert_from_select(
                     &row_data.query,
-                    &InsertConflict {
-                        do_nothing: row_data.on_conflict_do_nothing,
-                        update: row_data.on_conflict_update.clone(),
-                    },
+                    &InsertConflict::of(row_data),
                     &database,
                     depth,
                     tx,

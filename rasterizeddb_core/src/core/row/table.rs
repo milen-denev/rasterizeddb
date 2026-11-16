@@ -839,6 +839,60 @@ fn same_unique_value(db_type: &DbType, stored: &[u8], value: &[u8]) -> bool {
     }
 }
 
+/// A uniqueness violation, naming every unique key the row clashed on.
+///
+/// Carried inside the `AlreadyExists` error the check returns, so its text
+/// is still the first clash's, word for word (the SQLSTATE is read from it),
+/// while `INSERT … ON CONFLICT (k) DO NOTHING` can ask whether `k` was among
+/// the keys (`executor::conflict_is_on_arbiter`): a clash on another key is
+/// raised, as PostgreSQL raises it.
+#[derive(Debug)]
+pub struct UniqueViolation {
+    /// Each clashing key's columns, as declared: one column for a `UNIQUE`
+    /// column or a single-column primary key.
+    pub keys: Vec<Vec<String>>,
+    message: String,
+}
+
+impl UniqueViolation {
+    /// The violation `error` carries, when it is one this check raised.
+    pub fn of(error: &std::io::Error) -> Option<&UniqueViolation> {
+        error.get_ref()?.downcast_ref::<UniqueViolation>()
+    }
+}
+
+impl std::fmt::Display for UniqueViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UniqueViolation {}
+
+/// The clashes one row's check has found so far.
+#[derive(Default)]
+struct UniqueViolations {
+    keys: Vec<Vec<String>>,
+    first_message: Option<String>,
+}
+
+impl UniqueViolations {
+    fn push(&mut self, key: Vec<String>, message: String) {
+        self.first_message.get_or_insert(message);
+        self.keys.push(key);
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self.first_message {
+            None => Ok(()),
+            Some(message) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                UniqueViolation { keys: self.keys, message },
+            )),
+        }
+    }
+}
+
 /// What one UPDATE has already written, for its uniqueness checks.
 ///
 /// The check probes the table through its index or filter, whose
@@ -3323,6 +3377,12 @@ impl<S: StorageIO> Table<S> {
         if !self.has_unique {
             return Ok(());
         }
+        // Every key the row clashes on, not the first: `ON CONFLICT (k) DO
+        // NOTHING` absorbs a clash on `k` alone, and has to see it even when
+        // another key, checked first, clashes too (PostgreSQL checks the
+        // arbiter first). A key another transaction is still writing returns
+        // at once, as before: the replay waits for it.
+        let mut violations = UniqueViolations::default();
         let touches = |write_order: u64| -> bool {
             assigned.is_none_or(|set| set.contains(&(write_order as u32)))
         };
@@ -3380,24 +3440,25 @@ impl<S: StorageIO> Table<S> {
                         ),
                     ));
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
+                violations.push(
+                    vec![field.name.clone()],
                     format!(
                         "duplicate value for UNIQUE column {:?} (row {} already holds it)",
                         field.name, existing
                     ),
-                ));
+                );
+                continue;
             }
             if let Some(own) = own.as_deref_mut()
                 && !own.claim(field.write_order as usize, OwnKeys::key(std::iter::once((field, value))))
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
+                violations.push(
+                    vec![field.name.clone()],
                     format!(
                         "duplicate value for UNIQUE column {:?} (an earlier row of this statement holds it)",
                         field.name
                     ),
-                ));
+                );
             }
         }
 
@@ -3508,8 +3569,8 @@ impl<S: StorageIO> Table<S> {
                 // An update names the row it moves; an insert's row has no id
                 // yet, and printed as `None` it read like a lost value.
                 let updated = exclude_id.map(|id| format!("; the row being updated is {}", id)).unwrap_or_default();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
+                violations.push(
+                    key.columns.clone(),
                     format!(
                         "duplicate value for UNIQUE constraint {} (row {} already holds it): {}{}",
                         key.describe(),
@@ -3517,22 +3578,23 @@ impl<S: StorageIO> Table<S> {
                         shown.join(", "),
                         updated
                     ),
-                ));
+                );
+                continue;
             }
             if let Some(own) = own.as_deref_mut()
                 && !own.claim(Self::unique_key_constraint(position), OwnKeys::key(tuple.iter().copied()))
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
+                violations.push(
+                    key.columns.clone(),
                     format!(
                         "duplicate value for UNIQUE constraint {} (an earlier row of this statement holds it)",
                         key.describe()
                     ),
-                ));
+                );
             }
         }
 
-        Ok(())
+        violations.into_result()
     }
 
     /// Id of a live row whose whole tuple equals `tuple`, other than

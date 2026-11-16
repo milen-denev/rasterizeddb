@@ -399,11 +399,14 @@ than the rewrite and invisible to queries.
 
 `INSERT … ON CONFLICT DO NOTHING` works, with or without an arbiter, which is
 what makes a seed migration re-runnable against a database that already holds
-the rows. The arbiter is not consulted — any uniqueness violation is swallowed,
-where PostgreSQL would error if the named columns matched no constraint. That is
-more permissive, and the difference only shows for a statement PostgreSQL would
-have rejected. `DO UPDATE` finds the conflicting row by its arbiter key as the
-column stores it (`1.254` into a `NUMERIC(10,2)` key is `1.25`).
+the rows. The arbiter is consulted as in PostgreSQL: `ON CONFLICT (rid)` or
+`ON CONFLICT ON CONSTRAINT t_pkey` absorbs a clash on that key, and a clash on
+any other unique key alone is raised (23505). A row clashing on the arbiter and
+another key at once is the arbiter's. A targetless `ON CONFLICT DO NOTHING`
+absorbs a clash on any key. Until 2026-11-16 every clash was swallowed, so a
+second key's violation was reported as 0 rows. `DO UPDATE` follows the same
+rule, and finds the conflicting row by its arbiter key as the column stores it
+(`1.254` into a `NUMERIC(10,2)` key is `1.25`).
 
 Two rows of one `INSERT … ON CONFLICT DO UPDATE` with the same arbiter key
 refuse the statement with 21000, as in PostgreSQL, the keys compared as each
@@ -1331,3 +1334,27 @@ in-place-update path all have to agree about it:
   the query: on a nullable column `IS NULL` cannot distinguish "no matching row"
   from "matched, with a NULL value there", so it is refused rather than answered
   as an anti-join.
+
+## Statements over the native protocol
+
+A statement sent over the native protocol (`DbClient`, `rasterizeddb_client`)
+gets the same preparation as an autocommit statement over pgwire: comments,
+typed literals (`DATE '…'`), `CREATE UNIQUE INDEX` as a unique constraint,
+constant folding, `IN`/`EXISTS`/scalar subqueries, a `SELECT` with no `FROM`
+(`SELECT 1`, `SELECT now()`), and the catalogue views (`pg_tables`,
+`pg_indexes`, `information_schema.*`). The statements that administer the
+server (`BACKUP`, `RESTORE`, `STORAGE`, `REPLICATION`, `SET CONFIG`,
+`KV FLUSHALL`, databases, roles) need a superuser when the listener requires
+authentication, as on pgwire.
+
+What needs a session it does not have is refused by name rather than run in
+part:
+
+- **One statement per request.** `INSERT …; INSERT …` is refused whole. Before
+  2026-11-16 the first statement ran and the second was dropped with a success
+  reply.
+- **No transaction block.** `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and
+  `LOCK TABLE` are refused; each statement commits on its own.
+- **No `WITH` or `FROM (SELECT …)`.** A CTE or a derived table runs its parts
+  and the outer statement in one statement transaction that only the pgwire
+  listener sets up. Use pgwire for those.

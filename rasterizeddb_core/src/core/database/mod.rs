@@ -8,6 +8,8 @@ mod native_authz_tests;
 #[cfg(test)]
 mod native_catalog_tests;
 #[cfg(test)]
+mod native_statement_tests;
+#[cfg(test)]
 mod name_guard_tests;
 #[cfg(test)]
 mod sidecar_clash_tests;
@@ -5863,6 +5865,19 @@ pub(crate) async fn process_incoming_queries(
 ) -> Vec<u8> {
     let query = String::from_utf8_lossy(&request_vec);
 
+    // One statement per request: the native protocol answers each request
+    // with one response, and nothing here ran the second statement of
+    // `INSERT …; INSERT …`. It answered "1 row" for the first and the second
+    // row was never written; `UPDATE …; DELETE …` failed with a parser error
+    // about `;`. Refused before anything else reads the text, the role
+    // statements included, and without echoing it: it may hold a password.
+    if crate::pgwire::split_statements(&query).len() > 1 {
+        return error_response(
+            "the native protocol runs one statement per request: send each statement on its own \
+             (a request holding several, separated by ';', is refused rather than partly run)",
+        );
+    }
+
     // Role management is answered by the auth module rather than the RQL
     // executor: the catalogue is an ordinary table, but a password has to be
     // turned into a verifier instead of being stored as written.
@@ -5908,6 +5923,29 @@ pub(crate) async fn process_incoming_queries(
         principal,
         crate::core::redact::statement(&query)
     );
+
+    // What administers the server rather than the data (`BACKUP`, `RESTORE`,
+    // `STORAGE`, `REPLICATION`, `SET CONFIG`, `KV FLUSHALL`, databases)
+    // needs a superuser, as on pgwire (`pgwire::privileged_statement`). Only
+    // the role statements above were gated here, so any authenticated user
+    // could restore over the database or reconfigure the process.
+    if context.authentication_required
+        && !principal.superuser
+        && let Some(verb) = crate::pgwire::privileged_statement(&query)
+    {
+        return error_response(&format!("permission denied: {verb} requires superuser ({principal} is not one)"));
+    }
+
+    // A transaction block needs a session that holds it between requests,
+    // which the native protocol does not have: each statement commits on its
+    // own. Said plainly rather than "Unrecognized query", so a caller that
+    // sent `BEGIN` does not go on believing the next statements are one unit.
+    if is_transaction_control(&query) {
+        return error_response(
+            "transaction control (BEGIN, COMMIT, ROLLBACK, SAVEPOINT) is not supported over the native \
+             protocol: each statement commits on its own; use the PostgreSQL protocol for a transaction block",
+        );
+    }
 
     // `SELECT rdb_index_checkpoint('t')` (docs/persistent-indexes.md §3):
     // a clean point, answered above the engine as the pgwire listener
@@ -6007,7 +6045,97 @@ pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Databa
     run_native_query(query, database).await
 }
 
+/// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`,
+/// `SAVEPOINT`, `RELEASE`: the words pgwire's `handle_transaction_control`
+/// answers, less `SET`, whose transaction forms are no use without a block.
+fn is_transaction_control(query: &str) -> bool {
+    let first = query.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
+    ["begin", "start", "commit", "end", "rollback", "abort", "savepoint", "release"]
+        .iter()
+        .any(|w| first.eq_ignore_ascii_case(w))
+}
+
+/// One statement over the native protocol, through the same preparation the
+/// pgwire listener gives an autocommit statement (`pgwire::execute_single_statement`
+/// and `execute_single_statement_inner`), in the same order, less what needs
+/// a session: a transaction block, a CTE's or derived table's statement
+/// transaction. Those are refused by name rather than reaching the parser as
+/// text it cannot read.
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
+    let rewritten = match crate::pgwire::rewrite_statement_text(&database, query) {
+        Ok(text) => text,
+        Err((_, message)) => return error_response(&message),
+    };
+    let stmt = rewritten.as_ref();
+
+    // A unique index is a constraint here, as on pgwire.
+    let unique;
+    let stmt = match crate::core::rql::lexer_alter::unique_index_as_constraint(stmt) {
+        Some(altered) => {
+            unique = altered;
+            unique.as_str()
+        }
+        None => stmt,
+    };
+
+    // Released the moment the statement ended, so the caller would be told
+    // it holds a lock it does not (pgwire refuses it outside a block, 25P01).
+    if stmt.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("LOCK"))
+        && crate::core::rql::row_lock::parse_lock_table(stmt).is_some()
+    {
+        return error_response("LOCK TABLE can only be used in transaction blocks, which the native protocol does not have");
+    }
+
+    // A replicating node's peers run the text again, so a write carries the
+    // values of its `now()`, `random()` and `gen_random_uuid()`.
+    let deterministic;
+    let stmt = if database.replication.is_active() {
+        match crate::core::rql::replicated_values::fold(stmt) {
+            crate::core::rql::replicated_values::Fold::Unchanged => stmt,
+            crate::core::rql::replicated_values::Fold::Rewritten(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                deterministic = text;
+                deterministic.as_str()
+            }
+            crate::core::rql::replicated_values::Fold::Refused(message) => return error_response(&message),
+        }
+    } else {
+        stmt
+    };
+
+    // `WHERE created_at < NOW()`: the constant parts evaluated once, before
+    // the predicate tokenizer reads `NOW` as a column.
+    let folded = match crate::core::rql::executor::fold_where_constants_checked(stmt) {
+        Ok(folded) => folded,
+        Err(e) => return error_response(&e),
+    };
+    if folded != stmt {
+        crate::core::rql::prepared::note_rewritten();
+    }
+    let stmt = folded.as_str();
+
+    // A correlated scalar subquery, as the LATERAL join it means.
+    let correlated;
+    let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
+        Some(Ok(rewritten)) => {
+            crate::core::rql::prepared::note_rewritten();
+            correlated = rewritten;
+            correlated.as_str()
+        }
+        Some(Err(e)) => return error_response(&e),
+        None => stmt,
+    };
+
+    // A CTE or a derived table runs its bodies and the outer statement in one
+    // statement transaction that pgwire opens, commits or replays around
+    // them; a native statement has no such transaction to hand them.
+    if crate::core::rql::cte::has_with_clause(stmt) || crate::core::rql::cte::next_derived_table(stmt).is_some() {
+        return error_response(
+            "WITH (a CTE) and FROM (SELECT …) (a derived table) are not supported over the native protocol yet; \
+             use the PostgreSQL protocol for this statement",
+        );
+    }
+
     // The catalogue relations (`pg_tables`, `pg_class`,
     // `information_schema.tables` and the rest) exist only per statement:
     // built from the live catalogue into temporary relations the text is
@@ -6017,12 +6145,12 @@ async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
     // view itself. `pg_database` lists this database alone: a native session
     // has no catalogue of databases to read.
     let tx = crate::core::mvcc::transaction::FROZEN_TX;
-    let catalog = match crate::core::rql::catalog_views::materialize(query, &database, tx, None).await {
+    let catalog = match crate::core::rql::catalog_views::materialize(stmt, &database, tx, None).await {
         Ok(catalog) => catalog,
         Err(e) => return error_response(&e),
     };
     let Some(catalog) = catalog else {
-        return run_native_statement(query, database).await;
+        return run_native_statement(stmt, database).await;
     };
     crate::core::rql::prepared::note_rewritten();
     let response = run_native_statement(&catalog.rewritten, database.clone()).await;
@@ -6031,16 +6159,67 @@ async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
 }
 
 async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
-    if let Some(query_purpose) = recognize_query_purpose(query) {
-        info!("Recognized query purpose: {:?}", query_purpose);
-        // A named owner for the native protocol's statements (§7 Owner;
-        // finding L3): never `FROZEN_TX`, and one per statement.
-        execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database)
-            .await
+    // `IN (SELECT …)`, `EXISTS (SELECT …)` and a scalar subquery are read
+    // into literals first, as pgwire does (`execute_single_statement_inner`).
+    // Not in an UPDATE or a DELETE, which flatten their own inside each
+    // attempt, under the snapshot their rows are scanned under; nor in a
+    // generation expression, which PostgreSQL refuses to hold a subquery.
+    let write = query
+        .trim_start()
+        .as_bytes()
+        .get(..6)
+        .is_some_and(|w| w.eq_ignore_ascii_case(b"UPDATE") || w.eq_ignore_ascii_case(b"DELETE"));
+    let flattened;
+    let query = if !write
+        && (crate::core::rql::subquery::find_in_subquery(query).is_some()
+            || crate::core::rql::subquery::find_exists(query).is_some()
+            || crate::core::rql::subquery::find_scalar_subquery(query).is_some())
+        && !crate::core::rql::generated::declares_generated(query)
+    {
+        match crate::core::rql::executor::substitute_in_subqueries(
+            query,
+            &database,
+            crate::core::mvcc::transaction::FROZEN_TX,
+        )
+        .await
+        {
+            Ok(text) => {
+                crate::core::rql::prepared::note_rewritten();
+                flattened = text;
+                flattened.as_str()
+            }
+            Err(e) => return error_response(&e),
+        }
     } else {
-        error!("Could not recognize query purpose");
-        error_response("Unrecognized query")
-    }
+        query
+    };
+
+    let Some(query_purpose) = recognize_query_purpose(query) else {
+        // `SELECT 1`, `SELECT now()`: a SELECT with no FROM, one row
+        // evaluated with no columns (`rql::no_from`), as pgwire answers it.
+        // The usual liveness probe; it was "Unrecognized query" here.
+        return match crate::core::rql::no_from::parse(query) {
+            Some(Ok(select)) => match select.rows() {
+                Ok(rows) => {
+                    let mut response = vec![2u8];
+                    for row in &rows {
+                        row.extend_serialized(&mut response);
+                    }
+                    response
+                }
+                Err(e) => error_response(&e),
+            },
+            Some(Err(e)) => error_response(&e),
+            None => {
+                error!("Could not recognize query purpose");
+                error_response("Unrecognized query")
+            }
+        };
+    };
+    info!("Recognized query purpose: {:?}", query_purpose);
+    // A named owner for the native protocol's statements (§7 Owner;
+    // finding L3): never `FROZEN_TX`, and one per statement.
+    execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database).await
 }
 
 /// Rows a native-protocol response reports: the count a write carries, or the

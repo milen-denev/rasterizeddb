@@ -98,7 +98,7 @@ async fn resident_cost_per_partition_at_1024() {
                 table_name: "acct".into(),
                 query: format!("INSERT INTO acct (tenant_id, n, label) VALUES ({tenant}, 1, 'x')"),
                 on_conflict_do_nothing: false,
-                on_conflict_target: Vec::new(),
+                on_conflict_target: Default::default(),
                 on_conflict_update: None,
             });
             let row = crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &t.shell().schema.fields, &[], &[], 0).unwrap();

@@ -80,14 +80,14 @@ pub struct VacuumRequest {
 pub struct InsertRowData {
     pub table_name: String,
     pub query: String,
-    /// `ON CONFLICT … DO NOTHING` was written, so a uniqueness violation is the
+    /// `ON CONFLICT … DO NOTHING` was written, so a violation of its arbiter
+    /// (`on_conflict_target`; any unique key when it names none) is the
     /// statement working rather than failing.
     ///
-    /// The arbiter, if one was given, is not consulted. PostgreSQL uses it to
-    /// pick *which* constraint may conflict and errors when it names none; here
-    /// any uniqueness violation is swallowed. That is more permissive, and the
-    /// difference only shows up for a statement that would have been an error in
-    /// PostgreSQL — never for one that would have succeeded.
+    /// A violation of another key is raised, as PostgreSQL raises it: until
+    /// 2026-11-16 every violation was swallowed, so `ON CONFLICT (rid) DO
+    /// NOTHING` reported 0 rows for a clash on a second unique column, which a
+    /// caller cannot tell from "the row is already there".
     pub on_conflict_do_nothing: bool,
     /// The `DO UPDATE` half of an upsert, when one was written.
     ///
@@ -96,15 +96,29 @@ pub struct InsertRowData {
     /// would have been inserted has been built, so resolving them is the
     /// executor's job.
     pub on_conflict_update: Option<ConflictUpdate>,
-    /// The columns a `DO NOTHING` names as its target, `ON CONFLICT (a, b) DO
-    /// NOTHING`; empty when it names none or names a constraint. (`DO UPDATE`
-    /// keeps its own in [`ConflictUpdate::arbiter`].)
+    /// What a `DO NOTHING` names as its target: `ON CONFLICT (a, b) DO
+    /// NOTHING`'s columns or `ON CONSTRAINT name`; empty when it names
+    /// neither. (`DO UPDATE` keeps its own in [`ConflictUpdate::arbiter`].)
     ///
-    /// Read once, by the partitioned-table check that refuses a target missing
-    /// a partition-key column (42P10, as PostgreSQL), at the statement's first
-    /// dispatch. A statement re-parsed from its tuples or rewritten from its
-    /// `SELECT` may carry it empty: by then the check has passed.
-    pub on_conflict_target: Vec<String>,
+    /// Read by the target checks (42P10) at the statement's first dispatch,
+    /// and by every row's conflict, which absorbs only the arbiter's: so a
+    /// statement re-parsed from its tuples or rewritten from its `SELECT`
+    /// carries it (`executor::InsertConflict`).
+    pub on_conflict_target: ConflictTarget,
+}
+
+/// The arbiter a `DO NOTHING` names: columns, a constraint, or neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConflictTarget {
+    pub columns: Vec<String>,
+    pub constraint: Option<String>,
+}
+
+impl ConflictTarget {
+    /// Neither columns nor a constraint: every unique key is an arbiter.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.constraint.is_none()
+    }
 }
 
 /// The `DO UPDATE SET … [WHERE …]` of an `INSERT … ON CONFLICT`.
@@ -127,22 +141,22 @@ pub struct ConflictUpdate {
 /// Splits a trailing `ON CONFLICT …` clause off an `INSERT`.
 ///
 /// Returns the statement without the clause, whether it was `DO NOTHING`, the
-/// `DO UPDATE` half when there was one, and the columns a `DO NOTHING` names
-/// as its target.
+/// `DO UPDATE` half when there was one, and what a `DO NOTHING` names as its
+/// target.
 ///
 /// A `RETURNING` after the conflict clause belongs to the statement, not to the
 /// clause, so it is moved back onto the `INSERT`. Cutting at `ON CONFLICT` and
 /// discarding the rest would have dropped it, and the caller would have got no
 /// rows back from a statement that asked for them.
-fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, Vec<String>) {
+fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, ConflictTarget) {
     // The clause is found as `ON CONFLICT` in the uppercased text; a statement
     // that holds it nowhere, in any case, skips the copy. Every `INSERT` asks.
     if !crate::core::sql_scan::contains_ignore_ascii_case(query, b"ON CONFLICT") {
-        return (query.to_string(), false, None, Vec::new());
+        return (query.to_string(), false, None, ConflictTarget::default());
     }
     let upper = query.to_ascii_uppercase();
     let Some(at) = find_top_level(&upper, "ON CONFLICT") else {
-        return (query.to_string(), false, None, Vec::new());
+        return (query.to_string(), false, None, ConflictTarget::default());
     };
 
     let clause = &query[at..];
@@ -161,14 +175,14 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, Vec<
     };
 
     if let Some(do_at) = clause_upper.find("DO NOTHING") {
-        let (target, _) = conflict_target(clause[..do_at].trim());
-        return (rebuilt, true, None, target);
+        let (columns, constraint) = conflict_target(clause[..do_at].trim());
+        return (rebuilt, true, None, ConflictTarget { columns, constraint });
     }
 
     let Some(do_at) = clause_upper.find("DO UPDATE") else {
         // Neither form: leave the statement alone so it is reported rather than
         // silently treated as one of them.
-        return (query.to_string(), false, None, Vec::new());
+        return (query.to_string(), false, None, ConflictTarget::default());
     };
 
     let (arbiter, constraint) = conflict_target(clause[..do_at].trim());
@@ -176,7 +190,7 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, Vec<
     let after_do = &clause[do_at + "DO UPDATE".len()..];
     let after_do_upper = &clause_upper[do_at + "DO UPDATE".len()..];
     let Some(set_at) = after_do_upper.find("SET") else {
-        return (query.to_string(), false, None, Vec::new());
+        return (query.to_string(), false, None, ConflictTarget::default());
     };
     let body = &after_do[set_at + "SET".len()..];
     let body_upper = &after_do_upper[set_at + "SET".len()..];
@@ -198,7 +212,7 @@ fn split_on_conflict(query: &str) -> (String, bool, Option<ConflictUpdate>, Vec<
             assignments,
             where_clause,
         }),
-        Vec::new(),
+        ConflictTarget::default(),
     )
 }
 
@@ -739,20 +753,23 @@ mod strip_comment_tests {
 mod conflict_target_tests {
     use super::split_on_conflict;
 
-    /// `DO NOTHING` keeps its target's columns now (the partitioned-table
-    /// check reads them), `DO UPDATE` its arbiter, and `ON CONSTRAINT` its
-    /// name; `RETURNING` still moves back onto the statement.
+    /// `DO NOTHING` keeps its target's columns or constraint (the target
+    /// checks and the arbiter rule read them), `DO UPDATE` its arbiter, and
+    /// `ON CONSTRAINT` its name; `RETURNING` still moves back onto the
+    /// statement.
     #[test]
     fn each_form_keeps_its_target() {
         let (sql, nothing, update, target) =
             split_on_conflict("INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT (\"a\", B) DO NOTHING RETURNING a");
         assert_eq!(sql, "INSERT INTO t (a, b) VALUES (1, 2) RETURNING a");
         assert!(nothing && update.is_none());
-        assert_eq!(target, vec!["a".to_string(), "B".to_string()]);
+        assert_eq!(target.columns, vec!["a".to_string(), "B".to_string()]);
+        assert_eq!(target.constraint, None);
 
         let (_, nothing, update, target) =
             split_on_conflict("INSERT INTO t (a) VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING");
-        assert!(nothing && update.is_none() && target.is_empty(), "a name is not a column list");
+        assert!(nothing && update.is_none() && target.columns.is_empty(), "a name is not a column list");
+        assert_eq!(target.constraint.as_deref(), Some("t_pkey"), "the name is kept for the arbiter");
 
         let (_, _, update, _) = split_on_conflict(
             "INSERT INTO t (a, n) VALUES (1, 2) ON CONFLICT ON CONSTRAINT \"t_pkey\" DO UPDATE SET n = EXCLUDED.n WHERE t.n < 5",

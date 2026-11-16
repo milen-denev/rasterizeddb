@@ -2170,7 +2170,7 @@ async fn a_write_upgrades_a_scan_only_instance_before_its_ticket() {
         table_name: "pt".into(),
         query: "INSERT INTO pt (tenant_id, id, v) VALUES (3, 77, 99977)".into(),
         on_conflict_do_nothing: false,
-        on_conflict_target: Vec::new(),
+        on_conflict_target: Default::default(),
         on_conflict_update: None,
     });
     let row = crate::core::rql::lexer_ir::insert_row_with_defaults(&qp, &t.shell().schema.fields, &[], &[], 0).unwrap();
