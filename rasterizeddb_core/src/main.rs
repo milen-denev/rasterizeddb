@@ -1264,15 +1264,27 @@ fn main() -> std::io::Result<()> {
             config.location.as_deref().unwrap_or("/mnt/Volume4/test_db")
         };
 
+        // `--restore-to` writes somewhere else and exits: it opens nothing at
+        // the location, so it does not need one.
+        #[cfg(feature = "s3_backup")]
+        let standalone_restore = args.backup.restore_to.is_some();
+        #[cfg(not(feature = "s3_backup"))]
+        let standalone_restore = false;
         #[cfg(not(debug_assertions))]
         let db_location = if args.in_memory {
             ""
         } else {
-            config
-                .location
-                .as_deref()
-                .expect("Database location must be provided with --location <path> unless --in-memory is set")
+            match config.location.as_deref() {
+                Some(location) => location,
+                None if standalone_restore => "",
+                None => {
+                    eprintln!("error: --location <PATH> is required unless --in-memory or --restore-to is given");
+                    std::process::exit(2);
+                }
+            }
         };
+        #[cfg(debug_assertions)]
+        let _ = standalone_restore;
 
         // Before anything opens a table: a restore rewrites the files the
         // engine is about to memory-map, and the WAL recovery that

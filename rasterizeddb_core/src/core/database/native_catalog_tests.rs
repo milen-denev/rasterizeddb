@@ -73,9 +73,23 @@ async fn native_statements_checkpoint_a_table() {
         let r = native(&open, false, sql).await;
         assert_ne!(r.first(), Some(&3), "{sql}: {}", String::from_utf8_lossy(&r));
     }
-    let r = native(&open, false, "SELECT rdb_index_checkpoint('charges')").await;
-    assert_eq!(r.first(), Some(&2), "{}", String::from_utf8_lossy(&r));
-    assert_eq!(the_line(&r), "1 of 1 clean");
+    // A new table's index is built in the background, and a checkpoint that
+    // meets it still building says so ("an index is not ready") rather than
+    // sealing it: asked until it is sealed, within a bound, as a caller would.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let r = native(&open, false, "SELECT rdb_index_checkpoint('charges')").await;
+        assert_eq!(r.first(), Some(&2), "{}", String::from_utf8_lossy(&r));
+        let line = the_line(&r);
+        if line == "1 of 1 clean" {
+            break;
+        }
+        assert!(
+            line.contains("not ready") && std::time::Instant::now() < deadline,
+            "never sealed: {line}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     // Sealed already: still clean, nothing new to write.
     let again = native(&open, false, "select rdb_index_checkpoint('charges'::regclass);").await;
     assert_eq!(the_line(&again), "1 of 1 clean");

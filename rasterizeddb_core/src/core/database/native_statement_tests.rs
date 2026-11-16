@@ -256,3 +256,30 @@ async fn on_conflict_absorbs_its_arbiter_alone_on_a_partitioned_table() {
     );
     assert_eq!(rows(&c, "SELECT rid FROM p").await.len(), 2);
 }
+
+/// A boolean literal as a predicate, or as one side of one: what a query
+/// builder writes for an empty `IN` list or an always-true filter. They
+/// failed with "Unexpected end of token stream" from the planner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boolean_literals_are_predicates() {
+    let (_dir, db) = database().await;
+    let c = context(&db, false);
+    ok(&c, "CREATE TABLE s (id BIGINT PRIMARY KEY, v TEXT)").await;
+    ok(&c, "INSERT INTO s (id, v) VALUES (1, 'a'), (2, 'b')").await;
+    for (sql, expected) in [
+        ("SELECT id FROM s WHERE false", 0),
+        ("SELECT id FROM s WHERE true", 2),
+        ("SELECT id FROM s WHERE FALSE", 0),
+        ("SELECT id FROM s WHERE (id = 1) OR (false)", 1),
+        ("SELECT id FROM s WHERE (id = 1) AND (true)", 1),
+        ("SELECT id FROM s WHERE id = 1 OR false", 1),
+        ("SELECT id FROM s WHERE NOT false", 2),
+        ("SELECT id FROM s WHERE false OR v = 'b'", 1),
+        ("SELECT id FROM s WHERE 1 = 0", 0),
+    ] {
+        assert_eq!(rows(&c, sql).await.len(), expected, "{sql}");
+    }
+    assert_eq!(affected(&c, "UPDATE s SET v = 'z' WHERE false").await, 0);
+    assert_eq!(affected(&c, "DELETE FROM s WHERE false").await, 0);
+    assert_eq!(rows(&c, "SELECT id FROM s").await.len(), 2);
+}

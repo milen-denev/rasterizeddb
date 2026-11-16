@@ -1043,6 +1043,16 @@ impl TcpServer {
             RastcpError::Tls(e) => {
                 warn!("TLS error from {}: {}", peer_addr, e);
             }
+            // No complete request within the timeout: almost always a
+            // connection that sat idle, which a pooled client's spare
+            // connections do all day (on a plain connection, a peer stalled
+            // part-way through a frame reads the same). Logged at ERROR, it
+            // was a line a minute per idle connection for nothing wrong. The
+            // client's next request opens another (`MuxClient::send`,
+            // `reconnect_when_idle_closed`).
+            RastcpError::ConnectionTimeout => {
+                debug!("Closed a connection that sent no complete request within the timeout: {}", peer_addr);
+            }
             e => {
                 error!("Error reading from {}: {}", peer_addr, e);
             }
