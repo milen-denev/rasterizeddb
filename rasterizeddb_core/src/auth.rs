@@ -976,7 +976,11 @@ pub enum RoleStatement {
 /// else.
 pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_ascii_uppercase();
+    // Keywords and flags are read from the text with its string literals
+    // emptied. Read from the whole text, a password was searched too, so
+    // `CREATE ROLE app LOGIN PASSWORD 'x NOLOGIN SUPERUSER'` made a superuser
+    // that could not log in.
+    let upper = without_string_literals(trimmed).to_ascii_uppercase();
 
     let is_role_word = |word: &str| word == "ROLE" || word == "USER";
     let mut words = upper.split_whitespace();
@@ -1033,12 +1037,46 @@ pub fn parse_role_statement(sql: &str) -> Option<Result<RoleStatement, String>> 
     }
 }
 
+/// `sql` with the inside of every single-quoted literal removed (`'x'` becomes
+/// `''`), so no keyword search can match inside one.
+fn without_string_literals(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '\'' {
+            continue;
+        }
+        // Inside a literal: skip to its closing quote, a doubled one being an
+        // escaped quote.
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    continue;
+                }
+                out.push('\'');
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Reads the quoted value after `PASSWORD`, or `None` for `PASSWORD NULL`.
 fn extract_password(sql: &str) -> Result<Option<String>, String> {
-    let upper = sql.to_ascii_uppercase();
-    let Some(at) = upper.find("PASSWORD") else {
+    // The keyword is found outside literals, where it is one: a role name or
+    // an earlier literal holding the word must not move the search.
+    let outside = without_string_literals(sql);
+    let Some(at) = outside.to_ascii_uppercase().find("PASSWORD") else {
         return Ok(None);
     };
+    // The offset is `sql`'s too only when no literal comes before the
+    // keyword, which this grammar never has; anything else is refused rather
+    // than read from the wrong place.
+    if sql.get(..at) != Some(&outside[..at]) {
+        return Err("PASSWORD must follow the role name".to_string());
+    }
     let rest = sql[at + "PASSWORD".len()..].trim();
 
     if rest.to_ascii_uppercase().starts_with("NULL") {
@@ -1048,21 +1086,21 @@ fn extract_password(sql: &str) -> Result<Option<String>, String> {
         return Err("PASSWORD must be given as a quoted string".to_string());
     };
 
-    // A doubled quote inside the literal is an escaped quote.
-    let bytes = stripped.as_bytes();
+    // A doubled quote inside the literal is an escaped quote. Read as
+    // characters: read as bytes, each byte of a non-ASCII character became a
+    // character of its own and the stored verifier was for another password.
     let mut out = String::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+    let mut chars = stripped.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
                 out.push('\'');
-                i += 2;
+                chars.next();
                 continue;
             }
             return Ok(Some(out));
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        out.push(c);
     }
 
     Err("PASSWORD literal is not terminated".to_string())
@@ -1220,6 +1258,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_password_cannot_set_flags() {
+        // Each flag word inside the password was once read as the flag.
+        let parsed = parse_role_statement("CREATE ROLE esc LOGIN PASSWORD 'pw NOLOGIN SUPERUSER'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parsed,
+            RoleStatement::Create {
+                name: "esc".to_string(),
+                password: Some("pw NOLOGIN SUPERUSER".to_string()),
+                can_login: true,
+                is_superuser: false,
+            }
+        );
+        let parsed = parse_role_statement("CREATE ROLE esc2 PASSWORD 'a LOGIN'").unwrap().unwrap();
+        assert!(matches!(parsed, RoleStatement::Create { can_login: false, is_superuser: false, .. }));
+        let parsed = parse_role_statement("DROP ROLE x").unwrap().unwrap();
+        assert_eq!(parsed, RoleStatement::Drop { name: "x".to_string(), if_exists: false });
+    }
+
+    #[test]
+    fn a_non_ascii_password_is_read_as_written() {
+        let parsed = parse_role_statement("CREATE USER u PASSWORD 'пароль€😀''x'").unwrap().unwrap();
+        match parsed {
+            RoleStatement::Create { password, .. } => {
+                assert_eq!(password.as_deref(), Some("пароль€😀'x"))
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
