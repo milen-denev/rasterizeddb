@@ -548,6 +548,29 @@ impl Migrator {
         {
             return Err(Error::Param(format!("baseline {baseline:?} names no step")));
         }
+        // Every statement of every step is checked before any runs: a step
+        // refused at its third statement would leave its first two
+        // committed and the step unrecorded.
+        for step in &self.steps {
+            for (body, which) in [
+                (Some(&step.body), "step"),
+                (step.down.as_ref(), "down step"),
+            ] {
+                if let Some(Body::Sql(statements)) = body {
+                    for (i, statement) in statements.iter().enumerate() {
+                        crate::params::check_statement(statement).map_err(|e| match e {
+                            Error::Unsupported(m) => Error::Unsupported(format!(
+                                "migration {which} {:?}, statement {}: {m} (list each \
+                                 statement separately in the step)",
+                                step.name,
+                                i + 1
+                            )),
+                            other => other,
+                        })?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1330,6 +1353,43 @@ mod tests {
                 .step("1", &[])
                 .check_names()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_step_that_cannot_run_over_native_is_refused_before_anything_runs() {
+        let refused = |m: Migrator| match m.check_names() {
+            Err(Error::Unsupported(msg)) => msg,
+            other => panic!("{other:?}"),
+        };
+        let msg = refused(Migrator::new().step("1", &["CREATE TABLE a (x INT)"]).step(
+            "2",
+            &[
+                "CREATE TABLE b (x INT)",
+                "INSERT INTO b VALUES (1); INSERT INTO b VALUES (2)",
+            ],
+        ));
+        assert!(msg.contains("\"2\", statement 2"), "{msg}");
+        let msg = refused(Migrator::new().step("1", &["BEGIN"]));
+        assert!(msg.contains("\"1\", statement 1"), "{msg}");
+        let msg = refused(
+            Migrator::new()
+                .step("1", &["CREATE TABLE a (x INT)"])
+                .down(&["DROP TABLE a; DROP TABLE b"]),
+        );
+        assert!(msg.contains("down step \"1\""), "{msg}");
+        // A trailing semicolon, and one inside a literal, are one statement.
+        assert!(
+            Migrator::new()
+                .step(
+                    "1",
+                    &[
+                        "INSERT INTO a VALUES ('x;y');",
+                        "UPDATE a SET x = 1 -- ; no"
+                    ]
+                )
+                .check_names()
+                .is_ok()
         );
     }
 

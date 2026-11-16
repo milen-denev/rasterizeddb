@@ -70,6 +70,14 @@ rollback anyway, so a step that fails part-way runs again from its first
 statement next time: write statements that are safe to repeat
 (`IF NOT EXISTS`), or give each its own step.
 
+Each string in a step is one statement. The server refuses a request
+holding several `;`-separated statements, so list them separately. Before
+anything runs, `plan`, `apply`, `verify` and `rollback_to` check every
+statement of every step and down step, so a step can't fail on its third
+statement after committing its first two. A string with a second
+statement, or one of `BEGIN`/`COMMIT`/`ROLLBACK`, is refused with the
+step's name and the statement's position.
+
 ## Scenarios
 
 | situation | default | to allow it |
