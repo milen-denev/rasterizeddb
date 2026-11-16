@@ -1901,6 +1901,15 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
             },
         );
         push(
+            "rollover_interval_secs",
+            config.rollover_interval_secs.to_string(),
+            if config.rollover_interval_secs == 0 {
+                "0 means the prefix is rolled over only by BACKUP ROLLOVER"
+            } else {
+                "a fresh full snapshot, then every earlier generation deleted"
+            },
+        );
+        push(
             "wal_flush_secs",
             config.wal_flush_secs.to_string(),
             if config.wal_flush_secs == 0 {
@@ -1929,7 +1938,13 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
         push(
             "staged_bytes",
             staged.to_string(),
-            "written but not yet uploaded",
+            &match config.staging_max_bytes {
+                0 => "written but not yet uploaded".to_string(),
+                ceiling => format!(
+                    "written but not yet uploaded; {:.1}% of staging_max_bytes",
+                    staged as f64 * 100.0 / ceiling as f64
+                ),
+            },
         );
         push(
             "staging_max_bytes",
@@ -2006,8 +2021,104 @@ async fn backup_status(database: &Arc<Database>) -> Vec<Row> {
             "the highest commit any archived log bundle covers",
         );
 
+        // What was last tried and how it went. The rows above come from the
+        // catalogue, which only records what succeeded: a bucket refusing
+        // every upload left them reading like a quiet database.
+        for (metric, value, detail) in backup_activity_rows(&service.activity(), config) {
+            push(&metric, value, &detail);
+        }
+
         out
     }
+}
+
+/// The `SHOW BACKUP STATUS` rows for what the backup service last tried: each
+/// operation's last attempt and outcome, the last error, and when each
+/// schedule next fires. Metric, value, detail.
+#[cfg(feature = "s3_backup")]
+pub(crate) fn backup_activity_rows(
+    activity: &crate::core::backup::activity::Activity,
+    config: &crate::core::backup::BackupConfig,
+) -> Vec<(String, String, String)> {
+    use crate::core::backup::activity::{Next, Operation};
+    use crate::core::backup::timeutil::format_rfc3339;
+
+    let mut out = Vec::new();
+    let mut push = |metric: &str, value: String, detail: &str| {
+        out.push((metric.to_string(), value, detail.to_string()));
+    };
+
+    for operation in [Operation::Snapshot, Operation::WalFlush, Operation::Rollover] {
+        let name = operation.name();
+        match activity.attempt(operation) {
+            None => {
+                push(
+                    &format!("last_{name}_attempt_at"),
+                    "none".to_string(),
+                    "nothing attempted since this server started",
+                );
+                push(&format!("last_{name}_outcome"), "none".to_string(), "");
+            }
+            Some(attempt) => {
+                push(
+                    &format!("last_{name}_attempt_at"),
+                    format_rfc3339(attempt.started_at),
+                    &match attempt.finished_at {
+                        Some(at) => format!("finished {}", format_rfc3339(at)),
+                        None => "still running".to_string(),
+                    },
+                );
+                match &attempt.outcome {
+                    None => push(&format!("last_{name}_outcome"), "running".to_string(), ""),
+                    Some(Ok(summary)) => push(&format!("last_{name}_outcome"), "ok".to_string(), summary),
+                    Some(Err(message)) => push(&format!("last_{name}_outcome"), "failed".to_string(), message),
+                }
+            }
+        }
+    }
+
+    match &activity.last_error {
+        None => {
+            push(
+                "last_error",
+                "none".to_string(),
+                "no snapshot, log flush or rollover has failed since this server started",
+            );
+            push("last_error_at", "none".to_string(), "");
+        }
+        Some(failure) => {
+            push("last_error", failure.message.clone(), failure.operation.name());
+            push("last_error_at", format_rfc3339(failure.at), failure.operation.name());
+        }
+    }
+
+    for (operation, interval, knob) in [
+        (Operation::Snapshot, config.snapshot_interval_secs, "snapshot_interval_secs"),
+        (Operation::WalFlush, config.wal_flush_secs, "wal_flush_secs"),
+        (Operation::Rollover, config.rollover_interval_secs, "rollover_interval_secs"),
+    ] {
+        let (value, detail) = match activity.next(operation) {
+            Next::At(at) => (
+                format_rfc3339(at),
+                match operation {
+                    Operation::Snapshot => activity.next_snapshot_reason.clone().unwrap_or_default(),
+                    _ => String::new(),
+                },
+            ),
+            Next::Now => ("running now".to_string(), String::new()),
+            Next::NotScheduled if interval == 0 => (
+                "not scheduled".to_string(),
+                format!("{knob} is 0: only when asked for"),
+            ),
+            Next::NotScheduled => (
+                "not scheduled".to_string(),
+                "the schedule is not running in this process".to_string(),
+            ),
+        };
+        push(&format!("next_{}_at", operation.name()), value, &detail);
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------

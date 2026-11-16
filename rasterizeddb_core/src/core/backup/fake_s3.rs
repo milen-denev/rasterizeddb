@@ -25,6 +25,10 @@ pub struct Store {
     next_upload: u64,
     /// Requests served, for tests that count round trips.
     pub requests: u64,
+    /// Answer every write (PUT, POST, DELETE) with 403 AccessDenied, as a
+    /// bucket whose policy stopped allowing this server would. Reads still
+    /// work. For a server of a test's own ([`start`]), never [`shared`].
+    pub refuse_writes: bool,
 }
 
 pub struct FakeS3 {
@@ -241,6 +245,9 @@ fn handle(
 
     let mut store = store.lock();
     store.requests += 1;
+    if store.refuse_writes && method != "GET" && method != "HEAD" {
+        return Reply::new(403, "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>");
+    }
 
     match (method, key.is_empty()) {
         ("GET", true) if query.contains_key("uploads") => {

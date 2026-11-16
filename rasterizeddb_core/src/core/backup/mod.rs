@@ -81,6 +81,9 @@ use std::time::Duration;
 use log::{debug, error, info, warn};
 use tokio::sync::{RwLock, Semaphore};
 
+pub mod activity;
+#[cfg(all(test, feature = "s3_backup"))]
+mod activity_tests;
 pub mod archive;
 pub mod cold;
 pub mod manifest;
@@ -422,6 +425,9 @@ pub struct BackupService {
     /// pool file stopped parsing cannot be named, and its log kept staging
     /// past the ceiling that exists to protect the disk.
     attached: std::sync::Mutex<Vec<std::sync::Weak<crate::core::wal::Wal>>>,
+    /// The last attempt of each operation and the next scheduled one, for
+    /// `SHOW BACKUP STATUS`; see [`activity`].
+    activity: activity::ActivityLog,
 }
 
 impl BackupService {
@@ -492,6 +498,7 @@ impl BackupService {
             shutting_down: AtomicBool::new(false).into(),
             archiving_suspended: AtomicBool::new(false).into(),
             attached: std::sync::Mutex::new(Vec::new()),
+            activity: Default::default(),
         });
 
         // Sweep first, then hook, and the order is load-bearing rather than
@@ -876,6 +883,22 @@ impl BackupService {
     /// deletes every older generation.
     async fn take_snapshot(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
         let _one_at_a_time = self.snapshot_lock.lock().await;
+        let attempt = self.activity.begin(activity::Operation::Snapshot);
+        let result = self.take_snapshot_locked(full).await;
+        attempt.finish(&result, |report| {
+            format!(
+                "{}: {} files, {} bytes compressed, in {:.1}s",
+                report.id,
+                report.file_count,
+                report.compressed_bytes,
+                report.elapsed.as_secs_f64()
+            )
+        });
+        result
+    }
+
+    /// [`Self::take_snapshot`] once it holds `snapshot_lock`.
+    async fn take_snapshot_locked(self: &Arc<Self>, full: bool) -> io::Result<SnapshotReport> {
         let started = std::time::Instant::now();
         let started_at = timeutil::now_unix();
 
@@ -1171,6 +1194,12 @@ impl BackupService {
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum()
+    }
+
+    /// The last attempt of each operation, the last error and the next
+    /// scheduled runs.
+    pub fn activity(&self) -> activity::Activity {
+        self.activity.snapshot()
     }
 
     /// True while checkpoints have been told to stop staging.
@@ -1766,13 +1795,20 @@ impl BackupService {
         // still the result, so the caller learns which database is not covered.
         let cut = self.checkpoint_all_logs().await;
         let uploaded = self.flush_staged_segments().await;
-        match (cut, uploaded) {
+        let result = match (cut, uploaded) {
             (Ok(()), uploaded) => uploaded,
             (Err(cut), Ok(_)) => Err(cut),
             (Err(cut), Err(upload)) => Err(io::Error::other(format!(
                 "{cut}; and uploading the segments that were staged failed too: {upload}"
             ))),
+        };
+        // The upload recorded its own outcome; a cut that failed is this
+        // flush failing too, and the status has to say so, as the caller is
+        // told.
+        if let Err(e) = &result {
+            self.activity.fail_last(activity::Operation::WalFlush, e.to_string());
         }
+        result
     }
 
     /// Cuts every log under this location, so its records reach staging.
@@ -1853,7 +1889,27 @@ impl BackupService {
     /// and without an earlier one.
     async fn flush_staged_segments(self: &Arc<Self>) -> io::Result<ArchiveReport> {
         let _one_at_a_time = self.archive_lock.lock().await;
+        let attempt = self.activity.begin(activity::Operation::WalFlush);
+        let result = self.flush_staged_segments_locked().await;
+        attempt.finish(&result, |report| {
+            if report.bundles == 0 {
+                "nothing staged".to_string()
+            } else {
+                format!(
+                    "{} bundle(s), {} segment(s), {} bytes compressed, LSN {}..{}",
+                    report.bundles,
+                    report.segments,
+                    report.compressed_bytes,
+                    report.first_lsn,
+                    report.last_lsn
+                )
+            }
+        });
+        result
+    }
 
+    /// [`Self::flush_staged_segments`] once it holds `archive_lock`.
+    async fn flush_staged_segments_locked(self: &Arc<Self>) -> io::Result<ArchiveReport> {
         let cut = self.cut_together().await;
         let staged = self.staged_by_stream()?;
         if cut.is_none() && staged.iter().all(|(_, paths)| paths.is_empty()) {
@@ -2221,6 +2277,15 @@ impl BackupService {
     /// was rather than leaving the bucket empty — the one outcome worse than a
     /// stale backup is no backup.
     pub async fn rollover_now(self: &Arc<Self>) -> io::Result<(SnapshotReport, u32)> {
+        let attempt = self.activity.begin(activity::Operation::Rollover);
+        let result = self.roll_over().await;
+        attempt.finish(&result, |(report, removed)| {
+            format!("{} kept, {} object(s) from earlier generations removed", report.id, removed)
+        });
+        result
+    }
+
+    async fn roll_over(self: &Arc<Self>) -> io::Result<(SnapshotReport, u32)> {
         // Full, never incremental: the prune below removes every older
         // generation, and a snapshot that reused their objects would lose them.
         let report = self.take_snapshot(true).await?;
@@ -2310,11 +2375,14 @@ impl BackupService {
                     None => Duration::ZERO,
                 };
                 loop {
+                    service.activity.schedule(activity::Operation::WalFlush, next_after(delay));
                     tokio::time::sleep(delay).await;
                     delay = interval;
                     if service.shutting_down.load(Ordering::Acquire) {
+                        service.activity.schedule(activity::Operation::WalFlush, activity::Next::NotScheduled);
                         return;
                     }
+                    service.activity.schedule(activity::Operation::WalFlush, activity::Next::Now);
                     // Cut the log first, so the interval means "recoverable to
                     // within this long" rather than "whatever happened to have
                     // been checkpointed".
@@ -2355,11 +2423,24 @@ impl BackupService {
                     Some(_) if interval.is_zero() => None,
                     Some(last) => Some(first_delay(interval, last)),
                 };
+                let mut retrying = false;
                 while let Some(wait) = delay {
+                    service.activity.schedule_snapshot(
+                        next_after(wait),
+                        retrying.then(|| {
+                            format!(
+                                "retrying the base snapshot after a failure, backing off up to {}s; \
+                                 there is nothing to restore from until one succeeds",
+                                retry_ceiling.as_secs()
+                            )
+                        }),
+                    );
                     tokio::time::sleep(wait).await;
                     if service.shutting_down.load(Ordering::Acquire) {
+                        service.activity.schedule_snapshot(activity::Next::NotScheduled, None);
                         return;
                     }
+                    service.activity.schedule_snapshot(activity::Next::Now, None);
                     let failed = match service.snapshot_now().await {
                         Ok(_) => false,
                         Err(e) => {
@@ -2373,7 +2454,8 @@ impl BackupService {
                     // away, by default. Backing off doubles the wait, so a
                     // bucket that is simply misconfigured is not re-uploading
                     // the whole database every minute.
-                    delay = if failed && service.last_snapshot_at().await.is_none() {
+                    retrying = failed && service.last_snapshot_at().await.is_none();
+                    delay = if retrying {
                         let wait = retry;
                         retry = (retry * 2).min(retry_ceiling);
                         Some(wait)
@@ -2384,6 +2466,7 @@ impl BackupService {
                         Some(interval)
                     };
                 }
+                service.activity.schedule_snapshot(activity::Next::NotScheduled, None);
             });
         }
 
@@ -2400,11 +2483,14 @@ impl BackupService {
                     None => interval,
                 };
                 loop {
+                    service.activity.schedule(activity::Operation::Rollover, next_after(delay));
                     tokio::time::sleep(delay).await;
                     delay = interval;
                     if service.shutting_down.load(Ordering::Acquire) {
+                        service.activity.schedule(activity::Operation::Rollover, activity::Next::NotScheduled);
                         return;
                     }
+                    service.activity.schedule(activity::Operation::Rollover, activity::Next::Now);
                     // A failure is logged and the old generation is kept: the
                     // next rollover tries again, and until one succeeds there is
                     // still something to restore from.
@@ -2830,12 +2916,11 @@ fn new_encoder<W: Write>(
     Ok(encoder)
 }
 
-/// Whether the staging ceiling calls for a state change.
-///
-/// `Some(true)` means suspend, `Some(false)` means resume, `None` means leave
-/// it alone. Resumption uses half the ceiling rather than the ceiling itself,
-/// so a directory hovering at the limit does not flap between the two states
-/// once per tick.
+/// The time a task sleeping `delay` from now wakes, rounded up to a second.
+fn next_after(delay: Duration) -> activity::Next {
+    activity::Next::At(timeutil::now_unix() + delay.as_secs() + u64::from(delay.subsec_nanos() > 0))
+}
+
 /// How long a task that runs every `interval` should wait before its first run,
 /// given the unix second its last run finished.
 ///
@@ -2856,6 +2941,12 @@ fn first_delay(interval: Duration, last_finished_at: u64) -> Duration {
     interval.saturating_sub(elapsed)
 }
 
+/// Whether the staging ceiling calls for a state change.
+///
+/// `Some(true)` means suspend, `Some(false)` means resume, `None` means leave
+/// it alone. Resumption uses half the ceiling rather than the ceiling itself,
+/// so a directory hovering at the limit does not flap between the two states
+/// once per tick.
 fn staging_action(staged: u64, ceiling: u64, suspended: bool) -> Option<bool> {
     if ceiling == 0 {
         // No ceiling configured. A service already suspended is still allowed
@@ -3457,6 +3548,7 @@ mod tests {
             shutting_down: CacheGuard::new(AtomicBool::new(false)),
             archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
             attached: std::sync::Mutex::new(Vec::new()),
+            activity: Default::default(),
         });
         service.attach_to_logs().unwrap();
 
@@ -3524,6 +3616,7 @@ mod tests {
             shutting_down: CacheGuard::new(AtomicBool::new(false)),
             archiving_suspended: CacheGuard::new(AtomicBool::new(false)),
             attached: std::sync::Mutex::new(Vec::new()),
+            activity: Default::default(),
         })
     }
 

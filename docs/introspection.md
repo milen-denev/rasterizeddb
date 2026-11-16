@@ -249,6 +249,37 @@ like.
 archived bundle covers, which is the real answer to "how far forward can I
 recover", and which `SHOW BACKUPS` makes you work out by reading every row.
 
+### What was last tried
+
+The catalogue only records what succeeded. A snapshot or a log upload that
+failed leaves no entry, so the rows above read the same for a bucket that has
+been refusing uploads for a day as for a database nobody wrote to. These rows
+come from the service itself:
+
+| metric | value | detail |
+|---|---|---|
+| `last_snapshot_attempt_at` | start time, or `none` | `finished <time>`, or `still running` |
+| `last_snapshot_outcome` | `ok`, `failed`, `running` or `none` | the snapshot's id, files, bytes and time; or the error |
+| `last_wal_flush_attempt_at` / `last_wal_flush_outcome` | the same, for uploads of the staged log | bundles, segments, bytes and LSN range; `nothing staged`; or the error |
+| `last_rollover_attempt_at` / `last_rollover_outcome` | the same, for rollovers | the snapshot kept and how many objects were removed; or the error |
+| `last_error` | the newest failure's text, or `none` | which operation failed |
+| `last_error_at` | when it failed | which operation failed |
+| `next_snapshot_at` / `next_wal_flush_at` / `next_rollover_at` | when the schedule next fires, `running now`, or `not scheduled` | why: the interval is 0, or the base snapshot is being retried after a failure |
+
+A snapshot counts whoever asked for it: `BACKUP DATABASE`, the schedule, or a
+rollover, which takes one first. A log flush counts every upload of the staged
+log, including the one each snapshot makes on its way. An attempt that never
+finished, because the statement running it was cancelled or the server stopped,
+reads `failed` with `abandoned before it finished`, not `running`.
+
+`last_error` stays after the operation that failed starts working again, so an
+operator can still read what went wrong. It changes only when something else
+fails.
+
+All of it describes this process. After a restart every attempt reads `none`
+until the first one runs. The catalogue rows above still say what was last
+achieved.
+
 ## `SHOW REPLICATION STATS` and `SHOW REPLICATION PEER STATUS`
 
 `SHOW REPLICATION`, `... STATUS`, `... PEERS` and `... SETTINGS` return lines of
