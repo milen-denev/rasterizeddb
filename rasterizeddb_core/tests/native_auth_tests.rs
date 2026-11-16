@@ -564,8 +564,18 @@ mod unix_socket {
             }
             assert!(!server.is_finished(), "a group-only socket with trust was refused");
 
+            // The listener binds the file (it appears with the umask's mode)
+            // and only then sets the mode asked for; read before that and the
+            // test sees the umask's. Wait for the mode, bounded.
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o660);
+            let mode = || std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            for _ in 0..200 {
+                if mode() == 0o660 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            assert_eq!(mode(), 0o660);
 
             let client = DbClient::new_multiplexed(Some(&format!("unix:{}", path.display())))
                 .await

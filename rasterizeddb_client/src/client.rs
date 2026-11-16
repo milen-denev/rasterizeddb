@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use rastcp::client::TcpClientBuilder;
 use rastcp::mux::MuxClient;
@@ -38,6 +38,18 @@ pub struct Options {
     /// client connects (the default), only verify that nothing is pending, or
     /// leave them to [`Client::migrate`].
     pub auto_migrate: crate::orm::AutoMigrate,
+    /// A connection quiet for this long is reopened before a statement is
+    /// sent on it (default 20 s; `None` never does).
+    ///
+    /// The server closes a connection that has been idle for its request
+    /// timeout (30 s). A statement written in the instant it does is lost
+    /// with the connection and fails with [`Error::Transport`], and is not
+    /// sent again, because whether it ran is unknown. Reopening first, well
+    /// inside the server's limit, means no statement is ever sent on a
+    /// connection the server may be closing. It costs one handshake after a
+    /// quiet spell and no traffic while idle. A connection with a statement in
+    /// flight is never reopened under it.
+    pub idle_reconnect: Option<Duration>,
 }
 
 impl Default for Options {
@@ -49,6 +61,69 @@ impl Default for Options {
             max_message_size: 8 * 1024 * 1024,
             migrations: None,
             auto_migrate: crate::orm::AutoMigrate::Apply,
+            idle_reconnect: Some(DEFAULT_IDLE_RECONNECT),
+        }
+    }
+}
+
+/// [`Options::idle_reconnect`]'s default: two thirds of the server's 30 s
+/// idle limit, leaving room for clock and scheduling slack.
+pub const DEFAULT_IDLE_RECONNECT: Duration = Duration::from_secs(20);
+
+/// One multiplexed connection, and what deciding to reopen it needs.
+struct Connection {
+    mux: MuxClient,
+    /// Senders hold it shared for a statement's whole round trip; a reopen
+    /// takes it exclusively, and only when it can at once, so a connection is
+    /// never closed under a statement in flight.
+    gate: tokio::sync::RwLock<()>,
+    /// Statements in flight.
+    in_flight: AtomicUsize,
+    /// When the connection was last used (sent on, or answered), in µs since
+    /// [`Client::epoch`].
+    last_used: AtomicU64,
+}
+
+/// Counts a statement in flight, and marks the connection used when it ends,
+/// however it ends (a dropped future included).
+struct InFlight<'a> {
+    connection: &'a Connection,
+    epoch: Instant,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.connection.touch(self.epoch);
+        self.connection.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Connection {
+    fn touch(&self, epoch: Instant) {
+        self.last_used
+            .store(epoch.elapsed().as_micros() as u64, Ordering::Release);
+    }
+
+    fn idle_for(&self, epoch: Instant) -> Duration {
+        let now = epoch.elapsed().as_micros() as u64;
+        Duration::from_micros(now.saturating_sub(self.last_used.load(Ordering::Acquire)))
+    }
+
+    /// Closes the connection if nothing is in flight and it has been quiet for
+    /// `limit`; the next send opens a new one. A sender holding the gate, or
+    /// one arriving meanwhile, makes this give up: that connection is in use,
+    /// so the server is not closing it either.
+    async fn reopen_if_idle(&self, limit: Duration, epoch: Instant) {
+        if self.in_flight.load(Ordering::Acquire) != 0 || self.idle_for(epoch) < limit {
+            return;
+        }
+        let Ok(_exclusive) = self.gate.try_write() else {
+            return;
+        };
+        if self.in_flight.load(Ordering::Acquire) == 0 && self.idle_for(epoch) >= limit {
+            // The connection is marked down; the send that follows dials anew.
+            self.mux.close().await;
+            self.touch(epoch);
         }
     }
 }
@@ -62,8 +137,11 @@ impl Default for Options {
 /// sent twice: a statement whose connection fails returns
 /// [`Error::Transport`], and whether it ran is unknown.
 pub struct Client {
-    connections: Vec<MuxClient>,
+    connections: Vec<Connection>,
     next: AtomicUsize,
+    idle_reconnect: Option<Duration>,
+    /// The clock [`Connection::last_used`] counts from.
+    epoch: Instant,
 }
 
 impl Client {
@@ -92,13 +170,20 @@ impl Client {
             if let Some(authenticator) = &authenticator {
                 builder = builder.authenticator(authenticator.clone());
             }
-            let client = builder.build_multiplexed().await?;
-            client.connect().await?;
-            connections.push(client);
+            let mux = builder.build_multiplexed().await?;
+            mux.connect().await?;
+            connections.push(Connection {
+                mux,
+                gate: tokio::sync::RwLock::new(()),
+                in_flight: AtomicUsize::new(0),
+                last_used: AtomicU64::new(0),
+            });
         }
         let client = Client {
             connections,
             next: AtomicUsize::new(0),
+            idle_reconnect: options.idle_reconnect,
+            epoch: Instant::now(),
         };
         if let Some(migrator) = &options.migrations {
             use crate::orm::AutoMigrate;
@@ -121,10 +206,12 @@ impl Client {
         Client {
             connections: Vec::new(),
             next: AtomicUsize::new(0),
+            idle_reconnect: None,
+            epoch: Instant::now(),
         }
     }
 
-    fn pick(&self) -> &MuxClient {
+    fn pick(&self) -> &Connection {
         let turn = self.next.fetch_add(1, Ordering::Relaxed);
         &self.connections[turn % self.connections.len()]
     }
@@ -141,7 +228,18 @@ impl Client {
 
     /// Sends text already checked (by [`check_statement`], or by rendering).
     async fn send(&self, sql: &str) -> Result<Rows> {
-        let response = self.pick().send(sql.as_bytes()).await?;
+        let connection = self.pick();
+        if let Some(limit) = self.idle_reconnect {
+            connection.reopen_if_idle(limit, self.epoch).await;
+        }
+        let _shared = connection.gate.read().await;
+        connection.in_flight.fetch_add(1, Ordering::AcqRel);
+        connection.touch(self.epoch);
+        let _in_flight = InFlight {
+            connection,
+            epoch: self.epoch,
+        };
+        let response = connection.mux.send(sql.as_bytes()).await?;
         decode_response(response)
     }
 
@@ -251,15 +349,21 @@ impl Client {
         Ok(rows.rows_affected().unwrap_or(rows.len() as u64))
     }
 
-    /// Whether every connection is open.
+    /// Whether every connection is open right now.
+    ///
+    /// Not a health check: a connection the server closed after a quiet
+    /// spell, or one [`Options::idle_reconnect`] retired, is closed until
+    /// the next statement on it reopens it, which happens by itself. A client
+    /// that answers `false` here works; one whose server is gone fails its
+    /// next statement with [`Error::Transport`].
     pub fn is_connected(&self) -> bool {
-        self.connections.iter().all(MuxClient::is_connected)
+        self.connections.iter().all(|c| c.mux.is_connected())
     }
 
     /// Closes every connection.
     pub async fn close(&self) {
         for connection in &self.connections {
-            connection.close().await;
+            connection.mux.close().await;
         }
     }
 }
