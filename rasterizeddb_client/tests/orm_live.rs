@@ -1282,3 +1282,104 @@ async fn writes_return_rows_as_stored() {
     })
     .await
 }
+
+// ------------------------------------------------------------------ hooks
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "people", hooks)]
+struct Person {
+    #[rdb(primary_key)]
+    id: i64,
+    email: String,
+    frozen: bool,
+    #[rdb(skip)]
+    domain: String,
+}
+
+impl rasterizeddb_client::orm::ModelHooks for Person {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.email.contains('@') {
+            Ok(())
+        } else {
+            Err(format!("{:?} is not an email", self.email))
+        }
+    }
+    fn before_update(&self) -> Result<()> {
+        if self.frozen {
+            return Err(Error::Unsupported(format!("person {} is frozen", self.id)));
+        }
+        Ok(())
+    }
+    fn after_load(&mut self) {
+        self.domain = self.email.split('@').nth(1).unwrap_or("").to_string();
+    }
+}
+
+fn person(id: i64, email: &str, frozen: bool) -> Person {
+    Person {
+        id,
+        email: email.into(),
+        frozen,
+        domain: String::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hooks_validate_veto_and_load() {
+    bounded(async {
+        let Some(server) = server("hooks").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Person>().await.unwrap();
+        let counting = Counting::new(&c);
+
+        let e = counting
+            .insert(&person(1, "nope", false))
+            .await
+            .unwrap_err();
+        assert!(e.is_invalid(), "{e}");
+        let e = counting
+            .insert_many(&[person(2, "a@x.org", false), person(3, "bad", false)])
+            .await
+            .unwrap_err();
+        assert!(e.is_invalid(), "{e}");
+        assert_eq!(counting.take(), 0, "nothing was sent");
+        assert_eq!(
+            Person::query().count(&c).await.unwrap(),
+            0,
+            "not even the valid row"
+        );
+
+        let stored = c
+            .insert(&person(1, "ada@example.org", false))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.domain, "example.org",
+            "after_load on the returned row"
+        );
+        let found: Person = c.find(1i64).await.unwrap().unwrap();
+        assert_eq!(found.domain, "example.org");
+        let listed = Person::query().all(&c).await.unwrap();
+        assert_eq!(listed[0].domain, "example.org");
+        let mut stream = Person::query().stream(&c, 10);
+        assert_eq!(stream.next().await.unwrap().unwrap().domain, "example.org");
+
+        let frozen = c.upsert(&person(4, "f@frozen.io", true)).await;
+        assert!(
+            matches!(frozen, Err(Error::Unsupported(_))),
+            "an upsert may update: both hooks"
+        );
+        let frozen = c.insert(&person(4, "f@frozen.io", true)).await.unwrap();
+        let mut renamed = frozen.clone();
+        renamed.email = "g@frozen.io".into();
+        assert!(matches!(
+            c.update(&renamed).await,
+            Err(Error::Unsupported(_))
+        ));
+        let unchanged: Person = c.find(4i64).await.unwrap().unwrap();
+        assert_eq!(unchanged.email, "f@frozen.io");
+    })
+    .await
+}

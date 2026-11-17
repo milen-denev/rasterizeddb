@@ -256,6 +256,7 @@ impl<'a, E: Executor, M: Model> Upsert<'a, E, M> {
 
     /// The statement awaiting it sends.
     pub fn to_sql(&self) -> Result<String> {
+        self.row.__rdb_before(super::Write::Upsert)?;
         upsert_statement(&[self.row], self.target.as_deref(), &self.action, true)
     }
 }
@@ -283,7 +284,7 @@ impl<'a, E: Executor, M: Model + 'a> IntoFuture for Upsert<'a, E, M> {
                     )
                 }));
             }
-            rows.decode_first()?.ok_or(Error::RowCount {
+            super::decode_model(&rows)?.ok_or(Error::RowCount {
                 expected: "exactly 1",
                 got: 0,
             })
@@ -311,6 +312,7 @@ impl<E, M> fmt::Debug for UpsertNothing<'_, E, M> {
 impl<E: Executor, M: Model> UpsertNothing<'_, E, M> {
     /// The statement awaiting it sends.
     pub fn to_sql(&self) -> Result<String> {
+        self.row.__rdb_before(super::Write::Insert)?;
         upsert_statement(&[self.row], self.target.as_deref(), &Action::Nothing, false)
     }
 }
@@ -322,7 +324,7 @@ impl<'a, E: Executor, M: Model + 'a> IntoFuture for UpsertNothing<'a, E, M> {
     fn into_future(self) -> Self::IntoFuture {
         let sql = self.to_sql();
         let db = self.db;
-        Box::pin(async move { db.run(&sql?).await?.decode_first() })
+        Box::pin(async move { super::decode_model(&db.run(&sql?).await?) })
     }
 }
 
@@ -401,6 +403,13 @@ impl<'a, E: Executor, M: Model> InsertMany<'a, E, M> {
 
     /// The statements awaiting it sends, in order.
     pub fn to_sql(&self) -> Result<Vec<String>> {
+        let write = match &self.conflict {
+            Some((_, action)) if *action != Action::Nothing => super::Write::Upsert,
+            _ => super::Write::Insert,
+        };
+        for row in self.rows {
+            row.__rdb_before(write)?;
+        }
         let Some((target, action)) = &self.conflict else {
             return insert_chunks(self.rows);
         };
@@ -444,7 +453,7 @@ impl<'a, E: Executor, M: Model + 'a> IntoFuture for InsertMany<'a, E, M> {
             }
             let mut out = Vec::new();
             for rows in &answers {
-                out.extend(rows.decode_all::<M>()?);
+                out.extend(super::decode_models::<M>(rows)?);
             }
             Ok(out)
         })

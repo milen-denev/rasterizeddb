@@ -881,3 +881,77 @@ fn the_upsert_builder() {
             .all(|s| s.len() <= INSERT_CHUNK_BYTES || s.matches("), (").count() == 0)
     );
 }
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "people", hooks)]
+struct Person {
+    #[rdb(primary_key)]
+    id: i64,
+    email: String,
+    #[rdb(skip)]
+    domain: String,
+}
+
+impl ModelHooks for Person {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.email.contains('@') {
+            Ok(())
+        } else {
+            Err(format!("{:?} is not an email", self.email))
+        }
+    }
+    fn before_delete(&self) -> Result<()> {
+        if self.id == 1 {
+            Err(Error::Unsupported("person 1 stays".into()))
+        } else {
+            Ok(())
+        }
+    }
+    fn after_load(&mut self) {
+        self.domain = self.email.split('@').nth(1).unwrap_or("").to_string();
+    }
+}
+
+#[tokio::test]
+async fn hooks_run_before_anything_is_sent() {
+    // A client with no connection: anything sent would panic, so each
+    // refusal below is proof that nothing was.
+    let db = crate::Client::detached();
+    let bad = Person {
+        id: 2,
+        email: "nope".into(),
+        domain: String::new(),
+    };
+    for e in [
+        db.insert(&bad).await.unwrap_err(),
+        db.update(&bad).await.unwrap_err(),
+        db.upsert(&bad).await.unwrap_err(),
+        db.upsert(&bad).do_nothing().await.unwrap_err(),
+        db.insert_many(std::slice::from_ref(&bad))
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(e.is_invalid(), "{e}");
+        assert_eq!(e.to_string(), "invalid: people: \"nope\" is not an email");
+    }
+    let one = Person {
+        id: 1,
+        email: "a@b.c".into(),
+        domain: String::new(),
+    };
+    assert!(matches!(db.delete(&one).await, Err(Error::Unsupported(_))));
+    assert!(matches!(
+        db.force_delete(&one).await,
+        Err(Error::Unsupported(_))
+    ));
+
+    use crate::tag;
+    let rows = wire_row(&[
+        (tag::I64, &3i64.to_le_bytes()),
+        (tag::STRING, b"x@example.org"),
+    ]);
+    let read: Vec<Person> = decode_models(&rows).unwrap();
+    assert_eq!(read[0].domain, "example.org", "after_load ran");
+    let plain: Vec<Person> = rows.decode_all().unwrap();
+    assert_eq!(plain[0].domain, "", "FromRow alone does not run it");
+}

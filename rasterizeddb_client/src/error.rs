@@ -57,6 +57,10 @@ pub enum Error {
     /// than the one it was read at. Nothing was written. Read the row again
     /// and retry, or give up.
     Conflict(String),
+    /// A model's [`ModelHooks::validate`](crate::orm::ModelHooks::validate)
+    /// refused the row: nothing was sent. The text names the table and says
+    /// what was wrong.
+    Invalid(String),
 }
 
 impl Error {
@@ -151,6 +155,11 @@ impl Error {
         matches!(self, Error::Conflict(_))
     }
 
+    /// Whether a model's validation refused the row: [`Error::Invalid`].
+    pub fn is_invalid(&self) -> bool {
+        matches!(self, Error::Invalid(_))
+    }
+
     /// Whether a `fetch_one` found no row.
     pub fn is_no_rows(&self) -> bool {
         matches!(self, Error::RowCount { got: 0, .. })
@@ -180,6 +189,7 @@ impl fmt::Display for Error {
                 }
             }
             Error::Conflict(message) => write!(f, "conflict: {message}"),
+            Error::Invalid(message) => write!(f, "invalid: {message}"),
             Error::RowCount { expected, got } => {
                 write!(
                     f,

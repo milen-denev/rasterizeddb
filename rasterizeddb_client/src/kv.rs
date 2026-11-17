@@ -1110,7 +1110,7 @@ impl<M: Model, E: Executor> KvRepo<'_, M, E> {
         data.extend(payload);
         let rows = Rows::decode(data)?;
         let row = rows.get(0).expect("one row");
-        M::from_row(&row).map(Some).map_err(|e| match e {
+        let mut m = M::from_row(&row).map_err(|e| match e {
             Error::Column { index, message } => Error::Column {
                 index,
                 message: format!(
@@ -1120,7 +1120,9 @@ impl<M: Model, E: Executor> KvRepo<'_, M, E> {
                 ),
             },
             other => other,
-        })
+        })?;
+        m.__rdb_after_load();
+        Ok(Some(m))
     }
 
     /// Whether there was one to remove.

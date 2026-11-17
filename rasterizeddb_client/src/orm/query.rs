@@ -571,7 +571,7 @@ impl<M: Model> Select<M> {
     /// The rows of `rows`, and every relation loaded into them; read
     /// before a cursor, they arrive nearest first and are put back in order.
     async fn finish(&self, db: &dyn SendSql, rows: Rows) -> Result<Vec<M>> {
-        let mut out: Vec<M> = rows.decode_all()?;
+        let mut out: Vec<M> = super::decode_models(&rows)?;
         if self.keyset_direction() == Some(Direction::Before) {
             out.reverse();
         }
@@ -672,7 +672,11 @@ impl<M: Model> Select<M> {
     ) -> Result<Vec<M>> {
         let mut out: Vec<M> = order
             .iter()
-            .map(|&i| rows.get(i).expect("in range").decode())
+            .map(|&i| {
+                let mut m: M = rows.get(i).expect("in range").decode()?;
+                m.__rdb_after_load();
+                Ok(m)
+            })
             .collect::<Result<_>>()?;
         for include in &self.includes {
             include.load(db, &mut out).await?;
@@ -795,7 +799,7 @@ impl<M: Model> Select<M> {
         let mut sql = self.delete_sql(false)?;
         sql.push_str(" RETURNING ");
         sql.push_str(&select_list::<M>()?);
-        db.run(&sql).await?.decode_all()
+        super::decode_models(&db.run(&sql).await?)
     }
 
     /// The statement `delete` (or, `force`d, `force_delete`) sends.
@@ -920,6 +924,6 @@ impl<M: Model> Update<M> {
     /// that column itself. Soft-deleted rows are left alone unless the
     /// query says [`with_deleted`](Select::with_deleted).
     pub async fn run<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
-        db.run(&self.to_sql()?).await?.decode_all()
+        super::decode_models(&db.run(&self.to_sql()?).await?)
     }
 }

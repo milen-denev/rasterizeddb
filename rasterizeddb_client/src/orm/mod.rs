@@ -205,6 +205,130 @@ pub trait Model: FromRow + Sized {
     /// Appends column `i`'s text form (see [`crate::kv::text_form`]) to
     /// `out`, for the key/value cache: `false`, writing nothing, for a NULL.
     fn write_text(&self, column: usize, out: &mut Vec<u8>) -> Result<bool>;
+
+    /// Runs the model's [`ModelHooks`] before a write: what the derive
+    /// writes for `#[rdb(hooks)]`. The default does nothing.
+    #[doc(hidden)]
+    fn __rdb_before(&self, write: Write) -> Result<()> {
+        let _ = write;
+        Ok(())
+    }
+
+    /// Runs [`ModelHooks::after_load`] on a row the ORM read: what the
+    /// derive writes for `#[rdb(hooks)]`. The default does nothing.
+    #[doc(hidden)]
+    fn __rdb_after_load(&mut self) {}
+}
+
+/// Checks and reactions a model opts into with `#[rdb(hooks)]` on the
+/// struct, then implements: every method has a default that does nothing.
+///
+/// They run on this side, synchronously, on the row given:
+///
+/// | hook | runs | failing |
+/// |---|---|---|
+/// | [`validate`](Self::validate) | before `insert`, `insert_many` (each row), `upsert`, `update`, `update_many`, `restore` | [`Error::Invalid`], nothing sent |
+/// | [`before_insert`](Self::before_insert) | after `validate`, before `insert`, `insert_many`, `upsert` | its error, nothing sent |
+/// | [`before_update`](Self::before_update) | after `validate`, before `update`, `update_many`, `upsert`, `restore` | its error, nothing sent |
+/// | [`before_delete`](Self::before_delete) | before `delete`, `force_delete` | its error, nothing sent |
+/// | [`after_load`](Self::after_load) | on every row the ORM reads into the model: queries, `find`, relations, pages, streams, the rows writes return, the cache | |
+///
+/// An upsert may insert or update, so it runs both `before_*` hooks. The
+/// bulk `query().update()` and `query().delete()` take no rows, so they run
+/// none.
+///
+/// ```no_run
+/// use rasterizeddb_client::prelude::*;
+/// use rasterizeddb_client::orm::ModelHooks;
+///
+/// #[derive(Model, Debug, Clone)]
+/// #[rdb(hooks)]
+/// struct User {
+///     #[rdb(primary_key, serial)]
+///     id: i64,
+///     email: String,
+///     #[rdb(skip)]
+///     domain: String,
+/// }
+///
+/// impl ModelHooks for User {
+///     fn validate(&self) -> std::result::Result<(), String> {
+///         if self.email.contains('@') { Ok(()) } else { Err(format!("{:?} is not an email", self.email)) }
+///     }
+///     fn after_load(&mut self) {
+///         self.domain = self.email.split('@').nth(1).unwrap_or("").to_string();
+///     }
+/// }
+/// ```
+pub trait ModelHooks {
+    /// Whether the row may be written; the text says what is wrong.
+    fn validate(&self) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    /// Before an insert (or an upsert).
+    fn before_insert(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Before an update (or an upsert, or a restore).
+    fn before_update(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Before a delete.
+    fn before_delete(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// On a row just read.
+    fn after_load(&mut self) {}
+}
+
+/// Which write a row's hooks run before.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Write {
+    Insert,
+    Update,
+    Upsert,
+    Delete,
+}
+
+/// What the derive's `__rdb_before` calls for a model with `#[rdb(hooks)]`.
+#[doc(hidden)]
+pub fn run_hooks<M: Model + ModelHooks>(m: &M, write: Write) -> Result<()> {
+    if write != Write::Delete {
+        m.validate()
+            .map_err(|problem| Error::Invalid(format!("{}: {problem}", M::TABLE)))?;
+    }
+    match write {
+        Write::Insert => m.before_insert(),
+        Write::Update => m.before_update(),
+        Write::Upsert => {
+            m.before_insert()?;
+            m.before_update()
+        }
+        Write::Delete => m.before_delete(),
+    }
+}
+
+/// Every row of `rows` as a model, with [`ModelHooks::after_load`] run.
+pub(crate) fn decode_models<M: Model>(rows: &crate::Rows) -> Result<Vec<M>> {
+    let mut out: Vec<M> = rows.decode_all()?;
+    for m in &mut out {
+        m.__rdb_after_load();
+    }
+    Ok(out)
+}
+
+/// The first row of `rows` as a model, with [`ModelHooks::after_load`] run.
+pub(crate) fn decode_model<M: Model>(rows: &crate::Rows) -> Result<Option<M>> {
+    let mut out: Option<M> = rows.decode_first()?;
+    if let Some(m) = &mut out {
+        m.__rdb_after_load();
+    }
+    Ok(out)
 }
 
 /// The Rust side of a column type: what DDL names it and how it is read.
@@ -809,10 +933,12 @@ pub trait ModelExt: Executor {
     /// Inserts one row and returns it as stored: serial columns and defaults
     /// filled in.
     fn insert<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = insert_sql(&[row]);
+        let sql = row
+            .__rdb_before(Write::Insert)
+            .and_then(|()| insert_sql(&[row]));
         async move {
             let rows = self.run(&sql?).await?;
-            rows.decode_first()?.ok_or(Error::RowCount {
+            decode_model(&rows)?.ok_or(Error::RowCount {
                 expected: "exactly 1",
                 got: 0,
             })
@@ -863,7 +989,9 @@ pub trait ModelExt: Executor {
     /// [`Error::Conflict`] when the row is there at another version,
     /// [`Error::RowCount`] when it is gone.
     fn update<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = update_sql(row);
+        let sql = row
+            .__rdb_before(Write::Update)
+            .and_then(|()| update_sql(row));
         let probe = VersionProbe::of(row);
         async move {
             let rows = self.run(&sql?).await?;
@@ -874,7 +1002,7 @@ pub trait ModelExt: Executor {
                 return Err(conflict);
             }
             match rows.len() {
-                1 => Ok(rows.decode_first()?.expect("one row")),
+                1 => Ok(decode_model(&rows)?.expect("one row")),
                 got => Err(Error::RowCount {
                     expected: "exactly 1",
                     got,
@@ -895,7 +1023,9 @@ pub trait ModelExt: Executor {
     /// not deleted: [`Error::Conflict`]. A row already gone is `Ok(false)`,
     /// as without a version (one more statement tells the two apart).
     fn delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
-        let sql = delete_sql(row);
+        let sql = row
+            .__rdb_before(Write::Delete)
+            .and_then(|()| delete_sql(row));
         let probe = VersionProbe::of_live(row);
         async move { delete_checked(self, sql, probe).await }
     }
@@ -904,7 +1034,9 @@ pub trait ModelExt: Executor {
     /// with a `#[rdb(soft_delete)]` column (where [`delete`](Self::delete)
     /// only marks it). Checks the version as `delete` does.
     fn force_delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
-        let sql = force_delete_sql(row);
+        let sql = row
+            .__rdb_before(Write::Delete)
+            .and_then(|()| force_delete_sql(row));
         let probe = VersionProbe::of(row);
         async move { delete_checked(self, sql, probe).await }
     }
@@ -914,7 +1046,9 @@ pub trait ModelExt: Executor {
     /// when its version moved. [`Error::Unsupported`] for a model without a
     /// `#[rdb(soft_delete)]` column.
     fn restore<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = restore_sql(row);
+        let sql = row
+            .__rdb_before(Write::Update)
+            .and_then(|()| restore_sql(row));
         let probe = VersionProbe::of(row);
         async move {
             let rows = self.run(&sql?).await?;
@@ -925,7 +1059,7 @@ pub trait ModelExt: Executor {
                 return Err(conflict);
             }
             match rows.len() {
-                1 => Ok(rows.decode_first()?.expect("one row")),
+                1 => Ok(decode_model(&rows)?.expect("one row")),
                 got => Err(Error::RowCount {
                     expected: "exactly 1",
                     got,
@@ -952,7 +1086,7 @@ pub trait ModelExt: Executor {
     /// Every row of the table.
     fn all<M: Model>(&self) -> impl Future<Output = Result<Vec<M>>> + Send {
         let sql = Select::<M>::new().to_sql();
-        async move { self.run(&sql?).await?.decode_all() }
+        async move { decode_models(&self.run(&sql?).await?) }
     }
 }
 
@@ -980,7 +1114,7 @@ async fn fetch_at_most_one<E: Executor + ?Sized, M: Model>(
 ) -> Result<Option<M>> {
     let rows = db.run(&sql).await?;
     match rows.len() {
-        0 | 1 => rows.decode_first(),
+        0 | 1 => decode_model(&rows),
         got => Err(Error::RowCount {
             expected: "at most 1",
             got,

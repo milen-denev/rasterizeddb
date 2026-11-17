@@ -59,6 +59,7 @@ struct Account {
 |---|---|
 | `table = "name"` | the table (otherwise the struct's name in snake case) |
 | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
+| `hooks` | run the struct's [`ModelHooks`](crate::orm::ModelHooks) (below) |
 
 A field's type gives its column type through [`SqlType`](crate::orm::SqlType)
 (`i64` is `BIGINT`, `Option<T>` is nullable, `Vec<String>` is `TEXT[]`, …).
@@ -256,6 +257,53 @@ let back = db.restore(&bin[0]).await?;
 db.force_delete(&back).await?;                            // gone
 # let _ = live; Ok(()) }
 ```
+
+## Hooks and validation
+
+`#[rdb(hooks)]` on the struct makes the ORM call its
+[`ModelHooks`](crate::orm::ModelHooks) implementation, whose methods all
+default to doing nothing:
+
+```rust,no_run
+use rasterizeddb_client::prelude::*;
+use rasterizeddb_client::orm::ModelHooks;
+
+#[derive(Model, Debug, Clone)]
+#[rdb(hooks)]
+struct Person {
+    #[rdb(primary_key, serial)]
+    id: i64,
+    email: String,
+    frozen: bool,
+    #[rdb(skip)]
+    domain: String,
+}
+
+impl ModelHooks for Person {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.email.contains('@') { Ok(()) } else { Err(format!("{:?} is not an email", self.email)) }
+    }
+    fn before_update(&self) -> rasterizeddb_client::Result<()> {
+        if self.frozen {
+            return Err(Error::Unsupported(format!("person {} is frozen", self.id)));
+        }
+        Ok(())
+    }
+    fn after_load(&mut self) {
+        self.domain = self.email.split('@').nth(1).unwrap_or("").to_string();
+    }
+}
+# fn main() {}
+```
+
+`validate` runs before every insert, upsert and update of a row (and each
+row of `insert_many` and `update_many`); refusing is
+[`Error::Invalid`](crate::Error::Invalid), and **nothing is sent**, not even
+the valid rows of a batch. `before_insert`, `before_update` (an upsert runs
+both) and `before_delete` can veto a write with any error. `after_load` runs
+on every row the ORM reads into the model, the rows writes return
+included. The hooks are synchronous and run on this side; the bulk
+`query().update()` and `query().delete()` take no rows and run none.
 
 ## Queries
 

@@ -75,6 +75,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// |---|---|
 /// | `table = "name"` | the table's name (otherwise the struct's in snake case) |
 /// | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
+/// | `hooks` | run the struct's `ModelHooks` impl (validation, before/after hooks), which you then write |
 ///
 /// A field's type must implement `SqlType` (every type the client maps does)
 /// unless it has `sql_type` or `json`.
@@ -438,7 +439,22 @@ fn struct_attrs(attrs: &[syn::Attribute], allowed: &[&str]) -> syn::Result<Vec<(
                 .map(|i| i.to_string())
                 .unwrap_or_default();
             if allowed.contains(&key.as_str()) {
-                out.push((key, meta.value()?.parse::<LitStr>()?.value()));
+                // `key = "text"`, `key = 16`, or a bare flag (`hooks`).
+                let value = if meta.input.peek(syn::Token![=]) {
+                    match meta.value()?.parse::<syn::Lit>()? {
+                        syn::Lit::Str(s) => s.value(),
+                        syn::Lit::Int(i) => i.base10_digits().to_string(),
+                        other => {
+                            return Err(syn::Error::new(
+                                other.span(),
+                                "expected a string or an integer",
+                            ));
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+                out.push((key, value));
                 Ok(())
             } else {
                 Err(meta.error(format!(
@@ -596,7 +612,8 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     }
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let struct_settings = struct_attrs(&input.attrs, &["table", "renamed_from"])?;
+    let struct_settings = struct_attrs(&input.attrs, &["table", "renamed_from", "hooks"])?;
+    let hooks = struct_settings.iter().any(|(k, _)| k == "hooks");
     let table = struct_settings
         .iter()
         .filter(|(k, _)| k == "table")
@@ -838,6 +855,18 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     }
     let count = defs.len();
     let from_row = from_row_impl(input, &fields, named);
+    let hook_methods = if hooks {
+        quote! {
+            fn __rdb_before(&self, write: ::rasterizeddb_client::orm::Write) -> ::rasterizeddb_client::Result<()> {
+                ::rasterizeddb_client::orm::run_hooks(self, write)
+            }
+            fn __rdb_after_load(&mut self) {
+                <Self as ::rasterizeddb_client::orm::ModelHooks>::after_load(self)
+            }
+        }
+    } else {
+        quote!()
+    };
     Ok(quote! {
         impl #impl_generics ::rasterizeddb_client::orm::Model for #name #ty_generics #where_clause {
             const TABLE: &'static str = #table;
@@ -861,6 +890,8 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
                     )),
                 }
             }
+
+            #hook_methods
         }
 
         #[allow(non_upper_case_globals)]
