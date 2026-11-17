@@ -64,7 +64,8 @@ pub(crate) struct UpdateMany {
     versions: Vec<Option<String>>,
 }
 
-/// `UPDATE t SET a = CASE id WHEN 1 THEN … END, …, version = version + 1,
+/// `UPDATE t SET a = CASE id WHEN 1 THEN CAST(… AS <type>) … END, …,
+/// version = version + 1,
 /// updated_at = now() WHERE id IN (…) AND (SELECT COUNT(*) FROM t WHERE
 /// <every row's key, and version>) = n RETURNING …`.
 ///
@@ -119,8 +120,12 @@ pub(crate) fn update_many_sql<M: Model>(rows: &[&M]) -> Result<UpdateMany> {
             } else {
                 case.push_str(&format!("WHEN {} THEN ", k.predicate(&names)));
             }
+            // Cast to the column's type: the server stores an untyped
+            // literal from a CASE as text, which corrupts a BYTEA ('\x09'
+            // kept as four characters) or an array column.
+            case.push_str("CAST(");
             row.write_value(i, &mut case)?;
-            case.push(' ');
+            case.push_str(&format!(" AS {}) ", column.sql_type));
         }
         case.push_str("END");
         sets.push(case);

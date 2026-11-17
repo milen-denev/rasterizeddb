@@ -1018,8 +1018,8 @@ fn update_many_is_one_guarded_statement() {
     let plan = bulk::update_many_sql(&refs).unwrap();
     assert_eq!(
         plan.sql,
-        "UPDATE doc SET body = CASE id WHEN 1 THEN 'a' WHEN 2 THEN 'b''' END, version = version \
-         + 1 WHERE id IN (1, 2) AND (SELECT COUNT(*) FROM doc WHERE ((id = 1 AND version = 3) OR \
+        "UPDATE doc SET body = CASE id WHEN 1 THEN CAST('a' AS TEXT) WHEN 2 THEN CAST('b''' AS \
+         TEXT) END, version = version + 1 WHERE id IN (1, 2) AND (SELECT COUNT(*) FROM doc WHERE ((id = 1 AND version = 3) OR \
          (id = 2 AND version = 5))) = 2 RETURNING id, body, version"
     );
     // A composite key: searched CASE; soft delete and update time.
@@ -1050,7 +1050,8 @@ fn update_many_is_one_guarded_statement() {
     let refs: Vec<&Note> = notes.iter().collect();
     assert_eq!(
         bulk::update_many_sql(&refs).unwrap().sql,
-        "UPDATE notes SET body = CASE id WHEN 1 THEN 'x' WHEN 2 THEN 'y' END, updated = now(), \
+        "UPDATE notes SET body = CASE id WHEN 1 THEN CAST('x' AS TEXT) WHEN 2 THEN CAST('y' AS \
+         TEXT) END, updated = now(), \
          version = version + 1 WHERE id IN (1, 2) AND deleted IS NULL AND (SELECT COUNT(*) FROM \
          notes WHERE ((id = 1 AND version = 1) OR (id = 2 AND version = 1)) AND deleted IS NULL) \
          = 2 RETURNING id, body, created, updated, deleted, version"

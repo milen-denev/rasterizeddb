@@ -1837,6 +1837,53 @@ async fn update_many_is_all_or_nothing() {
 
 use rasterizeddb_client::orm::UPDATE_MANY_MAX_BYTES;
 
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "blobs")]
+struct Blob {
+    #[rdb(primary_key)]
+    id: i64,
+    data: Vec<u8>,
+    tags: Vec<String>,
+    ints: Option<Vec<i64>>,
+    price: Numeric,
+    at: Timestamp,
+}
+
+/// Every column type through update_many's CASE: the server stores an
+/// uncast literal from a CASE as text (a BYTEA kept as its escape, an array
+/// as unreadable bytes), so each value is cast to its column's type.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_many_writes_every_type_as_update_does() {
+    bounded(async {
+        let Some(server) = server("update_many_types").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Blob>().await.unwrap();
+        let blob = |id: i64, seed: u8| Blob {
+            id,
+            data: vec![seed, 0, 255, b'\\', b'\''],
+            tags: vec![format!("t{seed}"), "a,b".into(), "q\"z".into()],
+            ints: (seed % 2 == 0).then(|| vec![i64::from(seed), -1]),
+            price: Numeric::new(&format!("{seed}.25")).unwrap(),
+            at: Timestamp {
+                micros: 1_700_000_000_000_000 + i64::from(seed),
+            },
+        };
+        c.insert_many(&[blob(1, 1), blob(2, 2)]).await.unwrap();
+        let wanted = [blob(1, 7), blob(2, 8)];
+        let stored = c.update_many(&wanted).await.unwrap();
+        assert_eq!(stored, wanted, "RETURNING");
+        let read = Blob::query()
+            .order_by(Blob::id.asc())
+            .all(&c)
+            .await
+            .unwrap();
+        assert_eq!(read, wanted, "read back");
+    })
+    .await
+}
+
 async fn read_docs(c: &Client) -> Vec<Doc> {
     Doc::query().order_by(Doc::id.asc()).all(c).await.unwrap()
 }
