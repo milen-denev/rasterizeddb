@@ -477,3 +477,65 @@ fn relations_are_declared_and_filter_through_subqueries() {
         "a limit means nothing in a filter"
     );
 }
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "sales")]
+struct Sale {
+    #[rdb(primary_key)]
+    id: i64,
+    region: String,
+    units: i32,
+    amount: i64,
+    price: Numeric,
+    rate: Option<f64>,
+}
+
+#[test]
+fn projections_and_aggregates() {
+    let q = Sale::query()
+        .filter(Sale::units.gt(0))
+        .select((
+            Sale::region,
+            count_rows(),
+            Sale::amount.sum(),
+            Sale::units.avg(),
+            Sale::price.max(),
+            Sale::rate.avg(),
+            Sale::region.count_distinct(),
+        ))
+        .group_by(Sale::region)
+        .having(Sale::amount.sum().gt(100i64) & count_rows::<Sale>().ge(2))
+        .order_by(Sale::amount.sum().desc())
+        .limit(5);
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT region, COUNT(*), CAST(SUM(amount) AS BIGINT), AVG(units)::text, \
+         MAX(price)::text, CAST(AVG(rate) AS DOUBLE PRECISION), COUNT(DISTINCT region) \
+         FROM sales WHERE units > 0 GROUP BY region HAVING (SUM(amount) > 100) AND \
+         (COUNT(*) >= 2) ORDER BY SUM(amount) DESC LIMIT 5",
+        "an integer sum is cast outside the SUM"
+    );
+    let one = Sale::query().select(Sale::price.sum());
+    assert_eq!(one.to_sql().unwrap(), "SELECT SUM(price)::text FROM sales");
+    let cols = Sale::query().select((Sale::id, Sale::price)).distinct();
+    assert_eq!(
+        cols.to_sql().unwrap(),
+        "SELECT DISTINCT id, price::text FROM sales"
+    );
+    // The output types, checked by the compiler.
+    fn output<M, P: Projection<M>>(_: &Projected<M, P>) -> std::marker::PhantomData<P::Output> {
+        std::marker::PhantomData
+    }
+    let _: std::marker::PhantomData<Option<Numeric>> = output(&one);
+    let _: std::marker::PhantomData<(i64, Numeric)> = output(&cols);
+    let typed = Sale::query().select((Sale::units.sum(), Sale::rate.sum(), Sale::units.min()));
+    let _: std::marker::PhantomData<(Option<i64>, Option<f64>, Option<i32>)> = output(&typed);
+    assert!(
+        Author::query()
+            .with(Author::books)
+            .select(Author::id)
+            .to_sql()
+            .is_err(),
+        "relations do not load into a projection"
+    );
+}

@@ -157,7 +157,7 @@ pub use rasterizeddb_client_derive::{FromRow, Model, SqlEnum};
 /// Everything an application usually needs: `use rasterizeddb_client::prelude::*;`.
 pub mod prelude {
     pub use crate::kv::{KvKey, KvValue};
-    pub use crate::orm::{Expr, ModelExt, ModelQuery, ModelRelations};
+    pub use crate::orm::{Expr, ModelExt, ModelQuery, ModelRelations, count_rows};
     pub use crate::{
         Client, Date, Error, Executor, FromRow, FromSql, Interval, Isolation, Json, Numeric,
         Options, Param, Result, Row, Rows, Time, Timestamp, ToSql, Transaction, TransactionOptions,

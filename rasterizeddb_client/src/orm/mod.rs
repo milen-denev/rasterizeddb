@@ -42,6 +42,10 @@
 //! # let _ = (rich, found); Ok(()) }
 //! ```
 //!
+//! Projections and aggregates ([`Select::select`], [`Agg`]) read chosen
+//! columns, `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` into tuples or
+//! [`FromRow`] structs, with `GROUP BY` and `HAVING`.
+//!
 //! # What the derive writes
 //!
 //! `#[derive(Model)]` implements [`Model`] and [`FromRow`],
@@ -85,6 +89,7 @@
 //! inside an uncommitted transaction is not.
 
 mod migrate;
+mod projection;
 mod query;
 mod relations;
 
@@ -92,6 +97,7 @@ pub use migrate::{
     AutoMigrate, BoxFuture, MigrationPlan, MigrationReport, Migrator, StepState, StepStatus,
     SyncPolicy,
 };
+pub use projection::{Agg, Aggregate, Columns, Ordered, Projected, Projection, count_rows};
 pub use query::{Column, Expr, Order, Select, Update};
 pub use relations::{
     ModelRelations, RELATION_CHUNK, Relation, RelationKind, RelationSlot, Synced, Through, With,

@@ -192,6 +192,52 @@ async fn busiest<E: Executor>(db: &E) -> rasterizeddb_client::Result<Option<Acco
 }
 ```
 
+## Projections and aggregates
+
+[`select`](crate::orm::Select::select) reads chosen columns and aggregates
+instead of whole models: one item is read as its value, a tuple as a tuple.
+[`all_as`](crate::orm::Projected::all_as) reads each row into a
+`#[derive(FromRow)]` struct instead, by position.
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+# #[derive(Model)] #[rdb(table = "sales")]
+# struct Sale { #[rdb(primary_key)] id: i64, region: String, units: i32, amount: i64, price: Numeric }
+#[derive(FromRow)]
+struct RegionTotal { region: String, sales: i64, amount: Option<i64> }
+
+# async fn demo(db: &Client) -> rasterizeddb_client::Result<()> {
+let emails: Vec<String> = Sale::query().select(Sale::region).distinct().all(db).await?;
+
+let (n, total, mean): (i64, Option<i64>, Option<Numeric>) = Sale::query()
+    .select((count_rows(), Sale::amount.sum(), Sale::units.avg()))
+    .one(db)
+    .await?;
+
+let by_region: Vec<RegionTotal> = Sale::query()
+    .select((Sale::region, count_rows(), Sale::amount.sum()))
+    .group_by(Sale::region)
+    .having(count_rows::<Sale>().ge(10))
+    .order_by(Sale::amount.sum().desc())
+    .all_as(db)
+    .await?;
+# let _ = (emails, n, total, mean, by_region); Ok(()) }
+```
+
+| aggregate | reads as | over no rows |
+|---|---|---|
+| [`count_rows()`](crate::orm::count_rows), `col.count()`, `col.count_distinct()` | `i64` | 0 |
+| `col.sum()` over an integer column | `Option<i64>`, as `CAST(SUM(col) AS BIGINT)` | `None` |
+| `col.sum()` over `f32`/`f64`; over `Numeric` | `Option<f64>`; `Option<Numeric>` (as text) | `None` |
+| `col.avg()` over an integer or `Numeric` column; over a float | `Option<Numeric>` (as text, exact); `Option<f64>` | `None` |
+| `col.min()`, `col.max()` | `Option<T>` (a `Numeric` as text) | `None` |
+
+**Why the cast.** `SUM` over a `BIGINT` is a `NUMERIC`, and the native
+protocol sends a `NUMERIC` of that kind without its scale, which this client
+refuses to guess. The cast goes *outside* the sum, so the server adds exact
+integers and only the total is converted; a total past `i64` is the
+server's error, never a wrapped number.
+
 ## The same struct in the cache
 
 A model can also live in the key/value cache, as a hash per row:

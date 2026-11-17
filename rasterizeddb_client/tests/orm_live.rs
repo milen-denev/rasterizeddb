@@ -616,3 +616,171 @@ async fn relations_load_filter_count_and_link() {
     })
     .await
 }
+
+// ------------------------------------------------- projections, aggregates
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "sales")]
+struct Sale {
+    #[rdb(primary_key)]
+    id: i64,
+    region: String,
+    units: i32,
+    amount: i64,
+    #[rdb(sql_type = "NUMERIC(10,2)", text)]
+    price: Numeric,
+    rate: Option<f64>,
+}
+
+#[derive(FromRow, Debug, PartialEq)]
+struct RegionTotal {
+    region: String,
+    sales: i64,
+    amount: Option<i64>,
+}
+
+fn num(n: &Option<Numeric>) -> f64 {
+    n.as_ref().unwrap().to_string().parse().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn projections_and_aggregates_decode() {
+    bounded(async {
+        let Some(server) = server("aggregates").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Sale>().await.unwrap();
+        let big = 3_000_000_000i64; // past i32: SUM(bigint) is NUMERIC on the server
+        let sale =
+            |id: i64, region: &str, units: i32, amount: i64, price: &str, rate: Option<f64>| Sale {
+                id,
+                region: region.into(),
+                units,
+                amount,
+                price: Numeric::new(price).unwrap(),
+                rate,
+            };
+        c.insert_many(&[
+            sale(1, "north", 1, big, "10.50", Some(0.5)),
+            sale(2, "north", 2, big, "20.25", None),
+            sale(3, "south", 4, 7, "3.00", Some(1.5)),
+            sale(4, "east", 5, 1, "99.99", Some(2.5)),
+            sale(5, "east", 6, -2, "0.01", None),
+        ])
+        .await
+        .unwrap();
+
+        let (count, sum, avg_units, max_price, min_region, avg_rate, regions): (
+            i64,
+            Option<i64>,
+            Option<Numeric>,
+            Option<Numeric>,
+            Option<String>,
+            Option<f64>,
+            i64,
+        ) = Sale::query()
+            .select((
+                count_rows(),
+                Sale::amount.sum(),
+                Sale::units.avg(),
+                Sale::price.max(),
+                Sale::region.min(),
+                Sale::rate.avg(),
+                Sale::region.count_distinct(),
+            ))
+            .one(&c)
+            .await
+            .unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(sum, Some(2 * big + 6), "an exact i64, cast outside the SUM");
+        assert_eq!(num(&avg_units), 3.6);
+        assert_eq!(max_price.unwrap().to_string(), "99.99");
+        assert_eq!(min_region.as_deref(), Some("east"));
+        assert_eq!(avg_rate, Some(1.5), "NULLs are not averaged");
+        assert_eq!(regions, 3);
+
+        let total: Option<Numeric> = Sale::query()
+            .select(Sale::price.sum())
+            .one(&c)
+            .await
+            .unwrap();
+        assert_eq!(
+            total.unwrap().to_string(),
+            "133.75",
+            "NUMERIC(10,2) keeps its scale as text"
+        );
+        let nothing: (Option<i64>, Option<Numeric>, Option<i32>) = Sale::query()
+            .filter(Sale::id.gt(100i64))
+            .select((Sale::amount.sum(), Sale::units.avg(), Sale::units.max()))
+            .one(&c)
+            .await
+            .unwrap();
+        assert_eq!(
+            nothing,
+            (None, None, None),
+            "aggregates over no rows are NULL"
+        );
+
+        let grouped: Vec<(String, i64, Option<i64>)> = Sale::query()
+            .select((Sale::region, count_rows(), Sale::amount.sum()))
+            .group_by(Sale::region)
+            .having(count_rows::<Sale>().ge(2))
+            .order_by(Sale::amount.sum().desc())
+            .all(&c)
+            .await
+            .unwrap();
+        assert_eq!(
+            grouped,
+            [
+                ("north".to_string(), 2, Some(2 * big)),
+                ("east".to_string(), 2, Some(-1)),
+            ]
+        );
+        let structs: Vec<RegionTotal> = Sale::query()
+            .filter(Sale::units.ge(2))
+            .select((Sale::region, count_rows(), Sale::amount.sum()))
+            .group_by(Sale::region)
+            .order_by(Sale::region.asc())
+            .all_as(&c)
+            .await
+            .unwrap();
+        assert_eq!(
+            structs,
+            [
+                RegionTotal {
+                    region: "east".into(),
+                    sales: 2,
+                    amount: Some(-1)
+                },
+                RegionTotal {
+                    region: "north".into(),
+                    sales: 1,
+                    amount: Some(big)
+                },
+                RegionTotal {
+                    region: "south".into(),
+                    sales: 1,
+                    amount: Some(7)
+                },
+            ]
+        );
+        let columns: Vec<(i64, Numeric)> = Sale::query()
+            .filter(Sale::region.eq("east"))
+            .order_by(Sale::id.asc())
+            .select((Sale::id, Sale::price))
+            .all(&c)
+            .await
+            .unwrap();
+        assert_eq!(columns[1].1.to_string(), "0.01");
+        let distinct: Vec<String> = Sale::query()
+            .select(Sale::region)
+            .distinct()
+            .order_by(Sale::region.asc())
+            .all(&c)
+            .await
+            .unwrap();
+        assert_eq!(distinct, ["east", "north", "south"]);
+    })
+    .await
+}

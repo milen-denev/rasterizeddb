@@ -285,18 +285,36 @@ impl std::ops::Not for Expr {
     }
 }
 
-/// An `ORDER BY` item.
+/// An `ORDER BY` item: a column ([`Column::asc`]) or an aggregate
+/// ([`Agg::asc`](super::Agg::asc)).
 #[derive(Clone, Debug)]
 pub struct Order {
-    column: &'static str,
+    key: OrderKey,
     direction: &'static str,
     nulls: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+enum OrderKey {
+    Column(&'static str),
+    Expression(std::result::Result<String, String>),
 }
 
 impl Order {
     fn new(column: &'static str, direction: &'static str) -> Self {
         Order {
-            column,
+            key: OrderKey::Column(column),
+            direction,
+            nulls: None,
+        }
+    }
+
+    pub(crate) fn expression(
+        sql: std::result::Result<String, String>,
+        direction: &'static str,
+    ) -> Self {
+        Order {
+            key: OrderKey::Expression(sql),
             direction,
             nulls: None,
         }
@@ -315,7 +333,12 @@ impl Order {
     }
 
     fn push(&self, out: &mut String) -> Result<()> {
-        push_ident(out, self.column)?;
+        match &self.key {
+            OrderKey::Column(c) => push_ident(out, c)?,
+            OrderKey::Expression(sql) => {
+                out.push_str(sql.as_deref().map_err(|e| Error::Param(e.clone()))?)
+            }
+        }
         out.push(' ');
         out.push_str(self.direction);
         if let Some(nulls) = self.nulls {
@@ -520,13 +543,19 @@ impl<M: Model> Select<M> {
     pub fn to_sql(&self) -> Result<String> {
         let mut sql = format!("SELECT {} FROM {}", select_list::<M>()?, ident(M::TABLE)?);
         self.push_where(&mut sql)?;
+        self.push_tail(&mut sql)?;
+        Ok(sql)
+    }
+
+    /// `ORDER BY …`, `LIMIT`, `OFFSET`.
+    pub(crate) fn push_tail(&self, sql: &mut String) -> Result<()> {
         if !self.order.is_empty() {
             sql.push_str(" ORDER BY ");
             for (i, order) in self.order.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                order.push(&mut sql)?;
+                order.push(sql)?;
             }
         }
         if let Some(limit) = self.limit {
@@ -535,7 +564,7 @@ impl<M: Model> Select<M> {
         if let Some(offset) = self.offset {
             sql.push_str(&format!(" OFFSET {offset}"));
         }
-        Ok(sql)
+        Ok(())
     }
 
     /// Every matching row, with the relations [`with`](Self::with) names
