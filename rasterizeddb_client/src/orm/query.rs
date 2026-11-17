@@ -505,7 +505,8 @@ impl<M: Model> Select<M> {
 /// `UPDATE … SET … WHERE …`, from [`Select::update`].
 pub struct Update<M> {
     select: Select<M>,
-    sets: std::result::Result<Vec<String>, String>,
+    /// Each assignment, with the column it assigns.
+    sets: std::result::Result<Vec<(&'static str, String)>, String>,
 }
 
 impl<M: Model> Update<M> {
@@ -518,7 +519,7 @@ impl<M: Model> Update<M> {
                 push_param(&mut out, &value.to_param())
             });
             match written {
-                Ok(()) => sets.push(out),
+                Ok(()) => sets.push((column.name, out)),
                 Err(e) => self.sets = Err(e.to_string()),
             }
         }
@@ -536,7 +537,7 @@ impl<M: Model> Update<M> {
                 Ok(())
             });
             match written {
-                Ok(()) => sets.push(out),
+                Ok(()) => sets.push((column.name, out)),
                 Err(e) => self.sets = Err(e.to_string()),
             }
         }
@@ -552,14 +553,26 @@ impl<M: Model> Update<M> {
                 "an UPDATE needs at least one set()".to_string(),
             ));
         }
-        let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, sets.join(", "));
+        let mut assignments: Vec<String> = sets.iter().map(|(_, a)| a.clone()).collect();
+        // A versioned model's rows move to the next version whenever they
+        // change, so a holder of the old version cannot overwrite this.
+        if let Some(v) = super::version_column::<M>() {
+            let name = M::COLUMNS[v].name;
+            if !sets.iter().any(|(c, _)| *c == name) {
+                let name = ident(name)?;
+                assignments.push(format!("{name} = {name} + 1"));
+            }
+        }
+        let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, assignments.join(", "));
         self.select.push_where(&mut sql)?;
         sql.push_str(" RETURNING ");
         sql.push_str(&select_list::<M>()?);
         Ok(sql)
     }
 
-    /// Runs it, and returns the rows as they now are.
+    /// Runs it, and returns the rows as they now are. A model with a
+    /// `#[rdb(version)]` column has `version = version + 1` added, unless a
+    /// `set` names the version column itself.
     pub async fn run<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
         db.run(&self.to_sql()?).await?.decode_all()
     }

@@ -49,6 +49,7 @@ struct Account {
 | `json` | any `Serialize + Deserialize` type, stored as `jsonb` (feature `serde_json`) |
 | `text` | read as `col::text` and parsed, for a type of your own |
 | `skip` | not a column; `Default::default()` on reads |
+| `version` | an integer for optimistic locking (below) |
 
 | on the struct | meaning |
 |---|---|
@@ -86,6 +87,57 @@ let stored = client.update(&changed).await?;        // every non-key column, RET
 let upserted = client.upsert(&stored).await?;        // ON CONFLICT (primary key) DO UPDATE
 let existed = client.delete(&upserted).await?;
 # let _ = (found, existed); Ok(()) }
+```
+
+## Optimistic locking
+
+A `#[rdb(version)]` integer field makes every write check that nobody
+changed the row since it was read:
+
+| call | writes | matches |
+|---|---|---|
+| `insert`, `insert_many` | version `1` | |
+| `update` | `version = version + 1` | `WHERE <key> AND version = <the struct's>` |
+| `upsert` | `1` when new; `version + 1` when it exists | the existing row only at the struct's version |
+| `delete` | | `WHERE <key> AND version = <the struct's>` |
+| `query().update()…run()` | `version = version + 1` (unless a `set` names it) | the filter |
+
+A write that matches no row because the row is there at another version
+fails with [`Error::Conflict`](crate::Error::Conflict) and writes nothing:
+read the row again, reapply the change, retry. To tell a conflict from a
+row that is gone, the ORM reads the stored version with one more
+statement: a gone row stays [`Error::RowCount`](crate::Error::RowCount)
+for `update` and `Ok(false)` for `delete`, as without a version.
+
+`delete` checks the version too, so a row someone changed after you read it
+is not deleted on the strength of the old copy. Delete a row by key alone
+with `query().filter(…).delete(…)`, which checks nothing.
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+#[derive(Model, Debug, Clone)]
+struct Doc {
+    #[rdb(primary_key)]
+    id: i64,
+    body: String,
+    #[rdb(version)]
+    version: i64,
+}
+
+# async fn demo(client: &Client) -> rasterizeddb_client::Result<()> {
+let mut doc: Doc = client.find(1i64).await?.expect("there");
+loop {
+    doc.body.push('!');
+    match client.update(&doc).await {
+        Ok(stored) => {
+            doc = stored;
+            break;
+        }
+        Err(e) if e.is_conflict() => doc = client.find(1i64).await?.expect("there"),
+        Err(e) => return Err(e),
+    }
+}
+# let _ = doc; Ok(()) }
 ```
 
 ## Queries

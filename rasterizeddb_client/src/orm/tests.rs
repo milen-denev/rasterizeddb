@@ -314,3 +314,69 @@ async fn client_call_syntax(
     Account::query().all(&client).await?;
     Ok(())
 }
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+struct Doc {
+    #[rdb(primary_key)]
+    id: i64,
+    body: String,
+    #[rdb(version)]
+    version: i32,
+}
+
+#[test]
+fn a_version_column_guards_every_write() {
+    assert_eq!(Doc::COLUMNS[2].role, ColumnRole::Version);
+    assert_eq!(Doc::COLUMNS[0].role, ColumnRole::Plain);
+    let doc = Doc {
+        id: 7,
+        body: "b".into(),
+        version: 3,
+    };
+    assert_eq!(
+        insert_sql(&[&doc]).unwrap(),
+        "INSERT INTO doc (id, body, version) VALUES (7, 'b', 1) RETURNING id, body, version",
+        "an insert starts at version 1, whatever the struct holds"
+    );
+    assert_eq!(
+        update_sql(&doc).unwrap(),
+        "UPDATE doc SET body = 'b', version = version + 1 WHERE id = 7 AND version = 3 \
+         RETURNING id, body, version"
+    );
+    assert_eq!(
+        delete_sql(&doc).unwrap(),
+        "DELETE FROM doc WHERE id = 7 AND version = 3"
+    );
+    assert_eq!(
+        upsert_sql(&doc).unwrap(),
+        "INSERT INTO doc (id, body, version) VALUES (7, 'b', 1) ON CONFLICT (id) DO UPDATE SET \
+         body = EXCLUDED.body, version = doc.version + 1 WHERE doc.version = 3 \
+         RETURNING id, body, version"
+    );
+    let probe = VersionProbe::of(&doc).unwrap().unwrap();
+    assert_eq!(probe.sql, "SELECT version FROM doc WHERE id = 7");
+    assert!(VersionProbe::of(&account()).unwrap().is_none());
+
+    let bulk = Doc::query()
+        .filter(Doc::id.gt(1i64))
+        .update()
+        .set(Doc::body, "x");
+    assert_eq!(
+        bulk.to_sql().unwrap(),
+        "UPDATE doc SET body = 'x', version = version + 1 WHERE id > 1 RETURNING id, body, version",
+        "a bulk update moves the version too"
+    );
+    let explicit = Doc::query()
+        .filter(Doc::id.gt(1i64))
+        .update()
+        .set(Doc::version, 0);
+    assert_eq!(
+        explicit.to_sql().unwrap(),
+        "UPDATE doc SET version = 0 WHERE id > 1 RETURNING id, body, version"
+    );
+    // Unchanged for a model without one.
+    assert_eq!(
+        delete_sql(&account()).unwrap(),
+        "DELETE FROM accounts WHERE id = 0"
+    );
+}

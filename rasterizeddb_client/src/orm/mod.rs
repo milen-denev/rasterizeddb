@@ -60,6 +60,7 @@
 //! | `json` | any `Serialize + Deserialize` type, stored as `jsonb` (feature `serde_json`) |
 //! | `text` | read as `col::text` and parsed (for a type of your own) |
 //! | `skip` | not a column: filled with `Default::default()` on reads |
+//! | `version` | an integer for optimistic locking ([`ColumnRole::Version`]) |
 //!
 //! Struct attribute: `#[rdb(table = "name")]`, otherwise the struct's name in
 //! snake case.
@@ -124,6 +125,23 @@ pub struct ColumnDef {
     /// Names this column had before (`#[rdb(renamed_from = "…")]`): a
     /// migrator that finds one of them, and not this name, renames it.
     pub renamed_from: &'static [&'static str],
+    /// What the ORM writes into it itself, if anything.
+    pub role: ColumnRole,
+}
+
+/// A column the ORM maintains itself, from its field attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ColumnRole {
+    /// An ordinary column: written as the field holds it.
+    #[default]
+    Plain,
+    /// `#[rdb(version)]`, an integer for optimistic locking: an insert
+    /// writes 1, every update writes `version + 1` and only matches the row
+    /// at the version the struct holds, and a delete matches only that
+    /// version too. A write that finds the row at another version is
+    /// [`Error::Conflict`].
+    Version,
 }
 
 /// A struct stored as a table's rows. Derive it: `#[derive(Model)]`.
@@ -270,6 +288,45 @@ fn primary_key<M: Model>() -> Result<Vec<usize>> {
     Ok(key)
 }
 
+/// The `#[rdb(version)]` column, if the model has one.
+pub(crate) fn version_column<M: Model>() -> Option<usize> {
+    M::COLUMNS
+        .iter()
+        .position(|c| c.role == ColumnRole::Version)
+}
+
+/// ` AND version = <the struct's version>`, when the model has one.
+fn push_version_check<M: Model>(
+    m: &M,
+    lead: &str,
+    qualifier: Option<&str>,
+    out: &mut String,
+) -> Result<()> {
+    if let Some(v) = version_column::<M>() {
+        out.push_str(lead);
+        if let Some(table) = qualifier {
+            out.push_str(table);
+            out.push('.');
+        }
+        push_ident(out, M::COLUMNS[v].name)?;
+        out.push_str(" = ");
+        m.write_value(v, out)?;
+    }
+    Ok(())
+}
+
+/// Column `i`'s value as an `INSERT` writes it: the field, or what the ORM
+/// maintains itself (`1` for a version).
+fn push_insert_value<M: Model>(m: &M, i: usize, out: &mut String) -> Result<()> {
+    match M::COLUMNS[i].role {
+        ColumnRole::Version => {
+            out.push('1');
+            Ok(())
+        }
+        _ => m.write_value(i, out),
+    }
+}
+
 /// `a = 1 AND b = 'x'` over the primary key, from `m`'s values.
 fn key_predicate<M: Model>(m: &M, out: &mut String) -> Result<()> {
     for (n, i) in primary_key::<M>()?.into_iter().enumerate() {
@@ -327,7 +384,7 @@ fn push_values_tuple<M: Model>(out: &mut String, row: &M) -> Result<()> {
             out.push_str(", ");
         }
         first = false;
-        row.write_value(i, out)?;
+        push_insert_value(row, i, out)?;
     }
     out.push(')');
     Ok(())
@@ -335,7 +392,9 @@ fn push_values_tuple<M: Model>(out: &mut String, row: &M) -> Result<()> {
 
 /// `INSERT … ON CONFLICT (<primary key>) DO UPDATE SET <every other column> =
 /// EXCLUDED.<column> RETURNING …`. Every column is written, serial ones too:
-/// an upsert names its row.
+/// an upsert names its row. With a `#[rdb(version)]` column the insert
+/// writes version 1 and the update `version + 1`, `WHERE` the stored
+/// version is the struct's: no row back then means a conflict.
 pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
     let key = primary_key::<M>()?;
     let mut sql = format!("INSERT INTO {} (", ident(M::TABLE)?);
@@ -350,7 +409,7 @@ pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
         if i > 0 {
             sql.push_str(", ");
         }
-        m.write_value(i, &mut sql)?;
+        push_insert_value(m, i, &mut sql)?;
     }
     sql.push_str(") ON CONFLICT (");
     for (n, &i) in key.iter().enumerate() {
@@ -363,21 +422,28 @@ pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
     if rest.is_empty() {
         sql.push_str(") DO NOTHING");
     } else {
+        let table = ident(M::TABLE)?;
         sql.push_str(") DO UPDATE SET ");
         for (n, column) in rest.iter().enumerate() {
             if n > 0 {
                 sql.push_str(", ");
             }
             let name = ident(column.name)?;
-            sql.push_str(&format!("{name} = EXCLUDED.{name}"));
+            match column.role {
+                ColumnRole::Version => sql.push_str(&format!("{name} = {table}.{name} + 1")),
+                _ => sql.push_str(&format!("{name} = EXCLUDED.{name}")),
+            }
         }
+        push_version_check(m, " WHERE ", Some(&table), &mut sql)?;
     }
     sql.push_str(" RETURNING ");
     sql.push_str(&select_list::<M>()?);
     Ok(sql)
 }
 
-/// `UPDATE t SET <every non-key column> WHERE <key> RETURNING …`.
+/// `UPDATE t SET <every non-key column> WHERE <key> RETURNING …`; with a
+/// `#[rdb(version)]` column, `version = version + 1 … AND version = <the
+/// struct's>`.
 pub fn update_sql<M: Model>(m: &M) -> Result<String> {
     let mut sql = format!("UPDATE {} SET ", ident(M::TABLE)?);
     let mut any = false;
@@ -391,7 +457,13 @@ pub fn update_sql<M: Model>(m: &M) -> Result<String> {
         any = true;
         push_ident(&mut sql, column.name)?;
         sql.push_str(" = ");
-        m.write_value(i, &mut sql)?;
+        match column.role {
+            ColumnRole::Version => {
+                push_ident(&mut sql, column.name)?;
+                sql.push_str(" + 1");
+            }
+            _ => m.write_value(i, &mut sql)?,
+        }
     }
     if !any {
         return Err(Error::Unsupported(format!(
@@ -401,16 +473,70 @@ pub fn update_sql<M: Model>(m: &M) -> Result<String> {
     }
     sql.push_str(" WHERE ");
     key_predicate(m, &mut sql)?;
+    push_version_check(m, " AND ", None, &mut sql)?;
     sql.push_str(" RETURNING ");
     sql.push_str(&select_list::<M>()?);
     Ok(sql)
 }
 
-/// `DELETE FROM t WHERE <primary key>`.
+/// `DELETE FROM t WHERE <primary key>`, and `AND version = <the struct's>`
+/// with a `#[rdb(version)]` column.
 pub fn delete_sql<M: Model>(m: &M) -> Result<String> {
     let mut sql = format!("DELETE FROM {} WHERE ", ident(M::TABLE)?);
     key_predicate(m, &mut sql)?;
+    push_version_check(m, " AND ", None, &mut sql)?;
     Ok(sql)
+}
+
+/// What a versioned write that matched no row needs to say why: the row's
+/// key as SQL, the version the struct holds, and the statement that reads
+/// the version stored. `None` for a model without a version column.
+pub(crate) struct VersionProbe {
+    table: &'static str,
+    key: String,
+    expected: String,
+    sql: String,
+}
+
+impl VersionProbe {
+    pub(crate) fn of<M: Model>(m: &M) -> Result<Option<VersionProbe>> {
+        let Some(v) = version_column::<M>() else {
+            return Ok(None);
+        };
+        let mut key = String::new();
+        key_predicate(m, &mut key)?;
+        let mut expected = String::new();
+        m.write_value(v, &mut expected)?;
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {key}",
+            ident(M::COLUMNS[v].name)?,
+            ident(M::TABLE)?
+        );
+        Ok(Some(VersionProbe {
+            table: M::TABLE,
+            key,
+            expected,
+            sql,
+        }))
+    }
+
+    /// After a write matched nothing: [`Error::Conflict`] when the row is
+    /// there at another version, `None` when there is no such row.
+    pub(crate) async fn classify<E: Executor + ?Sized>(self, db: &E) -> Result<Option<Error>> {
+        let rows = db.run(&self.sql).await?;
+        let Some(row) = rows.get(0) else {
+            return Ok(None);
+        };
+        let stored: Option<i64> = row.get(0)?;
+        Ok(Some(Error::Conflict(format!(
+            "{} row {} was changed since it was read: the write expected version {}, the \
+             table holds version {}; read the row again and retry",
+            self.table,
+            self.key,
+            self.expected,
+            stored.map_or("NULL".to_string(), |v| v.to_string())
+        ))))
+    }
 }
 
 fn find_sql<M: Model>(key: &[&dyn ToSql]) -> Result<String> {
@@ -617,11 +743,27 @@ pub trait ModelExt: Executor {
     /// upsert names its row, so set the key (a new row with `id: 0` is
     /// stored with id 0, not a sequence value; use [`insert`](Self::insert)
     /// for that).
+    ///
+    /// With a `#[rdb(version)]` column, a new row is stored at version 1 and
+    /// an existing one is updated only at the version the struct holds;
+    /// at another, [`Error::Conflict`].
     fn upsert<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
         let sql = upsert_sql(row);
         let reread = reread_sql(row);
+        let probe = VersionProbe::of(row);
         async move {
             let mut rows = self.run(&sql?).await?;
+            if rows.is_empty()
+                && let Some(probe) = probe?
+            {
+                return Err(probe.classify(self).await?.unwrap_or_else(|| {
+                    Error::Conflict(
+                        "the upsert stored nothing and no row has its key: it was deleted \
+                         while the statement ran"
+                            .to_string(),
+                    )
+                }));
+            }
             if rows.is_empty() {
                 // `DO NOTHING` (a model that is all key) returns no row: the
                 // one already there is the answer.
@@ -636,10 +778,23 @@ pub trait ModelExt: Executor {
 
     /// Updates the row with this primary key to these values, returning it as
     /// stored; [`Error::RowCount`] when there is no such row.
+    ///
+    /// With a `#[rdb(version)]` column the update writes `version + 1` and
+    /// matches only the row at the version the struct holds. When it matches
+    /// nothing, one more statement reads the stored version to say why:
+    /// [`Error::Conflict`] when the row is there at another version,
+    /// [`Error::RowCount`] when it is gone.
     fn update<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
         let sql = update_sql(row);
+        let probe = VersionProbe::of(row);
         async move {
             let rows = self.run(&sql?).await?;
+            if rows.is_empty()
+                && let Some(probe) = probe?
+                && let Some(conflict) = probe.classify(self).await?
+            {
+                return Err(conflict);
+            }
             match rows.len() {
                 1 => Ok(rows.decode_first()?.expect("one row")),
                 got => Err(Error::RowCount {
@@ -651,11 +806,24 @@ pub trait ModelExt: Executor {
     }
 
     /// Deletes the row with this primary key. Whether there was one.
+    ///
+    /// With a `#[rdb(version)]` column the delete matches only the row at
+    /// the version the struct holds, so a row changed since it was read is
+    /// not deleted: [`Error::Conflict`]. A row already gone is `Ok(false)`,
+    /// as without a version (one more statement tells the two apart).
     fn delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
         let sql = delete_sql(row);
+        let probe = VersionProbe::of(row);
         async move {
             let rows = self.run(&sql?).await?;
-            Ok(rows.rows_affected().unwrap_or(0) > 0)
+            let deleted = rows.rows_affected().unwrap_or(0) > 0;
+            if !deleted
+                && let Some(probe) = probe?
+                && let Some(conflict) = probe.classify(self).await?
+            {
+                return Err(conflict);
+            }
+            Ok(deleted)
         }
     }
 

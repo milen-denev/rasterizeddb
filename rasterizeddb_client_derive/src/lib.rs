@@ -47,6 +47,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `json` | any `Serialize + Deserialize` type, stored as `jsonb` (feature `serde_json`) |
 /// | `text` | read as `col::text` and parsed (for a type of your own) |
 /// | `skip` | not a column: `Default::default()` on reads |
+/// | `version` | an integer for optimistic locking: inserts write 1, updates `version + 1` where it is still the struct's; a lost race is `Error::Conflict` |
 ///
 /// # Struct attributes
 ///
@@ -124,6 +125,8 @@ struct FieldAttrs {
     text: bool,
     skip: bool,
     renamed_from: Vec<String>,
+    /// `version`, …: what the ORM maintains in the column.
+    role: Option<(&'static str, Span)>,
 }
 
 fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
@@ -145,6 +148,12 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 "json" => out.json = true,
                 "text" => out.text = true,
                 "skip" => out.skip = true,
+                "version" => {
+                    if out.role.is_some() {
+                        return Err(meta.error("a column has one maintained role"));
+                    }
+                    out.role = Some(("Version", meta.path.span()));
+                }
                 "index" => {
                     out.index = Some(if meta.input.peek(syn::Token![=]) {
                         string(&meta)?
@@ -159,17 +168,34 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 _ => {
                     return Err(meta.error(
                         "unknown rdb attribute; expected primary_key, serial, unique, index, \
-                         column, sql_type, default, renamed_from, json, text or skip",
+                         column, sql_type, default, renamed_from, json, text, skip or version",
                     ));
                 }
             }
             Ok(())
         })?;
     }
-    if out.skip && (out.primary_key || out.serial || out.unique || out.index.is_some()) {
+    if out.skip
+        && (out.primary_key
+            || out.serial
+            || out.unique
+            || out.index.is_some()
+            || out.role.is_some())
+    {
         return Err(syn::Error::new(
             Span::call_site(),
             "a skipped field is not a column",
+        ));
+    }
+    if let Some((role, span)) = out.role
+        && (out.primary_key || out.serial)
+    {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "a {} column is maintained by the ORM, so it is not a key or serial",
+                role.to_lowercase()
+            ),
         ));
     }
     Ok(out)
@@ -362,6 +388,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     let mut writes = Vec::new();
     let mut texts = Vec::new();
     let mut consts = Vec::new();
+    let mut roles: Vec<&'static str> = Vec::new();
     for f in fields.iter().filter(|f| !f.attrs.skip) {
         let ident = f.ident.expect("named");
         let ty = f.ty;
@@ -397,6 +424,20 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
         };
         let (primary_key, serial, unique) = (f.attrs.primary_key, f.attrs.serial, f.attrs.unique);
         let renamed_from = &f.attrs.renamed_from;
+        let role = match f.attrs.role {
+            Some((role, span)) => {
+                if roles.contains(&role) {
+                    return Err(syn::Error::new(
+                        span,
+                        format!("a model has one {} column", role.to_lowercase()),
+                    ));
+                }
+                roles.push(role);
+                let variant = format_ident!("{}", role);
+                quote!(::rasterizeddb_client::orm::ColumnRole::#variant)
+            }
+            None => quote!(::rasterizeddb_client::orm::ColumnRole::Plain),
+        };
         defs.push(quote! {
             ::rasterizeddb_client::orm::ColumnDef {
                 name: #column,
@@ -409,6 +450,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
                 default: #default,
                 read_as_text: #read_as_text,
                 renamed_from: &[#(#renamed_from),*],
+                role: #role,
             }
         });
         let access = &f.access;

@@ -52,6 +52,11 @@ pub enum Error {
         /// What happened.
         message: String,
     },
+    /// A write lost a race it was told to detect: an ORM write of a model
+    /// with a `#[rdb(version)]` column found the row at another version
+    /// than the one it was read at. Nothing was written. Read the row again
+    /// and retry, or give up.
+    Conflict(String),
 }
 
 impl Error {
@@ -141,6 +146,11 @@ impl Error {
         })
     }
 
+    /// Whether a versioned write found the row changed: [`Error::Conflict`].
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Error::Conflict(_))
+    }
+
     /// Whether a `fetch_one` found no row.
     pub fn is_no_rows(&self) -> bool {
         matches!(self, Error::RowCount { got: 0, .. })
@@ -169,6 +179,7 @@ impl fmt::Display for Error {
                     write!(f, "transaction lost (the server rolled it back): {message}")
                 }
             }
+            Error::Conflict(message) => write!(f, "conflict: {message}"),
             Error::RowCount { expected, got } => {
                 write!(
                     f,
