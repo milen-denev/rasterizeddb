@@ -1575,3 +1575,118 @@ async fn partitioned_models_create_sync_and_convert() {
     })
     .await
 }
+
+// ------------------------------------------------------- read-through cache
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "profiles")]
+struct Profile {
+    #[rdb(primary_key)]
+    id: i64,
+    name: String,
+    bio: Option<String>,
+    #[rdb(soft_delete)]
+    deleted: Option<Timestamp>,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_through_cache() {
+    bounded(async {
+        let Some(server) = server("cache").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Profile>().await.unwrap();
+        let cache = c.cached::<Profile>(Duration::from_secs(60));
+        let ada = cache
+            .insert(&Profile {
+                id: 1,
+                name: "Ada".into(),
+                bio: None,
+                deleted: None,
+            })
+            .await
+            .unwrap();
+        let key = cache.key_for(&[&1i64]).unwrap();
+        assert_eq!(key, b"rdb_orm:profiles:1");
+        assert!(!c.kv().exists(&key).await.unwrap(), "a write fills nothing");
+
+        // A miss reads the table and fills, with the TTL.
+        assert_eq!(cache.find(1i64).await.unwrap(), Some(ada.clone()));
+        assert!(c.kv().exists(&key).await.unwrap());
+        let ttl = c.kv().ttl(&key).await.unwrap().expect("a TTL");
+        assert!(
+            ttl <= Duration::from_secs(60) && ttl > Duration::from_secs(50),
+            "{ttl:?}"
+        );
+
+        // A write elsewhere is not seen until the TTL: this is the bound.
+        c.exec(
+            "UPDATE profiles SET name = $1 WHERE id = 1",
+            params!["Elsewhere"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.find(1i64).await.unwrap().unwrap().name,
+            "Ada",
+            "stale, by design"
+        );
+        // A write through the handle removes the entry.
+        let mut changed = ada.clone();
+        changed.name = "Ada L.".into();
+        cache.update(&changed).await.unwrap();
+        assert!(!c.kv().exists(&key).await.unwrap());
+        assert_eq!(cache.find(1i64).await.unwrap().unwrap().name, "Ada L.");
+        let up = cache
+            .upsert(&Profile {
+                id: 1,
+                name: "Ada U.".into(),
+                bio: Some("x".into()),
+                deleted: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cache.find(1i64).await.unwrap(), Some(up.clone()));
+
+        // A soft delete through it: gone from the cache and from reads.
+        assert!(cache.delete(&up).await.unwrap());
+        assert_eq!(cache.find(1i64).await.unwrap(), None);
+        assert!(
+            !c.kv().exists(&key).await.unwrap(),
+            "a missing row is not cached"
+        );
+        let back = cache.restore(&up).await.unwrap();
+        assert_eq!(cache.find(1i64).await.unwrap(), Some(back));
+
+        // An entry it cannot read is a miss, and is replaced.
+        c.kv().set(&key, b"not an entry", None).await.unwrap();
+        assert_eq!(cache.find(1i64).await.unwrap().unwrap().name, "Ada U.");
+        assert!(
+            c.kv().ttl(&key).await.unwrap().is_some(),
+            "replaced, with a TTL"
+        );
+
+        // Expiry.
+        let short = c.cached::<Profile>(Duration::from_millis(300));
+        assert!(short.invalidate_key(&[&1i64]).await.unwrap());
+        short.find(1i64).await.unwrap();
+        c.exec(
+            "UPDATE profiles SET name = $1 WHERE id = 1",
+            params!["Later"],
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            short.find(1i64).await.unwrap().unwrap().name,
+            "Later",
+            "the TTL bounds it"
+        );
+        assert_eq!(
+            Profile::cached(&c, Duration::from_secs(1)).ttl(),
+            Duration::from_secs(1)
+        );
+    })
+    .await
+}

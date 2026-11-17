@@ -963,6 +963,28 @@ impl<K: KvKey + KvValue, V: KvValue, E: Executor> KvQuery<'_, K, V, E> {
 
 // ----------------------------------------------------------------- KvRepo
 
+/// One row as the server would send it: each cell text (a NULL for
+/// `None`), so a derived `FromRow` reads it as it reads a select list.
+pub(crate) fn rows_from_text(cells: &[Option<&[u8]>]) -> Result<Rows> {
+    let mut payload = Vec::new();
+    for cell in cells {
+        let (cell_tag, bytes): (u8, &[u8]) = match cell {
+            Some(v) => (tag::STRING, v),
+            None => (tag::NULL, &[]),
+        };
+        payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        payload.push(cell_tag);
+    }
+    let mut data = u32::try_from(payload.len())
+        .map_err(|_| Error::Protocol("a stored row is too large to read".to_string()))?
+        .to_le_bytes()
+        .to_vec();
+    data.extend(payload);
+    Rows::decode(data)
+}
+
 /// Model `M`'s rows as hashes: one field per column (a NULL column has no
 /// field), under `<table>:<primary key>`, the key's columns' text forms
 /// joined by `:` (a `:` or `\` inside one escaped by a `\`). From
@@ -1014,6 +1036,10 @@ impl<M: Model, E: Executor> KvRepo<'_, M, E> {
             }
         }
         out
+    }
+
+    pub(crate) fn key_of_model(&self, m: &M) -> Result<Vec<u8>> {
+        self.key_for_model(m)
     }
 
     fn key_for_model(&self, m: &M) -> Result<Vec<u8>> {
@@ -1091,24 +1117,16 @@ impl<M: Model, E: Executor> KvRepo<'_, M, E> {
         }
         // A row as the server would send it, the columns in the model's
         // order, so the derived FromRow reads it.
-        let mut payload = Vec::new();
-        for column in M::COLUMNS {
-            let value = fields.iter().find(|(f, _)| f == column.name.as_bytes());
-            let (cell_tag, bytes): (u8, &[u8]) = match value {
-                Some((_, v)) => (tag::STRING, v),
-                None => (tag::NULL, &[]),
-            };
-            payload.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            payload.extend_from_slice(&0u64.to_le_bytes());
-            payload.extend_from_slice(bytes);
-            payload.push(cell_tag);
-        }
-        let mut data = u32::try_from(payload.len())
-            .map_err(|_| Error::Protocol("a stored hash is too large to read".to_string()))?
-            .to_le_bytes()
-            .to_vec();
-        data.extend(payload);
-        let rows = Rows::decode(data)?;
+        let cells: Vec<Option<&[u8]>> = M::COLUMNS
+            .iter()
+            .map(|column| {
+                fields
+                    .iter()
+                    .find(|(f, _)| f == column.name.as_bytes())
+                    .map(|(_, v)| v.as_slice())
+            })
+            .collect();
+        let rows = rows_from_text(&cells)?;
         let row = rows.get(0).expect("one row");
         let mut m = M::from_row(&row).map_err(|e| match e {
             Error::Column { index, message } => Error::Column {

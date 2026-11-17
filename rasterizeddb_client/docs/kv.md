@@ -98,3 +98,48 @@ hashes, lists, sets, sorted sets, TTLs, `SCAN`, `MGET`/`MSET`), and
 No two commands are atomic together: the native protocol has no `MULTI`.
 Where a call takes two commands (saving a model with NULL fields, setting a
 TTL after a save) its documentation says so.
+
+## A read-through cache for models
+
+[`client.cached::<M>(ttl)`](crate::Client::cached) (or
+`M::cached(&client, ttl)`) puts the cache in front of a model's table:
+[`find`](crate::orm::Cached::find) answers from the cache, and on a miss
+reads the table and stores the row for `ttl`. Writes through the same handle
+run the ORM's statement and then remove the row's entry, so the next read
+sees them.
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+# #[derive(Model, Debug, Clone)] #[rdb(table = "profiles")]
+# struct Profile { #[rdb(primary_key)] id: i64, name: String }
+# async fn demo(client: &Client) -> rasterizeddb_client::Result<()> {
+use std::time::Duration;
+
+let profiles = client.cached::<Profile>(Duration::from_secs(30));
+let mut p = profiles.find(7i64).await?.expect("there");   // the table, then cached
+let again = profiles.find(7i64).await?;                     // the cache
+p.name = "renamed".into();
+profiles.update(&p).await?;                                 // UPDATE, then the entry removed
+# let _ = again; Ok(()) }
+```
+
+**Staleness is bounded by the TTL, and only by it.** A write that does not
+go through the handle (another process, plain SQL, a bulk
+`query().update()`, a pgwire client) leaves the cached row as it was until
+its TTL runs out. So does a read that races a write: a reader that read the
+table just before the write and stores the row just after the write removed
+the entry puts the old row back. Choose the TTL as the staleness you
+accept.
+
+Each entry is one `SET … PX`, so none is ever left without its TTL; it is
+keyed `rdb_orm:<table>:<primary key>` and tagged with the model's columns,
+so a struct whose columns changed reads an older entry as a miss. A row that
+does not exist is not cached; soft-deleted rows read as missing, as `find`
+reads them.
+
+The cache needs nothing on the server beyond the key/value cache itself,
+which the default build includes and which needs no store to be created;
+a server built without it fails every call with
+[`Error::Unsupported`](crate::Error::Unsupported) naming the cause. It is
+not transactional, so the cached handle takes a [`Client`](crate::Client),
+not a transaction.

@@ -502,5 +502,7 @@ while the stream runs is seen or not depending on where it sorts.
 ## The same struct in the cache
 
 A model can also live in the key/value cache, as a hash per row:
-[`client.kv().repo::<Account>()`](crate::kv::KvRepo). See the
+[`client.kv().repo::<Account>()`](crate::kv::KvRepo); or the cache can sit
+in front of its table, read-through, with
+[`client.cached::<Account>(ttl)`](crate::orm::Cached). See the
 [KV chapter](crate::guide::kv).

@@ -90,6 +90,7 @@
 //! be visible to other processes while it migrates, which a lock taken
 //! inside an uncommitted transaction is not.
 
+mod cache;
 mod keyset;
 mod migrate;
 mod projection;
@@ -97,6 +98,7 @@ mod query;
 mod relations;
 mod upsert;
 
+pub use cache::{CACHE_PREFIX, Cached};
 pub use keyset::{Cursor, Page, RowStream};
 pub use migrate::{
     AutoMigrate, BoxFuture, MigrationPlan, MigrationReport, Migrator, StepState, StepStatus,
@@ -1222,6 +1224,12 @@ pub trait ModelQuery: Model {
     /// [`filter`](Select::filter) and run with [`all`](Select::all).
     fn query() -> Select<Self> {
         Select::new()
+    }
+
+    /// This model's rows read through the server's key/value cache, each
+    /// kept for `ttl`: `User::cached(&client, ttl).find(7)`. See [`Cached`].
+    fn cached(client: &crate::Client, ttl: std::time::Duration) -> Cached<'_, Self> {
+        client.cached(ttl)
     }
 }
 
