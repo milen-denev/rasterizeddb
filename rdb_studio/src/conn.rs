@@ -62,12 +62,34 @@ impl PartialEq for Session {
     }
 }
 
+/// Whether `host` names a directory holding a unix socket rather than a
+/// machine: a path, as libpq and tokio-postgres read it. The server's socket
+/// is `<host>/.s.PGSQL.<port>` (`--pg-socket-dir`).
+pub fn is_socket_dir(host: &str) -> bool {
+    host.starts_with('/')
+}
+
+/// What a profile connects to, as the status bar and the error messages
+/// name it: `host:port`, or the socket file.
+pub fn endpoint(host: &str, port: u16) -> String {
+    if is_socket_dir(host) {
+        format!("{}/.s.PGSQL.{}", host.trim_end_matches('/'), port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
 /// Opens a connection, honouring the TLS mode.
 ///
 /// `Prefer` genuinely retries: it tries TLS and, if the handshake fails,
 /// connects again in cleartext. Reporting the TLS error would be wrong — a
 /// server started with `--pg-tls disable` refuses the handshake, and that is
 /// the configuration `prefer` exists for.
+///
+/// A host that is a directory reaches the server's unix socket, which carries
+/// no TLS whatever the profile says: the server answers a TLS request there
+/// with "no", as PostgreSQL does, so `require` would refuse every connection.
+/// Only root can watch a local socket, so nothing is given up.
 pub async fn connect(profile: Connection) -> Result<Session, String> {
     let mut config = tokio_postgres::Config::new();
     config
@@ -80,9 +102,10 @@ pub async fn connect(profile: Connection) -> Result<Session, String> {
         config.password(&profile.password);
     }
 
-    let server = format!("{}:{}", profile.host, profile.port);
+    let server = endpoint(&profile.host, profile.port);
 
-    let attempt_tls = matches!(profile.tls, TlsMode::Prefer | TlsMode::Require);
+    let attempt_tls = !is_socket_dir(&profile.host)
+        && matches!(profile.tls, TlsMode::Prefer | TlsMode::Require);
     if attempt_tls {
         match connect_tls(&config).await {
             Ok(client) => {
@@ -153,16 +176,18 @@ fn describe(error: &str, profile: &Connection) -> String {
     if error.contains("server does not support SSL") || error.contains("no TLS") {
         return format!("{} — the server has TLS disabled; set TLS to `disable`", error);
     }
+    let at = endpoint(&profile.host, profile.port);
     if error.contains("3D000") || error.contains("does not exist") {
-        return format!(
-            "{} — no database named `{}` on {}:{}",
-            error, profile.database, profile.host, profile.port
-        );
+        return format!("{} — no database named `{}` on {}", error, profile.database, at);
     }
     if error.contains("Connection refused") {
+        return format!("nothing is listening on {} — is the server running?", at);
+    }
+    if is_socket_dir(&profile.host) && error.contains("No such file or directory") {
         return format!(
-            "nothing is listening on {}:{} — is the server running?",
-            profile.host, profile.port
+            "there is no socket at {} — is the server running with --pg-socket-dir {} \
+             and --pg-port {}?",
+            at, profile.host, profile.port
         );
     }
     error.to_string()
@@ -367,5 +392,55 @@ impl ServerCertVerifier for AcceptAnyServer {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    #[test]
+    fn a_path_is_a_socket_directory_and_a_name_is_a_host() {
+        assert!(is_socket_dir("/run/rasterizeddb"));
+        assert!(is_socket_dir("/tmp"));
+        for host in ["127.0.0.1", "localhost", "db.example.com", "::1", ""] {
+            assert!(!is_socket_dir(host), "{host:?} was taken for a socket directory");
+        }
+    }
+
+    #[test]
+    fn the_endpoint_names_the_socket_file_a_server_creates() {
+        assert_eq!(endpoint("/run/rdb", 5432), "/run/rdb/.s.PGSQL.5432");
+        assert_eq!(endpoint("/run/rdb/", 6543), "/run/rdb/.s.PGSQL.6543");
+        assert_eq!(endpoint("127.0.0.1", 5432), "127.0.0.1:5432");
+    }
+
+    /// A live check against a real server, for a run that has one:
+    /// `RDB_STUDIO_SOCKET_DIR=/dir RDB_STUDIO_SOCKET_PORT=5432 cargo test -p
+    /// rdb_studio -- --ignored`. The profile asks for TLS, as the default one
+    /// does, and must connect anyway.
+    #[tokio::test]
+    #[ignore]
+    async fn connects_to_a_live_server_on_its_socket_with_tls_asked_for() {
+        let Ok(dir) = std::env::var("RDB_STUDIO_SOCKET_DIR") else {
+            return;
+        };
+        let port = std::env::var("RDB_STUDIO_SOCKET_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(5432);
+        let profile = Connection {
+            host: dir.clone(),
+            port,
+            user: std::env::var("RDB_STUDIO_SOCKET_USER").unwrap_or_else(|_| "rasterized".into()),
+            password: std::env::var("RDB_STUDIO_SOCKET_PASSWORD").unwrap_or_default(),
+            tls: TlsMode::Require,
+            ..Connection::default()
+        };
+        let session = connect(profile).await.expect("connected over the socket");
+        assert!(!session.encrypted);
+        assert_eq!(session.server, endpoint(&dir, port));
+        let rows = session.client().simple_query("SELECT 1").await.expect("a query");
+        assert!(!rows.is_empty());
     }
 }

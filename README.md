@@ -404,6 +404,47 @@ loopback listener accepts any caller and says so loudly at start-up: a database
 nobody can open is not a secure database. It starts requiring a password the
 moment there is one to require, and never stops again.
 
+### Unix sockets
+
+Every listener can also be served on a unix socket, for clients on the same
+machine, and its TCP port can be turned off. On a socket there is no TCP stack
+and no TLS: only root can watch a local socket, and who may connect is decided
+by the socket file's permissions and group.
+
+| Listener | Socket | Turn TCP off | How callers on the socket log in |
+|---|---|---|---|
+| Native (`rasterizeddb_client`) | `--rdb-socket PATH` | `--rdb-tcp off` | `--rdb-socket-auth` (defaults to `--rdb-auth`) |
+| Redis protocol | `--kv-socket PATH` | leave out `--kv-port` | `--kv-auth` |
+| PostgreSQL | `--pg-socket-dir DIR` | `--pg-tcp off` | `--pg-socket-auth` (defaults to `--pg-auth`) |
+
+`--pg-socket-dir` creates `DIR/.s.PGSQL.<pg-port>`, the name every PostgreSQL
+client looks for: `psql "host=DIR port=5432"`, tokio-postgres's `host_path`,
+sqlx's `socket`, and rdb_studio with the directory as its host. A TLS request
+there is answered "no" whatever `--pg-tls` says, as PostgreSQL does, so the
+default `--pg-tls require` applies to TCP only.
+
+`--socket-mode` (octal, default `600`: this server's user only) and
+`--socket-group NAME` apply to every socket. Connecting needs write permission,
+so `--socket-mode 660 --socket-group app` admits the members of `app`, which is
+how a service running as another user is given access.
+
+- **`peer`**, offered on sockets only: a role may log in without a password when
+  its name is the operating-system user connecting, which the kernel reports.
+  The role must exist and be allowed to log in.
+- **`trust`** is allowed on a socket only when its mode admits nobody outside
+  its owner and group (`660` yes, `666` no), as it is allowed on TCP only on
+  loopback.
+- A socket file left behind by a server that did not shut down is replaced at
+  start-up. One another server is listening on, or a path that is not a socket,
+  is refused rather than taken. The file is removed at shutdown.
+- A socket's path has to fit a socket address: about 107 bytes on Linux.
+
+Measured on one machine with 64-byte requests, a unix socket doubled the
+requests one connection could carry (81,000 to 160,000 a second, median
+latency 12 µs to 5 µs). A single point query's median latency fell from 67 µs
+to 56 µs. Under heavy concurrent load the query engine, not the transport, is
+the limit, and the two perform the same.
+
 ### rdb_studio — the desktop console
 
 A pgAdmin-style console for RasterizedDB, written in [iced](https://iced.rs).

@@ -24,7 +24,9 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         row![
             column![
                 field("Profile name", &studio.form.name, Message::FormName),
-                field("Host", &studio.form.host, Message::FormHost),
+                // A directory such as /run/rasterizeddb reaches the server's
+                // unix socket (`--pg-socket-dir`) instead of a host.
+                field("Host or socket directory", &studio.form.host, Message::FormHost),
                 field("Port", &port, Message::FormPort),
             ]
             .spacing(10)
