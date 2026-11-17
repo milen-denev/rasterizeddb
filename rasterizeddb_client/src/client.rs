@@ -229,7 +229,7 @@ impl Client {
     }
 
     /// Sends text already checked (by [`check_statement`], or by rendering).
-    async fn send(&self, sql: &str) -> Result<Rows> {
+    pub(crate) async fn send(&self, sql: &str) -> Result<Rows> {
         let connection = self.pick();
         if let Some(limit) = self.idle_reconnect {
             connection.reopen_if_idle(limit, self.epoch).await;

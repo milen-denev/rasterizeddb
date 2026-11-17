@@ -94,6 +94,7 @@ extern crate self as rasterizeddb_client;
 
 mod client;
 mod error;
+mod executor;
 mod from_sql;
 mod login;
 mod params;
@@ -128,6 +129,7 @@ pub mod guide {
 
 pub use client::{Client, Options};
 pub use error::Error;
+pub use executor::Executor;
 pub use from_sql::{FromSql, FromSqlOwned};
 pub use login::Login;
 pub use params::{
@@ -146,8 +148,8 @@ pub mod prelude {
     pub use crate::kv::{KvKey, KvValue};
     pub use crate::orm::{Expr, ModelExt, ModelQuery};
     pub use crate::{
-        Client, Date, Error, FromRow, FromSql, Interval, Json, Numeric, Options, Param, Result,
-        Row, Rows, Time, Timestamp, ToSql, Uuid, Value, params,
+        Client, Date, Error, Executor, FromRow, FromSql, Interval, Json, Numeric, Options, Param,
+        Result, Row, Rows, Time, Timestamp, ToSql, Uuid, Value, params,
     };
     #[cfg(feature = "derive")]
     pub use crate::{Model, SqlEnum};
