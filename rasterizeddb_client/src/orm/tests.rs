@@ -539,3 +539,101 @@ fn projections_and_aggregates() {
         "relations do not load into a projection"
     );
 }
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "events")]
+struct Event {
+    #[rdb(primary_key)]
+    id: i64,
+    kind: String,
+    at: Timestamp,
+    score: i32,
+    note: Option<String>,
+}
+
+#[test]
+fn keyset_pages_compare_row_values_or_chains() {
+    use crate::Value;
+    let c = |v: Vec<Value>| Cursor::new(v);
+    // One direction: a row-value comparison, the key breaking ties the same
+    // way.
+    let q = Event::query()
+        .order_by(Event::score.desc())
+        .limit(10)
+        .after(&c(vec![Value::I32(5), Value::I64(9)]));
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, kind, at, score, note FROM events WHERE (score, id) < (5, 9) ORDER BY \
+         score DESC, id DESC LIMIT 10"
+    );
+    // Before a cursor: the comparison and the order turn round.
+    let q = Event::query()
+        .order_by(Event::score.desc())
+        .limit(10)
+        .before(&c(vec![Value::I32(5), Value::I64(9)]));
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, kind, at, score, note FROM events WHERE (score, id) > (5, 9) ORDER BY \
+         score ASC, id ASC LIMIT 10"
+    );
+    // Mixed directions: an OR-chain, each column compared its own way.
+    let q = Event::query()
+        .filter(Event::kind.eq("x"))
+        .order_by(Event::kind.asc())
+        .order_by(Event::at.desc())
+        .limit(2)
+        .after(&c(vec![
+            Value::Text("o'k".into()),
+            Value::Timestamp(Timestamp { micros: 0 }),
+            Value::I64(-3),
+        ]));
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, kind, at, score, note FROM events WHERE (kind = 'x') AND ((kind > 'o''k') OR \
+         (kind = 'o''k' AND at < '1970-01-01 00:00:00+00') OR (kind = 'o''k' AND at = \
+         '1970-01-01 00:00:00+00' AND id < (-3))) ORDER BY kind ASC, at DESC, id DESC LIMIT 2"
+    );
+    // No order: the primary key alone, no parentheses (a parenthesised
+    // bare column is refused by the server).
+    let q = Event::query().limit(3).after(&c(vec![Value::I64(7)]));
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, kind, at, score, note FROM events WHERE id > 7 ORDER BY id ASC LIMIT 3"
+    );
+    // Refusals: a nullable key, a cursor for another order, an offset.
+    let refused = |q: Select<Event>| q.to_sql().unwrap_err().to_string();
+    assert!(
+        refused(Event::query().order_by(Event::note.asc()).after(&c(vec![]))).contains("nullable")
+    );
+    assert!(
+        refused(Event::query().after(&c(vec![Value::I64(1), Value::I64(2)])))
+            .contains("another order")
+    );
+    assert!(refused(Event::query().offset(5).after(&c(vec![Value::I64(1)]))).contains("offset"));
+
+    // Cursors as strings: typed values only, rendered under escaping.
+    let cursor = c(vec![
+        Value::Text("'); DROP TABLE events; --".into()),
+        Value::Timestamp(Timestamp {
+            micros: 1_700_000_000_123_456,
+        }),
+        Value::I64(-1),
+        Value::Numeric(Numeric::new("-1.50").unwrap()),
+    ]);
+    let text = cursor.encode().unwrap();
+    assert!(
+        text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.'),
+        "{text}"
+    );
+    assert_eq!(Cursor::decode(&text).unwrap(), cursor);
+    assert!(Cursor::decode("zz").is_err());
+    assert!(Cursor::decode("l3").is_err());
+    let hostile = c(vec![Value::Text("'; --".into()), Value::I64(1)]);
+    let back = Cursor::decode(&hostile.encode().unwrap()).unwrap();
+    let sql = Event::query()
+        .order_by(Event::kind.asc())
+        .after(&back)
+        .to_sql()
+        .unwrap();
+    assert!(sql.contains("(kind, id) > ('''; --', 1)"), "{sql}");
+}

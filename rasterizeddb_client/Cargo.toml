@@ -35,6 +35,8 @@ sha2 = "0.11"
 hmac = "0.13"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 base64 = "0.23"
+# RowStream is a futures_core::Stream (the trait only, no executor).
+futures-core = { version = "0.3", default-features = false }
 rasterizeddb_client_derive = { path = "../rasterizeddb_client_derive", version = "0.2.0", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 uuid = { version = "1", default-features = false, optional = true }

@@ -88,11 +88,13 @@
 //! be visible to other processes while it migrates, which a lock taken
 //! inside an uncommitted transaction is not.
 
+mod keyset;
 mod migrate;
 mod projection;
 mod query;
 mod relations;
 
+pub use keyset::{Cursor, Page, RowStream};
 pub use migrate::{
     AutoMigrate, BoxFuture, MigrationPlan, MigrationReport, Migrator, StepState, StepStatus,
     SyncPolicy,

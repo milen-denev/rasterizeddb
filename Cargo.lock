@@ -4499,6 +4499,7 @@ version = "0.2.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
+ "futures-core",
  "hmac",
  "libc",
  "pbkdf2",

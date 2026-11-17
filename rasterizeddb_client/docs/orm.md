@@ -238,6 +238,70 @@ refuses to guess. The cast goes *outside* the sum, so the server adds exact
 integers and only the total is converted; a total past `i64` is the
 server's error, never a wrapped number.
 
+## Keyset pages and streams
+
+`OFFSET` pages skip rows the server still reads, and shift when rows are
+added before them. A keyset page starts *after a row's sort key* instead:
+[`page`](crate::orm::Select::page) reads up to `limit` rows in the query's
+order and returns a [`Page`](crate::orm::Page) with the
+[`Cursor`](crate::orm::Cursor) of the next page and of the one before.
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+use rasterizeddb_client::orm::Cursor;
+# #[derive(Model)] #[rdb(table = "events")]
+# struct Event { #[rdb(primary_key)] id: i64, kind: String, at: Timestamp }
+# async fn demo(db: &Client, from_client: Option<&str>) -> rasterizeddb_client::Result<()> {
+let q = Event::query()
+    .filter(Event::kind.eq("login"))
+    .order_by(Event::at.desc())
+    .limit(50);
+let page = match from_client {
+    Some(text) => q.after(&Cursor::decode(text)?).page(db).await?,
+    None => q.page(db).await?,
+};
+// Hand page.next_cursor (encoded) to the client for the next request.
+let next: Option<String> = page.next_cursor.map(|c| c.encode()).transpose()?;
+# let _ = (page.items, next); Ok(()) }
+```
+
+* The sort key is the `ORDER BY` columns, then the primary key's (in the
+  last column's direction) to break ties, so every row has one place.
+* When every key sorts the same way the condition is a row-value
+  comparison, `(at, id) < ('…', 42)`; when directions differ it is the
+  equivalent OR-chain, `kind > 'x' OR (kind = 'x' AND at < '…') OR …`.
+* [`before`](crate::orm::Select::before) reads the page before a cursor
+  (backwards, then put back in order).
+* Keys must be `NOT NULL` columns: a NULL compares as unknown, and the rows
+  holding one would never be reached. A nullable key is refused, as is an
+  `offset` or an order by an expression.
+* [`Cursor::encode`](crate::orm::Cursor::encode) is an opaque, URL-safe
+  string of typed values; a decoded cursor is written into the next
+  statement as escaped literals, so a client cannot smuggle SQL in one.
+
+[`stream`](crate::orm::Select::stream) reads every matching row in keyset
+batches, one statement each, so a table of any size is read without an
+answer past the message limit. Pull rows with
+[`next`](crate::orm::RowStream::next) or whole batches with
+[`next_batch`](crate::orm::RowStream::next_batch); it is also a
+`futures_core::Stream`.
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+# #[derive(Model)] #[rdb(table = "events")]
+# struct Event { #[rdb(primary_key)] id: i64, at: Timestamp }
+# async fn demo(db: &Client) -> rasterizeddb_client::Result<()> {
+let mut rows = Event::query().order_by(Event::at.asc()).stream(db, 1000);
+while let Some(event) = rows.next().await {
+    let event = event?;
+#   let _ = event;
+}
+# Ok(()) }
+```
+
+Each batch is its own statement: outside a transaction, a row written
+while the stream runs is seen or not depending on where it sorts.
+
 ## The same struct in the cache
 
 A model can also live in the key/value cache, as a hash per row:

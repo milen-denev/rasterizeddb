@@ -784,3 +784,143 @@ async fn projections_and_aggregates_decode() {
     })
     .await
 }
+
+// ------------------------------------------------------- keyset and stream
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "events")]
+struct Event {
+    #[rdb(primary_key)]
+    id: i64,
+    kind: String,
+    at: Timestamp,
+    score: i32,
+}
+
+fn ids(events: &[Event]) -> Vec<i64> {
+    events.iter().map(|e| e.id).collect()
+}
+
+/// Every page of `q` forwards, then every page backwards from the end:
+/// both must be the whole result in order.
+async fn walk(c: &Client, q: rasterizeddb_client::orm::Select<Event>) -> (Vec<i64>, Vec<i64>) {
+    let mut forward = Vec::new();
+    let mut page = q.clone().page(c).await.unwrap();
+    assert!(
+        page.prev_cursor.is_none(),
+        "the first page has nothing before it"
+    );
+    let mut last_page;
+    loop {
+        forward.extend(ids(&page.items));
+        last_page = page.clone();
+        match &page.next_cursor {
+            // Through the string form, as a web client would carry it.
+            Some(cursor) => {
+                let carried = Cursor::decode(&cursor.encode().unwrap()).unwrap();
+                page = q.clone().after(&carried).page(c).await.unwrap();
+            }
+            None => break,
+        }
+    }
+    let mut backward: Vec<i64> = ids(&last_page.items).into_iter().rev().collect();
+    let mut page = last_page;
+    while let Some(cursor) = page.prev_cursor.clone() {
+        page = q.clone().before(&cursor).page(c).await.unwrap();
+        assert!(page.next_cursor.is_some());
+        backward.extend(ids(&page.items).into_iter().rev());
+    }
+    backward.reverse();
+    (forward, backward)
+}
+
+use rasterizeddb_client::orm::Cursor;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keyset_pages_and_streams() {
+    bounded(async {
+        let Some(server) = server("keyset").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Event>().await.unwrap();
+        let base = 1_700_000_000_000_000i64;
+        let events: Vec<Event> = (1..=50)
+            .map(|i| Event {
+                id: i,
+                kind: ["b", "a", "c"][(i % 3) as usize].to_string(),
+                at: Timestamp {
+                    micros: base + (i * 7919 % 50) * 1_000_000,
+                },
+                score: (i % 5) as i32,
+            })
+            .collect();
+        c.insert_many(&events).await.unwrap();
+
+        // One direction, many ties: (score, id) < (x, y).
+        let by_score = Event::query().order_by(Event::score.desc()).limit(7);
+        let whole = ids(&Event::query()
+            .order_by(Event::score.desc())
+            .order_by(Event::id.desc())
+            .all(&c)
+            .await
+            .unwrap());
+        let (forward, backward) = walk(&c, by_score).await;
+        assert_eq!(forward, whole);
+        assert_eq!(backward, whole);
+
+        // Mixed directions, filtered: the OR-chain.
+        let mixed = Event::query()
+            .filter(Event::score.ne(0))
+            .order_by(Event::kind.asc())
+            .order_by(Event::at.desc())
+            .limit(6);
+        let whole = ids(&Event::query()
+            .filter(Event::score.ne(0))
+            .order_by(Event::kind.asc())
+            .order_by(Event::at.desc())
+            .order_by(Event::id.desc())
+            .all(&c)
+            .await
+            .unwrap());
+        assert_eq!(whole.len(), 40);
+        let (forward, backward) = walk(&c, mixed).await;
+        assert_eq!(forward, whole);
+        assert_eq!(backward, whole);
+
+        // A page that ends exactly at the end says so.
+        let exact = Event::query().limit(50).page(&c).await.unwrap();
+        assert_eq!(exact.items.len(), 50);
+        assert!(exact.next_cursor.is_none());
+        let e = Event::query().page(&c).await.unwrap_err();
+        assert!(e.to_string().contains("limit"), "{e}");
+
+        // A stream: every row in key order, one statement per batch.
+        let counting = Counting::new(&c);
+        let mut stream = Event::query()
+            .order_by(Event::at.asc())
+            .stream(&counting, 6);
+        let mut streamed = Vec::new();
+        while let Some(row) = stream.next().await {
+            streamed.push(row.unwrap().id);
+        }
+        let whole = ids(&Event::query()
+            .order_by(Event::at.asc())
+            .order_by(Event::id.asc())
+            .all(&c)
+            .await
+            .unwrap());
+        assert_eq!(streamed, whole);
+        assert_eq!(counting.take(), 9, "ceil(50 / 6) batches");
+        let mut capped = Event::query()
+            .filter(Event::score.eq(1))
+            .limit(4)
+            .stream(&c, 3);
+        let mut first = Vec::new();
+        while let Some(batch) = capped.next_batch().await {
+            first.push(batch.unwrap().len());
+        }
+        assert_eq!(first, [3, 1], "a limit caps the stream");
+    })
+    .await
+}

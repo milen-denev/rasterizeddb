@@ -9,6 +9,7 @@ use std::marker::PhantomData;
 
 use std::sync::Arc;
 
+use super::keyset::{Cursor, Direction, keys, order_sql, predicate};
 use super::relations::{Count, Eager, Includes, With};
 use super::{BoxFuture, Model, ident, select_list};
 use crate::executor::Executor;
@@ -309,6 +310,18 @@ impl Order {
         }
     }
 
+    /// The column it sorts by, when it is one.
+    pub(crate) fn column(&self) -> Option<&'static str> {
+        match self.key {
+            OrderKey::Column(c) => Some(c),
+            OrderKey::Expression(_) => None,
+        }
+    }
+
+    pub(crate) fn descending(&self) -> bool {
+        self.direction == "DESC"
+    }
+
     pub(crate) fn expression(
         sql: std::result::Result<String, String>,
         direction: &'static str,
@@ -370,6 +383,8 @@ pub struct Select<M> {
     every_row: bool,
     /// Relations and counts loaded after the rows arrive, in order.
     includes: Includes<M>,
+    /// A keyset query's cursor, and which way it reads from it.
+    keyset: Option<(Cursor, Direction)>,
     _model: PhantomData<fn() -> M>,
 }
 
@@ -382,6 +397,7 @@ impl<M> Clone for Select<M> {
             offset: self.offset,
             every_row: self.every_row,
             includes: self.includes.clone(),
+            keyset: self.keyset.clone(),
             _model: PhantomData,
         }
     }
@@ -415,6 +431,7 @@ impl<M: Model> Select<M> {
             offset: None,
             every_row: false,
             includes: Vec::new(),
+            keyset: None,
             _model: PhantomData,
         }
     }
@@ -518,9 +535,13 @@ impl<M: Model> Select<M> {
         Ok(())
     }
 
-    /// The rows of `rows`, and every relation loaded into them.
+    /// The rows of `rows`, and every relation loaded into them; read
+    /// before a cursor, they arrive nearest first and are put back in order.
     async fn finish(&self, db: &dyn SendSql, rows: Rows) -> Result<Vec<M>> {
         let mut out: Vec<M> = rows.decode_all()?;
+        if self.keyset_direction() == Some(Direction::Before) {
+            out.reverse();
+        }
         for include in &self.includes {
             include.load(db, &mut out).await?;
         }
@@ -539,8 +560,98 @@ impl<M: Model> Select<M> {
         })
     }
 
+    /// The rows after `cursor` in the query's order (a keyset page): see
+    /// [`page`](Self::page). Replaces an earlier `after` or `before`.
+    pub fn after(mut self, cursor: &Cursor) -> Self {
+        self.keyset = Some((cursor.clone(), Direction::After));
+        self
+    }
+
+    /// The rows before `cursor` in the query's order, the nearest last:
+    /// the page before a page. Replaces an earlier `after` or `before`.
+    pub fn before(mut self, cursor: &Cursor) -> Self {
+        self.keyset = Some((cursor.clone(), Direction::Before));
+        self
+    }
+
+    pub(crate) fn keyset_direction(&self) -> Option<Direction> {
+        self.keyset.as_ref().map(|(_, d)| *d)
+    }
+
+    pub(crate) fn order_list(&self) -> &[Order] {
+        &self.order
+    }
+
+    pub(crate) fn limit_value(&self) -> Option<u64> {
+        self.limit
+    }
+
+    pub(crate) fn page_size(&self) -> Result<u64> {
+        match self.limit {
+            Some(n) if n > 0 => Ok(n),
+            _ => Err(Error::Param(
+                "a page needs its size: set limit(n) to a positive number".to_string(),
+            )),
+        }
+    }
+
+    /// A keyset statement: the filter, the cursor's predicate, `ORDER BY`
+    /// the keys (reversed to read before a cursor), and `LIMIT`.
+    pub(crate) fn keyset_sql(
+        &self,
+        keys: &[super::keyset::Key],
+        limit: Option<u64>,
+    ) -> Result<String> {
+        if self.offset.is_some() {
+            return Err(Error::Unsupported(
+                "a keyset page starts at a cursor, not an offset: drop offset()".to_string(),
+            ));
+        }
+        let mut sql = format!("SELECT {} FROM {}", select_list::<M>()?, ident(M::TABLE)?);
+        let mut conditions = Vec::new();
+        if let Some(filter) = self.where_sql()? {
+            conditions.push(format!("({filter})"));
+        }
+        if let Some((cursor, direction)) = &self.keyset {
+            conditions.push(predicate(keys, cursor, *direction)?);
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order_sql(
+            keys,
+            self.keyset_direction() == Some(Direction::Before),
+        )?);
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        Ok(sql)
+    }
+
+    /// Rows `order` of `rows`, in that order, with their relations.
+    pub(crate) async fn finish_rows(
+        &self,
+        db: &dyn SendSql,
+        rows: &Rows,
+        order: &[usize],
+    ) -> Result<Vec<M>> {
+        let mut out: Vec<M> = order
+            .iter()
+            .map(|&i| rows.get(i).expect("in range").decode())
+            .collect::<Result<_>>()?;
+        for include in &self.includes {
+            include.load(db, &mut out).await?;
+        }
+        Ok(out)
+    }
+
     /// The statement [`all`](Self::all) runs.
     pub fn to_sql(&self) -> Result<String> {
+        if self.keyset.is_some() {
+            return self.keyset_sql(&keys::<M>(&self.order)?, self.limit);
+        }
         let mut sql = format!("SELECT {} FROM {}", select_list::<M>()?, ident(M::TABLE)?);
         self.push_where(&mut sql)?;
         self.push_tail(&mut sql)?;
