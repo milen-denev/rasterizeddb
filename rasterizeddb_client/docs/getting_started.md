@@ -100,11 +100,11 @@ database. A few things it does not carry, which this client accounts for:
   before it is sent ([`Error::Unsupported`](crate::Error::Unsupported)): the
   server would run only the first statement of an `INSERT …; INSERT …`
   string and drop the rest.
-* **No transactions.** `BEGIN`, `COMMIT` and the rest are refused; every
-  statement commits on its own. Put writes that belong together into one
-  statement (a multi-row `INSERT`, `INSERT … ON CONFLICT`, `UPDATE … WHERE`,
-  `DELETE … RETURNING`), or use the server's PostgreSQL listener when you need
-  a transaction block.
+* **Transactions through [`begin`](crate::Client::begin).** A statement sent
+  on the client commits on its own. Statements that must commit together run
+  in a [`Transaction`](crate::Transaction), on a connection of its own; see
+  [transactions](crate::guide::transactions). `BEGIN`, `COMMIT` and the rest
+  written as statements are refused.
 * **No column names or types in answers.** Columns are read by position, and
   each cell carries a type tag; see [types](crate::guide::types) for what that
   means for `jsonb`, arrays and `NUMERIC(p, s)`.

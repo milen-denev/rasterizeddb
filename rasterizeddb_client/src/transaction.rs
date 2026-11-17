@@ -1,5 +1,6 @@
 //! [`Transaction`]: statements that commit or roll back together.
-
+//!
+//! See the [transactions chapter](crate::guide::transactions) of the guide.
 
 use std::future::Future;
 use std::pin::Pin;

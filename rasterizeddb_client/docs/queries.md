@@ -61,8 +61,9 @@ for row in &rows {
 
 ## Writing many rows, atomically
 
-Each statement is atomic, and there are no transaction blocks on this
-protocol, so make the write one statement:
+Each statement is atomic. Writes that belong together can go in one
+statement, which needs no transaction (several statements that must commit
+together go in a [transaction](crate::guide::transactions)):
 
 ```rust,no_run
 # use rasterizeddb_client::prelude::*;
@@ -91,6 +92,7 @@ let (id, hits): (i64, i64) = client
 | [`Error`](crate::Error) | meaning |
 |---|---|
 | `Transport` | the connection failed; the statement may or may not have run |
+| `TransactionLost` | a transaction's connection failed or idled out; it was rolled back, unless the failure came during COMMIT |
 | `Server` | the server refused the statement; its message |
 | `Unsupported` | refused before sending: a second statement, transaction control, an unsafe ORM call |
 | `Param` | a value that cannot be written (text with a NUL, a bad number) |

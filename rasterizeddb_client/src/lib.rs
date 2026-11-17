@@ -46,6 +46,7 @@
 //! | [Getting started](guide::getting_started) | connecting, sharing a client, what the native protocol cannot do |
 //! | [Types](guide::types) | the Rust ⇄ SQL mapping, and the three types that need `::text` |
 //! | [Queries](guide::queries) | the calls, rows, atomic writes, errors |
+//! | [Transactions](guide::transactions) | `begin`/`commit`, the retrying closure, savepoints, lost connections |
 //! | [The ORM](guide::orm) | `#[derive(Model)]`, CRUD, the query builder |
 //! | [Migrations](guide::migrations) | steps, scenarios, model sync, the `auto_migrate` knob |
 //! | [Key/value](guide::kv) | typed values, maps, queries, models as hashes |
@@ -118,6 +119,8 @@ pub mod guide {
     pub mod types {}
     #[doc = include_str!("../docs/queries.md")]
     pub mod queries {}
+    #[doc = include_str!("../docs/transactions.md")]
+    pub mod transactions {}
     #[doc = include_str!("../docs/orm.md")]
     pub mod orm {}
     #[doc = include_str!("../docs/migrations.md")]
