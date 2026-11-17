@@ -924,3 +924,151 @@ async fn keyset_pages_and_streams() {
     })
     .await
 }
+
+// --------------------------------------------- timestamps and soft delete
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "folders")]
+struct Folder {
+    #[rdb(primary_key)]
+    id: i64,
+    #[rdb(has_many(Note, foreign_key = "folder_id"))]
+    notes: Vec<Note>,
+}
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "notes")]
+struct Note {
+    #[rdb(primary_key, serial)]
+    id: i64,
+    folder_id: i64,
+    body: String,
+    #[rdb(created_at)]
+    created: Timestamp,
+    #[rdb(updated_at)]
+    updated: Timestamp,
+    #[rdb(soft_delete)]
+    deleted: Option<Timestamp>,
+    #[rdb(version)]
+    version: i64,
+}
+
+fn note(folder_id: i64, body: &str) -> Note {
+    Note {
+        id: 0,
+        folder_id,
+        body: body.into(),
+        created: Timestamp { micros: 0 },
+        updated: Timestamp { micros: 0 },
+        deleted: Some(Timestamp { micros: 0 }),
+        version: 0,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamps_come_from_the_server_and_deletes_are_soft() {
+    bounded(async {
+        let Some(server) = server("soft").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Folder>().await.unwrap();
+        c.create_table::<Note>().await.unwrap();
+        c.insert(&Folder {
+            id: 1,
+            notes: vec![],
+        })
+        .await
+        .unwrap();
+
+        let before = Timestamp::now().micros;
+        let mut a = c.insert(&note(1, "a")).await.unwrap();
+        assert!(
+            a.created.micros >= before - 60_000_000,
+            "the server's clock, not 1970"
+        );
+        // The server evaluates now() per call (PostgreSQL holds it for the
+        // transaction), so the two may differ by microseconds.
+        assert!(a.updated.micros >= a.created.micros);
+        assert!(a.updated.micros - a.created.micros < 1_000_000);
+        assert_eq!(
+            a.deleted,
+            Some(Timestamp { micros: 0 }),
+            "inserted as given"
+        );
+        a = c.restore(&a).await.unwrap();
+        assert_eq!(a.deleted, None);
+        assert_eq!(a.version, 2, "restore is a versioned write");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.body = "a2".into();
+        let a = c.update(&a).await.unwrap();
+        assert!(a.updated.micros > a.created.micros, "updated moves");
+        let stored: Note = c.find(a.id).await.unwrap().unwrap();
+        assert_eq!(stored.created, a.created, "created never moves");
+
+        let mut b = note(1, "b");
+        b.deleted = None;
+        let b = c.insert(&b).await.unwrap();
+        let mut gone = note(1, "gone");
+        gone.deleted = None;
+        let gone = c.insert(&gone).await.unwrap();
+
+        // A soft delete: the row stays, queries leave it out.
+        assert!(c.delete(&b).await.unwrap());
+        assert!(
+            !c.delete(&b).await.unwrap(),
+            "already deleted: false, not a conflict"
+        );
+        assert!(c.find::<Note>(b.id).await.unwrap().is_none());
+        assert_eq!(Note::query().count(&c).await.unwrap(), 2);
+        assert_eq!(Note::query().with_deleted().count(&c).await.unwrap(), 3);
+        let deleted = Note::query().only_deleted().all(&c).await.unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].body, "b");
+        assert!(deleted[0].deleted.is_some());
+        assert_eq!(deleted[0].version, b.version + 1);
+
+        // Relations see live rows too, unless told otherwise.
+        let folders = Folder::query().with(Folder::notes).all(&c).await.unwrap();
+        assert_eq!(folders[0].notes.len(), 2);
+        let all = Folder::query()
+            .with(Folder::notes.with_deleted())
+            .all(&c)
+            .await
+            .unwrap();
+        assert_eq!(all[0].notes.len(), 3);
+        let with_deleted_b = Folder::query()
+            .where_has(Folder::notes.filter(Note::body.eq("b")))
+            .count(&c)
+            .await
+            .unwrap();
+        assert_eq!(with_deleted_b, 0, "a deleted note does not count");
+        let (n,): (i64,) = Note::query().select((count_rows(),)).one(&c).await.unwrap();
+        assert_eq!(n, 2);
+
+        // Restore, then force.
+        let b = c.restore(&deleted[0]).await.unwrap();
+        assert_eq!(b.deleted, None);
+        assert!(c.find::<Note>(b.id).await.unwrap().is_some());
+        assert!(c.force_delete(&gone).await.unwrap());
+        assert_eq!(Note::query().with_deleted().count(&c).await.unwrap(), 2);
+
+        // Bulk: delete marks, bumps versions and update times; force removes.
+        let marked = Note::query()
+            .filter(Note::body.eq("b"))
+            .delete(&c)
+            .await
+            .unwrap();
+        assert_eq!(marked, 1);
+        assert_eq!(Note::query().count(&c).await.unwrap(), 1);
+        let removed = Note::query()
+            .filter(Note::folder_id.eq(1i64))
+            .with_deleted()
+            .force_delete(&c)
+            .await
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(Note::query().with_deleted().count(&c).await.unwrap(), 0);
+    })
+    .await
+}

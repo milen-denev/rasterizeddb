@@ -287,6 +287,16 @@ impl<P: Model, C: Model> Relation<P, C> {
         With::from(self).limit(n)
     }
 
+    /// Soft-deleted related rows too (see [`Select::with_deleted`]).
+    pub fn with_deleted(self) -> With<P, C> {
+        With::from(self).with_deleted()
+    }
+
+    /// Only soft-deleted related rows.
+    pub fn only_deleted(self) -> With<P, C> {
+        With::from(self).only_deleted()
+    }
+
     /// Loads `nested` on the related rows too: `User::posts.with(Post::comments)`.
     pub fn with<G>(self, nested: impl Into<With<C, G>>) -> With<P, C>
     where
@@ -572,6 +582,18 @@ impl<P: Model, C: Model> With<P, C> {
         G: Model + Send + Sync + 'static,
     {
         self.select = self.select.with_count(relation);
+        self
+    }
+
+    /// Soft-deleted related rows too (see [`Select::with_deleted`]).
+    pub fn with_deleted(mut self) -> Self {
+        self.select = self.select.with_deleted();
+        self
+    }
+
+    /// Only soft-deleted related rows.
+    pub fn only_deleted(mut self) -> Self {
+        self.select = self.select.only_deleted();
         self
     }
 

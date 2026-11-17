@@ -49,6 +49,8 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `skip` | not a column: `Default::default()` on reads |
 /// | `version` | an integer for optimistic locking: inserts write 1, updates `version + 1` where it is still the struct's; a lost race is `Error::Conflict` |
 /// | `references = "users(id)"` | a foreign key in the DDL, with `on_delete = "cascade"` / `on_update = …` |
+/// | `created_at`, `updated_at` | set to the server's `now()` on insert (and, `updated_at`, on every update) |
+/// | `soft_delete` | an `Option` timestamp: `delete` sets it, queries leave out rows where it is set |
 ///
 /// # Relation fields
 ///
@@ -299,11 +301,17 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 "json" => out.json = true,
                 "text" => out.text = true,
                 "skip" => out.skip = true,
-                "version" => {
+                "version" | "created_at" | "updated_at" | "soft_delete" => {
                     if out.role.is_some() {
                         return Err(meta.error("a column has one maintained role"));
                     }
-                    out.role = Some(("Version", meta.path.span()));
+                    let role = match key.as_str() {
+                        "version" => "Version",
+                        "created_at" => "CreatedAt",
+                        "updated_at" => "UpdatedAt",
+                        _ => "SoftDelete",
+                    };
+                    out.role = Some((role, meta.path.span()));
                 }
                 "index" => {
                     out.index = Some(if meta.input.peek(syn::Token![=]) {
@@ -344,8 +352,8 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                     return Err(meta.error(
                         "unknown rdb attribute; expected primary_key, serial, unique, index, \
                          column, sql_type, default, renamed_from, references, on_delete, \
-                         on_update, json, text, skip, version, has_many, has_one, belongs_to, \
-                         many_to_many or count_of",
+                         on_update, json, text, skip, version, created_at, updated_at, \
+                         soft_delete, has_many, has_one, belongs_to, many_to_many or count_of",
                     ));
                 }
             }
@@ -659,11 +667,17 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             None => quote!(::core::option::Option::None),
         };
         let role = match f.attrs.role {
+            Some(("SoftDelete", span)) if !nullable => {
+                return Err(syn::Error::new(
+                    span,
+                    "a soft_delete column is NULL while the row is live: make the field an Option",
+                ));
+            }
             Some((role, span)) => {
                 if roles.contains(&role) {
                     return Err(syn::Error::new(
                         span,
-                        format!("a model has one {} column", role.to_lowercase()),
+                        format!("a model has one {role} column"),
                     ));
                 }
                 roles.push(role);

@@ -385,7 +385,17 @@ pub struct Select<M> {
     includes: Includes<M>,
     /// A keyset query's cursor, and which way it reads from it.
     keyset: Option<(Cursor, Direction)>,
+    /// Which rows of a soft-deleting model it sees.
+    scope: Scope,
     _model: PhantomData<fn() -> M>,
+}
+
+/// Which rows of a model with a `#[rdb(soft_delete)]` column a query sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scope {
+    Live,
+    WithDeleted,
+    OnlyDeleted,
 }
 
 impl<M> Clone for Select<M> {
@@ -398,6 +408,7 @@ impl<M> Clone for Select<M> {
             every_row: self.every_row,
             includes: self.includes.clone(),
             keyset: self.keyset.clone(),
+            scope: self.scope,
             _model: PhantomData,
         }
     }
@@ -432,6 +443,7 @@ impl<M: Model> Select<M> {
             every_row: false,
             includes: Vec::new(),
             keyset: None,
+            scope: Scope::Live,
             _model: PhantomData,
         }
     }
@@ -519,11 +531,32 @@ impl<M: Model> Select<M> {
         !self.includes.is_empty()
     }
 
-    /// The `WHERE` condition, without the keyword; `None` for every row.
+    /// Soft-deleted rows too: for a model with a `#[rdb(soft_delete)]`
+    /// column, whose queries leave them out by default. (No effect on
+    /// other models.)
+    pub fn with_deleted(mut self) -> Self {
+        self.scope = Scope::WithDeleted;
+        self
+    }
+
+    /// Only soft-deleted rows.
+    pub fn only_deleted(mut self) -> Self {
+        self.scope = Scope::OnlyDeleted;
+        self
+    }
+
+    /// The `WHERE` condition, without the keyword: the filter, and the
+    /// soft-delete scope; `None` for every row.
     pub(crate) fn where_sql(&self) -> Result<Option<String>> {
-        Ok(match &self.filter {
-            Some(filter) => Some(filter.to_sql()?.to_string()),
-            None => None,
+        let scope = match (super::soft_delete_column::<M>(), self.scope) {
+            (None, _) | (Some(_), Scope::WithDeleted) => None,
+            (Some(c), Scope::Live) => Some(format!("{} IS NULL", ident(c)?)),
+            (Some(c), Scope::OnlyDeleted) => Some(format!("{} IS NOT NULL", ident(c)?)),
+        };
+        Ok(match (&self.filter, scope) {
+            (None, scope) => scope,
+            (Some(filter), None) => Some(filter.to_sql()?.to_string()),
+            (Some(filter), Some(scope)) => Some(format!("({}) AND {scope}", filter.to_sql()?)),
         })
     }
 
@@ -730,16 +763,48 @@ impl<M: Model> Select<M> {
                 M::TABLE
             )));
         }
-        if self.limit.is_some() || self.offset.is_some() || !self.order.is_empty() {
+        if self.limit.is_some()
+            || self.offset.is_some()
+            || !self.order.is_empty()
+            || self.keyset.is_some()
+            || !self.includes.is_empty()
+        {
             return Err(Error::Unsupported(format!(
-                "{verb} takes a filter only: limit, offset and order do not apply"
+                "{verb} takes a filter only: limit, offset, order, a cursor and relations do \
+                 not apply"
             )));
         }
         Ok(())
     }
 
     /// Deletes the filtered rows. How many.
+    ///
+    /// For a model with a `#[rdb(soft_delete)]` column, it marks them
+    /// deleted instead (`UPDATE … SET deleted_at = now()`, with the version
+    /// and update time), the ones not deleted yet;
+    /// [`force_delete`](Self::force_delete) removes them.
     pub async fn delete<E: Executor>(&self, db: &E) -> Result<u64> {
+        self.check_scope("DELETE")?;
+        let Some(column) = super::soft_delete_column::<M>() else {
+            return self.force_delete(db).await;
+        };
+        let column = ident(column)?;
+        let mut sets = vec![format!("{column} = now()")];
+        sets.extend(super::maintained_sets::<M>(None)?);
+        let mut live = self.clone();
+        if live.scope == Scope::WithDeleted {
+            live.scope = Scope::Live;
+        }
+        let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, sets.join(", "));
+        live.push_where(&mut sql)?;
+        Ok(db.run(&sql).await?.rows_affected().unwrap_or(0))
+    }
+
+    /// Removes the filtered rows with a `DELETE`, soft-deleting model or
+    /// not; for a soft-deleting model, the rows the query sees (add
+    /// [`with_deleted`](Self::with_deleted) to include deleted ones). How
+    /// many.
+    pub async fn force_delete<E: Executor>(&self, db: &E) -> Result<u64> {
         self.check_scope("DELETE")?;
         let mut sql = format!("DELETE FROM {}", ident(M::TABLE)?);
         self.push_where(&mut sql)?;
@@ -809,12 +874,18 @@ impl<M: Model> Update<M> {
         }
         let mut assignments: Vec<String> = sets.iter().map(|(_, a)| a.clone()).collect();
         // A versioned model's rows move to the next version whenever they
-        // change, so a holder of the old version cannot overwrite this.
-        if let Some(v) = super::version_column::<M>() {
-            let name = M::COLUMNS[v].name;
-            if !sets.iter().any(|(c, _)| *c == name) {
-                let name = ident(name)?;
-                assignments.push(format!("{name} = {name} + 1"));
+        // change, so a holder of the old version cannot overwrite this; an
+        // update time moves too. Unless a `set` names the column itself.
+        for (role, sql) in [
+            (super::ColumnRole::Version, "{} + 1"),
+            (super::ColumnRole::UpdatedAt, "now()"),
+        ] {
+            if let Some(i) = super::role_column::<M>(role) {
+                let name = M::COLUMNS[i].name;
+                if !sets.iter().any(|(c, _)| *c == name) {
+                    let quoted = ident(name)?;
+                    assignments.push(format!("{quoted} = {}", sql.replace("{}", &quoted)));
+                }
             }
         }
         let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, assignments.join(", "));
@@ -825,8 +896,10 @@ impl<M: Model> Update<M> {
     }
 
     /// Runs it, and returns the rows as they now are. A model with a
-    /// `#[rdb(version)]` column has `version = version + 1` added, unless a
-    /// `set` names the version column itself.
+    /// `#[rdb(version)]` column has `version = version + 1` added, and one
+    /// with `#[rdb(updated_at)]` `updated_at = now()`, unless a `set` names
+    /// that column itself. Soft-deleted rows are left alone unless the
+    /// query says [`with_deleted`](Select::with_deleted).
     pub async fn run<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
         db.run(&self.to_sql()?).await?.decode_all()
     }

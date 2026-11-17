@@ -65,6 +65,8 @@
 //! | `text` | read as `col::text` and parsed (for a type of your own) |
 //! | `skip` | not a column: filled with `Default::default()` on reads |
 //! | `version` | an integer for optimistic locking ([`ColumnRole::Version`]) |
+//! | `created_at`, `updated_at` | set to the server's `now()` ([`ColumnRole`]) |
+//! | `soft_delete` | `delete` marks the row; queries leave it out ([`ColumnRole::SoftDelete`]) |
 //! | `references = "users(id)"` | a foreign key ([`ForeignKey`]) |
 //! | `has_many(…)`, `belongs_to(…)`, … | a relation field ([`Relation`], [guide](crate::guide::relations)) |
 //!
@@ -173,6 +175,15 @@ pub enum ColumnRole {
     /// version too. A write that finds the row at another version is
     /// [`Error::Conflict`].
     Version,
+    /// `#[rdb(created_at)]`: `now()` on insert (the server's clock), never
+    /// written again.
+    CreatedAt,
+    /// `#[rdb(updated_at)]`: `now()` on insert and on every update.
+    UpdatedAt,
+    /// `#[rdb(soft_delete)]`, a nullable timestamp: `delete` sets it to
+    /// `now()` instead of removing the row, and queries leave out rows
+    /// where it is set (see [`Select::with_deleted`]).
+    SoftDelete,
 }
 
 /// A struct stored as a table's rows. Derive it: `#[derive(Model)]`.
@@ -321,9 +332,17 @@ fn primary_key<M: Model>() -> Result<Vec<usize>> {
 
 /// The `#[rdb(version)]` column, if the model has one.
 pub(crate) fn version_column<M: Model>() -> Option<usize> {
-    M::COLUMNS
-        .iter()
-        .position(|c| c.role == ColumnRole::Version)
+    role_column::<M>(ColumnRole::Version)
+}
+
+/// The column with `role`, if the model has one.
+pub(crate) fn role_column<M: Model>(role: ColumnRole) -> Option<usize> {
+    M::COLUMNS.iter().position(|c| c.role == role)
+}
+
+/// The `#[rdb(soft_delete)]` column's name, if the model has one.
+pub(crate) fn soft_delete_column<M: Model>() -> Option<&'static str> {
+    role_column::<M>(ColumnRole::SoftDelete).map(|i| M::COLUMNS[i].name)
 }
 
 /// ` AND version = <the struct's version>`, when the model has one.
@@ -347,15 +366,37 @@ fn push_version_check<M: Model>(
 }
 
 /// Column `i`'s value as an `INSERT` writes it: the field, or what the ORM
-/// maintains itself (`1` for a version).
+/// maintains itself (`1` for a version, `now()` for a timestamp).
 fn push_insert_value<M: Model>(m: &M, i: usize, out: &mut String) -> Result<()> {
     match M::COLUMNS[i].role {
         ColumnRole::Version => {
             out.push('1');
             Ok(())
         }
+        ColumnRole::CreatedAt | ColumnRole::UpdatedAt => {
+            out.push_str("now()");
+            Ok(())
+        }
         _ => m.write_value(i, out),
     }
+}
+
+/// The assignments every ORM update of a row adds: `version = version + 1`
+/// and `updated_at = now()`, for the model's columns with those roles.
+pub(crate) fn maintained_sets<M: Model>(qualifier: Option<&str>) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for column in M::COLUMNS {
+        let name = ident(column.name)?;
+        match column.role {
+            ColumnRole::Version => out.push(match qualifier {
+                Some(t) => format!("{name} = {t}.{name} + 1"),
+                None => format!("{name} = {name} + 1"),
+            }),
+            ColumnRole::UpdatedAt => out.push(format!("{name} = now()")),
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// `a = 1 AND b = 'x'` over the primary key, from `m`'s values.
@@ -455,16 +496,22 @@ pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
     } else {
         let table = ident(M::TABLE)?;
         sql.push_str(") DO UPDATE SET ");
-        for (n, column) in rest.iter().enumerate() {
-            if n > 0 {
-                sql.push_str(", ");
-            }
+        let mut sets = Vec::new();
+        for column in &rest {
             let name = ident(column.name)?;
             match column.role {
-                ColumnRole::Version => sql.push_str(&format!("{name} = {table}.{name} + 1")),
-                _ => sql.push_str(&format!("{name} = EXCLUDED.{name}")),
+                // Kept from the stored row; the next two below.
+                ColumnRole::CreatedAt | ColumnRole::Version | ColumnRole::UpdatedAt => {}
+                _ => sets.push(format!("{name} = EXCLUDED.{name}")),
             }
         }
+        sets.extend(maintained_sets::<M>(Some(&table))?);
+        if sets.is_empty() {
+            // Only a creation time outside the key: nothing to change.
+            let name = ident(rest[0].name)?;
+            sets.push(format!("{name} = {table}.{name}"));
+        }
+        sql.push_str(&sets.join(", "));
         push_version_check(m, " WHERE ", Some(&table), &mut sql)?;
     }
     sql.push_str(" RETURNING ");
@@ -476,27 +523,30 @@ pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
 /// `#[rdb(version)]` column, `version = version + 1 … AND version = <the
 /// struct's>`.
 pub fn update_sql<M: Model>(m: &M) -> Result<String> {
-    let mut sql = format!("UPDATE {} SET ", ident(M::TABLE)?);
-    let mut any = false;
+    let mut sets = Vec::new();
     for (i, column) in M::COLUMNS.iter().enumerate() {
         if column.primary_key || column.serial {
             continue;
         }
-        if any {
-            sql.push_str(", ");
-        }
-        any = true;
-        push_ident(&mut sql, column.name)?;
-        sql.push_str(" = ");
         match column.role {
-            ColumnRole::Version => {
-                push_ident(&mut sql, column.name)?;
-                sql.push_str(" + 1");
+            // Maintained below, or never written by an update (a creation
+            // time; a deletion, which delete and restore write).
+            ColumnRole::Version
+            | ColumnRole::UpdatedAt
+            | ColumnRole::CreatedAt
+            | ColumnRole::SoftDelete => {}
+            _ => {
+                let mut set = ident(column.name)?;
+                set.push_str(" = ");
+                m.write_value(i, &mut set)?;
+                sets.push(set);
             }
-            _ => m.write_value(i, &mut sql)?,
         }
     }
-    if !any {
+    let plain = sets.len();
+    sets.extend(maintained_sets::<M>(None)?);
+    let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, sets.join(", "));
+    if plain == 0 {
         return Err(Error::Unsupported(format!(
             "{} has no column outside its primary key to update",
             M::TABLE
@@ -510,12 +560,52 @@ pub fn update_sql<M: Model>(m: &M) -> Result<String> {
     Ok(sql)
 }
 
-/// `DELETE FROM t WHERE <primary key>`, and `AND version = <the struct's>`
-/// with a `#[rdb(version)]` column.
+/// What [`ModelExt::delete`] sends: `DELETE FROM t WHERE <primary key>`,
+/// and `AND version = <the struct's>` with a `#[rdb(version)]` column. With
+/// a `#[rdb(soft_delete)]` column, `UPDATE t SET deleted_at = now()` (and
+/// the version and update time) of the row while it is not deleted.
 pub fn delete_sql<M: Model>(m: &M) -> Result<String> {
+    match soft_delete_column::<M>() {
+        Some(column) => {
+            let column = ident(column)?;
+            let mut sets = vec![format!("{column} = now()")];
+            sets.extend(maintained_sets::<M>(None)?);
+            let mut sql = format!("UPDATE {} SET {} WHERE ", ident(M::TABLE)?, sets.join(", "));
+            key_predicate(m, &mut sql)?;
+            push_version_check(m, " AND ", None, &mut sql)?;
+            sql.push_str(&format!(" AND {column} IS NULL"));
+            Ok(sql)
+        }
+        None => force_delete_sql(m),
+    }
+}
+
+/// `DELETE FROM t WHERE <primary key> [AND version = …]`: what
+/// [`ModelExt::force_delete`] sends, removing the row whatever its
+/// soft-delete column says.
+pub fn force_delete_sql<M: Model>(m: &M) -> Result<String> {
     let mut sql = format!("DELETE FROM {} WHERE ", ident(M::TABLE)?);
     key_predicate(m, &mut sql)?;
     push_version_check(m, " AND ", None, &mut sql)?;
+    Ok(sql)
+}
+
+/// `UPDATE t SET deleted_at = NULL … WHERE <key> [AND version = …]
+/// RETURNING …`: what [`ModelExt::restore`] sends.
+pub fn restore_sql<M: Model>(m: &M) -> Result<String> {
+    let column = soft_delete_column::<M>().ok_or_else(|| {
+        Error::Unsupported(format!(
+            "{} has no #[rdb(soft_delete)] column: there is nothing to restore",
+            M::TABLE
+        ))
+    })?;
+    let mut sets = vec![format!("{} = NULL", ident(column)?)];
+    sets.extend(maintained_sets::<M>(None)?);
+    let mut sql = format!("UPDATE {} SET {} WHERE ", ident(M::TABLE)?, sets.join(", "));
+    key_predicate(m, &mut sql)?;
+    push_version_check(m, " AND ", None, &mut sql)?;
+    sql.push_str(" RETURNING ");
+    sql.push_str(&select_list::<M>()?);
     Ok(sql)
 }
 
@@ -531,6 +621,16 @@ pub(crate) struct VersionProbe {
 
 impl VersionProbe {
     pub(crate) fn of<M: Model>(m: &M) -> Result<Option<VersionProbe>> {
+        Self::probe(m, false)
+    }
+
+    /// For a soft delete: only a row not yet deleted can conflict; one
+    /// already deleted is "not there", as for a hard delete.
+    pub(crate) fn of_live<M: Model>(m: &M) -> Result<Option<VersionProbe>> {
+        Self::probe(m, true)
+    }
+
+    fn probe<M: Model>(m: &M, live: bool) -> Result<Option<VersionProbe>> {
         let Some(v) = version_column::<M>() else {
             return Ok(None);
         };
@@ -538,11 +638,14 @@ impl VersionProbe {
         key_predicate(m, &mut key)?;
         let mut expected = String::new();
         m.write_value(v, &mut expected)?;
-        let sql = format!(
+        let mut sql = format!(
             "SELECT {} FROM {} WHERE {key}",
             ident(M::COLUMNS[v].name)?,
             ident(M::TABLE)?
         );
+        if live && let Some(column) = soft_delete_column::<M>() {
+            sql.push_str(&format!(" AND {} IS NULL", ident(column)?));
+        }
         Ok(Some(VersionProbe {
             table: M::TABLE,
             key,
@@ -592,6 +695,9 @@ fn find_sql<M: Model>(key: &[&dyn ToSql]) -> Result<String> {
         push_ident(&mut sql, M::COLUMNS[i].name)?;
         sql.push_str(" = ");
         push_param(&mut sql, &value.to_param())?;
+    }
+    if let Some(column) = soft_delete_column::<M>() {
+        sql.push_str(&format!(" AND {} IS NULL", ident(column)?));
     }
     Ok(sql)
 }
@@ -850,23 +956,52 @@ pub trait ModelExt: Executor {
 
     /// Deletes the row with this primary key. Whether there was one.
     ///
+    /// With a `#[rdb(soft_delete)]` column it sets that column to `now()`
+    /// instead (and moves the version and update time): the row stays,
+    /// and queries leave it out. `false` when it was already deleted.
+    /// [`force_delete`](Self::force_delete) removes it.
+    ///
     /// With a `#[rdb(version)]` column the delete matches only the row at
     /// the version the struct holds, so a row changed since it was read is
     /// not deleted: [`Error::Conflict`]. A row already gone is `Ok(false)`,
     /// as without a version (one more statement tells the two apart).
     fn delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
         let sql = delete_sql(row);
+        let probe = VersionProbe::of_live(row);
+        async move { delete_checked(self, sql, probe).await }
+    }
+
+    /// Removes the row with this primary key: a `DELETE`, even for a model
+    /// with a `#[rdb(soft_delete)]` column (where [`delete`](Self::delete)
+    /// only marks it). Checks the version as `delete` does.
+    fn force_delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
+        let sql = force_delete_sql(row);
+        let probe = VersionProbe::of(row);
+        async move { delete_checked(self, sql, probe).await }
+    }
+
+    /// Clears a soft-deleted row's deletion time, and returns it as stored;
+    /// [`Error::RowCount`] when there is no such row, [`Error::Conflict`]
+    /// when its version moved. [`Error::Unsupported`] for a model without a
+    /// `#[rdb(soft_delete)]` column.
+    fn restore<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
+        let sql = restore_sql(row);
         let probe = VersionProbe::of(row);
         async move {
             let rows = self.run(&sql?).await?;
-            let deleted = rows.rows_affected().unwrap_or(0) > 0;
-            if !deleted
+            if rows.is_empty()
                 && let Some(probe) = probe?
                 && let Some(conflict) = probe.classify(self).await?
             {
                 return Err(conflict);
             }
-            Ok(deleted)
+            match rows.len() {
+                1 => Ok(rows.decode_first()?.expect("one row")),
+                got => Err(Error::RowCount {
+                    expected: "exactly 1",
+                    got,
+                }),
+            }
         }
     }
 
@@ -893,6 +1028,22 @@ pub trait ModelExt: Executor {
 }
 
 impl<E: Executor> ModelExt for E {}
+
+async fn delete_checked<E: Executor + ?Sized>(
+    db: &E,
+    sql: Result<String>,
+    probe: Result<Option<VersionProbe>>,
+) -> Result<bool> {
+    let rows = db.run(&sql?).await?;
+    let deleted = rows.rows_affected().unwrap_or(rows.len() as u64) > 0;
+    if !deleted
+        && let Some(probe) = probe?
+        && let Some(conflict) = probe.classify(db).await?
+    {
+        return Err(conflict);
+    }
+    Ok(deleted)
+}
 
 async fn fetch_at_most_one<E: Executor + ?Sized, M: Model>(
     db: &E,

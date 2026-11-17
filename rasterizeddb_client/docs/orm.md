@@ -50,6 +50,8 @@ struct Account {
 | `text` | read as `col::text` and parsed, for a type of your own |
 | `skip` | not a column; `Default::default()` on reads |
 | `version` | an integer for optimistic locking (below) |
+| `created_at`, `updated_at` | timestamps the server sets (below) |
+| `soft_delete` | an `Option` timestamp: `delete` marks the row instead of removing it (below) |
 | `references = "users(id)"` | a foreign key, with `on_delete` / `on_update` ([relations](crate::guide::relations#foreign-keys)) |
 | `has_many(…)`, `has_one(…)`, `belongs_to(…)`, `many_to_many(…)`, `count_of = "…"` | a relation field, not a column ([relations](crate::guide::relations)) |
 
@@ -140,6 +142,55 @@ loop {
     }
 }
 # let _ = doc; Ok(()) }
+```
+
+## Timestamps and soft delete
+
+`#[rdb(created_at)]` and `#[rdb(updated_at)]` fields are written by the
+server: `now()` in the statement, so every client agrees on one clock and a
+skewed one cannot write a time in the future. An insert or upsert sets both
+(the struct's values are ignored); every update, the bulk
+`query().update()` included, sets `updated_at` again and never touches
+`created_at`. The row that comes back holds the server's times. (This server
+evaluates `now()` per call, so the two can differ by microseconds within
+one insert.)
+
+`#[rdb(soft_delete)]` on an `Option<Timestamp>` field makes deleting a
+mark:
+
+| call | does |
+|---|---|
+| `delete(&row)` | `UPDATE … SET deleted_at = now()` (and the version and update time) of the row while it is not deleted; `false` when it already was |
+| `query()…delete(db)` | the same, for the filtered rows |
+| every query, `find`, relation load, count and aggregate | leaves out rows whose mark is set |
+| `.with_deleted()`, `.only_deleted()` | on a query or a relation: all rows, or only the marked ones |
+| `restore(&row)` | clears the mark, returns the row |
+| `force_delete(&row)`, `query()…force_delete(db)` | a real `DELETE` |
+| `update(&row)` | updates the row whether it is marked or not (you hold it) |
+| `upsert(&row)` | writes the row as given, the mark included: upserting a struct whose mark is `None` restores the row |
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+#[derive(Model, Debug, Clone)]
+struct Note {
+    #[rdb(primary_key, serial)]
+    id: i64,
+    body: String,
+    #[rdb(created_at)]
+    created_at: Timestamp,
+    #[rdb(updated_at)]
+    updated_at: Timestamp,
+    #[rdb(soft_delete)]
+    deleted_at: Option<Timestamp>,
+}
+
+# async fn demo(db: &Client, note: Note) -> rasterizeddb_client::Result<()> {
+db.delete(&note).await?;                                  // marked
+let live = Note::query().count(db).await?;                // leaves it out
+let bin = Note::query().only_deleted().all(db).await?;    // finds it
+let back = db.restore(&bin[0]).await?;
+db.force_delete(&back).await?;                            // gone
+# let _ = live; Ok(()) }
 ```
 
 ## Queries

@@ -637,3 +637,117 @@ fn keyset_pages_compare_row_values_or_chains() {
         .unwrap();
     assert!(sql.contains("(kind, id) > ('''; --', 1)"), "{sql}");
 }
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "notes")]
+struct Note {
+    #[rdb(primary_key)]
+    id: i64,
+    body: String,
+    #[rdb(created_at)]
+    created: Timestamp,
+    #[rdb(updated_at)]
+    updated: Timestamp,
+    #[rdb(soft_delete)]
+    deleted: Option<Timestamp>,
+    #[rdb(version)]
+    version: i64,
+}
+
+#[test]
+fn timestamps_and_soft_delete() {
+    let note = Note {
+        id: 1,
+        body: "b".into(),
+        created: Timestamp { micros: 0 },
+        updated: Timestamp { micros: 0 },
+        deleted: None,
+        version: 4,
+    };
+    let list = "id, body, created, updated, deleted, version";
+    assert_eq!(
+        insert_sql(&[&note]).unwrap(),
+        format!(
+            "INSERT INTO notes (id, body, created, updated, deleted, version) VALUES \
+             (1, 'b', now(), now(), NULL, 1) RETURNING {list}"
+        ),
+        "the server's clock, not the struct's"
+    );
+    assert_eq!(
+        update_sql(&note).unwrap(),
+        format!(
+            "UPDATE notes SET body = 'b', updated = now(), version = version + 1 WHERE id = 1 \
+             AND version = 4 RETURNING {list}"
+        ),
+        "an update never writes the creation or deletion time"
+    );
+    assert_eq!(
+        upsert_sql(&note).unwrap(),
+        format!(
+            "INSERT INTO notes (id, body, created, updated, deleted, version) VALUES \
+             (1, 'b', now(), now(), NULL, 1) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, \
+             deleted = EXCLUDED.deleted, updated = now(), version = notes.version + 1 WHERE \
+             notes.version = 4 RETURNING {list}"
+        )
+    );
+    assert_eq!(
+        delete_sql(&note).unwrap(),
+        "UPDATE notes SET deleted = now(), updated = now(), version = version + 1 WHERE id = 1 \
+         AND version = 4 AND deleted IS NULL"
+    );
+    assert_eq!(
+        force_delete_sql(&note).unwrap(),
+        "DELETE FROM notes WHERE id = 1 AND version = 4"
+    );
+    assert_eq!(
+        restore_sql(&note).unwrap(),
+        format!(
+            "UPDATE notes SET deleted = NULL, updated = now(), version = version + 1 WHERE id = 1 \
+             AND version = 4 RETURNING {list}"
+        )
+    );
+    assert!(restore_sql(&account()).is_err(), "nothing to restore");
+    assert_eq!(
+        find_sql::<Note>(&[&1i64]).unwrap(),
+        format!("SELECT {list} FROM notes WHERE id = 1 AND deleted IS NULL")
+    );
+    assert_eq!(
+        VersionProbe::of_live(&note).unwrap().unwrap().sql,
+        "SELECT version FROM notes WHERE id = 1 AND deleted IS NULL"
+    );
+
+    // Queries see live rows, unless told otherwise.
+    assert_eq!(
+        Note::query().to_sql().unwrap(),
+        format!("SELECT {list} FROM notes WHERE deleted IS NULL")
+    );
+    assert_eq!(
+        Note::query()
+            .filter(Note::id.gt(1i64))
+            .only_deleted()
+            .to_sql()
+            .unwrap(),
+        format!("SELECT {list} FROM notes WHERE (id > 1) AND deleted IS NOT NULL")
+    );
+    assert_eq!(
+        Note::query().with_deleted().to_sql().unwrap(),
+        format!("SELECT {list} FROM notes")
+    );
+    assert_eq!(
+        Note::query()
+            .filter(Note::id.gt(1i64))
+            .update()
+            .set(Note::body, "x")
+            .to_sql()
+            .unwrap(),
+        format!(
+            "UPDATE notes SET body = 'x', version = version + 1, updated = now() WHERE \
+             (id > 1) AND deleted IS NULL RETURNING {list}"
+        )
+    );
+    assert_eq!(
+        Note::query().select(count_rows()).to_sql().unwrap(),
+        "SELECT COUNT(*) FROM notes WHERE deleted IS NULL",
+        "aggregates count live rows"
+    );
+}
