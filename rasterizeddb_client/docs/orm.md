@@ -60,8 +60,11 @@ A field's type gives its column type through [`SqlType`](crate::orm::SqlType)
 
 ## Create, read, update, delete
 
-[`ModelExt`](crate::orm::ModelExt) gives the client the calls; each is one
-statement.
+[`ModelExt`](crate::orm::ModelExt) gives every
+[`Executor`](crate::Executor) the calls: a [`Client`](crate::Client), a
+reference to one, or a transaction. Each is one statement. Code written
+against `E: Executor` runs on its own or inside a transaction unchanged, and
+every future it returns is `Send`.
 
 ```rust,no_run
 # use rasterizeddb_client::prelude::*;
@@ -123,7 +126,17 @@ let removed = Account::query().filter(Account::visits.eq(0)).delete(client).awai
 # let _ = (page, n, one, raw, bumped, removed); Ok(()) }
 ```
 
-Every statement the builder makes can be seen first with `to_sql()`.
+Every statement the builder makes can be seen first with `to_sql()`. The
+terminal calls (`all`, `first`, `one`, `count`, `exists`, `delete`, `run`)
+take any executor, as the `ModelExt` calls do:
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+# #[derive(Model)] struct Account { #[rdb(primary_key, serial)] id: i64, visits: i64 }
+async fn busiest<E: Executor>(db: &E) -> rasterizeddb_client::Result<Option<Account>> {
+    Account::query().order_by(Account::visits.desc()).first(db).await
+}
+```
 
 ## The same struct in the cache
 

@@ -8,7 +8,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use super::{Model, ident, select_list};
-use crate::client::Client;
+use crate::executor::Executor;
 use crate::params::{push_ident, push_param};
 use crate::to_sql::ToSql;
 use crate::{Error, Result};
@@ -428,19 +428,19 @@ impl<M: Model> Select<M> {
     }
 
     /// Every matching row.
-    pub async fn all(&self, client: &Client) -> Result<Vec<M>> {
-        client.run(&self.to_sql()?).await?.decode_all()
+    pub async fn all<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
+        db.run(&self.to_sql()?).await?.decode_all()
     }
 
     /// The first row, if any (this adds `LIMIT 1`).
-    pub async fn first(&self, client: &Client) -> Result<Option<M>> {
+    pub async fn first<E: Executor>(&self, db: &E) -> Result<Option<M>> {
         let one = self.clone().limit(1);
-        client.run(&one.to_sql()?).await?.decode_first()
+        db.run(&one.to_sql()?).await?.decode_first()
     }
 
     /// Exactly one row; none or several is [`Error::RowCount`].
-    pub async fn one(&self, client: &Client) -> Result<M> {
-        let rows = client.run(&self.clone().limit(2).to_sql()?).await?;
+    pub async fn one<E: Executor>(&self, db: &E) -> Result<M> {
+        let rows = db.run(&self.clone().limit(2).to_sql()?).await?;
         match rows.len() {
             1 => Ok(rows.decode_first()?.expect("one row")),
             got => Err(Error::RowCount {
@@ -451,17 +451,14 @@ impl<M: Model> Select<M> {
     }
 
     /// `SELECT count(*)` over the filtered rows (limit and offset ignored).
-    pub async fn count(&self, client: &Client) -> Result<u64> {
+    pub async fn count<E: Executor>(&self, db: &E) -> Result<u64> {
         let mut sql = format!("SELECT COUNT(*) FROM {}", ident(M::TABLE)?);
         self.push_where(&mut sql)?;
-        client
-            .fetch_scalar::<i64>(&sql, &[])
-            .await
-            .map(|n| n as u64)
+        db.fetch_scalar::<i64>(&sql, &[]).await.map(|n| n as u64)
     }
 
     /// Whether any row matches.
-    pub async fn exists(&self, client: &Client) -> Result<bool> {
+    pub async fn exists<E: Executor>(&self, db: &E) -> Result<bool> {
         let mut sql = format!(
             "SELECT {} FROM {}",
             ident(M::COLUMNS.first().map_or("*", |c| c.name))?,
@@ -469,7 +466,7 @@ impl<M: Model> Select<M> {
         );
         self.push_where(&mut sql)?;
         sql.push_str(" LIMIT 1");
-        Ok(!client.run(&sql).await?.is_empty())
+        Ok(!db.run(&sql).await?.is_empty())
     }
 
     fn check_scope(&self, verb: &str) -> Result<()> {
@@ -488,11 +485,11 @@ impl<M: Model> Select<M> {
     }
 
     /// Deletes the filtered rows. How many.
-    pub async fn delete(&self, client: &Client) -> Result<u64> {
+    pub async fn delete<E: Executor>(&self, db: &E) -> Result<u64> {
         self.check_scope("DELETE")?;
         let mut sql = format!("DELETE FROM {}", ident(M::TABLE)?);
         self.push_where(&mut sql)?;
-        Ok(client.run(&sql).await?.rows_affected().unwrap_or(0))
+        Ok(db.run(&sql).await?.rows_affected().unwrap_or(0))
     }
 
     /// An `UPDATE` of the filtered rows: add [`set`](Update::set)s, then
@@ -563,7 +560,7 @@ impl<M: Model> Update<M> {
     }
 
     /// Runs it, and returns the rows as they now are.
-    pub async fn run(&self, client: &Client) -> Result<Vec<M>> {
-        client.run(&self.to_sql()?).await?.decode_all()
+    pub async fn run<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
+        db.run(&self.to_sql()?).await?.decode_all()
     }
 }

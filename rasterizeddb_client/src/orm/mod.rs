@@ -64,11 +64,22 @@
 //! Struct attribute: `#[rdb(table = "name")]`, otherwise the struct's name in
 //! snake case.
 //!
-//! # No transactions
+//! # On any executor
 //!
-//! Each call is one statement and commits on its own (the native protocol
-//! has no transaction blocks). [`ModelExt::insert_many`] is one multi-row
-//! statement per chunk: atomic within a chunk, not across chunks.
+//! Every call takes an [`Executor`]: a
+//! [`Client`](crate::Client), a reference to one, or a transaction. The
+//! same ORM code runs on its own, each statement committing by itself, or
+//! inside a transaction, unchanged. [`ModelExt`] is implemented for every
+//! executor (`client.insert(&row)`, `tx.insert(&row)`), and the query
+//! builder's terminal calls take one (`.all(&client)`, `.all(&tx)`).
+//!
+//! Outside a transaction each call is one statement and commits on its own.
+//! [`ModelExt::insert_many`] is one multi-row statement per chunk: atomic
+//! within a chunk, not across chunks.
+//!
+//! The [`Migrator`] stays on a [`Client`](crate::Client): its lock row must
+//! be visible to other processes while it migrates, which a lock taken
+//! inside an uncommitted transaction is not.
 
 mod migrate;
 mod query;
@@ -79,8 +90,10 @@ pub use migrate::{
 };
 pub use query::{Column, Expr, Order, Select, Update};
 
+use std::future::Future;
+
 use crate::admin::IndexMethod;
-use crate::client::Client;
+use crate::executor::Executor;
 use crate::params::{push_ident, push_param};
 use crate::row::FromRow;
 use crate::to_sql::ToSql;
@@ -539,153 +552,193 @@ pub const INSERT_CHUNK_ROWS: usize = 500;
 /// under.
 pub const INSERT_CHUNK_BYTES: usize = 1 << 20;
 
-/// The ORM's calls on a [`Client`]: `client.insert(&row)` and the rest.
-#[allow(async_fn_in_trait)]
-pub trait ModelExt {
+/// The ORM's calls on any [`Executor`]: `client.insert(&row)` and the rest,
+/// on a [`Client`](crate::Client) or inside a transaction.
+///
+/// Implemented for every [`Executor`]; bring it into scope (the prelude
+/// does) and call it on one. Every future is `Send`, and none borrows the
+/// row it was given past the call: the statement is written before the
+/// future is returned.
+pub trait ModelExt: Executor {
     /// Creates the model's table and indexes, if absent.
-    async fn create_table<M: Model>(&self) -> Result<()>;
+    fn create_table<M: Model>(&self) -> impl Future<Output = Result<()>> + Send {
+        let statements = create_table_sql::<M>();
+        async move {
+            for statement in statements? {
+                self.run(&statement).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// `DROP TABLE IF EXISTS`.
-    async fn drop_table<M: Model>(&self) -> Result<()>;
+    fn drop_table<M: Model>(&self) -> impl Future<Output = Result<()>> + Send {
+        let sql = ident(M::TABLE).map(|t| format!("DROP TABLE IF EXISTS {t}"));
+        async move { self.run(&sql?).await.map(drop) }
+    }
+
     /// Inserts one row and returns it as stored: serial columns and defaults
     /// filled in.
-    async fn insert<M: Model>(&self, row: &M) -> Result<M>;
+    fn insert<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
+        let sql = insert_sql(&[row]);
+        async move {
+            let rows = self.run(&sql?).await?;
+            rows.decode_first()?.ok_or(Error::RowCount {
+                expected: "exactly 1",
+                got: 0,
+            })
+        }
+    }
+
     /// Inserts many rows, up to [`INSERT_CHUNK_ROWS`] rows and about
     /// [`INSERT_CHUNK_BYTES`] of text to a statement, and returns them as
-    /// stored. A statement is atomic; the whole is not.
-    async fn insert_many<M: Model>(&self, rows: &[M]) -> Result<Vec<M>>;
+    /// stored. A statement is atomic; the whole is not, unless it runs in a
+    /// transaction.
+    fn insert_many<M: Model>(&self, rows: &[M]) -> impl Future<Output = Result<Vec<M>>> + Send {
+        let chunks = insert_chunks(rows);
+        let rows_len = rows.len();
+        async move {
+            // Answers are kept as they came and decoded at the end, so the
+            // future holds no `M` across a send (`M` need not be `Send`).
+            let mut answers = Vec::new();
+            for sql in chunks? {
+                answers.push(self.run(&sql).await?);
+            }
+            let mut out = Vec::with_capacity(rows_len);
+            for rows in &answers {
+                out.extend(rows.decode_all::<M>()?);
+            }
+            Ok(out)
+        }
+    }
+
     /// Inserts the row, or updates the one with its primary key. The row as
     /// stored. Every column is written as given, a serial key included: an
     /// upsert names its row, so set the key (a new row with `id: 0` is
     /// stored with id 0, not a sequence value; use [`insert`](Self::insert)
     /// for that).
-    async fn upsert<M: Model>(&self, row: &M) -> Result<M>;
+    fn upsert<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
+        let sql = upsert_sql(row);
+        let reread = reread_sql(row);
+        async move {
+            let mut rows = self.run(&sql?).await?;
+            if rows.is_empty() {
+                // `DO NOTHING` (a model that is all key) returns no row: the
+                // one already there is the answer.
+                rows = self.run(&reread?).await?;
+            }
+            rows.decode_first()?.ok_or(Error::RowCount {
+                expected: "exactly 1",
+                got: 0,
+            })
+        }
+    }
+
     /// Updates the row with this primary key to these values, returning it as
     /// stored; [`Error::RowCount`] when there is no such row.
-    async fn update<M: Model>(&self, row: &M) -> Result<M>;
+    fn update<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
+        let sql = update_sql(row);
+        async move {
+            let rows = self.run(&sql?).await?;
+            match rows.len() {
+                1 => Ok(rows.decode_first()?.expect("one row")),
+                got => Err(Error::RowCount {
+                    expected: "exactly 1",
+                    got,
+                }),
+            }
+        }
+    }
+
     /// Deletes the row with this primary key. Whether there was one.
-    async fn delete<M: Model>(&self, row: &M) -> Result<bool>;
+    fn delete<M: Model>(&self, row: &M) -> impl Future<Output = Result<bool>> + Send {
+        let sql = delete_sql(row);
+        async move {
+            let rows = self.run(&sql?).await?;
+            Ok(rows.rows_affected().unwrap_or(0) > 0)
+        }
+    }
+
     /// The row whose (single-column) primary key is `key`.
-    async fn find<M: Model>(&self, key: impl ToSql) -> Result<Option<M>>;
+    fn find<M: Model>(&self, key: impl ToSql) -> impl Future<Output = Result<Option<M>>> + Send {
+        let sql = find_sql::<M>(&[&key]);
+        async move { fetch_at_most_one(self, sql?).await }
+    }
+
     /// The row whose composite primary key is `key`, in key column order.
-    async fn find_by_key<M: Model>(&self, key: &[&dyn ToSql]) -> Result<Option<M>>;
+    fn find_by_key<M: Model>(
+        &self,
+        key: &[&dyn ToSql],
+    ) -> impl Future<Output = Result<Option<M>>> + Send {
+        let sql = find_sql::<M>(key);
+        async move { fetch_at_most_one(self, sql?).await }
+    }
+
     /// Every row of the table.
-    async fn all<M: Model>(&self) -> Result<Vec<M>>;
+    fn all<M: Model>(&self) -> impl Future<Output = Result<Vec<M>>> + Send {
+        let sql = Select::<M>::new().to_sql();
+        async move { self.run(&sql?).await?.decode_all() }
+    }
 }
 
-impl ModelExt for Client {
-    async fn create_table<M: Model>(&self) -> Result<()> {
-        for statement in create_table_sql::<M>()? {
-            self.run(&statement).await?;
-        }
-        Ok(())
-    }
+impl<E: Executor> ModelExt for E {}
 
-    async fn drop_table<M: Model>(&self) -> Result<()> {
-        self.run(&format!("DROP TABLE IF EXISTS {}", ident(M::TABLE)?))
-            .await
-            .map(drop)
+async fn fetch_at_most_one<E: Executor + ?Sized, M: Model>(
+    db: &E,
+    sql: String,
+) -> Result<Option<M>> {
+    let rows = db.run(&sql).await?;
+    match rows.len() {
+        0 | 1 => rows.decode_first(),
+        got => Err(Error::RowCount {
+            expected: "at most 1",
+            got,
+        }),
     }
+}
 
-    async fn insert<M: Model>(&self, row: &M) -> Result<M> {
-        let rows = self.run(&insert_sql(&[row])?).await?;
-        rows.decode_first()?.ok_or(Error::RowCount {
-            expected: "exactly 1",
-            got: 0,
-        })
-    }
+/// `SELECT … WHERE <primary key>` for `m`'s key.
+fn reread_sql<M: Model>(m: &M) -> Result<String> {
+    let mut sql = format!(
+        "SELECT {} FROM {} WHERE ",
+        select_list::<M>()?,
+        ident(M::TABLE)?
+    );
+    key_predicate(m, &mut sql)?;
+    Ok(sql)
+}
 
-    async fn insert_many<M: Model>(&self, rows: &[M]) -> Result<Vec<M>> {
-        let (head, tail) = insert_frame::<M>()?;
-        let mut out = Vec::with_capacity(rows.len());
-        let mut sql = head.clone();
-        let mut in_chunk = 0usize;
-        let mut tuple = String::new();
-        for row in rows {
-            tuple.clear();
-            push_values_tuple(&mut tuple, row)?;
-            // A full chunk goes before this row joins it; a row past the
-            // byte bound on its own still goes, alone.
-            if in_chunk > 0
-                && (in_chunk == INSERT_CHUNK_ROWS
-                    || sql.len() + 2 + tuple.len() > INSERT_CHUNK_BYTES)
-            {
-                sql.push_str(&tail);
-                out.extend(self.run(&sql).await?.decode_all::<M>()?);
-                sql.clear();
-                sql.push_str(&head);
-                in_chunk = 0;
-            }
-            if in_chunk > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&tuple);
-            in_chunk += 1;
+/// The statements [`ModelExt::insert_many`] sends: up to
+/// [`INSERT_CHUNK_ROWS`] rows and about [`INSERT_CHUNK_BYTES`] each.
+fn insert_chunks<M: Model>(rows: &[M]) -> Result<Vec<String>> {
+    let (head, tail) = insert_frame::<M>()?;
+    let mut out = Vec::new();
+    let mut sql = head.clone();
+    let mut in_chunk = 0usize;
+    let mut tuple = String::new();
+    for row in rows {
+        tuple.clear();
+        push_values_tuple(&mut tuple, row)?;
+        // A full chunk goes before this row joins it; a row past the byte
+        // bound on its own still goes, alone.
+        if in_chunk > 0
+            && (in_chunk == INSERT_CHUNK_ROWS || sql.len() + 2 + tuple.len() > INSERT_CHUNK_BYTES)
+        {
+            sql.push_str(&tail);
+            out.push(std::mem::replace(&mut sql, head.clone()));
+            in_chunk = 0;
         }
         if in_chunk > 0 {
-            sql.push_str(&tail);
-            out.extend(self.run(&sql).await?.decode_all::<M>()?);
+            sql.push_str(", ");
         }
-        Ok(out)
+        sql.push_str(&tuple);
+        in_chunk += 1;
     }
-
-    async fn upsert<M: Model>(&self, row: &M) -> Result<M> {
-        let rows = self.run(&upsert_sql(row)?).await?;
-        match rows.decode_first()? {
-            Some(stored) => Ok(stored),
-            // `DO NOTHING` (a model that is all key) returns no row: the one
-            // already there is the answer.
-            None => {
-                let mut sql = format!(
-                    "SELECT {} FROM {} WHERE ",
-                    select_list::<M>()?,
-                    ident(M::TABLE)?
-                );
-                key_predicate(row, &mut sql)?;
-                self.run(&sql)
-                    .await?
-                    .decode_first()?
-                    .ok_or(Error::RowCount {
-                        expected: "exactly 1",
-                        got: 0,
-                    })
-            }
-        }
+    if in_chunk > 0 {
+        sql.push_str(&tail);
+        out.push(sql);
     }
-
-    async fn update<M: Model>(&self, row: &M) -> Result<M> {
-        let rows = self.run(&update_sql(row)?).await?;
-        match rows.len() {
-            1 => Ok(rows.decode_first()?.expect("one row")),
-            got => Err(Error::RowCount {
-                expected: "exactly 1",
-                got,
-            }),
-        }
-    }
-
-    async fn delete<M: Model>(&self, row: &M) -> Result<bool> {
-        let rows = self.run(&delete_sql(row)?).await?;
-        Ok(rows.rows_affected().unwrap_or(0) > 0)
-    }
-
-    async fn find<M: Model>(&self, key: impl ToSql) -> Result<Option<M>> {
-        self.find_by_key::<M>(&[&key]).await
-    }
-
-    async fn find_by_key<M: Model>(&self, key: &[&dyn ToSql]) -> Result<Option<M>> {
-        let rows = self.run(&find_sql::<M>(key)?).await?;
-        match rows.len() {
-            0 | 1 => rows.decode_first(),
-            got => Err(Error::RowCount {
-                expected: "at most 1",
-                got,
-            }),
-        }
-    }
-
-    async fn all<M: Model>(&self) -> Result<Vec<M>> {
-        Select::<M>::new().all(self).await
-    }
+    Ok(out)
 }
 
 /// What every [`Model`] gets: [`query`](ModelQuery::query) for the builder.

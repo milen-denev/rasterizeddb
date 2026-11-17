@@ -40,6 +40,7 @@ use std::marker::PhantomData;
 use std::time::Duration;
 
 use crate::client::Client;
+use crate::executor::Executor;
 use crate::from_sql::FromSqlOwned;
 use crate::orm::Model;
 use crate::params::Param;
@@ -127,14 +128,26 @@ fn glob_escape(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The key/value cache's commands, on byte strings. From [`Client::kv`].
-#[derive(Clone, Copy)]
-pub struct Kv<'c> {
-    client: &'c Client,
+/// The key/value cache's commands, on byte strings. From [`Client::kv`],
+/// or [`Kv::new`] on any [`Executor`].
+///
+/// The cache is not part of any SQL transaction: a `KV` command sent on a
+/// transaction's connection takes effect at once, whether the transaction
+/// commits or not.
+pub struct Kv<'c, E = Client> {
+    client: &'c E,
 }
 
-impl<'c> Kv<'c> {
-    pub(crate) fn new(client: &'c Client) -> Self {
+impl<E> Clone for Kv<'_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<E> Copy for Kv<'_, E> {}
+
+impl<'c, E: Executor> Kv<'c, E> {
+    /// The cache's commands, sent on `client`.
+    pub fn new(client: &'c E) -> Self {
         Kv { client }
     }
 
@@ -499,13 +512,13 @@ impl<'c> Kv<'c> {
 
     /// A query over the whole keyspace, keys read as `K` and values as `V`:
     /// `client.kv().query::<String, i32>().filter_keys(|k| k == "Value 1")`.
-    pub fn query<K: KvKey + KvValue, V: KvValue>(&self) -> KvQuery<'c, K, V> {
+    pub fn query<K: KvKey + KvValue, V: KvValue>(&self) -> KvQuery<'c, K, V, E> {
         self.map::<K, V>("").query()
     }
 
     /// A typed map under `prefix:` (see [`KvMap`]); an empty prefix is the
     /// whole keyspace.
-    pub fn map<K: KvKey, V: KvValue>(&self, prefix: &str) -> KvMap<'c, K, V> {
+    pub fn map<K: KvKey, V: KvValue>(&self, prefix: &str) -> KvMap<'c, K, V, E> {
         KvMap {
             kv: *self,
             prefix: prefix.to_string(),
@@ -514,7 +527,7 @@ impl<'c> Kv<'c> {
     }
 
     /// Model `M`'s rows as hashes under `<table>:` (see [`KvRepo`]).
-    pub fn repo<M: Model>(&self) -> KvRepo<'c, M> {
+    pub fn repo<M: Model>(&self) -> KvRepo<'c, M, E> {
         KvRepo {
             kv: *self,
             prefix: M::TABLE.to_string(),
@@ -591,13 +604,13 @@ impl<T: serde::Serialize + serde::de::DeserializeOwned> KvValue for KvJson<T> {
 }
 
 /// Values of type `V` under keys `prefix:<key>`. From [`Kv::map`].
-pub struct KvMap<'c, K: ?Sized, V> {
-    kv: Kv<'c>,
+pub struct KvMap<'c, K: ?Sized, V, E = Client> {
+    kv: Kv<'c, E>,
     prefix: String,
     _types: PhantomData<fn(&K) -> V>,
 }
 
-impl<K: KvKey + ?Sized, V: KvValue> KvMap<'_, K, V> {
+impl<K: KvKey + ?Sized, V: KvValue, E: Executor> KvMap<'_, K, V, E> {
     /// The full key of `key`.
     pub fn full_key(&self, key: &K) -> Result<Vec<u8>> {
         let mut out = self.key_prefix();
@@ -723,12 +736,12 @@ impl<K: KvKey + ?Sized, V: KvValue> KvMap<'_, K, V> {
     }
 }
 
-impl<'c, K: KvKey + KvValue, V: KvValue> KvMap<'c, K, V> {
+impl<'c, K: KvKey + KvValue, V: KvValue, E: Executor> KvMap<'c, K, V, E> {
     /// A query over this map's entries: narrowed on the server by key
     /// ([`prefix`](KvQuery::prefix), [`pattern`](KvQuery::pattern)), then
     /// here by typed closures ([`filter_keys`](KvQuery::filter_keys),
     /// [`filter`](KvQuery::filter)).
-    pub fn query(&self) -> KvQuery<'c, K, V> {
+    pub fn query(&self) -> KvQuery<'c, K, V, E> {
         KvQuery {
             map: KvMap {
                 kv: self.kv,
@@ -754,8 +767,8 @@ type EntryFilter<K, V> = Box<dyn Fn(&K, &V) -> bool + Send + Sync>;
 /// here, `filter_keys` before values are fetched (so a key it rejects costs
 /// no read), `filter` after. A cache has no index on values: a value filter
 /// reads every value the key filters let through.
-pub struct KvQuery<'c, K, V> {
-    map: KvMap<'c, K, V>,
+pub struct KvQuery<'c, K, V, E = Client> {
+    map: KvMap<'c, K, V, E>,
     /// The glob for the key's suffix, after the map's prefix.
     suffix: Vec<u8>,
     key_filter: Option<KeyFilter<K>>,
@@ -764,7 +777,7 @@ pub struct KvQuery<'c, K, V> {
     lenient: bool,
 }
 
-impl<K: KvKey + KvValue, V: KvValue> KvQuery<'_, K, V> {
+impl<K: KvKey + KvValue, V: KvValue, E: Executor> KvQuery<'_, K, V, E> {
     /// Only keys (after the map's prefix) starting with `prefix`; matched on
     /// the server.
     pub fn prefix(mut self, prefix: &str) -> Self {
@@ -958,13 +971,13 @@ impl<K: KvKey + KvValue, V: KvValue> KvQuery<'_, K, V> {
 /// The struct is the same one the SQL ORM maps, so a model can live in a
 /// table, in the cache, or both (a read-through cache in front of a table).
 /// Serial columns are stored as given: assign the key before saving.
-pub struct KvRepo<'c, M> {
-    kv: Kv<'c>,
+pub struct KvRepo<'c, M, E = Client> {
+    kv: Kv<'c, E>,
     prefix: String,
     _model: PhantomData<fn() -> M>,
 }
 
-impl<M: Model> KvRepo<'_, M> {
+impl<M: Model, E: Executor> KvRepo<'_, M, E> {
     /// Another prefix than the table's name.
     pub fn with_prefix(mut self, prefix: &str) -> Self {
         self.prefix = prefix.to_string();

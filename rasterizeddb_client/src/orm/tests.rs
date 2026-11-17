@@ -255,3 +255,62 @@ fn rows_read_into_the_struct() {
     assert!(bad_enum.get(0).unwrap().get::<Status>(0).is_err());
     let _ = Timestamp::now();
 }
+
+/// A model that is neither `Send` nor `Sync`.
+#[derive(crate::Model)]
+struct Local {
+    #[rdb(primary_key)]
+    id: i64,
+    #[rdb(skip)]
+    memo: std::rc::Rc<()>,
+}
+
+fn assert_send<T: Send>(_: T) {}
+
+/// Every ORM future is `Send` on any executor, for any model: the statement
+/// is written before the future is made, so no row is held across a send.
+#[allow(dead_code)]
+fn orm_futures_are_send<E: crate::Executor>(db: &E, a: &Account, local: &Local) {
+    assert_send(db.create_table::<Account>());
+    assert_send(db.insert(a));
+    assert_send(db.insert_many(std::slice::from_ref(a)));
+    assert_send(db.upsert(a));
+    assert_send(db.update(a));
+    assert_send(db.delete(a));
+    assert_send(db.find::<Account>(1i64));
+    assert_send(db.all::<Account>());
+    assert_send(db.insert(local));
+    assert_send(db.insert_many(std::slice::from_ref(local)));
+    assert_send(db.upsert(local));
+    assert_send(db.delete(local));
+    let q = Account::query();
+    assert_send(q.all(db));
+    assert_send(q.first(db));
+    assert_send(q.count(db));
+    assert_send(q.exists(db));
+    assert_send(q.filter(Account::id.eq(1i64)).delete(db));
+    let update = Account::query()
+        .every_row()
+        .update()
+        .set(Account::position, 1);
+    assert_send(update.run(db));
+    assert_send(crate::kv::Kv::new(db).get(b"k"));
+    assert_send(crate::kv::Kv::new(db).repo::<Account>().get(&[&1i64]));
+    let _ = local.memo.clone();
+}
+
+/// A `&Client` and a `Client` are both executors: the call syntax of a
+/// client and of a reference to one is the same.
+#[allow(dead_code)]
+async fn client_call_syntax(
+    client: &crate::Client,
+    owned: crate::Client,
+    a: &Account,
+) -> Result<()> {
+    client.insert(a).await?;
+    owned.insert(a).await?;
+    Account::query().all(client).await?;
+    Account::query().all(&owned).await?;
+    Account::query().all(&client).await?;
+    Ok(())
+}
