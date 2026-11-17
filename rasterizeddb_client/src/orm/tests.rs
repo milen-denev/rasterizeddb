@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Numeric, Row, Rows, SqlEnum, Timestamp};
+use crate::{Numeric, Row, Rows, SqlEnum, Timestamp, Uuid};
 
 #[derive(crate::Model, Debug, Clone, PartialEq)]
 #[rdb(table = "accounts")]
@@ -954,4 +954,48 @@ async fn hooks_run_before_anything_is_sent() {
     assert_eq!(read[0].domain, "example.org", "after_load ran");
     let plain: Vec<Person> = rows.decode_all().unwrap();
     assert_eq!(plain[0].domain, "", "FromRow alone does not run it");
+}
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(
+    table = "assets",
+    partition_by = "tenant_id, group_id",
+    partitions = 16
+)]
+struct Asset {
+    #[rdb(primary_key)]
+    tenant_id: i64,
+    #[rdb(primary_key)]
+    group_id: i64,
+    #[rdb(primary_key)]
+    id: Uuid,
+    body: Option<String>,
+}
+
+#[test]
+fn a_partitioned_model() {
+    assert_eq!(
+        Asset::PARTITION,
+        Some(Partitioning {
+            columns: &["tenant_id", "group_id"],
+            partitions: Some(16)
+        })
+    );
+    assert_eq!(Account::PARTITION, None);
+    assert_eq!(
+        create_table_sql::<Asset>().unwrap()[0],
+        "CREATE TABLE IF NOT EXISTS assets (tenant_id BIGINT NOT NULL, group_id BIGINT NOT NULL, \
+         id UUID NOT NULL, body TEXT, PRIMARY KEY (tenant_id, group_id, id)) PARTITION BY HASH \
+         (tenant_id, group_id) PARTITIONS 16"
+    );
+    let unnamed = Partitioning {
+        columns: &["a"],
+        partitions: None,
+    };
+    assert_eq!(unnamed.clause().unwrap(), "PARTITION BY HASH (a)");
+    let wide = Partitioning {
+        columns: &["a", "b", "c", "d"],
+        partitions: None,
+    };
+    assert!(wide.clause().is_err(), "one to three key columns");
 }

@@ -107,6 +107,9 @@ table with the struct and acts under the [`SyncPolicy`](crate::orm::SyncPolicy):
 | a column the struct does not have | reported, kept | `drop_columns` |
 | a type that differs | reported | `retype` (`ALTER COLUMN … TYPE`) |
 | nullability that differs | reported | `nullability` (`SET`/`DROP NOT NULL`) |
+| a partitioned model over a plain table | reported | `convert_partitioning` (`ALTER TABLE … PARTITION BY HASH`, offline) |
+| a partitioned table the model does not partition, or partitioned by another key | reported, always | none: the server converts plain to partitioned only |
+| a new field with `references = "t(c)"` | `ADD COLUMN … REFERENCES` | `add_columns` |
 
 Reported differences are warnings in the
 [`MigrationReport`](crate::orm::MigrationReport), or an error with
@@ -114,6 +117,17 @@ Reported differences are warnings in the
 (create and add only), [`SyncPolicy::exact`](crate::orm::SyncPolicy::exact)
 (everything, dropping included: for development databases) and
 [`SyncPolicy::report_only`](crate::orm::SyncPolicy::report_only).
+
+**Partitioning.** The table's partition key is read from `SHOW TABLE
+STATS`. Converting a plain table is offline: the statement holds the table
+exclusively, so readers and writers wait, while it copies every row into
+its partition. No preset turns it on, `exact()` included; set
+`convert_partitioning: true` for the run that should do it, at a quiet
+time. The number of partitions is compared at creation only: splits,
+merges and isolated keys change it afterwards.
+
+**Foreign keys** on columns that already exist are not compared: the native
+protocol has no catalogue of constraints to read them from.
 
 A `NOT NULL` field added to a table that holds rows needs a
 `#[rdb(default = "…")]`; without one the server refuses the column and says

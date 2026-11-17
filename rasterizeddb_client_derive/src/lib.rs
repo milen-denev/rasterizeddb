@@ -76,6 +76,7 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `table = "name"` | the table's name (otherwise the struct's in snake case) |
 /// | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
 /// | `hooks` | run the struct's `ModelHooks` impl (validation, before/after hooks), which you then write |
+/// | `partition_by = "tenant_id, group_id"`, `partitions = 16` | a hash-partitioned table: `CREATE TABLE … PARTITION BY HASH (…) PARTITIONS 16` |
 ///
 /// A field's type must implement `SqlType` (every type the client maps does)
 /// unless it has `sql_type` or `json`.
@@ -612,7 +613,23 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     }
     let name = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
-    let struct_settings = struct_attrs(&input.attrs, &["table", "renamed_from", "hooks"])?;
+    let struct_settings = struct_attrs(
+        &input.attrs,
+        &[
+            "table",
+            "renamed_from",
+            "hooks",
+            "partition_by",
+            "partitions",
+        ],
+    )?;
+    let setting = |key: &str| {
+        struct_settings
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .next_back()
+    };
     let hooks = struct_settings.iter().any(|(k, _)| k == "hooks");
     let table = struct_settings
         .iter()
@@ -631,6 +648,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
     let mut texts = Vec::new();
     let mut consts = Vec::new();
     let mut roles: Vec<&'static str> = Vec::new();
+    let mut column_names: Vec<String> = Vec::new();
     for f in fields.iter().filter(|f| !f.attrs.skip) {
         let ident = f.ident.expect("named");
         let ty = f.ty;
@@ -640,6 +658,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             .clone()
             .unwrap_or_else(|| ident.to_string().trim_start_matches("r#").to_string());
         let i = defs.len();
+        column_names.push(column.clone());
         let nullable = is_option(ty);
         let sql_type = match (&f.attrs.sql_type, f.attrs.json) {
             (Some(t), _) => quote!(#t),
@@ -854,6 +873,52 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
         });
     }
     let count = defs.len();
+    let partition = match (setting("partition_by"), setting("partitions")) {
+        (None, None) => quote!(::core::option::Option::None),
+        (None, Some(_)) => {
+            return Err(syn::Error::new(
+                input.span(),
+                "partitions goes with partition_by = \"<key columns>\"",
+            ));
+        }
+        (Some(key), partitions) => {
+            let key: Vec<String> = key
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if key.is_empty() || key.len() > 3 {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "partition_by names one to three columns: partition_by = \"tenant_id, group_id\"",
+                ));
+            }
+            for column in &key {
+                if !column_names.contains(column) {
+                    return Err(syn::Error::new(
+                        input.span(),
+                        format!("partition_by names {column}, which is not a column of this model"),
+                    ));
+                }
+            }
+            let partitions = match partitions {
+                None => quote!(::core::option::Option::None),
+                Some(n) => match n.parse::<u32>() {
+                    Ok(n) if n > 0 => quote!(::core::option::Option::Some(#n)),
+                    _ => {
+                        return Err(syn::Error::new(
+                            input.span(),
+                            "partitions is a positive number: partitions = 16",
+                        ));
+                    }
+                },
+            };
+            quote!(::core::option::Option::Some(::rasterizeddb_client::orm::Partitioning {
+                columns: &[#(#key),*],
+                partitions: #partitions,
+            }))
+        }
+    };
     let from_row = from_row_impl(input, &fields, named);
     let hook_methods = if hooks {
         quote! {
@@ -872,6 +937,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             const TABLE: &'static str = #table;
             const COLUMNS: &'static [::rasterizeddb_client::orm::ColumnDef] = &[#(#defs),*];
             const RENAMED_FROM: &'static [&'static str] = &[#(#table_renamed_from),*];
+            const PARTITION: ::core::option::Option<::rasterizeddb_client::orm::Partitioning> = #partition;
 
             fn write_value(&self, column: usize, out: &mut ::std::string::String) -> ::rasterizeddb_client::Result<()> {
                 match column {

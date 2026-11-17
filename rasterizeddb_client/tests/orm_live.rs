@@ -1383,3 +1383,195 @@ async fn hooks_validate_veto_and_load() {
     })
     .await
 }
+
+// ------------------------------------------------------------ partitioning
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "assets", partition_by = "tenant_id", partitions = 8)]
+struct Asset {
+    #[rdb(primary_key)]
+    tenant_id: i64,
+    #[rdb(primary_key)]
+    id: i64,
+    body: String,
+}
+
+/// The same table, as a model that does not partition it.
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "assets")]
+struct PlainAsset {
+    #[rdb(primary_key)]
+    tenant_id: i64,
+    #[rdb(primary_key)]
+    id: i64,
+    body: String,
+}
+
+/// The same table, partitioned by another key.
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "assets", partition_by = "id")]
+struct RekeyedAsset {
+    #[rdb(primary_key)]
+    tenant_id: i64,
+    #[rdb(primary_key)]
+    id: i64,
+    body: String,
+}
+
+async fn partition_key(c: &Client, table: &str) -> Option<String> {
+    c.admin()
+        .table_stats(table)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.metric == "partition_key")
+        .and_then(|m| m.value)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_models_create_sync_and_convert() {
+    use rasterizeddb_client::orm::{Migrator, SyncPolicy};
+    bounded(async {
+        let Some(server) = server("partition").await else {
+            return;
+        };
+        let c = connect(&server).await;
+
+        // A plain table first, with rows, as an older build made it.
+        c.create_table::<PlainAsset>().await.unwrap();
+        for (t, i) in [(1, 1), (1, 2), (2, 1), (3, 7)] {
+            c.insert(&PlainAsset {
+                tenant_id: t,
+                id: i,
+                body: format!("{t}/{i}"),
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(partition_key(&c, "assets").await, None);
+
+        // The partitioned model reports it as drift, and does not convert.
+        let sync = Migrator::new().model::<Asset>();
+        let plan = sync.plan(&c).await.unwrap();
+        assert!(plan.schema_changes.is_empty(), "{plan:?}");
+        assert_eq!(plan.drift.len(), 1, "{plan:?}");
+        assert!(
+            plan.drift[0].contains("PARTITION BY HASH (tenant_id) PARTITIONS 8"),
+            "{plan:?}"
+        );
+        assert!(plan.drift[0].contains("convert_partitioning"), "{plan:?}");
+        let report = sync.apply(&c).await.unwrap();
+        assert!(report.schema_changes.is_empty());
+        assert_eq!(partition_key(&c, "assets").await, None, "nothing converted");
+        let strict = Migrator::new().model::<Asset>().sync_policy(SyncPolicy {
+            fail_on_drift: true,
+            ..SyncPolicy::default()
+        });
+        assert!(strict.apply(&c).await.is_err(), "drift fails a strict sync");
+
+        // Under the explicit policy it converts, offline, keeping the rows.
+        let convert = Migrator::new().model::<Asset>().sync_policy(SyncPolicy {
+            convert_partitioning: true,
+            ..SyncPolicy::default()
+        });
+        let report = convert.apply(&c).await.unwrap();
+        assert_eq!(
+            report.schema_changes,
+            ["ALTER TABLE assets PARTITION BY HASH (tenant_id) PARTITIONS 8"]
+        );
+        assert_eq!(
+            partition_key(&c, "assets").await.as_deref(),
+            Some("tenant_id")
+        );
+        let rows = Asset::query()
+            .order_by(Asset::tenant_id.asc())
+            .order_by(Asset::id.asc())
+            .all(&c)
+            .await
+            .unwrap();
+        let bodies: Vec<&str> = rows.iter().map(|a| a.body.as_str()).collect();
+        assert_eq!(bodies, ["1/1", "1/2", "2/1", "3/7"]);
+        assert!(
+            Migrator::new()
+                .model::<Asset>()
+                .plan(&c)
+                .await
+                .unwrap()
+                .is_up_to_date()
+        );
+
+        // The other differences are drift, always: no conversion back, no
+        // second key.
+        let plan = Migrator::new()
+            .model::<PlainAsset>()
+            .sync_policy(SyncPolicy {
+                convert_partitioning: true,
+                ..SyncPolicy::exact()
+            })
+            .plan(&c)
+            .await
+            .unwrap();
+        assert!(
+            plan.drift
+                .iter()
+                .any(|d| d.contains("cannot be converted back")),
+            "{plan:?}"
+        );
+        let plan = Migrator::new()
+            .model::<RekeyedAsset>()
+            .sync_policy(SyncPolicy {
+                convert_partitioning: true,
+                ..SyncPolicy::default()
+            })
+            .plan(&c)
+            .await
+            .unwrap();
+        assert!(
+            plan.drift.iter().any(|d| d.contains("another key")),
+            "{plan:?}"
+        );
+
+        // A partitioned model creates its table partitioned, and the ORM
+        // works on it as on any other: routed writes, RETURNING, upserts.
+        c.drop_table::<Asset>().await.unwrap();
+        c.create_table::<Asset>().await.unwrap();
+        assert_eq!(
+            partition_key(&c, "assets").await.as_deref(),
+            Some("tenant_id")
+        );
+        let stored = c
+            .insert_many(&[
+                Asset {
+                    tenant_id: 9,
+                    id: 1,
+                    body: "a".into(),
+                },
+                Asset {
+                    tenant_id: 10,
+                    id: 1,
+                    body: "b".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 2);
+        let up = c
+            .upsert(&Asset {
+                tenant_id: 9,
+                id: 1,
+                body: "a2".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(up.body, "a2");
+        let one = Asset::query()
+            .filter(Asset::tenant_id.eq(10i64))
+            .one(&c)
+            .await
+            .unwrap();
+        assert_eq!(one.body, "b");
+        assert!(c.delete(&one).await.unwrap());
+        assert_eq!(Asset::query().count(&c).await.unwrap(), 1);
+    })
+    .await
+}

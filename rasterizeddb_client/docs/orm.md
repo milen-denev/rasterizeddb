@@ -60,6 +60,7 @@ struct Account {
 | `table = "name"` | the table (otherwise the struct's name in snake case) |
 | `renamed_from = "old"` | an earlier table name, for the migrator to rename |
 | `hooks` | run the struct's [`ModelHooks`](crate::orm::ModelHooks) (below) |
+| `partition_by = "tenant_id, group_id"`, `partitions = 16` | a hash-partitioned table (below) |
 
 A field's type gives its column type through [`SqlType`](crate::orm::SqlType)
 (`i64` is `BIGINT`, `Option<T>` is nullable, `Vec<String>` is `TEXT[]`, …).
@@ -257,6 +258,39 @@ let back = db.restore(&bin[0]).await?;
 db.force_delete(&back).await?;                            // gone
 # let _ = live; Ok(()) }
 ```
+
+## Partitioned tables
+
+`#[rdb(partition_by = "…")]` on the struct makes `create_table` (and a
+migrator's model sync) create the table hash-partitioned on that key, one
+to three `NOT NULL` columns that every primary and unique key includes:
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+#[derive(Model, Debug, Clone)]
+#[rdb(table = "assets", partition_by = "tenant_id, group_id", partitions = 64)]
+struct Asset {
+    #[rdb(primary_key)]
+    tenant_id: i64,
+    #[rdb(primary_key)]
+    group_id: i64,
+    #[rdb(primary_key)]
+    id: Uuid,
+    body: Option<String>,
+}
+// CREATE TABLE IF NOT EXISTS assets (…, PRIMARY KEY (tenant_id, group_id, id))
+//   PARTITION BY HASH (tenant_id, group_id) PARTITIONS 64
+# fn main() {}
+```
+
+Everything else works on it unchanged: the server routes each row by its
+key, and a query fixing the key (or its leading column) reads one
+partition. A [`Migrator`](crate::orm::Migrator) reports a model partitioned
+over a plain table as drift, and converts it only under
+[`SyncPolicy::convert_partitioning`](crate::orm::SyncPolicy::convert_partitioning)
+(an offline `ALTER TABLE … PARTITION BY HASH`); see the
+[migrations chapter](crate::guide::migrations). Reshaping partitions
+(`SPLIT`, `MERGE`, `ISOLATE KEY`, moves) is the administration API's.
 
 ## Hooks and validation
 

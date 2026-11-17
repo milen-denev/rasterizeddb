@@ -198,6 +198,9 @@ pub trait Model: FromRow + Sized {
     /// Names the table had before (`#[rdb(renamed_from = "…")]` on the
     /// struct), for a migrator to rename.
     const RENAMED_FROM: &'static [&'static str] = &[];
+    /// The table's hash partitioning (`#[rdb(partition_by = "…")]` on the
+    /// struct), if it is partitioned.
+    const PARTITION: Option<Partitioning> = None;
 
     /// Writes this value's column `i` as a literal into `out`.
     fn write_value(&self, column: usize, out: &mut String) -> Result<()>;
@@ -796,6 +799,49 @@ pub struct TableSchema {
     pub renamed_from: &'static [&'static str],
     /// The columns, in select-list order.
     pub columns: &'static [ColumnDef],
+    /// The table's hash partitioning, if any.
+    pub partition: Option<Partitioning>,
+}
+
+/// A table hash-partitioned on its partition key: `PARTITION BY HASH (a,
+/// b) [PARTITIONS n]`, from `#[rdb(partition_by = "a, b", partitions = n)]`
+/// on the struct.
+///
+/// The server routes each row to a partition by a hash of its key (one to
+/// three `NOT NULL` columns, which every primary and unique key must
+/// include); a statement fixing the key, or its leading column, touches one
+/// partition. `partitions` is how many are declared at creation (the
+/// server's default is 64); splits, merges and isolated keys change it
+/// later, so it is not compared afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Partitioning {
+    /// The partition key's columns, in order.
+    pub columns: &'static [&'static str],
+    /// The partitions declared at creation; `None` for the server's
+    /// default.
+    pub partitions: Option<u32>,
+}
+
+impl Partitioning {
+    /// `PARTITION BY HASH (…) [PARTITIONS n]`, as `CREATE TABLE` and
+    /// `ALTER TABLE` write it.
+    pub fn clause(&self) -> Result<String> {
+        if self.columns.is_empty() || self.columns.len() > 3 {
+            return Err(Error::Unsupported(
+                "a hash partition key has one to three columns".to_string(),
+            ));
+        }
+        let key = self
+            .columns
+            .iter()
+            .map(|c| ident(c))
+            .collect::<Result<Vec<_>>>()?;
+        let mut sql = format!("PARTITION BY HASH ({})", key.join(", "));
+        if let Some(n) = self.partitions {
+            sql.push_str(&format!(" PARTITIONS {n}"));
+        }
+        Ok(sql)
+    }
 }
 
 impl TableSchema {
@@ -805,6 +851,7 @@ impl TableSchema {
             table: M::TABLE,
             renamed_from: M::RENAMED_FROM,
             columns: M::COLUMNS,
+            partition: M::PARTITION,
         }
     }
 
@@ -850,7 +897,8 @@ impl TableSchema {
         Ok(line)
     }
 
-    /// `CREATE TABLE IF NOT EXISTS`, then the unique keys and indexes.
+    /// `CREATE TABLE IF NOT EXISTS` (`… PARTITION BY HASH (…)` for a
+    /// partitioned model), then the unique keys and indexes.
     pub fn create_sql(&self) -> Result<Vec<String>> {
         let mut lines = Vec::new();
         for column in self.columns {
@@ -865,11 +913,24 @@ impl TableSchema {
         if !key.is_empty() {
             lines.push(format!("PRIMARY KEY ({})", key.join(", ")));
         }
-        let mut statements = vec![format!(
+        let mut create = format!(
             "CREATE TABLE IF NOT EXISTS {} ({})",
             ident(self.table)?,
             lines.join(", ")
-        )];
+        );
+        if let Some(partition) = &self.partition {
+            for column in partition.columns {
+                if !self.columns.iter().any(|c| c.name == *column) {
+                    return Err(Error::Unsupported(format!(
+                        "{} is partitioned by {column}, which is not one of its columns",
+                        self.table
+                    )));
+                }
+            }
+            create.push(' ');
+            create.push_str(&partition.clause()?);
+        }
+        let mut statements = vec![create];
         statements.extend(self.keys_sql()?);
         Ok(statements)
     }

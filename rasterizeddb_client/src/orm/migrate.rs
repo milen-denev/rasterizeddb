@@ -131,6 +131,12 @@ pub struct SyncPolicy {
     pub drop_columns: bool,
     /// Make drift an error rather than a warning in the report.
     pub fail_on_drift: bool,
+    /// Convert a plain table whose model is partitioned (`ALTER TABLE …
+    /// PARTITION BY HASH`). Off by default, and in every preset: the
+    /// conversion is offline, holding the table exclusively (readers and
+    /// writers wait) while every row is copied into partitions. Turn it on
+    /// for the run that should do it.
+    pub convert_partitioning: bool,
 }
 
 impl Default for SyncPolicy {
@@ -144,6 +150,7 @@ impl Default for SyncPolicy {
             retype: false,
             drop_columns: false,
             fail_on_drift: false,
+            convert_partitioning: false,
         }
     }
 }
@@ -158,7 +165,8 @@ impl SyncPolicy {
     }
 
     /// Everything, dropping columns included: the table becomes exactly the
-    /// model. For development databases.
+    /// model. For development databases. (Not a partitioning conversion:
+    /// that stays [`convert_partitioning`](Self::convert_partitioning).)
     pub fn exact() -> Self {
         SyncPolicy {
             nullability: true,
@@ -179,6 +187,7 @@ impl SyncPolicy {
             retype: false,
             drop_columns: false,
             fail_on_drift: false,
+            convert_partitioning: false,
         }
     }
 }
@@ -1172,6 +1181,16 @@ async fn plan_model(
             &mut drift,
         )?;
     }
+    plan_partitioning(
+        client,
+        model,
+        found,
+        &table,
+        policy,
+        &mut changes,
+        &mut drift,
+    )
+    .await?;
     let mut extra: Vec<&String> = existing
         .keys()
         .filter(|n| !accounted.contains(n.as_str()))
@@ -1226,6 +1245,68 @@ async fn plan_model(
         ensure,
         drift,
     })
+}
+
+/// The partition key `SHOW TABLE STATS` reports for `table`, if it is
+/// partitioned.
+async fn partition_key(client: &Client, table: &str) -> Result<Option<Vec<String>>> {
+    let stats = crate::admin::Admin::new(client).table_stats(table).await?;
+    Ok(stats
+        .into_iter()
+        .find(|m| m.metric == "partition_key")
+        .and_then(|m| m.value)
+        .map(|key| key.split(',').map(|c| c.trim().to_string()).collect()))
+}
+
+/// Partitioning drift: a model partitioned over a plain table is converted
+/// under [`SyncPolicy::convert_partitioning`], and reported otherwise; the
+/// other differences (a partitioned table the model does not partition, a
+/// different key) have no conversion and are always drift.
+#[allow(clippy::too_many_arguments)]
+async fn plan_partitioning(
+    client: &Client,
+    model: &TableSchema,
+    found: &str,
+    table: &str,
+    policy: &SyncPolicy,
+    changes: &mut Vec<String>,
+    drift: &mut Vec<String>,
+) -> Result<()> {
+    let current = partition_key(client, found).await?;
+    let wanted: Option<Vec<String>> = model
+        .partition
+        .map(|p| p.columns.iter().map(|c| c.to_string()).collect());
+    match (wanted, current) {
+        (None, None) => {}
+        (Some(_), None) => {
+            let clause = model.partition.expect("wanted").clause()?;
+            if policy.convert_partitioning {
+                changes.push(format!("ALTER TABLE {table} {clause}"));
+            } else {
+                drift.push(format!(
+                    "{} is a plain table; the model says {clause} (an offline conversion that \
+                     holds the table exclusively while it copies every row: allow it with \
+                     SyncPolicy::convert_partitioning)",
+                    model.table
+                ));
+            }
+        }
+        (None, Some(key)) => drift.push(format!(
+            "{} is partitioned by HASH ({}); the model is not partitioned, and a partitioned \
+             table cannot be converted back",
+            model.table,
+            key.join(", ")
+        )),
+        (Some(wanted), Some(key)) if wanted != key => drift.push(format!(
+            "{} is partitioned by HASH ({}); the model says HASH ({}), and a table cannot be \
+             partitioned again by another key",
+            model.table,
+            key.join(", "),
+            wanted.join(", ")
+        )),
+        (Some(_), Some(_)) => {}
+    }
+    Ok(())
 }
 
 fn compare_column(
