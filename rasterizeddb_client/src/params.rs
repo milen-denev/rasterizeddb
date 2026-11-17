@@ -720,10 +720,13 @@ fn first_word(sql: &str) -> String {
     word.to_ascii_uppercase()
 }
 
-/// Refuses what the native protocol cannot run as written, before it is sent:
-/// a second statement (the server would run only the first), and transaction control,
-/// which the native protocol does not recognise: every statement there
-/// commits on its own.
+/// Refuses what is not sent as a statement, before it is sent: a second
+/// statement (the native protocol runs one per request), and transaction
+/// control, which [`Client::begin`](crate::Client::begin) and
+/// [`Transaction`](crate::Transaction) send themselves, on a connection of
+/// the transaction's own. Sent on a client's shared connections, a `BEGIN`
+/// would be refused by the server, and a block opened there would take in
+/// other tasks' statements.
 pub fn check_statement(sql: &str) -> Result<()> {
     let bytes = sql.as_bytes();
     for event in scan(sql) {
@@ -743,9 +746,10 @@ fn check_not_transaction_control(sql: &str) -> Result<()> {
         "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE"
     ) {
         return Err(Error::Unsupported(format!(
-            "{word}: the native protocol has no transactions; each statement commits on its own. \
-             Put related writes in one statement (a multi-row INSERT, an UPDATE … WHERE, \
-             INSERT … ON CONFLICT), or use the pgwire listener for a transaction block"
+            "{word}: transaction control is not sent as a statement. Open a transaction with \
+             client.begin() (or client.transaction(|tx| …)), end it with tx.commit() or \
+             tx.rollback(), and use tx.savepoint(), tx.rollback_to() and tx.release() for \
+             savepoints: a transaction needs a connection of its own, which they manage"
         )));
     }
     Ok(())

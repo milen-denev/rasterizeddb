@@ -142,6 +142,9 @@ pub struct Client {
     idle_reconnect: Option<Duration>,
     /// The clock [`Connection::last_used`] counts from.
     epoch: Instant,
+    /// Where transactions get their connections: each one its own, never
+    /// one of the shared connections above.
+    transactions: std::sync::Arc<crate::transaction::Connections>,
 }
 
 impl Client {
@@ -186,6 +189,12 @@ impl Client {
             next: AtomicUsize::new(0),
             idle_reconnect: options.idle_reconnect,
             epoch: Instant::now(),
+            transactions: crate::transaction::Connections::new(crate::transaction::Dial {
+                addr: addr.to_string(),
+                timeout: options.timeout,
+                max_message_size: options.max_message_size,
+                authenticator,
+            }),
         };
         if let Some(migrator) = &options.migrations {
             use crate::orm::AutoMigrate;
@@ -210,6 +219,12 @@ impl Client {
             next: AtomicUsize::new(0),
             idle_reconnect: None,
             epoch: Instant::now(),
+            transactions: crate::transaction::Connections::new(crate::transaction::Dial {
+                addr: String::new(),
+                timeout: None,
+                max_message_size: 0,
+                authenticator: None,
+            }),
         }
     }
 
@@ -218,11 +233,89 @@ impl Client {
         &self.connections[turn % self.connections.len()]
     }
 
+    /// Opens a transaction, at the server's default isolation (read
+    /// committed). See [`Transaction`](crate::Transaction).
+    ///
+    /// The transaction runs on a connection of its own, never one of the
+    /// client's shared ones: a finished transaction's connection is kept a
+    /// short while for the next, and otherwise one is opened (and logged
+    /// in) for it.
+    ///
+    /// ```no_run
+    /// # async fn demo(client: &rasterizeddb_client::Client) -> rasterizeddb_client::Result<()> {
+    /// use rasterizeddb_client::{Executor, params};
+    /// let tx = client.begin().await?;
+    /// tx.exec("UPDATE account SET balance = balance - $1 WHERE id = $2", params![10, 1]).await?;
+    /// tx.exec("UPDATE account SET balance = balance + $1 WHERE id = $2", params![10, 2]).await?;
+    /// tx.commit().await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn begin(&self) -> Result<crate::Transaction> {
+        self.begin_with(crate::TransactionOptions::default()).await
+    }
+
+    /// [`begin`](Self::begin) with an isolation level or `READ ONLY`.
+    /// [`TransactionOptions::retries`](crate::TransactionOptions::retries)
+    /// is not used here.
+    pub async fn begin_with(
+        &self,
+        options: crate::TransactionOptions,
+    ) -> Result<crate::Transaction> {
+        self.transactions.begin(&options).await
+    }
+
+    /// Runs `body` in a transaction: commits when it returns `Ok`, rolls
+    /// back when it returns `Err`, and after a serialization failure or a
+    /// deadlock ([`Error::is_retryable`]) runs it again in a new transaction,
+    /// up to [`DEFAULT_TRANSACTION_RETRIES`](crate::DEFAULT_TRANSACTION_RETRIES)
+    /// times. **The closure may therefore run more than once**: keep what it
+    /// does outside the database to after it returns.
+    ///
+    /// A COMMIT whose connection failed is never retried: whether it
+    /// committed is unknown ([`Error::is_commit_outcome_unknown`]).
+    ///
+    /// ```no_run
+    /// # async fn demo(client: &rasterizeddb_client::Client) -> rasterizeddb_client::Result<()> {
+    /// use rasterizeddb_client::{Executor, params};
+    /// let moved = client
+    ///     .transaction(|tx| {
+    ///         Box::pin(async move {
+    ///             tx.exec("UPDATE account SET balance = balance - 10 WHERE id = $1", params![1]).await?;
+    ///             tx.exec("UPDATE account SET balance = balance + 10 WHERE id = $1", params![2]).await
+    ///         })
+    ///     })
+    ///     .await?;
+    /// # let _ = moved; Ok(()) }
+    /// ```
+    pub async fn transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send,
+        F: for<'t> FnMut(&'t crate::Transaction) -> crate::TransactionFuture<'t, T> + Send,
+    {
+        self.transaction_with(crate::TransactionOptions::default(), body)
+            .await
+    }
+
+    /// [`transaction`](Self::transaction) with an isolation level, `READ
+    /// ONLY`, or another retry count.
+    pub async fn transaction_with<T, F>(
+        &self,
+        options: crate::TransactionOptions,
+        body: F,
+    ) -> Result<T>
+    where
+        T: Send,
+        F: for<'t> FnMut(&'t crate::Transaction) -> crate::TransactionFuture<'t, T> + Send,
+    {
+        crate::transaction::run(&self.transactions, options, body).await
+    }
+
     /// Runs `sql` exactly as given, with no placeholder rendering.
     ///
     /// Text holding a second statement, or transaction control, is refused
     /// with [`Error::Unsupported`] before anything is sent (see
-    /// [`check_statement`](crate::check_statement)).
+    /// [`check_statement`](crate::check_statement)); a transaction is opened
+    /// with [`begin`](Self::begin).
     pub async fn run(&self, sql: &str) -> Result<Rows> {
         check_statement(sql)?;
         self.send(sql).await
@@ -362,11 +455,13 @@ impl Client {
         self.connections.iter().all(|c| c.mux.is_connected())
     }
 
-    /// Closes every connection.
+    /// Closes every shared connection, and the connections kept for
+    /// transactions. A transaction still open keeps its own until it ends.
     pub async fn close(&self) {
         for connection in &self.connections {
             connection.mux.close().await;
         }
+        self.transactions.forget_spares();
     }
 }
 

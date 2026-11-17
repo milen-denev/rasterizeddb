@@ -38,6 +38,20 @@ pub enum Error {
         /// How many there were.
         got: usize,
     },
+    /// A [`Transaction`](crate::Transaction)'s connection failed, was closed
+    /// by the server (it closes a connection idle for 30 s), or was left
+    /// unusable by a statement whose future was dropped before its answer
+    /// came. The transaction is over and nothing is sent again: the server
+    /// rolls a transaction back when its connection ends, so it did not
+    /// commit, unless `commit_outcome_unknown` says the failure came during
+    /// COMMIT, after which it may or may not have.
+    TransactionLost {
+        /// The connection failed while COMMIT was in flight: the server may
+        /// have committed before it went, and nothing on this side can tell.
+        commit_outcome_unknown: bool,
+        /// What happened.
+        message: String,
+    },
 }
 
 impl Error {
@@ -49,9 +63,64 @@ impl Error {
     }
 
     /// Whether the connection failed, as opposed to the server answering with
-    /// an error. Only then can the statement's fate be unknown.
+    /// an error. Only then can the statement's fate be unknown. A
+    /// transaction whose connection failed ([`Error::TransactionLost`]) is
+    /// one too.
     pub fn is_transport(&self) -> bool {
-        matches!(self, Error::Transport(_))
+        matches!(self, Error::Transport(_) | Error::TransactionLost { .. })
+    }
+
+    /// Whether a transaction's connection was lost ([`Error::TransactionLost`]).
+    pub fn is_transaction_lost(&self) -> bool {
+        matches!(self, Error::TransactionLost { .. })
+    }
+
+    /// Whether a COMMIT's connection failed before its answer came, so the
+    /// transaction may or may not have committed. Never retried by
+    /// [`Client::transaction`](crate::Client::transaction).
+    pub fn is_commit_outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            Error::TransactionLost {
+                commit_outcome_unknown: true,
+                ..
+            }
+        )
+    }
+
+    /// The SQLSTATE the server gave, when it gave one.
+    ///
+    /// Statements run inside a transaction are answered by the server's
+    /// transaction machinery, which ends each error message with
+    /// `(SQLSTATE xxxxx)`; that code is returned. A statement outside a
+    /// transaction carries no code (the native protocol has no field for
+    /// it), and this is `None`.
+    pub fn sqlstate(&self) -> Option<&str> {
+        let message = self.server_message()?;
+        let rest = message.strip_suffix(')')?;
+        let at = rest.rfind("(SQLSTATE ")?;
+        let code = &rest[at + "(SQLSTATE ".len()..];
+        (code.len() == 5 && code.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(code)
+    }
+
+    /// Whether the server refused a statement for a conflict with a
+    /// concurrent transaction (`40001`, serialization_failure): the whole
+    /// transaction may succeed if run again.
+    pub fn is_serialization_failure(&self) -> bool {
+        self.sqlstate() == Some("40001")
+    }
+
+    /// Whether the server chose this transaction as a deadlock's victim
+    /// (`40P01`): the whole transaction may succeed if run again.
+    pub fn is_deadlock(&self) -> bool {
+        self.sqlstate() == Some("40P01")
+    }
+
+    /// Whether running the whole transaction again may succeed: a
+    /// serialization failure or a deadlock. What
+    /// [`Client::transaction`](crate::Client::transaction) retries on.
+    pub fn is_retryable(&self) -> bool {
+        self.is_serialization_failure() || self.is_deadlock()
     }
 
     /// The server's message, when the server refused the statement.
@@ -87,6 +156,19 @@ impl fmt::Display for Error {
             Error::Param(message) => write!(f, "parameter: {message}"),
             Error::Column { index, message } => write!(f, "column {index}: {message}"),
             Error::Unsupported(message) => write!(f, "unsupported: {message}"),
+            Error::TransactionLost {
+                commit_outcome_unknown,
+                message,
+            } => {
+                if *commit_outcome_unknown {
+                    write!(
+                        f,
+                        "transaction lost during COMMIT, which may or may not have committed: {message}"
+                    )
+                } else {
+                    write!(f, "transaction lost (the server rolled it back): {message}")
+                }
+            }
             Error::RowCount { expected, got } => {
                 write!(
                     f,

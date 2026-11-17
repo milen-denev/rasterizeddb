@@ -72,14 +72,14 @@
 //! a quoted identifier or a comment is left alone. The pgwire listener does
 //! the same thing on its side for clients that do bind (`pg_params.rs`).
 //!
-//! # One statement at a time, and no transactions
+//! # One statement at a time; transactions through `begin`
 //!
-//! Text holding a second statement is refused before it is sent: the native
-//! protocol runs only the first statement of an `INSERT …; INSERT …` string
-//! and silently drops the rest. Transaction control is refused too: the native
-//! protocol has none, and every statement commits on its own. Put related
-//! writes in one statement (a multi-row `INSERT`, `INSERT … ON CONFLICT`, an
-//! `UPDATE … WHERE`), or use the pgwire listener for a transaction block.
+//! Text holding a second statement is refused before it is sent: the server
+//! runs one statement per request. A statement sent on a [`Client`] commits on
+//! its own. Statements that must commit together run in a [`Transaction`]
+//! ([`Client::begin`], [`Client::transaction`]), on a connection of its own;
+//! `BEGIN`, `COMMIT` and the rest are never sent as statements, and are
+//! refused if written as one.
 //!
 //! # Results are positional
 //!
@@ -101,6 +101,7 @@ mod params;
 mod row;
 mod scram;
 mod to_sql;
+mod transaction;
 mod types;
 mod value;
 
@@ -137,6 +138,10 @@ pub use params::{
 };
 pub use row::{FromRow, Row, Rows, tag};
 pub use to_sql::ToSql;
+pub use transaction::{
+    DEFAULT_TRANSACTION_RETRIES, Isolation, SERVER_IDLE_CLOSE, Transaction, TransactionFuture,
+    TransactionOptions,
+};
 pub use types::{Date, Interval, Json, Numeric, Time, Timestamp, Uuid};
 pub use value::Value;
 
@@ -148,8 +153,9 @@ pub mod prelude {
     pub use crate::kv::{KvKey, KvValue};
     pub use crate::orm::{Expr, ModelExt, ModelQuery};
     pub use crate::{
-        Client, Date, Error, Executor, FromRow, FromSql, Interval, Json, Numeric, Options, Param,
-        Result, Row, Rows, Time, Timestamp, ToSql, Uuid, Value, params,
+        Client, Date, Error, Executor, FromRow, FromSql, Interval, Isolation, Json, Numeric,
+        Options, Param, Result, Row, Rows, Time, Timestamp, ToSql, Transaction, TransactionOptions,
+        Uuid, Value, params,
     };
     #[cfg(feature = "derive")]
     pub use crate::{Model, SqlEnum};
