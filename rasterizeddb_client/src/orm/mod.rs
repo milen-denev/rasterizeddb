@@ -95,6 +95,7 @@ mod migrate;
 mod projection;
 mod query;
 mod relations;
+mod upsert;
 
 pub use keyset::{Cursor, Page, RowStream};
 pub use migrate::{
@@ -106,6 +107,7 @@ pub use query::{Column, Expr, Order, Select, Update};
 pub use relations::{
     ModelRelations, RELATION_CHUNK, Relation, RelationKind, RelationSlot, Synced, Through, With,
 };
+pub use upsert::{InsertMany, Upsert, UpsertNothing};
 
 use std::future::Future;
 
@@ -468,55 +470,7 @@ fn push_values_tuple<M: Model>(out: &mut String, row: &M) -> Result<()> {
 /// writes version 1 and the update `version + 1`, `WHERE` the stored
 /// version is the struct's: no row back then means a conflict.
 pub fn upsert_sql<M: Model>(m: &M) -> Result<String> {
-    let key = primary_key::<M>()?;
-    let mut sql = format!("INSERT INTO {} (", ident(M::TABLE)?);
-    for (i, column) in M::COLUMNS.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        push_ident(&mut sql, column.name)?;
-    }
-    sql.push_str(") VALUES (");
-    for i in 0..M::COLUMNS.len() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        push_insert_value(m, i, &mut sql)?;
-    }
-    sql.push_str(") ON CONFLICT (");
-    for (n, &i) in key.iter().enumerate() {
-        if n > 0 {
-            sql.push_str(", ");
-        }
-        push_ident(&mut sql, M::COLUMNS[i].name)?;
-    }
-    let rest: Vec<&ColumnDef> = M::COLUMNS.iter().filter(|c| !c.primary_key).collect();
-    if rest.is_empty() {
-        sql.push_str(") DO NOTHING");
-    } else {
-        let table = ident(M::TABLE)?;
-        sql.push_str(") DO UPDATE SET ");
-        let mut sets = Vec::new();
-        for column in &rest {
-            let name = ident(column.name)?;
-            match column.role {
-                // Kept from the stored row; the next two below.
-                ColumnRole::CreatedAt | ColumnRole::Version | ColumnRole::UpdatedAt => {}
-                _ => sets.push(format!("{name} = EXCLUDED.{name}")),
-            }
-        }
-        sets.extend(maintained_sets::<M>(Some(&table))?);
-        if sets.is_empty() {
-            // Only a creation time outside the key: nothing to change.
-            let name = ident(rest[0].name)?;
-            sets.push(format!("{name} = {table}.{name}"));
-        }
-        sql.push_str(&sets.join(", "));
-        push_version_check(m, " WHERE ", Some(&table), &mut sql)?;
-    }
-    sql.push_str(" RETURNING ");
-    sql.push_str(&select_list::<M>()?);
-    Ok(sql)
+    upsert::upsert_statement(&[m], None, &upsert::Action::UpdateDefault, true)
 }
 
 /// `UPDATE t SET <every non-key column> WHERE <key> RETURNING …`; with a
@@ -869,22 +823,15 @@ pub trait ModelExt: Executor {
     /// [`INSERT_CHUNK_BYTES`] of text to a statement, and returns them as
     /// stored. A statement is atomic; the whole is not, unless it runs in a
     /// transaction.
-    fn insert_many<M: Model>(&self, rows: &[M]) -> impl Future<Output = Result<Vec<M>>> + Send {
-        let chunks = insert_chunks(rows);
-        let rows_len = rows.len();
-        async move {
-            // Answers are kept as they came and decoded at the end, so the
-            // future holds no `M` across a send (`M` need not be `Send`).
-            let mut answers = Vec::new();
-            for sql in chunks? {
-                answers.push(self.run(&sql).await?);
-            }
-            let mut out = Vec::with_capacity(rows_len);
-            for rows in &answers {
-                out.extend(rows.decode_all::<M>()?);
-            }
-            Ok(out)
-        }
+    ///
+    /// Await it as it is, or say what a clash does first:
+    /// `.on_conflict((Account::email,)).do_nothing()`, `.do_update(…)`
+    /// (see [`InsertMany`]).
+    fn insert_many<'a, M: Model>(&'a self, rows: &'a [M]) -> InsertMany<'a, Self, M>
+    where
+        Self: Sized,
+    {
+        InsertMany::new(self, rows)
     }
 
     /// Inserts the row, or updates the one with its primary key. The row as
@@ -896,33 +843,15 @@ pub trait ModelExt: Executor {
     /// With a `#[rdb(version)]` column, a new row is stored at version 1 and
     /// an existing one is updated only at the version the struct holds;
     /// at another, [`Error::Conflict`].
-    fn upsert<M: Model>(&self, row: &M) -> impl Future<Output = Result<M>> + Send {
-        let sql = upsert_sql(row);
-        let reread = reread_sql(row);
-        let probe = VersionProbe::of(row);
-        async move {
-            let mut rows = self.run(&sql?).await?;
-            if rows.is_empty()
-                && let Some(probe) = probe?
-            {
-                return Err(probe.classify(self).await?.unwrap_or_else(|| {
-                    Error::Conflict(
-                        "the upsert stored nothing and no row has its key: it was deleted \
-                         while the statement ran"
-                            .to_string(),
-                    )
-                }));
-            }
-            if rows.is_empty() {
-                // `DO NOTHING` (a model that is all key) returns no row: the
-                // one already there is the answer.
-                rows = self.run(&reread?).await?;
-            }
-            rows.decode_first()?.ok_or(Error::RowCount {
-                expected: "exactly 1",
-                got: 0,
-            })
-        }
+    ///
+    /// Await it as it is, or narrow it first: `.on_conflict(Account::email)`,
+    /// `.do_update((Account::name,))`, `.do_update_all_except(…)`,
+    /// `.do_nothing()` (see [`Upsert`]).
+    fn upsert<'a, M: Model>(&'a self, row: &'a M) -> Upsert<'a, Self, M>
+    where
+        Self: Sized,
+    {
+        Upsert::new(self, row)
     }
 
     /// Updates the row with this primary key to these values, returning it as

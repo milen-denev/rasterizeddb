@@ -1072,3 +1072,133 @@ async fn timestamps_come_from_the_server_and_deletes_are_soft() {
     })
     .await
 }
+
+// ------------------------------------------------------------- upserts
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "members")]
+struct Member {
+    #[rdb(primary_key, serial)]
+    id: i64,
+    #[rdb(unique)]
+    email: String,
+    name: String,
+    visits: i64,
+}
+
+fn member(email: &str, name: &str, visits: i64) -> Member {
+    Member {
+        id: 0,
+        email: email.into(),
+        name: name.into(),
+        visits,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_upsert_builder_absorbs_only_its_arbiter() {
+    bounded(async {
+        let Some(server) = server("upsert").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Member>().await.unwrap();
+
+        // By email: the serial id is the server's, the second call updates.
+        let ada = c
+            .upsert(&member("ada@x", "Ada", 1))
+            .on_conflict(Member::email)
+            .await
+            .unwrap();
+        assert!(ada.id > 0, "the sequence assigned it");
+        let again = c
+            .upsert(&member("ada@x", "Ada L.", 5))
+            .on_conflict(Member::email)
+            .do_update(Member::name)
+            .await
+            .unwrap();
+        assert_eq!(again.id, ada.id);
+        assert_eq!(
+            (again.name.as_str(), again.visits),
+            ("Ada L.", 1),
+            "only name moved"
+        );
+        let kept = c
+            .upsert(&member("ada@x", "ignored", 9))
+            .on_conflict(Member::email)
+            .do_update_all_except(Member::name)
+            .await
+            .unwrap();
+        assert_eq!((kept.name.as_str(), kept.visits), ("Ada L.", 9));
+        let skipped = c
+            .upsert(&member("ada@x", "nope", 0))
+            .on_conflict(Member::email)
+            .do_nothing()
+            .await
+            .unwrap();
+        assert_eq!(skipped, None, "the key was taken");
+        let new = c
+            .upsert(&member("bob@x", "Bob", 0))
+            .on_conflict(Member::email)
+            .do_nothing()
+            .await
+            .unwrap();
+        assert_eq!(new.as_ref().map(|m| m.name.as_str()), Some("Bob"));
+
+        // The arbiter absorbs its own clash only: a clash on the email
+        // under ON CONFLICT (id) is still an error, and writes nothing.
+        let mut clash = member("ada@x", "Clash", 0);
+        clash.id = 999;
+        let e = c.upsert(&clash).await.unwrap_err();
+        assert!(e.is_unique_violation(), "{e}");
+        let (mut carol, mut dup) = (member("carol@x", "Carol", 0), member("ada@x", "Dup", 0));
+        (carol.id, dup.id) = (100, 101);
+        let e = c
+            .insert_many(&[carol, dup])
+            .on_conflict(Member::id)
+            .do_nothing()
+            .await
+            .unwrap_err();
+        assert!(e.is_unique_violation(), "{e}");
+        assert_eq!(
+            Member::query().count(&c).await.unwrap(),
+            2,
+            "carol was not half-written"
+        );
+
+        // Many rows: skipped, or merged.
+        let inserted = c
+            .insert_many(&[
+                member("carol@x", "Carol", 1),
+                member("ada@x", "skipped", 0),
+                member("dan@x", "Dan", 1),
+            ])
+            .on_conflict(Member::email)
+            .do_nothing()
+            .await
+            .unwrap();
+        let names: Vec<&str> = inserted.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["Carol", "Dan"], "only the rows inserted come back");
+        let merged = c
+            .insert_many(&[member("carol@x", "Carol2", 7), member("eve@x", "Eve", 1)])
+            .on_conflict(Member::email)
+            .do_update((Member::name, Member::visits))
+            .await
+            .unwrap();
+        assert_eq!(merged.len(), 2);
+        let carol = Member::query()
+            .filter(Member::email.eq("carol@x"))
+            .one(&c)
+            .await
+            .unwrap();
+        assert_eq!((carol.name.as_str(), carol.visits), ("Carol2", 7));
+        let targetless = c
+            .insert_many(&[member("eve@x", "x", 0), member("fay@x", "Fay", 0)])
+            .do_nothing()
+            .await
+            .unwrap();
+        assert_eq!(targetless.len(), 1, "any clash skipped without a target");
+        assert_eq!(Member::query().count(&c).await.unwrap(), 6);
+    })
+    .await
+}

@@ -88,10 +88,57 @@ let found: Option<Account> = client.find(ada.id).await?;
 let mut changed = ada.clone();
 changed.name = Some("Ada".into());
 let stored = client.update(&changed).await?;        // every non-key column, RETURNING
-let upserted = client.upsert(&stored).await?;        // ON CONFLICT (primary key) DO UPDATE
+let upserted = client.upsert(&stored).await?;        // ON CONFLICT (primary key) DO UPDATE (below)
 let existed = client.delete(&upserted).await?;
 # let _ = (found, existed); Ok(()) }
 ```
+
+## Upserts
+
+`upsert` and `insert_many` return builders that run when awaited, so
+`client.upsert(&row).await` works as it is, and a clash can be described
+first:
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+# #[derive(Model, Debug, Clone)] #[rdb(table = "members")]
+# struct Member { #[rdb(primary_key, serial)] id: i64, #[rdb(unique)] email: String, name: String, visits: i64 }
+# async fn demo(db: &Client, m: Member, batch: Vec<Member>) -> rasterizeddb_client::Result<()> {
+// By another unique key: the serial id is assigned by the server.
+let stored = db.upsert(&m).on_conflict(Member::email).await?;
+
+// Choose what a clash updates.
+let renamed = db.upsert(&m).on_conflict(Member::email).do_update(Member::name).await?;
+let most = db.upsert(&m).do_update_all_except((Member::visits,)).await?;
+
+// Keep the stored row: None when the key was taken.
+let fresh: Option<Member> = db.upsert(&m).on_conflict(Member::email).do_nothing().await?;
+
+// Many rows, multi-row statements, the same choices.
+let inserted = db.insert_many(&batch).on_conflict(Member::email).do_nothing().await?;
+let merged = db
+    .insert_many(&batch)
+    .on_conflict(Member::email)
+    .do_update((Member::name, Member::visits))
+    .await?;
+# let _ = (stored, renamed, most, fresh, inserted, merged); Ok(()) }
+```
+
+* The default target is the primary key, and then every column is written
+  as given, a serial key included (the upsert names its row). With another
+  target, serial columns are left to the server, as an insert leaves them.
+* The default update writes every column but the key, the target, serial
+  and `created_at` columns; `version` and `updated_at` move as on any
+  update and cannot be named in `do_update`.
+* The server absorbs a clash on the **arbiter** only: under
+  `on_conflict(Member::id)` a row whose *email* is taken is still a
+  unique-violation error, and the statement writes nothing.
+* `insert_many(…).do_nothing()` with no target skips a clash on any unique
+  key, and returns only the rows inserted.
+* A multi-row upsert that updates a model with a `#[rdb(version)]` column is
+  refused: one statement cannot check each row's own version. Upsert the
+  rows one at a time, or use `update_many`.
+* Every builder shows its statement(s) with `to_sql()`.
 
 ## Optimistic locking
 

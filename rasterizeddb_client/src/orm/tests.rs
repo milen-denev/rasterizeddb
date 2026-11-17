@@ -267,21 +267,30 @@ struct Local {
 
 fn assert_send<T: Send>(_: T) {}
 
+use std::future::IntoFuture;
+
 /// Every ORM future is `Send` on any executor, for any model: the statement
 /// is written before the future is made, so no row is held across a send.
 #[allow(dead_code)]
 fn orm_futures_are_send<E: crate::Executor>(db: &E, a: &Account, local: &Local) {
     assert_send(db.create_table::<Account>());
     assert_send(db.insert(a));
-    assert_send(db.insert_many(std::slice::from_ref(a)));
-    assert_send(db.upsert(a));
+    assert_send(db.insert_many(std::slice::from_ref(a)).into_future());
+    assert_send(db.upsert(a).into_future());
+    assert_send(
+        db.upsert(a)
+            .on_conflict(Account::email)
+            .do_nothing()
+            .into_future(),
+    );
     assert_send(db.update(a));
     assert_send(db.delete(a));
     assert_send(db.find::<Account>(1i64));
     assert_send(db.all::<Account>());
     assert_send(db.insert(local));
-    assert_send(db.insert_many(std::slice::from_ref(local)));
-    assert_send(db.upsert(local));
+    // The builders hold the row; the futures they make do not.
+    assert_send(db.insert_many(std::slice::from_ref(local)).into_future());
+    assert_send(db.upsert(local).into_future());
     assert_send(db.delete(local));
     let q = Account::query();
     assert_send(q.all(db));
@@ -749,5 +758,124 @@ fn timestamps_and_soft_delete() {
         Note::query().select(count_rows()).to_sql().unwrap(),
         "SELECT COUNT(*) FROM notes WHERE deleted IS NULL",
         "aggregates count live rows"
+    );
+}
+
+#[test]
+fn the_upsert_builder() {
+    let db = crate::Client::detached();
+    let a = account();
+    let list = "id, email, name, balance::text, tags::text, \"order\", status";
+    let values = "('o''neil@example.com', NULL, (-10.50), '{\"a b\",\"q\\\"z\"}', 3, 'on-hold')";
+    assert_eq!(
+        db.upsert(&a).on_conflict(Account::email).to_sql().unwrap(),
+        format!(
+            "INSERT INTO accounts (email, name, balance, tags, \"order\", status) VALUES {values} \
+             ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, balance = EXCLUDED.balance, \
+             tags = EXCLUDED.tags, \"order\" = EXCLUDED.\"order\", status = EXCLUDED.status \
+             RETURNING {list}"
+        ),
+        "another key than the primary one: the serial id is the server's"
+    );
+    assert_eq!(
+        db.upsert(&a)
+            .on_conflict(Account::email)
+            .do_update((Account::name, Account::status))
+            .to_sql()
+            .unwrap(),
+        format!(
+            "INSERT INTO accounts (email, name, balance, tags, \"order\", status) VALUES {values} \
+             ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status \
+             RETURNING {list}"
+        )
+    );
+    assert!(
+        db.upsert(&a)
+            .do_update_all_except((Account::balance, Account::tags, Account::position))
+            .to_sql()
+            .unwrap()
+            .contains(
+                "ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, \
+                 status = EXCLUDED.status RETURNING"
+            )
+    );
+    assert_eq!(
+        db.upsert(&a)
+            .on_conflict(Account::email)
+            .do_nothing()
+            .to_sql()
+            .unwrap(),
+        format!(
+            "INSERT INTO accounts (email, name, balance, tags, \"order\", status) VALUES {values} \
+             ON CONFLICT (email) DO NOTHING RETURNING {list}"
+        )
+    );
+    let rows = [a.clone(), a.clone()];
+    assert_eq!(
+        db.insert_many(&rows).do_nothing().to_sql().unwrap(),
+        vec![format!(
+            "INSERT INTO accounts (id, email, name, balance, tags, \"order\", status) VALUES \
+             (0, 'o''neil@example.com', NULL, (-10.50), '{{\"a b\",\"q\\\"z\"}}', 3, 'on-hold'), \
+             (0, 'o''neil@example.com', NULL, (-10.50), '{{\"a b\",\"q\\\"z\"}}', 3, 'on-hold') \
+             ON CONFLICT DO NOTHING RETURNING {list}"
+        )],
+        "no target: any clash is skipped"
+    );
+    assert!(
+        db.insert_many(&rows)
+            .on_conflict((Account::email,))
+            .do_update(Account::name)
+            .to_sql()
+            .unwrap()[0]
+            .ends_with(&format!(
+                "ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name RETURNING {list}"
+            ))
+    );
+    assert_eq!(
+        db.insert_many(&rows).to_sql().unwrap(),
+        vec![insert_sql(&[&rows[0], &rows[1]]).unwrap()],
+        "plain, it is the multi-row insert"
+    );
+    // Versions: one row checks its own; many rows cannot.
+    let doc = Doc {
+        id: 1,
+        body: "x".into(),
+        version: 2,
+    };
+    assert!(
+        db.upsert(&doc)
+            .do_update(Doc::body)
+            .to_sql()
+            .unwrap()
+            .ends_with("DO UPDATE SET body = EXCLUDED.body, version = doc.version + 1 WHERE doc.version = 2 RETURNING id, body, version")
+    );
+    let docs = [doc.clone()];
+    assert!(db.insert_many(&docs).on_conflict(Doc::id).to_sql().is_err());
+    assert!(
+        db.insert_many(&docs)
+            .on_conflict(Doc::id)
+            .do_nothing()
+            .to_sql()
+            .is_ok()
+    );
+    assert!(
+        db.upsert(&doc).do_update(Doc::version).to_sql().is_err(),
+        "the ORM writes the version itself"
+    );
+    // Big batches split by rows, then by bytes.
+    let many: Vec<Account> = (0..INSERT_CHUNK_ROWS + 1).map(|_| a.clone()).collect();
+    assert_eq!(
+        db.insert_many(&many).do_nothing().to_sql().unwrap().len(),
+        2
+    );
+    let mut wide = a.clone();
+    wide.email = "x".repeat(INSERT_CHUNK_BYTES / 3);
+    let wide = vec![wide; 4];
+    let statements = db.insert_many(&wide).do_nothing().to_sql().unwrap();
+    assert!(statements.len() >= 2, "{}", statements.len());
+    assert!(
+        statements
+            .iter()
+            .all(|s| s.len() <= INSERT_CHUNK_BYTES || s.matches("), (").count() == 0)
     );
 }
