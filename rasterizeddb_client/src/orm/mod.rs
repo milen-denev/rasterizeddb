@@ -61,6 +61,8 @@
 //! | `text` | read as `col::text` and parsed (for a type of your own) |
 //! | `skip` | not a column: filled with `Default::default()` on reads |
 //! | `version` | an integer for optimistic locking ([`ColumnRole::Version`]) |
+//! | `references = "users(id)"` | a foreign key ([`ForeignKey`]) |
+//! | `has_many(…)`, `belongs_to(…)`, … | a relation field ([`Relation`], [guide](crate::guide::relations)) |
 //!
 //! Struct attribute: `#[rdb(table = "name")]`, otherwise the struct's name in
 //! snake case.
@@ -84,12 +86,16 @@
 
 mod migrate;
 mod query;
+mod relations;
 
 pub use migrate::{
     AutoMigrate, BoxFuture, MigrationPlan, MigrationReport, Migrator, StepState, StepStatus,
     SyncPolicy,
 };
 pub use query::{Column, Expr, Order, Select, Update};
+pub use relations::{
+    ModelRelations, RELATION_CHUNK, Relation, RelationKind, RelationSlot, Synced, Through, With,
+};
 
 use std::future::Future;
 
@@ -127,6 +133,23 @@ pub struct ColumnDef {
     pub renamed_from: &'static [&'static str],
     /// What the ORM writes into it itself, if anything.
     pub role: ColumnRole,
+    /// The foreign key the DDL declares on it (`#[rdb(references =
+    /// "users(id)")]`).
+    pub references: Option<ForeignKey>,
+}
+
+/// A column's foreign key: `REFERENCES table (column) [ON DELETE …] [ON
+/// UPDATE …]`, written by `CREATE TABLE` and by a migrator's `ADD COLUMN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignKey {
+    /// The referenced table.
+    pub table: &'static str,
+    /// The referenced column: its primary key or a unique column.
+    pub column: &'static str,
+    /// `CASCADE`, `RESTRICT`, `SET NULL`, `SET DEFAULT` or `NO ACTION`.
+    pub on_delete: Option<&'static str>,
+    /// As `on_delete`, on an update of the referenced key.
+    pub on_update: Option<&'static str>,
 }
 
 /// A column the ORM maintains itself, from its field attribute.
@@ -619,6 +642,18 @@ impl TableSchema {
         if let Some(default) = column.default {
             line.push_str(" DEFAULT ");
             line.push_str(default);
+        }
+        if let Some(key) = column.references {
+            line.push_str(&format!(
+                " REFERENCES {} ({})",
+                ident(key.table)?,
+                ident(key.column)?
+            ));
+            for (verb, action) in [("DELETE", key.on_delete), ("UPDATE", key.on_update)] {
+                if let Some(action) = action {
+                    line.push_str(&format!(" ON {verb} {action}"));
+                }
+            }
         }
         Ok(line)
     }

@@ -380,3 +380,100 @@ fn a_version_column_guards_every_write() {
         "DELETE FROM accounts WHERE id = 0"
     );
 }
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "authors")]
+struct Author {
+    #[rdb(primary_key)]
+    id: i64,
+    name: String,
+    #[rdb(has_many(Book, foreign_key = "author_id"))]
+    books: Vec<Book>,
+    #[rdb(many_to_many(
+        Genre,
+        through = "author_genres",
+        local = "author_id",
+        foreign = "genre_id"
+    ))]
+    genres: Vec<Genre>,
+    #[rdb(count_of = "books")]
+    book_count: i64,
+}
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "books")]
+struct Book {
+    #[rdb(primary_key)]
+    id: i64,
+    #[rdb(references = "authors(id)", on_delete = "set null")]
+    author_id: Option<i64>,
+    title: String,
+    #[rdb(belongs_to(Author, foreign_key = "author_id"))]
+    author: Option<Box<Author>>,
+}
+
+#[derive(crate::Model, Debug, Clone, PartialEq)]
+#[rdb(table = "genres")]
+struct Genre {
+    #[rdb(primary_key)]
+    id: i64,
+    name: String,
+}
+
+#[test]
+fn relations_are_declared_and_filter_through_subqueries() {
+    let names: Vec<&str> = Author::COLUMNS.iter().map(|c| c.name).collect();
+    assert_eq!(
+        names,
+        ["id", "name"],
+        "relation and count fields are not columns"
+    );
+    assert_eq!(Author::books.kind(), RelationKind::HasMany);
+    assert_eq!(Book::author.kind(), RelationKind::BelongsTo);
+    assert_eq!(
+        Author::genres.through(),
+        Some(Through {
+            table: "author_genres",
+            local: "author_id",
+            foreign: "genre_id"
+        })
+    );
+    assert_eq!(
+        create_table_sql::<Book>().unwrap()[0],
+        "CREATE TABLE IF NOT EXISTS books (id BIGINT NOT NULL, author_id BIGINT REFERENCES \
+         authors (id) ON DELETE SET NULL, title TEXT NOT NULL, PRIMARY KEY (id))"
+    );
+
+    let q = Author::query().where_has(Author::books.filter(Book::title.like("R%")));
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, name FROM authors WHERE id IN (SELECT author_id FROM books WHERE author_id \
+         IS NOT NULL AND (title LIKE 'R%'))"
+    );
+    let q = Author::query().where_doesnt_have(Author::books);
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, name FROM authors WHERE (id IS NULL OR id NOT IN (SELECT author_id FROM \
+         books WHERE author_id IS NOT NULL))"
+    );
+    let q = Author::query().where_has(Author::genres.filter(Genre::name.eq("poetry")));
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, name FROM authors WHERE id IN (SELECT author_id FROM author_genres WHERE \
+         author_id IS NOT NULL AND genre_id IN (SELECT id FROM genres WHERE name = 'poetry'))"
+    );
+    let q = Book::query().where_doesnt_have(Book::author);
+    assert_eq!(
+        q.to_sql().unwrap(),
+        "SELECT id, author_id, title FROM books WHERE (author_id IS NULL OR author_id NOT IN \
+         (SELECT id FROM authors WHERE id IS NOT NULL))",
+        "a book with no author has none"
+    );
+    assert!(
+        Author::query()
+            .where_has(Author::books.limit(1))
+            .to_sql()
+            .is_err(),
+        "a limit means nothing in a filter"
+    );
+}

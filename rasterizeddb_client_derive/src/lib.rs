@@ -48,6 +48,24 @@ use syn::{Data, DeriveInput, Fields, LitStr, Type, parse_macro_input};
 /// | `text` | read as `col::text` and parsed (for a type of your own) |
 /// | `skip` | not a column: `Default::default()` on reads |
 /// | `version` | an integer for optimistic locking: inserts write 1, updates `version + 1` where it is still the struct's; a lost race is `Error::Conflict` |
+/// | `references = "users(id)"` | a foreign key in the DDL, with `on_delete = "cascade"` / `on_update = …` |
+///
+/// # Relation fields
+///
+/// Not columns: each gets a `Relation<Self, C>` constant named as the field,
+/// and is filled by loading it (`Default` until then).
+///
+/// | attribute | field type |
+/// |---|---|
+/// | `has_many(Post, foreign_key = "user_id")` | `Vec<Post>` |
+/// | `has_one(Profile, foreign_key = "user_id")` | `Option<Profile>` |
+/// | `belongs_to(User, foreign_key = "user_id")` | `Option<User>` or `Option<Box<User>>` |
+/// | `many_to_many(Tag, through = "user_tags", local = "user_id", foreign = "tag_id")` | `Vec<Tag>` |
+/// | `count_of = "posts"` | `i64`, filled by `with_count` |
+///
+/// `local_key` (has_many, has_one, many_to_many), `owner_key` (belongs_to)
+/// and `related_key` (many_to_many) name the matched column when it is not
+/// that model's primary key; `through` takes a join model's type too.
 ///
 /// # Struct attributes
 ///
@@ -127,6 +145,139 @@ struct FieldAttrs {
     renamed_from: Vec<String>,
     /// `version`, …: what the ORM maintains in the column.
     role: Option<(&'static str, Span)>,
+    /// `references = "table(column)"`, with its actions.
+    references: Option<(String, String)>,
+    on_delete: Option<String>,
+    on_update: Option<String>,
+    /// A relation field: not a column.
+    relation: Option<RelationAttr>,
+    /// `count_of = "relation"`: not a column; holds a relation's count.
+    count_of: Option<(String, Span)>,
+}
+
+struct RelationAttr {
+    /// `BelongsTo`, `HasOne`, `HasMany`, `ManyToMany`.
+    kind: &'static str,
+    target: Option<syn::Path>,
+    foreign_key: Option<String>,
+    local_key: Option<String>,
+    owner_key: Option<String>,
+    related_key: Option<String>,
+    through: Option<Tokens>,
+    local: Option<String>,
+    foreign: Option<String>,
+    span: Span,
+}
+
+fn relation_attr(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+    kind: &'static str,
+) -> syn::Result<RelationAttr> {
+    let mut out = RelationAttr {
+        kind,
+        target: None,
+        foreign_key: None,
+        local_key: None,
+        owner_key: None,
+        related_key: None,
+        through: None,
+        local: None,
+        foreign: None,
+        span: meta.path.span(),
+    };
+    meta.parse_nested_meta(|inner| {
+        if !inner.input.peek(syn::Token![=]) {
+            if out.target.is_some() {
+                return Err(inner.error("a relation names one model"));
+            }
+            out.target = Some(inner.path.clone());
+            return Ok(());
+        }
+        let key = inner
+            .path
+            .get_ident()
+            .map(|i| i.to_string())
+            .unwrap_or_default();
+        let value = inner.value()?;
+        if key == "through" {
+            out.through = Some(if value.peek(LitStr) {
+                let table = value.parse::<LitStr>()?.value();
+                quote!(#table)
+            } else {
+                let model = value.parse::<syn::Path>()?;
+                quote!(<#model as ::rasterizeddb_client::orm::Model>::TABLE)
+            });
+            return Ok(());
+        }
+        let text = value.parse::<LitStr>()?.value();
+        let slot = match key.as_str() {
+            "foreign_key" => &mut out.foreign_key,
+            "local_key" => &mut out.local_key,
+            "owner_key" => &mut out.owner_key,
+            "related_key" => &mut out.related_key,
+            "local" => &mut out.local,
+            "foreign" => &mut out.foreign,
+            _ => {
+                return Err(inner.error(
+                    "expected the related model, then foreign_key, local_key, owner_key, \
+                     related_key, through, local or foreign",
+                ));
+            }
+        };
+        *slot = Some(text);
+        Ok(())
+    })?;
+    if out.target.is_none() {
+        return Err(
+            meta.error("name the related model first: has_many(Post, foreign_key = \"user_id\")")
+        );
+    }
+    let wrong = |what: &str| Err(syn::Error::new(out.span, what.to_string()));
+    match kind {
+        "HasMany" | "HasOne" => {
+            if out.foreign_key.is_none() {
+                return wrong(
+                    "has_many/has_one need foreign_key = \"<column of the related model>\"",
+                );
+            }
+            if out.owner_key.is_some() || out.related_key.is_some() || out.through.is_some() {
+                return wrong("has_many/has_one take foreign_key and local_key");
+            }
+        }
+        "BelongsTo" => {
+            if out.foreign_key.is_none() {
+                return wrong("belongs_to needs foreign_key = \"<column of this model>\"");
+            }
+            if out.local_key.is_some() || out.related_key.is_some() || out.through.is_some() {
+                return wrong("belongs_to takes foreign_key and owner_key");
+            }
+        }
+        _ => {
+            if out.through.is_none() || out.local.is_none() || out.foreign.is_none() {
+                return wrong(
+                    "many_to_many needs through = \"<join table>\" (or a join model), \
+                     local = \"<its column for this model>\" and foreign = \"<its column for the related one>\"",
+                );
+            }
+            if out.foreign_key.is_some() || out.owner_key.is_some() {
+                return wrong(
+                    "many_to_many takes through, local, foreign, local_key and related_key",
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn fk_action(text: &str, span: Span) -> syn::Result<String> {
+    let upper = text.trim().to_ascii_uppercase();
+    match upper.as_str() {
+        "CASCADE" | "RESTRICT" | "SET NULL" | "SET DEFAULT" | "NO ACTION" => Ok(upper),
+        _ => Err(syn::Error::new(
+            span,
+            "a foreign key action is cascade, restrict, set null, set default or no action",
+        )),
+    }
 }
 
 fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
@@ -165,15 +316,81 @@ fn field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
                 "sql_type" => out.sql_type = Some(string(&meta)?),
                 "default" => out.default = Some(string(&meta)?),
                 "renamed_from" => out.renamed_from.push(string(&meta)?),
+                "references" => {
+                    let text = string(&meta)?;
+                    let parsed = text.trim().strip_suffix(')').and_then(|t| {
+                        let (table, column) = t.split_once('(')?;
+                        let (table, column) = (table.trim(), column.trim());
+                        (!table.is_empty() && !column.is_empty() && !column.contains(','))
+                            .then(|| (table.to_string(), column.to_string()))
+                    });
+                    match parsed {
+                        Some(pair) => out.references = Some(pair),
+                        None => {
+                            return Err(
+                                meta.error("references = \"table(column)\": one referenced column")
+                            );
+                        }
+                    }
+                }
+                "on_delete" => out.on_delete = Some(fk_action(&string(&meta)?, meta.path.span())?),
+                "on_update" => out.on_update = Some(fk_action(&string(&meta)?, meta.path.span())?),
+                "has_many" => out.relation = Some(relation_attr(&meta, "HasMany")?),
+                "has_one" => out.relation = Some(relation_attr(&meta, "HasOne")?),
+                "belongs_to" => out.relation = Some(relation_attr(&meta, "BelongsTo")?),
+                "many_to_many" => out.relation = Some(relation_attr(&meta, "ManyToMany")?),
+                "count_of" => out.count_of = Some((string(&meta)?, meta.path.span())),
                 _ => {
                     return Err(meta.error(
                         "unknown rdb attribute; expected primary_key, serial, unique, index, \
-                         column, sql_type, default, renamed_from, json, text, skip or version",
+                         column, sql_type, default, renamed_from, references, on_delete, \
+                         on_update, json, text, skip, version, has_many, has_one, belongs_to, \
+                         many_to_many or count_of",
                     ));
                 }
             }
             Ok(())
         })?;
+    }
+    if (out.on_delete.is_some() || out.on_update.is_some()) && out.references.is_none() {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "on_delete and on_update go with references = \"table(column)\"",
+        ));
+    }
+    if out.relation.is_some() || out.count_of.is_some() {
+        if out.relation.is_some() && out.count_of.is_some() {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "a field is a relation or a count_of, not both",
+            ));
+        }
+        if out.skip {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "a relation or count_of field is not a column already; drop skip",
+            ));
+        }
+        // Not a column: read as Default, filled by loading.
+        out.skip = true;
+        if out.primary_key
+            || out.serial
+            || out.unique
+            || out.index.is_some()
+            || out.role.is_some()
+            || out.references.is_some()
+            || out.column.is_some()
+            || out.sql_type.is_some()
+            || out.default.is_some()
+            || out.json
+            || out.text
+        {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "a relation or count_of field is not a column: it takes no column attributes",
+            ));
+        }
+        return Ok(out);
     }
     if out.skip
         && (out.primary_key
@@ -424,6 +641,23 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
         };
         let (primary_key, serial, unique) = (f.attrs.primary_key, f.attrs.serial, f.attrs.unique);
         let renamed_from = &f.attrs.renamed_from;
+        let references = match &f.attrs.references {
+            Some((table, column)) => {
+                let action = |a: &Option<String>| match a {
+                    Some(a) => quote!(::core::option::Option::Some(#a)),
+                    None => quote!(::core::option::Option::None),
+                };
+                let (on_delete, on_update) =
+                    (action(&f.attrs.on_delete), action(&f.attrs.on_update));
+                quote!(::core::option::Option::Some(::rasterizeddb_client::orm::ForeignKey {
+                    table: #table,
+                    column: #column,
+                    on_delete: #on_delete,
+                    on_update: #on_update,
+                }))
+            }
+            None => quote!(::core::option::Option::None),
+        };
         let role = match f.attrs.role {
             Some((role, span)) => {
                 if roles.contains(&role) {
@@ -451,6 +685,7 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
                 read_as_text: #read_as_text,
                 renamed_from: &[#(#renamed_from),*],
                 role: #role,
+                references: #references,
             }
         });
         let access = &f.access;
@@ -500,6 +735,91 @@ fn model(input: &DeriveInput) -> syn::Result<Tokens> {
             #[doc = #doc]
             pub const #const_name: ::rasterizeddb_client::orm::Column<Self, #ty> =
                 ::rasterizeddb_client::orm::Column::new(#column);
+        });
+    }
+    // Relation fields: a `Relation<Self, C>` constant each.
+    for f in fields.iter().filter(|f| f.attrs.count_of.is_some()) {
+        let (target, span) = f.attrs.count_of.as_ref().expect("filtered");
+        let named = fields
+            .iter()
+            .any(|r| r.attrs.relation.is_some() && r.ident.is_some_and(|i| i == target));
+        if !named {
+            return Err(syn::Error::new(
+                *span,
+                format!("count_of = \"{target}\" names no relation field of this struct"),
+            ));
+        }
+    }
+    for f in fields.iter() {
+        let Some(relation) = &f.attrs.relation else {
+            continue;
+        };
+        let ident = f.ident.expect("named");
+        let field_name = ident.to_string().trim_start_matches("r#").to_string();
+        let target = relation.target.as_ref().expect("checked");
+        let kind = format_ident!("{}", relation.kind);
+        let opt = |v: &Option<String>| match v {
+            Some(v) => quote!(::core::option::Option::Some(#v)),
+            None => quote!(::core::option::Option::None),
+        };
+        let (parent_key, child_key) = match relation.kind {
+            "BelongsTo" => (opt(&relation.foreign_key), opt(&relation.owner_key)),
+            "ManyToMany" => (opt(&relation.local_key), opt(&relation.related_key)),
+            _ => (opt(&relation.local_key), opt(&relation.foreign_key)),
+        };
+        let through = match &relation.through {
+            Some(table) => {
+                let (local, foreign) = (
+                    relation.local.as_ref().expect("checked"),
+                    relation.foreign.as_ref().expect("checked"),
+                );
+                quote!(::core::option::Option::Some(::rasterizeddb_client::orm::Through {
+                    table: #table,
+                    local: #local,
+                    foreign: #foreign,
+                }))
+            }
+            None => quote!(::core::option::Option::None),
+        };
+        let count = fields.iter().find(|c| {
+            c.attrs
+                .count_of
+                .as_ref()
+                .is_some_and(|(t, _)| *t == field_name)
+        });
+        let count = match count {
+            Some(c) => {
+                let access = &c.access;
+                quote!(::core::option::Option::Some(|p: &mut Self, n: i64| p.#access = n))
+            }
+            None => quote!(::core::option::Option::None),
+        };
+        let const_name = format_ident!("{}", field_name, span = ident.span());
+        let doc = format!(
+            "The `{field_name}` relation: {} `{}`.",
+            match relation.kind {
+                "BelongsTo" => "belongs to",
+                "HasOne" => "has one",
+                "HasMany" => "has many",
+                _ => "many to many,",
+            },
+            quote!(#target).to_string().replace(' ', "")
+        );
+        let access = &f.access;
+        consts.push(quote! {
+            #[doc = #doc]
+            pub const #const_name: ::rasterizeddb_client::orm::Relation<Self, #target> =
+                ::rasterizeddb_client::orm::Relation::new(
+                    #field_name,
+                    ::rasterizeddb_client::orm::RelationKind::#kind,
+                    #parent_key,
+                    #child_key,
+                    #through,
+                    |p: &mut Self, rows: ::std::vec::Vec<#target>| {
+                        ::rasterizeddb_client::orm::RelationSlot::<#target>::fill(&mut p.#access, rows)
+                    },
+                    #count,
+                );
         });
     }
     let count = defs.len();

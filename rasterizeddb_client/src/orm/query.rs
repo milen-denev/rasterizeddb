@@ -7,9 +7,13 @@
 use std::fmt;
 use std::marker::PhantomData;
 
-use super::{Model, ident, select_list};
+use std::sync::Arc;
+
+use super::relations::{Count, Eager, Includes, With};
+use super::{BoxFuture, Model, ident, select_list};
 use crate::executor::Executor;
 use crate::params::{push_ident, push_param};
+use crate::row::Rows;
 use crate::to_sql::ToSql;
 use crate::{Error, Result};
 
@@ -190,6 +194,19 @@ impl Expr {
         }
     }
 
+    /// SQL this crate wrote itself, every value in it already a literal.
+    pub(crate) fn trusted(sql: String) -> Expr {
+        Expr { sql: Ok(sql) }
+    }
+
+    /// A predicate that could not be built: its error surfaces when the
+    /// statement runs.
+    pub(crate) fn failed(error: Error) -> Expr {
+        Expr {
+            sql: Err(error.to_string()),
+        }
+    }
+
     /// SQL of your own, with `$n` placeholders for `params`, for what the
     /// builder does not express (`lower(name) = $1`, a JSON path). The text
     /// is yours: only the parameters are escaped.
@@ -309,6 +326,18 @@ impl Order {
     }
 }
 
+/// Sends a statement on any executor, behind a reference that can be
+/// stored: what a relation loaded after the rows arrive is sent on.
+pub(crate) trait SendSql: Sync {
+    fn send_sql<'a>(&'a self, sql: &'a str) -> BoxFuture<'a, Result<Rows>>;
+}
+
+impl<E: Executor> SendSql for E {
+    fn send_sql<'a>(&'a self, sql: &'a str) -> BoxFuture<'a, Result<Rows>> {
+        Box::pin(self.run(sql))
+    }
+}
+
 /// A `SELECT` of model `M`'s rows: [`Model::query`](super::ModelQuery::query).
 pub struct Select<M> {
     filter: Option<Expr>,
@@ -316,6 +345,8 @@ pub struct Select<M> {
     limit: Option<u64>,
     offset: Option<u64>,
     every_row: bool,
+    /// Relations and counts loaded after the rows arrive, in order.
+    includes: Includes<M>,
     _model: PhantomData<fn() -> M>,
 }
 
@@ -327,6 +358,7 @@ impl<M> Clone for Select<M> {
             limit: self.limit,
             offset: self.offset,
             every_row: self.every_row,
+            includes: self.includes.clone(),
             _model: PhantomData,
         }
     }
@@ -339,6 +371,7 @@ impl<M> fmt::Debug for Select<M> {
             .field("order", &self.order)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
+            .field("includes", &self.includes.len())
             .finish()
     }
 }
@@ -358,6 +391,7 @@ impl<M: Model> Select<M> {
             limit: None,
             offset: None,
             every_row: false,
+            includes: Vec::new(),
             _model: PhantomData,
         }
     }
@@ -397,12 +431,89 @@ impl<M: Model> Select<M> {
         self
     }
 
+    /// Loads `relation` for every row read, after the rows arrive: one
+    /// statement per relation (per [`RELATION_CHUNK`](super::RELATION_CHUNK)
+    /// parents), never one per row. Nest with
+    /// `.with(User::posts.with(Post::comments))`; narrow with
+    /// `.with(User::posts.filter(…).order_by(…).limit(3))`.
+    pub fn with<C>(mut self, relation: impl Into<With<M, C>>) -> Self
+    where
+        M: Send + 'static,
+        C: Model + Clone + Send + Sync + 'static,
+    {
+        self.includes.push(Arc::new(Eager(relation.into())));
+        self
+    }
+
+    /// Counts `relation` for every row read, into the field marked
+    /// `#[rdb(count_of = "<relation>")]`: one `GROUP BY` statement, never
+    /// one per row. Filters on the relation narrow what is counted.
+    pub fn with_count<C>(mut self, relation: impl Into<With<M, C>>) -> Self
+    where
+        M: Send + 'static,
+        C: Model + Send + Sync + 'static,
+    {
+        self.includes.push(Arc::new(Count(relation.into())));
+        self
+    }
+
+    /// Only rows with at least one related row (matching the relation's
+    /// filters): `WHERE key IN (SELECT …)`.
+    pub fn where_has<C: Model>(self, relation: impl Into<With<M, C>>) -> Self {
+        let expr = relation.into().has_expr(false).unwrap_or_else(Expr::failed);
+        self.filter(expr)
+    }
+
+    /// Only rows with no related row (matching the relation's filters):
+    /// `WHERE key IS NULL OR key NOT IN (SELECT …)`.
+    pub fn where_doesnt_have<C: Model>(self, relation: impl Into<With<M, C>>) -> Self {
+        let expr = relation.into().has_expr(true).unwrap_or_else(Expr::failed);
+        self.filter(expr)
+    }
+
+    pub(crate) fn has_order(&self) -> bool {
+        !self.order.is_empty()
+    }
+
+    pub(crate) fn has_includes(&self) -> bool {
+        !self.includes.is_empty()
+    }
+
+    /// The `WHERE` condition, without the keyword; `None` for every row.
+    pub(crate) fn where_sql(&self) -> Result<Option<String>> {
+        Ok(match &self.filter {
+            Some(filter) => Some(filter.to_sql()?.to_string()),
+            None => None,
+        })
+    }
+
     fn push_where(&self, out: &mut String) -> Result<()> {
-        if let Some(filter) = &self.filter {
+        if let Some(filter) = self.where_sql()? {
             out.push_str(" WHERE ");
-            out.push_str(filter.to_sql()?);
+            out.push_str(&filter);
         }
         Ok(())
+    }
+
+    /// The rows of `rows`, and every relation loaded into them.
+    async fn finish(&self, db: &dyn SendSql, rows: Rows) -> Result<Vec<M>> {
+        let mut out: Vec<M> = rows.decode_all()?;
+        for include in &self.includes {
+            include.load(db, &mut out).await?;
+        }
+        Ok(out)
+    }
+
+    /// [`all`](Self::all) behind a reference that can be stored, for a
+    /// relation's rows.
+    pub(crate) fn all_dyn<'a>(&'a self, db: &'a dyn SendSql) -> BoxFuture<'a, Result<Vec<M>>>
+    where
+        M: Send,
+    {
+        Box::pin(async move {
+            let rows = db.send_sql(&self.to_sql()?).await?;
+            self.finish(db, rows).await
+        })
     }
 
     /// The statement [`all`](Self::all) runs.
@@ -427,22 +538,25 @@ impl<M: Model> Select<M> {
         Ok(sql)
     }
 
-    /// Every matching row.
+    /// Every matching row, with the relations [`with`](Self::with) names
+    /// loaded into them.
     pub async fn all<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
-        db.run(&self.to_sql()?).await?.decode_all()
+        let rows = db.run(&self.to_sql()?).await?;
+        self.finish(db, rows).await
     }
 
     /// The first row, if any (this adds `LIMIT 1`).
     pub async fn first<E: Executor>(&self, db: &E) -> Result<Option<M>> {
         let one = self.clone().limit(1);
-        db.run(&one.to_sql()?).await?.decode_first()
+        let rows = db.run(&one.to_sql()?).await?;
+        Ok(self.finish(db, rows).await?.into_iter().next())
     }
 
     /// Exactly one row; none or several is [`Error::RowCount`].
     pub async fn one<E: Executor>(&self, db: &E) -> Result<M> {
         let rows = db.run(&self.clone().limit(2).to_sql()?).await?;
         match rows.len() {
-            1 => Ok(rows.decode_first()?.expect("one row")),
+            1 => Ok(self.finish(db, rows).await?.pop().expect("one row")),
             got => Err(Error::RowCount {
                 expected: "exactly 1",
                 got,

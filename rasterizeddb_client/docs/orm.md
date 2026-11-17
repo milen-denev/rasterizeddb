@@ -50,6 +50,8 @@ struct Account {
 | `text` | read as `col::text` and parsed, for a type of your own |
 | `skip` | not a column; `Default::default()` on reads |
 | `version` | an integer for optimistic locking (below) |
+| `references = "users(id)"` | a foreign key, with `on_delete` / `on_update` ([relations](crate::guide::relations#foreign-keys)) |
+| `has_many(…)`, `has_one(…)`, `belongs_to(…)`, `many_to_many(…)`, `count_of = "…"` | a relation field, not a column ([relations](crate::guide::relations)) |
 
 | on the struct | meaning |
 |---|---|

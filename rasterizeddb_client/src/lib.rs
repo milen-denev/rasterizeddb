@@ -48,6 +48,7 @@
 //! | [Queries](guide::queries) | the calls, rows, atomic writes, errors |
 //! | [Transactions](guide::transactions) | `begin`/`commit`, the retrying closure, savepoints, lost connections |
 //! | [The ORM](guide::orm) | `#[derive(Model)]`, CRUD, the query builder |
+//! | [Relations](guide::relations) | belongs-to, has-one, has-many, many-to-many; eager and lazy loading |
 //! | [Migrations](guide::migrations) | steps, scenarios, model sync, the `auto_migrate` knob |
 //! | [Key/value](guide::kv) | typed values, maps, queries, models as hashes |
 //! | [Administration](guide::admin) | stores, indexes, partitions, roles, backups |
@@ -123,6 +124,8 @@ pub mod guide {
     pub mod transactions {}
     #[doc = include_str!("../docs/orm.md")]
     pub mod orm {}
+    #[doc = include_str!("../docs/relations.md")]
+    pub mod relations {}
     #[doc = include_str!("../docs/migrations.md")]
     pub mod migrations {}
     #[doc = include_str!("../docs/kv.md")]
@@ -154,7 +157,7 @@ pub use rasterizeddb_client_derive::{FromRow, Model, SqlEnum};
 /// Everything an application usually needs: `use rasterizeddb_client::prelude::*;`.
 pub mod prelude {
     pub use crate::kv::{KvKey, KvValue};
-    pub use crate::orm::{Expr, ModelExt, ModelQuery};
+    pub use crate::orm::{Expr, ModelExt, ModelQuery, ModelRelations};
     pub use crate::{
         Client, Date, Error, Executor, FromRow, FromSql, Interval, Isolation, Json, Numeric,
         Options, Param, Result, Row, Rows, Time, Timestamp, ToSql, Transaction, TransactionOptions,
