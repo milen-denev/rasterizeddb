@@ -1887,3 +1887,80 @@ async fn update_many_writes_every_type_as_update_does() {
 async fn read_docs(c: &Client) -> Vec<Doc> {
     Doc::query().order_by(Doc::id.asc()).all(c).await.unwrap()
 }
+
+// ------------------------------------------------------ inside a transaction
+
+/// The ORM runs on a [`Transaction`] as on a client: its writes are seen
+/// inside the block and by nobody else until COMMIT, a rollback takes them
+/// all back, and a version conflict inside a block fails that block's write.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_orm_runs_inside_a_transaction() {
+    bounded(async {
+        let Some(server) = server("orm_in_tx").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Doc>().await.unwrap();
+        let doc = |id: i64, body: &str| Doc {
+            id,
+            body: body.into(),
+            version: 0,
+        };
+
+        // Rolled back: seen inside, never outside, gone after.
+        let tx = c.begin().await.unwrap();
+        tx.insert(&doc(1, "draft")).await.unwrap();
+        tx.insert_many(&[doc(2, "a"), doc(3, "b")]).await.unwrap();
+        assert_eq!(Doc::query().count(&tx).await.unwrap(), 3);
+        assert_eq!(Doc::query().count(&c).await.unwrap(), 0, "uncommitted");
+        tx.rollback().await.unwrap();
+        assert_eq!(Doc::query().count(&c).await.unwrap(), 0, "rolled back");
+
+        // Committed: an insert, an update bumping the version, and a
+        // filtered query, all in one block.
+        let tx = c.begin().await.unwrap();
+        let stored = tx.insert(&doc(1, "first")).await.unwrap();
+        let mut edited = stored.clone();
+        edited.body = "edited".into();
+        let edited = tx.update(&edited).await.unwrap();
+        assert_eq!(edited.version, 2);
+        let found = Doc::query()
+            .filter(Doc::body.eq("edited"))
+            .all(&tx)
+            .await
+            .unwrap();
+        assert_eq!(found, vec![edited.clone()]);
+        tx.commit().await.unwrap();
+        assert_eq!(c.find::<Doc>(1).await.unwrap(), Some(edited.clone()));
+
+        // A stale copy inside a block is a conflict there too, and the block
+        // can still roll back cleanly.
+        let tx = c.begin().await.unwrap();
+        let e = tx.update(&stored).await.unwrap_err();
+        assert!(e.is_conflict(), "{e}");
+        tx.rollback().await.unwrap();
+        assert_eq!(c.find::<Doc>(1).await.unwrap(), Some(edited));
+
+        // The closure form: Ok commits, Err rolls back.
+        c.transaction(|tx| {
+            Box::pin(async move {
+                tx.insert(&doc(10, "kept")).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let failed: rasterizeddb_client::Result<()> = c
+            .transaction(|tx| {
+                Box::pin(async move {
+                    tx.insert(&doc(11, "discarded")).await?;
+                    Err(rasterizeddb_client::Error::Param("give up".into()))
+                })
+            })
+            .await;
+        assert!(failed.is_err());
+        assert!(c.find::<Doc>(10).await.unwrap().is_some());
+        assert!(c.find::<Doc>(11).await.unwrap().is_none(), "rolled back");
+    })
+    .await
+}
