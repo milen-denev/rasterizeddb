@@ -486,6 +486,18 @@ mod tests {
     }
 
     #[test]
+    fn a_null_cell_is_a_null_value() {
+        let rows = Rows::decode(row(&[
+            (tag::I64, &1i64.to_le_bytes()),
+            (tag::NULL, &[0, 0, 0, 0]),
+        ]))
+        .unwrap();
+        let r = rows.get(0).unwrap();
+        assert_eq!(r.values().unwrap(), vec![Value::I64(1), Value::Null]);
+        assert_eq!(r.decode::<Vec<Value>>().unwrap()[1], Value::Null);
+    }
+
+    #[test]
     fn narrowing_is_checked() {
         let rows = Rows::decode(row(&[(tag::I64, &70000i64.to_le_bytes())])).unwrap();
         let r = rows.get(0).unwrap();

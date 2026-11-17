@@ -343,6 +343,9 @@ impl FromSql<'_> for Value {
     fn from_sql(t: u8, raw: &[u8]) -> Result<Self, String> {
         Value::decode(t, raw)
     }
+    fn from_null() -> Option<Self> {
+        Some(Value::Null)
+    }
 }
 
 // --------------------------------------------------------------------- arrays
