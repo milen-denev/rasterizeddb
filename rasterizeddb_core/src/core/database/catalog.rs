@@ -211,6 +211,23 @@ impl DatabaseCatalog {
         })
     }
 
+    /// [`DatabaseCatalog::single`] without the automatic compaction task: a
+    /// view of one database that is already served (and compacted) through
+    /// the catalogue that opened it. What a native-protocol transaction's
+    /// session (`pgwire::native_session`) runs its statements against, so a
+    /// block opened over native does not start a second compaction loop over
+    /// the same tables.
+    pub(crate) fn single_unmanaged(database: Arc<Database>) -> Arc<Self> {
+        let name = database.name.clone();
+        let databases = DashMap::with_hasher(ahash::RandomState::new());
+        databases.insert(name.clone(), Entry::new(database));
+        Arc::new(Self {
+            databases: StdArc::new(databases),
+            root: None,
+            default_name: name,
+        })
+    }
+
     /// What `SHOW DATABASES` reports, ordered by name.
     pub fn listing(&self) -> Vec<DatabaseListing> {
         let mut out: Vec<DatabaseListing> = self

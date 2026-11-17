@@ -4641,7 +4641,7 @@ impl Database {
             tokio::spawn(async move {
                 info!("Also listening on {}", socket_server.local_endpoint());
                 if let Err(e) = socket_server
-                    .run_with_context_and_principal(context, process_incoming_queries)
+                    .run_with_session(context, open_native_session, serve_native_request)
                     .await
                 {
                     error!("The unix socket listener stopped with an error: {}", e);
@@ -4653,7 +4653,7 @@ impl Database {
             let fut = async move {
                 info!("Database started, listening on {}", listen);
                 if let Err(e) = server
-                    .run_with_context_and_principal(context, process_incoming_queries)
+                    .run_with_session(context, open_native_session, serve_native_request)
                     .await
                 {
                     error!("Server stopped with an error: {}", e);
@@ -5870,9 +5870,70 @@ fn error_response(message: &str) -> Vec<u8> {
     result
 }
 
+/// Serves the native protocol on `server` for `database`, as the listeners
+/// [`Database::start_db_with_auth_on`] binds do: each connection with a
+/// session of its own, so a `rastcp/1` connection can hold a transaction
+/// block (`pgwire::NativeSession`). `authentication_required` says whether
+/// `server` was given an authenticator; see [`NativeContext`].
+///
+/// For embedding and tests that build their own [`TcpServer`] (a
+/// listener of their choosing, a shorter request timeout).
+pub async fn serve_native(
+    server: &TcpServer,
+    database: Arc<Database>,
+    authentication_required: bool,
+) -> Result<(), rastcp::error::RastcpError> {
+    let context = NativeContext {
+        database,
+        authentication_required,
+    };
+    server
+        .run_with_session(context, open_native_session, serve_native_request)
+        .await
+}
+
+/// A native connection's session, opened once its caller has authenticated
+/// (rastcp's `run_with_session`). Keyed on the connection, never on the
+/// principal: two connections of one user are two sessions.
+fn open_native_session(
+    context: &NativeContext,
+    principal: &StdArc<rastcp::session::Principal>,
+    connection: &rastcp::server::ConnectionInfo,
+) -> crate::pgwire::NativeSession {
+    crate::pgwire::NativeSession::new(
+        context.database.clone(),
+        &principal.user,
+        principal.superuser,
+        context.authentication_required,
+        connection.multiplexed,
+    )
+}
+
+/// One request on a connection that has a session.
+async fn serve_native_request(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: StdArc<crate::pgwire::NativeSession>,
+    request_vec: Vec<u8>,
+) -> Vec<u8> {
+    process_native_request(context, principal, Some(&session), request_vec).await
+}
+
+/// One request with no connection session: transaction control is refused.
+/// What the statement tests drive the dispatch through.
+#[cfg(test)]
 pub(crate) async fn process_incoming_queries(
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
+    request_vec: Vec<u8>,
+) -> Vec<u8> {
+    process_native_request(context, principal, None, request_vec).await
+}
+
+async fn process_native_request(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
     let query = String::from_utf8_lossy(&request_vec);
@@ -5888,6 +5949,19 @@ pub(crate) async fn process_incoming_queries(
             "the native protocol runs one statement per request: send each statement on its own \
              (a request holding several, separated by ';', is refused rather than partly run)",
         );
+    }
+
+    // Transaction control, and every statement while the connection's block
+    // is open, run through the connection's session: pgwire's block
+    // machinery, gates and all (`pgwire::native_session`). Ahead of the role
+    // statements below, whose catalogue write inside a block is the
+    // block's. Not logged here: the text may carry a password, and the
+    // session's path logs as pgwire's does (debug, redacted).
+    if let Some(session) = session
+        && session.takes(&query)
+    {
+        debug!("Native transaction statement from {}", principal);
+        return session.run(&query).await;
     }
 
     // Role management is answered by the auth module rather than the RQL
@@ -5948,14 +6022,15 @@ pub(crate) async fn process_incoming_queries(
         return error_response(&format!("permission denied: {verb} requires superuser ({principal} is not one)"));
     }
 
-    // A transaction block needs a session that holds it between requests,
-    // which the native protocol does not have: each statement commits on its
-    // own. Said plainly rather than "Unrecognized query", so a caller that
-    // sent `BEGIN` does not go on believing the next statements are one unit.
-    if is_transaction_control(&query) {
+    // A transaction block needs a session that holds it between requests;
+    // a caller with none (an embedding that serves requests without
+    // connections) has each statement commit on its own. Said plainly rather
+    // than "Unrecognized query", so a caller that sent `BEGIN` does not go on
+    // believing the next statements are one unit.
+    if crate::pgwire::native_session_is_transaction_control(&query) {
         return error_response(
-            "transaction control (BEGIN, COMMIT, ROLLBACK, SAVEPOINT) is not supported over the native \
-             protocol: each statement commits on its own; use the PostgreSQL protocol for a transaction block",
+            "transaction control (BEGIN, COMMIT, ROLLBACK, SAVEPOINT) needs a connection session, which \
+             this caller does not have: each statement commits on its own",
         );
     }
 
@@ -6057,16 +6132,6 @@ pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Databa
     run_native_query(query, database).await
 }
 
-/// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`,
-/// `SAVEPOINT`, `RELEASE`: the words pgwire's `handle_transaction_control`
-/// answers, less `SET`, whose transaction forms are no use without a block.
-fn is_transaction_control(query: &str) -> bool {
-    let first = query.trim_start().split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("");
-    ["begin", "start", "commit", "end", "rollback", "abort", "savepoint", "release"]
-        .iter()
-        .any(|w| first.eq_ignore_ascii_case(w))
-}
-
 /// One statement over the native protocol, through the same preparation the
 /// pgwire listener gives an autocommit statement (`pgwire::execute_single_statement`
 /// and `execute_single_statement_inner`), in the same order, less what needs
@@ -6095,7 +6160,10 @@ async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
     if stmt.trim_start().get(..4).is_some_and(|w| w.eq_ignore_ascii_case("LOCK"))
         && crate::core::rql::row_lock::parse_lock_table(stmt).is_some()
     {
-        return error_response("LOCK TABLE can only be used in transaction blocks, which the native protocol does not have");
+        return error_response(
+            "LOCK TABLE can only be used in transaction blocks: send BEGIN first (rasterizeddb_client: \
+             Client::begin) (SQLSTATE 25P01)",
+        );
     }
 
     // A replicating node's peers run the text again, so a write carries the

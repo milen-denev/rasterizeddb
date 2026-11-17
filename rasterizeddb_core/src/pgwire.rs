@@ -56,7 +56,11 @@ mod block_error_tests;
 #[cfg(test)]
 mod shape_repair_tests;
 mod fixed_rows;
+mod native_session;
 mod wire_out;
+
+pub(crate) use native_session::NativeSession;
+pub(crate) use native_session::is_transaction_control as native_session_is_transaction_control;
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
 ///
@@ -2750,6 +2754,15 @@ struct SessionState {
     /// `rdb.shape_change`): the values `RESET ALL` returns them to, as in
     /// PostgreSQL, where a connection option is the session's default.
     startup_settings: (Option<u64>, Option<u64>, Option<ShapeChangeMode>),
+    /// The session serves a native-protocol connection's transaction block
+    /// (`native_session`), not a PostgreSQL client: a statement's engine
+    /// answer is kept whole in `native_result` instead of being encoded as
+    /// `DataRow`s, because the native protocol carries the engine's own
+    /// typed rows and a text rendering of them could not be turned back.
+    native_capture: bool,
+    /// The engine's answer to the statement just run, under
+    /// `native_capture`: the bytes the native protocol sends as they are.
+    native_result: Option<Vec<u8>>,
 }
 
 /// `rdb.shape_change`: what an `Execute` sends when the statement's result
@@ -3094,6 +3107,8 @@ impl SessionState {
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
+            native_capture: false,
+            native_result: None,
         }
     }
 
@@ -7505,6 +7520,16 @@ where
                     };
                     let (columns, scales) = (select.columns(), select.scales());
                     let tag = format!("SELECT {}", rows.len());
+                    // The rows as the engine made them, typed, for a
+                    // native-protocol session (`native_session`).
+                    if state.native_capture {
+                        let mut answer = vec![2u8];
+                        for row in &rows {
+                            row.extend_serialized(&mut answer);
+                        }
+                        state.native_result = Some(answer);
+                        return send_command_complete(stream, &tag).await;
+                    }
                     return send_query_result(
                         stream,
                         Some(&columns),
@@ -7943,6 +7968,27 @@ where
     if resp.is_empty() {
         fail_statement(state, stream, "XX000", "empty engine response").await?;
         return Ok(());
+    }
+
+    // A native-protocol session takes the engine's answer as it is
+    // (`native_session`). A failure (3) still goes through
+    // `fail_statement`, below, which is what fails the block.
+    if state.native_capture && matches!(resp[0], 0..=2) {
+        if resp[0] == 2 {
+            let rows = match validate_serialized_rows(&resp[1..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    log::error!("the engine returned a damaged result: {}", e);
+                    fail_statement(state, stream, "XX000", &format!("internal error: damaged result ({})", e)).await?;
+                    return Ok(());
+                }
+            };
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_rows(rows as u64);
+            state.native_result = Some(resp);
+            return send_command_complete(stream, &format!("SELECT {}", rows)).await;
+        }
+        state.native_result = Some(resp.clone());
     }
 
     match resp[0] {
