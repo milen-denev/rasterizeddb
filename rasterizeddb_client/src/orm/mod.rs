@@ -988,17 +988,6 @@ async fn fetch_at_most_one<E: Executor + ?Sized, M: Model>(
     }
 }
 
-/// `SELECT … WHERE <primary key>` for `m`'s key.
-fn reread_sql<M: Model>(m: &M) -> Result<String> {
-    let mut sql = format!(
-        "SELECT {} FROM {} WHERE ",
-        select_list::<M>()?,
-        ident(M::TABLE)?
-    );
-    key_predicate(m, &mut sql)?;
-    Ok(sql)
-}
-
 /// The statements [`ModelExt::insert_many`] sends: up to
 /// [`INSERT_CHUNK_ROWS`] rows and about [`INSERT_CHUNK_BYTES`] each.
 fn insert_chunks<M: Model>(rows: &[M]) -> Result<Vec<String>> {

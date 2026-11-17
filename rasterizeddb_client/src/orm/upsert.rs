@@ -8,7 +8,7 @@ use std::future::IntoFuture;
 use super::projection::Columns;
 use super::{
     BoxFuture, ColumnRole, INSERT_CHUNK_BYTES, INSERT_CHUNK_ROWS, Model, VersionProbe, ident,
-    insert_chunks, maintained_sets, primary_key, push_insert_value, push_version_check, reread_sql,
+    insert_chunks, maintained_sets, primary_key, push_insert_value, push_version_check,
     select_list,
 };
 use crate::executor::Executor;
@@ -166,10 +166,12 @@ pub(crate) fn upsert_statement<M: Model>(
     }
     sets.extend(maintained_sets::<M>(Some(&table))?);
     if sets.is_empty() {
-        // Nothing to change (a model that is all key).
-        sql.push_str(" DO NOTHING RETURNING ");
-        sql.push_str(&select_list::<M>()?);
-        return Ok(sql);
+        // Nothing to change (a model that is all key): a no-op assignment
+        // still returns the stored row through RETURNING, in the same
+        // statement, where reading it again after a DO NOTHING would race
+        // a delete.
+        let name = ident(arbiter[0])?;
+        sets.push(format!("{name} = EXCLUDED.{name}"));
     }
     sql.push_str(" DO UPDATE SET ");
     sql.push_str(&sets.join(", "));
@@ -265,26 +267,21 @@ impl<'a, E: Executor, M: Model + 'a> IntoFuture for Upsert<'a, E, M> {
     fn into_future(self) -> Self::IntoFuture {
         let sql = self.to_sql();
         let probe = VersionProbe::of(self.row);
-        let reread = reread_sql(self.row);
         let db = self.db;
         Box::pin(async move {
-            let sql = sql?;
-            let mut rows = db.run(&sql).await?;
-            if rows.is_empty() {
-                if let Some(probe) = probe? {
-                    return Err(probe.classify(db).await?.unwrap_or_else(|| {
-                        Error::Conflict(
-                            "the upsert stored nothing and no row has its key: it was deleted \
-                             while the statement ran"
-                                .to_string(),
-                        )
-                    }));
-                }
-                if sql.contains(" DO NOTHING RETURNING ") {
-                    // A model that is all key: the row already there is
-                    // the answer.
-                    rows = db.run(&reread?).await?;
-                }
+            // The row as stored comes back from the statement itself
+            // (RETURNING): inserted or updated, never read again after.
+            let rows = db.run(&sql?).await?;
+            if rows.is_empty()
+                && let Some(probe) = probe?
+            {
+                return Err(probe.classify(db).await?.unwrap_or_else(|| {
+                    Error::Conflict(
+                        "the upsert stored nothing and no row has its key: it was deleted \
+                         while the statement ran"
+                            .to_string(),
+                    )
+                }));
             }
             rows.decode_first()?.ok_or(Error::RowCount {
                 expected: "exactly 1",

@@ -1202,3 +1202,83 @@ async fn the_upsert_builder_absorbs_only_its_arbiter() {
     })
     .await
 }
+
+// ---------------------------------------------------------------- RETURNING
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "prices")]
+struct Price {
+    #[rdb(primary_key, serial)]
+    id: i64,
+    #[rdb(sql_type = "NUMERIC(10,2)", text)]
+    amount: Numeric,
+    label: String,
+}
+
+#[derive(Model, Debug, Clone, PartialEq)]
+#[rdb(table = "pairs")]
+struct Pair {
+    #[rdb(primary_key)]
+    a: i64,
+    #[rdb(primary_key)]
+    b: i64,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_return_rows_as_stored() {
+    bounded(async {
+        let Some(server) = server("returning").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Price>().await.unwrap();
+        c.create_table::<Pair>().await.unwrap();
+        let counting = Counting::new(&c);
+
+        // The server's RETURNING lists, casts included, decode as the model.
+        let sent = Price {
+            id: 0,
+            amount: Numeric::new("1.239").unwrap(),
+            label: "x".into(),
+        };
+        let stored = counting.insert(&sent).await.unwrap();
+        assert_eq!(counting.take(), 1, "no read after the write");
+        assert!(stored.id > 0);
+        let read: Price = c.find(stored.id).await.unwrap().unwrap();
+        assert_eq!(stored, read, "RETURNING is the row as stored");
+        let mut changed = read.clone();
+        changed.amount = Numeric::new("7.005").unwrap();
+        let updated = counting.update(&changed).await.unwrap();
+        assert_eq!(counting.take(), 1);
+        assert_eq!(updated, c.find::<Price>(stored.id).await.unwrap().unwrap());
+        let upserted = counting.upsert(&updated).await.unwrap();
+        assert_eq!(counting.take(), 1);
+        assert_eq!(upserted, c.find::<Price>(stored.id).await.unwrap().unwrap());
+
+        // A model that is all key: the second upsert finds the row there and
+        // returns it from the same statement, with no re-read to race a
+        // delete.
+        let pair = Pair { a: 1, b: 2 };
+        assert_eq!(counting.upsert(&pair).await.unwrap(), pair);
+        assert_eq!(counting.upsert(&pair).await.unwrap(), pair);
+        assert_eq!(counting.take(), 2);
+        assert_eq!(Pair::query().count(&c).await.unwrap(), 1);
+
+        // Deletes can return what they removed.
+        c.insert(&Pair { a: 3, b: 4 }).await.unwrap();
+        let gone = Pair::query()
+            .filter(Pair::a.ge(3i64))
+            .delete_returning(&c)
+            .await
+            .unwrap();
+        assert_eq!(gone, [Pair { a: 3, b: 4 }]);
+        assert_eq!(Pair::query().count(&c).await.unwrap(), 1);
+        // The server takes RETURNING * as well; the ORM names its columns,
+        // in order, to cast the ones native cannot send as they are.
+        assert_eq!(
+            c.run("DELETE FROM pairs RETURNING *").await.unwrap().len(),
+            1
+        );
+    })
+    .await
+}

@@ -784,9 +784,30 @@ impl<M: Model> Select<M> {
     /// and update time), the ones not deleted yet;
     /// [`force_delete`](Self::force_delete) removes them.
     pub async fn delete<E: Executor>(&self, db: &E) -> Result<u64> {
+        let sql = self.delete_sql(false)?;
+        Ok(db.run(&sql).await?.rows_affected().unwrap_or(0))
+    }
+
+    /// [`delete`](Self::delete), returning the rows deleted as they were
+    /// (for a soft delete, as marked): `… RETURNING`, from the statement
+    /// itself, so no other write can come between the delete and the read.
+    pub async fn delete_returning<E: Executor>(&self, db: &E) -> Result<Vec<M>> {
+        let mut sql = self.delete_sql(false)?;
+        sql.push_str(" RETURNING ");
+        sql.push_str(&select_list::<M>()?);
+        db.run(&sql).await?.decode_all()
+    }
+
+    /// The statement `delete` (or, `force`d, `force_delete`) sends.
+    pub(crate) fn delete_sql(&self, force: bool) -> Result<String> {
         self.check_scope("DELETE")?;
-        let Some(column) = super::soft_delete_column::<M>() else {
-            return self.force_delete(db).await;
+        let column = match super::soft_delete_column::<M>() {
+            Some(column) if !force => column,
+            _ => {
+                let mut sql = format!("DELETE FROM {}", ident(M::TABLE)?);
+                self.push_where(&mut sql)?;
+                return Ok(sql);
+            }
         };
         let column = ident(column)?;
         let mut sets = vec![format!("{column} = now()")];
@@ -797,7 +818,7 @@ impl<M: Model> Select<M> {
         }
         let mut sql = format!("UPDATE {} SET {}", ident(M::TABLE)?, sets.join(", "));
         live.push_where(&mut sql)?;
-        Ok(db.run(&sql).await?.rows_affected().unwrap_or(0))
+        Ok(sql)
     }
 
     /// Removes the filtered rows with a `DELETE`, soft-deleting model or
@@ -805,9 +826,7 @@ impl<M: Model> Select<M> {
     /// [`with_deleted`](Self::with_deleted) to include deleted ones). How
     /// many.
     pub async fn force_delete<E: Executor>(&self, db: &E) -> Result<u64> {
-        self.check_scope("DELETE")?;
-        let mut sql = format!("DELETE FROM {}", ident(M::TABLE)?);
-        self.push_where(&mut sql)?;
+        let sql = self.delete_sql(true)?;
         Ok(db.run(&sql).await?.rows_affected().unwrap_or(0))
     }
 

@@ -93,6 +93,23 @@ let existed = client.delete(&upserted).await?;
 # let _ = (found, existed); Ok(()) }
 ```
 
+## Rows as stored: `RETURNING`
+
+Every write that returns a row gets it from the statement itself,
+`… RETURNING <the model's columns>`, never by reading it again afterwards:
+`insert`, `insert_many`, `update`, `upsert` (all its forms), `restore`,
+the bulk `query().update()…run()` and
+[`delete_returning`](crate::orm::Select::delete_returning). What comes back
+is what the server stored, with serial keys, server timestamps and any
+coercion of the column type applied, and no other write can land between
+the write and the read. An upsert of a model that is all key, which has
+nothing to update, writes a no-op `DO UPDATE SET k = EXCLUDED.k` so the
+stored row still comes back from the same statement.
+
+The ORM names its columns rather than `RETURNING *` (which the server also
+takes) because a `NUMERIC`, `JSONB` or array column has to be cast to text
+to arrive readable over the native protocol.
+
 ## Upserts
 
 `upsert` and `insert_many` return builders that run when awaited, so

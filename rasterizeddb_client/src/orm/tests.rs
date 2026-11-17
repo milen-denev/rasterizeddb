@@ -108,9 +108,11 @@ fn statements() {
         "DELETE FROM order_line WHERE order_id = 7 AND line = (-1)"
     );
     assert!(
-        upsert_sql(&line)
-            .unwrap()
-            .contains("ON CONFLICT (order_id, line) DO NOTHING")
+        upsert_sql(&line).unwrap().contains(
+            "ON CONFLICT (order_id, line) DO UPDATE SET order_id = EXCLUDED.order_id \
+                 RETURNING order_id, line"
+        ),
+        "a model that is all key: a no-op update returns the stored row, no re-read"
     );
     assert!(update_sql(&line).is_err(), "nothing outside the key");
     assert!(
