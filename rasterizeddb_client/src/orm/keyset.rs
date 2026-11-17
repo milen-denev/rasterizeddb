@@ -385,6 +385,9 @@ impl<M: Model> Select<M> {
     }
 }
 
+/// One batch's rows, and the cursor after its last.
+type Batch<M> = (Vec<M>, Option<Cursor>);
+
 /// The rows of a [`Select::stream`], fetched a batch at a time.
 pub struct RowStream<'a, M> {
     select: Select<M>,
@@ -394,7 +397,7 @@ pub struct RowStream<'a, M> {
     buffer: VecDeque<M>,
     cursor: Option<Cursor>,
     done: bool,
-    pending: Option<BoxFuture<'a, Result<(Vec<M>, Option<Cursor>)>>>,
+    pending: Option<BoxFuture<'a, Result<Batch<M>>>>,
 }
 
 impl<M> fmt::Debug for RowStream<'_, M> {

@@ -159,6 +159,48 @@ let merged = db
   rows one at a time, or use `update_many`.
 * Every builder shows its statement(s) with `to_sql()`.
 
+## Many rows in one statement: `update_many`
+
+[`update_many`](crate::orm::ModelExt::update_many) writes every row given,
+by primary key, as **one** `UPDATE`, so the change commits whole or not at
+all:
+
+```sql
+UPDATE t SET name = CASE id WHEN 1 THEN 'a' WHEN 2 THEN 'b' END,
+             version = version + 1, updated_at = now()
+ WHERE id IN (1, 2)
+   AND (SELECT COUNT(*) FROM t WHERE (id = 1 AND version = 3) OR (id = 2 AND version = 5)) = 2
+ RETURNING …
+```
+
+The count guard is what makes it all or nothing: if any row is gone,
+soft-deleted, or (with a `#[rdb(version)]` column) at another version than
+the struct holds, the guard is false for every row, nothing is updated, and
+the call fails with [`Error::Conflict`](crate::Error::Conflict) naming the
+rows. Rows come back as stored, in the order given; each is validated
+first.
+
+A change past [`UPDATE_MANY_MAX_BYTES`](crate::orm::UPDATE_MANY_MAX_BYTES)
+of SQL is refused, not split: two statements could leave the first applied
+and the second not. Update fewer rows per call, or run several calls in a
+transaction to make them one change.
+
+```rust,no_run
+# use rasterizeddb_client::prelude::*;
+# #[derive(Model, Debug, Clone)] struct Doc { #[rdb(primary_key)] id: i64, body: String, #[rdb(version)] version: i64 }
+# async fn demo(db: &Client) -> rasterizeddb_client::Result<()> {
+let mut docs = Doc::query().filter(Doc::id.is_in([1i64, 2, 3])).all(db).await?;
+for d in &mut docs {
+    d.body = d.body.trim().to_string();
+}
+match db.update_many(&docs).await {
+    Ok(stored) => { let _ = stored; }
+    Err(e) if e.is_conflict() => { /* someone got there first: read again */ }
+    Err(e) => return Err(e),
+}
+# Ok(()) }
+```
+
 ## Optimistic locking
 
 A `#[rdb(version)]` integer field makes every write check that nobody

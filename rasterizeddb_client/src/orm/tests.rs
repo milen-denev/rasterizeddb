@@ -999,3 +999,99 @@ fn a_partitioned_model() {
     };
     assert!(wide.clause().is_err(), "one to three key columns");
 }
+
+#[test]
+fn update_many_is_one_guarded_statement() {
+    let docs = [
+        Doc {
+            id: 1,
+            body: "a".into(),
+            version: 3,
+        },
+        Doc {
+            id: 2,
+            body: "b'".into(),
+            version: 5,
+        },
+    ];
+    let refs: Vec<&Doc> = docs.iter().collect();
+    let plan = bulk::update_many_sql(&refs).unwrap();
+    assert_eq!(
+        plan.sql,
+        "UPDATE doc SET body = CASE id WHEN 1 THEN 'a' WHEN 2 THEN 'b''' END, version = version \
+         + 1 WHERE id IN (1, 2) AND (SELECT COUNT(*) FROM doc WHERE ((id = 1 AND version = 3) OR \
+         (id = 2 AND version = 5))) = 2 RETURNING id, body, version"
+    );
+    // A composite key: searched CASE; soft delete and update time.
+    let lines = [
+        OrderLine {
+            order_id: 1,
+            line: 2,
+        },
+        OrderLine {
+            order_id: 1,
+            line: 3,
+        },
+    ];
+    let refs: Vec<&OrderLine> = lines.iter().collect();
+    assert!(
+        bulk::update_many_sql(&refs).is_err(),
+        "nothing outside the key to update"
+    );
+    let note = |id: i64, body: &str| Note {
+        id,
+        body: body.into(),
+        created: Timestamp { micros: 0 },
+        updated: Timestamp { micros: 0 },
+        deleted: None,
+        version: 1,
+    };
+    let notes = [note(1, "x"), note(2, "y")];
+    let refs: Vec<&Note> = notes.iter().collect();
+    assert_eq!(
+        bulk::update_many_sql(&refs).unwrap().sql,
+        "UPDATE notes SET body = CASE id WHEN 1 THEN 'x' WHEN 2 THEN 'y' END, updated = now(), \
+         version = version + 1 WHERE id IN (1, 2) AND deleted IS NULL AND (SELECT COUNT(*) FROM \
+         notes WHERE ((id = 1 AND version = 1) OR (id = 2 AND version = 1)) AND deleted IS NULL) \
+         = 2 RETURNING id, body, created, updated, deleted, version"
+    );
+    let events = [
+        Event {
+            id: 1,
+            kind: "k".into(),
+            at: Timestamp { micros: 0 },
+            score: 1,
+            note: None,
+        },
+        Event {
+            id: 1,
+            kind: "k".into(),
+            at: Timestamp { micros: 0 },
+            score: 1,
+            note: None,
+        },
+    ];
+    let refs: Vec<&Event> = events.iter().collect();
+    let e = bulk::update_many_sql(&refs).err().unwrap();
+    assert!(e.to_string().contains("twice"), "{e}");
+    // Past one statement: refused, never split.
+    let big: Vec<Doc> = (0..40)
+        .map(|i| Doc {
+            id: i,
+            body: "x".repeat(UPDATE_MANY_MAX_BYTES / 30),
+            version: 1,
+        })
+        .collect();
+    let refs: Vec<&Doc> = big.iter().collect();
+    let e = bulk::update_many_sql(&refs).err().unwrap();
+    assert!(matches!(e, Error::Unsupported(_)), "{e}");
+    assert!(e.to_string().contains("transaction"), "{e}");
+    // Validation runs first.
+    let bad = [Person {
+        id: 9,
+        email: "no".into(),
+        domain: String::new(),
+    }];
+    let refs: Vec<&Person> = bad.iter().collect();
+    assert!(bulk::update_many_sql(&refs).err().unwrap().is_invalid());
+}

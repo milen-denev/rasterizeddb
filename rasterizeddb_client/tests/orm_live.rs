@@ -1690,3 +1690,153 @@ async fn the_read_through_cache() {
     })
     .await
 }
+
+// ------------------------------------------------------------- update_many
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_many_is_all_or_nothing() {
+    bounded(async {
+        let Some(server) = server("update_many").await else {
+            return;
+        };
+        let c = connect(&server).await;
+        c.create_table::<Doc>().await.unwrap();
+        c.create_table::<Folder>().await.unwrap();
+        c.create_table::<Note>().await.unwrap();
+        c.create_table::<Member>().await.unwrap();
+        let docs = c
+            .insert_many(
+                &(1..=3)
+                    .map(|id| Doc {
+                        id,
+                        body: format!("d{id}"),
+                        version: 0,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let bodies = |rows: &[Doc]| {
+            rows.iter()
+                .map(|d| (d.id, d.body.clone(), d.version))
+                .collect::<Vec<_>>()
+        };
+
+        // All three, in one statement, returned in the order given.
+        let counting = Counting::new(&c);
+        let mut changed: Vec<Doc> = docs.iter().rev().cloned().collect();
+        for d in &mut changed {
+            d.body.push('!');
+        }
+        let stored = counting.update_many(&changed).await.unwrap();
+        assert_eq!(counting.take(), 1);
+        assert_eq!(
+            bodies(&stored),
+            [
+                (3, "d3!".into(), 2),
+                (2, "d2!".into(), 2),
+                (1, "d1!".into(), 2)
+            ]
+        );
+
+        // One stale version: nothing is updated, the conflict names it.
+        let mut stale = read_docs(&c).await;
+        stale[1].version = 1;
+        for d in &mut stale {
+            d.body.push('?');
+        }
+        let e = c.update_many(&stale).await.unwrap_err();
+        assert!(e.is_conflict(), "{e}");
+        assert!(e.to_string().contains("(2) is at version 2, not 1"), "{e}");
+        assert_eq!(
+            bodies(&read_docs(&c).await),
+            bodies(&stored).into_iter().rev().collect::<Vec<_>>(),
+            "nothing moved"
+        );
+
+        // One missing row: nothing is updated either.
+        let mut current = read_docs(&c).await;
+        current.push(Doc {
+            id: 99,
+            body: "ghost".into(),
+            version: 1,
+        });
+        for d in &mut current {
+            d.body = "all".into();
+        }
+        let e = c.update_many(&current).await.unwrap_err();
+        assert!(e.to_string().contains("(99) is gone"), "{e}");
+        assert!(read_docs(&c).await.iter().all(|d| d.body != "all"));
+
+        // Without a version: a missing row still stops the whole change.
+        let ms = c
+            .insert_many(&[member("a@x", "A", 0), member("b@x", "B", 0)])
+            .await
+            .unwrap();
+        let mut gone = ms.clone();
+        gone[1].id = 12345;
+        for m in &mut gone {
+            m.visits = 7;
+        }
+        let e = c.update_many(&gone).await.unwrap_err();
+        assert!(
+            e.is_conflict() && e.to_string().contains("(12345) is gone"),
+            "{e}"
+        );
+        assert_eq!(
+            Member::query()
+                .filter(Member::visits.eq(7i64))
+                .count(&c)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut both = ms.clone();
+        for m in &mut both {
+            m.visits = 7;
+        }
+        assert_eq!(c.update_many(&both).await.unwrap().len(), 2);
+
+        // The update time moves; a soft-deleted row counts as gone.
+        c.insert(&Folder {
+            id: 1,
+            notes: vec![],
+        })
+        .await
+        .unwrap();
+        let mut n1 = note(1, "n1");
+        n1.deleted = None;
+        let mut n2 = note(1, "n2");
+        n2.deleted = None;
+        let notes = c.insert_many(&[n1, n2]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut edited = notes.clone();
+        edited[0].body = "e1".into();
+        let after = c.update_many(&edited).await.unwrap();
+        assert!(after[0].updated.micros > notes[0].updated.micros);
+        assert_eq!(after[0].created, notes[0].created);
+        assert!(c.delete(&after[1]).await.unwrap());
+        let e = c.update_many(&after).await.unwrap_err();
+        assert!(e.to_string().contains("is gone"), "{e}");
+
+        // Too big for one statement: refused before anything is sent.
+        let huge: Vec<Doc> = (1..=3)
+            .map(|id| Doc {
+                id,
+                body: "x".repeat(UPDATE_MANY_MAX_BYTES / 2),
+                version: 2,
+            })
+            .collect();
+        let e = counting.update_many(&huge).await.unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)), "{e}");
+        assert_eq!(counting.take(), 0);
+        assert!(c.update_many::<Doc>(&[]).await.unwrap().is_empty());
+    })
+    .await
+}
+
+use rasterizeddb_client::orm::UPDATE_MANY_MAX_BYTES;
+
+async fn read_docs(c: &Client) -> Vec<Doc> {
+    Doc::query().order_by(Doc::id.asc()).all(c).await.unwrap()
+}

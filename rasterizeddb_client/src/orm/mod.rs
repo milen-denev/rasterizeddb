@@ -90,6 +90,7 @@
 //! be visible to other processes while it migrates, which a lock taken
 //! inside an uncommitted transaction is not.
 
+mod bulk;
 mod cache;
 mod keyset;
 mod migrate;
@@ -98,6 +99,7 @@ mod query;
 mod relations;
 mod upsert;
 
+pub use bulk::UPDATE_MANY_MAX_BYTES;
 pub use cache::{CACHE_PREFIX, Cached};
 pub use keyset::{Cursor, Page, RowStream};
 pub use migrate::{
@@ -1070,6 +1072,36 @@ pub trait ModelExt: Executor {
                     expected: "exactly 1",
                     got,
                 }),
+            }
+        }
+    }
+
+    /// Updates every row given, by primary key, in **one** statement, so the
+    /// whole change commits or none of it does, and returns the rows as
+    /// stored, in the order given.
+    ///
+    /// `UPDATE t SET a = CASE id WHEN 1 THEN … WHEN 2 THEN … END, … WHERE id
+    /// IN (1, 2) AND (SELECT COUNT(*) FROM t WHERE <each row's key, at its
+    /// version>) = 2`: when any row is missing (or soft-deleted), or, with a
+    /// `#[rdb(version)]` column, at another version than the struct's, the
+    /// guard is false for every row and nothing is updated:
+    /// [`Error::Conflict`], naming the rows (one more statement reads them
+    /// to say which). Versions move and `#[rdb(updated_at)]` is set, as on
+    /// [`update`](Self::update); every row is validated first.
+    ///
+    /// A change past [`UPDATE_MANY_MAX_BYTES`] of SQL is refused with
+    /// [`Error::Unsupported`], never split: several statements could
+    /// half-apply. Update fewer rows per call, or run several calls inside
+    /// a transaction to make them one change.
+    fn update_many<M: Model>(&self, rows: &[M]) -> impl Future<Output = Result<Vec<M>>> + Send {
+        let plan = (!rows.is_empty()).then(|| {
+            let refs: Vec<&M> = rows.iter().collect();
+            bulk::update_many_sql(&refs)
+        });
+        async move {
+            match plan {
+                None => Ok(Vec::new()),
+                Some(plan) => plan?.run(self).await,
             }
         }
     }

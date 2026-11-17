@@ -54,8 +54,8 @@ pub enum Error {
     },
     /// A write lost a race it was told to detect: an ORM write of a model
     /// with a `#[rdb(version)]` column found the row at another version
-    /// than the one it was read at. Nothing was written. Read the row again
-    /// and retry, or give up.
+    /// than the one it was read at, or an `update_many` found a row gone.
+    /// Nothing was written. Read the rows again and retry, or give up.
     Conflict(String),
     /// A model's [`ModelHooks::validate`](crate::orm::ModelHooks::validate)
     /// refused the row: nothing was sent. The text names the table and says
