@@ -863,13 +863,16 @@ impl TcpServer {
         Ok(())
     }
 
-    /// Serves with a handler that is given the authenticated caller.
+    /// Serves with a handler made for each connection once its caller has
+    /// authenticated: `open` is given the principal and what the connection
+    /// is, and returns what serves that connection's requests.
     ///
-    /// Every other `run*` method is this one with the principal dropped, so
-    /// there is exactly one path from an accepted socket to a served request.
-    async fn serve_all<H, Fut>(&self, handler: H) -> Result<(), RastcpError>
+    /// Every `run*` method is this one, so there is exactly one path from an
+    /// accepted socket to a served request.
+    async fn serve_connections<M, H, Fut>(&self, open: M) -> Result<(), RastcpError>
     where
-        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        M: Fn(Arc<Principal>, &ConnectionInfo) -> H + Send + Sync + Clone + 'static,
+        H: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         let acceptor = self.acceptor.clone();
@@ -883,7 +886,7 @@ impl TcpServer {
 
         self.accept_loop(move |stream, peer, connection_shutdown| {
             let acceptor = acceptor.clone();
-            let handler = handler.clone();
+            let open = open.clone();
             let authenticator = authenticator.clone();
 
             async move {
@@ -899,13 +902,26 @@ impl TcpServer {
                     inline_handlers,
                     authenticator,
                     connection_shutdown,
-                    handler,
+                    open,
                 )
                 .await
                 {
                     error!("Connection error: {}", e);
                 }
             }
+        })
+        .await
+    }
+
+    /// Serves with a handler that is given the authenticated caller.
+    async fn serve_all<H, Fut>(&self, handler: H) -> Result<(), RastcpError>
+    where
+        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        self.serve_connections(move |principal, _connection| {
+            let handler = handler.clone();
+            move |data| handler(principal.clone(), data)
         })
         .await
     }
@@ -961,6 +977,48 @@ impl TcpServer {
     {
         self.serve_all(move |principal, data| handler(context.clone(), principal, data))
             .await
+    }
+
+    /// [`TcpServer::run_with_context_and_principal`] plus a value that lives
+    /// as long as the connection: a session.
+    ///
+    /// `open` makes the session once the connection's caller has
+    /// authenticated, from the context, the caller and what the connection is
+    /// ([`ConnectionInfo`]). Every request on that connection is handed the
+    /// same session, and no request on another connection ever is: it is
+    /// keyed on the connection, not on who is connected, so two connections
+    /// of one user have two sessions.
+    ///
+    /// The session is dropped when the connection has ended **and** every
+    /// request of it still running has finished. A `rastcp/2` connection
+    /// that closes leaves its running handlers to finish on their own rather
+    /// than cancelling them (a write carried out halfway is worse than one
+    /// carried out unseen), and each of them holds the session, so whatever
+    /// the session's `Drop` does (rolling back a transaction, say) happens
+    /// after the last of them and never under one. On `rastcp/1` the handler
+    /// runs on the connection's own task, so the session goes when that
+    /// request is done. A handler that runs past the request timeout on
+    /// `rastcp/1` is dropped where it stands, and the session with it.
+    pub async fn run_with_session<A, S, O, F, Fut>(
+        &self,
+        context: A,
+        open: O,
+        handler: F,
+    ) -> Result<(), RastcpError>
+    where
+        A: Clone + Send + Sync + 'static,
+        S: Send + Sync + 'static,
+        O: Fn(&A, &Arc<Principal>, &ConnectionInfo) -> S + Send + Sync + Clone + 'static,
+        F: Fn(A, Arc<Principal>, Arc<S>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        Fut: Future<Output = Vec<u8>> + Send + 'static,
+    {
+        self.serve_connections(move |principal, connection| {
+            let session = Arc::new(open(&context, &principal, connection));
+            let context = context.clone();
+            let handler = handler.clone();
+            move |data| handler(context.clone(), principal.clone(), session.clone(), data)
+        })
+        .await
     }
 
     // New method that accepts a mutable reference to a context through Arc<xutex::AsyncMutex<>>
@@ -1065,11 +1123,10 @@ impl TcpServer {
         tls_stream: &mut ServerStream,
         guard: &mut Guard,
         peer_addr: Peer,
-        principal: Arc<Principal>,
         handler: &H,
         max_message_size: usize,
     ) where
-        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync,
+        H: Fn(Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
     {
         let mut reader = FrameReader::new();
@@ -1117,7 +1174,7 @@ impl TcpServer {
 
                 // Not stoppable from here on: a request that was read is
                 // answered, which is what lets a shutdown drain.
-                let mut call = std::pin::pin!(handler(principal.clone(), data));
+                let mut call = std::pin::pin!(handler(data));
 
                 let response = match poll_once(call.as_mut()).await {
                     Some(response) => response,
@@ -1251,14 +1308,13 @@ impl TcpServer {
         tls_stream: &mut ServerStream,
         guard: &mut Guard,
         peer_addr: Peer,
-        principal: Arc<Principal>,
         handler: &H,
         max_message_size: usize,
         request_timeout: Duration,
         max_in_flight: usize,
         inline_handlers: bool,
     ) where
-        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        H: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         let mut reader = FrameReader::tagged();
@@ -1335,14 +1391,13 @@ impl TcpServer {
                         debug!("Received {} bytes from {}", data.len(), peer_addr);
 
                         let handler = handler.clone();
-                        let principal = principal.clone();
                         let id = tag.id;
                         let task = in_flight.spawn(async move {
                             // Made here, in the task, and boxed: a handler's
                             // future can run to tens of kilobytes, and built
                             // on the connection it would be copied on its way
                             // into the task.
-                            let call = Box::pin(handler(principal, data));
+                            let call = Box::pin(handler(data));
                             (id, tokio::time::timeout(request_timeout, call).await.ok())
                         });
                         ids.insert(task.id(), id);
@@ -1351,7 +1406,7 @@ impl TcpServer {
                     Event::Frame(Ok((tag, data))) => {
                         debug!("Received {} bytes from {}", data.len(), peer_addr);
 
-                        cell.set(Some(handler(principal.clone(), data)));
+                        cell.set(Some(handler(data)));
                         let first = match cell.as_mut().as_pin_mut() {
                             Some(call) => poll_once(call).await,
                             None => None,
@@ -1542,7 +1597,7 @@ impl TcpServer {
     }
 
     /// One accepted socket, from handshake to close.
-    async fn serve_connection<H, Fut>(
+    async fn serve_connection<M, H, Fut>(
         stream: Accepted,
         peer_addr: Peer,
         acceptor: Option<TlsAcceptor>,
@@ -1554,10 +1609,11 @@ impl TcpServer {
         inline_handlers: bool,
         authenticator: Option<Arc<dyn ServerAuthenticator>>,
         shutdown: StopListener,
-        handler: H,
+        open: M,
     ) -> Result<(), RastcpError>
     where
-        H: Fn(Arc<Principal>, Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
+        M: Fn(Arc<Principal>, &ConnectionInfo) -> H,
+        H: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
         let Some((mut tls_stream, version)) =
@@ -1592,6 +1648,15 @@ impl TcpServer {
             debug!("{} authenticated as {}", peer_addr, principal);
         }
 
+        // What serves this connection, made now that its caller is known:
+        // with `run_with_session`, this is where the connection's session
+        // is opened.
+        let connection = ConnectionInfo {
+            peer: peer_addr,
+            multiplexed: version == Version::Multiplexed,
+        };
+        let handler = open(principal, &connection);
+
         // One stop listener and one timer for the life of the connection, in
         // place of a timer per read, per handler call and per write.
         let mut guard = Guard::new(shutdown, request_timeout);
@@ -1601,7 +1666,6 @@ impl TcpServer {
                 &mut tls_stream,
                 &mut guard,
                 peer_addr,
-                principal,
                 &handler,
                 max_message_size,
                 request_timeout,
@@ -1614,12 +1678,17 @@ impl TcpServer {
                 &mut tls_stream,
                 &mut guard,
                 peer_addr,
-                principal,
                 &handler,
                 max_message_size,
             )
             .await;
         }
+
+        // Before the TLS close, which waits on the peer: a session this
+        // connection held (`run_with_session`) is let go now, so whatever its
+        // end does is not held up by a peer slow to answer close_notify. Any
+        // handler of it still running holds its own reference.
+        drop(handler);
 
         // Explicit shutdown to ensure clean TLS termination
         if let Err(e) = tls_stream.shutdown().await {
@@ -1629,6 +1698,20 @@ impl TcpServer {
         debug!("Connection handler completed for {}", peer_addr);
         Ok(())
     }
+}
+
+/// What a connection is, as a session opened for it
+/// ([`TcpServer::run_with_session`]) is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConnectionInfo {
+    /// Who is at the other end.
+    pub peer: Peer,
+    /// Whether the connection speaks `rastcp/2`: many requests in flight at
+    /// once, handled concurrently and answered in any order, usually from
+    /// several unrelated callers sharing it. On `rastcp/1` (`false`) the
+    /// requests are handled one at a time, in the order they arrived.
+    pub multiplexed: bool,
 }
 
 /// One connection's share of the server's connection count.
