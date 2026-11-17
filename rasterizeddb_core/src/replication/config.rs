@@ -588,6 +588,16 @@ pub struct ReplicationConfig {
     pub batch_linger: Duration,
     /// Records a peer's send queue holds before a commit has to wait for it.
     pub queue_capacity: usize,
+    /// Batches of this node's own stream a link keeps in flight before it
+    /// waits for an answer. `1` sends one and waits for it, as every link did
+    /// before this existed.
+    ///
+    /// Waiting for each batch caps a link at one batch per round trip, which
+    /// over a long link is the limit however fast the peer applies. The peer
+    /// still applies the batches one after another and in order; only the
+    /// waiting overlaps. Costs up to `pipeline_depth` × `batch_max_bytes` of
+    /// frames held in flight.
+    pub pipeline_depth: usize,
 
     /// Forward transactions that arrived from one peer on to the others.
     ///
@@ -644,6 +654,7 @@ impl Default for ReplicationConfig {
             batch_max_bytes: 1024 * 1024,
             batch_linger: Duration::from_micros(500),
             queue_capacity: 8192,
+            pipeline_depth: 8,
             relay: false,
             log_retention_bytes: 256 * 1024 * 1024,
             connect_timeout: Duration::from_secs(5),
@@ -692,6 +703,12 @@ impl ReplicationConfig {
         }
         if self.batch_max_records == 0 {
             return Err("batch-max-records must be at least 1".to_string());
+        }
+        if self.pipeline_depth == 0 {
+            return Err(
+                "pipeline_depth must be at least 1: one batch in flight is waiting for each answer"
+                    .to_string(),
+            );
         }
         if self.queue_capacity == 0 {
             return Err("queue-capacity must be at least 1".to_string());

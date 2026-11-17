@@ -1435,3 +1435,189 @@ async fn the_round_trip_and_apply_counters_account_for_the_same_batches() {
     assert_eq!(metric("batches_applied"), Some("0".to_string()));
     assert_eq!(metric("apply_us"), Some("0".to_string()));
 }
+
+/// A refusal in the middle of a window of batches in flight.
+///
+/// With one transaction per batch and several batches sent before the first
+/// answer, the peer is already holding the batches behind the one it refuses
+/// when it refuses it. None of them may be applied — each would leave a hole
+/// in the stream — and once the cause is gone every one of them has to arrive,
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_inside_a_window_applies_nothing_behind_it_and_loses_nothing() {
+    let (one, two) = pair_tuned(|config| {
+        config.batch_max_records = 1;
+        config.batch_linger = Duration::ZERO;
+        config.pipeline_depth = 8;
+    })
+    .await;
+    run_ok(&one, "CREATE TABLE repl_window (id INTEGER PRIMARY KEY, name VARCHAR)").await;
+    settled(&one, &two).await;
+    let base = two.replication.applied().high_water(1);
+
+    // Node two already holds the key of the fifth of ten.
+    two.replication.set_active(false);
+    run_ok(&two, "INSERT INTO repl_window (id, name) VALUES (5, 'in the way')").await;
+    two.replication.set_active(true);
+
+    for id in 1..=10 {
+        run_ok(&one, &format!("INSERT INTO repl_window (id, name) VALUES ({id}, 'row {id}')")).await;
+    }
+
+    eventually("the link to report the stall", || async {
+        one.replication
+            .peer("two")
+            .is_some_and(|peer| peer.snapshot(0).state == super::peer::PeerState::Stalled)
+    })
+    .await;
+    assert_eq!(
+        two.replication.applied().high_water(1),
+        base + 4,
+        "exactly the four transactions before the refused one may be applied"
+    );
+    assert_eq!(
+        rows(&two, "SELECT id FROM repl_window WHERE id > 5").await.map(|r| r.len()),
+        Some(0),
+        "a transaction behind the refused one was applied"
+    );
+
+    two.replication.set_active(false);
+    run_ok(&two, "DELETE FROM repl_window WHERE id = 5").await;
+    two.replication.set_active(true);
+
+    settled(&one, &two).await;
+    let on_two = rows(&two, "SELECT id, name FROM repl_window").await.expect("rows");
+    assert_eq!(on_two.len(), 10, "a transaction was lost or applied twice: {on_two:?}");
+    assert_eq!(on_two, rows(&one, "SELECT id, name FROM repl_window").await.expect("rows"));
+}
+
+/// A TCP proxy that holds every chunk for `delay` before passing it on, in
+/// each direction.
+async fn delaying_proxy(target: String, delay: Duration) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((client, _)) = listener.accept().await {
+            let target = target.clone();
+            tokio::spawn(async move {
+                let Ok(server) = tokio::net::TcpStream::connect(&target).await else { return };
+                let (client_read, client_write) = client.into_split();
+                let (server_read, server_write) = server.into_split();
+                tokio::spawn(carry(client_read, server_write, delay));
+                tokio::spawn(carry(server_read, client_write, delay));
+            });
+        }
+    });
+    addr
+}
+
+async fn carry(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delay: Duration,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let delivering = tokio::spawn(async move {
+        while let Some((due, chunk)) = rx.recv().await {
+            tokio::time::sleep_until(due).await;
+            if to.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec()));
+            }
+        }
+    }
+    drop(tx);
+    let _ = delivering.await;
+}
+
+/// Over a long link, batches in flight together take a fraction of the time
+/// batches sent one after another do — and arrive the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_link_is_not_limited_to_one_batch_per_round_trip() {
+    let (bound_one, bound_two) = (listener(), listener());
+    let (port_one, port_two) = (bound_one.1, bound_two.1);
+    // Node one reaches node two 20 ms away each way: a 40 ms round trip.
+    let far_two = delaying_proxy(format!("127.0.0.1:{port_two}"), Duration::from_millis(20)).await;
+
+    async fn tuned(
+        node_id: u64,
+        bound: (std::net::TcpListener, u16),
+        peers: Vec<PeerConfig>,
+    ) -> Arc<Database> {
+        let (socket, port) = bound;
+        let database = super::test_support::in_memory_database().await;
+        let mut config = ReplicationConfig {
+            node_id,
+            listen_port: port,
+            peers,
+            ..Default::default()
+        };
+        brisk(&mut config);
+        config.batch_max_records = 1;
+        config.batch_linger = Duration::ZERO;
+        database.replication.set_config(config).expect("a valid configuration");
+        database.replication.serve_on(socket);
+        Database::start_replication(database.clone()).expect("replication should start");
+        database
+    }
+    let one = tuned(1, bound_one, vec![PeerConfig::new("two", far_two)]).await;
+    let two = tuned(2, bound_two, vec![PeerConfig::new("one", format!("127.0.0.1:{port_one}"))]).await;
+
+    run_ok(&one, "CREATE TABLE repl_far (id INTEGER, name VARCHAR)").await;
+    settled(&one, &two).await;
+
+    // Twenty-four transactions, one batch each, sent `depth` at a time.
+    let mut next_id = 0;
+    let mut timed = |depth: usize| {
+        let (one, two) = (one.clone(), two.clone());
+        next_id += 24;
+        let first = next_id - 24;
+        async move {
+            // Every answer in first, so nothing of the previous phase is
+            // still in flight when this one starts.
+            eventually("node one to have every answer", || async {
+                one.replication
+                    .peer("two")
+                    .is_some_and(|peer| peer.acked_seq() == one.replication.local_seq())
+            })
+            .await;
+            one.replication
+                .update_config(|config| {
+                    config.pipeline_depth = depth;
+                    Ok(())
+                })
+                .unwrap();
+            let started = tokio::time::Instant::now();
+            for id in first..first + 24 {
+                run_ok(&one, &format!("INSERT INTO repl_far (id, name) VALUES ({id}, 'x')")).await;
+            }
+            settled(&one, &two).await;
+            started.elapsed()
+        }
+    };
+
+    let one_at_a_time = timed(1).await;
+    let pipelined = timed(8).await;
+
+    assert!(
+        one_at_a_time >= Duration::from_millis(24 * 40),
+        "the delay is not being applied: {one_at_a_time:?}"
+    );
+    assert!(
+        pipelined * 3 < one_at_a_time,
+        "eight in flight took {pipelined:?} against {one_at_a_time:?} one at a time"
+    );
+    assert_eq!(
+        rows(&two, "SELECT id FROM repl_far").await.map(|r| r.len()),
+        Some(48)
+    );
+}

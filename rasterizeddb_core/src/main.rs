@@ -577,6 +577,12 @@ struct Args {
     #[arg(long = "replication-batch-bytes", value_name = "N")]
     replication_batch_bytes: Option<usize>,
 
+    /// Batches of this node's stream a link keeps in flight before it waits
+    /// for an answer (default: 8). `1` waits for each. More helps a long link,
+    /// where waiting for every answer caps it at one batch per round trip.
+    #[arg(long = "replication-pipeline-depth", value_name = "N")]
+    replication_pipeline_depth: Option<usize>,
+
     /// How long a sender waits for more records before sending a partial
     /// batch, in microseconds (default: 500).
     #[arg(long = "replication-linger-us", value_name = "US")]
@@ -828,6 +834,9 @@ fn replication_config(
     }
     if let Some(n) = args.replication_batch_bytes {
         config.batch_max_bytes = n;
+    }
+    if let Some(n) = args.replication_pipeline_depth {
+        config.pipeline_depth = n;
     }
     if let Some(us) = args.replication_linger_us {
         config.batch_linger = Duration::from_micros(us);

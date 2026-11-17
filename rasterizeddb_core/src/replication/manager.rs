@@ -112,9 +112,10 @@ pub struct Stats {
     /// before and after 15 s of writers, 2026-11-14): with 16 writers the
     /// apply was 20.4 ms of a 20.9 ms round trip, 98%, the sender was inside
     /// a round trip 96% of the time, and the peer needed 7 s more to catch
-    /// up. So what a loaded link waits for is the peer applying, one batch
-    /// after another; sending the next batch before the last is acknowledged
-    /// would win back the other 2%.
+    /// up. So what a loaded link on one machine waits for is the peer
+    /// applying, one batch after another. Over a long link the round trip
+    /// itself is the limit — one batch per round trip — which is what
+    /// `pipeline_depth` lifts.
     pub batches_applied: AtomicU64,
     pub apply_us: AtomicU64,
 }

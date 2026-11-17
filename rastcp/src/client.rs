@@ -857,6 +857,43 @@ impl TcpClient {
         Ok(())
     }
 
+    /// Opens this client's connection if it has none, and returns a handle
+    /// for sending requests on it without waiting for each answer.
+    ///
+    /// A `rastcp/1` server handles one connection's requests strictly in the
+    /// order they arrive and answers them in that order, so a caller may have
+    /// several on the wire at once and still know which answer is whose: the
+    /// first one back answers the first one sent. What that buys is the round
+    /// trip. Waiting for every answer before sending the next request caps a
+    /// connection at one request per round trip, which on a link with a few
+    /// tens of milliseconds of latency is the whole limit, however fast the
+    /// server is.
+    ///
+    /// The requests are still handled one after another; only the waiting
+    /// overlaps. That is the difference from [`TcpClient::build_multiplexed`]'s
+    /// connections, whose requests the server runs side by side, and from
+    /// [`TcpClient::send_batch`], which sends everything at once and returns
+    /// nothing until the last answer is in.
+    ///
+    /// The connection is dropped if the handle is dropped with requests still
+    /// unanswered — their answers would otherwise be read as the answers to
+    /// whatever is sent next — and after any error, as [`TcpClient::send`]
+    /// drops it.
+    pub async fn pipeline(&mut self) -> Result<Pipeline<'_>, RastcpError> {
+        let max_message_size = self.dialer.max_message_size;
+        self.ready(max_message_size).await?;
+
+        Ok(Pipeline {
+            client: self,
+            out: Vec::new(),
+            written: 0,
+            unflushed: false,
+            answers: std::collections::VecDeque::new(),
+            awaiting: 0,
+            max_message_size,
+        })
+    }
+
     // Add a close method to explicitly close the connection
     pub async fn close(&mut self) -> Result<(), RastcpError> {
         self.connection = None;
@@ -872,5 +909,229 @@ impl TcpClient {
     pub async fn reconnect(&mut self) -> Result<(), RastcpError> {
         self.close().await?;
         self.connect().await
+    }
+}
+
+/// Requests on the wire before their answers are in. See
+/// [`TcpClient::pipeline`].
+pub struct Pipeline<'a> {
+    client: &'a mut TcpClient,
+    /// Framed requests not yet written, and how much of them has been.
+    out: Vec<u8>,
+    written: usize,
+    unflushed: bool,
+    /// Answers that have arrived and not yet been handed out, oldest first.
+    answers: std::collections::VecDeque<Vec<u8>>,
+    /// Requests sent whose answers have not been handed out, counting those
+    /// in `answers`.
+    awaiting: usize,
+    max_message_size: usize,
+}
+
+/// What a wait on a [`Pipeline`] waits for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Until {
+    /// Everything queued has been written and flushed.
+    Written,
+    /// An answer has arrived.
+    Answer,
+}
+
+impl Pipeline<'_> {
+    /// How many requests have been sent and not yet answered through
+    /// [`Pipeline::recv`].
+    pub fn in_flight(&self) -> usize {
+        self.awaiting
+    }
+
+    /// Sends `request`, without waiting for its answer.
+    ///
+    /// Returns once it has been handed to the connection. Answers that arrive
+    /// meanwhile are read and kept, so a peer that answers while this side is
+    /// still writing is never left unable to send them — the deadlock a
+    /// write-everything-then-read client walks into once both directions'
+    /// buffers fill.
+    pub async fn send(&mut self, request: &[u8]) -> Result<(), RastcpError> {
+        let len = u32::try_from(request.len()).map_err(|_| RastcpError::MessageTooLarge {
+            len: request.len(),
+            max: u32::MAX as usize,
+        })?;
+        self.out.reserve(4 + request.len());
+        self.out.extend_from_slice(&len.to_le_bytes());
+        self.out.extend_from_slice(request);
+        self.awaiting += 1;
+
+        self.drive(Until::Written).await
+    }
+
+    /// The answer to the oldest request still unanswered.
+    pub async fn recv(&mut self) -> Result<Vec<u8>, RastcpError> {
+        if self.awaiting == 0 {
+            return Err(RastcpError::ProtocolError(
+                "no request is waiting for an answer".to_string(),
+            ));
+        }
+
+        if self.answers.is_empty() {
+            self.drive(Until::Answer).await?;
+        }
+
+        let answer = self.answers.pop_front().ok_or(RastcpError::NotConnected)?;
+        self.awaiting -= 1;
+        Ok(answer)
+    }
+
+    /// Writes and reads until `until` holds, under the connection's timeout.
+    /// Any error drops the connection.
+    async fn drive(&mut self, until: Until) -> Result<(), RastcpError> {
+        let max_message_size = self.max_message_size;
+        let Some(connection) = self.client.connection.as_mut() else {
+            return Err(RastcpError::NotConnected);
+        };
+        let Connection {
+            stream,
+            reader,
+            deadline,
+            last_used,
+            ..
+        } = connection;
+
+        let out = &mut self.out;
+        let written = &mut self.written;
+        let unflushed = &mut self.unflushed;
+        let answers = &mut self.answers;
+        let awaiting = self.awaiting;
+
+        let result = within(
+            deadline,
+            std::future::poll_fn(|cx| {
+                poll_pipeline(
+                    stream,
+                    reader,
+                    cx,
+                    PipelineState {
+                        out: &mut *out,
+                        written: &mut *written,
+                        unflushed: &mut *unflushed,
+                        answers: &mut *answers,
+                        awaiting,
+                        max_message_size,
+                    },
+                    until,
+                )
+            }),
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                *last_used = std::time::Instant::now();
+                Ok(())
+            }
+            Err(err) => {
+                self.client.connection = None;
+                self.out.clear();
+                self.written = 0;
+                self.answers.clear();
+                self.awaiting = 0;
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for Pipeline<'_> {
+    fn drop(&mut self) {
+        // Answers still due would be read as the answers to whatever this
+        // client sends next. A connection in that state is not used again.
+        if self.awaiting > 0 || self.written < self.out.len() {
+            self.client.connection = None;
+        }
+    }
+}
+
+/// The parts of a [`Pipeline`] one poll moves.
+struct PipelineState<'s> {
+    out: &'s mut Vec<u8>,
+    written: &'s mut usize,
+    unflushed: &'s mut bool,
+    answers: &'s mut std::collections::VecDeque<Vec<u8>>,
+    awaiting: usize,
+    max_message_size: usize,
+}
+
+/// Writes what is queued and reads what has arrived, both as far as the
+/// connection allows without waiting, until `until` holds.
+fn poll_pipeline(
+    stream: &mut ClientStream,
+    reader: &mut FrameReader,
+    cx: &mut Context<'_>,
+    state: PipelineState<'_>,
+    until: Until,
+) -> Poll<Result<(), RastcpError>> {
+    let PipelineState {
+        out,
+        written,
+        unflushed,
+        answers,
+        awaiting,
+        max_message_size,
+    } = state;
+
+    loop {
+        let mut progressed = false;
+
+        while *written < out.len() {
+            match Pin::new(&mut *stream).poll_write(cx, &out[*written..]) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(
+                        std::io::Error::from(std::io::ErrorKind::WriteZero).into()
+                    ));
+                }
+                Poll::Ready(Ok(n)) => {
+                    *written += n;
+                    *unflushed = true;
+                    progressed = true;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+                Poll::Pending => break,
+            }
+        }
+
+        if *written == out.len() {
+            out.clear();
+            *written = 0;
+            if *unflushed {
+                match Pin::new(&mut *stream).poll_flush(cx) {
+                    Poll::Ready(Ok(())) => *unflushed = false,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+                    Poll::Pending => {}
+                }
+            }
+        }
+
+        // Answers are taken whenever they are there, whatever this wait is
+        // for: a server that cannot send them stops reading.
+        while answers.len() < awaiting {
+            match reader.poll_frame(stream, cx, max_message_size) {
+                Poll::Ready(Ok(answer)) => {
+                    answers.push_back(answer);
+                    progressed = true;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => break,
+            }
+        }
+
+        let done = match until {
+            Until::Written => out.is_empty() && !*unflushed,
+            Until::Answer => !answers.is_empty(),
+        };
+        if done {
+            return Poll::Ready(Ok(()));
+        }
+        if !progressed {
+            return Poll::Pending;
+        }
     }
 }

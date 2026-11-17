@@ -544,6 +544,18 @@ sender's `push_round_trip_us`, the peer is short of apply, and no amount of
 network will help it; if it is a small part, look at the link. On two nodes on
 one machine, 16 writers gave an apply of 20.4 ms in a round trip of 20.9 ms.
 
+**Batches in flight.** A link keeps up to `pipeline_depth` batches of its own
+node's stream on the wire before it waits for an answer (8 by default;
+`--replication-pipeline-depth`, or `REPLICATION SET pipeline_depth`). Waiting for
+each answer caps a link at one batch per round trip, which on a long link is the
+whole limit: at a 40 ms round trip, 24 single-transaction batches took 1.03 s
+one at a time and 0.14 s eight at a time. The peer still applies the batches
+one after another and in order — only the waiting overlaps — so on a short link,
+where the apply is most of each round trip, it changes little. A batch the peer
+refuses holds everything behind it exactly as before: the peer applies none of
+the batches already sent after it, and the stream starts again from where the
+peer says it is. `pipeline_depth = 1` waits for each answer.
+
 **A quiet link is kept alive.** A node's link to a peer carries transactions
 when there are some; when it has carried nothing for `keepalive_ms` (10 seconds
 by default) — because there is nothing to send, or because the peer is refusing

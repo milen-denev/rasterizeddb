@@ -381,12 +381,23 @@ struct Link {
 
 impl Link {
     fn take_vector(&mut self, vector: &[VectorEntry]) {
-        self.applied = vector.iter().map(|entry| (entry.origin, entry.seq)).collect();
+        take_vector(&mut self.applied, vector);
     }
 
     fn position(&self, origin: NodeId) -> u64 {
-        self.applied.get(&origin).copied().unwrap_or(0)
+        position(&self.applied, origin)
     }
+}
+
+/// Replaces what a link knows of the peer's progress with the peer's own
+/// latest account of it.
+fn take_vector(applied: &mut HashMap<NodeId, u64>, vector: &[VectorEntry]) {
+    *applied = vector.iter().map(|entry| (entry.origin, entry.seq)).collect();
+}
+
+/// How far the peer has applied `origin`'s stream, by its last account.
+fn position(applied: &HashMap<NodeId, u64>, origin: NodeId) -> u64 {
+    applied.get(&origin).copied().unwrap_or(0)
 }
 
 /// Dials the peer and completes the handshake.
@@ -545,16 +556,20 @@ async fn stream(
         woken.as_mut().enable();
 
         let config = replication.config();
-        let mut outcome = send_from(
-            replication,
-            peer,
-            link,
-            codec,
-            &mut frame,
-            node_id,
-            replication.released_through(),
-        )
-        .await?;
+        let mut outcome = if config.pipeline_depth > 1 {
+            send_own_window(replication, peer, link, codec, &mut frame).await?
+        } else {
+            send_from(
+                replication,
+                peer,
+                link,
+                codec,
+                &mut frame,
+                node_id,
+                replication.released_through(),
+            )
+            .await?
+        };
 
         if config.relay {
             // Everything this node has logged of other origins, for a peer
@@ -741,21 +756,34 @@ enum Sent {
     Advanced,
 }
 
-/// Sends the peer the next batch of `origin`'s stream, from where the peer
-/// says it is up to `upto`.
-async fn send_from(
+/// What [`prepare`] found to send.
+enum Prepared {
+    /// The next batch, contiguous from where it was asked to start.
+    Records(Vec<TxnRecord>),
+    /// The peer has everything sendable.
+    Nothing,
+    /// A compaction swapped the log under the read; look again.
+    Retry,
+}
+
+/// The batch of `origin`'s stream that starts after `from` and goes no
+/// further than `upto`, after the checks that make sending it right: that the
+/// peer is not ahead of this node, that the log still holds where the peer
+/// is, and that the batch has no holes.
+///
+/// `linger` lets a short batch wait a moment for the commits right behind it,
+/// which is worth it only when nothing else is in flight to hide the wait.
+async fn prepare(
     replication: &Arc<Replication>,
     peer: &Arc<PeerHandle>,
-    link: &mut Link,
-    codec: &mut FrameCodec,
-    frame: &mut Vec<u8>,
     origin: NodeId,
+    from: u64,
     upto: u64,
-) -> Result<Sent, String> {
+    linger: bool,
+) -> Result<Prepared, String> {
     let Some(log) = replication.log() else {
-        return Ok(Sent::Nothing);
+        return Ok(Prepared::Nothing);
     };
-    let from = link.position(origin);
     let own = origin == replication.node_id();
     if own && from > replication.local_seq() {
         // As at the handshake: the peer holds more of this node's stream
@@ -775,7 +803,7 @@ async fn send_from(
         return Err(message);
     }
     if from >= upto {
-        return Ok(Sent::Nothing);
+        return Ok(Prepared::Nothing);
     }
 
     if !log.can_serve(origin, from) {
@@ -801,7 +829,11 @@ async fn send_from(
     let config = replication.config();
     // At low load the first record is all there is; a short wait lets the
     // commits right behind it share its frame.
-    if own && !config.batch_linger.is_zero() && upto - from < config.batch_max_records as u64 {
+    if linger
+        && own
+        && !config.batch_linger.is_zero()
+        && upto - from < config.batch_max_records as u64
+    {
         tokio::time::sleep(config.batch_linger).await;
     }
     let upto = if own { replication.released_through() } else { upto };
@@ -814,12 +846,11 @@ async fn send_from(
         config.batch_max_bytes,
     ) {
         Ok(read) => read,
-        // A compaction swapped the file under the read. Look again.
-        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Sent::Advanced),
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Ok(Prepared::Retry),
         Err(e) => return Err(format!("could not read the replication log: {}", e)),
     };
     if records.is_empty() {
-        return Ok(Sent::Nothing);
+        return Ok(Prepared::Nothing);
     }
 
     // The stream has no holes by construction. One here means the log lost
@@ -845,23 +876,34 @@ async fn send_from(
         expected += 1;
     }
 
-    let refs: Vec<&TxnRecord> = records.iter().collect();
-    let ack = push(replication, peer, link, codec, &refs, frame).await?;
-    link.take_vector(&ack.applied);
-    if own {
+    Ok(Prepared::Records(records))
+}
+
+/// What the peer's answer to a batch of `origin`'s stream sent from `from`
+/// came to, folded into what the link and the node know.
+fn settle(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    applied: &mut HashMap<NodeId, u64>,
+    origin: NodeId,
+    from: u64,
+    ack: &PushAck,
+) -> Sent {
+    take_vector(applied, &ack.applied);
+    if origin == replication.node_id() {
         // Stored, not raised: a peer that was rewound (`RESYNC … FROM`) is
         // followed back, or the status view would claim a position the peer
         // no longer has.
-        peer.acked_seq.store(link.position(origin), Ordering::Relaxed);
+        peer.acked_seq.store(position(applied, origin), Ordering::Relaxed);
         replication.note_ack();
     }
 
-    if link.position(origin) > from {
+    if position(applied, origin) > from {
         if peer.set_state(PeerState::Streaming) {
             info!("Peer {} is applying origin {}'s stream again", peer.name, origin);
         }
         peer.set_error(None);
-        return Ok(Sent::Advanced);
+        return Sent::Advanced;
     }
 
     // Nothing moved. The first record's outcome says why.
@@ -885,28 +927,171 @@ async fn send_from(
         }
         _ => {}
     }
-    Ok(Sent::Refused)
+    Sent::Refused
 }
 
-/// Sends one batch and returns what the peer said about it.
-async fn push(
+/// Sends the peer the next batch of `origin`'s stream, from where the peer
+/// says it is up to `upto`, and waits for the answer.
+async fn send_from(
     replication: &Arc<Replication>,
     peer: &Arc<PeerHandle>,
     link: &mut Link,
+    codec: &mut FrameCodec,
+    frame: &mut Vec<u8>,
+    origin: NodeId,
+    upto: u64,
+) -> Result<Sent, String> {
+    let from = link.position(origin);
+    let records = match prepare(replication, peer, origin, from, upto, true).await? {
+        Prepared::Records(records) => records,
+        Prepared::Nothing => return Ok(Sent::Nothing),
+        Prepared::Retry => return Ok(Sent::Advanced),
+    };
+
+    let refs: Vec<&TxnRecord> = records.iter().collect();
+    let ack = push(replication, peer, link, codec, &refs, frame).await?;
+    Ok(settle(replication, peer, &mut link.applied, origin, from, &ack))
+}
+
+/// How many batches a call of [`send_own_window`] has answered before it lets
+/// the stream loop look at everything else — a stop, a pause, a relayed
+/// origin, a keep-alive — rather than keep the window full for ever.
+const WINDOW_ACKS_PER_CALL: usize = 64;
+
+/// Sends this node's own stream with up to `pipeline_depth` batches in flight.
+///
+/// One batch at a time costs a round trip per batch, and over a link with
+/// tens of milliseconds of latency that round trip is the limit, not the
+/// peer's apply. The link is plain `rastcp/1`, whose server handles a
+/// connection's requests strictly in order, so the batches still apply one
+/// after another and in order; only the waiting overlaps.
+///
+/// Each batch is sent as if the ones before it will apply. When one does not
+/// — refused, or applied only in part — the peer answers each batch behind it
+/// with a gap and applies nothing of it, because what it is missing comes
+/// first. Those answers are drained, and the stream starts again from where
+/// the peer says it is, exactly as one batch at a time would.
+async fn send_own_window(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    link: &mut Link,
+    codec: &mut FrameCodec,
+    frame: &mut Vec<u8>,
+) -> Result<Sent, String> {
+    let origin = replication.node_id();
+    let link_codec = link.codec;
+    let Link {
+        client,
+        applied,
+        last_exchange,
+        ..
+    } = link;
+
+    let mut next = position(applied, origin);
+    let mut in_flight: std::collections::VecDeque<(u64, u64, Encoded, std::time::Instant)> =
+        std::collections::VecDeque::new();
+    let mut outcome = Sent::Nothing;
+    let mut answered = 0usize;
+
+    let mut pipeline = client
+        .pipeline()
+        .await
+        .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
+
+    loop {
+        // Fill the window. The depth is read each time, so a change made with
+        // `REPLICATION SET` applies to the next batch, not the next call.
+        while in_flight.len() < replication.config().pipeline_depth
+            && answered + in_flight.len() < WINDOW_ACKS_PER_CALL
+            && !peer.is_stopping()
+            && !peer.is_paused()
+        {
+            let upto = replication.released_through();
+            let records =
+                match prepare(replication, peer, origin, next, upto, in_flight.is_empty()).await? {
+                    Prepared::Records(records) => records,
+                    Prepared::Nothing => break,
+                    Prepared::Retry => continue,
+                };
+            let last = records.last().map(|record| record.seq).unwrap_or(next);
+            let refs: Vec<&TxnRecord> = records.iter().collect();
+            let encoded = encode_batch(replication, peer, link_codec, codec, &refs, frame)?;
+            pipeline
+                .send(frame)
+                .await
+                .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
+            in_flight.push_back((next, last, encoded, std::time::Instant::now()));
+            next = last;
+        }
+
+        let Some((from, last, encoded, sent_at)) = in_flight.pop_front() else {
+            return Ok(outcome);
+        };
+
+        let response = pipeline
+            .recv()
+            .await
+            .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
+        *last_exchange = std::time::Instant::now();
+        replication.stats().push_round_trip_us.fetch_add(
+            last_exchange.duration_since(sent_at).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        let ack = settle_push(replication, peer, codec, &response, &encoded)?;
+        let settled = settle(replication, peer, applied, origin, from, &ack);
+        answered += 1;
+
+        if position(applied, origin) >= last {
+            outcome = Sent::Advanced;
+            continue;
+        }
+
+        // It did not all apply, so nothing behind it can have: drain those
+        // answers, keeping only the peer's account of where it is.
+        while let Some((_, _, encoded, _)) = in_flight.pop_front() {
+            let response = pipeline
+                .recv()
+                .await
+                .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
+            *last_exchange = std::time::Instant::now();
+            let ack = settle_push(replication, peer, codec, &response, &encoded)?;
+            take_vector(applied, &ack.applied);
+        }
+
+        return Ok(outcome.max(settled));
+    }
+}
+
+/// Sends one batch and returns what the peer said about it.
+/// A batch encoded into a frame, and what its counters need once the peer
+/// has answered it.
+struct Encoded {
+    raw: u64,
+    wire: u64,
+    compressed: bool,
+    records: usize,
+}
+
+/// Encodes `records` as a PUSH frame into `frame`, compressed as the peer
+/// can decode.
+fn encode_batch(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    link_codec: Codec,
     codec: &mut FrameCodec,
     records: &[&TxnRecord],
     // Reused across batches. `encode_frame` clears it, so what carries over is
     // the capacity — which is what stops every batch from growing a buffer up
     // to its size from nothing.
     frame: &mut Vec<u8>,
-) -> Result<PushAck, String> {
+) -> Result<Encoded, String> {
     let config = replication.config();
     let compression = peer.compression_override().unwrap_or(config.compression);
     codec.set_level(compression.level);
 
     // The peer only advertised what it can decode; sending it something else
     // would be a decode failure at the far end rather than here.
-    let compression = if link.codec == Codec::None {
+    let compression = if link_codec == Codec::None {
         Compression {
             mode: super::config::CompressionMode::Off,
             codec: Codec::None,
@@ -914,7 +1099,7 @@ async fn push(
         }
     } else {
         Compression {
-            codec: link.codec,
+            codec: link_codec,
             ..compression
         }
     };
@@ -947,32 +1132,36 @@ async fn push(
         Some(wire as f64 / raw.max(1) as f64)
     });
 
-    let sent_at = std::time::Instant::now();
-    let response = link
-        .client
-        .send_borrowed(frame)
-        .await
-        .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
-    link.last_exchange = std::time::Instant::now();
-    replication.stats().push_round_trip_us.fetch_add(
-        link.last_exchange.duration_since(sent_at).as_micros() as u64,
-        Ordering::Relaxed,
-    );
+    Ok(Encoded {
+        raw,
+        wire,
+        compressed: used != Codec::None,
+        records: records.len(),
+    })
+}
 
+/// Reads the peer's answer to a batch, and counts the batch.
+fn settle_push(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    codec: &mut FrameCodec,
+    response: &[u8],
+    encoded: &Encoded,
+) -> Result<PushAck, String> {
     let stats = replication.stats();
-    stats.bytes_raw.fetch_add(raw, Ordering::Relaxed);
-    stats.bytes_wire.fetch_add(wire, Ordering::Relaxed);
+    stats.bytes_raw.fetch_add(encoded.raw, Ordering::Relaxed);
+    stats.bytes_wire.fetch_add(encoded.wire, Ordering::Relaxed);
     stats.batches_sent.fetch_add(1, Ordering::Relaxed);
-    if used != Codec::None {
+    if encoded.compressed {
         stats.compressed_batches.fetch_add(1, Ordering::Relaxed);
     }
     peer.batches_sent.fetch_add(1, Ordering::Relaxed);
     peer.records_sent
-        .fetch_add(records.len() as u64, Ordering::Relaxed);
+        .fetch_add(encoded.records as u64, Ordering::Relaxed);
 
     let mut scratch = Vec::new();
     let (header, body) = codec
-        .decode_frame(&response, &mut scratch)
+        .decode_frame(response, &mut scratch)
         .map_err(|e| format!("{} answered with an unreadable frame: {}", peer.name, e))?;
 
     match header.kind {
@@ -987,6 +1176,32 @@ async fn push(
     replication.clock().observe(ack.clock);
     count_outcomes(replication, peer, &ack);
     Ok(ack)
+}
+
+/// Sends one batch and waits for its answer.
+async fn push(
+    replication: &Arc<Replication>,
+    peer: &Arc<PeerHandle>,
+    link: &mut Link,
+    codec: &mut FrameCodec,
+    records: &[&TxnRecord],
+    frame: &mut Vec<u8>,
+) -> Result<PushAck, String> {
+    let encoded = encode_batch(replication, peer, link.codec, codec, records, frame)?;
+
+    let sent_at = std::time::Instant::now();
+    let response = link
+        .client
+        .send_borrowed(frame)
+        .await
+        .map_err(|e| format!("sending to {} failed: {}", peer.name, e))?;
+    link.last_exchange = std::time::Instant::now();
+    replication.stats().push_round_trip_us.fetch_add(
+        link.last_exchange.duration_since(sent_at).as_micros() as u64,
+        Ordering::Relaxed,
+    );
+
+    settle_push(replication, peer, codec, &response, &encoded)
 }
 
 /// Folds an acknowledgement into the node's counters.

@@ -83,6 +83,10 @@ pub const KEYS: &[Key] = &[
         help: "records in one outbound batch",
     },
     Key {
+        name: "pipeline_depth",
+        help: "batches of this node's stream in flight before waiting for an answer; 1 waits for each",
+    },
+    Key {
         name: "batch_max_bytes",
         help: "uncompressed bytes in one outbound batch",
     },
@@ -708,6 +712,7 @@ fn apply_setting(config: &mut ReplicationConfig, key: &str, value: &str) -> Resu
         }
         "ack_timeout_ms" => config.ack_timeout = Duration::from_millis(parse_number(value, key)?),
         "batch_max_records" => config.batch_max_records = parse_number(value, key)?,
+        "pipeline_depth" => config.pipeline_depth = parse_number(value, key)?,
         "batch_max_bytes" => config.batch_max_bytes = parse_number(value, key)?,
         "batch_linger_us" => config.batch_linger = Duration::from_micros(parse_number(value, key)?),
         "queue_capacity" => config.queue_capacity = parse_number(value, key)?,
@@ -757,6 +762,7 @@ fn describe_setting(config: &ReplicationConfig, key: &str) -> String {
         "conflict" | "conflict_policy" => config.conflict.to_string(),
         "ack_timeout_ms" => config.ack_timeout.as_millis().to_string(),
         "batch_max_records" => config.batch_max_records.to_string(),
+        "pipeline_depth" => config.pipeline_depth.to_string(),
         "batch_max_bytes" => config.batch_max_bytes.to_string(),
         "batch_linger_us" => config.batch_linger.as_micros().to_string(),
         "queue_capacity" => config.queue_capacity.to_string(),
@@ -1256,6 +1262,7 @@ fn stats_rows(database: &Arc<Database>) -> Vec<crate::core::row::row::Row> {
         config.batch_max_records.to_string(),
         "",
     );
+    push("pipeline_depth", config.pipeline_depth.to_string(), "");
     push("batch_max_bytes", config.batch_max_bytes.to_string(), "");
     push(
         "batch_linger_us",
