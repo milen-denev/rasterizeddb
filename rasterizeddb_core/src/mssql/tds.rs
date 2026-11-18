@@ -1467,10 +1467,20 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
         }
         // Nullable variable-length types: a byte of length.
         0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 => {
-            let _max = r.u8()?;
+            let max = r.u8()?;
             let len = r.u8()? as usize;
             if len == 0 {
-                return Ok((ParamValue::Null, 0));
+                // NULL keeps its type: an OUTPUT parameter is sent back as it.
+                let oid = match ty {
+                    0x26 if max == 8 => 20,
+                    0x26 => 23,
+                    0x68 => 16,
+                    0x6d => 701,
+                    0x6e => 1700,
+                    0x6f => 1114,
+                    _ => 2950,
+                };
+                return Ok((ParamValue::Null, oid));
             }
             let b = r.bytes(len)?;
             match ty {
@@ -1674,6 +1684,171 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
     })
 }
 
+/// A column of a bulk load: its name and TYPE_INFO in the form an RPC
+/// parameter carries it (what [`read_typed_value`] reads).
+#[derive(Clone, Debug)]
+pub(crate) struct BulkColumn {
+    pub(crate) name: String,
+    type_info: Vec<u8>,
+}
+
+/// A bulk load's rows (a BulkLoadBCP message: COLMETADATA, ROW / NBCROW
+/// tokens, DONE), each cell as an RPC parameter's value and engine type.
+pub(crate) fn read_bulk(payload: &[u8]) -> io::Result<(Vec<BulkColumn>, Vec<Vec<(ParamValue, u32)>>)> {
+    let bad = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
+    let mut r = Reader::new(payload);
+    if r.u8()? != 0x81 {
+        return Err(bad("a bulk load starts with COLMETADATA".into()));
+    }
+    let count = r.u16()? as usize;
+    let mut columns = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _user_type = r.u32()?;
+        let _flags = r.u16()?;
+        let start = r.pos;
+        let ty = r.u8()?;
+        match ty {
+            0x1f | 0x30 | 0x32 | 0x34 | 0x38 | 0x7f | 0x3b | 0x3e | 0x3c | 0x7a | 0x3d | 0x3a | 0x28 => {}
+            0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 | 0x29 | 0x2a | 0x2b => {
+                r.u8()?;
+            }
+            0x6a | 0x6c | 0x37 | 0x3f => {
+                r.bytes(3)?;
+            }
+            0xa7 | 0xaf | 0xe7 | 0xef => {
+                r.bytes(7)?;
+            }
+            0xa5 | 0xad => {
+                r.u16()?;
+            }
+            0x23 | 0x63 | 0x22 => {
+                r.u32()?;
+                if ty != 0x22 {
+                    r.bytes(5)?;
+                }
+            }
+            0xf1 => {
+                if r.u8()? != 0 {
+                    return Err(bad("xml columns with a schema collection".into()));
+                }
+            }
+            other => return Err(bad(format!("unsupported bulk column type {other:#04x}"))),
+        }
+        let type_info = payload[start..r.pos].to_vec();
+        if matches!(ty, 0x23 | 0x63 | 0x22) {
+            // The table name a TEXT / NTEXT / IMAGE column carries.
+            let parts = r.u8()?;
+            for _ in 0..parts {
+                let n = r.u16()? as usize;
+                r.bytes(n * 2)?;
+            }
+        }
+        let name = r.b_varchar()?;
+        columns.push(BulkColumn { name, type_info });
+    }
+    let mut rows = Vec::new();
+    while r.remaining() > 0 {
+        let token = r.u8()?;
+        match token {
+            0xd1 | 0xd2 => {
+                let nulls = if token == 0xd2 {
+                    r.bytes(count.div_ceil(8))?.to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut row = Vec::with_capacity(count);
+                for (k, c) in columns.iter().enumerate() {
+                    if token == 0xd2 && nulls[k / 8] & (1 << (k % 8)) != 0 {
+                        row.push((ParamValue::Null, 0));
+                        continue;
+                    }
+                    row.push(read_bulk_cell(&mut r, &c.type_info)?);
+                }
+                rows.push(row);
+            }
+            0xfd | 0xfe | 0xff => break,
+            other => return Err(bad(format!("unexpected token {other:#04x} in a bulk load"))),
+        }
+    }
+    Ok((columns, rows))
+}
+
+/// One cell of a bulk row: its value's bytes measured by its type, then
+/// read as an RPC parameter of the same type.
+fn read_bulk_cell(r: &mut Reader<'_>, type_info: &[u8]) -> io::Result<(ParamValue, u32)> {
+    let ty = type_info[0];
+    let start = r.pos;
+    let mut value: Vec<u8> = Vec::new();
+    match ty {
+        0x1f => {}
+        0x30 | 0x32 => {
+            r.bytes(1)?;
+        }
+        0x34 => {
+            r.bytes(2)?;
+        }
+        0x38 | 0x3b | 0x7a | 0x3a => {
+            r.bytes(4)?;
+        }
+        0x7f | 0x3e | 0x3c | 0x3d => {
+            r.bytes(8)?;
+        }
+        0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 | 0x6a | 0x6c | 0x37 | 0x3f | 0x28 | 0x29 | 0x2a | 0x2b => {
+            let n = r.u8()? as usize;
+            r.bytes(n)?;
+        }
+        0xa7 | 0xaf | 0xe7 | 0xef | 0xa5 | 0xad => {
+            let max = u16::from_le_bytes([type_info[1], type_info[2]]);
+            if max == 0xffff {
+                skip_plp(r)?;
+            } else {
+                let n = r.u16()?;
+                if n != 0xffff {
+                    r.bytes(n as usize)?;
+                }
+            }
+        }
+        0xf1 => skip_plp(r)?,
+        0x23 | 0x63 | 0x22 => {
+            // A text pointer (none: NULL) and timestamp before the data.
+            let pointer = r.u8()? as usize;
+            if pointer == 0 {
+                value.extend_from_slice(&u32::MAX.to_le_bytes());
+            } else {
+                r.bytes(pointer + 8)?;
+                let n = r.u32()?;
+                value.extend_from_slice(&n.to_le_bytes());
+                value.extend_from_slice(r.bytes(n as usize)?);
+            }
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported bulk column type {other:#04x}"),
+            ));
+        }
+    }
+    if !matches!(ty, 0x23 | 0x63 | 0x22) {
+        value = r.buf[start..r.pos].to_vec();
+    }
+    let mut cell = type_info.to_vec();
+    cell.extend_from_slice(&value);
+    read_typed_value(&mut Reader::new(&cell))
+}
+
+fn skip_plp(r: &mut Reader<'_>) -> io::Result<()> {
+    if r.u64()? == u64::MAX {
+        return Ok(());
+    }
+    loop {
+        let n = r.u32()?;
+        if n == 0 {
+            return Ok(());
+        }
+        r.bytes(n as usize)?;
+    }
+}
+
 /// Parses the parameters of one RPC call, from after the option flags.
 pub(crate) fn read_params(r: &mut Reader<'_>) -> io::Result<Vec<Param>> {
     let mut params = Vec::new();
@@ -1698,6 +1873,40 @@ pub(crate) fn read_params(r: &mut Reader<'_>) -> io::Result<Vec<Param>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_rows() {
+        // COLMETADATA: id INTN(4), name NVARCHAR(20) with a collation,
+        // price DECIMALN(18,2); a ROW, an NBCROW with name NULL; DONE.
+        let mut b = vec![0x81, 3, 0];
+        let col = |b: &mut Vec<u8>, info: &[u8], name: &str| {
+            b.extend_from_slice(&[0, 0, 0, 0, 9, 0]);
+            b.extend_from_slice(info);
+            put_b_varchar(b, name);
+        };
+        col(&mut b, &[0x26, 4], "id");
+        col(&mut b, &[0xe7, 40, 0, 9, 4, 0xd0, 0, 0x34], "name");
+        col(&mut b, &[0x6a, 17, 18, 2], "price");
+        b.push(0xd1);
+        b.extend_from_slice(&[4, 7, 0, 0, 0]);
+        let name: Vec<u8> = "Zoë".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        b.extend_from_slice(&name);
+        b.extend_from_slice(&[5, 1, 0xe2, 0x04, 0, 0]); // +12.50
+        b.push(0xd2);
+        b.push(0b010);
+        b.extend_from_slice(&[4, 8, 0, 0, 0]);
+        b.extend_from_slice(&[5, 0, 5, 0, 0, 0]); // -0.05
+        b.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let (cols, rows) = read_bulk(&b).unwrap();
+        assert_eq!(cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "name", "price"]);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0][0].0, ParamValue::Text(t) if t == "7"));
+        assert!(matches!(&rows[0][1].0, ParamValue::Text(t) if t == "Zoë"));
+        assert!(matches!(&rows[0][2].0, ParamValue::Text(t) if t == "12.50"));
+        assert!(matches!(rows[1][1].0, ParamValue::Null));
+        assert!(matches!(&rows[1][2].0, ParamValue::Text(t) if t == "-0.05"));
+    }
 
     #[test]
     fn dates_count_from_year_one() {

@@ -192,6 +192,11 @@ struct Session {
     rpc_outputs: Vec<(u16, String, u32, Value)>,
     /// What this connection's `#tables` are named with.
     temp_prefix: String,
+    /// SET FMTONLY ON: queries answer their columns and no rows; nothing
+    /// else runs.
+    fmtonly: bool,
+    /// The table an `INSERT BULK` named, which the next bulk load fills.
+    bulk_target: Option<String>,
 }
 
 pub(crate) async fn serve_connection(
@@ -260,6 +265,8 @@ pub(crate) async fn serve_connection(
         routine_cache: None,
         rpc_outputs: Vec::new(),
         temp_prefix: crate::sqlcompat::temp_table_prefix("tds", crate::sqlcompat::next_connection_id()),
+        fmtonly: false,
+        bulk_target: None,
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -769,9 +776,17 @@ impl Session {
                     continue;
                 }
                 tds::PT_BULK => {
-                    self.error_token(&TsqlError::unsupported(
-                        "bulk load (BULK INSERT / SqlBulkCopy)",
-                    ));
+                    self.in_rpc = false;
+                    match self.bulk_load(&message).await {
+                        Ok(n) => {
+                            self.rowcount = n as i64;
+                            self.statement_done(tds::DONE_COUNT, 0, n);
+                        }
+                        Err(e) => {
+                            self.error_token(&e);
+                            self.statement_done(tds::DONE_ERROR, 0, 0);
+                        }
+                    }
                     self.final_done();
                 }
                 tds::PT_SSPI => return Ok(()),
@@ -1418,6 +1433,7 @@ impl Session {
             }
         }
         let text = tds::utf16_text(&message.payload[r.pos..]);
+        log::debug!("T-SQL batch: {text}");
         self.in_rpc = false;
         self.batch(&text, None).await?;
         self.final_done();
@@ -1707,7 +1723,22 @@ impl Session {
         let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
         let next = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
         let made_temp = temp_table_made(tokens);
+        // SET FMTONLY ON: a query answers its columns; nothing else runs.
+        if self.fmtonly
+            && !matches!(head.as_str(), "SET" | "SELECT" | "DECLARE" | "IF" | "WHILE" | "BEGIN" | "EXEC" | "EXECUTE")
+        {
+            self.statement_done(0, 0, 0);
+            return Ok(Ok(Flow::Next));
+        }
+        if self.fmtonly && head == "SELECT" {
+            if let Some(columns) = self.declared_columns(tokens) {
+                tds::col_metadata(self.wire.reply(), &columns);
+                self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, 0);
+                return Ok(Ok(Flow::Next));
+            }
+        }
         let r: Result<Flow, TsqlError> = match head.as_str() {
+            "INSERT" if next == "BULK" => self.insert_bulk(tokens),
             "DECLARE" => self.declare(tokens, params).await,
             "DROP" if matches!(next.as_str(), "PROC" | "PROCEDURE") => {
                 self.drop_procedure(tokens).await
@@ -1908,6 +1939,23 @@ impl Session {
                         e.message
                     ),
                 }
+                let translated = match translated {
+                    Ok(mut f) if self.fmtonly && f.kind == Kind::Query => {
+                        if let Some(last) = f.statements.last_mut() {
+                            // LIMIT 0 on the query itself keeps its columns'
+                            // declared types (a derived table loses their
+                            // precision and length).
+                            let lower = last.to_ascii_lowercase();
+                            *last = if lower.contains(" limit ") || lower.contains(" union ") || lower.contains(" for update") {
+                                format!("SELECT * FROM ({last}) AS __fmtonly LIMIT 0")
+                            } else {
+                                format!("{last} LIMIT 0")
+                            };
+                        }
+                        Ok(f)
+                    }
+                    other => other,
+                };
                 match translated {
                     Ok(forward) => match self.forward(forward, params).await? {
                         Ok(()) => Ok(Flow::Next),
@@ -2003,7 +2051,7 @@ impl Session {
         if let Some(p) = params {
             p.used.lock().clear();
         }
-        let Some((sql, names)) =
+        let Some((sql, names, accumulates)) =
             translate::assignment_select(text, tokens, &Scope { s: self, params })?
         else {
             return Err(TsqlError::syntax("an assignment SELECT was expected"));
@@ -2013,6 +2061,11 @@ impl Session {
             .fetch(&sql, &bound)
             .await
             .map_err(|e| error_from_engine(&e))?;
+        if accumulates && rows.len() > 1 {
+            return Err(TsqlError::unsupported(
+                "SELECT @v = … @v … over more than one row (it folds row by row; use STRING_AGG or SUM)",
+            ));
+        }
         // The last row's values, as SQL Server leaves them.
         if let Some(row) = rows.last() {
             for (k, name) in names.iter().enumerate() {
@@ -2186,7 +2239,8 @@ impl Session {
                     return Err(TsqlError::unsupported("SET ROWCOUNT (use TOP)"));
                 }
             }
-            "FMTONLY" | "NOEXEC" | "PARSEONLY" if on() => {
+            "FMTONLY" => self.fmtonly = on(),
+            "NOEXEC" | "PARSEONLY" if on() => {
                 return Err(TsqlError::unsupported(format!("SET {first} ON")));
             }
             "SHOWPLAN_ALL" | "SHOWPLAN_TEXT" | "SHOWPLAN_XML" if on() => {
@@ -2230,6 +2284,9 @@ impl Session {
         }
         let mut k = 0;
         let mut name = String::new();
+        while rest.get(k).is_some_and(|t| t.is_op(".")) {
+            k += 1;
+        }
         while let Some(t) = rest.get(k) {
             if let Some(i) = t.ident() {
                 name = i.to_lowercase();
@@ -2368,6 +2425,14 @@ impl Session {
                 self.silent(&sql).await.map_err(|e| error_from_engine(&e))?;
                 self.statement_done(0, 0, 0);
                 Ok(Flow::Next)
+            }
+            "sp_tablecollations" | "sp_tablecollations_90" | "sp_tablecollations_100" => {
+                let table = values
+                    .first()
+                    .and_then(|v| v.text())
+                    .map(|t| routines::object_name_at(&lex::lex(&t).unwrap_or_default(), 0).map(|(n, _)| n).unwrap_or_default())
+                    .unwrap_or_default();
+                self.table_collations(&table).await
             }
             "sp_reset_connection" | "sp_set_session_context" | "sp_setapprole" => {
                 self.statement_done(0, 0, 0);
@@ -2576,7 +2641,9 @@ impl Session {
                 self.reset(false).await;
                 Ok(())
             }
-            other if !other.starts_with("sp_") => {
+            other if !procedure_name(other).starts_with("sp_") => {
+                let other = procedure_name(other);
+                let other = other.as_str();
                 let args = params
                     .iter()
                     .map(|p| ProcArg {
@@ -2754,6 +2821,15 @@ fn temp_table_made(tokens: &[Token]) -> Option<String> {
         }
     }
     None
+}
+
+/// A procedure's name as an RPC request gives it (`dbo.p`, `[db].[dbo].[p]`):
+/// its last part, lower case.
+fn procedure_name(raw: &str) -> String {
+    lex::lex(raw)
+        .ok()
+        .and_then(|t| routines::object_name_at(&t, 0).map(|(n, _)| n))
+        .unwrap_or_else(|| raw.to_lowercase())
 }
 
 fn text_param(v: &str) -> (i16, Option<Vec<u8>>, u32) {
@@ -3622,6 +3698,183 @@ impl Session {
             total += tag_count(&tag).unwrap_or(0);
         }
         Ok(total)
+    }
+}
+
+/// Bulk loads (SqlBulkCopy, bcp): INSERT BULK names the table, then a bulk
+/// load message carries the rows.
+impl Session {
+    fn insert_bulk(&mut self, tokens: &[Token]) -> Result<Flow, TsqlError> {
+        let (name, _) = routines::object_name_at(tokens, 2)
+            .ok_or_else(|| TsqlError::syntax("INSERT BULK needs a table"))?;
+        let name = if name.starts_with('#') { self.temp_name(&name) } else { name };
+        if !self.bridge().database.has_table(&name) {
+            return Err(TsqlError::new(208, format!("Invalid object name '{name}'.")));
+        }
+        self.bulk_target = Some(name);
+        self.statement_done(0, 0, 0);
+        Ok(Flow::Next)
+    }
+
+    async fn bulk_load(&mut self, message: &Message) -> Result<u64, TsqlError> {
+        let table = self.bulk_target.take().ok_or_else(|| {
+            TsqlError::new(4022, "Bulk load data was expected but not sent. The batch will be terminated.")
+        })?;
+        let (columns, rows) = tds::read_bulk(&message.payload)
+            .map_err(|e| TsqlError::new(4815, format!("Received an invalid column length from the bcp client: {e}")))?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let cols = columns
+            .iter()
+            .map(|c| ident_sql(&c.name.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let per = (30_000 / columns.len().max(1)).max(1);
+        // One transaction, as SQL Server's batch is (BatchSize 0).
+        let outer = self.bridge().in_block();
+        self.silent(if outer { "SAVEPOINT rdb_tds_bulk" } else { "BEGIN" })
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        let mut total = 0u64;
+        let mut failed = None;
+        for chunk in rows.chunks(per) {
+            let mut values = Vec::with_capacity(chunk.len());
+            let mut bound = Vec::with_capacity(chunk.len() * columns.len());
+            for row in chunk {
+                let mut slots = Vec::with_capacity(row.len());
+                for (value, oid) in row {
+                    bound.push(match value {
+                        ParamValue::Null => (0i16, None, 0u32),
+                        ParamValue::Text(t) => (0, Some(t.clone().into_bytes()), *oid),
+                        ParamValue::Bytes(b) => (1, Some(b.clone()), 17),
+                    });
+                    slots.push(format!("${}", bound.len()));
+                }
+                values.push(format!("({})", slots.join(", ")));
+            }
+            let sql = format!("INSERT INTO {} ({cols}) VALUES {}", ident_sql(&table), values.join(", "));
+            match self.query_bound(&sql, &bound).await {
+                Ok((_, _, tag)) => total += tag_count(&tag).unwrap_or(0),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        let end = match (&failed, outer) {
+            (None, true) => "RELEASE SAVEPOINT rdb_tds_bulk",
+            (None, false) => "COMMIT",
+            (Some(_), true) => "ROLLBACK TO SAVEPOINT rdb_tds_bulk",
+            (Some(_), false) => "ROLLBACK",
+        };
+        let ended = self.silent(end).await;
+        if outer && failed.is_some() {
+            let _ = self.silent("RELEASE SAVEPOINT rdb_tds_bulk").await;
+        }
+        if let Some(e) = failed {
+            return Err(error_from_engine(&e));
+        }
+        ended.map_err(|e| error_from_engine(&e))?;
+        Ok(total)
+    }
+
+    /// sp_tablecollations_100: a row per column, the collation of its text
+    /// (none: the engine compares bytes).
+    async fn table_collations(&mut self, table: &str) -> Result<Flow, TsqlError> {
+        let view = self
+            .bridge()
+            .database
+            .schema_view(table)
+            .ok_or_else(|| TsqlError::new(208, format!("Invalid object name '{table}'.")))?;
+        let names: Vec<String> = view
+            .schema()
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+            .map(|f| f.name.clone())
+            .collect();
+        let field = |name: &str, oid: u32| PgField {
+            name: name.to_string(),
+            table_oid: 0,
+            column: 0,
+            type_oid: oid,
+            type_size: -1,
+            type_modifier: -1,
+        };
+        let fields = vec![
+            field("colid", 23),
+            field("name", 25),
+            field("tds_collation_100", 17),
+            field("collation_100", 25),
+        ];
+        let rows = names
+            .into_iter()
+            .enumerate()
+            .map(|(k, n)| vec![Some((k + 1).to_string()), Some(n), None, None])
+            .collect();
+        self.send_rows(&fields, rows);
+        Ok(Flow::Next)
+    }
+}
+
+/// The declared types of a table's columns, which the engine's result
+/// descriptions do not carry (a `decimal(18,2)` is described as `numeric`).
+impl Session {
+    /// `SELECT * | col, … FROM table` under SET FMTONLY ON (SqlBulkCopy's
+    /// probe): the columns as declared.
+    fn declared_columns(&self, tokens: &[Token]) -> Option<Vec<Column>> {
+        let from = find_top(tokens, 1, &["FROM"])?;
+        let (table, end) = routines::object_name_at(tokens, from + 1)?;
+        if end != tokens.len() && !tokens[end..].iter().all(|t| t.is_op(";")) {
+            return None;
+        }
+        let table = if table.starts_with('#') { self.temp_name(&table) } else { table };
+        let view = self.bridge.as_ref()?.database.schema_view(&table)?;
+        let schema = view.schema();
+        let fields: Vec<_> = schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+            .collect();
+        let items = split_commas(&tokens[1..from]);
+        let chosen: Vec<_> = if items.len() == 1 && items[0].len() == 1 && items[0][0].is_op("*") {
+            fields
+        } else {
+            let mut chosen = Vec::new();
+            for item in &items {
+                let [t] = item.as_slice() else { return None };
+                let name = t.ident()?;
+                chosen.push(*fields.iter().find(|f| f.name.eq_ignore_ascii_case(name))?);
+            }
+            chosen
+        };
+        Some(
+            chosen
+                .into_iter()
+                .map(|f| {
+                    use crate::core::db_type::DbType as D;
+                    use crate::core::rql::type_modifier::{TextTypmod, precision_of};
+                    let oid = f.db_type.pg_oid();
+                    let ty = match (&f.db_type, f.text_typmod()) {
+                        (D::DECIMAL, _) => {
+                            let scale = f.scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE).min(38);
+                            let precision = precision_of(&f.name, &schema.type_modifiers).unwrap_or(38).clamp(scale.max(1), 38);
+                            ColType::Decimal { precision: precision as u8, scale: scale as u8 }
+                        }
+                        (D::STRING, Some(TextTypmod::Varchar(n) | TextTypmod::Bpchar(n))) if n > 0 && n <= 4000 => {
+                            ColType::NVarChar(Some(n as u16))
+                        }
+                        _ => match tds::column_type(oid, -1).unwrap_or(ColType::NVarChar(None)) {
+                            ColType::DateTimeOffset if f.without_time_zone => ColType::DateTime2,
+                            other => other,
+                        },
+                    };
+                    let oid = if oid == 1184 && f.without_time_zone { 1114 } else { oid };
+                    Column { name: f.name.clone(), ty, oid }
+                })
+                .collect(),
+        )
     }
 }
 

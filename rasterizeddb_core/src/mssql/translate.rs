@@ -1488,6 +1488,14 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let v = server_property(&prop);
             vec![v.token()]
         }
+        // HAS_PERMS_BY_NAME(securable, class, permission): the privilege
+        // gates are the engine's; the sys schema is not readable as tables.
+        "HAS_PERMS_BY_NAME" => {
+            let r = raw();
+            let securable = r.first().and_then(|a| text_arg(a)).unwrap_or_default().to_ascii_lowercase();
+            let sys = securable.contains("[sys]") || securable.starts_with("sys.") || securable.contains(".sys.");
+            vec![Token::new(Tok::Num(if sys { "0" } else { "1" }.into()))]
+        }
         // STUFF(s, start, length, replacement)
         "STUFF" => {
             let a = args(cx)?;
@@ -3783,7 +3791,7 @@ pub(crate) fn assignment_select(
     sql: &str,
     tokens: &[Token],
     env: &dyn Env,
-) -> Result<Option<(String, Vec<String>)>, TsqlError> {
+) -> Result<Option<(String, Vec<String>, bool)>, TsqlError> {
     let mut i = 1;
     if kw(tokens, i, "TOP") {
         return Ok(None);
@@ -3806,7 +3814,20 @@ pub(crate) fn assignment_select(
     .unwrap_or(tokens.len());
     let mut names = Vec::new();
     let mut select = vec![tokens[0].clone()];
-    for (k, part) in split_commas(&tokens[i..end]).into_iter().enumerate() {
+    let parts = split_commas(&tokens[i..end]);
+    let assigned: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| match p.first().map(|t| &t.tok) {
+            Some(Tok::UserVar(n)) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    // `SELECT @s = @s + x FROM t`: folded row by row in SQL Server.
+    let accumulates = end < tokens.len()
+        && parts.iter().any(|p| {
+            p.iter().skip(2).any(|t| matches!(&t.tok, Tok::UserVar(n) if assigned.contains(&n.as_str())))
+        });
+    for (k, part) in parts.into_iter().enumerate() {
         let Some(Tok::UserVar(name)) = part.first().map(|t| &t.tok) else {
             return Err(TsqlError::new(
                 141,
@@ -3822,7 +3843,7 @@ pub(crate) fn assignment_select(
     select.extend(tokens[end..].iter().cloned());
     let mut cx = Cx::new(env);
     let body = rewrite_select(sql, select, &mut cx, false)?;
-    Ok(Some((render_text(&body), names)))
+    Ok(Some((render_text(&body), names, accumulates)))
 }
 
 #[cfg(test)]
