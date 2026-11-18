@@ -384,6 +384,42 @@ fn aliased_select_item(sql: &str, start: usize, end: usize) -> bool {
     opens && after.len() > 3 && after[..2].eq_ignore_ascii_case(b"AS") && after[2].is_ascii_whitespace()
 }
 
+/// Whether `start` lies in the select list of the `SELECT` that `sql` is:
+/// before its top-level `FROM`, or anywhere in one that has none.
+fn in_select_list(sql: &str, start: usize) -> bool {
+    let trimmed = sql.trim_start();
+    trimmed.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT"))
+        && crate::core::rql::join::find_keyword(sql, "FROM", 0).is_none_or(|from| from > start)
+}
+
+/// A scalar subquery's constant in a select list, typed as its value is,
+/// where a bare literal would not carry the type: a temporal value is quoted
+/// text, and a boolean was written `1`/`0`. Numbers and text stand as they
+/// are.
+fn select_list_typed_literal(literal: String, column_type: Option<&crate::core::db_type::DbType>) -> String {
+    use crate::core::db_type::DbType;
+    if literal == "NULL" {
+        return literal;
+    }
+    let cast = match column_type {
+        Some(DbType::DATETIME) => "timestamptz",
+        Some(DbType::TIMESTAMP) => "timestamp",
+        Some(DbType::DATE) => "date",
+        Some(DbType::INTERVAL) => "interval",
+        Some(DbType::TIME) => "time",
+        Some(DbType::TIMETZ) => "timetz",
+        Some(DbType::BOOL) => {
+            return match literal.as_str() {
+                "1" => "true".to_string(),
+                "0" => "false".to_string(),
+                _ => literal,
+            };
+        }
+        _ => return literal,
+    };
+    format!("{literal}::{cast}")
+}
+
 fn scalar_subquery_label(sql: &str, start: usize, end: usize, inner: &str) -> Option<String> {
     use crate::core::rql::join::find_keyword;
     let trimmed = sql.trim_start();
@@ -1232,6 +1268,17 @@ pub async fn substitute_in_subqueries(
                 Some(crate::core::db_type::DbType::I32) if literal != "NULL" => format!("{literal}::integer"),
                 _ => literal,
             }
+        };
+        // In the select list, a value whose type a bare literal does not
+        // carry is written with it, whole item or inside an expression: as
+        // text, `(SELECT now()) = now()` compared a string with a timestamp
+        // and was false, `(SELECT current_date) + 1` was refused, and a
+        // boolean was the number 1 (`(SELECT true) AND true` failed).
+        let literal = if in_select_list(&current, found.start) {
+            let column_type = rows.first().and_then(|r| r.columns.first()).map(|c| c.column_type.clone());
+            select_list_typed_literal(literal, column_type.as_ref())
+        } else {
+            literal
         };
         let literal = match scalar_subquery_label(&current, found.start, found.end, &found.inner_sql) {
             Some(label) => format!("{} AS \"{}\"", typed(literal), label.replace('"', "\"\"")),

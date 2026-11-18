@@ -6139,6 +6139,20 @@ pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Databa
 /// transaction. Those are refused by name rather than reaching the parser as
 /// text it cannot read.
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
+    // An autocommit statement is its own transaction: `now()` is its start,
+    // one instant for every call and row of it, as pgwire's
+    // `execute_single_statement` sets (`statement_clock`). With no clock set
+    // each call read the wall clock, so `INSERT … VALUES (now(), now())`
+    // stored two different times over native. A caller that already set one
+    // (a native block runs through pgwire's path) keeps it.
+    if crate::core::statement_clock::current().is_some() {
+        return Box::pin(run_native_query_body(query, database)).await;
+    }
+    let clock = crate::core::statement_clock::StatementClock::starting(None);
+    crate::core::statement_clock::scope(clock, Box::pin(run_native_query_body(query, database))).await
+}
+
+async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> {
     let rewritten = match crate::pgwire::rewrite_statement_text(&database, query) {
         Ok(text) => text,
         Err((_, message)) => return error_response(&message),

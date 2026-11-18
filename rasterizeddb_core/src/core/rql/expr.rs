@@ -2285,8 +2285,14 @@ fn keyword_constant(text: &str) -> Option<Expr> {
         // The same instant as a `timestamp` (without time zone): shown with
         // no offset (`yields_timestamp`).
         "LOCALTIMESTAMP" => Some(Expr::Cast(Box::new(Expr::Scalar(now)), DbType::TIMESTAMP)),
-        "CURRENT_DATE" => Some(Expr::Scalar(
-            crate::core::rql::aggregate::ScalarFunc::CurrentDate,
+        // The transaction's date, a `date`: as the bare midnight timestamp it
+        // is evaluated as, `SELECT current_date` showed `… 00:00:00+00` and
+        // was described as a timestamptz, and `(SELECT current_date) + 1`
+        // was refused. (`date_operand` casts it the same way inside
+        // arithmetic; this cast is that one, made everywhere.)
+        "CURRENT_DATE" => Some(Expr::Cast(
+            Box::new(Expr::Scalar(crate::core::rql::aggregate::ScalarFunc::CurrentDate)),
+            DbType::DATE,
         )),
         // `CURRENT_TIME` and `LOCALTIME` are deliberately absent: there is no
         // constant that encodes a bare time of day here, and a wrong instant is
@@ -3935,6 +3941,11 @@ pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> 
     if is_timestamp(a) || is_timestamp(b) {
         if !matches!(op, ArithOp::Add | ArithOp::Sub) {
             return Err(format!("'{}' is not defined for a timestamp", op.symbol()));
+        }
+        // `interval + timestamp` is PostgreSQL's too (`interval_pl_timestamp`),
+        // the same instant as the other way round; it was refused.
+        if matches!(op, ArithOp::Add) && is_interval(a) && is_timestamp(b) {
+            return arith(b, op, a);
         }
 
         // An interval operand may be a real `INTERVAL` value or the plain

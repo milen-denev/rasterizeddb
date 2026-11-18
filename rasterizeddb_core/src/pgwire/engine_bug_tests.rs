@@ -375,3 +375,88 @@ async fn an_unknown_savepoint_fails_the_block() {
         assert_eq!(sqlstate_of(&e), "25P01", "{sql}: {e}");
     }
 }
+
+/// `now()` over the native protocol is the statement's start under
+/// autocommit, one instant for every call: with no statement clock set,
+/// each call read the wall clock, so `INSERT … VALUES (now(), now())` stored
+/// two different times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_now_is_one_instant_per_statement() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE t6 (id BIGINT PRIMARY KEY, a TIMESTAMPTZ, b TIMESTAMPTZ, c TIMESTAMPTZ DEFAULT now())").await;
+    for id in 1..=20 {
+        let out = crate::core::database::run_native_query_for_tests(
+            &format!("INSERT INTO t6 (id, a, b) VALUES ({id}, now(), now())"),
+            db.clone(),
+        )
+        .await;
+        assert_ne!(out.first(), Some(&3), "{}", String::from_utf8_lossy(&out));
+    }
+    assert_eq!(
+        one(&db, &mut s, "SELECT count(*) FROM t6 WHERE a = b AND a = c").await,
+        vec![r(&[Some("20")])]
+    );
+}
+
+/// A scalar subquery folded into a constant keeps its type in a select list:
+/// written as quoted text, `(SELECT now()) = now()` compared a string with a
+/// timestamp and was false, a date or interval could not take part in
+/// arithmetic, a boolean was the number 1, and a `timestamp` was refused.
+/// `CURRENT_DATE` is a `date` (it was a midnight timestamptz), and
+/// `interval + timestamp` is a timestamp, as the other order was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_folded_subquery_keeps_its_type_and_current_date_is_a_date() {
+    let db = db().await;
+    let mut s = session(&db);
+    let t = Some("t");
+    for sql in [
+        "SELECT (SELECT now()) = now()",
+        "SELECT (SELECT now()) - now() = interval '0 seconds'",
+        "SELECT (SELECT now()::timestamp) = now()::timestamp",
+        "SELECT (SELECT '2024-01-01'::date) = '2024-01-01'::date",
+        "SELECT (SELECT current_date) + 1 = current_date + 1",
+        "SELECT (SELECT interval '1 day') + now() > now()",
+        "SELECT (SELECT true) AND true",
+        "SELECT (SELECT '10:00'::time) < '11:00'::time",
+        "SELECT current_date = now()::date",
+        "SELECT '1 day'::interval + '2024-01-01 00:00+00'::timestamptz = '2024-01-02 00:00+00'::timestamptz",
+    ] {
+        assert_eq!(one(&db, &mut s, sql).await, vec![r(&[t])], "{sql}");
+    }
+    assert_eq!(
+        one(
+            &db,
+            &mut s,
+            "SELECT pg_typeof((SELECT now())), pg_typeof(current_date), pg_typeof((SELECT true))"
+        )
+        .await,
+        vec![r(&[
+            Some("timestamp with time zone"),
+            Some("date"),
+            Some("boolean")
+        ])]
+    );
+    // A predicate's subquery stays an untyped constant, read as the column.
+    ok(
+        &db,
+        &mut s,
+        "CREATE TABLE t9 (id BIGINT PRIMARY KEY, d DATE, ts TIMESTAMPTZ, b BOOLEAN)",
+    )
+    .await;
+    ok(&db, &mut s, "INSERT INTO t9 VALUES (1, '2024-01-01', '2024-01-01 10:00+00', true), (2, '2024-02-01', '2024-02-01 10:00+00', false)").await;
+    for (sql, want) in [
+        ("SELECT id FROM t9 WHERE d = (SELECT max(d) FROM t9)", "2"),
+        ("SELECT id FROM t9 WHERE ts < (SELECT max(ts) FROM t9)", "1"),
+        (
+            "SELECT id FROM t9 WHERE b = (SELECT b FROM t9 WHERE id = 1)",
+            "1",
+        ),
+        (
+            "SELECT (SELECT max(d) FROM t9) - d FROM t9 WHERE id = 1",
+            "31",
+        ),
+    ] {
+        assert_eq!(one(&db, &mut s, sql).await, vec![r(&[Some(want)])], "{sql}");
+    }
+}

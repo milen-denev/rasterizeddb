@@ -1272,7 +1272,9 @@ pub fn value_to_literal(db_type: &DbType, bytes: &[u8]) -> Option<String> {
         DbType::JSONTEXT => value_codec::quote_sql(std::str::from_utf8(bytes).ok()?),
         DbType::UUID => value_codec::quote_sql(&value_codec::format_uuid(bytes)),
         DbType::INET => value_codec::quote_sql(&value_codec::format_inet(bytes)?),
-        DbType::DATETIME => {
+        // A `timestamp` (without time zone) has the same eight bytes and
+        // text; it had no arm, and `(SELECT now()::timestamp)` was refused.
+        DbType::DATETIME | DbType::TIMESTAMP => {
             value_codec::quote_sql(&value_codec::format_timestamp_us(i64::from_le_bytes(le::<
                 8,
             >(
