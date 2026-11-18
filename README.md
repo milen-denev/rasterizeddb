@@ -63,6 +63,8 @@ default = ["memory_pool_reuse", "replication_compression", "s3_backup",
 | `kv_storage` | on | A table kept in a key/value store rather than in files, and the `kv:` placement spec |
 | `kv_storage_s3` | on | The S3 backing store for `kv_storage`. Implies `kv_storage` and `s3_backup` |
 | `kv_cache` | on | A Redis-compatible key/value store: `KV …` statements, and the Redis protocol on `--kv-port` |
+| `mysql_wire` | on | The MySQL / MariaDB client protocol on `--mysql-port` / `--mysql-socket` |
+| `mssql_wire` | on | The SQL Server (TDS) client protocol on `--mssql-port` / `--mssql-socket` |
 | `query_stats` | on | `SHOW QUERIES`, `SHOW QUERY STATS` and `pg_stat_statements` |
 | `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
 | `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
@@ -119,6 +121,61 @@ from another host). The two share the role catalogue, which is seeded from
 `--pg-user`/`--pg-password`, so the same role logs in on either; the native
 protocol answers SCRAM only, so keep `--pg-auth scram-sha-256` there. The
 native protocol is single-database and serves `--pg-default-db`.
+
+### MySQL and SQL Server network compatibility
+
+Beside PostgreSQL, the server speaks the **MySQL / MariaDB** client protocol
+and the **SQL Server** protocol (TDS 7.4, and TDS 8.0's TLS-first mode). Each
+is off until it is given a port or a unix socket, and all of them run at once,
+on the same databases and the same roles:
+
+```sh
+cargo run -p rasterizeddb_core -- --location <PATH> --protocol all \
+    --pg-port 5432 --pg-password <password> \
+    --mysql-port 3306 --mysql-socket /run/rdb/mysql.sock \
+    --mssql-port 1433
+
+mysql -h 127.0.0.1 -P 3306 -u rasterized -p postgres
+sqlcmd -S 127.0.0.1,1433 -U rasterized -P <password> -d postgres -C
+```
+
+`--protocol all` (or `both`) also serves the native protocol beside pgwire.
+A MySQL "database" and a SQL Server database are the engine's databases;
+`master` (and the other SQL Server system databases) is the default one.
+
+| Flag | Default | |
+|---|---|---|
+| `--mysql-port`, `--mssql-port` | off | TCP port to serve on |
+| `--mysql-addr`, `--mssql-addr` | `127.0.0.1` | Address to listen on |
+| `--mysql-socket`, `--mssql-socket` | off | Unix socket (`--socket-mode`, `--socket-group` apply) |
+| `--mysql-auth`, `--mssql-auth` | `password` | `password` or `trust` |
+| `--mysql-socket-auth`, `--mssql-socket-auth` | the TCP method | Authentication on the socket |
+| `--mysql-tls`, `--mssql-tls` | `prefer` | `disable`, `prefer` or `require` |
+| `--mysql-cert`/`--mysql-key`, `--mssql-cert`/`--mssql-key` | `--pg-cert`/`--pg-key`, else self-signed | TLS certificate |
+
+Logins are checked against the role catalogue the PostgreSQL listener uses
+(`CREATE USER` there, or over any protocol). MySQL clients authenticate with
+`caching_sha2_password`, MySQL 8's default: a role's first login sends its
+password over TLS (or the unix socket), later ones use the fast scramble. SQL
+Server clients use SQL Server authentication; Windows authentication is not
+offered.
+
+Each connection is translated onto an engine session, so transactions,
+isolation, prepared statements and cancellation behave as they do over
+PostgreSQL. Both dialects are rewritten into the engine's: MySQL's backticks,
+`LIMIT a, b`, `AUTO_INCREMENT`, `ON DUPLICATE KEY UPDATE`, `INSERT IGNORE`,
+`SHOW …`, `@@variables` and functions; T-SQL's `[brackets]`, `TOP`,
+`OFFSET … FETCH`, `IDENTITY`, `OUTPUT INSERTED`, `+` concatenation, batches
+with variables, `IF`/`WHILE`/`TRY…CATCH`, `sp_executesql` and the RPC calls
+drivers make, and the `sys.*` / `INFORMATION_SCHEMA` views. An error inside a
+transaction fails only its statement, as in both of those databases.
+
+Verified with the `mysql` 8.4 and `mariadb` 11.4 clients, a `mysqldump`
+loaded as is, sqlx-mysql, SQLAlchemy 2 + PyMySQL, Microsoft.Data.SqlClient,
+Dapper, EF Core 10, tiberius and ODBC `sqlcmd`. Text compares as bytes (the
+servers report `utf8mb4_bin` / `Latin1_General_BIN2`), not case-insensitively.
+See [`docs/mysql-and-sql-server.md`](docs/mysql-and-sql-server.md) for what is
+translated, what is refused, and why.
 
 ### SQL surface
 

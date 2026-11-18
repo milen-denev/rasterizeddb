@@ -1,0 +1,154 @@
+# MySQL and SQL Server compatibility
+
+RasterizedDB serves the MySQL / MariaDB client protocol (`mysql_wire`) and
+the SQL Server protocol (`mssql_wire`) beside PostgreSQL's, on the same
+databases and roles. This document says how, what each dialect is
+translated into, and where the answers would differ from MySQL's or SQL
+Server's — which is refused rather than answered differently.
+
+## How it is built
+
+A MySQL or SQL Server connection does not have an engine path of its own.
+Each one opens an in-process PostgreSQL session (`pgwire::proxied`) over an
+in-memory pipe and talks to it as a PostgreSQL client would. The front end
+owns three things:
+
+- **The wire format**: MySQL packets, the handshake, text and binary rows;
+  TDS packets, PRELOGIN/LOGIN7, tokens, RPC parameters.
+- **The dialect**: a lexer for MySQL or T-SQL and token-level rewrites into
+  the engine's SQL (`mysql/translate.rs`, `mssql/translate.rs`). Text is
+  never substituted: a keyword inside a string or a quoted name is never
+  touched.
+- **The session statements** each protocol's drivers send: `SET`, `SHOW`,
+  `USE`, `@@variables`; T-SQL's batches, variables and control flow.
+
+Everything else — transaction blocks and their rollback when a connection
+drops, savepoints, isolation levels, prepared statements, statement
+cancellation, idle timeouts, the privilege gates — is the session pgwire
+already runs, so it cannot drift from PostgreSQL's behaviour.
+
+## Common to both
+
+- **Names** are compared case-insensitively (both databases' default), by
+  folding them to lower case. A result column is named as it was written in
+  the select list (`SELECT UserId` returns `UserId`); `SELECT *` returns the
+  names in lower case.
+- **Text compares as bytes.** The servers say so (`utf8mb4_bin`,
+  `Latin1_General_BIN2`). MySQL's and SQL Server's default collations ignore
+  case (and MySQL's accents): `WHERE name = 'abc'` does not match `'ABC'`
+  here.
+- **Index names** are per table in both databases and per database here; an
+  index made through either protocol is stored as `<table>__<name>` and shown
+  under its own name.
+- **An error inside a transaction fails only its statement** (each runs
+  under a savepoint), as in both databases. A deadlock or serialization
+  failure rolls the whole transaction back, as it does there.
+- **Errors** carry the database's own numbers (MySQL 1062, 1146, 1054, …;
+  SQL Server 2627, 208, 207, …), with the PostgreSQL SQLSTATE at the end of
+  the message.
+
+## MySQL / MariaDB
+
+**Connection.** Protocol 4.1 with `CLIENT_DEPRECATE_EOF`, multi-statements
+and multi-results; TLS on TCP and on the unix socket. Authentication is
+`caching_sha2_password` against the role catalogue: a role's first login
+sends its password over a secure channel and is checked against the stored
+SCRAM verifier; later logins use the fast scramble against a hash kept in
+memory (dropped when the password changes). There is no RSA key exchange,
+so a first login over plain TCP is refused with a message saying to use TLS.
+A client asking for another plugin (MariaDB's `mysql_native_password`) is
+switched to this one.
+
+**Statements.**
+
+| MySQL | Sent as |
+|---|---|
+| `` `name` ``, `"str"` (no `ANSI_QUOTES`), `'it\'s'`, `x'ff'`, `b'101'` | names, standard strings, `bytea` |
+| `LIMIT a, b` | `LIMIT b OFFSET a` |
+| `/` | exact division (`a * 1.0 / b`); `DIV` is integer division |
+| `<=>`, `&&`, `\|\|` (unless `PIPES_AS_CONCAT`), `!`, `REGEXP` | `IS NOT DISTINCT FROM`, `AND`, `OR`, `NOT`, `~` |
+| `TRUE`/`FALSE` | `1`/`0` |
+| `AUTO_INCREMENT` | `serial`/`bigserial`; the insert id comes back in the OK packet |
+| `INSERT IGNORE`, `ON DUPLICATE KEY UPDATE … VALUES(c)`, `AS new` | `ON CONFLICT [(key)] DO NOTHING / DO UPDATE … excluded.c` |
+| `REPLACE` naming every column | `ON CONFLICT DO UPDATE` |
+| `UPDATE/DELETE … ORDER BY … LIMIT n` | by primary key in a subquery |
+| multi-table `UPDATE a JOIN b`, `DELETE a FROM a JOIN b` | `UPDATE … FROM`, `DELETE … USING` |
+| `CREATE TABLE` with MySQL types, `KEY`, `UNIQUE KEY`, `ENUM`, table options | engine types, indexes, a `CHECK` for the `ENUM` |
+| `ALTER TABLE … ADD/MODIFY/CHANGE/DROP …, FIRST/AFTER` | one engine `ALTER` per change |
+| `IFNULL`, `IF`, `GROUP_CONCAT`, `DATE_FORMAT`, `DATE_ADD`, `JSON_EXTRACT`, `->>`, … | engine functions |
+| `SQL_CALC_FOUND_ROWS` + `FOUND_ROWS()` | a count of the query without its `LIMIT` |
+| `SHOW DATABASES/TABLES/COLUMNS/INDEX/CREATE TABLE/VARIABLES/…`, `DESCRIBE` | answered from the catalogue |
+| `information_schema … TABLE_SCHEMA = 'db'` | the database name, as MySQL tools expect |
+
+`SET autocommit = 0` holds work in a transaction until `COMMIT`; DDL commits
+what is open first, as in MySQL. `SET FOREIGN_KEY_CHECKS = 0` holds back
+foreign keys a `CREATE TABLE` declares and adds them when it is switched back
+on, which is how a `mysqldump` loads; `LOCK TABLES` is accepted and does
+nothing. Comment-only queries answer OK.
+
+**Refused** (an error, never a different answer): `ON UPDATE
+CURRENT_TIMESTAMP`, `FULLTEXT`/`SPATIAL` indexes and `MATCH … AGAINST`,
+`PARTITION BY`, `CREATE TABLE … LIKE/SELECT`, stored procedures and
+`CALL`, `XOR`, `LOAD DATA`, a `REPLACE` that leaves columns out (MySQL resets
+them to their defaults), `sql_select_limit`, character sets other than
+`utf8mb4`/`utf8`/`ascii`/`binary`, and cursors (`COM_STMT_FETCH`).
+
+`BIGINT UNSIGNED` is a `bigint` (values past 2^63 are refused).
+
+## SQL Server
+
+**Connection.** TDS 7.4 with TLS carried inside PRELOGIN (each TDS packet
+its own TLS record, as SQL Server sends them), or TDS 8.0 (`Encrypt=Strict`:
+TLS first, ALPN `tds/8.0`; the client validates the certificate, so use a
+real one or pin it). A client that asks for encryption gets the whole
+connection encrypted; login-only encryption is not offered, so under
+`--mssql-tls prefer` a client that declines encryption is served without it
+(and sends its password in the clear), and under `require` it is refused.
+The unix socket has no TLS. SQL Server authentication only.
+
+**Requests.** SQL batches; RPC calls `sp_executesql`, `sp_prepare`,
+`sp_prepexec`, `sp_execute`, `sp_unprepare`, `sp_reset_connection` (typed
+parameters are bound through the engine, never written into the SQL);
+transaction-manager requests (`SqlConnection.BeginTransaction`); the
+reset-connection flag of pooled connections; attention.
+
+**Batches** run as SQL Server runs them: statements need no `;`, an error
+ends its statement and the batch goes on (unless `XACT_ABORT`), and
+`DECLARE`/`SET @v`/`SELECT @v = …`, `IF … ELSE`, `BEGIN … END`, `WHILE`,
+`BEGIN TRY … BEGIN CATCH` (with `ERROR_MESSAGE()` and friends), `PRINT`,
+`RAISERROR`, `THROW`, `RETURN`, `EXEC('…')` and `EXEC sp_executesql` work.
+`BEGIN TRAN` nests (`@@TRANCOUNT`) and the client is told of each
+transaction with ENVCHANGE; `SET IMPLICIT_TRANSACTIONS ON` and
+`SET TRANSACTION ISOLATION LEVEL` behave as there.
+
+| T-SQL | Sent as |
+|---|---|
+| `[name]`, `"name"`, `N'…'`, `dbo.`/`db.dbo.` | names (the engine's one schema), strings |
+| `TOP (n)`, `OFFSET … FETCH` | `LIMIT … OFFSET …`; `UPDATE/DELETE TOP` by primary key |
+| `a + b` with a string side | `\|\|` |
+| `IDENTITY(1,1)`, `SCOPE_IDENTITY()`, `@@IDENTITY` | `serial`, the captured value |
+| `OUTPUT INSERTED.x` / `DELETED.x` | `RETURNING x` |
+| EF Core's `MERGE … ON 1=0 WHEN NOT MATCHED THEN INSERT … OUTPUT` | a multi-row `INSERT … RETURNING` |
+| `UPDATE a SET … FROM t a JOIN …`, `DELETE p FROM t AS p` | `UPDATE t AS a … FROM … WHERE`, `DELETE FROM t AS p` |
+| `ISNULL`, `LEN`, `GETDATE`, `DATEADD`, `DATEDIFF` (boundaries), `CONVERT(…, style)`, `IIF`, `CHARINDEX`, `COUNT` (an `int`), … | engine functions |
+| `WITH (NOLOCK)`, `OPTION (…)`, `ON [PRIMARY]`, `CLUSTERED` | dropped |
+| `sys.tables/columns/objects/indexes/types/schemas/databases`, `INFORMATION_SCHEMA.TABLES/COLUMNS`, `OBJECT_ID`, `SERVERPROPERTY`, `@@VERSION` | built from the catalogue |
+
+`master`, `model`, `msdb` and `tempdb` are the default database, so a
+client can create and drop its own (`EnsureCreated`, `EnsureDeleted`).
+
+**Refused**: general `MERGE`, cursors, table variables, stored procedures
+other than the system ones above, `FOR JSON`/`FOR XML`, `rowversion`,
+computed columns, filtered indexes, `SET ROWCOUNT`, `TOP … PERCENT/WITH
+TIES`, bulk load (`SqlBulkCopy`), `OUTPUT … INTO`, and Windows
+authentication. `TRY_CAST`/`TRY_CONVERT` raise the conversion error where
+SQL Server would return NULL.
+
+## Verified with
+
+`mysql` 8.4 and `mariadb` 11.4 clients (TCP, TLS, unix socket), a
+`mysqldump` from MySQL 8.4 loaded as is, sqlx-mysql (prepared statements,
+binary rows), SQLAlchemy 2 + PyMySQL (ORM), Microsoft.Data.SqlClient 7.1,
+Dapper, EF Core 10, tiberius, and ODBC Driver 13 `sqlcmd`.
+`rasterizeddb_compat/tests/mysql_protocol.rs` and `mssql_protocol.rs` run in
+the compat suite.
