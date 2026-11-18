@@ -2397,10 +2397,16 @@ impl<S: StorageIO> Table<S> {
         }
         // Our own uncommitted row is a real duplicate, not a race: retrying
         // would find it again. Only another transaction's unfinished write is
-        // worth waiting out.
+        // worth waiting out. "Our own" is the whole transaction, savepoints
+        // included: a key the block wrote before `SAVEPOINT` (or in one since
+        // released) and written again inside one was "being written by
+        // another transaction", 40001 where PostgreSQL says 23505, and
+        // `transaction()` retries replayed it for nothing. A rolled-back
+        // savepoint's rows are `Aborted`, refused above.
+        let mine = pointer.xmin == writer || manager.top_level(pointer.xmin) == manager.top_level(writer);
         Some(match creator {
-            TxOutcome::InProgress if pointer.xmin != writer => Occupancy::InFlight(pointer.xmin),
-            TxOutcome::Committed if pointer.xmin != writer && !floor.retired(manager, pointer.xmin) => {
+            TxOutcome::InProgress if !mine => Occupancy::InFlight(pointer.xmin),
+            TxOutcome::Committed if !mine && !floor.retired(manager, pointer.xmin) => {
                 Occupancy::Committed(pointer.xmin)
             }
             _ => Occupancy::Held,

@@ -260,3 +260,60 @@ async fn add_constraint_if_not_exists_names_a_foreign_key_and_a_check_properly()
     ok(&db, &mut s, "ALTER TABLE c3 DROP CONSTRAINT c3_v_chk").await;
     ok(&db, &mut s, "INSERT INTO c3 VALUES (4, 99, -1)").await;
 }
+
+/// A key the block wrote itself, written again inside a savepoint, is a
+/// duplicate (23505). The uniqueness check compared the row's writer with
+/// the savepoint's id, took the block's own row for another transaction's
+/// write in flight, and answered 40001, which a retrying caller replayed for
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_of_the_blocks_own_key_inside_a_savepoint_is_23505() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE b4 (id BIGINT PRIMARY KEY, u BIGINT UNIQUE, a BIGINT, b BIGINT, UNIQUE (a, b))").await;
+    for (setup, duplicate) in [
+        ("SAVEPOINT s", "INSERT INTO b4 VALUES (1, 2, 2, 2)"),
+        (
+            "SAVEPOINT s; INSERT INTO b4 VALUES (2, 2, 2, 2); ROLLBACK TO s",
+            "INSERT INTO b4 VALUES (1, 3, 3, 3)",
+        ),
+        (
+            "SAVEPOINT s; INSERT INTO b4 VALUES (2, 2, 2, 2); RELEASE s",
+            "INSERT INTO b4 VALUES (2, 3, 3, 3)",
+        ),
+        (
+            "SAVEPOINT s; SAVEPOINT t",
+            "INSERT INTO b4 VALUES (4, 1, 4, 4)",
+        ),
+        ("SAVEPOINT s", "INSERT INTO b4 VALUES (3, 3, 1, 1)"),
+    ] {
+        ok(&db, &mut s, "BEGIN").await;
+        ok(&db, &mut s, "INSERT INTO b4 VALUES (1, 1, 1, 1)").await;
+        for sql in setup.split("; ") {
+            ok(&db, &mut s, sql).await;
+        }
+        let e = rows(&db, &mut s, duplicate).await.expect_err(duplicate);
+        assert_eq!(sqlstate_of(&e), "23505", "{setup}; {duplicate}: {e}");
+        ok(&db, &mut s, "ROLLBACK").await;
+    }
+
+    // A key a rolled-back savepoint wrote is free again, and ON CONFLICT
+    // inside a savepoint sees the block's own row.
+    ok(&db, &mut s, "BEGIN").await;
+    ok(&db, &mut s, "INSERT INTO b4 VALUES (1, 1, 1, 1)").await;
+    ok(&db, &mut s, "SAVEPOINT s").await;
+    ok(&db, &mut s, "INSERT INTO b4 VALUES (2, 2, 2, 2)").await;
+    ok(&db, &mut s, "ROLLBACK TO s").await;
+    ok(&db, &mut s, "INSERT INTO b4 VALUES (2, 2, 2, 2)").await;
+    ok(
+        &db,
+        &mut s,
+        "INSERT INTO b4 VALUES (1, 6, 6, 6) ON CONFLICT (id) DO UPDATE SET u = 70",
+    )
+    .await;
+    ok(&db, &mut s, "COMMIT").await;
+    assert_eq!(
+        one(&db, &mut s, "SELECT id, u FROM b4 ORDER BY id").await,
+        vec![r(&[Some("1"), Some("70")]), r(&[Some("2"), Some("2")])]
+    );
+}
