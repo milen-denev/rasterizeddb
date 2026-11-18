@@ -39,6 +39,9 @@ const CLIENT_LONG_PASSWORD: u32 = 1;
 const CLIENT_FOUND_ROWS: u32 = 2;
 const CLIENT_LONG_FLAG: u32 = 4;
 const CLIENT_LOCAL_FILES: u32 = 128;
+const CURSOR_TYPE_READ_ONLY: u8 = 1;
+const SERVER_STATUS_CURSOR_EXISTS: u16 = 0x40;
+const SERVER_STATUS_LAST_ROW_SENT: u16 = 0x80;
 const CLIENT_CONNECT_WITH_DB: u32 = 8;
 const CLIENT_NO_SCHEMA: u32 = 16;
 const CLIENT_IGNORE_SPACE: u32 = 256;
@@ -182,6 +185,9 @@ pub(crate) struct Session {
     /// has no temporary tables; see [`crate::sqlcompat::TEMP_PREFIX`]).
     temp_tables: HashMap<String, String>,
     temp_prefix: String,
+    /// Open cursors (an execute with CURSOR_TYPE_READ_ONLY), by statement:
+    /// the columns and the rows not fetched yet.
+    cursors: HashMap<u32, (Vec<MyColumn>, std::collections::VecDeque<Vec<Option<String>>>)>,
     statements: HashMap<u32, Prepared>,
     next_statement: u32,
     next_isolation: Option<String>,
@@ -269,6 +275,7 @@ pub(crate) async fn serve_connection(
         on_update: HashMap::new(),
         temp_tables: HashMap::new(),
         temp_prefix: crate::sqlcompat::temp_table_prefix("my", crate::sqlcompat::next_connection_id()),
+        cursors: HashMap::new(),
         statements: HashMap::new(),
         next_statement: 1,
         next_isolation: None,
@@ -788,6 +795,7 @@ impl Session {
                 0x19 => {
                     // COM_STMT_CLOSE: no answer.
                     let id = Reader::new(body).u32().unwrap_or(0);
+                    self.cursors.remove(&id);
                     if let Some(p) = self.statements.remove(&id) {
                         if let Some(name) = p.engine_name {
                             let b = self.bridge();
@@ -800,6 +808,7 @@ impl Session {
                 }
                 0x1a => {
                     let id = Reader::new(body).u32().unwrap_or(0);
+                    self.cursors.remove(&id);
                     match self.statements.get_mut(&id) {
                         Some(p) => {
                             p.long_data.clear();
@@ -816,7 +825,7 @@ impl Session {
                     }
                     self.end_of_rows(false);
                 }
-                0x1c => self.err(&MyError::unsupported("cursors (COM_STMT_FETCH)")),
+                0x1c => self.com_fetch(body),
                 0x1f => {
                     self.reset_connection().await;
                     self.ok(0, 0, "");
@@ -2901,6 +2910,7 @@ impl Session {
             ));
             return Ok(());
         };
+        let cursor = body.get(4).is_some_and(|f| f & CURSOR_TYPE_READ_ONLY != 0);
         let values = match decode_params(&mut r, &mut prepared) {
             Ok(v) => v,
             Err(e) => {
@@ -2911,6 +2921,15 @@ impl Session {
         };
         prepared.long_data.clear();
         self.warnings.clear();
+        self.cursors.remove(&id);
+        if cursor && prepared.kind == Kind::Query {
+            let r = self.open_cursor(id, &prepared, values).await;
+            self.statements.insert(id, prepared);
+            if let Err(e) = r {
+                self.err(&e);
+            }
+            return Ok(());
+        }
         match &prepared.engine_name {
             Some(name) => {
                 let name = name.clone();
@@ -3184,6 +3203,127 @@ impl Session {
         match error {
             Some(e) => Err(results::error_from_engine(&e)),
             None => Ok(tag_count(&tag).unwrap_or(0)),
+        }
+    }
+}
+
+/// Cursors: COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY answers the columns
+/// and holds the rows, which COM_STMT_FETCH sends a number at a time.
+impl Session {
+    async fn open_cursor(
+        &mut self,
+        id: u32,
+        prepared: &Prepared,
+        values: Vec<Option<ParamValue>>,
+    ) -> Result<(), MyError> {
+        let (fields, rows) = match &prepared.engine_name {
+            Some(name) => {
+                let params: Vec<(i16, Option<Vec<u8>>)> = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, v)| {
+                        let oid = prepared.param_oids.get(k).copied().unwrap_or(0);
+                        match v {
+                            None => (0, None),
+                            Some(ParamValue::Bytes(b)) if oid == 17 => (1, Some(b)),
+                            Some(ParamValue::Bytes(b)) => (0, Some(b)),
+                            Some(ParamValue::Text(t)) => (0, Some(t.into_bytes())),
+                        }
+                    })
+                    .collect();
+                let b = self.bridge();
+                let refs: Vec<(i16, Option<&[u8]>)> = params.iter().map(|(f, v)| (*f, v.as_deref())).collect();
+                b.bind("", name, &refs, &[0]);
+                b.describe(b'P', "");
+                b.execute("", 0);
+                b.sync();
+                let mut error = None;
+                let mut fields = Vec::new();
+                let mut rows = std::collections::VecDeque::new();
+                loop {
+                    let frame = b.next().await.map_err(|e| MyError::new(2013, "HY000", e.to_string()))?;
+                    match frame.tag {
+                        b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
+                        b'T' => fields = parse_row_description(frame.body).unwrap_or_default(),
+                        b'D' => {
+                            if let Ok(cells) = data_row_cells(frame.body) {
+                                rows.push_back(cells.iter().map(|c| c.map(|v| String::from_utf8_lossy(v).into_owned())).collect());
+                            }
+                        }
+                        b'Z' => break,
+                        _ => {}
+                    }
+                }
+                if let Some(e) = error {
+                    return Err(results::error_from_engine(&e));
+                }
+                (fields, rows)
+            }
+            None => {
+                let tokens = lex::lex(&prepared.sql, self.mode()).map_err(|e| MyError::syntax(e.0))?;
+                let tokens: Vec<Token> = tokens
+                    .into_iter()
+                    .map(|t| match t.tok {
+                        Tok::Param(k) => match values.get(k) {
+                            Some(Some(ParamValue::Text(text))) => Token::new(Tok::Str(text.clone().into_bytes())),
+                            Some(Some(ParamValue::Bytes(b))) => Token::new(Tok::Str(b.clone())),
+                            _ => Token::word("NULL"),
+                        },
+                        _ => t,
+                    })
+                    .collect();
+                let tokens = self.rename_temp_references(tokens);
+                let forward = translate::translate(&prepared.sql, tokens, self, false)?;
+                let sql = forward.statements.last().cloned().unwrap_or_default();
+                let (fields, rows) = self.fetch(&sql).await.map_err(|e| results::error_from_engine(&e))?;
+                (fields, rows.into_iter().collect())
+            }
+        };
+        let columns: Vec<MyColumn> = fields.iter().map(results::column_for).collect();
+        let schema = self.database_name().to_string();
+        let at = self.io.begin();
+        put_lenenc_int(self.io.buf(), columns.len() as u64);
+        self.io.end(at);
+        for c in &columns {
+            results::write_column(&mut self.io, &schema, c);
+        }
+        let status = self.status(false) | SERVER_STATUS_CURSOR_EXISTS;
+        let warnings = self.warnings.len() as u16;
+        if self.deprecate_eof() {
+            results::write_ok(&mut self.io, 0, 0, status, warnings, "", true);
+        } else {
+            results::write_eof(&mut self.io, status, warnings);
+        }
+        self.cursors.insert(id, (columns, rows));
+        Ok(())
+    }
+
+    fn com_fetch(&mut self, body: &[u8]) {
+        let mut r = Reader::new(body);
+        let id = r.u32().unwrap_or(0);
+        let n = r.u32().unwrap_or(0).max(1) as usize;
+        log::debug!("COM_STMT_FETCH statement {id}: {n} rows");
+        let Some((columns, mut rows)) = self.cursors.remove(&id) else {
+            self.err(&MyError::new(1421, "HY000", format!("The statement ({id}) has no open cursor.")));
+            return;
+        };
+        for _ in 0..n {
+            let Some(row) = rows.pop_front() else { break };
+            let cells: Vec<Option<&[u8]>> = row.iter().map(|c| c.as_deref().map(str::as_bytes)).collect();
+            let _ = results::write_binary_row(&mut self.io, &columns, &cells);
+        }
+        let mut status = self.status(false) | SERVER_STATUS_CURSOR_EXISTS;
+        if rows.is_empty() {
+            status |= SERVER_STATUS_LAST_ROW_SENT;
+        }
+        let warnings = self.warnings.len() as u16;
+        if self.deprecate_eof() {
+            results::write_ok(&mut self.io, 0, 0, status, warnings, "", true);
+        } else {
+            results::write_eof(&mut self.io, status, warnings);
+        }
+        if !rows.is_empty() {
+            self.cursors.insert(id, (columns, rows));
         }
     }
 }

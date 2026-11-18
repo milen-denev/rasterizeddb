@@ -479,7 +479,12 @@ pub(crate) fn write_ok(
     put_lenenc_int(out, insert_id);
     out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&warnings.to_le_bytes());
-    out.extend_from_slice(info.as_bytes());
+    // The info is length-encoded, as MySQL writes it (net_store_data) and
+    // libmysqlclient and Connector/J read it; nothing when there is none.
+    if !info.is_empty() {
+        put_lenenc_int(out, info.len() as u64);
+        out.extend_from_slice(info.as_bytes());
+    }
     io.end(at);
 }
 
