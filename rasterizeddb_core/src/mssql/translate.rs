@@ -570,6 +570,9 @@ pub(crate) struct Cx<'a> {
     /// left uncast there, where its type is no column's and the engine
     /// does not take a cast inside HAVING.
     past_select_list: bool,
+    /// The FOR XML being rewritten is read back as text with
+    /// `.value('.', …)`: its text is unescaped.
+    xml_value: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -579,6 +582,7 @@ impl<'a> Cx<'a> {
             aliases: Vec::new(),
             window_next: false,
             past_select_list: false,
+            xml_value: false,
         }
     }
 }
@@ -807,6 +811,28 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                     }
                 }
             }
+        }
+        // A subquery: a query of its own (TOP, FOR JSON, …).
+        if t.is_op("(") && kw(&tokens, i + 1, "SELECT") {
+            let close = matching_paren(&tokens, i)
+                .ok_or_else(|| TsqlError::syntax("unbalanced parentheses"))?;
+            // `(SELECT … FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)')`
+            let value_call = tokens.get(close + 1).is_some_and(|d| d.is_op("."))
+                && tokens.get(close + 2).is_some_and(|w| w.is_word("value"))
+                && tokens.get(close + 3).is_some_and(|o| o.is_op("("));
+            let outer_xml = std::mem::replace(&mut cx.xml_value, value_call);
+            let inner = rewrite_select("", tokens[i + 1..close].to_vec(), cx, false);
+            cx.xml_value = outer_xml;
+            out.push(t.clone());
+            out.extend(inner?);
+            out.push(tokens[close].clone());
+            i = close + 1;
+            if value_call {
+                i = matching_paren(&tokens, close + 3)
+                    .ok_or_else(|| TsqlError::syntax("unbalanced .value()"))?
+                    + 1;
+            }
+            continue;
         }
         // A table hint, WITH (NOLOCK), or query hints, OPTION (…): dropped.
         if (t.is_word("WITH")
@@ -1462,8 +1488,21 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let v = server_property(&prop);
             vec![v.token()]
         }
+        // STUFF(s, start, length, replacement)
+        "STUFF" => {
+            let a = args(cx)?;
+            arity(&a, &[4])?;
+            let text = |k: usize| render_text(&a[k]);
+            vec![Token::raw(format!(
+                "(substring({s}, 1, ({start}) - 1) || coalesce({r}, '') || substring({s}, ({start}) + ({len})))",
+                s = text(0),
+                start = text(1),
+                len = text(2),
+                r = text(3)
+            ))]
+        }
         "STRING_SPLIT" | "OPENJSON" | "OPENXML" | "OPENQUERY" | "OPENROWSET" | "PATINDEX"
-        | "STUFF" | "FORMAT" | "TRANSLATE" | "SOUNDEX" | "DIFFERENCE" => {
+        | "FORMAT" | "TRANSLATE" | "SOUNDEX" | "DIFFERENCE" => {
             return Err(TsqlError::unsupported(upper));
         }
         "ERROR_MESSAGE" | "ERROR_NUMBER" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE"
@@ -1823,9 +1862,344 @@ fn rewrite_select(
 ) -> Result<Vec<Token>, TsqlError> {
     // A query has its own select list, wherever it sits.
     let outer = std::mem::replace(&mut cx.past_select_list, false);
-    let r = rewrite_select_inner(sql, tokens, cx, name_items);
+    let r = match find_top(&tokens, 1, &["FOR"]) {
+        Some(f) if kw(&tokens, f + 1, "JSON") => for_json(tokens, f, cx, name_items),
+        Some(f) if kw(&tokens, f + 1, "XML") => for_xml(tokens, f, cx, name_items),
+        _ => rewrite_select_inner(sql, tokens, cx, name_items),
+    };
     cx.past_select_list = outer;
     r
+}
+
+/// FOR JSON / FOR XML's result column, as SQL Server names it.
+const JSON_COLUMN: &str = "JSON_F52E2B61-18A1-11d1-B105-00805F49916B";
+const XML_COLUMN: &str = "XML_F52E2B61-18A1-11d1-B105-00805F49916B";
+
+/// A FOR JSON / FOR XML query's parts: its select items (expression, key)
+/// and what follows them, split at ORDER BY.
+struct Shaped {
+    items: Vec<(Vec<Token>, String)>,
+    tail: Vec<Token>,
+    order: Option<Vec<Token>>,
+    /// DISTINCT, TOP, GROUP BY, aggregates, OFFSET, UNION: the rows are
+    /// those of the query as written, read through a derived table.
+    derived: bool,
+    /// An item holds a subquery. The engine answers a correlated subquery
+    /// wrongly inside a derived table and refuses one beside HAVING, so
+    /// neither is used then.
+    subquery: bool,
+}
+
+fn shape_for(tokens: &[Token], cx: &Cx, what: &str) -> Result<Shaped, TsqlError> {
+    let mut i = 1;
+    let mut derived = false;
+    if kw(tokens, i, "DISTINCT") || kw(tokens, i, "TOP") {
+        derived = true;
+    }
+    if kw(tokens, i, "DISTINCT") || kw(tokens, i, "ALL") {
+        i += 1;
+    }
+    if kw(tokens, i, "TOP") {
+        i += 1;
+        if tokens.get(i).is_some_and(|t| t.is_op("(")) {
+            i = matching_paren(tokens, i).ok_or_else(|| TsqlError::syntax("unbalanced TOP"))? + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let end = find_top(tokens, i, &["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "OFFSET"])
+        .unwrap_or(tokens.len());
+    let mut items = Vec::new();
+    for item in split_commas(&tokens[i..end]) {
+        if item.len() == 1 && item[0].is_op("*") {
+            // SELECT * FROM one table: its columns.
+            let from = find_top(tokens, end, &["FROM"]).ok_or_else(|| TsqlError::unsupported(format!("FOR {what} of SELECT *")))?;
+            let (table, after) = table_name_at(tokens, from + 1).ok_or_else(|| TsqlError::unsupported(format!("FOR {what} of SELECT *")))?;
+            if find_top(tokens, after, &["JOIN"]).is_some() || tokens.get(after).is_some_and(|t| t.is_op(",")) {
+                return Err(TsqlError::unsupported(format!("FOR {what} of SELECT * over a join")));
+            }
+            let view = cx.env.database().schema_view(&table).ok_or_else(|| TsqlError::new(208, format!("Invalid object name '{table}'.")))?;
+            for f in view.schema().fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)) {
+                items.push((vec![Token::new(Tok::Quoted(f.name.clone()))], f.name.clone()));
+            }
+            continue;
+        }
+        let (expr, alias) = if item.len() >= 3 && item[1].is_op("=") && matches!(item[0].tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Str(_)) {
+            let name = match &item[0].tok {
+                Tok::Word(w) | Tok::Quoted(w) => w.clone(),
+                Tok::Str(b) => String::from_utf8_lossy(b).into_owned(),
+                _ => unreachable!(),
+            };
+            (item[2..].to_vec(), Some(name))
+        } else {
+            split_alias(&item)
+        };
+        let column = expr.len() % 2 == 1
+            && expr.iter().enumerate().all(|(k, t)| if k % 2 == 1 { t.is_op(".") } else { matches!(t.tok, Tok::Word(_) | Tok::Quoted(_)) });
+        let key = match alias {
+            Some(a) => a,
+            None if column => expr.last().and_then(|t| t.ident()).unwrap_or_default().to_string(),
+            None => String::new(),
+        };
+        let aggregate = expr.iter().enumerate().any(|(k, t)| {
+            t.upper().is_some_and(|w| matches!(w.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"))
+                && expr.get(k + 1).is_some_and(|o| o.is_op("("))
+        });
+        derived |= aggregate;
+        items.push((expr, key));
+    }
+    let mut tail = tokens[end..].to_vec();
+    if find_top(&tail, 0, &["GROUP", "HAVING", "OFFSET", "UNION", "EXCEPT", "INTERSECT"]).is_some() {
+        derived = true;
+    }
+    let mut order = None;
+    if let Some(o) = find_top(&tail, 0, &["ORDER"]) {
+        if kw(&tail, o + 1, "BY") && !derived {
+            order = Some(tail[o + 2..].to_vec());
+            tail.truncate(o);
+        }
+    }
+    let subquery = items.iter().any(|(e, _)| e.windows(2).any(|w| w[0].is_op("(") && w[1].is_word("SELECT")));
+    if derived && subquery {
+        return Err(TsqlError::unsupported(format!(
+            "FOR {what} with a subquery in a query with DISTINCT, TOP, GROUP BY or aggregates"
+        )));
+    }
+    Ok(Shaped { items, tail, order, derived, subquery })
+}
+
+/// The options after FOR JSON / FOR XML: (mode, its argument, ROOT,
+/// other words).
+fn for_options(tokens: &[Token]) -> (String, Option<String>, Option<String>, Vec<String>) {
+    let mut mode = String::new();
+    let mut arg = None;
+    let mut root = None;
+    let mut words = Vec::new();
+    for (k, part) in split_commas(tokens).into_iter().enumerate() {
+        let word = part.first().and_then(|t| t.upper()).unwrap_or_default();
+        let inner = if part.get(1).is_some_and(|t| t.is_op("(")) {
+            part.get(2).and_then(|t| match &t.tok {
+                Tok::Str(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if k == 0 {
+            mode = word;
+            arg = inner;
+        } else if word == "ROOT" {
+            root = Some(inner.unwrap_or_else(|| "root".into()));
+        } else {
+            words.push(word);
+        }
+    }
+    (mode, arg, root, words)
+}
+
+/// A JSON string's text, as SQL text: `"key"` escaped, then quoted.
+fn json_key_sql(key: &str) -> String {
+    let mut j = String::from("\"");
+    for c in key.chars() {
+        match c {
+            '"' => j.push_str("\\\""),
+            '\\' => j.push_str("\\\\"),
+            c if (c as u32) < 0x20 => j.push_str(&format!("\\u{:04x}", c as u32)),
+            c => j.push(c),
+        }
+    }
+    j.push('"');
+    sql_str(&j)
+}
+
+/// Whether an item's expression is JSON already (a FOR JSON subquery,
+/// JSON_QUERY), which goes in as it is rather than as a string.
+fn is_json_already(expr: &[Token]) -> bool {
+    (expr.first().is_some_and(|t| t.is_op("("))
+        && kw(expr, 1, "SELECT")
+        && matching_paren(expr, 0) == Some(expr.len() - 1)
+        && find_top(&expr[1..expr.len() - 1], 1, &["FOR"]).is_some_and(|f| kw(&expr[1..], f + 1, "JSON")))
+        || (kw(expr, 0, "JSON_QUERY") && expr.get(1).is_some_and(|t| t.is_op("(")))
+}
+
+/// One row's JSON object, from (key path, value SQL, already JSON).
+fn json_object_sql(members: &[(Vec<String>, String, bool)], include_nulls: bool) -> String {
+    // Nested by the key paths' first parts, in the order they appear.
+    let mut groups: Vec<(String, Vec<(Vec<String>, String, bool)>)> = Vec::new();
+    let mut parts = Vec::new();
+    for (path, value, raw) in members {
+        if path.len() > 1 {
+            match groups.iter_mut().find(|(g, _)| *g == path[0]) {
+                Some((_, v)) => v.push((path[1..].to_vec(), value.clone(), *raw)),
+                None => {
+                    groups.push((path[0].clone(), vec![(path[1..].to_vec(), value.clone(), *raw)]));
+                    parts.push(format!("\u{0}{}", path[0]));
+                }
+            }
+            continue;
+        }
+        let key = json_key_sql(&format!("{}", path[0]));
+        let json = if *raw { format!("({value})") } else { format!("(to_jsonb({value}))::text") };
+        parts.push(if include_nulls {
+            format!("{key} || ':' || coalesce({json}, 'null')")
+        } else {
+            format!("CASE WHEN ({value}) IS NULL THEN NULL ELSE {key} || ':' || {json} END")
+        });
+    }
+    let parts: Vec<String> = parts
+        .into_iter()
+        .map(|p| match p.strip_prefix('\u{0}') {
+            Some(group) => {
+                let members = &groups.iter().find(|(g, _)| g == group).unwrap().1;
+                format!("{} || ':' || {}", json_key_sql(group), json_object_sql(members, include_nulls))
+            }
+            None => p,
+        })
+        .collect();
+    format!("('{{' || coalesce(concat_ws(',', {}), '') || '}}')", parts.join(", "))
+}
+
+fn for_json(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Result<Vec<Token>, TsqlError> {
+    let (mode, _, root, words) = for_options(&tokens[at + 2..]);
+    if mode != "PATH" && mode != "AUTO" {
+        return Err(TsqlError::syntax("FOR JSON needs PATH or AUTO"));
+    }
+    let query = &tokens[..at];
+    if mode == "AUTO" && find_top(query, 1, &["JOIN"]).is_some() {
+        return Err(TsqlError::unsupported("FOR JSON AUTO over a join (its nesting by table); use FOR JSON PATH"));
+    }
+    let include_nulls = words.iter().any(|w| w == "INCLUDE_NULL_VALUES");
+    let unwrapped = words.iter().any(|w| w == "WITHOUT_ARRAY_WRAPPER");
+    let shaped = shape_for(query, cx, "JSON")?;
+    if let Some((_, _)) = shaped.items.iter().find(|(_, k)| k.is_empty()) {
+        return Err(TsqlError::new(
+            13605,
+            "Column expressions and data sources without names or aliases cannot be formatted as JSON text using FOR JSON clause. Add alias to the unnamed column or table.",
+        ));
+    }
+    let path = |key: &str| -> Vec<String> {
+        if mode == "PATH" { key.split('.').map(str::to_string).collect() } else { vec![key.to_string()] }
+    };
+    let (members, from_sql) = if shaped.derived {
+        // The query as written, its items named c0, c1, …, read through a
+        // derived table.
+        let mut inner = vec![tokens[0].clone()];
+        let select_end = find_top(query, 1, &["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "OFFSET"]).unwrap_or(query.len());
+        let first_item = (1..select_end).find(|&k| {
+            !(kw(query, k, "DISTINCT") || kw(query, k, "ALL") || kw(query, k, "TOP"))
+        }).unwrap_or(1);
+        let mut k = 1;
+        while k < first_item {
+            inner.push(query[k].clone());
+            k += 1;
+        }
+        // TOP (n): keep its parenthesized count.
+        if kw(query, first_item.saturating_sub(1), "TOP") && query.get(first_item).is_some_and(|t| t.is_op("(")) {
+            let close = matching_paren(query, first_item).unwrap_or(first_item);
+            inner.extend(query[first_item..=close].iter().cloned());
+        } else if kw(query, first_item.saturating_sub(1), "TOP") {
+            inner.push(query[first_item].clone());
+        }
+        for (n, (expr, _)) in shaped.items.iter().enumerate() {
+            if n > 0 {
+                inner.push(Token::op(","));
+            }
+            inner.extend(expr.iter().cloned());
+            inner.push(Token::word("AS"));
+            inner.push(Token::new(Tok::Quoted(format!("c{n}"))));
+        }
+        inner.extend(shaped.tail.iter().cloned());
+        let body = render_text(&rewrite_select_inner("", inner, cx, false)?);
+        let members = shaped
+            .items
+            .iter()
+            .enumerate()
+            .map(|(n, (expr, key))| (path(key), format!("__json.{}", quote_ident(&format!("c{n}"))), is_json_already(expr)))
+            .collect::<Vec<_>>();
+        (members, format!("FROM ({body}) AS __json"))
+    } else {
+        let mut members = Vec::new();
+        for (expr, key) in &shaped.items {
+            let value = render_text(&rewrite_expr(expr.clone(), cx)?);
+            members.push((path(key), value, is_json_already(expr)));
+        }
+        let outer = std::mem::replace(&mut cx.past_select_list, true);
+        let tail = rewrite_expr(shaped.tail.clone(), cx);
+        cx.past_select_list = outer;
+        (members, render_text(&tail?))
+    };
+    let object = json_object_sql(&members, include_nulls);
+    let order = match &shaped.order {
+        Some(o) => {
+            let outer = std::mem::replace(&mut cx.past_select_list, true);
+            let r = rewrite_expr(o.clone(), cx);
+            cx.past_select_list = outer;
+            format!(" ORDER BY {}", render_text(&r?))
+        }
+        None => String::new(),
+    };
+    let rows = format!("string_agg({object}, ','{order})");
+    let mut value = if unwrapped { rows } else { format!("('[' || {rows} || ']')") };
+    if let Some(r) = root {
+        value = format!("('{{' || {} || ':' || coalesce({value}, '[]') || '}}')", json_key_sql(&r));
+    }
+    // At the top a query of no rows answers no rows; as a subquery, NULL.
+    // (With a subquery in its items: a row holding NULL.)
+    let having = if top_level && !shaped.subquery { " HAVING count(*) > 0" } else { "" };
+    Ok(vec![Token::raw(format!("SELECT {value} AS {} {from_sql}{having}", quote_ident(JSON_COLUMN)))])
+}
+
+fn xml_escape_sql(value: &str) -> String {
+    format!("replace(replace(replace(CAST({value} AS text), '&', '&amp;'), '<', '&lt;'), '>', '&gt;')")
+}
+
+/// FOR XML PATH: rows as elements (`PATH('')`: none), columns as elements
+/// named by their aliases (an unnamed column: its text alone), ROOT.
+fn for_xml(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Result<Vec<Token>, TsqlError> {
+    let (mode, arg, root, words) = for_options(&tokens[at + 2..]);
+    if mode != "PATH" {
+        return Err(TsqlError::unsupported(format!("FOR XML {} (FOR XML PATH is)", mode.to_lowercase())));
+    }
+    if words.iter().any(|w| w != "TYPE") {
+        return Err(TsqlError::unsupported(format!("FOR XML … {}", words.join(", "))));
+    }
+    let row = arg.unwrap_or_else(|| "row".into());
+    let shaped = shape_for(&tokens[..at], cx, "XML")?;
+    if shaped.derived {
+        return Err(TsqlError::unsupported("FOR XML over DISTINCT, TOP, GROUP BY or aggregates"));
+    }
+    let escape = !cx.xml_value;
+    let mut parts = Vec::new();
+    for (expr, key) in &shaped.items {
+        let value = render_text(&rewrite_expr(expr.clone(), cx)?);
+        let text = if escape { xml_escape_sql(&value) } else { format!("CAST({value} AS text)") };
+        // A column named by an alias is an element; an unnamed one (or
+        // one aliased [*]) is its text.
+        let named = !key.is_empty() && key != "*";
+        parts.push(if named {
+            format!("CASE WHEN ({value}) IS NULL THEN NULL ELSE {} || {text} || {} END", sql_str(&format!("<{key}>")), sql_str(&format!("</{key}>")))
+        } else {
+            text
+        });
+    }
+    let mut object = format!("concat({})", parts.join(", "));
+    if !row.is_empty() {
+        object = format!("({} || {object} || {})", sql_str(&format!("<{row}>")), sql_str(&format!("</{row}>")));
+    }
+    let outer = std::mem::replace(&mut cx.past_select_list, true);
+    let tail = rewrite_expr(shaped.tail.clone(), cx);
+    let order = match &shaped.order {
+        Some(o) => rewrite_expr(o.clone(), cx).map(|o| format!(" ORDER BY {}", render_text(&o))),
+        None => Ok(String::new()),
+    };
+    cx.past_select_list = outer;
+    let (tail, order) = (render_text(&tail?), order?);
+    let mut value = format!("string_agg({object}, ''{order})");
+    if let Some(r) = root {
+        value = format!("({} || coalesce({value}, '') || {})", sql_str(&format!("<{r}>")), sql_str(&format!("</{r}>")));
+    }
+    let having = if top_level && !shaped.subquery { " HAVING count(*) > 0" } else { "" };
+    Ok(vec![Token::raw(format!("SELECT {value} AS {} {tail}{having}", quote_ident(XML_COLUMN)))])
 }
 
 fn rewrite_select_inner(
@@ -3571,7 +3945,7 @@ mod tests {
         );
         assert_eq!(
             tr(&e, "SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT COUNT(*) FROM v))"),
-            r#"SELECT a, ((count(*))::integer) AS "n" FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT COUNT(*) FROM v))"#
+            r#"SELECT a, ((count(*))::integer) AS "n" FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT ((count(*))::integer) FROM v))"#
         );
         assert_eq!(
             tr(&e, "SELECT 'a' + name + N'b' FROM t"),

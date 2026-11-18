@@ -669,3 +669,76 @@ async fn tiberius_merge() {
     let r = batch(&mut c, "SELECT Qty FROM Stock WHERE Id = 1").await.unwrap();
     assert_eq!(r[0][0].get::<i32, _>(0), Some(15));
 }
+
+/// FOR JSON PATH/AUTO, FOR XML PATH (and the STUFF(… FOR XML PATH('')) way
+/// of joining strings), and T-SQL inside subqueries (TOP).
+#[tokio::test(flavor = "multi_thread")]
+async fn tiberius_for_json_and_xml() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE Authors (Id int PRIMARY KEY, Name nvarchar(40), Born int)").await.unwrap();
+    batch(&mut c, "CREATE TABLE Books (Id int PRIMARY KEY, AuthorId int, Title nvarchar(60))").await.unwrap();
+    batch(&mut c, "INSERT INTO Authors VALUES (1, N'Ann \"A\" <x>', 1970), (2, N'Bo', NULL)").await.unwrap();
+    batch(&mut c, "INSERT INTO Books VALUES (10, 1, N'First'), (11, 1, N'Second'), (12, 2, N'Third')").await.unwrap();
+
+    let json = |r: &Vec<Vec<tiberius::Row>>| r[0][0].get::<&str, _>(0).unwrap().to_string();
+    // Compact, in column order, NULLs left out, nested by dotted names.
+    let r = batch(&mut c, "SELECT Id, Name AS [person.name], Born AS [person.born] FROM Authors ORDER BY Id FOR JSON PATH").await.unwrap();
+    assert_eq!(json(&r), r#"[{"Id":1,"person":{"name":"Ann \"A\" <x>","born":1970}},{"Id":2,"person":{"name":"Bo"}}]"#);
+    let r = batch(&mut c, "SELECT Id, Born FROM Authors WHERE Id = 2 FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER").await.unwrap();
+    assert_eq!(json(&r), r#"{"Id":2,"Born":null}"#);
+    let r = batch(&mut c, "SELECT Id FROM Authors ORDER BY Id DESC FOR JSON AUTO, ROOT('authors')").await.unwrap();
+    assert_eq!(json(&r), r#"{"authors":[{"Id":2},{"Id":1}]}"#);
+    // A nested FOR JSON is JSON, not a string; aggregates go through a
+    // derived table.
+    let r = batch(
+        &mut c,
+        "SELECT a.Name AS name,
+                (SELECT b.Title AS title FROM Books b WHERE b.AuthorId = a.Id ORDER BY b.Id FOR JSON PATH) AS books
+         FROM Authors a ORDER BY a.Id FOR JSON PATH",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        json(&r),
+        r#"[{"name":"Ann \"A\" <x>","books":[{"title":"First"},{"title":"Second"}]},{"name":"Bo","books":[{"title":"Third"}]}]"#
+    );
+    let r = batch(&mut c, "SELECT AuthorId AS a, COUNT(*) AS n FROM Books GROUP BY AuthorId ORDER BY AuthorId FOR JSON PATH").await.unwrap();
+    assert_eq!(json(&r), r#"[{"a":1,"n":2},{"a":2,"n":1}]"#);
+    // No rows: no rows at the top, NULL in a subquery.
+    let r = batch(&mut c, "SELECT Id FROM Authors WHERE Id > 5 FOR JSON PATH").await.unwrap();
+    assert!(r.is_empty() || r[0].is_empty(), "{r:?}");
+    let r = batch(&mut c, "SELECT ISNULL((SELECT Id FROM Authors WHERE Id > 5 FOR JSON PATH), '[]') AS j").await.unwrap();
+    assert_eq!(json(&r), "[]");
+    let e = batch(&mut c, "SELECT Id + 1 FROM Authors FOR JSON PATH").await.unwrap_err();
+    assert_eq!(number(&e), Some(13605), "{e}");
+
+    // FOR XML PATH: elements, escaping, and the string-joining idioms.
+    let r = batch(&mut c, "SELECT Id, Name FROM Authors ORDER BY Id FOR XML PATH('author'), ROOT('authors')").await.unwrap();
+    assert_eq!(
+        json(&r),
+        "<authors><author><Id>1</Id><Name>Ann \"A\" &lt;x&gt;</Name></author><author><Id>2</Id><Name>Bo</Name></author></authors>"
+    );
+    let r = batch(
+        &mut c,
+        "SELECT a.Id, STUFF((SELECT ', ' + b.Title FROM Books b WHERE b.AuthorId = a.Id ORDER BY b.Id FOR XML PATH('')), 1, 2, '') AS titles
+         FROM Authors a ORDER BY a.Id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<&str, _>("titles"), Some("First, Second"));
+    assert_eq!(r[0][1].get::<&str, _>("titles"), Some("Third"));
+    let r = batch(
+        &mut c,
+        "SELECT (SELECT ';' + Name FROM Authors ORDER BY Id FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)') AS raw,
+                (SELECT ';' + Name FROM Authors ORDER BY Id FOR XML PATH('')) AS escaped",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<&str, _>("raw"), Some(";Ann \"A\" <x>;Bo"));
+    assert_eq!(r[0][0].get::<&str, _>("escaped"), Some(";Ann \"A\" &lt;x&gt;;Bo"));
+
+    // TOP inside a subquery.
+    let r = batch(&mut c, "SELECT (SELECT TOP 1 Title FROM Books ORDER BY Id DESC) AS last").await.unwrap();
+    assert_eq!(r[0][0].get::<&str, _>("last"), Some("Third"));
+}
