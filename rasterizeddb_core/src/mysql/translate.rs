@@ -26,6 +26,13 @@
 use rclite::Arc;
 
 use super::lex::{Mode, Tok, Token, matching_paren, split_commas};
+pub(crate) use crate::sqlcompat::{call, find_top, ident_sql, kw, literal_str, quote_ident, string_sql, wrap};
+
+/// Tokens back to text. Never fails today; kept fallible so a rewrite that
+/// leaves something unrenderable can say so.
+pub(crate) fn render(tokens: &[Token]) -> Result<String, MyError> {
+    Ok(crate::sqlcompat::render_text(tokens))
+}
 use crate::core::database::Database;
 
 /// A value MySQL's session holds: a system or user variable.
@@ -180,165 +187,9 @@ impl<'a> Cx<'a> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// A name as the engine is sent it: folded to lower case, quoted when it
-/// would not survive unquoted.
-pub(crate) fn ident_sql(name: &str) -> String {
-    let lower = name.to_lowercase();
-    let plain = !lower.is_empty()
-        && lower
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && lower.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && !is_pg_reserved(&lower);
-    if plain { lower } else { quote_ident(&lower) }
-}
-
-fn is_pg_reserved(word: &str) -> bool {
-    matches!(
-        word,
-        "all" | "analyse" | "analyze" | "and" | "any" | "array" | "as" | "asc" | "asymmetric" | "both" | "case"
-            | "cast" | "check" | "collate" | "column" | "constraint" | "create" | "current_catalog"
-            | "current_date" | "current_role" | "current_time" | "current_timestamp" | "current_user"
-            | "default" | "deferrable" | "desc" | "distinct" | "do" | "else" | "end" | "except" | "false"
-            | "fetch" | "for" | "foreign" | "from" | "grant" | "group" | "having" | "in" | "initially"
-            | "intersect" | "into" | "lateral" | "leading" | "limit" | "localtime" | "localtimestamp" | "not"
-            | "null" | "offset" | "on" | "only" | "or" | "order" | "placing" | "primary" | "references"
-            | "returning" | "select" | "session_user" | "some" | "symmetric" | "system_user" | "table"
-            | "then" | "to" | "trailing" | "true" | "union" | "unique" | "user" | "using" | "variadic"
-            | "when" | "where" | "window" | "with"
-    )
-}
-
-/// Words a `(` after them is not a call of: kept apart, as the engine reads
-/// `SELECT(` as one unknown word.
-fn is_keyword_before_paren(word: &str) -> bool {
-    matches!(
-        word.to_ascii_uppercase().as_str(),
-        "SELECT" | "IN" | "VALUES" | "AND" | "OR" | "NOT" | "EXISTS" | "WHERE" | "ON" | "AS" | "FROM" | "JOIN"
-            | "USING" | "WHEN" | "THEN" | "ELSE" | "CASE" | "BY" | "ALL" | "ANY" | "SOME" | "INTO" | "TABLE"
-            | "LIKE" | "IS" | "BETWEEN" | "DISTINCT" | "UNION" | "RETURNING" | "SET" | "LIMIT" | "OFFSET"
-            | "HAVING" | "WITH" | "RECURSIVE" | "LATERAL" | "INTERSECT" | "EXCEPT" | "KEY" | "UNIQUE" | "CHECK"
-            | "REFERENCES" | "FOREIGN" | "PRIMARY" | "DEFAULT" | "OVER" | "PARTITION" | "FILTER" | "WITHIN"
-    )
-}
-
-pub(crate) fn string_sql(value: &[u8]) -> String {
-    match std::str::from_utf8(value) {
-        Ok(text) if !text.contains('\0') => format!("'{}'", text.replace('\'', "''")),
-        _ => bytea_sql(value),
-    }
-}
-
-fn bytea_sql(value: &[u8]) -> String {
-    let mut out = String::with_capacity(value.len() * 2 + 12);
-    out.push_str("'\\x");
-    for b in value {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out.push_str("'::bytea");
-    out
-}
-
-/// Tokens back to text.
-pub(crate) fn render(tokens: &[Token]) -> Result<String, MyError> {
-    let mut out = String::new();
-    let mut prev: Option<&Token> = None;
-    for t in tokens {
-        if let Some(p) = prev {
-            let glue = p.is_op("(")
-                || p.is_op(".")
-                || t.is_op(",")
-                || t.is_op(")")
-                || t.is_op(".")
-                || matches!(&t.tok, Tok::Raw(r) if r.starts_with("::"));
-            let call = t.is_op("(")
-                && !t.space
-                && match &p.tok {
-                    Tok::Word(w) => !is_keyword_before_paren(w),
-                    Tok::Raw(_) => true,
-                    _ => false,
-                };
-            if !glue && !call {
-                out.push(' ');
-            }
-        }
-        match &t.tok {
-            Tok::Word(w) => {
-                if w.chars().next().is_some_and(|c| c.is_ascii_digit()) || w.contains('$') || !w.is_ascii() {
-                    out.push_str(&quote_ident(&w.to_lowercase()));
-                } else {
-                    out.push_str(w);
-                }
-            }
-            Tok::Quoted(name) => out.push_str(&ident_sql(name)),
-            Tok::Str(value) => out.push_str(&string_sql(value)),
-            Tok::Num(n) => out.push_str(n),
-            Tok::Hex(bytes) => out.push_str(&bytea_sql(bytes)),
-            Tok::Param(i) => out.push_str(&format!("${}", i + 1)),
-            Tok::SysVar(name) => return Err(MyError::new(1193, "HY000", format!("Unknown system variable '{name}'"))),
-            Tok::UserVar(name) => out.push_str(&format!("@{name}")),
-            Tok::Op(o) => out.push_str(o),
-            Tok::Raw(r) => out.push_str(r),
-        }
-        prev = Some(t);
-    }
-    Ok(out)
-}
-
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
-
-fn kw(tokens: &[Token], i: usize, word: &str) -> bool {
-    tokens.get(i).is_some_and(|t| t.is_word(word))
-}
-
-/// The index of the next depth-0 word among `words`, from `from`.
-pub(crate) fn find_top(tokens: &[Token], from: usize, words: &[&str]) -> Option<usize> {
-    let mut depth = 0i32;
-    for (i, t) in tokens.iter().enumerate().skip(from) {
-        if t.is_op("(") {
-            depth += 1;
-        } else if t.is_op(")") {
-            depth -= 1;
-        } else if depth == 0 && words.iter().any(|w| t.is_word(w)) {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn wrap(inner: Vec<Token>) -> Vec<Token> {
-    let mut out = Vec::with_capacity(inner.len() + 2);
-    out.push(Token::op("("));
-    out.extend(inner);
-    out.push(Token::op(")"));
-    out
-}
-
-fn call(name: &str, args: Vec<Vec<Token>>) -> Vec<Token> {
-    let mut out = vec![Token::raw(name)];
-    let mut open = Token::op("(");
-    open.space = false;
-    out.push(open);
-    for (i, arg) in args.into_iter().enumerate() {
-        if i > 0 {
-            out.push(Token::op(","));
-        }
-        out.extend(arg);
-    }
-    out.push(Token::op(")"));
-    out
-}
-
-fn literal_str(text: &str) -> Token {
-    Token::new(Tok::Str(text.as_bytes().to_vec()))
-}
 
 /// The unit of `INTERVAL n unit` in the engine's words.
 fn interval_unit(word: &str) -> Option<(&'static str, i64)> {
@@ -1844,17 +1695,7 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
 // DDL
 // ---------------------------------------------------------------------------
 
-/// MySQL index names are per table; the engine's are per database. An
-/// index made here is named `<table>__<name>`, which [`plain_index_name`]
-/// takes apart again.
-pub(crate) fn index_name(table: &str, name: &str) -> String {
-    format!("{}__{}", table.to_lowercase(), name.to_lowercase())
-}
-
-/// An index name as MySQL shows it.
-pub(crate) fn plain_index_name<'a>(table: &str, name: &'a str) -> &'a str {
-    name.strip_prefix(&format!("{}__", table.to_lowercase())).unwrap_or(name)
-}
+pub(crate) use crate::sqlcompat::{index_name, plain_index_name};
 
 /// A column list for an index, prefix lengths (`name(10)`) and ASC/DESC
 /// stripped of what the engine does not take.

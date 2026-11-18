@@ -401,7 +401,9 @@ pub(crate) fn write_err(io: &mut Packets, error: &MyError) {
 /// An engine error, in MySQL's numbering. The PostgreSQL code is kept at the
 /// end of the message, so nothing it said is lost.
 pub(crate) fn error_from_engine(notice: &PgNotice) -> MyError {
-    let (code, state): (u16, &'static str) = match notice.code.as_str() {
+    // The engine reports some unknown columns as a syntax error.
+    let sqlstate = if notice.message.contains("not found in schema") { "42703" } else { notice.code.as_str() };
+    let (code, state): (u16, &'static str) = match sqlstate {
         "23505" => (1062, "23000"),
         "23502" => (1048, "23000"),
         "23503" => (1452, "23000"),

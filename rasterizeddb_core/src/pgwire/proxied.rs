@@ -476,3 +476,34 @@ pub(crate) fn tls_acceptor(cert_path: Option<String>, key_path: Option<String>) 
         key_path,
     })
 }
+
+/// [`tls_acceptor`], offering `alpn` (TDS 8.0 clients ask for `tds/8.0`).
+/// The protocols are offered, not required: a client that names none is
+/// served all the same.
+pub(crate) fn tls_acceptor_with_alpn(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    alpn: Vec<Vec<u8>>,
+) -> io::Result<TlsAcceptor> {
+    ensure_crypto_provider();
+    let (certs, key) = match (&cert_path, &key_path) {
+        (Some(cert_path), Some(key_path)) => load_tls_from_pem(cert_path, key_path)?,
+        (None, None) => rastcp::cert::generate_self_signed_cert().map_err(|e| io::Error::other(e.to_string()))?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS needs both a certificate and a key, or neither",
+            ));
+        }
+    };
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    config.alpn_protocols = alpn;
+    // No TLS 1.3 tickets: TDS 7.x wraps the handshake in its own packets and
+    // stops wrapping when the handshake ends, so a ticket written after that
+    // point would reach a client expecting the other framing.
+    config.send_tls13_tickets = 0;
+    Ok(TlsAcceptor::from(StdArc::new(config)))
+}

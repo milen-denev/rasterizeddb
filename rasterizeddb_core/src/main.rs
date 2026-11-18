@@ -526,6 +526,54 @@ struct Args {
     #[arg(long = "mysql-key", value_name = "PATH")]
     mysql_key: Option<String>,
 
+    // --- SQL Server protocol (TDS) -----------------------------------------
+    /// Also serve the SQL Server (TDS) client protocol on this TCP port (1433
+    /// is SQL Server's), beside the other listeners, on the same databases
+    /// and roles. Off unless this or `--mssql-socket` is given.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-port", value_name = "PORT")]
+    mssql_port: Option<u16>,
+
+    /// Address the SQL Server protocol listens on (default: 127.0.0.1).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-addr", default_value = "127.0.0.1")]
+    mssql_addr: String,
+
+    /// Also serve the SQL Server protocol on this unix socket. Its
+    /// permissions are `--socket-mode` and `--socket-group`; no TLS on it.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-socket", value_name = "PATH")]
+    mssql_socket: Option<std::path::PathBuf>,
+
+    /// How SQL Server clients authenticate: `password` (SQL Server
+    /// authentication against the role catalogue, the default) or `trust`.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-auth", default_value = "password")]
+    mssql_auth: String,
+
+    /// How callers on `--mssql-socket` authenticate; defaults to
+    /// `--mssql-auth`.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-socket-auth", value_name = "METHOD")]
+    mssql_socket_auth: Option<String>,
+
+    /// SQL Server protocol TLS: disable, prefer (default) or require. A client
+    /// that asks for encryption gets the whole connection encrypted.
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-tls", default_value = "prefer")]
+    mssql_tls: String,
+
+    /// PEM certificate chain for the SQL Server listener (default:
+    /// `--pg-cert`, else a self-signed one made at start-up).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-cert", value_name = "PATH")]
+    mssql_cert: Option<String>,
+
+    /// PEM private key for the SQL Server listener (default: `--pg-key`).
+    #[cfg(feature = "mssql_wire")]
+    #[arg(long = "mssql-key", value_name = "PATH")]
+    mssql_key: Option<String>,
+
     /// How callers on `--rdb-socket` authenticate: `scram-sha-256`, `trust`,
     /// or `peer` — a role may log in without a password when its name is the
     /// operating-system user connecting, which the kernel reports. Defaults to
@@ -1060,6 +1108,52 @@ fn mysql_config(args: &Args) -> Result<Option<rasterizeddb_core::mysql::MyConfig
         tls,
         cert_path: args.mysql_cert.clone().or_else(|| args.pg_cert.clone()),
         key_path: args.mysql_key.clone().or_else(|| args.pg_key.clone()),
+        bootstrap_user,
+        bootstrap_password,
+        limits: compat_limits(args),
+    }))
+}
+
+/// The SQL Server listener's configuration, or `None` when it is not asked for.
+#[cfg(feature = "mssql_wire")]
+fn mssql_config(args: &Args) -> Result<Option<rasterizeddb_core::mssql::MsConfig>, String> {
+    use rasterizeddb_core::mssql::{MsAuth, MsConfig, MsSocket, MsTls};
+    if args.mssql_port.is_none() && args.mssql_socket.is_none() {
+        if args.mssql_socket_auth.is_some() {
+            return Err("--mssql-socket-auth needs --mssql-socket".into());
+        }
+        return Ok(None);
+    }
+    let auth = MsAuth::parse(&args.mssql_auth)
+        .ok_or_else(|| format!("unknown --mssql-auth {:?}: expected password or trust", args.mssql_auth))?;
+    let tls = MsTls::parse(&args.mssql_tls)
+        .ok_or_else(|| format!("unknown --mssql-tls {:?}: expected disable, prefer or require", args.mssql_tls))?;
+    let socket = match &args.mssql_socket {
+        Some(path) => {
+            let auth = match args.mssql_socket_auth.as_deref() {
+                None => None,
+                Some(text) => Some(MsAuth::parse(text).ok_or_else(|| {
+                    format!("unknown --mssql-socket-auth {text:?}: expected password or trust")
+                })?),
+            };
+            let (mode, group) = socket_permissions(args);
+            Some(MsSocket { path: path.clone(), mode, group, auth })
+        }
+        None => {
+            if args.mssql_socket_auth.is_some() {
+                return Err("--mssql-socket-auth needs --mssql-socket".into());
+            }
+            None
+        }
+    };
+    let (bootstrap_user, bootstrap_password) = bootstrap_role(args);
+    Ok(Some(MsConfig {
+        tcp: args.mssql_port.map(|port| (args.mssql_addr.clone(), port)),
+        socket,
+        auth,
+        tls,
+        cert_path: args.mssql_cert.clone().or_else(|| args.pg_cert.clone()),
+        key_path: args.mssql_key.clone().or_else(|| args.pg_key.clone()),
         bootstrap_user,
         bootstrap_password,
         limits: compat_limits(args),
@@ -1909,6 +2003,30 @@ fn main() -> std::io::Result<()> {
             }
         };
 
+        // The SQL Server protocol, the same way.
+        #[cfg(feature = "mssql_wire")]
+        let mssql_server = match mssql_config(&args) {
+            Ok(None) => None,
+            Ok(Some(config)) => {
+                let started = match rasterizeddb_core::mssql::bind(config).await {
+                    Ok(listener) => rasterizeddb_core::mssql::serve(listener, catalog.clone()).await,
+                    Err(e) => Err(e),
+                };
+                match started {
+                    Ok(server) => Some(server),
+                    Err(e) => {
+                        eprintln!("could not start the SQL Server protocol listener: {e}");
+                        rasterizeddb_core::shutdown::finalize();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+
         let sealing = catalog.clone();
         let native_side = async move {
             match native {
@@ -1938,6 +2056,10 @@ fn main() -> std::io::Result<()> {
         }
         #[cfg(feature = "mysql_wire")]
         if let Some(server) = mysql_server {
+            server.drain(std::time::Duration::from_secs(10)).await;
+        }
+        #[cfg(feature = "mssql_wire")]
+        if let Some(server) = mssql_server {
             server.drain(std::time::Duration::from_secs(10)).await;
         }
         // Every listener has drained and ended its sessions: the shutdown

@@ -451,8 +451,12 @@ pub mod memory_pool;
 pub mod native_auth;
 pub mod pg_params;
 pub mod pgwire;
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+pub(crate) mod sqlcompat;
 #[cfg(feature = "mysql_wire")]
 pub mod mysql;
+#[cfg(feature = "mssql_wire")]
+pub mod mssql;
 
 /// Multi-primary replication between instances, over `rastcp`.
 pub mod replication;
