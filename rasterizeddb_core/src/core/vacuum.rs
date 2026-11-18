@@ -2373,20 +2373,31 @@ pub(crate) mod run_once_test_hooks {
     /// After each chunk of the pointer sweep (parks once, after the first).
     pub(crate) const IN_SCAN: u8 = 3;
 
-    static CHUNK: parking_lot::Mutex<Option<(usize, usize)>> = parking_lot::Mutex::new(None);
+    // One entry per table, keyed by its free-space map's address. Each was a
+    // single slot: tests running at once overwrote each other's, so a sweep
+    // waited at no park, or read whole-size chunks, and the test that armed
+    // it timed out ("the sweep never reached its first chunk", "never
+    // reached its park point"). A table's tests hold it for as long as its
+    // entries matter, so its address is not reused meanwhile.
+    static CHUNK: parking_lot::Mutex<Vec<(usize, usize)>> = parking_lot::Mutex::new(Vec::new());
 
     /// Sweeps of `free_space`'s table read `records` pointer records a chunk,
     /// so a test can stop one between chunks without writing thousands of
     /// rows.
     pub(crate) fn set_chunk_records(free_space: &super::FreeSpace, records: usize) {
-        *CHUNK.lock() = Some((free_space as *const _ as usize, records));
+        let at = free_space as *const _ as usize;
+        let mut chunks = CHUNK.lock();
+        chunks.retain(|(a, _)| *a != at);
+        chunks.push((at, records));
     }
 
     pub(super) fn chunk_records(free_space: &super::FreeSpace) -> usize {
-        match *CHUNK.lock() {
-            Some((at, records)) if at == free_space as *const _ as usize => records,
-            _ => super::SCAN_RECORDS_PER_CHUNK,
-        }
+        let at = free_space as *const _ as usize;
+        CHUNK
+            .lock()
+            .iter()
+            .find(|(a, _)| *a == at)
+            .map_or(super::SCAN_RECORDS_PER_CHUNK, |(_, records)| *records)
     }
 
     #[derive(Default)]
@@ -2397,28 +2408,69 @@ pub(crate) mod run_once_test_hooks {
         pub release: tokio::sync::Notify,
     }
 
-    static PARK: parking_lot::Mutex<Option<(usize, u8, Arc<Park>)>> = parking_lot::Mutex::new(None);
+    static PARK: parking_lot::Mutex<Vec<(usize, u8, Arc<Park>)>> = parking_lot::Mutex::new(Vec::new());
 
+    /// Parks the next run of `free_space`'s table at `point`, once. Arming a
+    /// table again replaces its own park, not another table's.
     pub(crate) fn arm(free_space: &super::FreeSpace, point: u8) -> Arc<Park> {
+        let at = free_space as *const _ as usize;
         let park = Arc::new(Park::default());
-        *PARK.lock() = Some((free_space as *const _ as usize, point, park.clone()));
+        let mut parks = PARK.lock();
+        parks.retain(|(a, _, _)| *a != at);
+        parks.push((at, point, park.clone()));
         park
     }
 
     pub(super) async fn reached(free_space: &super::FreeSpace, point: u8) {
         let park = {
-            let mut g = PARK.lock();
-            match g.as_ref() {
-                Some((at, p, _)) if *at == free_space as *const _ as usize && *p == point => {
-                    g.take().map(|(_, _, park)| park)
-                }
-                _ => None,
-            }
+            let at = free_space as *const _ as usize;
+            let mut parks = PARK.lock();
+            parks
+                .iter()
+                .position(|(a, p, _)| *a == at && *p == point)
+                .map(|i| parks.swap_remove(i).2)
         };
         if let Some(park) = park {
             park.parked.notify_one();
             park.release.notified().await;
         }
+    }
+
+    /// Another table's arm leaves this table's park, and its chunk size,
+    /// where they were: tests running at once each park their own sweep.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_table_keeps_its_own_park_and_chunk_size() {
+        // In an `Arc` before anything is armed: the hooks key a table by its
+        // map's address, and moving it would change that.
+        let a = Arc::new(super::FreeSpace::new(true));
+        let b = super::FreeSpace::new(true);
+        set_chunk_records(&a, 8);
+        set_chunk_records(&b, 16);
+        let park_a = arm(&a, IN_SCAN);
+        let park_b = arm(&b, AFTER_SCAN);
+        assert_eq!(chunk_records(&a), 8);
+        assert_eq!(chunk_records(&b), 16);
+
+        let run = a.clone();
+        let parked = tokio::spawn(async move { reached(&run, IN_SCAN).await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), park_a.parked.notified())
+            .await
+            .expect("table a's run parks at its own point");
+        park_a.release.notify_one();
+        parked.await.unwrap();
+        // Taken once: a's next run passes straight through, and b's park is
+        // still armed for b.
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached(&a, IN_SCAN))
+            .await
+            .expect("a second run of a does not park");
+        let b_at = &b as *const _ as usize;
+        assert!(PARK.lock().iter().any(|(at, p, _)| *at == b_at && *p == AFTER_SCAN));
+        // Nothing of these two left behind: a table later allocated at one of
+        // their addresses would park with no one to release it.
+        let a_at = &*a as *const _ as usize;
+        PARK.lock().retain(|(at, _, _)| *at != a_at && *at != b_at);
+        CHUNK.lock().retain(|(at, _)| *at != a_at && *at != b_at);
+        drop(park_b);
     }
 }
 
