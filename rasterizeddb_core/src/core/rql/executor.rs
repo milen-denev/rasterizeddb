@@ -5759,10 +5759,14 @@ async fn constant_select_insert(
         // A nullary scalar function is evaluated for this one row.
         let literal = if let Some(open) = item.find('(') {
             let name = item[..open].trim();
-            let (func, db_type) = crate::core::rql::aggregate::ScalarFunc::parse(name)
-                .ok_or_else(|| format!("'{}' is not a constant this can evaluate", item))?;
-            crate::core::rql::subquery::value_to_literal(&db_type, &func.evaluate())
-                .ok_or_else(|| format!("'{}' produced a value that cannot be written", item))?
+            match crate::core::rql::aggregate::ScalarFunc::parse(name) {
+                Some((func, db_type)) => crate::core::rql::subquery::value_to_literal(&db_type, &func.evaluate())
+                    .ok_or_else(|| format!("'{}' produced a value that cannot be written", item))?,
+                // Any other call (`nextval('s')`, `lower('A')`) goes into the
+                // VALUES tuple as written, where the insert evaluates it for
+                // this one row.
+                None => item.to_string(),
+            }
         } else if item.starts_with('\'')
             || item.starts_with('"')
             || item
@@ -18418,64 +18422,16 @@ async fn returning_rows_for_write<S: crate::core::storage_providers::traits::Sto
     if let Some(updates) = updates {
         for row in rows.iter_mut() {
             let mut computed: Vec<(u64, crate::memory_pool::MemoryBlock, DbTypeRef)> = Vec::new();
-            for (write_order, expression) in expressions {
-                // Propagated rather than skipped: a skipped evaluation fell
-                // through to the assignment's empty placeholder below, which
-                // reported "" for a column whose write was about to succeed —
-                // a silent wrong answer. The write path fails the statement on
-                // the same evaluation error, and this runs before it, so both
-                // now fail identically.
-                // At the target's declared scale, as the write path computes it.
-                let value = match schema
-                    .iter()
-                    .find(|f| f.write_order as u32 == *write_order as u32)
-                {
-                    // Held to the column's declared length or precision, as
-                    // the write path stores it: a text-typed `'qq   '` into
-                    // `character(4)` is reported `qq  `, not as assigned.
-                    Some(target) => crate::core::rql::expr::held_to_text_length(
-                        crate::core::rql::expr::eval_into(expression, row, schema, target)?,
-                        target,
-                    )?,
-                    None => crate::core::rql::expr::eval(expression, row, schema)?,
-                };
-                // NULL is a value here, not an absence: without an entry the
-                // placeholder overlay reported the empty string where the
-                // write path was about to store NULL and set its companion.
-                if matches!(value, crate::core::rql::expr::Value::Null) {
-                    computed.push((
-                        u64::from(*write_order),
-                        crate::memory_pool::MemoryBlock::default(),
-                        crate::core::db_type::DbType::NULL,
-                    ));
-                    continue;
-                }
-                if let crate::core::rql::expr::Value::Data { bytes, .. } = value {
-                    // Fitted to the column's declared width, and reported as
-                    // the column's own type — exactly as the write path stores
-                    // it. Arithmetic widens to an i64, so `SET n = n + 1` on an
-                    // `int4` produced eight bytes; handed to the renderer as an
-                    // `int4` those decoded to nothing and `RETURNING` came back
-                    // empty while the stored value was right.
-                    let Some(target) = schema.iter().find(|f| f.write_order as u32 == *write_order)
-                    else {
-                        continue;
-                    };
-                    let variable = target.db_type.is_variable_width();
-                    let width = if variable {
-                        bytes.len()
-                    } else {
-                        target.size as usize
-                    };
-                    let mut mb = crate::memory_pool::MEMORY_POOL.acquire(width);
-                    let slot = mb.into_slice_mut();
-                    slot.fill(0);
-                    let n = bytes.len().min(slot.len());
-                    slot[..n].copy_from_slice(&bytes[..n]);
-                    computed.push((u64::from(*write_order), mb, target.db_type.physical()));
+            // Each computed assignment as the write stored it: the update
+            // paths collect every row with them applied
+            // (`Table::returning_image`). Evaluated again here, `SET id =
+            // nextval('s')` or `SET token = gen_random_uuid()` reported a
+            // second value, not the one the row holds.
+            for (write_order, _) in expressions {
+                if let Some(cell) = row.columns.iter().find(|c| u64::from(c.schema_id) == u64::from(*write_order)) {
+                    computed.push((u64::from(*write_order), cell.data.clone(), cell.column_type.clone()));
                 }
             }
-
             for column in row.columns.iter_mut() {
                 if let Some((_, data, db_type)) = computed
                     .iter()

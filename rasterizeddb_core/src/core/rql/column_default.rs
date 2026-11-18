@@ -481,7 +481,7 @@ fn evaluate_in(
     // from it, so a row that is never written never takes a value.
     if let Some(name) = crate::core::rql::sequence::parse_nextval(text) {
         return Ok(match database {
-            Some(database) => crate::core::rql::sequence::next(database, &name).to_string(),
+            Some(database) => crate::core::rql::sequence::next_checked(database, &name)?.to_string(),
             // Validation: the shape is all that is being checked, and nothing
             // reads this value.
             None => String::new(),

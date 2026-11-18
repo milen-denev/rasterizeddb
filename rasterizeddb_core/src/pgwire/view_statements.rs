@@ -24,7 +24,7 @@ fn last_command_tag(bytes: &[u8]) -> String {
 /// statement: its output goes nowhere, and a failure comes back as its
 /// message, already recorded on the session (a block already failed by it)
 /// as any statement's is. The view guards let it through.
-async fn run_for_view(database: &Arc<Database>, state: &mut SessionState, sql: &str) -> io::Result<Result<String, String>> {
+pub(super) async fn run_internal(database: &Arc<Database>, state: &mut SessionState, sql: &str) -> io::Result<Result<String, String>> {
     let mut sink = std::io::Cursor::new(Vec::<u8>::new());
     let was_internal = std::mem::replace(&mut state.view_internal, true);
     let ran = Box::pin(execute_single_statement(database, state, &mut sink, sql, &[], true)).await;
@@ -36,7 +36,7 @@ async fn run_for_view(database: &Arc<Database>, state: &mut SessionState, sql: &
     Ok(Ok(last_command_tag(sink.get_ref())))
 }
 
-/// [`run_for_view`] for a query: the column names its `RowDescription` gave.
+/// [`run_internal`] for a query: the column names its `RowDescription` gave.
 async fn run_for_view_described(
     database: &Arc<Database>,
     state: &mut SessionState,
@@ -79,7 +79,7 @@ fn row_description_names(bytes: &[u8]) -> Vec<String> {
     Vec::new()
 }
 
-/// Reports a failure a [`run_for_view`] statement already recorded.
+/// Reports a failure a [`run_internal`] statement already recorded.
 async fn report_run_failure<S>(stream: &mut S, message: &str) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -310,7 +310,7 @@ where
             expanded,
             if with_data { "" } else { " WITH NO DATA" }
         );
-        match run_for_view(database, state, &ctas).await? {
+        match run_internal(database, state, &ctas).await? {
             Ok(tag) => tag,
             Err(e) => return report_run_failure(stream, &e).await,
         }
@@ -415,7 +415,7 @@ where
         }
         if view.kind == ViewKind::Materialized {
             let sql = format!("DROP TABLE {}", views::quote_ident(&view.name));
-            if let Err(e) = run_for_view(database, state, &sql).await? {
+            if let Err(e) = run_internal(database, state, &sql).await? {
                 report_run_failure(stream, &e).await?;
                 return Ok(Err(()));
             }
@@ -487,14 +487,14 @@ where
     // reader sees the view emptied between them.
     let own_block = state.transaction.is_none();
     if own_block {
-        if let Err(e) = run_for_view(database, state, "BEGIN").await? {
+        if let Err(e) = run_internal(database, state, "BEGIN").await? {
             return report_run_failure(stream, &e).await;
         }
     }
     let previous = state.refreshing_materialized.replace(name.clone());
     let mut failure = None;
     for sql in &statements {
-        if let Err(e) = run_for_view(database, state, sql).await? {
+        if let Err(e) = run_internal(database, state, sql).await? {
             failure = Some(e);
             break;
         }
@@ -502,7 +502,7 @@ where
     state.refreshing_materialized = previous;
     if own_block {
         let end = if failure.is_some() { "ROLLBACK" } else { "COMMIT" };
-        let ended = run_for_view(database, state, end).await?;
+        let ended = run_internal(database, state, end).await?;
         if failure.is_none()
             && let Err(e) = ended
         {
@@ -557,7 +557,7 @@ where
     }
     if view.kind == ViewKind::Materialized {
         let sql = format!("ALTER TABLE {} RENAME TO {}", views::quote_ident(from), views::quote_ident(to));
-        if let Err(e) = run_for_view(database, state, &sql).await? {
+        if let Err(e) = run_internal(database, state, &sql).await? {
             return report_run_failure(stream, &e).await;
         }
     }
@@ -682,7 +682,7 @@ where
                 return Ok(false);
             }
             // The rename, then its views pointed at the new name.
-            match run_for_view(database, state, stmt).await? {
+            match run_internal(database, state, stmt).await? {
                 Ok(_) => {}
                 Err(e) => {
                     report_run_failure(stream, &e).await?;

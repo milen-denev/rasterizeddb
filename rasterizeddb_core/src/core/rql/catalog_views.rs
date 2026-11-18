@@ -48,6 +48,8 @@ const VIEWS: &[&str] = &[
     "views",
     "pg_views",
     "pg_matviews",
+    "sequences",
+    "pg_sequences",
 ];
 
 /// The columns each view is built with, in order.
@@ -208,6 +210,29 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("ispopulated", BOOL),
             ("definition", STRING),
         ],
+        "sequences" => &[
+            ("sequence_catalog", STRING),
+            ("sequence_schema", STRING),
+            ("sequence_name", STRING),
+            ("data_type", STRING),
+            ("start_value", STRING),
+            ("minimum_value", STRING),
+            ("maximum_value", STRING),
+            ("increment", STRING),
+            ("cycle_option", STRING),
+        ],
+        "pg_sequences" => &[
+            ("schemaname", STRING),
+            ("sequencename", STRING),
+            ("data_type", STRING),
+            ("start_value", I64),
+            ("min_value", I64),
+            ("max_value", I64),
+            ("increment_by", I64),
+            ("cycle", BOOL),
+            ("cache_size", I64),
+            ("last_value", I64),
+        ],
         _ => return None,
     })
 }
@@ -269,7 +294,7 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 3] = ["columns", "tables", "views"];
+const QUALIFIED_ONLY: [&str; 4] = ["columns", "tables", "views", "sequences"];
 
 /// Whether `view` may only be matched with its schema in front of it.
 fn needs_qualifier(view: &str) -> bool {
@@ -917,6 +942,14 @@ async fn build(
         .filter(|name| !is_internal(name))
         .filter(|name| !is_view_of(name, crate::core::rql::views::ViewKind::Materialized))
         .collect();
+    // Every sequence: those `CREATE SEQUENCE` made, and those a column's
+    // default reads (a `SERIAL`'s, an identity column's), as PostgreSQL
+    // lists both.
+    let sequences: Vec<SequenceRow> = if matches!(view, "sequences" | "pg_sequences" | "pg_class") {
+        sequence_rows(database, view_tx).await?
+    } else {
+        Vec::new()
+    };
 
     let (create, inserts) = match view {
         "pg_tables" => (
@@ -959,6 +992,16 @@ async fn build(
                     oid_of(SCHEMA),
                     bytes,
                     tuples
+                ));
+            }
+            for seq in &sequences {
+                rows.push(format!(
+                    "INSERT INTO {} (oid, relname, relnamespace, relkind, relsize, reltuples) \
+                     VALUES ({}, '{}', {}, 'S', 0, 1)",
+                    temp,
+                    oid_of(&seq.name),
+                    escape(&seq.name),
+                    oid_of(SCHEMA)
                 ));
             }
             // A view is a relation of kind 'v' with no storage, a
@@ -1095,6 +1138,58 @@ async fn build(
                 ),
                 rows,
             )
+        }
+        "sequences" | "pg_sequences" => {
+            let mut rows = Vec::new();
+            for seq in &sequences {
+                rows.push(match view {
+                    "sequences" => format!(
+                        "INSERT INTO {} (sequence_catalog, sequence_schema, sequence_name, data_type, start_value, \
+                         minimum_value, maximum_value, increment, cycle_option) VALUES ('{}', '{}', '{}', '{}', '{}', \
+                         '{}', '{}', '{}', '{}')",
+                        temp,
+                        escape(&database.name),
+                        SCHEMA,
+                        escape(&seq.name),
+                        seq.data_type,
+                        seq.start,
+                        seq.min,
+                        seq.max,
+                        seq.increment,
+                        if seq.cycle { "YES" } else { "NO" }
+                    ),
+                    _ => format!(
+                        "INSERT INTO {} (schemaname, sequencename, data_type, start_value, min_value, max_value, \
+                         increment_by, cycle, cache_size, last_value) VALUES ('{}', '{}', '{}', {}, {}, {}, {}, {}, \
+                         {}, {})",
+                        temp,
+                        SCHEMA,
+                        escape(&seq.name),
+                        seq.data_type,
+                        seq.start,
+                        seq.min,
+                        seq.max,
+                        seq.increment,
+                        if seq.cycle { "TRUE" } else { "FALSE" },
+                        seq.cache,
+                        seq.last.map_or("NULL".to_string(), |v| v.to_string())
+                    ),
+                });
+            }
+            let create = match view {
+                "sequences" => format!(
+                    "CREATE TABLE {} (sequence_catalog TEXT, sequence_schema TEXT, sequence_name TEXT, data_type TEXT, \
+                     start_value TEXT, minimum_value TEXT, maximum_value TEXT, increment TEXT, cycle_option TEXT)",
+                    temp
+                ),
+                _ => format!(
+                    "CREATE TABLE {} (schemaname TEXT, sequencename TEXT, data_type TEXT, start_value BIGINT, \
+                     min_value BIGINT, max_value BIGINT, increment_by BIGINT, cycle BOOLEAN, cache_size BIGINT, \
+                     last_value BIGINT)",
+                    temp
+                ),
+            };
+            (create, rows)
         }
         "views" | "pg_views" | "pg_matviews" => {
             use crate::core::rql::views::ViewKind;
@@ -1795,6 +1890,81 @@ fn oid_of(name: &str) -> i64 {
     // Kept positive and inside i32 range: `oid` is a 32-bit unsigned type in
     // PostgreSQL and a client may decode it as one.
     ((hash % 2_000_000_000) + 16_384) as i64
+}
+
+/// One sequence as the catalogue relations list it.
+struct SequenceRow {
+    name: String,
+    data_type: String,
+    start: i64,
+    min: i64,
+    max: i64,
+    increment: i64,
+    cycle: bool,
+    cache: i64,
+    last: Option<i64>,
+}
+
+/// Every sequence of `database` as `tx` sees it: each explicit one with its
+/// counter as it stands, and each implicit one a column default reads.
+async fn sequence_rows(
+    database: &Arc<Database>,
+    tx: Option<crate::core::mvcc::transaction::TxId>,
+) -> Result<Vec<SequenceRow>, String> {
+    use crate::core::rql::{sequence, sequence_catalog};
+    let mut out: Vec<SequenceRow> = Vec::new();
+    for def in sequence_catalog::load(database, None, tx).await? {
+        let live = sequence::explicit(database.id, &def.name);
+        let last = match &live {
+            Some(s) if s.called.load(std::sync::atomic::Ordering::SeqCst) => Some(s.last.load(std::sync::atomic::Ordering::SeqCst)),
+            Some(_) => None,
+            None => def.is_called.then_some(def.last_value),
+        };
+        out.push(SequenceRow {
+            name: def.name,
+            data_type: def.data_type,
+            start: def.start,
+            min: def.min,
+            max: def.max,
+            increment: def.increment,
+            cycle: def.cycle,
+            cache: def.cache,
+            last,
+        });
+    }
+    for (name, table, column) in sequence_catalog::implicit_sequences(database) {
+        if out.iter().any(|s| s.name == name) {
+            continue;
+        }
+        let data_type = database
+            .schema_view(&table)
+            .and_then(|v| {
+                v.schema().fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&column)).map(|f| f.db_type.clone())
+            })
+            .map_or("bigint", |t| match t {
+                crate::core::db_type::DbType::I16 => "smallint",
+                crate::core::db_type::DbType::I32 => "integer",
+                _ => "bigint",
+            });
+        let max = match data_type {
+            "smallint" => i16::MAX as i64,
+            "integer" => i32::MAX as i64,
+            _ => i64::MAX,
+        };
+        out.push(SequenceRow {
+            name: name.clone(),
+            data_type: data_type.to_string(),
+            start: 1,
+            min: 1,
+            max,
+            increment: 1,
+            cycle: false,
+            cache: 1,
+            last: sequence::current(database.id, &name).filter(|v| *v > 0),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 /// Tables the engine keeps for itself, which PostgreSQL's catalogue would not

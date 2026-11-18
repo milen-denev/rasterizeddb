@@ -80,10 +80,11 @@ async fn identity_columns_number_rows_and_guard_always() {
     let from_select = ids(&pool, "INSERT INTO a OVERRIDING USER VALUE SELECT a, b FROM src RETURNING id").await;
     assert!(from_select.iter().all(|id| *id != 50 && *id != 51), "{from_select:?}");
     pool.execute("DELETE FROM a WHERE id IN (50, 51)").await.expect("tidy");
-    // SET id = DEFAULT gets past the ALWAYS check; it then needs nextval as
-    // an expression, which a SERIAL's DEFAULT needs too, and is refused by
-    // name (0A000) until sequences are first-class.
-    assert_eq!(refused(&pool, "UPDATE a SET id = DEFAULT WHERE v = 'x'").await, "0A000");
+    // SET id = DEFAULT takes the next value, as PostgreSQL's does.
+    let before: i64 = sqlx::query("SELECT id FROM a WHERE v = 'x'").fetch_one(&pool).await.expect("x").get(0);
+    pool.execute("UPDATE a SET id = DEFAULT WHERE v = 'x'").await.expect("SET id = DEFAULT");
+    let after: i64 = sqlx::query("SELECT id FROM a WHERE v = 'x'").fetch_one(&pool).await.expect("x").get(0);
+    assert!(after > before, "{before} -> {after}");
     pool.execute("DELETE FROM a WHERE v IN ('p', 'q')").await.expect("tidy");
 
     // BY DEFAULT takes a value as written, as SERIAL does.

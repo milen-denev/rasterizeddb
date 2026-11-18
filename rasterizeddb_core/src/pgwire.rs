@@ -37,6 +37,7 @@ use crate::pg_params::{BoundParam, inline_params};
 
 mod param_infer;
 mod view_statements;
+mod sequence_statements;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -2759,6 +2760,9 @@ struct SessionState {
     /// The materialized view a `REFRESH` is filling: the one write to a
     /// materialized view expansion lets through.
     refreshing_materialized: Option<String>,
+    /// This session's `nextval` results, for `currval` and `lastval`
+    /// (`rql::sequence::session`).
+    sequence_values: StdArc<std::sync::Mutex<crate::core::rql::sequence::session::SessionSequences>>,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -3131,6 +3135,7 @@ impl SessionState {
             statement_error: None,
             view_internal: false,
             refreshing_materialized: None,
+            sequence_values: StdArc::default(),
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -6873,7 +6878,34 @@ pub(crate) fn rewrite_statement_text<'a>(
 /// not transactional here, so a statement that fails part-way would otherwise
 /// leave tables behind to collide with the next run, and the body returns early
 /// in a dozen places.
+/// [`execute_single_statement_unscoped`], with this session's sequence values
+/// in reach of the statement's expressions (`nextval`, `currval`, a `DEFAULT
+/// nextval(…)`), and a sequence's reservation written ahead after it.
 async fn execute_single_statement<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let scope = crate::core::rql::sequence::session::Scope {
+        database: database.id,
+        values: state.sequence_values.clone(),
+    };
+    let ran = crate::core::rql::sequence::session::scoped(
+        scope,
+        Box::pin(execute_single_statement_unscoped(database, state, stream, stmt, result_formats, omit_description)),
+    )
+    .await;
+    crate::core::rql::sequence_catalog::flush(database).await;
+    ran
+}
+
+async fn execute_single_statement_unscoped<S>(
     database: &Arc<Database>,
     state: &mut SessionState,
     stream: &mut S,
@@ -6904,6 +6936,29 @@ where
     if let Some(parsed) = crate::core::rql::views::parse_view_statement(stmt) {
         return view_statements::handle_view_statement(database, state, stream, parsed).await;
     }
+    if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
+        return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
+    }
+    if database.has_table(crate::core::rql::sequence_catalog::SEQUENCE_TABLE)
+        && !state.view_internal
+        && let Some(ddl) = crate::core::rql::views::table_ddl(stmt)
+        && sequence_statements::guard_table_ddl(database, state, stream, stmt, &ddl).await?
+    {
+        return Ok(());
+    }
+    let prepared_sequences;
+    let stmt = match sequence_statements::prepare_statement(database, state.current_tx(), stmt).await {
+        Ok(None) => stmt,
+        Ok(Some(text)) => {
+            crate::core::rql::prepared::note_rewritten();
+            prepared_sequences = text;
+            prepared_sequences.as_str()
+        }
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
     let expanded_views;
     let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
         if !state.view_internal
@@ -8936,6 +8991,14 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         // PostgreSQL's own codes for a generation expression it refuses:
         // a subquery is a missing feature, the rest a bad definition.
         "0A000"
+    } else if has("nextval: reached maximum value") || has("nextval: reached minimum value") {
+        // A sequence at its bound with no CYCLE.
+        "2200H"
+    } else if has("is not yet defined in this session") {
+        // `currval`/`lastval` before any `nextval`.
+        "55000"
+    } else if has("setval: value") && has("is out of bounds for sequence") {
+        "22003"
     } else if has("both default and identity specified") || has("drop identity instead") {
         // PostgreSQL's codes for an identity declaration it refuses.
         "42601"

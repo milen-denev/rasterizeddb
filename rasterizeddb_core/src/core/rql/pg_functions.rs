@@ -138,6 +138,13 @@ pub enum PgFunc {
     JsonbSet,
     /// `jsonb_strip_nulls(doc)`.
     JsonbStripNulls,
+    /// `nextval(regclass)`, `currval(regclass)`, `setval(regclass, n[,
+    /// is_called])`, `lastval()`: a sequence's values (`rql::sequence`), for
+    /// the database and session a statement's scope names.
+    NextVal,
+    CurrVal,
+    SetVal,
+    LastVal,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -150,7 +157,8 @@ pub const NAMES: &[&str] = &[
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
-    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS",
+    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
+    "LASTVAL",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -270,6 +278,10 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "ARRAY_CAT" => (ArrayCat, &[2]),
         "JSONB_SET" => (JsonbSet, &[3, 4]),
         "JSONB_STRIP_NULLS" => (JsonbStripNulls, &[1]),
+        "NEXTVAL" => (NextVal, &[1]),
+        "CURRVAL" => (CurrVal, &[1]),
+        "SETVAL" => (SetVal, &[2, 3]),
+        "LASTVAL" => (LastVal, &[0]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -314,6 +326,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
             DbType::DECIMAL
         }
         Power | Cbrt | Exp | Ln | Log | Log10 | Pi | Degrees | Radians | Random => DbType::F64,
+        NextVal | CurrVal | SetVal | LastVal => DbType::I64,
         Div => DbType::DECIMAL,
         Gcd | Lcm => match first() {
             DbType::I64 => DbType::I64,
@@ -1652,6 +1665,25 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             data(crate::core::jsonb::set_path(&jsonb_of(&args[0])?, &path, &jsonb_of(&args[2])?, create)?, DbType::JSONB)
         }
         JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
+        NextVal | CurrVal | SetVal | LastVal => {
+            use crate::core::rql::sequence;
+            let database = sequence::session::database()
+                .ok_or_else(|| "sequence functions are not available in this context".to_string())?;
+            let value = match func {
+                NextVal => sequence::next_checked(database, &sequence::sequence_name_of(&s(0)))?,
+                CurrVal => sequence::session::current(&sequence::sequence_name_of(&s(0)))?,
+                LastVal => sequence::session::last()?,
+                _ => {
+                    let is_called = match args.get(2) {
+                        Some(Value::Data { bytes, db_type: DbType::BOOL }) => bytes.first().is_some_and(|b| *b != 0),
+                        Some(other) => text_of(other).eq_ignore_ascii_case("true") || text_of(other) == "t",
+                        None => true,
+                    };
+                    sequence::set_value(database, &sequence::sequence_name_of(&s(0)), int_of(&args[1], "the value")?, is_called)?
+                }
+            };
+            data(value.to_le_bytes().to_vec(), DbType::I64)
+        }
         TimezoneToLocal | TimezoneToUtc => {
             let Value::Data { bytes, .. } = &args[1] else {
                 return Ok(Value::Null);

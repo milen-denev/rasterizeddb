@@ -483,6 +483,14 @@ pub(crate) fn written_null(value: &str) -> bool {
     {
         return false;
     }
+    // A call that consumes a sequence value is not evaluated to ask whether
+    // it is NULL (it never is): evaluated here and again by the write, every
+    // `VALUES (nextval('s'), …)` took two values and stored the second.
+    if crate::core::sql_scan::contains_ignore_ascii_case(value, b"nextval")
+        || crate::core::sql_scan::contains_ignore_ascii_case(value, b"setval")
+    {
+        return false;
+    }
     let empty = crate::core::row::row::Row {
         position: 0,
         length: 0,
