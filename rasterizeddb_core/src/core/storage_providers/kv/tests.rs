@@ -502,6 +502,51 @@ async fn a_compacted_file_reopens_from_its_base_chunks() {
     assert_eq!(read_all(&io).await, expected);
 }
 
+/// The file's state as a restart recovers it is the state it had: a
+/// compaction that stored no leftovers took a sequence it stored nothing at,
+/// so the process was one ahead of what a restart recovers, and a key/value
+/// index snapshot sealed after it (which records that state) was rejected at
+/// every restart and every index rebuilt (`partition_kv_snapshot`).
+#[tokio::test]
+async fn a_compaction_leaves_the_state_a_restart_recovers() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let mut expected: Vec<u8> = (0..30_000u32).map(|i| (i % 251) as u8).collect();
+    let before = {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "rows.db").await;
+        for block in expected.chunks(1000) {
+            let txn = io.begin_txn();
+            io.append_data_txn(txn, block).await;
+            io.commit_durable(txn).await.unwrap();
+        }
+        io.compact_now().await.unwrap();
+        io.kv_state_now().expect("a key/value file has a state")
+    };
+    let after = {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "rows.db").await;
+        let after = io.kv_state_now().expect("a key/value file has a state");
+        // A batch at the sequence the compaction gave back is replayed.
+        let txn = io.begin_txn();
+        io.append_data_txn(txn, b"after the compaction").await;
+        io.commit_durable(txn).await.unwrap();
+        after
+    };
+    assert_eq!(after, before, "the state a restart recovers after a compaction");
+    expected.extend_from_slice(b"after the compaction");
+    let before = {
+        let family = open_family(store.clone()).await;
+        let io = open(&family, "rows.db").await;
+        assert_eq!(read_all(&io).await, expected);
+        io.compact_now().await.unwrap();
+        io.kv_state_now().expect("a key/value file has a state")
+    };
+    let family = open_family(store).await;
+    let io = open(&family, "rows.db").await;
+    assert_eq!(io.kv_state_now().expect("a key/value file has a state"), before);
+    assert_eq!(read_all(&io).await, expected);
+}
+
 #[tokio::test]
 async fn compaction_leaves_an_open_transaction_alone() {
     let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());

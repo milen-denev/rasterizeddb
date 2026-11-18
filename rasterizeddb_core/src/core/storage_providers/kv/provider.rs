@@ -2510,6 +2510,25 @@ impl KvFile {
             // this one and must not be undone by merging the copy back.
             let frozen = state.frozen.take().expect("held");
             state.reserved_seq = None;
+            // A pass with no leftovers stored nothing at its reserved
+            // sequence, so a restart recovers the next sequence as
+            // `max(compacted_upto, highest delta + 1)` — the reserved one —
+            // while this process had moved past it. A key/value snapshot
+            // records the next sequence as part of the files' state
+            // (`index_store::kv_snapshot`), and one sealed after such a pass
+            // was rejected at every restart ("StoreState") and every index
+            // rebuilt. Given back unless a batch has taken the one after it
+            // since, in which case that batch's object makes recovery agree.
+            // Reusing it is safe: the META retires sequences *below*
+            // `compacted_upto`, so a batch stored at it is still replayed.
+            if !wrote_leftovers {
+                let _ = self.next_seq.compare_exchange(
+                    reserved_seq + 1,
+                    reserved_seq,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
             let remaining = unfolded(&frozen, &folded);
             // A reader that fetched its base bytes before the fold and applies
             // the overlays after this point would find the folded bytes in
