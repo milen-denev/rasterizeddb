@@ -281,3 +281,49 @@ async fn mysql_refuses_a_wrong_password_and_plain_first_login() {
     let e = sqlx::MySqlConnection::connect(&mysql_url(&s, "nosuch", "required")).await.unwrap_err();
     assert_eq!(code(&e).0, Some(1049), "{e}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_prepared_session_statements_and_catalogue() {
+    let s = start(MyAuth::Trust);
+    let mut c = sqlx::MySqlConnection::connect(&format!("mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled", s.mysql_port))
+        .await
+        .unwrap();
+    c.execute("CREATE TABLE people (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20), born DATE, t TIME)").await.unwrap();
+    sqlx::query("INSERT INTO people (name, born, t) VALUES (?, ?, ?)")
+        .bind("ada")
+        .bind(chrono::NaiveDate::from_ymd_opt(1815, 12, 10).unwrap())
+        .bind(chrono::NaiveTime::from_hms_opt(13, 14, 15).unwrap())
+        .execute(&mut c)
+        .await
+        .unwrap();
+    // Statements the engine does not prepare (SHOW, SET) still prepare, and
+    // answer in the binary row format.
+    let rows = sqlx::query("SHOW COLUMNS FROM people").fetch_all(&mut c).await.unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[1].get::<String, _>("Field"), "name");
+    sqlx::query("SET @who = ?").bind("ada").execute(&mut c).await.unwrap();
+    let name: String = sqlx::query_scalar("SELECT name FROM people WHERE name = @who").fetch_one(&mut c).await.unwrap();
+    assert_eq!(name, "ada");
+    // Dates and times round-trip through binds and binary rows.
+    let row = sqlx::query("SELECT born, t FROM people WHERE id = ?").bind(1).fetch_one(&mut c).await.unwrap();
+    assert_eq!(row.get::<chrono::NaiveDate, _>("born"), chrono::NaiveDate::from_ymd_opt(1815, 12, 10).unwrap());
+    assert_eq!(row.get::<chrono::NaiveTime, _>("t"), chrono::NaiveTime::from_hms_opt(13, 14, 15).unwrap());
+    // MySQL's information_schema calls the database TABLE_SCHEMA.
+    let found: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+    )
+    .bind("postgres")
+    .bind("people")
+    .fetch_one(&mut c)
+    .await
+    .unwrap();
+    assert_eq!(found, 1);
+    // A query cancelled with KILL QUERY from another connection.
+    let id: i64 = sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut c).await.unwrap();
+    let mut killer = sqlx::MySqlConnection::connect(&format!("mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled", s.mysql_port))
+        .await
+        .unwrap();
+    let kill = format!("KILL QUERY {id}");
+    killer.execute(sqlx::AssertSqlSafe(kill)).await.unwrap();
+    c.close().await.unwrap();
+}

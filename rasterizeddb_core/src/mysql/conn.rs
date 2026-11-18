@@ -273,7 +273,7 @@ async fn handshake(
     nonce: &[u8; 20],
     over_limit: bool,
 ) -> io::Result<Option<Login>> {
-    let tls_offered = shared.acceptor.is_some() && !io.stream.is_unix();
+    let tls_offered = shared.acceptor.is_some();
     let mut caps = SERVER_CAPABILITIES;
     if tls_offered {
         caps |= CLIENT_SSL;
@@ -312,14 +312,13 @@ async fn handshake(
         }
         let seq = io.seq;
         let plain = std::mem::replace(&mut io.stream, MyStream::Upgrading);
-        let MyStream::Tcp(tcp) = plain else {
-            return Err(io::Error::other("TLS over a stream that is not TCP"));
+        let aborted = |e: io::Error| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string());
+        io.stream = match plain {
+            MyStream::Tcp(tcp) => MyStream::Tls(Box::new(acceptor.accept(tcp).await.map_err(aborted)?)),
+            #[cfg(unix)]
+            MyStream::Unix(unix) => MyStream::TlsUnix(Box::new(acceptor.accept(unix).await.map_err(aborted)?)),
+            _ => return Err(io::Error::other("TLS asked for twice")),
         };
-        let tls = acceptor
-            .accept(tcp)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e.to_string()))?;
-        io.stream = MyStream::Tls(Box::new(tls));
         io.seq = seq;
         response = io.read().await?;
         client_caps = Reader::new(&response).u32().unwrap_or(0);
@@ -1137,7 +1136,14 @@ impl Session {
         };
         let statements = lex::split_statements(tokens);
         if statements.is_empty() {
-            self.err(&MyError::new(1065, "42000", "Query was empty"));
+            // Comments alone are an empty statement, answered OK (the mysql
+            // client sends a dump's comments on their own); only a query
+            // with nothing in it is an error.
+            if sql.iter().all(|b| b.is_ascii_whitespace() || *b == b';') {
+                self.err(&MyError::new(1065, "42000", "Query was empty"));
+            } else {
+                self.ok(0, 0, "");
+            }
             return Ok(());
         }
         if statements.len() > 1 && self.caps & CLIENT_MULTI_STATEMENTS == 0 {
@@ -1728,7 +1734,7 @@ impl Session {
                     vec![Some("Uptime".into()), Some(self.shared.started.elapsed().as_secs().to_string())],
                     vec![Some("Threads_connected".into()), Some(self.shared.active.load(Ordering::Relaxed).to_string())],
                     vec![Some("Questions".into()), Some(self.shared.questions.load(Ordering::Relaxed).to_string())],
-                    vec![Some("Ssl_cipher".into()), Some(if self.io.stream.is_secure() && !self.io.stream.is_unix() { "TLS".into() } else { String::new() })],
+                    vec![Some("Ssl_cipher".into()), Some(if matches!(self.io.stream, MyStream::Tls(_)) || self.io.stream.is_tls_unix() { "TLS".into() } else { String::new() })],
                 ];
                 self.send_rows(vec![t("Variable_name"), t("Value")], rows, filter, more, rows_mode).await
             }
@@ -2074,6 +2080,29 @@ impl Session {
             } else {
                 format!("  UNIQUE KEY `{key}` ({cols})")
             });
+        }
+        if let Some(view) = self.database().schema_view(&name) {
+            use crate::core::rql::foreign_key::ReferentialAction as A;
+            let action = |a: &A| match a {
+                A::NoAction => None,
+                A::Restrict => Some("RESTRICT"),
+                A::Cascade => Some("CASCADE"),
+                A::SetNull => Some("SET NULL"),
+                A::SetDefault => Some("SET DEFAULT"),
+            };
+            for fk in view.schema().foreign_keys.iter().filter(|f| !f.is_deleted) {
+                let mut line = format!(
+                    "  CONSTRAINT `{}` FOREIGN KEY (`{}`) REFERENCES `{}` (`{}`)",
+                    fk.name, fk.column, fk.parent_table, fk.parent_column
+                );
+                if let Some(a) = action(&fk.on_delete) {
+                    line.push_str(&format!(" ON DELETE {a}"));
+                }
+                if let Some(a) = action(&fk.on_update) {
+                    line.push_str(&format!(" ON UPDATE {a}"));
+                }
+                lines.push(line);
+            }
         }
         Ok(format!(
             "CREATE TABLE `{name}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",

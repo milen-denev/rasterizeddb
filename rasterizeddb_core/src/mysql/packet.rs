@@ -19,6 +19,9 @@ pub(crate) enum MyStream {
     Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
+    /// TLS on the unix socket: MariaDB's client asks for it there too.
+    #[cfg(unix)]
+    TlsUnix(Box<tokio_rustls::server::TlsStream<tokio::net::UnixStream>>),
     /// Between the plain stream and TLS, during the upgrade.
     Upgrading,
 }
@@ -28,15 +31,26 @@ impl MyStream {
         match self {
             MyStream::Tls(_) => true,
             #[cfg(unix)]
-            MyStream::Unix(_) => true,
+            MyStream::Unix(_) | MyStream::TlsUnix(_) => true,
             _ => false,
+        }
+    }
+
+    pub(crate) fn is_tls_unix(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, MyStream::TlsUnix(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 
     pub(crate) fn is_unix(&self) -> bool {
         #[cfg(unix)]
         {
-            matches!(self, MyStream::Unix(_))
+            matches!(self, MyStream::Unix(_) | MyStream::TlsUnix(_))
         }
         #[cfg(not(unix))]
         {
@@ -52,6 +66,7 @@ impl std::os::fd::AsFd for MyStream {
             MyStream::Tcp(s) => s.as_fd(),
             MyStream::Tls(s) => s.get_ref().0.as_fd(),
             MyStream::Unix(s) => s.as_fd(),
+            MyStream::TlsUnix(s) => s.get_ref().0.as_fd(),
             MyStream::Upgrading => unreachable!("a stream is never watched mid-upgrade"),
         }
     }
@@ -64,6 +79,8 @@ macro_rules! each {
             MyStream::Tls($s) => $e,
             #[cfg(unix)]
             MyStream::Unix($s) => $e,
+            #[cfg(unix)]
+            MyStream::TlsUnix($s) => $e,
             MyStream::Upgrading => Poll::Ready(Err(io::Error::other("stream mid-upgrade"))),
         }
     };

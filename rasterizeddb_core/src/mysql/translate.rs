@@ -924,16 +924,16 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             if !inner.is_empty() {
                 return Err(MyError::unsupported("LAST_INSERT_ID(expr)"));
             }
-            vec![Token::new(Tok::Num(cx.env.last_insert_id().to_string()))]
+            vec![Token::raw(format!("({}::bigint)", cx.env.last_insert_id().to_string()))]
         }
         "DATABASE" | "SCHEMA" => vec![literal_str(cx.env.database_name())],
         "VERSION" => vec![literal_str(super::SERVER_VERSION)],
-        "CONNECTION_ID" => vec![Token::new(Tok::Num(cx.env.connection_id().to_string()))],
+        "CONNECTION_ID" => vec![Token::raw(format!("({}::bigint)", cx.env.connection_id().to_string()))],
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
             vec![literal_str(&format!("{}@%", cx.env.user()))]
         }
-        "FOUND_ROWS" => vec![Token::new(Tok::Num(cx.env.found_rows().to_string()))],
-        "ROW_COUNT" => vec![Token::new(Tok::Num(cx.env.row_count().to_string()))],
+        "FOUND_ROWS" => vec![Token::raw(format!("({}::bigint)", cx.env.found_rows().to_string()))],
+        "ROW_COUNT" => vec![Token::raw(format!("({}::bigint)", cx.env.row_count().to_string()))],
         "LCASE" => call("lower", args(cx)?),
         "UCASE" => call("upper", args(cx)?),
         "LENGTH" | "OCTET_LENGTH" => call("octet_length", args(cx)?),
@@ -2318,8 +2318,10 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                     statements.push(format!("ALTER TABLE {t} RENAME TO {}", ident_sql(&new)));
                 }
             }
-            // Storage options: the engine chooses its own.
-            "ENGINE" | "DEFAULT" | "CHARACTER" | "CHARSET" | "COLLATE" | "CONVERT" | "AUTO_INCREMENT" | "COMMENT"
+            // Storage options: the engine chooses its own. DISABLE/ENABLE
+            // KEYS (mysqldump) defers index maintenance in MySQL; indexes
+            // here are always maintained.
+            "DISABLE" | "ENABLE" | "ENGINE" | "DEFAULT" | "CHARACTER" | "CHARSET" | "COLLATE" | "CONVERT" | "AUTO_INCREMENT" | "COMMENT"
             | "ROW_FORMAT" | "ALGORITHM" | "LOCK" | "FORCE" | "KEY_BLOCK_SIZE" | "STATS_PERSISTENT" => {}
             other => return Err(MyError::unsupported(format!("ALTER TABLE … {other}"))),
         }
@@ -2498,6 +2500,23 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
 /// statements (SET, SHOW, USE, transaction control) are not handled here.
 pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placeholders: bool) -> Result<Forward, MyError> {
     let mut cx = Cx::new(env, placeholders);
+    // MySQL's information_schema calls a database a schema: TABLE_SCHEMA
+    // holds the database's name, which the engine's views keep in
+    // table_catalog (their table_schema is the namespace, `public`).
+    let tokens = if tokens.iter().any(|t| t.ident().is_some_and(|i| i.eq_ignore_ascii_case("information_schema"))) {
+        tokens
+            .into_iter()
+            .map(|t| match t.ident() {
+                Some(i) if i.eq_ignore_ascii_case("table_schema") => Token {
+                    tok: Tok::Word("table_catalog".into()),
+                    ..t
+                },
+                _ => t,
+            })
+            .collect()
+    } else {
+        tokens
+    };
     let params = tokens.iter().filter(|t| matches!(t.tok, Tok::Param(_))).count();
     let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
     let mut forward = match head.as_str() {
@@ -2736,7 +2755,7 @@ mod tests {
         assert_eq!(tr(&e, "SELECT a FROM t WHERE b <=> NULL && c"), "SELECT a FROM t WHERE b IS NOT DISTINCT FROM NULL AND c");
         assert_eq!(tr(&e, "SELECT a FROM t WHERE ok = TRUE"), "SELECT a FROM t WHERE ok = 1");
         assert_eq!(tr(&e, "SELECT a FROM t WHERE x = ? AND y = ?"), "SELECT a FROM t WHERE x = $1 AND y = $2");
-        assert_eq!(tr(&e, "SELECT LAST_INSERT_ID() AS id"), r#"SELECT 42 AS "id""#);
+        assert_eq!(tr(&e, "SELECT LAST_INSERT_ID() AS id"), r#"SELECT (42::bigint) AS "id""#);
         assert_eq!(tr(&e, "SELECT 1 FROM DUAL"), r#"SELECT 1 AS "1""#);
         assert_eq!(
             tr(&e, "SELECT IF(a > 1, 'y', 'n') AS r FROM t"),
@@ -2759,6 +2778,10 @@ mod tests {
         );
         assert_eq!(tr(&e, "SELECT * FROM t USE INDEX (i) WHERE a = 1"), "SELECT * FROM t WHERE a = 1");
         assert_eq!(tr(&e, "SELECT * FROM t LOCK IN SHARE MODE"), "SELECT * FROM t FOR SHARE");
+        assert_eq!(
+            tr(&e, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'app'"),
+            "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'app'"
+        );
     }
 
     #[test]
