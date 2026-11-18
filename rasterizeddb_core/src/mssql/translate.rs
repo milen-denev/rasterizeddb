@@ -2693,7 +2693,7 @@ mod tests {
     #[test]
     fn selects() {
         let e = env();
-        assert_eq!(tr(&e, "SELECT TOP (5) [Name] FROM [dbo].[Users] WITH (NOLOCK) ORDER BY [Name]"), r#"SELECT name AS "Name" FROM users ORDER BY name LIMIT 5"#);
+        assert_eq!(tr(&e, "SELECT TOP (5) [Name] FROM [dbo].[Users] WITH (NOLOCK) ORDER BY [Name]"), r#"SELECT name AS "Name" FROM users ORDER BY "Name" LIMIT 5"#);
         assert_eq!(tr(&e, "SELECT a FROM t ORDER BY a OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY"), "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10");
         assert_eq!(tr(&e, "SELECT Total = COUNT(*) FROM t"), r#"SELECT ((count(*))::integer) AS "Total" FROM t"#);
         assert_eq!(tr(&e, "SELECT 'a' + name + N'b' FROM t"), "SELECT 'a' || name || 'b' FROM t");
