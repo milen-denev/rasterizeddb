@@ -214,6 +214,19 @@ fn is_pg_reserved(word: &str) -> bool {
     )
 }
 
+/// Words a `(` after them is not a call of: kept apart, as the engine reads
+/// `SELECT(` as one unknown word.
+fn is_keyword_before_paren(word: &str) -> bool {
+    matches!(
+        word.to_ascii_uppercase().as_str(),
+        "SELECT" | "IN" | "VALUES" | "AND" | "OR" | "NOT" | "EXISTS" | "WHERE" | "ON" | "AS" | "FROM" | "JOIN"
+            | "USING" | "WHEN" | "THEN" | "ELSE" | "CASE" | "BY" | "ALL" | "ANY" | "SOME" | "INTO" | "TABLE"
+            | "LIKE" | "IS" | "BETWEEN" | "DISTINCT" | "UNION" | "RETURNING" | "SET" | "LIMIT" | "OFFSET"
+            | "HAVING" | "WITH" | "RECURSIVE" | "LATERAL" | "INTERSECT" | "EXCEPT" | "KEY" | "UNIQUE" | "CHECK"
+            | "REFERENCES" | "FOREIGN" | "PRIMARY" | "DEFAULT" | "OVER" | "PARTITION" | "FILTER" | "WITHIN"
+    )
+}
+
 pub(crate) fn string_sql(value: &[u8]) -> String {
     match std::str::from_utf8(value) {
         Ok(text) if !text.contains('\0') => format!("'{}'", text.replace('\'', "''")),
@@ -243,7 +256,13 @@ pub(crate) fn render(tokens: &[Token]) -> Result<String, MyError> {
                 || t.is_op(")")
                 || t.is_op(".")
                 || matches!(&t.tok, Tok::Raw(r) if r.starts_with("::"));
-            let call = t.is_op("(") && matches!(p.tok, Tok::Word(_) | Tok::Raw(_)) && !t.space;
+            let call = t.is_op("(")
+                && !t.space
+                && match &p.tok {
+                    Tok::Word(w) => !is_keyword_before_paren(w),
+                    Tok::Raw(_) => true,
+                    _ => false,
+                };
             if !glue && !call {
                 out.push(' ');
             }
@@ -475,13 +494,20 @@ fn str_of(tokens: &[Token]) -> Option<String> {
 fn date_format_pattern(fmt: &str) -> Result<String, MyError> {
     let mut out = String::new();
     let mut literal = String::new();
+    // Punctuation stands for itself in a to_char template; only text with
+    // letters (which could read as a pattern) is quoted.
     let flush = |out: &mut String, literal: &mut String| {
-        if !literal.is_empty() {
+        if literal.is_empty() {
+            return;
+        }
+        if literal.chars().any(|c| c.is_alphanumeric() || c == '"' || c == '\\') {
             out.push('"');
             out.push_str(&literal.replace('"', "\\\""));
             out.push('"');
-            literal.clear();
+        } else {
+            out.push_str(literal);
         }
+        literal.clear();
     };
     let mut chars = fmt.chars();
     while let Some(c) = chars.next() {
@@ -708,7 +734,10 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                         let rest = rewrite_expr(tokens[i + 1..].to_vec(), cx)?;
                         let end = operand_end(&rest, 0).ok_or_else(|| MyError::syntax("DIV needs operands"))?;
                         let right: Vec<Token> = rest[..=end].to_vec();
-                        out.extend(call("div", vec![left, right]));
+                        // MySQL's DIV is a BIGINT whatever its operands.
+                        let mut quotient = call("div", vec![left, right]);
+                        quotient.push(Token::raw("::bigint"));
+                        out.extend(wrap(quotient));
                         out.extend(rest[end + 1..].iter().cloned());
                         return Ok(out);
                     }
@@ -1107,7 +1136,10 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let a = args(cx)?;
             arity(&a, &[2])?;
             let pattern = str_of(&a[1]).ok_or_else(|| MyError::unsupported("a DATE_FORMAT format that is not a literal"))?;
-            call("to_char", vec![a[0].clone(), vec![literal_str(&date_format_pattern(&pattern)?)]])
+            // MySQL takes a date in a string too.
+            let mut date = wrap(a[0].clone());
+            date.push(Token::raw("::timestamp"));
+            call("to_char", vec![date, vec![literal_str(&date_format_pattern(&pattern)?)]])
         }
         "STR_TO_DATE" => {
             let a = args(cx)?;
@@ -1520,7 +1552,8 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
             ));
         }
         out.push(Token::raw(format!(
-            "ON CONFLICT DO UPDATE SET {}",
+            "ON CONFLICT{} DO UPDATE SET {}",
+            conflict_target(&database, &table, Some(&given)),
             given
                 .iter()
                 .map(|c| format!("{0} = excluded.{0}", ident_sql(c)))
@@ -1556,7 +1589,7 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
             p.extend(rewrite_expr(part[eq + 1..].to_vec(), cx)?);
             parts.push(p);
         }
-        out.push(Token::raw("ON CONFLICT DO UPDATE SET"));
+        out.push(Token::raw(format!("ON CONFLICT{} DO UPDATE SET", conflict_target(&database, &table, columns.as_deref()))));
         for (n, p) in parts.into_iter().enumerate() {
             if n > 0 {
                 out.push(Token::op(","));
@@ -1581,6 +1614,43 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
         params: 0,
         deferred: Vec::new(),
     })
+}
+
+/// Which key an upsert's conflict is on. MySQL's ON DUPLICATE KEY UPDATE
+/// fires on whichever unique key collides; the engine wants it named when a
+/// table has more than one. The key named is the first (primary first) whose
+/// columns the statement gives values for — a key it gives no value for can
+/// only collide through its default, which for an auto-increment key never
+/// happens. Empty when there is no such key, which leaves the choice to the
+/// engine.
+fn conflict_target(database: &Database, table: &str, given: Option<&[String]>) -> String {
+    let Some(view) = database.schema_view(table) else {
+        return String::new();
+    };
+    let schema = view.schema();
+    let given: Vec<String> = match given {
+        Some(g) => g.to_vec(),
+        None => schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+            .map(|f| f.name.clone())
+            .collect(),
+    };
+    let mut keys: Vec<Vec<String>> = Vec::new();
+    if let Some(pk) = &schema.primary_key {
+        keys.push(vec![pk.clone()]);
+    }
+    for key in schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
+        keys.push(key.columns.clone());
+    }
+    for field in schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
+        keys.push(vec![field.name.clone()]);
+    }
+    keys.into_iter()
+        .find(|cols| cols.iter().all(|c| given.contains(c)))
+        .map(|cols| format!(" ({})", cols.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", ")))
+        .unwrap_or_default()
 }
 
 fn no_table(table: &str) -> MyError {
@@ -2681,11 +2751,11 @@ mod tests {
             "SELECT * FROM t WHERE d > now() - interval '1 days'"
         );
         assert_eq!(tr(&e, "SELECT doc->>'$.a.b' AS v FROM t"), r#"SELECT ((doc) -> 'a' ->> 'b') AS "v" FROM t"#);
-        assert_eq!(tr(&e, "SELECT 7 DIV 2 AS q"), r#"SELECT div(7, 2) AS "q""#);
+        assert_eq!(tr(&e, "SELECT 7 DIV 2 AS q"), r#"SELECT (div(7, 2)::bigint) AS "q""#);
         assert_eq!(tr(&e, "SELECT CAST(a AS SIGNED) x FROM t"), r#"SELECT CAST(a AS bigint) AS "x" FROM t"#);
         assert_eq!(
             tr(&e, "SELECT DATE_FORMAT(d, '%Y-%m-%d %H:%i') f FROM t"),
-            r#"SELECT to_char(d, 'YYYY"-"MM"-"DD" "HH24":"MI') AS "f" FROM t"#
+            r#"SELECT to_char((d)::timestamp, 'YYYY-MM-DD HH24:MI') AS "f" FROM t"#
         );
         assert_eq!(tr(&e, "SELECT * FROM t USE INDEX (i) WHERE a = 1"), "SELECT * FROM t WHERE a = 1");
         assert_eq!(tr(&e, "SELECT * FROM t LOCK IN SHARE MODE"), "SELECT * FROM t FOR SHARE");

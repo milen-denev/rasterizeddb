@@ -20,6 +20,8 @@ sea-orm = { version = "2.0", default-features = false, features = [
 ] }
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
+    # The MySQL protocol's suite (`tests/mysql_protocol.rs`).
+    "mysql",
     # 0.9 split the old `runtime-tokio-rustls` into the runtime and the TLS
     # provider. `ring` is named explicitly to match what the rest of the
     # workspace links, so one provider is built rather than two.

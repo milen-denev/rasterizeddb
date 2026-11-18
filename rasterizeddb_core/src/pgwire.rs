@@ -715,15 +715,28 @@ async fn prepare_pgwire(
     // From here on `limits` is what is enforced and what `SHOW` reports.
     let limits = limits.fit_to_descriptor_limit();
 
-    // Every database needs its roles before the first connection tries to
-    // authenticate: they are per database, so one seeded catalogue does not
-    // make the others reachable.
+    seed_catalogue_roles(catalog, auth).await?;
+    Ok(limits)
+}
+
+/// Gives every database in `catalog` its role catalogue, with `auth`'s
+/// bootstrap role in any that has none yet. A database that already has
+/// roles is left as it is, so calling this again is harmless.
+///
+/// Every database needs its roles before the first connection tries to
+/// authenticate: they are per database, so one seeded catalogue does not
+/// make the others reachable. Public for `--protocol both`, which runs this
+/// before the native listener seeds the same catalogue its own way.
+pub async fn seed_catalogue_roles(
+    catalog: &Arc<DatabaseCatalog>,
+    auth: &AuthConfig,
+) -> io::Result<()> {
     for database in catalog.all() {
         if let Err(e) = seed_roles(&database, auth).await {
             return Err(io::Error::new(io::ErrorKind::Other, e));
         }
     }
-    Ok(limits)
+    Ok(())
 }
 
 /// The accept loop, shared by every way of starting the server.

@@ -1602,9 +1602,9 @@ impl Session {
             Show::Tables { full, database } => {
                 let target = database.unwrap_or_else(|| db.clone());
                 let listing = if target == db {
-                    self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name").await
+                    self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' ORDER BY table_name").await
                 } else {
-                    match self.other_database_fetch(&target, "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name").await {
+                    match self.other_database_fetch(&target, "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' ORDER BY table_name").await {
                         Ok(r) => r,
                         Err(e) => {
                             self.err(&e);
@@ -1814,7 +1814,7 @@ impl Session {
                 self.send_rows(vec![t(&name)], vec![vec![Some(grant)]], filter, more, rows_mode).await
             }
             Show::TableStatus => {
-                let rows = match self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name").await {
+                let rows = match self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' ORDER BY table_name").await {
                     Ok((_, rows)) => rows,
                     Err(e) => {
                         self.err(&results::error_from_engine(&e));
@@ -2012,6 +2012,10 @@ impl Session {
             push("PRIMARY", false, std::slice::from_ref(pk));
         }
         for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
+            // The primary key's own constraint is the PRIMARY row already.
+            if schema.primary_key.as_ref().is_some_and(|pk| key.columns.len() == 1 && &key.columns[0] == pk) {
+                continue;
+            }
             push(translate::plain_index_name(&name, &key.name), false, &key.columns);
         }
         for index in schema.secondary_indexes.iter().filter(|i| !i.is_deleted) {

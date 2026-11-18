@@ -41,6 +41,13 @@ enum Protocol {
     Rastcp,
     /// PostgreSQL wire protocol (pgwire) for network-level Postgres compatibility
     Pgwire,
+    /// Both at once, on one catalogue: the `--pg-*` flags configure the
+    /// PostgreSQL listener and the `--rdb-*` flags the native one. They share
+    /// the role catalogue, which the PostgreSQL side seeds first, so its
+    /// `--pg-user`/`--pg-password` log in on either protocol (under
+    /// `--pg-auth scram-sha-256`: the native protocol answers SCRAM only)
+    #[value(alias = "all")]
+    Both,
 }
 
 #[derive(Parser, Debug)]
@@ -290,7 +297,7 @@ struct Args {
     #[arg(long = "in-memory", alias = "in_memory", default_value_t = false)]
     in_memory: bool,
 
-    /// Server protocol to use: rastcp or pgwire (default: rastcp)
+    /// Server protocol to use: rastcp, pgwire or both (default: rastcp)
     #[arg(long, value_enum, default_value_t = Protocol::Rastcp)]
     protocol: Protocol,
 
@@ -468,6 +475,56 @@ struct Args {
     /// belong to the group.
     #[arg(long = "socket-group", value_name = "GROUP")]
     socket_group: Option<String>,
+
+    // --- MySQL / MariaDB protocol ------------------------------------------
+    /// Also serve the MySQL / MariaDB client protocol on this TCP port (3306
+    /// is MySQL's), beside whichever other listeners run, on the same
+    /// databases and roles. Off unless this or `--mysql-socket` is given.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-port", value_name = "PORT")]
+    mysql_port: Option<u16>,
+
+    /// Address the MySQL protocol listens on (default: 127.0.0.1).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-addr", default_value = "127.0.0.1")]
+    mysql_addr: String,
+
+    /// Also serve the MySQL protocol on this unix socket (what
+    /// `mysql --socket=PATH` connects to). Its permissions are
+    /// `--socket-mode` and `--socket-group`; no TLS on it.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-socket", value_name = "PATH")]
+    mysql_socket: Option<std::path::PathBuf>,
+
+    /// How MySQL clients authenticate: `password` (caching_sha2_password
+    /// against the role catalogue, the default) or `trust`.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-auth", default_value = "password")]
+    mysql_auth: String,
+
+    /// How callers on `--mysql-socket` authenticate; defaults to
+    /// `--mysql-auth`. trust is refused on a socket that admits users outside
+    /// its owner and group.
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-socket-auth", value_name = "METHOD")]
+    mysql_socket_auth: Option<String>,
+
+    /// MySQL protocol TLS: disable, prefer (default) or require. A first
+    /// password login over TCP needs TLS (there is no RSA key exchange).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-tls", default_value = "prefer")]
+    mysql_tls: String,
+
+    /// PEM certificate chain for the MySQL listener (default: `--pg-cert`,
+    /// else a self-signed one made at start-up).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-cert", value_name = "PATH")]
+    mysql_cert: Option<String>,
+
+    /// PEM private key for the MySQL listener (default: `--pg-key`).
+    #[cfg(feature = "mysql_wire")]
+    #[arg(long = "mysql-key", value_name = "PATH")]
+    mysql_key: Option<String>,
 
     /// How callers on `--rdb-socket` authenticate: `scram-sha-256`, `trust`,
     /// or `peer` — a role may log in without a password when its name is the
@@ -933,6 +990,82 @@ fn apply_saved_settings(args: &mut Args) {
 /// server serves. Exits with the reason if either is wrong, as the other flags
 /// do: a socket with permissions an operator did not ask for is worse than no
 /// start-up.
+/// The role an empty role catalogue is given: the one the main protocol
+/// would create, so whichever listener seeds first, the same role exists.
+fn bootstrap_role(args: &Args) -> (String, Option<String>) {
+    match args.protocol {
+        Protocol::Rastcp => (
+            args.rdb_user.clone(),
+            args.rdb_password
+                .clone()
+                .or_else(|| std::env::var("RASTERIZEDDB_PASSWORD").ok())
+                .filter(|p| !p.is_empty()),
+        ),
+        _ => (
+            args.pg_user.clone(),
+            args.pg_password
+                .clone()
+                .or_else(|| std::env::var("RASTERIZEDDB_PG_PASSWORD").ok())
+                .filter(|p| !p.is_empty()),
+        ),
+    }
+}
+
+fn compat_limits(args: &Args) -> rasterizeddb_core::pgwire::ConnectionLimits {
+    rasterizeddb_core::pgwire::ConnectionLimits {
+        max_connections: args.max_connections as usize,
+        handshake_timeout: args.authentication_timeout,
+        idle_in_transaction_session_timeout: args.idle_in_transaction_session_timeout,
+        idle_session_timeout: args.idle_session_timeout,
+    }
+}
+
+/// The MySQL listener's configuration, or `None` when it is not asked for.
+#[cfg(feature = "mysql_wire")]
+fn mysql_config(args: &Args) -> Result<Option<rasterizeddb_core::mysql::MyConfig>, String> {
+    use rasterizeddb_core::mysql::{MyAuth, MyConfig, MySocket, MyTls};
+    if args.mysql_port.is_none() && args.mysql_socket.is_none() {
+        if args.mysql_socket_auth.is_some() {
+            return Err("--mysql-socket-auth needs --mysql-socket".into());
+        }
+        return Ok(None);
+    }
+    let auth = MyAuth::parse(&args.mysql_auth)
+        .ok_or_else(|| format!("unknown --mysql-auth {:?}: expected password or trust", args.mysql_auth))?;
+    let tls = MyTls::parse(&args.mysql_tls)
+        .ok_or_else(|| format!("unknown --mysql-tls {:?}: expected disable, prefer or require", args.mysql_tls))?;
+    let socket = match &args.mysql_socket {
+        Some(path) => {
+            let auth = match args.mysql_socket_auth.as_deref() {
+                None => None,
+                Some(text) => Some(MyAuth::parse(text).ok_or_else(|| {
+                    format!("unknown --mysql-socket-auth {text:?}: expected password or trust")
+                })?),
+            };
+            let (mode, group) = socket_permissions(args);
+            Some(MySocket { path: path.clone(), mode, group, auth })
+        }
+        None => {
+            if args.mysql_socket_auth.is_some() {
+                return Err("--mysql-socket-auth needs --mysql-socket".into());
+            }
+            None
+        }
+    };
+    let (bootstrap_user, bootstrap_password) = bootstrap_role(args);
+    Ok(Some(MyConfig {
+        tcp: args.mysql_port.map(|port| (args.mysql_addr.clone(), port)),
+        socket,
+        auth,
+        tls,
+        cert_path: args.mysql_cert.clone().or_else(|| args.pg_cert.clone()),
+        key_path: args.mysql_key.clone().or_else(|| args.pg_key.clone()),
+        bootstrap_user,
+        bootstrap_password,
+        limits: compat_limits(args),
+    }))
+}
+
 fn socket_permissions(args: &Args) -> (u32, Option<u32>) {
     let mode = match u32::from_str_radix(args.socket_mode.trim_start_matches("0o"), 8) {
         Ok(mode) if mode <= 0o777 => mode,
@@ -1510,8 +1643,14 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        match args.protocol {
-            Protocol::Rastcp => {
+        let serves_native = matches!(args.protocol, Protocol::Rastcp | Protocol::Both);
+        let serves_pgwire = matches!(args.protocol, Protocol::Pgwire | Protocol::Both);
+
+        // Each side's flags are read and checked before either listener
+        // starts, so a bad flag for one protocol never leaves the other
+        // serving in a process that is about to exit.
+        let native = if serves_native {
+            Some({
                 let Some(method) = rasterizeddb_core::auth::AuthMethod::parse(&args.rdb_auth)
                 else {
                     eprintln!(
@@ -1588,16 +1727,14 @@ fn main() -> std::io::Result<()> {
                     std::process::exit(2);
                 }
 
-                if let Err(e) =
-                    Database::start_db_with_auth_on(arc_database, auth, listen).await
-                {
-                    eprintln!("{e}");
-                    std::process::exit(2);
-                }
-                // The shutdown clean point (docs/persistent-indexes.md §3).
-                rasterizeddb_core::shutdown::seal_all(&catalog).await;
-            }
-            Protocol::Pgwire => {
+                (auth, listen)
+            })
+        } else {
+            None
+        };
+
+        let pgwire = if serves_pgwire {
+            Some({
                 // Run a PostgreSQL-wire-compatible server.
                 let tls_mode = match args.pg_tls {
                     PgTlsMode::Disable => rasterizeddb_core::pgwire::TlsMode::Disable,
@@ -1713,35 +1850,99 @@ fn main() -> std::io::Result<()> {
                     idle_session_timeout: args.idle_session_timeout,
                 };
 
-                // The listener returns an error only when it could not start —
-                // the port taken, the certificate unreadable — since a failed
-                // accept is retried rather than returned. That used to be
-                // discarded here, and the process exited 0 having served
-                // nothing, which a supervisor reads as a clean stop.
-                let sealing = catalog.clone();
                 let listen = rasterizeddb_core::pgwire::PgListen {
                     tcp: pg_tcp.then(|| (args.pg_addr.clone(), args.pg_port)),
                     socket: pg_socket,
                 };
-                if let Err(e) = rasterizeddb_core::pgwire::start_pgwire_on(
-                    catalog,
-                    listen,
-                    tls,
-                    auth,
-                    limits,
-                )
-                .await
-                {
-                    log::error!("pgwire server failed: {}", e);
-                    eprintln!("pgwire server failed: {e}");
-                    rasterizeddb_core::shutdown::finalize();
-                    std::process::exit(2);
-                }
-                // The listener has drained and ended its sessions: the
-                // shutdown clean point (docs/persistent-indexes.md §3).
-                rasterizeddb_core::shutdown::seal_all(&sealing).await;
+                (listen, tls, auth, limits)
+            })
+        } else {
+            None
+        };
+
+        // Both listeners would otherwise seed an empty role catalogue at
+        // once, each checking for roles and each creating its own bootstrap
+        // role. The PostgreSQL side goes first, so `--pg-user` with its
+        // password is the role a fresh catalogue gets; the native side then
+        // finds roles and adds none.
+        if let (Some(_), Some((_, _, auth, _))) = (&native, &pgwire) {
+            if let Err(e) =
+                rasterizeddb_core::pgwire::seed_catalogue_roles(&catalog, auth).await
+            {
+                eprintln!("could not prepare the role catalogue: {e}");
+                rasterizeddb_core::shutdown::finalize();
+                std::process::exit(2);
             }
         }
+
+        // A listener returns an error only when it could not start — the port
+        // taken, the certificate unreadable — since a failed accept is retried
+        // rather than returned. That used to be discarded, and the process
+        // exited 0 having served nothing, which a supervisor reads as a clean
+        // stop. With both listeners, the first such error stops the process
+        // whatever the other is doing: half a server is not what was asked
+        // for. Otherwise each returns once a termination signal has drained
+        // it, and both are waited for.
+        // The MySQL protocol, beside the others: bound and started before
+        // them, so a port that cannot be had stops the start-up with the
+        // reason. Drained before the databases are sealed.
+        #[cfg(feature = "mysql_wire")]
+        let mysql_server = match mysql_config(&args) {
+            Ok(None) => None,
+            Ok(Some(config)) => {
+                let started = match rasterizeddb_core::mysql::bind(config).await {
+                    Ok(listener) => rasterizeddb_core::mysql::serve(listener, catalog.clone()).await,
+                    Err(e) => Err(e),
+                };
+                match started {
+                    Ok(server) => Some(server),
+                    Err(e) => {
+                        eprintln!("could not start the MySQL protocol listener: {e}");
+                        rasterizeddb_core::shutdown::finalize();
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+
+        let sealing = catalog.clone();
+        let native_side = async move {
+            match native {
+                Some((auth, listen)) => {
+                    Database::start_db_with_auth_on(arc_database, auth, listen)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => Ok(()),
+            }
+        };
+        let pgwire_side = async move {
+            match pgwire {
+                Some((listen, tls, auth, limits)) => {
+                    rasterizeddb_core::pgwire::start_pgwire_on(catalog, listen, tls, auth, limits)
+                        .await
+                        .map_err(|e| format!("pgwire server failed: {e}"))
+                }
+                None => Ok(()),
+            }
+        };
+        if let Err(e) = futures::future::try_join(native_side, pgwire_side).await {
+            log::error!("{}", e);
+            eprintln!("{e}");
+            rasterizeddb_core::shutdown::finalize();
+            std::process::exit(2);
+        }
+        #[cfg(feature = "mysql_wire")]
+        if let Some(server) = mysql_server {
+            server.drain(std::time::Duration::from_secs(10)).await;
+        }
+        // Every listener has drained and ended its sessions: the shutdown
+        // clean point (docs/persistent-indexes.md §3).
+        rasterizeddb_core::shutdown::seal_all(&sealing).await;
 
         // Both servers return once they have drained, so this is the last thing
         // the process does: flush what the WAL still holds so the next start-up

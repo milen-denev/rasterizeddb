@@ -112,6 +112,14 @@ Authentication defaults to SCRAM-SHA-256; `--pg-auth` also accepts `md5`,
 `password` and `trust`. Both the simple and the extended query protocols are
 implemented, which is what lets prepared statements and ORMs work.
 
+`--protocol both` serves this and the native protocol (`rasterizeddb_client`)
+from one process, on one catalogue. The `--pg-*` flags configure this listener
+and `--rdb-*` the native one (`--rdb-addr 0.0.0.0 --rdb-port 61170` to reach it
+from another host). The two share the role catalogue, which is seeded from
+`--pg-user`/`--pg-password`, so the same role logs in on either; the native
+protocol answers SCRAM only, so keep `--pg-auth scram-sha-256` there. The
+native protocol is single-database and serves `--pg-default-db`.
+
 ### SQL surface
 
 The dialect is PostgreSQL's. What is implemented:
