@@ -166,6 +166,28 @@ impl NativeSession {
         answer
     }
 
+    /// One autocommit statement through pgwire's whole path, in a session
+    /// made for it alone: for a statement that needs what the native path
+    /// does not have (a correlated subquery's `LATERAL` join, run in the
+    /// statement transaction pgwire opens around it). Nothing of the session
+    /// outlives the statement and no lock is shared with the connection's
+    /// block, so a multiplexed connection may use it too. Never called with
+    /// a block open (`takes` routes every statement of one to `run`).
+    pub(crate) async fn run_alone(&self, query: &str) -> Vec<u8> {
+        let mut state = self.new_state();
+        let answer = Box::pin(self.run_in(&mut state, query)).await;
+        // Not reachable for a statement that is not transaction control, but
+        // a block left open here would hold its locks with no client to end
+        // it.
+        if let Some(t) = state.transaction.take() {
+            state.end_block_settings(&t);
+            self.database.block_ddl_abort(t.id).await;
+            t.abort_unless_aborted(&self.database);
+            t.owner.release();
+        }
+        answer
+    }
+
     async fn run_in(&self, state: &mut SessionState, query: &str) -> Vec<u8> {
         state.message_us = crate::core::statement_clock::wall_us();
         state.error_in_batch = false;

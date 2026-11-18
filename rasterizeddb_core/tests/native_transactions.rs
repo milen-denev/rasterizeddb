@@ -931,9 +931,29 @@ async fn the_native_listener_answers_a_script_as_pgwire_does() {
                     // A ROLLBACK TO an unknown savepoint (3B001) fails the
                     // block, as in PostgreSQL, so the COMMIT after it rolls
                     // back.
-                    "ok", "23505", "25P02", "25P02", "ok", "ok", "ok", "23505", "ok", "ok", "ok",
-                    "3B001", "rolled back", "25P01", "25P01", "ok", "25006", "ok", "ok", "ok", "ok",
-                    "25001", "ok",
+                    "ok",
+                    "23505",
+                    "25P02",
+                    "25P02",
+                    "ok",
+                    "ok",
+                    "ok",
+                    "23505",
+                    "ok",
+                    "ok",
+                    "ok",
+                    "3B001",
+                    "rolled back",
+                    "25P01",
+                    "25P01",
+                    "ok",
+                    "25006",
+                    "ok",
+                    "ok",
+                    "ok",
+                    "ok",
+                    "25001",
+                    "ok",
                 ],
             ),
             (
@@ -1064,6 +1084,57 @@ async fn a_deadlock_fails_one_block_with_40p01_as_pgwire_does() {
             first.outcome("ROLLBACK").await;
             second.outcome("ROLLBACK").await;
         }
+    })
+    .await
+}
+
+/// A correlated scalar subquery over native, on a plain and a multiplexed
+/// connection and inside a block: the LATERAL join it is rewritten into
+/// needs the statement transaction pgwire opens, which the native path does
+/// not have, so it failed with `missing FROM-clause entry for table "__cs0"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_correlated_scalar_subquery_runs_over_native() {
+    bounded(async {
+        let h = Harness::start(Duration::from_secs(30)).await;
+        let mut conn = h.conn().await;
+        for sql in [
+            "CREATE TABLE u7 (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE p7 (id BIGINT PRIMARY KEY, user_id BIGINT)",
+            "INSERT INTO u7 (id) VALUES (1), (2), (3)",
+            "INSERT INTO p7 (id, user_id) VALUES (1, 1), (2, 1), (3, 2)",
+        ] {
+            ok(&mut conn, sql).await;
+        }
+        let counts = "SELECT id, (SELECT COUNT(*) FROM p7 WHERE p7.user_id = u7.id) FROM u7 ORDER BY id";
+        let rows = |counts: [i64; 3]| {
+            Answer::Rows(vec![
+                vec![Cell::Int(1), Cell::Int(counts[0])],
+                vec![Cell::Int(2), Cell::Int(counts[1])],
+                vec![Cell::Int(3), Cell::Int(counts[2])],
+            ])
+        };
+        assert_eq!(ok(&mut conn, counts).await, rows([2, 1, 0]));
+        assert_eq!(
+            ok(&mut conn, "SELECT id FROM u7 WHERE (SELECT COUNT(*) FROM p7 WHERE p7.user_id = u7.id) > 0 ORDER BY id")
+                .await,
+            Answer::Rows(vec![vec![Cell::Int(1)], vec![Cell::Int(2)]])
+        );
+        let m = fails(&mut conn, "SELECT id, (SELECT p7.id FROM p7 WHERE p7.user_id = u7.id) FROM u7").await;
+        assert_eq!(code(&m).as_deref(), Some("21000"), "{m}");
+
+        let mux = TcpClientBuilder::new(&h.socket)
+            .timeout(Duration::from_secs(30))
+            .build_multiplexed()
+            .await
+            .unwrap();
+        assert_eq!(decode(&mux.send(counts.as_bytes()).await.unwrap()).unwrap(), rows([2, 1, 0]));
+
+        // In a block it reads the block's own rows, and the block goes on.
+        ok(&mut conn, "BEGIN").await;
+        ok(&mut conn, "INSERT INTO p7 (id, user_id) VALUES (9, 3)").await;
+        assert_eq!(ok(&mut conn, counts).await, rows([2, 1, 1]));
+        ok(&mut conn, "ROLLBACK").await;
+        assert_eq!(ok(&mut conn, counts).await, rows([2, 1, 0]));
     })
     .await
 }

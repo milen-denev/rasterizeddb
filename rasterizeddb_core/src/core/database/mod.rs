@@ -6049,6 +6049,19 @@ async fn process_native_request(
         return native_index_checkpoint(&context.database, name).await;
     }
 
+    // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p
+    // WHERE p.u = t.id) FROM t`) is the LATERAL join it means
+    // (`rql::correlated`), which runs inside the statement transaction pgwire
+    // opens around it; this path has none, and its planner met the join's
+    // `__cs0` item unmaterialised ("missing FROM-clause entry"). Run whole
+    // through pgwire's path, in a session made for this statement alone
+    // (`NativeSession::run_alone`).
+    if let Some(session) = session
+        && crate::core::rql::correlated::rewrite_select(&query).is_some()
+    {
+        return session.run_alone(&query).await;
+    }
+
     #[cfg(not(feature = "query_stats"))]
     {
         run_native_query(&query, context.database).await
