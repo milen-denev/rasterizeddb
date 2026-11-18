@@ -1137,11 +1137,18 @@ pub(crate) fn rewrite_select(
         })));
     }
     let saved = std::mem::take(&mut cx.aliases);
+    // Each named item's rewritten text: an ORDER BY of the same expression
+    // is sent as the item's name, which the engine resolves where it refuses
+    // a grouped expression it does not find in the list.
+    let mut item_texts: Vec<(String, String)> = Vec::new();
     for (k, (expr, name)) in prepared.into_iter().enumerate() {
         if k > 0 {
             out.push(Token::op(","));
         }
         let rewritten = rewrite_expr(expr, cx)?;
+        if let Some(n) = &name {
+            item_texts.push((render(&rewritten)?, n.clone()));
+        }
         out.extend(rewritten);
         if let Some(name) = name {
             out.push(Token::word("AS"));
@@ -1150,6 +1157,38 @@ pub(crate) fn rewrite_select(
     }
     cx.aliases = saved;
     let mut rest: Vec<Token> = tokens[end..].to_vec();
+    if let Some(order) = find_top(&rest, 0, &["ORDER"]) {
+        if kw(&rest, order + 1, "BY") && !item_texts.is_empty() {
+            let stop = find_top(&rest, order + 2, &["LIMIT", "FOR", "LOCK", "UNION", "EXCEPT", "INTERSECT"]).unwrap_or(rest.len());
+            let mut terms = Vec::new();
+            for term in split_commas(&rest[order + 2..stop]) {
+                let mut body = term.clone();
+                let mut direction = Vec::new();
+                if body.last().is_some_and(|t| t.is_word("ASC") || t.is_word("DESC")) {
+                    direction.push(body.pop().unwrap());
+                }
+                let mut probe = Cx::new(cx.env, cx.placeholders);
+                let text = render(&rewrite_expr(body, &mut probe)?)?;
+                match item_texts.iter().find(|(t, _)| *t == text) {
+                    Some((_, alias)) => {
+                        let mut replaced = vec![Token::raw(quote_ident(alias))];
+                        replaced.extend(direction);
+                        terms.push(replaced);
+                    }
+                    None => terms.push(term),
+                }
+            }
+            let mut rebuilt: Vec<Token> = rest[..order + 2].to_vec();
+            for (n, t) in terms.into_iter().enumerate() {
+                if n > 0 {
+                    rebuilt.push(Token::op(","));
+                }
+                rebuilt.extend(t);
+            }
+            rebuilt.extend(rest[stop..].iter().cloned());
+            rest = rebuilt;
+        }
+    }
     // `LIMIT a, b` → `LIMIT b OFFSET a`, at depth 0 of this select.
     if let Some(at) = find_top(&rest, 0, &["LIMIT"]) {
         let tail = rest.split_off(at + 1);

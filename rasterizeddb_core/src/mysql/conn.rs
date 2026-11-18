@@ -29,7 +29,7 @@ use crate::pgwire::proxied::{
 
 use super::admin::{self, Action, Assignment, Filter, Show, Target};
 use super::lex::{self, Mode, Tok, Token};
-use super::packet::{MyStream, Packets, Reader, put_lenenc_int, put_lenenc_str};
+use super::packet::{MyStream, Packets, Reader, put_lenenc_int};
 use super::results::{self, MyColumn};
 use super::translate::{self, Env, Forward, Kind, MyError, Value};
 use super::{MyAuth, MyTls, Registered, SERVER_VERSION, Shared};
@@ -147,7 +147,6 @@ pub(crate) struct Session {
     caps: u32,
     conn_id: u32,
     user: String,
-    host: String,
     login: ProxiedLogin,
     bridge: Option<PgBridge>,
     vars: BTreeMap<String, Value>,
@@ -225,7 +224,6 @@ pub(crate) async fn serve_connection(
         caps,
         conn_id,
         user,
-        host: peer,
         login,
         bridge: None,
         vars: admin::initial_variables(tls, port),
@@ -536,10 +534,6 @@ impl Env for Session {
     fn mode(&self) -> Mode {
         Mode::from_sql_mode(self.vars.get("sql_mode").and_then(|v| v.text()).as_deref().unwrap_or(""))
     }
-}
-
-fn engine_error(e: io::Error) -> MyError {
-    MyError::new(2013, "HY000", format!("Lost connection to the session: {e}"))
 }
 
 impl Session {
@@ -2492,7 +2486,3 @@ fn insert_id_of(kind: &Kind, returned: Option<u64>) -> Option<u64> {
     }
 }
 
-#[allow(dead_code)]
-fn lenenc(out: &mut Vec<u8>, s: &[u8]) {
-    put_lenenc_str(out, s);
-}

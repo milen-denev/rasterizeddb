@@ -153,6 +153,7 @@ impl PgNotice {
 
 /// One column of a RowDescription.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct PgField {
     pub(crate) name: String,
     pub(crate) table_oid: u32,

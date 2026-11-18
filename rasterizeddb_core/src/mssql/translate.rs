@@ -2344,15 +2344,18 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
 /// It is an INSERT of those rows. The source columns OUTPUT names cannot
 /// be RETURNED, so each row's are put back by position: the engine returns
 /// an INSERT's rows in the order of its VALUES.
+fn merge_refused() -> TsqlError {
+    TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated)")
+}
+
 fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
-    let refuse = || TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated)");
     let mut i = 1;
     if kw(&tokens, i, "INTO") {
         i += 1;
     }
-    let (table, mut j) = table_name_at(&tokens, i).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [1]")))?;
+    let (table, mut j) = table_name_at(&tokens, i).ok_or_else(merge_refused)?;
     if kw(&tokens, j, "WITH") && tokens.get(j + 1).is_some_and(|t| t.is_op("(")) {
-        j = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [2]")))? + 1;
+        j = matching_paren(&tokens, j + 1).ok_or_else(merge_refused)? + 1;
     }
     if kw(&tokens, j, "AS") {
         j += 2;
@@ -2360,9 +2363,9 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         j += 1;
     }
     if !kw(&tokens, j, "USING") || !tokens.get(j + 1).is_some_and(|t| t.is_op("(")) || !kw(&tokens, j + 2, "VALUES") {
-        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+        return Err(merge_refused());
     }
-    let close = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [3]")))?;
+    let close = matching_paren(&tokens, j + 1).ok_or_else(merge_refused)?;
     let rows: Vec<Vec<Vec<Token>>> = split_commas(&tokens[j + 3..close])
         .into_iter()
         .map(|row| {
@@ -2378,9 +2381,9 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     if kw(&tokens, k, "AS") {
         k += 1;
     }
-    let alias = tokens.get(k).and_then(|t| t.ident()).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [4]")))?.to_lowercase();
+    let alias = tokens.get(k).and_then(|t| t.ident()).ok_or_else(merge_refused)?.to_lowercase();
     k += 1;
-    let source_close = matching_paren(&tokens, k).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [5]")))?;
+    let source_close = matching_paren(&tokens, k).ok_or_else(merge_refused)?;
     let source_cols: Vec<String> = split_commas(&tokens[k + 1..source_close])
         .iter()
         .map(|c| c.first().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
@@ -2389,45 +2392,45 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     let always_false = kw(&tokens, on, "ON")
         && matches!((tokens.get(on + 1), tokens.get(on + 2), tokens.get(on + 3)), (Some(a), Some(eq), Some(b)) if eq.is_op("=") && matches!((&a.tok, &b.tok), (Tok::Num(x), Tok::Num(y)) if x != y));
     if !always_false {
-        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+        return Err(merge_refused());
     }
-    let insert = find_top(&tokens, on, &["INSERT"]).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [6]")))?;
+    let insert = find_top(&tokens, on, &["INSERT"]).ok_or_else(merge_refused)?;
     if find_top(&tokens, on, &["MATCHED"]).is_none() || find_top(&tokens, on, &["UPDATE", "DELETE"]).is_some_and(|u| u < insert) {
-        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+        return Err(merge_refused());
     }
     let cols_open = insert + 1;
-    let cols_close = matching_paren(&tokens, cols_open).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [7]")))?;
+    let cols_close = matching_paren(&tokens, cols_open).ok_or_else(merge_refused)?;
     let target_cols: Vec<String> = split_commas(&tokens[cols_open + 1..cols_close])
         .iter()
         .map(|c| c.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
         .collect();
     if !kw(&tokens, cols_close + 1, "VALUES") {
-        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+        return Err(merge_refused());
     }
-    let values_close = matching_paren(&tokens, cols_close + 2).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [8]")))?;
+    let values_close = matching_paren(&tokens, cols_close + 2).ok_or_else(merge_refused)?;
     // Each inserted value is a source column: which one.
     let mut picks = Vec::new();
     for v in split_commas(&tokens[cols_close + 3..values_close]) {
         let name = v.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase();
-        let at = source_cols.iter().position(|c| *c == name).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [9]")))?;
+        let at = source_cols.iter().position(|c| *c == name).ok_or_else(merge_refused)?;
         picks.push(at);
     }
     // OUTPUT: inserted columns, then source columns put back by position.
-    let output = find_top(&tokens, values_close + 1, &["OUTPUT"]).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [10]")))?;
+    let output = find_top(&tokens, values_close + 1, &["OUTPUT"]).ok_or_else(merge_refused)?;
     let mut returning = Vec::new();
     let mut extra: Option<(String, usize)> = None;
     for part in split_commas(&tokens[output + 1..]) {
         let names: Vec<String> = part.iter().filter_map(|t| t.ident().map(|s| s.to_lowercase())).collect();
         if names.first().map(String::as_str) == Some(alias.as_str()) {
             if extra.is_some() {
-                return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+                return Err(merge_refused());
             }
             let col = names.get(1).cloned().unwrap_or_default();
-            let at = source_cols.iter().position(|c| *c == col).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [11]")))?;
+            let at = source_cols.iter().position(|c| *c == col).ok_or_else(merge_refused)?;
             let written = part.last().and_then(|t| t.ident()).unwrap_or(&col).to_string();
             extra = Some((written, at));
         } else if extra.is_some() {
-            return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+            return Err(merge_refused());
         } else {
             let written = part.last().and_then(|t| t.ident()).unwrap_or("").to_string();
             let col = names.last().cloned().unwrap_or_default();
@@ -2439,12 +2442,12 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     for row in &rows {
         let mut vals = Vec::new();
         for &p in &picks {
-            let v = row.get(p).cloned().ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [12]")))?;
+            let v = row.get(p).cloned().ok_or_else(merge_refused)?;
             vals.push(render_text(&rewrite_expr(v, cx)?));
         }
         row_sql.push(format!("({})", vals.join(", ")));
         if let Some((_, at)) = &extra {
-            let v = row.get(*at).cloned().ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [13]")))?;
+            let v = row.get(*at).cloned().ok_or_else(merge_refused)?;
             positions.push(render_text(&rewrite_expr(v, cx)?));
         }
     }

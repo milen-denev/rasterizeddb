@@ -532,10 +532,6 @@ impl Wire {
         self.stream.flush().await
     }
 
-    /// Drops whatever reply was built (a cancelled request).
-    pub(crate) fn discard_reply(&mut self) {
-        self.reply.clear();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,9 +562,6 @@ impl<'a> Reader<'a> {
     pub(crate) fn u16(&mut self) -> io::Result<u16> {
         Ok(u16::from_le_bytes(self.bytes(2)?.try_into().unwrap()))
     }
-    pub(crate) fn u16_be(&mut self) -> io::Result<u16> {
-        Ok(u16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
-    }
     pub(crate) fn u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
@@ -587,11 +580,6 @@ impl<'a> Reader<'a> {
     /// B_VARCHAR: a byte of length, then UTF-16.
     pub(crate) fn b_varchar(&mut self) -> io::Result<String> {
         let n = self.u8()? as usize;
-        self.utf16(n)
-    }
-    /// US_VARCHAR: two bytes of length, then UTF-16.
-    pub(crate) fn us_varchar(&mut self) -> io::Result<String> {
-        let n = self.u16()? as usize;
         self.utf16(n)
     }
 }
@@ -672,6 +660,7 @@ pub(crate) fn prelogin_reply(encryption: u8) -> Vec<u8> {
 
 /// What LOGIN7 carries that the server reads.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct Login {
     pub(crate) tds_version: u32,
     pub(crate) packet_size: u32,
@@ -1210,6 +1199,7 @@ pub(crate) enum ParamValue {
 
 /// One RPC parameter.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct Param {
     pub(crate) name: String,
     pub(crate) output: bool,

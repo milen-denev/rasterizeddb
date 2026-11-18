@@ -13,6 +13,7 @@ use super::packet::{Packets, put_lenenc_int, put_lenenc_str};
 use super::translate::MyError;
 
 // Column types.
+#[allow(dead_code)]
 pub(crate) const T_DECIMAL: u8 = 0;
 pub(crate) const T_TINY: u8 = 1;
 pub(crate) const T_SHORT: u8 = 2;
@@ -27,11 +28,15 @@ pub(crate) const T_DATE: u8 = 10;
 pub(crate) const T_TIME: u8 = 11;
 pub(crate) const T_DATETIME: u8 = 12;
 pub(crate) const T_YEAR: u8 = 13;
+#[allow(dead_code)]
 pub(crate) const T_VARCHAR: u8 = 15;
+#[allow(dead_code)]
 pub(crate) const T_BIT: u8 = 16;
 pub(crate) const T_JSON: u8 = 245;
 pub(crate) const T_NEWDECIMAL: u8 = 246;
+#[allow(dead_code)]
 pub(crate) const T_ENUM: u8 = 247;
+#[allow(dead_code)]
 pub(crate) const T_SET: u8 = 248;
 pub(crate) const T_TINY_BLOB: u8 = 249;
 pub(crate) const T_MEDIUM_BLOB: u8 = 250;
@@ -39,10 +44,10 @@ pub(crate) const T_LONG_BLOB: u8 = 251;
 pub(crate) const T_BLOB: u8 = 252;
 pub(crate) const T_VAR_STRING: u8 = 253;
 pub(crate) const T_STRING: u8 = 254;
+#[allow(dead_code)]
 pub(crate) const T_GEOMETRY: u8 = 255;
 
 // Column flags.
-const F_NOT_NULL: u16 = 1;
 const F_BLOB: u16 = 16;
 const F_BINARY: u16 = 128;
 const F_TIMESTAMP: u16 = 1024;
@@ -110,10 +115,6 @@ impl MyColumn {
         }
     }
 
-    pub(crate) fn not_null(mut self) -> Self {
-        self.flags |= F_NOT_NULL;
-        self
-    }
 }
 
 /// The MySQL column for an engine column.

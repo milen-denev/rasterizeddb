@@ -92,7 +92,6 @@ pub(crate) struct Shared {
     pub(crate) acceptor: Option<tokio_rustls::TlsAcceptor>,
     pub(crate) active: AtomicUsize,
     pub(crate) stopping: tokio::sync::watch::Sender<bool>,
-    pub(crate) started: Instant,
 }
 
 pub struct MsListener {
@@ -196,7 +195,6 @@ pub async fn serve(listener: MsListener, catalog: Arc<DatabaseCatalog>) -> io::R
         acceptor,
         active: AtomicUsize::new(0),
         stopping,
-        started: Instant::now(),
     });
     let serving = shared.clone();
     let task = tokio::spawn(async move { accept_loop(listener, serving).await });
