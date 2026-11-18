@@ -1,0 +1,137 @@
+//! Engine bugs the client crate's ORM work found (2026-11-17), each checked
+//! against PostgreSQL 17 and pinned here through a pgwire session.
+
+use super::owner_tests::{Session, ok, session};
+use super::*;
+use tokio::io::AsyncReadExt;
+
+async fn db() -> Arc<Database> {
+    crate::replication::test_support::in_memory_database().await
+}
+
+fn sqlstate_of(error: &str) -> &str {
+    error
+        .split('\0')
+        .find_map(|field| field.strip_prefix('C'))
+        .unwrap_or("")
+}
+
+type Rows = Vec<Vec<Option<String>>>;
+
+/// Runs `sql` and returns its rows as text (`None` for NULL), or the error.
+async fn rows(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<Rows, String> {
+    Box::pin(execute_recorded(
+        db,
+        &mut s.state,
+        &mut s.server,
+        sql,
+        &[],
+        false,
+        None,
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut out = Vec::new();
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'D' => {
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                let mut at = 2;
+                let mut row = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let l = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                    at += 4;
+                    if l < 0 {
+                        row.push(None);
+                    } else {
+                        let l = l as usize;
+                        row.push(Some(
+                            String::from_utf8_lossy(&body[at..at + l]).into_owned(),
+                        ));
+                        at += l;
+                    }
+                }
+                out.push(row);
+            }
+            b'C' => return Ok(out),
+            b'E' => return Err(String::from_utf8_lossy(&body).to_string()),
+            _ => {}
+        }
+    }
+}
+
+async fn one(db: &Arc<Database>, s: &mut Session, sql: &str) -> Rows {
+    rows(db, s, sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+fn r(values: &[Option<&str>]) -> Vec<Option<String>> {
+    values.iter().map(|v| v.map(str::to_string)).collect()
+}
+
+/// A per-row NULL assigned to a `NOT NULL` column is 23502, whatever
+/// produced it. Only a constant NULL was refused; `SET n = m`, `n + m`,
+/// `NULLIF` and a `CASE` that is NULL for one row stored the type's zero
+/// (or `''`) and reported success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_computed_null_into_a_not_null_column_is_refused() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE n1 (id BIGINT PRIMARY KEY, n BIGINT NOT NULL, m BIGINT, s TEXT NOT NULL, t TEXT)").await;
+    ok(
+        &db,
+        &mut s,
+        "INSERT INTO n1 VALUES (1, 5, NULL, 'a', NULL), (2, 6, 7, 'b', 'x')",
+    )
+    .await;
+
+    for sql in [
+        "UPDATE n1 SET n = m WHERE id = 1",
+        "UPDATE n1 SET n = n + m",
+        "UPDATE n1 SET n = NULLIF(n, 5)",
+        "UPDATE n1 SET n = CASE WHEN id = 1 THEN NULL ELSE n END",
+        "UPDATE n1 SET s = t",
+        "UPDATE n1 SET s = CASE WHEN id = 1 THEN NULL ELSE s END",
+    ] {
+        let e = rows(&db, &mut s, sql).await.expect_err(sql);
+        assert_eq!(sqlstate_of(&e), "23502", "{sql}: {e}");
+    }
+    // Nothing of a refused statement was written, not even the rows before
+    // the one that failed.
+    assert_eq!(
+        one(&db, &mut s, "SELECT id, n, s FROM n1 ORDER BY id").await,
+        vec![
+            r(&[Some("1"), Some("5"), Some("a")]),
+            r(&[Some("2"), Some("6"), Some("b")])
+        ]
+    );
+
+    // ON CONFLICT … DO UPDATE goes the same way.
+    let e = rows(
+        &db,
+        &mut s,
+        "INSERT INTO n1 VALUES (1, 1, 1, 'z', NULL) ON CONFLICT (id) DO UPDATE SET n = n1.m",
+    )
+    .await
+    .expect_err("conflict update to NULL");
+    assert_eq!(sqlstate_of(&e), "23502", "{e}");
+
+    // A nullable column still takes a computed NULL, and a NOT NULL one a
+    // computed value.
+    assert_eq!(
+        one(&db, &mut s, "UPDATE n1 SET t = CASE WHEN id = 2 THEN NULL END, n = COALESCE(m, 0) + 1 RETURNING id, n, t").await.len(),
+        2
+    );
+    assert_eq!(
+        one(&db, &mut s, "SELECT id, n, t FROM n1 ORDER BY id").await,
+        vec![
+            r(&[Some("1"), Some("1"), None]),
+            r(&[Some("2"), Some("8"), None])
+        ]
+    );
+}

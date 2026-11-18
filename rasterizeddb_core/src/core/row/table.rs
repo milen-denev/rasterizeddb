@@ -6329,6 +6329,32 @@ impl<S: StorageIO> Table<S> {
                 };
 
                 let is_null = matches!(value, crate::core::rql::expr::Value::Null);
+                // NULL into a column with no companion (`NOT NULL`: a column
+                // is nullable exactly when it has one) is 23502, per row, as
+                // in PostgreSQL. The statement-level check
+                // (`executor::check_not_null`) only sees a NULL written as a
+                // constant; `SET n = m`, `n + m`, `NULLIF(…)` or a `CASE` that
+                // is NULL for this row reached here, and the empty value below
+                // was stored as the type's zero (or `''`) without a word.
+                if is_null
+                    && let Some(target) = self
+                        .schema
+                        .fields
+                        .iter()
+                        .find(|f| !f.is_deleted && f.write_order as u32 == *write_order)
+                    && !crate::core::rql::nullable::is_hidden(&target.name)
+                    && crate::core::rql::nullable::flag_field(&target.name, &self.schema.fields).is_none()
+                {
+                    d.io_pointers.abort_txn(txn).await;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "null value in column \"{}\" of relation \"{}\" violates not-null constraint",
+                            target.name, self.schema.name
+                        ),
+                    )
+                    .into());
+                }
                 let bytes = match value {
                     crate::core::rql::expr::Value::Null => Vec::new(),
                     crate::core::rql::expr::Value::Data { bytes, .. } => bytes,
