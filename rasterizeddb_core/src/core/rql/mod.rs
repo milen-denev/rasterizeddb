@@ -81,6 +81,7 @@ pub mod type_modifier;
 /// Table-level and composite `UNIQUE` constraints.
 pub mod unique_key;
 pub mod window;
+pub mod views;
 
 #[cfg(test)]
 mod rename_column_tests;

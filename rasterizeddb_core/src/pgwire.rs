@@ -36,6 +36,7 @@ use crate::core::{
 use crate::pg_params::{BoundParam, inline_params};
 
 mod param_infer;
+mod view_statements;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -2751,6 +2752,13 @@ struct SessionState {
     /// own transaction state) leaves the journal with a statement and no
     /// reason.
     statement_error: Option<String>,
+    /// A statement this session runs for a view statement of its own (a
+    /// materialized view's table DDL, a rename's): the view guards on table
+    /// DDL let it through (`rql::views`).
+    view_internal: bool,
+    /// The materialized view a `REFRESH` is filling: the one write to a
+    /// materialized view expansion lets through.
+    refreshing_materialized: Option<String>,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -3121,6 +3129,8 @@ impl SessionState {
             error_in_batch: false,
             message_us: crate::core::statement_clock::wall_us(),
             statement_error: None,
+            view_internal: false,
+            refreshing_materialized: None,
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -4720,6 +4730,16 @@ pub(crate) async fn describe_query(
     // Folded as it runs (`execute_single_statement`).
     let folded = crate::core::sql_scan::fold_core_statement(stmt);
     let stmt = folded.as_ref();
+    // A view read as the derived table it stands for, as the execute path
+    // reads it (`rql::views`), so the description is of the same statement.
+    let expanded_views;
+    let stmt = match crate::core::rql::views::expand(database, stmt, None, Default::default()).await {
+        Ok(Some(text)) => {
+            expanded_views = text;
+            expanded_views.as_str()
+        }
+        _ => stmt,
+    };
     // And a correlated scalar subquery as the `LATERAL` join it runs as.
     let correlated;
     let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
@@ -6877,6 +6897,48 @@ where
         }
     };
     let stmt = rewritten.as_ref();
+
+    // Views (`core::rql::views`): their own statements are answered here,
+    // table DDL is checked against them, and a statement reading one is
+    // given its query as a derived table, before anything else plans it.
+    if let Some(parsed) = crate::core::rql::views::parse_view_statement(stmt) {
+        return view_statements::handle_view_statement(database, state, stream, parsed).await;
+    }
+    let expanded_views;
+    let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
+        if !state.view_internal
+            && let Some(ddl) = crate::core::rql::views::table_ddl(stmt)
+            && view_statements::guard_table_ddl(database, state, stream, stmt, ddl).await?
+        {
+            return Ok(());
+        }
+        let options = crate::core::rql::views::ExpandOptions {
+            writing_materialized: state.refreshing_materialized.as_deref(),
+        };
+        match crate::core::rql::views::expand(database, stmt, state.current_tx(), options).await {
+            Ok(None) => stmt,
+            Ok(Some(text)) => {
+                crate::core::rql::prepared::note_rewritten();
+                // Through the rewrites again: the derived tables are new text.
+                match rewrite_statement_text(database, &text) {
+                    Ok(again) => {
+                        expanded_views = again.into_owned();
+                        expanded_views.as_str()
+                    }
+                    Err((code, message)) => {
+                        fail_statement(state, stream, code, &message).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err((code, message)) => {
+                fail_statement(state, stream, code, &message).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        stmt
+    };
 
     // A data-modifying CTE and the statement it feeds are one statement, so
     // they need one transaction. Outside an explicit block there is none yet —

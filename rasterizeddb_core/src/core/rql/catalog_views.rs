@@ -45,6 +45,9 @@ const VIEWS: &[&str] = &[
     "pg_tables",
     "columns",
     "tables",
+    "views",
+    "pg_views",
+    "pg_matviews",
 ];
 
 /// The columns each view is built with, in order.
@@ -186,6 +189,25 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("table_type", STRING),
         ],
         "pg_inherits" => &[("inhrelid", I64), ("inhparent", I64), ("inhseqno", I64)],
+        // `information_schema.views`: views here are not updatable and take
+        // no check option.
+        "views" => &[
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("view_definition", STRING),
+            ("check_option", STRING),
+            ("is_updatable", STRING),
+            ("is_insertable_into", STRING),
+        ],
+        "pg_views" => &[("schemaname", STRING), ("viewname", STRING), ("viewowner", STRING), ("definition", STRING)],
+        "pg_matviews" => &[
+            ("schemaname", STRING),
+            ("matviewname", STRING),
+            ("matviewowner", STRING),
+            ("ispopulated", BOOL),
+            ("definition", STRING),
+        ],
         _ => return None,
     })
 }
@@ -247,7 +269,7 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 2] = ["columns", "tables"];
+const QUALIFIED_ONLY: [&str; 3] = ["columns", "tables", "views"];
 
 /// Whether `view` may only be matched with its schema in front of it.
 fn needs_qualifier(view: &str) -> bool {
@@ -882,10 +904,18 @@ async fn build(
     // partitioned table whose schema could not be read has no shell in
     // `tables`; it is listed too, so a view that needs its data or schema
     // refuses rather than answering without it.
+    // The views this statement's transaction sees (`rql::views`). A
+    // materialized view is a table underneath, listed as what it is.
+    let view_tx = (tx != crate::core::mvcc::transaction::FROZEN_TX).then_some(tx);
+    let view_defs = crate::core::rql::views::load(database, None, view_tx).await?;
+    let is_view_of = |name: &str, kind: crate::core::rql::views::ViewKind| {
+        view_defs.iter().any(|v| v.kind == kind && v.name == name)
+    };
     let tables: Vec<String> = database
         .relation_names()
         .into_iter()
         .filter(|name| !is_internal(name))
+        .filter(|name| !is_view_of(name, crate::core::rql::views::ViewKind::Materialized))
         .collect();
 
     let (create, inserts) = match view {
@@ -927,6 +957,27 @@ async fn build(
                     oid_of(name),
                     escape(name),
                     oid_of(SCHEMA),
+                    bytes,
+                    tuples
+                ));
+            }
+            // A view is a relation of kind 'v' with no storage, a
+            // materialized view one of kind 'm' with its table's.
+            for view in &view_defs {
+                let (relkind, (bytes, tuples)) = match view.kind {
+                    crate::core::rql::views::ViewKind::View => ("v", (0, 0)),
+                    crate::core::rql::views::ViewKind::Materialized => {
+                        ("m", relation_size(database, &view.name).await.unwrap_or((0, 0)))
+                    }
+                };
+                rows.push(format!(
+                    "INSERT INTO {} (oid, relname, relnamespace, relkind, relsize, reltuples) \
+                     VALUES ({}, '{}', {}, '{}', {}, {})",
+                    temp,
+                    oid_of(&view.name),
+                    escape(&view.name),
+                    oid_of(SCHEMA),
+                    relkind,
                     bytes,
                     tuples
                 ));
@@ -995,6 +1046,44 @@ async fn build(
                     ));
                 }
             }
+            // A view's columns and their types, as its query describes them.
+            for view in view_defs.iter().filter(|v| v.kind == crate::core::rql::views::ViewKind::View) {
+                let select = format!("SELECT * FROM {}", crate::core::rql::views::quote_ident(&view.name));
+                let Ok(Some((fields, true))) = Box::pin(crate::pgwire::describe_query(database, &select)).await else {
+                    continue;
+                };
+                for (position, (column, db_type)) in fields.iter().enumerate() {
+                    let field = crate::core::row::schema::SchemaField::new(
+                        column.clone(),
+                        db_type.clone(),
+                        db_type.get_size(),
+                        0,
+                        position as u64,
+                        false,
+                    );
+                    let info = column_info(&field, &crate::core::row::schema::TableSchema::new(view.name.clone(), false));
+                    rows.push(format!(
+                        "INSERT INTO {} (table_catalog, table_schema, table_name, column_name, \
+                         ordinal_position, is_nullable, data_type, character_maximum_length, \
+                         numeric_precision, numeric_precision_radix, numeric_scale, \
+                         datetime_precision, udt_name) \
+                         VALUES ('{}', '{}', '{}', '{}', {}, 'YES', '{}', {}, {}, {}, {}, {}, '{}')",
+                        temp,
+                        escape(&database.name),
+                        SCHEMA,
+                        escape(&view.name),
+                        escape(column),
+                        position + 1,
+                        info.data_type,
+                        number_or_null(info.character_maximum_length),
+                        number_or_null(info.numeric_precision),
+                        number_or_null(info.numeric_precision_radix),
+                        number_or_null(info.numeric_scale),
+                        number_or_null(info.datetime_precision),
+                        info.udt_name,
+                    ));
+                }
+            }
             (
                 format!(
                     "CREATE TABLE {} (table_catalog TEXT, table_schema TEXT, table_name TEXT, \
@@ -1007,6 +1096,58 @@ async fn build(
                 rows,
             )
         }
+        "views" | "pg_views" | "pg_matviews" => {
+            use crate::core::rql::views::ViewKind;
+            let wanted = if view == "pg_matviews" { ViewKind::Materialized } else { ViewKind::View };
+            let mut rows = Vec::new();
+            for def in view_defs.iter().filter(|v| v.kind == wanted) {
+                rows.push(match view {
+                    "views" => format!(
+                        "INSERT INTO {} (table_catalog, table_schema, table_name, view_definition, check_option, \
+                         is_updatable, is_insertable_into) VALUES ('{}', '{}', '{}', '{}', 'NONE', 'NO', 'NO')",
+                        temp,
+                        escape(&database.name),
+                        SCHEMA,
+                        escape(&def.name),
+                        escape(&def.definition)
+                    ),
+                    "pg_views" => format!(
+                        "INSERT INTO {} (schemaname, viewname, viewowner, definition) VALUES ('{}', '{}', '{}', '{}')",
+                        temp,
+                        SCHEMA,
+                        escape(&def.name),
+                        escape(&database.name),
+                        escape(&def.definition)
+                    ),
+                    _ => format!(
+                        "INSERT INTO {} (schemaname, matviewname, matviewowner, ispopulated, definition) \
+                         VALUES ('{}', '{}', '{}', TRUE, '{}')",
+                        temp,
+                        SCHEMA,
+                        escape(&def.name),
+                        escape(&database.name),
+                        escape(&def.definition)
+                    ),
+                });
+            }
+            let create = match view {
+                "views" => format!(
+                    "CREATE TABLE {} (table_catalog TEXT, table_schema TEXT, table_name TEXT, view_definition TEXT, \
+                     check_option TEXT, is_updatable TEXT, is_insertable_into TEXT)",
+                    temp
+                ),
+                "pg_views" => format!(
+                    "CREATE TABLE {} (schemaname TEXT, viewname TEXT, viewowner TEXT, definition TEXT)",
+                    temp
+                ),
+                _ => format!(
+                    "CREATE TABLE {} (schemaname TEXT, matviewname TEXT, matviewowner TEXT, ispopulated BOOLEAN, \
+                     definition TEXT)",
+                    temp
+                ),
+            };
+            (create, rows)
+        }
         // The four columns schema introspection actually reads —
         // `sea-orm-cli`, Diesel's `print-schema` and JDBC's `getTables` all
         // select them by name. The standard's remaining columns
@@ -1016,15 +1157,22 @@ async fn build(
         // answer.
         "tables" => {
             let mut rows = Vec::with_capacity(tables.len());
-            for name in &tables {
+            let listed = tables.iter().map(|n| (n.as_str(), "BASE TABLE")).chain(
+                view_defs
+                    .iter()
+                    .filter(|v| v.kind == crate::core::rql::views::ViewKind::View)
+                    .map(|v| (v.name.as_str(), "VIEW")),
+            );
+            for (name, kind) in listed {
                 rows.push(format!(
                     "INSERT INTO {} (table_catalog, table_schema, table_name, table_type) \
-                     VALUES ('{}', '{}', '{}', 'BASE TABLE')",
+                     VALUES ('{}', '{}', '{}', '{}')",
                     temp,
                     // The database, as in `columns`.
                     escape(&database.name),
                     SCHEMA,
-                    escape(name)
+                    escape(name),
+                    kind
                 ));
             }
             (

@@ -1341,6 +1341,8 @@ fn pool_has_placement(_pool: &StoragePool, _table_name: &str) -> bool {
 }
 
 pub struct Database {
+    /// The names of the views this database may hold (`rql::views`).
+    pub(crate) views: crate::core::rql::views::ViewRegistry,
     /// Each table's slot by name (a partitioned table's shell included).
     /// Private, and named only in `slots.rs`: metadata readers use
     /// [`Database::schema_view`], execution the escape hatches listed there.
@@ -1891,6 +1893,7 @@ impl Database {
         let database = Database {
             #[cfg(test)]
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
+            views: crate::core::rql::views::ViewRegistry::default(),
             id,
             name: name.to_string(),
             table_slots,
@@ -6171,6 +6174,22 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
         Err((_, message)) => return error_response(&message),
     };
     let stmt = rewritten.as_ref();
+
+    // Views (`rql::views`) are read as derived tables and kept in a catalogue
+    // written in a session's transaction; neither is open to a native
+    // statement yet.
+    if crate::core::rql::views::parse_view_statement(stmt).is_some() {
+        return error_response(
+            "view statements are not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
+    if crate::core::rql::views::names_a_known_view(&database, stmt) {
+        return error_response(
+            "reading a view is not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
 
     // A unique index is a constraint here, as on pgwire.
     let unique;

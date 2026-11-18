@@ -50,10 +50,23 @@ enum Tok<'a> {
 }
 
 fn tokens(sql: &str) -> Vec<Tok<'_>> {
+    tokens_spanned(sql).0
+}
+
+/// [`tokens`], with each token's byte range in `sql` beside it.
+fn tokens_spanned(sql: &str) -> (Vec<Tok<'_>>, Vec<std::ops::Range<usize>>) {
     let b = sql.as_bytes();
     let mut out = Vec::with_capacity(sql.len() / 4 + 4);
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::with_capacity(sql.len() / 4 + 4);
     let mut i = 0;
+    // Where the token being read began: each pass of the loop pushes at most
+    // one, so its range is recorded at the start of the next pass.
+    let mut token_start = 0;
     while i < b.len() {
+        if spans.len() < out.len() {
+            spans.push(token_start..i);
+        }
+        token_start = i;
         let c = b[i];
         match c {
             b' ' | b'\t' | b'\n' | b'\r' => i += 1,
@@ -146,7 +159,10 @@ fn tokens(sql: &str) -> Vec<Tok<'_>> {
             }
         }
     }
-    out
+    if spans.len() < out.len() {
+        spans.push(token_start..i.min(b.len()));
+    }
+    (out, spans)
 }
 
 /// A word's name: a quoted identifier with its doubled quotes undone.
@@ -212,10 +228,17 @@ fn reserved(t: &Tok<'_>) -> bool {
 
 /// A relation name at `toks[i]`, schema qualifier dropped (`public.t` is
 /// `t`; the engine has one schema), and the index past it.
-fn relation_at(toks: &[Tok<'_>], mut i: usize) -> Option<(String, usize)> {
+fn relation_at(toks: &[Tok<'_>], i: usize) -> Option<(String, usize)> {
+    relation_span_at(toks, i).map(|(name, _, next)| (name, next))
+}
+
+/// [`relation_at`], with the index of the name's first token (past `ONLY`
+/// and `LATERAL`).
+fn relation_span_at(toks: &[Tok<'_>], mut i: usize) -> Option<(String, usize, usize)> {
     while toks.get(i).is_some_and(|t| is_kw(t, "ONLY") || is_kw(t, "LATERAL")) {
         i += 1;
     }
+    let start = i;
     let Some(Tok::Word { text, quoted }) = toks.get(i) else {
         return None;
     };
@@ -233,7 +256,7 @@ fn relation_at(toks: &[Tok<'_>], mut i: usize) -> Option<(String, usize)> {
             _ => break,
         }
     }
-    Some((word_text(name, name_quoted), j))
+    Some((word_text(name, name_quoted), start, j))
 }
 
 /// Past an optional alias (`AS a`, `a`, `a (c1, c2)`) after a relation.
@@ -371,10 +394,58 @@ struct Depth {
 /// may appear more than once; `tables_for` merges). See the module comment.
 pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
     let toks = tokens(sql);
-    let mut out: Vec<(String, TableMode)> = Vec::new();
     if let Some(ddl) = ddl_targets(&toks) {
         return ddl;
     }
+    scan(&toks).into_iter().map(|f| (f.name, f.mode)).collect()
+}
+
+/// A relation the scan found: its name, mode, and the tokens it spans (the
+/// first of its name, and the one just past it).
+struct Found {
+    name: String,
+    mode: TableMode,
+    start: usize,
+    next: usize,
+}
+
+/// A relation a statement reads or writes, where it is written: the byte
+/// range of its (possibly qualified) name, and whether an alias follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationRef {
+    pub name: String,
+    pub mode: TableMode,
+    pub span: std::ops::Range<usize>,
+    pub aliased: bool,
+}
+
+/// Every relation `sql` names where a relation is read or written (`FROM`,
+/// `JOIN` and `USING` lists, the target of `INSERT INTO`, `UPDATE` and
+/// `DELETE FROM`), at every depth, with where each is written. Empty for a
+/// DDL statement [`statement_lock_set`] reads as one (`ALTER`, `DROP`,
+/// `CREATE TABLE`, `CREATE INDEX`); a `CREATE TABLE … AS`'s query is read.
+/// The same scan as the lock set, so the two cannot disagree on what a
+/// statement names.
+pub fn relation_references(sql: &str) -> Vec<RelationRef> {
+    let (toks, spans) = tokens_spanned(sql);
+    if ddl_targets(&toks).is_some() {
+        return Vec::new();
+    }
+    scan(&toks)
+        .into_iter()
+        .filter_map(|f| {
+            let first = spans.get(f.start)?;
+            let last = spans.get(f.next.checked_sub(1)?)?;
+            let aliased = skip_alias(&toks, f.next) != f.next;
+            Some(RelationRef { name: f.name, mode: f.mode, span: first.start..last.end, aliased })
+        })
+        .collect()
+}
+
+/// The relations the tokens of a statement that is not DDL name; see
+/// [`statement_lock_set`].
+fn scan(toks: &[Tok<'_>]) -> Vec<Found> {
+    let mut out: Vec<Found> = Vec::new();
     // The top level, and a level per open paren above it (allocated only
     // once a statement has one, as most single-table statements do not).
     let mut top = Depth { call: false, list: None };
@@ -411,7 +482,7 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
                             item_paren = Some(i);
                         } else if !opens_a_query(toks.get(i)) {
                             depth!().list = Some(mode);
-                            i = list_from(&toks, i, mode, &mut out, &mut item_paren);
+                            i = list_from(toks, i, mode, &mut out, &mut item_paren);
                         }
                     }
                 }
@@ -425,7 +496,7 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
             Tok::Punct(',') => {
                 let depth = depth!();
                 if let (false, Some(mode)) = (depth.call, depth.list) {
-                    i = list_from(&toks, i + 1, mode, &mut out, &mut item_paren);
+                    i = list_from(toks, i + 1, mode, &mut out, &mut item_paren);
                     continue;
                 }
                 i += 1;
@@ -444,7 +515,7 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
                 TableMode::AccessShare
             };
             depth!().list = Some(mode);
-            i = list_from(&toks, i + 1, mode, &mut out, &mut item_paren);
+            i = list_from(toks, i + 1, mode, &mut out, &mut item_paren);
             continue;
         }
         // `DELETE FROM t USING …`: the one USING that follows the write
@@ -453,18 +524,18 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
         let deletes_using = depth!().list == Some(TableMode::RowExclusive);
         if is_kw(t, "USING") && !in_call && (deletes_using || toks.get(i + 1) != Some(&Tok::Punct('('))) {
             depth!().list = Some(TableMode::AccessShare);
-            i = list_from(&toks, i + 1, TableMode::AccessShare, &mut out, &mut item_paren);
+            i = list_from(toks, i + 1, TableMode::AccessShare, &mut out, &mut item_paren);
             continue;
         }
         if is_kw(t, "JOIN") && !in_call {
-            if let Some((name, next)) = relation_at(&toks, i + 1) {
+            if let Some((name, start, next)) = relation_span_at(toks, i + 1) {
                 if toks.get(next) == Some(&Tok::Punct('(')) {
                     // `JOIN f(x)`: a function, not a relation.
                     item_paren = Some(next);
                     i = next;
                     continue;
                 }
-                out.push((name, TableMode::AccessShare));
+                out.push(Found { name, mode: TableMode::AccessShare, start, next });
                 i = next;
                 continue;
             }
@@ -480,8 +551,8 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
             }
         }
         if is_kw(t, "INTO") && prev.is_some_and(|p| is_kw(p, "INSERT")) {
-            if let Some((name, next)) = relation_at(&toks, i + 1) {
-                out.push((name, TableMode::RowExclusive));
+            if let Some((name, start, next)) = relation_span_at(toks, i + 1) {
+                out.push(Found { name, mode: TableMode::RowExclusive, start, next });
                 i = next;
                 continue;
             }
@@ -489,8 +560,8 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
         if is_kw(t, "UPDATE")
             && !prev.is_some_and(|p| is_kw(p, "FOR") || is_kw(p, "KEY") || is_kw(p, "DO") || is_kw(p, "ON"))
         {
-            if let Some((name, next)) = relation_at(&toks, i + 1) {
-                out.push((name, TableMode::RowExclusive));
+            if let Some((name, start, next)) = relation_span_at(toks, i + 1) {
+                out.push(Found { name, mode: TableMode::RowExclusive, start, next });
                 i = next;
                 continue;
             }
@@ -505,9 +576,9 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
         i += 1;
     }
     if locking {
-        for (_, mode) in out.iter_mut() {
-            if *mode == TableMode::AccessShare {
-                *mode = TableMode::RowExclusive;
+        for found in out.iter_mut() {
+            if found.mode == TableMode::AccessShare {
+                found.mode = TableMode::RowExclusive;
             }
         }
     }
@@ -520,7 +591,7 @@ fn list_from(
     toks: &[Tok<'_>],
     i: usize,
     mode: TableMode,
-    out: &mut Vec<(String, TableMode)>,
+    out: &mut Vec<Found>,
     item_paren: &mut Option<usize>,
 ) -> usize {
     let end = relation_list(toks, i, mode, out);
@@ -535,7 +606,7 @@ fn list_from(
 /// function's arguments, a parenthesised join) is left for the main scan,
 /// which sees the paren next and resumes the list at the comma after it.
 /// Returns where the list stops.
-fn relation_list(toks: &[Tok<'_>], mut i: usize, mode: TableMode, out: &mut Vec<(String, TableMode)>) -> usize {
+fn relation_list(toks: &[Tok<'_>], mut i: usize, mode: TableMode, out: &mut Vec<Found>) -> usize {
     loop {
         while toks.get(i).is_some_and(|t| is_kw(t, "LATERAL")) {
             i += 1;
@@ -543,14 +614,14 @@ fn relation_list(toks: &[Tok<'_>], mut i: usize, mode: TableMode, out: &mut Vec<
         if toks.get(i) == Some(&Tok::Punct('(')) {
             return i;
         }
-        let Some((name, next)) = relation_at(toks, i) else {
+        let Some((name, start, next)) = relation_span_at(toks, i) else {
             return i;
         };
         // `FROM f(x)`: a set-returning function, not a relation.
         if toks.get(next) == Some(&Tok::Punct('(')) {
             return next;
         }
-        out.push((name, mode));
+        out.push(Found { name, mode, start, next });
         i = skip_alias(toks, next);
         if toks.get(i) == Some(&Tok::Punct(',')) {
             i += 1;
@@ -633,6 +704,18 @@ fn is_create_table_as(toks: &[Tok<'_>]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reference_carries_where_it_is_written() {
+        let sql = "SELECT * FROM public.v x JOIN \"W\" ON true WHERE a IN (SELECT 1 FROM v) AND EXTRACT(year FROM ts) > 0";
+        let refs = relation_references(sql);
+        let spans: Vec<(&str, &str, bool)> = refs.iter().map(|r| (r.name.as_str(), &sql[r.span.clone()], r.aliased)).collect();
+        assert_eq!(spans, [("v", "public.v", true), ("W", "\"W\"", false), ("v", "v", false)]);
+        let writes = relation_references("INSERT INTO t (a) SELECT a FROM s");
+        assert_eq!(writes.iter().map(|r| (r.name.as_str(), r.mode)).collect::<Vec<_>>(), [("t", RX), ("s", AS)]);
+        assert!(relation_references("DROP TABLE t").is_empty());
+        assert_eq!(relation_references("CREATE TABLE n AS SELECT * FROM t").len(), 1);
+    }
     use TableMode::{AccessExclusive as AE, AccessShare as AS, RowExclusive as RX};
 
     fn set(sql: &str) -> Vec<(String, TableMode)> {
