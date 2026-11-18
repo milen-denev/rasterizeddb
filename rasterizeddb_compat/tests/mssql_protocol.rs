@@ -593,3 +593,79 @@ async fn tiberius_procedures_cursors_table_variables() {
     .unwrap();
     assert_eq!(r.last().unwrap()[0].get::<i32, _>("gone"), Some(1));
 }
+
+/// A general MERGE: run as its parts, atomically, as SQL Server would.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiberius_merge() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE Stock (Id int PRIMARY KEY, Qty int, Note nvarchar(10))").await.unwrap();
+    batch(&mut c, "INSERT INTO Stock VALUES (1, 10, N'a'), (2, 20, N'b'), (3, 30, N'c'), (4, 40, N'd')").await.unwrap();
+    // 1: updated; 2: deleted (Qty 0); 3: untouched by source → deleted by
+    // BY SOURCE only when Qty > 25; 4: not in source, Qty 40 → deleted;
+    // 5: inserted.
+    let r = batch(
+        &mut c,
+        "MERGE INTO dbo.Stock WITH (HOLDLOCK) AS t
+         USING (VALUES (1, 5), (2, 0), (5, 7)) AS s (Id, Qty) ON t.Id = s.Id
+         WHEN MATCHED AND s.Qty = 0 THEN DELETE
+         WHEN MATCHED THEN UPDATE SET Qty = t.Qty + s.Qty, Note = CASE WHEN s.Qty > 3 THEN N'big' ELSE N'small' END
+         WHEN NOT MATCHED BY TARGET THEN INSERT (Id, Qty, Note) VALUES (s.Id, s.Qty, N'new')
+         WHEN NOT MATCHED BY SOURCE AND t.Qty > 35 THEN DELETE
+         WHEN NOT MATCHED BY SOURCE THEN UPDATE SET Note = N'kept';
+         SELECT @@ROWCOUNT AS n;
+         SELECT Id, Qty, Note FROM Stock ORDER BY Id",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<i32, _>("n"), Some(5));
+    let rows: Vec<(i32, i32, String)> = r[1]
+        .iter()
+        .map(|row| (row.get(0).unwrap(), row.get(1).unwrap(), row.get::<&str, _>(2).unwrap().to_string()))
+        .collect();
+    assert_eq!(
+        rows,
+        [(1, 15, "big".to_string()), (3, 30, "kept".to_string()), (5, 7, "new".to_string())]
+    );
+    // From a table, with parameters.
+    batch(&mut c, "CREATE TABLE Incoming (Id int, Qty int)").await.unwrap();
+    batch(&mut c, "INSERT INTO Incoming VALUES (3, 1), (6, 2)").await.unwrap();
+    let n = c
+        .execute(
+            "MERGE Stock AS t USING Incoming AS s ON t.Id = s.Id
+             WHEN MATCHED THEN UPDATE SET Qty = s.Qty * @P1
+             WHEN NOT MATCHED THEN INSERT (Id, Qty, Note) VALUES (s.Id, s.Qty * @P1, @P2);",
+            &[&100i32, &"param"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(n.total(), 2);
+    let r = batch(&mut c, "SELECT Qty, Note FROM Stock WHERE Id IN (3, 6) ORDER BY Id").await.unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(100));
+    assert_eq!(r[0][1].get::<i32, _>(0), Some(200));
+    assert_eq!(r[0][1].get::<&str, _>(1), Some("param"));
+    // A target row matched twice is an error, and nothing changes.
+    let e = batch(
+        &mut c,
+        "MERGE Stock AS t USING (VALUES (1, 1), (1, 2)) AS s (Id, Qty) ON t.Id = s.Id
+         WHEN MATCHED THEN UPDATE SET Qty = s.Qty
+         WHEN NOT MATCHED THEN INSERT (Id, Qty) VALUES (s.Id + 100, s.Qty);",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(number(&e), Some(8672), "{e}");
+    let r = batch(&mut c, "SELECT Qty FROM Stock WHERE Id = 1; SELECT COUNT(*) FROM Stock WHERE Id > 100").await.unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(15));
+    assert_eq!(r[1][0].get::<i32, _>(0), Some(0));
+    // Inside a transaction that is rolled back.
+    batch(
+        &mut c,
+        "BEGIN TRAN;
+         MERGE Stock AS t USING (VALUES (1, 99)) AS s (Id, Qty) ON t.Id = s.Id WHEN MATCHED THEN UPDATE SET Qty = s.Qty;
+         ROLLBACK",
+    )
+    .await
+    .unwrap();
+    let r = batch(&mut c, "SELECT Qty FROM Stock WHERE Id = 1").await.unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(15));
+}

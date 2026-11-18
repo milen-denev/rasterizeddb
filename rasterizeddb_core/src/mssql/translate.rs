@@ -566,6 +566,10 @@ pub(crate) struct Cx<'a> {
     aliases: Vec<String>,
     /// The call being rewritten is followed by OVER.
     window_next: bool,
+    /// Past a select list (WHERE, GROUP BY, HAVING, ORDER BY): COUNT is
+    /// left uncast there, where its type is no column's and the engine
+    /// does not take a cast inside HAVING.
+    past_select_list: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -574,6 +578,7 @@ impl<'a> Cx<'a> {
             env,
             aliases: Vec::new(),
             window_next: false,
+            past_select_list: false,
         }
     }
 }
@@ -1049,7 +1054,7 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
     Ok(Some(match upper.as_str() {
         // SQL Server's COUNT is an int; COUNT_BIG is the bigint. A window
         // (COUNT(*) OVER …) is left as it is: the cast cannot sit between.
-        "COUNT" if !cx.window_next => {
+        "COUNT" if !cx.window_next && !cx.past_select_list => {
             let mut inner_tokens = vec![Token::raw("count"), Token::op("(")];
             inner_tokens[1].space = false;
             inner_tokens.extend(rewrite_expr(inner.to_vec(), cx)?);
@@ -1816,6 +1821,19 @@ fn rewrite_select(
     cx: &mut Cx,
     name_items: bool,
 ) -> Result<Vec<Token>, TsqlError> {
+    // A query has its own select list, wherever it sits.
+    let outer = std::mem::replace(&mut cx.past_select_list, false);
+    let r = rewrite_select_inner(sql, tokens, cx, name_items);
+    cx.past_select_list = outer;
+    r
+}
+
+fn rewrite_select_inner(
+    sql: &str,
+    tokens: Vec<Token>,
+    cx: &mut Cx,
+    name_items: bool,
+) -> Result<Vec<Token>, TsqlError> {
     let mut tokens = tokens;
     let mut i = 0usize;
     let mut out = Vec::new();
@@ -1971,7 +1989,10 @@ fn rewrite_select(
         if kw(&rest, j, "ALL") {
             j += 1;
         }
-        out.extend(rewrite_expr(rest[..j].to_vec(), cx)?);
+        let outer = std::mem::replace(&mut cx.past_select_list, true);
+        let tail = rewrite_expr(rest[..j].to_vec(), cx);
+        cx.past_select_list = outer;
+        out.extend(tail?);
         out.extend(rewrite_select(sql, rest[j..].to_vec(), cx, false)?);
         cx.aliases.clear();
         return Ok(out);
@@ -1982,7 +2003,10 @@ fn rewrite_select(
             return Err(TsqlError::unsupported("FOR JSON / FOR XML"));
         }
     }
-    out.extend(rewrite_expr(rest, cx)?);
+    let outer = std::mem::replace(&mut cx.past_select_list, true);
+    let tail = rewrite_expr(rest, cx);
+    cx.past_select_list = outer;
+    out.extend(tail?);
     if let Some(l) = limit {
         out.push(Token::word("LIMIT"));
         out.extend(rewrite_expr(l, cx)?);
@@ -3544,6 +3568,10 @@ mod tests {
         assert_eq!(
             tr(&e, "SELECT Total = COUNT(*) FROM t"),
             r#"SELECT ((count(*))::integer) AS "Total" FROM t"#
+        );
+        assert_eq!(
+            tr(&e, "SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT COUNT(*) FROM v))"),
+            r#"SELECT a, ((count(*))::integer) AS "n" FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT COUNT(*) FROM v))"#
         );
         assert_eq!(
             tr(&e, "SELECT 'a' + name + N'b' FROM t"),

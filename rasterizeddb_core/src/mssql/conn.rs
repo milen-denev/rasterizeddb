@@ -912,6 +912,15 @@ impl Session {
         sql: &str,
         params: &[(i16, Option<Vec<u8>>, u32)],
     ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
+        self.query_bound(sql, params).await.map(|(f, r, _)| (f, r))
+    }
+
+    /// One statement's columns, rows and command tag.
+    async fn query_bound(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>, String), PgNotice> {
         let b = self.bridge();
         if params.is_empty() {
             b.query(sql);
@@ -928,6 +937,7 @@ impl Session {
         let mut error = None;
         let mut fields = Vec::new();
         let mut rows = Vec::new();
+        let mut tag = String::new();
         loop {
             let frame = b.next().await.map_err(|e| PgNotice {
                 code: "08006".into(),
@@ -937,6 +947,10 @@ impl Session {
             match frame.tag {
                 b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
                 b'T' => fields = parse_row_description(frame.body).unwrap_or_default(),
+                b'C' => {
+                    tag = String::from_utf8_lossy(frame.body.strip_suffix(&[0]).unwrap_or(frame.body))
+                        .into_owned()
+                }
                 b'D' => {
                     if let Ok(cells) = data_row_cells(frame.body) {
                         rows.push(
@@ -953,7 +967,7 @@ impl Session {
         }
         match error {
             Some(e) => Err(e),
-            None => Ok((fields, rows)),
+            None => Ok((fields, rows, tag)),
         }
     }
 
@@ -1701,6 +1715,7 @@ impl Session {
             "OPEN" | "CLOSE" | "FETCH" | "DEALLOCATE" => {
                 self.cursor_statement(&head, tokens, params).await
             }
+            "MERGE" if !super::merge::is_insert_only(tokens) => self.merge(tokens, params).await,
             "SET" if matches!(tokens.get(1).map(|t| &t.tok), Some(Tok::UserVar(_))) => {
                 let Some(Tok::UserVar(name)) = tokens.get(1).map(|t| &t.tok) else {
                     unreachable!()
@@ -3409,6 +3424,204 @@ impl Session {
             outputs,
             flow,
         })
+    }
+}
+
+/// MERGE (see [`super::merge`]).
+impl Session {
+    /// T-SQL run as a statement of the session's, its rows kept here:
+    /// (columns, rows, rows affected).
+    async fn exec_tsql(
+        &mut self,
+        tokens: Vec<Token>,
+        params: Option<&ParamCtx>,
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>, u64), TsqlError> {
+        let tokens = self.bind_names(&tokens).unwrap_or(tokens);
+        if let Some(p) = params {
+            p.used.lock().clear();
+        }
+        let forward = translate::translate("", tokens, &Scope { s: self, params })?;
+        let bound = bound_values(params);
+        let mut last = (Vec::new(), Vec::new(), 0);
+        for sql in forward.statements {
+            log::debug!("MERGE step: {sql}");
+            let (f, r, tag) = self
+                .query_bound(&sql, &bound)
+                .await
+                .map_err(|e| error_from_engine(&e))?;
+            last = (f, r, tag_count(&tag).unwrap_or(0));
+        }
+        Ok(last)
+    }
+
+    async fn merge(&mut self, tokens: &[Token], params: Option<&ParamCtx>) -> Result<Flow, TsqlError> {
+        let m = super::merge::parse(tokens)?;
+        let database = self.bridge().database.clone();
+        if !database.has_table(&m.target_name) {
+            return Err(TsqlError::new(208, format!("Invalid object name '{}'.", m.target_name)));
+        }
+        let pk = database
+            .schema_view(&m.target_name)
+            .and_then(|v| v.schema().primary_key.clone());
+        let outer = self.bridge().in_block();
+        self.silent(if outer { "SAVEPOINT rdb_tds_merge" } else { "BEGIN" })
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        let r = self.merge_steps(&m, pk.as_deref(), params).await;
+        let end = match (&r, outer) {
+            (Ok(_), true) => "RELEASE SAVEPOINT rdb_tds_merge",
+            (Ok(_), false) => "COMMIT",
+            (Err(_), true) => "ROLLBACK TO SAVEPOINT rdb_tds_merge",
+            (Err(_), false) => "ROLLBACK",
+        };
+        let ended = self.silent(end).await;
+        if outer && r.is_err() {
+            let _ = self.silent("RELEASE SAVEPOINT rdb_tds_merge").await;
+        }
+        let n = r?;
+        ended.map_err(|e| error_from_engine(&e))?;
+        self.rowcount = n as i64;
+        self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, n);
+        Ok(Flow::Next)
+    }
+
+    async fn merge_steps(
+        &mut self,
+        m: &super::merge::Merge,
+        pk: Option<&str>,
+        params: Option<&ParamCtx>,
+    ) -> Result<u64, TsqlError> {
+        use super::merge::t;
+        let alias = Token::new(Tok::Quoted(m.source_alias.clone()));
+        let mut copied = None;
+        let mut source = Vec::new();
+        if m.derived_source() {
+            // The engine correlates with a table, not a derived one.
+            self.temp_seq += 1;
+            let tmp = format!("#rdb_merge{}", self.temp_seq);
+            let mut copy = t("SELECT * INTO");
+            copy.push(Token::new(Tok::Quoted(tmp.clone())));
+            copy.extend(t("FROM"));
+            copy.extend(m.source.iter().cloned());
+            copy.extend(t("AS"));
+            copy.push(alias.clone());
+            if let Some(cols) = &m.source_columns {
+                copy.push(Token::op("("));
+                copy.extend(cols.iter().cloned());
+                copy.push(Token::op(")"));
+            }
+            self.exec_tsql(copy, params).await?;
+            copied = Some(self.temp_name(&tmp));
+            source.push(Token::new(Tok::Quoted(tmp)));
+        } else {
+            source.extend(m.source.iter().cloned());
+        }
+        source.extend(t("AS"));
+        source.push(alias);
+        let r = self.merge_run(m, &source, pk, params).await;
+        if let Some(table) = copied {
+            let _ = self.silent(&format!("DROP TABLE IF EXISTS {}", ident_sql(&table))).await;
+        }
+        r
+    }
+
+    async fn merge_run(
+        &mut self,
+        m: &super::merge::Merge,
+        source: &[Token],
+        pk: Option<&str>,
+        params: Option<&ParamCtx>,
+    ) -> Result<u64, TsqlError> {
+        let steps = super::merge::steps(m, source, pk)?;
+        if let Some(d) = steps.duplicates {
+            let (_, rows, _) = self.exec_tsql(d, params).await?;
+            if !rows.is_empty() {
+                return Err(TsqlError::new(
+                    8672,
+                    "The MERGE statement attempted to UPDATE or DELETE the same row more than once. This happens when a target row matches more than one source row. A MERGE statement cannot UPDATE/DELETE the same row of the target table multiple times. Refine the ON clause to ensure a target row matches at most one source row, or use the GROUP BY clause to group the source rows.",
+                ));
+            }
+        }
+        let inserting = match steps.to_insert {
+            Some((select, columns, default)) => {
+                let (fields, rows, _) = self.exec_tsql(select, params).await?;
+                Some((fields, rows, columns, default))
+            }
+            None => None,
+        };
+        let mut total = 0u64;
+        for w in steps.writes {
+            total += self.exec_tsql(w, params).await?.2;
+        }
+        let Some((fields, rows, columns, default)) = inserting else {
+            return Ok(total);
+        };
+        if rows.is_empty() {
+            return Ok(total);
+        }
+        let table = ident_sql(&m.target_name);
+        if default {
+            for _ in &rows {
+                let tag = self
+                    .silent(&format!("INSERT INTO {table} DEFAULT VALUES"))
+                    .await
+                    .map_err(|e| error_from_engine(&e))?;
+                total += tag_count(&tag).unwrap_or(0);
+            }
+            return Ok(total);
+        }
+        let columns = match columns {
+            Some(c) => c,
+            None => {
+                // All the columns but an identity, in the table's order.
+                let view = self
+                    .bridge()
+                    .database
+                    .schema_view(&m.target_name)
+                    .ok_or_else(|| TsqlError::new(208, format!("Invalid object name '{}'.", m.target_name)))?;
+                let schema = view.schema();
+                schema
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                    .filter(|f| {
+                        !schema.defaults.iter().any(|d| {
+                            !d.is_deleted
+                                && d.column == f.name
+                                && d.expression.trim_start().to_ascii_lowercase().starts_with("nextval(")
+                        })
+                    })
+                    .map(|f| f.name.clone())
+                    .collect()
+            }
+        };
+        if columns.len() != fields.len() {
+            return Err(TsqlError::new(
+                110,
+                "There are fewer columns in the INSERT statement than values specified in the VALUES clause.",
+            ));
+        }
+        let cols = columns.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", ");
+        let per = (30_000 / columns.len().max(1)).max(1);
+        for chunk in rows.chunks(per) {
+            let mut values = Vec::with_capacity(chunk.len());
+            let mut bound = Vec::with_capacity(chunk.len() * columns.len());
+            for row in chunk {
+                let mut slots = Vec::with_capacity(columns.len());
+                for (k, cell) in row.iter().enumerate() {
+                    bound.push((0i16, cell.as_ref().map(|c| c.as_bytes().to_vec()), fields[k].type_oid));
+                    slots.push(format!("${}", bound.len()));
+                }
+                values.push(format!("({})", slots.join(", ")));
+            }
+            let sql = format!("INSERT INTO {table} ({cols}) VALUES {}", values.join(", "));
+            let (_, _, tag) = self
+                .query_bound(&sql, &bound)
+                .await
+                .map_err(|e| error_from_engine(&e))?;
+            total += tag_count(&tag).unwrap_or(0);
+        }
+        Ok(total)
     }
 }
 
