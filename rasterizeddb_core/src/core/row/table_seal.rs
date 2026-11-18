@@ -144,7 +144,28 @@ impl<S: StorageIO> SealParts<S> {
     /// settled; any of them abandons the seal, so the sections describe the
     /// bytes those states recover. The caller holds the instance's
     /// maintenance, so no vacuum changes the structures without a write.
-    pub(super) async fn seal_on_store(&self) -> SealOutcome {
+    /// A mandatory seal (shutdown's, `rdb_index_checkpoint`'s) tries again
+    /// while the files are busy, under `seal_timeout`, as a file set's seal
+    /// waits for its tickets: the store's service compacts a file in the
+    /// background, and an attempt that overlaps a compaction is abandoned.
+    /// An optional one gives up at once.
+    pub(super) async fn seal_on_store(&self, kind: SealKind) -> SealOutcome {
+        use crate::core::index_store::seal::{Skip, settings};
+        let deadline = tokio::time::Instant::now() + settings::seal_timeout();
+        loop {
+            match self.seal_on_store_once().await {
+                SealOutcome::Skipped(Skip::Busy) if kind == SealKind::Mandatory => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return SealOutcome::Skipped(Skip::Timeout);
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    async fn seal_on_store_once(&self) -> SealOutcome {
         use crate::core::index_store::seal::Skip;
         if self.retired() {
             return SealOutcome::Skipped(Skip::Retired);
@@ -375,9 +396,8 @@ impl<S: StorageIO> Table<S> {
             // A key/value table (docs/kv-partitions.md §2), under the
             // instance's maintenance: no vacuum sweep between its two reads.
             Ok(d) if d.seal_parts().on_store => {
-                let _ = kind;
                 let _tick = self.maintenance_tick.lock().await;
-                d.seal_parts().seal_on_store().await
+                d.seal_parts().seal_on_store(kind).await
             }
             Ok(d) => seal::seal(&**d.seal_parts(), kind).await,
             Err(_) => SealOutcome::Excluded,
@@ -390,6 +410,14 @@ impl<S: StorageIO> Table<S> {
     /// sealed: shutdown seals it next.
     pub async fn quiesce_for_shutdown(&self) {
         self.maintenance_alive.store(false, Ordering::Release);
+        // A key/value table's store compacts its files on a service of its
+        // own, which `maintenance_alive` does not reach: a compaction after
+        // the shutdown seal would move a file's state past the one the
+        // snapshot records, and the restart would rebuild every index.
+        if let Ok(d) = self.data() {
+            d.seal_parts().io_pointers.kv_pause_service();
+            d.seal_parts().io_rows.kv_pause_service();
+        }
         let _joined = self.maintenance_tick.lock().await;
     }
 

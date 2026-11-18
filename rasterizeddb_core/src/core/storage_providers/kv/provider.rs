@@ -909,6 +909,7 @@ impl KvFamily {
             flush: tokio::sync::Mutex::new(()),
             compacting: AtomicBool::new(false),
             service: AtomicBool::new(false),
+            service_paused: AtomicBool::new(false),
             dropped: AtomicBool::new(true),
             read_cursor: AtomicU64::new(u64::MAX),
             prefetched_to: AtomicU64::new(0),
@@ -1210,6 +1211,11 @@ pub(crate) struct KvFile {
     flush: tokio::sync::Mutex<()>,
     compacting: AtomicBool,
     service: AtomicBool,
+    /// Set by [`KvStorageProvider::kv_pause_service`] at shutdown: the
+    /// service still flushes, but starts no compaction, which would move
+    /// the file's state after the shutdown seal recorded it and leave the
+    /// snapshot stale at the restart (docs/kv-partitions.md §2).
+    service_paused: AtomicBool,
     dropped: AtomicBool,
     /// End of the last read, for spotting a sequential scan.
     read_cursor: AtomicU64,
@@ -1354,6 +1360,7 @@ impl KvFile {
             flush: tokio::sync::Mutex::new(()),
             compacting: AtomicBool::new(false),
             service: AtomicBool::new(false),
+            service_paused: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             read_cursor: AtomicU64::new(u64::MAX),
             prefetched_to: AtomicU64::new(0),
@@ -3031,6 +3038,19 @@ impl KvStorageProvider {
         })
     }
 
+    /// The deltas this file holds, which a compaction folds away.
+    #[cfg(test)]
+    pub(super) fn deltas_for_tests(&self) -> usize {
+        self.file.state.read().deltas.len()
+    }
+
+    /// [`StorageIO::kv_pause_service`]: this file's service starts no
+    /// further compaction. One already running still ends, and a seal waits
+    /// for it (`kv_settled_state` is `None` while it runs).
+    pub(crate) fn kv_pause_service(&self) {
+        self.file.service_paused.store(true, Ordering::Release);
+    }
+
     /// [`StorageIO::kv_settled_state`]: under the flush lock, so no batch of
     /// this file is in flight while it is read.
     pub(crate) async fn kv_settled_state(&self) -> io::Result<Option<super::super::traits::KvState>> {
@@ -3437,6 +3457,7 @@ impl StorageIO for KvStorageProvider {
             flush: tokio::sync::Mutex::new(()),
             compacting: AtomicBool::new(false),
             service: AtomicBool::new(false),
+            service_paused: AtomicBool::new(false),
             // A dropped or poisoned file's scratch writes nothing either: it
             // shares the real name's prefix.
             dropped: AtomicBool::new(file.dropped.load(Ordering::Acquire)),
@@ -3592,7 +3613,9 @@ impl StorageIO for KvStorageProvider {
                 if has_pending && let Err(e) = file.flush(None).await {
                     error!("kv: periodic flush of {} failed: {e}", file.name);
                 }
-                if deltas >= max_deltas || overlay_bytes >= compact_bytes.saturating_mul(2) {
+                if (deltas >= max_deltas || overlay_bytes >= compact_bytes.saturating_mul(2))
+                    && !file.service_paused.load(Ordering::Acquire)
+                {
                     if let Err(e) = file.compact().await {
                         warn!("kv: compaction of {} failed: {e}", file.name);
                     }

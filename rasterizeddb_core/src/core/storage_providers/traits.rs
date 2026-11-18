@@ -354,6 +354,11 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         None
     }
 
+    /// Stops a key/value file's background service from compacting it, so
+    /// its state stays what a shutdown seal records until the process ends
+    /// (docs/kv-partitions.md §2). Nothing for every other provider.
+    fn kv_pause_service(&self) {}
+
     /// A key/value file's state once everything written to it is stored:
     /// its pending records flushed, and then `Some` only when nothing of it
     /// is in flight or undecided (no open or in-doubt transaction wrote it,

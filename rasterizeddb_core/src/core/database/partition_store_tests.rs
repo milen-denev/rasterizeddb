@@ -588,6 +588,14 @@ async fn a_plain_store_table_loads_its_snapshot_after_a_restart() {
     let report = db.index_checkpoint("plain", None).await.unwrap();
     assert_eq!(report.sealed.len(), 1);
     assert!(report.sealed[0].outcome.is_clean(), "{}", report.sealed[0].outcome.describe());
+    // As a server stops: the store's service compacts a file at 64 deltas,
+    // and one after the checkpoint above would leave its snapshot stale; the
+    // shutdown seal pauses the service and seals again.
+    let shutdown = db.seal_for_shutdown(Duration::from_secs(60)).await;
+    assert!(shutdown.skipped.is_empty(), "{:?}", shutdown.skipped);
+    for s in &shutdown.sealed {
+        assert!(s.outcome.is_clean(), "{}: {}", s.name, s.outcome.describe());
+    }
     close(db, &d);
 
     let db = open(&d).await;

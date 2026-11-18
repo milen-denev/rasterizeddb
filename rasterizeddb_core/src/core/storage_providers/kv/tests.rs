@@ -547,6 +547,45 @@ async fn a_compaction_leaves_the_state_a_restart_recovers() {
     assert_eq!(read_all(&io).await, expected);
 }
 
+/// A paused service compacts nothing, while the same service on an
+/// unpaused file does: a shutdown seal records a file's state and pauses its
+/// service, so the restart finds the state the snapshot records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_service_starts_no_compaction() {
+    let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+    let mut config = tiny_config();
+    config.max_deltas = 2;
+    config.flush_interval_ms = 10;
+    let family = KvFamily::open(store, config).await.unwrap();
+    let paused = open(&family, "paused.db").await;
+    let running = open(&family, "running.db").await;
+    paused.kv_pause_service();
+    for io in [&paused, &running] {
+        io.start_service().await;
+        for block in 0..4u8 {
+            let txn = io.begin_txn();
+            io.append_data_txn(txn, &[block; 600]).await;
+            io.commit_durable(txn).await.unwrap();
+        }
+    }
+    // A compaction folds the deltas into base chunks.
+    let deltas = |io: &KvStorageProvider| io.deltas_for_tests();
+    let held = (paused.kv_state_now().expect("a key/value file has a state"), deltas(&paused));
+    assert!(held.1 >= 2, "four commits left {} delta(s)", held.1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while deltas(&running) >= 2 {
+        assert!(std::time::Instant::now() < deadline, "the unpaused file's service never compacted it");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Twenty more of the service's ticks.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        (paused.kv_state_now().unwrap(), deltas(&paused)),
+        held,
+        "the paused file's service compacted it"
+    );
+}
+
 #[tokio::test]
 async fn compaction_leaves_an_open_transaction_alone() {
     let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());

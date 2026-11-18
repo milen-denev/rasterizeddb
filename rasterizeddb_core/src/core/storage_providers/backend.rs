@@ -546,6 +546,14 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    fn kv_pause_service(&self) {
+        match self {
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.kv_pause_service(),
+            _ => {}
+        }
+    }
+
     async fn kv_settled_state(&self) -> io::Result<Option<super::traits::KvState>> {
         match self {
             #[cfg(feature = "kv_storage")]
