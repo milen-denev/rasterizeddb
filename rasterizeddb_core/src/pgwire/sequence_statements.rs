@@ -312,31 +312,18 @@ where
                 .await?;
                 return Ok(true);
             }
-            let owned: Vec<&SequenceDef> = all
-                .iter()
-                .filter(|d| {
-                    d.owned_by.split('.').next().is_some_and(|t| names.iter().any(|n| n.eq_ignore_ascii_case(t)))
-                })
-                .collect();
-            if owned.is_empty() {
-                return Ok(false);
-            }
-            match super::view_statements::run_internal(database, state, stmt).await? {
-                Ok(_) => {}
-                Err(e) => {
-                    send_error_response(stream, sqlstate_for(&e), &e).await?;
-                    return Ok(true);
-                }
-            }
-            for def in owned {
+            // Its `OWNED BY` sequences go with it, in its transaction; the
+            // DROP itself goes on as written.
+            for def in all.iter().filter(|d| {
+                d.owned_by.split('.').next().is_some_and(|t| names.iter().any(|n| n.eq_ignore_ascii_case(t)))
+            }) {
                 if let Err(e) = sequence_catalog::remove(database, &def.name, tx).await {
                     fail_statement(state, stream, sqlstate_for(&e), &e).await?;
                     return Ok(true);
                 }
-                sequence::forget_explicit(database.id, &def.name);
             }
-            send_command_complete(stream, "DROP TABLE").await?;
-            Ok(true)
+            let _ = stmt;
+            Ok(false)
         }
         TableDdl::Alter { .. } => Ok(false),
     }

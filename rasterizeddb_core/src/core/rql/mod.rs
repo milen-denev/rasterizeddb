@@ -83,6 +83,8 @@ pub mod unique_key;
 pub mod window;
 pub mod views;
 pub mod sequence_catalog;
+pub mod functions;
+pub mod triggers;
 
 #[cfg(test)]
 mod rename_column_tests;

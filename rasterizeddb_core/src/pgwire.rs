@@ -38,6 +38,8 @@ use crate::pg_params::{BoundParam, inline_params};
 mod param_infer;
 mod view_statements;
 mod sequence_statements;
+mod routine_statements;
+mod trigger_exec;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -1553,6 +1555,17 @@ tokio::task_local! {
 /// scoped to exactly the statement and outside its owner's scope.
 type ReplyHold = crate::core::cancel::HeldReply;
 
+tokio::task_local! {
+    /// Set while a statement runs for another one, its reply going to a
+    /// buffer rather than the client (see [`hold_reply`]).
+    static INTERNAL_RUN: ();
+}
+
+/// Runs `fut`, a statement run for another, outside the reply hold.
+pub(super) async fn internal_run<F: std::future::Future>(fut: F) -> F::Output {
+    INTERNAL_RUN.scope((), fut).await
+}
+
 /// Whether `tag` ends a statement's reply (see [`ReplyHold`]).
 fn ends_reply(tag: u8) -> bool {
     matches!(tag, b'C' | b'E' | b'I' | b's')
@@ -1561,6 +1574,13 @@ fn ends_reply(tag: u8) -> bool {
 /// Keeps a message for the statement's [`ReplyHold`] when one is open and
 /// holding (or `tag` begins holding); `false` when it should be written now.
 fn hold_reply(tag: u8, header: &[u8], payload: &[u8]) -> bool {
+    // A statement run for another (`run_internal`) writes its whole reply
+    // to the buffer it was given: its `CommandComplete` is not the end of
+    // the client's reply, and held, it started holding everything after it,
+    // which then reached the client behind the real reply.
+    if INTERNAL_RUN.try_with(|_| ()).is_ok() {
+        return false;
+    }
     crate::core::cancel::STATEMENT_CANCEL
         .try_with(|cancel| {
             let Some(hold) = cancel.held_reply() else {
@@ -2763,6 +2783,9 @@ struct SessionState {
     /// This session's `nextval` results, for `currval` and `lastval`
     /// (`rql::sequence::session`).
     sequence_values: StdArc<std::sync::Mutex<crate::core::rql::sequence::session::SessionSequences>>,
+    /// The tables whose triggers are held off while this session writes the
+    /// rows they were run for (`trigger_exec`).
+    triggers_suppressed: Vec<String>,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -3136,6 +3159,7 @@ impl SessionState {
             view_internal: false,
             refreshing_materialized: None,
             sequence_values: StdArc::default(),
+            triggers_suppressed: Vec::new(),
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -4737,6 +4761,14 @@ pub(crate) async fn describe_query(
     let stmt = folded.as_ref();
     // A view read as the derived table it stands for, as the execute path
     // reads it (`rql::views`), so the description is of the same statement.
+    let inlined_calls;
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None).await {
+        Ok(Some(text)) => {
+            inlined_calls = text;
+            inlined_calls.as_str()
+        }
+        _ => stmt,
+    };
     let expanded_views;
     let stmt = match crate::core::rql::views::expand(database, stmt, None, Default::default()).await {
         Ok(Some(text)) => {
@@ -6120,6 +6152,16 @@ where
                             let read_only = state.transaction.as_ref().is_some_and(|t| t.read_only);
                             // A DROP TABLE runs at the block's commit, so a
                             // ROLLBACK keeps the table (`deferred_drops`).
+                            if ddl.is_some() && !read_only && !state.view_internal {
+                                // Views, sequences and triggers first: a
+                                // deferred DROP never reaches the statement
+                                // path's guards (`catalog_guards`).
+                                match Box::pin(catalog_guards(database, state, stream, stmt)).await {
+                                    Ok(true) => return Ok(()),
+                                    Ok(false) => {}
+                                    Err(e) => return Err(e),
+                                }
+                            }
                             if ddl.is_some() && !read_only {
                                 match deferred_drops(database, root, stmt) {
                                     Some(Err((code, message))) => return fail_statement(state, stream, code, &message).await,
@@ -6878,6 +6920,46 @@ pub(crate) fn rewrite_statement_text<'a>(
 /// not transactional here, so a statement that fails part-way would otherwise
 /// leave tables behind to collide with the next run, and the body returns early
 /// in a dozen places.
+/// `CREATE`, `DROP` and `ALTER TABLE` checked against the catalogue objects
+/// kept above the engine: a table may not take a view's or a sequence's
+/// name, `DROP TABLE` of a view is refused, a table views read is not
+/// dropped from under them (or they go first with `CASCADE`), and a dropped
+/// table's triggers and `OWNED BY` sequences go with it, in the DROP's own
+/// transaction. `Ok(true)` when the statement was answered here.
+///
+/// Called on every path a table DDL statement takes: the statement path,
+/// and a block's, which defers a `DROP TABLE` to its commit before the
+/// statement path would see it.
+async fn catalog_guards<S>(database: &Arc<Database>, state: &mut SessionState, stream: &mut S, stmt: &str) -> io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(ddl) = crate::core::rql::views::table_ddl(stmt) else {
+        return Ok(false);
+    };
+    if database.has_table(crate::core::rql::sequence_catalog::SEQUENCE_TABLE)
+        && sequence_statements::guard_table_ddl(database, state, stream, stmt, &ddl).await?
+    {
+        return Ok(true);
+    }
+    if database.has_table(crate::core::rql::views::VIEW_TABLE)
+        && view_statements::guard_table_ddl(database, state, stream, stmt, ddl.clone()).await?
+    {
+        return Ok(true);
+    }
+    if database.has_table(crate::core::rql::triggers::TRIGGER_TABLE)
+        && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
+    {
+        for name in names {
+            if let Err(e) = crate::core::rql::triggers::remove_table(database, name, state.current_tx()).await {
+                fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// [`execute_single_statement_unscoped`], with this session's sequence values
 /// in reach of the statement's expressions (`nextval`, `currval`, a `DEFAULT
 /// nextval(…)`), and a sequence's reservation written ahead after it.
@@ -6902,6 +6984,9 @@ where
     )
     .await;
     crate::core::rql::sequence_catalog::flush(database).await;
+    if ran.is_ok() && !state.statement_failed && let Some(ddl) = crate::core::rql::views::table_ddl(stmt) {
+        trigger_exec::after_table_ddl(database, state.current_tx(), &ddl).await;
+    }
     ran
 }
 
@@ -6939,11 +7024,15 @@ where
     if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
         return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
     }
-    if database.has_table(crate::core::rql::sequence_catalog::SEQUENCE_TABLE)
-        && !state.view_internal
-        && let Some(ddl) = crate::core::rql::views::table_ddl(stmt)
-        && sequence_statements::guard_table_ddl(database, state, stream, stmt, &ddl).await?
-    {
+    if let Some(parsed) = crate::core::rql::functions::parse_routine_statement(stmt) {
+        return routine_statements::handle_routine_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::triggers::parse_trigger_statement(stmt) {
+        return trigger_exec::handle_trigger_statement(database, state, stream, parsed).await;
+    }
+    // Table DDL checked against views, sequences and triggers
+    // (`catalog_guards`).
+    if !state.view_internal && catalog_guards(database, state, stream, stmt).await? {
         return Ok(());
     }
     let prepared_sequences;
@@ -6959,14 +7048,31 @@ where
             return Ok(());
         }
     };
-    let expanded_views;
-    let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
-        if !state.view_internal
-            && let Some(ddl) = crate::core::rql::views::table_ddl(stmt)
-            && view_statements::guard_table_ddl(database, state, stream, stmt, ddl).await?
-        {
+    // A call of a `CREATE FUNCTION` function, as its body
+    // (`rql::functions`), before views are expanded: a body may read one.
+    let inlined_calls;
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx()).await {
+        Ok(None) => stmt,
+        Ok(Some(text)) => {
+            crate::core::rql::prepared::note_rewritten();
+            match rewrite_statement_text(database, &text) {
+                Ok(again) => {
+                    inlined_calls = again.into_owned();
+                    inlined_calls.as_str()
+                }
+                Err((code, message)) => {
+                    fail_statement(state, stream, code, &message).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
             return Ok(());
         }
+    };
+    let expanded_views;
+    let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
         let options = crate::core::rql::views::ExpandOptions {
             writing_materialized: state.refreshing_materialized.as_deref(),
         };
@@ -6994,6 +7100,12 @@ where
     } else {
         stmt
     };
+    // A write to a table with triggers runs a row at a time
+    // (`trigger_exec`).
+    if let Some((event, table)) = trigger_exec::triggered_write(database, state, stmt).await {
+        return trigger_exec::run_triggered_write(database, state, stream, stmt, event, &table, result_formats, omit_description)
+            .await;
+    }
 
     // A data-modifying CTE and the statement it feeds are one statement, so
     // they need one transaction. Outside an explicit block there is none yet —
@@ -9200,6 +9312,12 @@ pub(crate) fn split_statements(query: &str) -> Vec<String> {
             b'\'' | b'"' => {
                 quote = Some(c);
                 i += 1;
+            }
+            // `$$ … $$` and `$tag$ … $tag$`, a function's body: a `;` inside
+            // ends no statement. Split there, `CREATE FUNCTION … AS $$ BEGIN
+            // RETURN 1; END $$` reached the parser as two broken halves.
+            b'$' if crate::core::sql_scan::dollar_tag_len(bytes, i).is_some() => {
+                i = crate::core::sql_scan::dollar_quote_end(bytes, i).unwrap_or(bytes.len());
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 while i < bytes.len() && bytes[i] != b'\n' {

@@ -1343,6 +1343,10 @@ fn pool_has_placement(_pool: &StoragePool, _table_name: &str) -> bool {
 pub struct Database {
     /// The names of the views this database may hold (`rql::views`).
     pub(crate) views: crate::core::rql::views::ViewRegistry,
+    /// The names of the routines this database may hold (`rql::functions`).
+    pub(crate) functions: crate::core::rql::functions::FunctionRegistry,
+    /// The tables that may have triggers (`rql::triggers`).
+    pub(crate) triggers: crate::core::rql::triggers::TriggerRegistry,
     /// Each table's slot by name (a partitioned table's shell included).
     /// Private, and named only in `slots.rs`: metadata readers use
     /// [`Database::schema_view`], execution the escape hatches listed there.
@@ -1894,6 +1898,8 @@ impl Database {
             #[cfg(test)]
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
             views: crate::core::rql::views::ViewRegistry::default(),
+            functions: crate::core::rql::functions::FunctionRegistry::default(),
+            triggers: crate::core::rql::triggers::TriggerRegistry::default(),
             id,
             name: name.to_string(),
             table_slots,

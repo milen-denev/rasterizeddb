@@ -271,3 +271,27 @@ async fn views_survive_a_restart() {
     drop(server);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Inside a block, and in a statement batch (an implicit block), `DROP
+/// TABLE` is deferred to the commit before the statement path runs: the view
+/// checks must hold there too. They did not, so `DROP TABLE` of a table a
+/// view reads went through in a block.
+#[tokio::test(flavor = "multi_thread")]
+async fn view_checks_hold_inside_a_block_and_a_batch() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    setup(&c).await;
+    c.batch_execute("CREATE VIEW v AS SELECT id FROM vt").await.expect("view");
+    assert_eq!(code(&c, "BEGIN; DROP TABLE vt").await, "2BP01");
+    c.batch_execute("ROLLBACK").await.expect("rollback");
+    assert_eq!(code(&c, "BEGIN; DROP TABLE v").await, "42809");
+    c.batch_execute("ROLLBACK").await.expect("rollback");
+    assert_eq!(code(&c, "DROP TABLE vt; SELECT 1").await, "2BP01");
+    assert_eq!(rows(&c, "SELECT count(*) FROM v").await, ["3"]);
+    // CASCADE in a block: the view goes, and comes back with a ROLLBACK.
+    c.batch_execute("BEGIN; DROP TABLE vt CASCADE; ROLLBACK").await.expect("cascade rolled back");
+    assert_eq!(rows(&c, "SELECT count(*) FROM v").await, ["3"]);
+    c.batch_execute("BEGIN; DROP TABLE vt CASCADE; COMMIT").await.expect("cascade");
+    assert_eq!(code(&c, "SELECT * FROM v").await, "42P01");
+}

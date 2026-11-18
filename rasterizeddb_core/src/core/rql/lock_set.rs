@@ -397,7 +397,7 @@ pub fn statement_lock_set(sql: &str) -> Vec<(String, TableMode)> {
     if let Some(ddl) = ddl_targets(&toks) {
         return ddl;
     }
-    scan(&toks).into_iter().map(|f| (f.name, f.mode)).collect()
+    scan(&toks).into_iter().filter(|f| !f.function).map(|f| (f.name, f.mode)).collect()
 }
 
 /// A relation the scan found: its name, mode, and the tokens it spans (the
@@ -407,6 +407,8 @@ struct Found {
     mode: TableMode,
     start: usize,
     next: usize,
+    /// A function in a `FROM` list (`FROM f(x)`): `next` is past its `)`.
+    function: bool,
 }
 
 /// A relation a statement reads or writes, where it is written: the byte
@@ -433,6 +435,27 @@ pub fn relation_references(sql: &str) -> Vec<RelationRef> {
     }
     scan(&toks)
         .into_iter()
+        .filter(|f| !f.function)
+        .filter_map(|f| {
+            let first = spans.get(f.start)?;
+            let last = spans.get(f.next.checked_sub(1)?)?;
+            let aliased = skip_alias(&toks, f.next) != f.next;
+            Some(RelationRef { name: f.name, mode: f.mode, span: first.start..last.end, aliased })
+        })
+        .collect()
+}
+
+/// Every function a `FROM` or `JOIN` list calls as a row source (`FROM
+/// f(1) AS x`, `JOIN g(a) ON …`), where it is written: the span runs from
+/// its name to its `)`. Empty for DDL, as [`relation_references`] is.
+pub fn function_references(sql: &str) -> Vec<RelationRef> {
+    let (toks, spans) = tokens_spanned(sql);
+    if ddl_targets(&toks).is_some() {
+        return Vec::new();
+    }
+    scan(&toks)
+        .into_iter()
+        .filter(|f| f.function)
         .filter_map(|f| {
             let first = spans.get(f.start)?;
             let last = spans.get(f.next.checked_sub(1)?)?;
@@ -531,11 +554,12 @@ fn scan(toks: &[Tok<'_>]) -> Vec<Found> {
             if let Some((name, start, next)) = relation_span_at(toks, i + 1) {
                 if toks.get(next) == Some(&Tok::Punct('(')) {
                     // `JOIN f(x)`: a function, not a relation.
+                    out.push(Found { name, mode: TableMode::AccessShare, start, next: past_parens(toks, next), function: true });
                     item_paren = Some(next);
                     i = next;
                     continue;
                 }
-                out.push(Found { name, mode: TableMode::AccessShare, start, next });
+                out.push(Found { name, mode: TableMode::AccessShare, start, next, function: false });
                 i = next;
                 continue;
             }
@@ -552,7 +576,7 @@ fn scan(toks: &[Tok<'_>]) -> Vec<Found> {
         }
         if is_kw(t, "INTO") && prev.is_some_and(|p| is_kw(p, "INSERT")) {
             if let Some((name, start, next)) = relation_span_at(toks, i + 1) {
-                out.push(Found { name, mode: TableMode::RowExclusive, start, next });
+                out.push(Found { name, mode: TableMode::RowExclusive, start, next, function: false });
                 i = next;
                 continue;
             }
@@ -561,7 +585,7 @@ fn scan(toks: &[Tok<'_>]) -> Vec<Found> {
             && !prev.is_some_and(|p| is_kw(p, "FOR") || is_kw(p, "KEY") || is_kw(p, "DO") || is_kw(p, "ON"))
         {
             if let Some((name, start, next)) = relation_span_at(toks, i + 1) {
-                out.push(Found { name, mode: TableMode::RowExclusive, start, next });
+                out.push(Found { name, mode: TableMode::RowExclusive, start, next, function: false });
                 i = next;
                 continue;
             }
@@ -619,9 +643,10 @@ fn relation_list(toks: &[Tok<'_>], mut i: usize, mode: TableMode, out: &mut Vec<
         };
         // `FROM f(x)`: a set-returning function, not a relation.
         if toks.get(next) == Some(&Tok::Punct('(')) {
+            out.push(Found { name, mode, start, next: past_parens(toks, next), function: true });
             return next;
         }
-        out.push(Found { name, mode, start, next });
+        out.push(Found { name, mode, start, next, function: false });
         i = skip_alias(toks, next);
         if toks.get(i) == Some(&Tok::Punct(',')) {
             i += 1;
