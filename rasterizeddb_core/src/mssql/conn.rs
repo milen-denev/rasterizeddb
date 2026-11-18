@@ -374,11 +374,6 @@ impl Env for Scope<'_> {
         };
         Some(ParamSlot { index, string: p.decls[k].1 })
     }
-    fn param_is_null(&self, name: &str) -> Option<bool> {
-        let p = self.params?;
-        let k = p.decls.iter().position(|d| d.0 == name)?;
-        Some(matches!(p.values.get(k), None | Some(ParamValue::Null)))
-    }
     fn system(&self, name: &str) -> Option<Value> {
         let s = self.s;
         Some(match name {
@@ -430,9 +425,7 @@ impl Env for Scope<'_> {
 
 /// A PostgreSQL error in SQL Server's numbering; the PostgreSQL code is kept.
 fn error_from_engine(n: &PgNotice) -> TsqlError {
-    // The engine reports some unknown columns as a syntax error.
-    let code = if n.message.contains("not found in schema") { "42703" } else { n.code.as_str() };
-    let (number, class): (i32, u8) = match code {
+    let (number, class): (i32, u8) = match n.code.as_str() {
         "23505" => (2627, 14),
         "23502" => (515, 16),
         "23503" => (547, 16),

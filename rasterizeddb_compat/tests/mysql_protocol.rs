@@ -193,6 +193,8 @@ async fn mysql_driver_end_to_end() {
     assert_eq!(code(&e), (Some(1062), Some("23000".into())), "{e}");
     let e = c.execute("SELECT nope FROM items").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1054), "{e}");
+    let e = c.execute("SELECT nope AS Nope FROM items").await.unwrap_err();
+    assert_eq!(code(&e).0, Some(1054), "{e}");
     let e = c.execute("SELECT * FROM missing_table").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1146), "{e}");
 

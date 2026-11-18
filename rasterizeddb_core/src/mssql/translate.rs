@@ -102,10 +102,6 @@ pub(crate) trait Env {
     }
     fn variable(&self, name: &str) -> Option<Value>;
     fn param(&self, name: &str) -> Option<ParamSlot>;
-    /// Whether a parameter's value (known at each execution) is NULL.
-    fn param_is_null(&self, _name: &str) -> Option<bool> {
-        None
-    }
     fn system(&self, name: &str) -> Option<Value>;
     fn function(&self, name: &str) -> Option<Value>;
 }
@@ -649,24 +645,6 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             }
         }
         match &t.tok {
-            // `@p IS [NOT] NULL` is decided here, the value being known: the
-            // engine cannot plan `NULL IS NULL` inside an OR, and this is how
-            // optional filters (`@p IS NULL OR col = @p`) are written.
-            Tok::UserVar(name) if kw(&tokens, i + 1, "IS") && (kw(&tokens, i + 2, "NULL") || (kw(&tokens, i + 2, "NOT") && kw(&tokens, i + 3, "NULL"))) => {
-                let null = cx
-                    .env
-                    .param_is_null(name)
-                    .or_else(|| cx.env.variable(name).map(|v| v == Value::Null));
-                match null {
-                    Some(is_null) => {
-                        let negated = kw(&tokens, i + 2, "NOT");
-                        out.push(Token::raw(if is_null != negated { "(1 = 1)" } else { "(1 = 0)" }));
-                        i += if negated { 4 } else { 3 };
-                        continue;
-                    }
-                    None => return Err(TsqlError::new(137, format!("Must declare the scalar variable \"@{name}\"."))),
-                }
-            }
             Tok::UserVar(name) => {
                 if let Some(p) = cx.env.param(name) {
                     let mut v = Token::new(Tok::Param(p.index));

@@ -192,8 +192,34 @@ async fn tiberius_end_to_end() {
     assert_eq!(number(&e), Some(2627), "{e}");
     let e = c.simple_query("SELECT Nope FROM Items").await.unwrap_err();
     assert_eq!(number(&e), Some(207), "{e}");
+    let e = c.simple_query("SELECT Nope AS [N] FROM Items").await.unwrap_err();
+    assert_eq!(number(&e), Some(207), "{e}");
     let e = c.simple_query("SELECT * FROM Missing").await.unwrap_err();
     assert_eq!(number(&e), Some(208), "{e}");
+
+    // An optional filter, with the parameter NULL and not.
+    for (p, want) in [(None, 3), (Some("a"), 1)] {
+        let n = c
+            .query("SELECT COUNT(*) FROM Items WHERE @P1 IS NULL OR Name = @P1", &[&p])
+            .await
+            .unwrap()
+            .into_row()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i32, _>(0);
+        assert_eq!(n, Some(want), "{p:?}");
+    }
+    let n = c
+        .simple_query("DECLARE @n nvarchar(10) = NULL; SELECT COUNT(*) FROM Items WHERE @n IS NOT NULL AND Name = @n")
+        .await
+        .unwrap()
+        .into_row()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i32, _>(0);
+    assert_eq!(n, Some(0));
 
     // Nested transactions: only the outer COMMIT commits; a failed
     // statement inside fails alone.
