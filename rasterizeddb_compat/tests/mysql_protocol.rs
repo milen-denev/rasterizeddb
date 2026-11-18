@@ -327,3 +327,50 @@ async fn mysql_prepared_session_statements_and_catalogue() {
     killer.execute(sqlx::AssertSqlSafe(kill)).await.unwrap();
     c.close().await.unwrap();
 }
+
+/// Point-select latency over MySQL against the same over PostgreSQL, one
+/// connection each: what the translation costs. `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn mysql_point_select_overhead() {
+    let s = start(MyAuth::Trust);
+    let mut my = sqlx::MySqlConnection::connect(&format!("mysql://rasterized@127.0.0.1:{}/postgres?ssl-mode=disabled", s.mysql_port))
+        .await
+        .unwrap();
+    let mut pg = sqlx::PgConnection::connect(&format!("postgres://rasterized:{PASSWORD}@127.0.0.1:{}/postgres?sslmode=disable", s.pg_port))
+        .await
+        .unwrap();
+    my.execute("CREATE TABLE bench (id INT PRIMARY KEY, v VARCHAR(40))").await.unwrap();
+    for start in (1..=10_000).step_by(1000) {
+        let values: Vec<String> = (start..start + 1000).map(|i| format!("({i}, 'value {i}')")).collect();
+        my.execute(sqlx::AssertSqlSafe(format!("INSERT INTO bench VALUES {}", values.join(",")))).await.unwrap();
+    }
+    const N: usize = 5000;
+    for round in 0..2 {
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let _: String = sqlx::query_scalar("SELECT v FROM bench WHERE id = $1").bind((i % 10_000 + 1) as i32).fetch_one(&mut pg).await.unwrap();
+        }
+        let pg_us = t.elapsed().as_micros() as f64 / N as f64;
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let _: String = sqlx::query_scalar("SELECT v FROM bench WHERE id = ?").bind((i % 10_000 + 1) as i32).fetch_one(&mut my).await.unwrap();
+        }
+        let my_prep_us = t.elapsed().as_micros() as f64 / N as f64;
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let q = format!("SELECT v FROM bench WHERE id = {}", i % 10_000 + 1);
+            let _ = my.fetch_one(sqlx::AssertSqlSafe(q)).await.unwrap();
+        }
+        let my_text_us = t.elapsed().as_micros() as f64 / N as f64;
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            let q = format!("SELECT v FROM bench WHERE id = {}", i % 10_000 + 1);
+            let _ = pg.fetch_one(sqlx::raw_sql(sqlx::AssertSqlSafe(q))).await.unwrap();
+        }
+        let pg_text_us = t.elapsed().as_micros() as f64 / N as f64;
+        println!(
+            "round {round}: pgwire prepared {pg_us:.1} us, simple {pg_text_us:.1} us; mysql prepared {my_prep_us:.1} us, text {my_text_us:.1} us"
+        );
+    }
+}
