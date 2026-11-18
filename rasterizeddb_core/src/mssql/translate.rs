@@ -1465,11 +1465,19 @@ fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) 
         prepared.push((expr, name));
     }
     let saved = std::mem::take(&mut cx.aliases);
+    // Each item's rewritten text and alias: an ORDER BY of the same
+    // expression is sent as the alias, which the engine resolves where it
+    // would refuse a grouped expression it does not see in the list.
+    let mut item_texts: Vec<(String, String)> = Vec::new();
     for (k, (expr, name)) in prepared.into_iter().enumerate() {
         if k > 0 {
             out.push(Token::op(","));
         }
-        out.extend(rewrite_expr(expr, cx)?);
+        let rewritten = rewrite_expr(expr, cx)?;
+        if let Some(n) = &name {
+            item_texts.push((render_text(&rewritten), n.clone()));
+        }
+        out.extend(rewritten);
         if let Some(name) = name {
             out.push(Token::word("AS"));
             out.push(Token::raw(quote_ident(&name)));
@@ -1477,6 +1485,38 @@ fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) 
     }
     cx.aliases = saved;
     let mut rest: Vec<Token> = tokens[end..].to_vec();
+    if let Some(order) = find_top(&rest, 0, &["ORDER"]) {
+        if kw(&rest, order + 1, "BY") && !item_texts.is_empty() {
+            let stop = find_top(&rest, order + 2, &["OFFSET", "OPTION", "FOR", "UNION", "EXCEPT", "INTERSECT"]).unwrap_or(rest.len());
+            let mut terms = Vec::new();
+            for term in split_commas(&rest[order + 2..stop]) {
+                let mut body = term.clone();
+                let mut direction = Vec::new();
+                if body.last().is_some_and(|t| t.is_word("ASC") || t.is_word("DESC")) {
+                    direction.push(body.pop().unwrap());
+                }
+                let mut probe = Cx::new(cx.env);
+                let text = render_text(&rewrite_expr(body.clone(), &mut probe)?);
+                match item_texts.iter().find(|(t, _)| *t == text) {
+                    Some((_, alias)) => {
+                        let mut replaced = vec![Token::raw(quote_ident(alias))];
+                        replaced.extend(direction);
+                        terms.push(replaced);
+                    }
+                    None => terms.push(term),
+                }
+            }
+            let mut rebuilt: Vec<Token> = rest[..order + 2].to_vec();
+            for (n, t) in terms.into_iter().enumerate() {
+                if n > 0 {
+                    rebuilt.push(Token::op(","));
+                }
+                rebuilt.extend(t);
+            }
+            rebuilt.extend(rest[stop..].iter().cloned());
+            rest = rebuilt;
+        }
+    }
     // OFFSET n ROWS FETCH NEXT m ROWS ONLY
     let mut limit: Option<Vec<Token>> = top;
     let mut offset: Option<Vec<Token>> = None;
@@ -1820,13 +1860,35 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     let output_at = find_top(&tokens, after, &["OUTPUT"]);
     let from_at = find_top(&tokens, after, &["FROM"]);
     let where_at = find_top(&tokens, after, &["WHERE"]);
-    let mut out = vec![Token::word("DELETE"), Token::word("FROM"), Token::raw(ident_sql(&target))];
+    let mut table = target.clone();
+    let mut alias: Option<String> = None;
+    let mut using_first: Vec<Vec<Token>> = Vec::new();
     let mut conditions: Vec<Vec<Token>> = Vec::new();
+    let mut from: Vec<Token> = Vec::new();
+    let mut first_end = 0usize;
     if let Some(f) = from_at {
-        // DELETE t FROM t JOIN u ON … → DELETE FROM t USING u WHERE …
-        let from = tokens[f + 1..where_at.unwrap_or(tokens.len())].to_vec();
-        let first_end = find_top(&from, 0, &["JOIN", "INNER"]).unwrap_or(from.len());
-        let mut using: Vec<Vec<Token>> = split_commas(&from[..first_end]).into_iter().filter(|p| table_name_at(p, 0).is_none_or(|(n, _)| n != target)).collect();
+        // DELETE p FROM t AS p JOIN u ON … → DELETE FROM t AS p USING u WHERE …
+        from = tokens[f + 1..where_at.unwrap_or(tokens.len())].to_vec();
+        first_end = find_top(&from, 0, &["JOIN", "INNER"]).unwrap_or(from.len());
+        for part in split_commas(&from[..first_end]) {
+            let Some((name, after)) = table_name_at(&part, 0) else { continue };
+            let part_alias = part.get(after).and_then(|t| if t.is_word("AS") { part.get(after + 1) } else { Some(t) }).and_then(|t| t.ident()).map(|s| s.to_lowercase());
+            if name == target || part_alias.as_deref() == Some(target.as_str()) {
+                table = name;
+                alias = part_alias.filter(|a| *a != table);
+            } else {
+                using_first.push(part);
+            }
+        }
+    }
+    let mut out = vec![Token::word("DELETE"), Token::word("FROM"), Token::raw(ident_sql(&table))];
+    if let Some(a) = &alias {
+        out.push(Token::word("AS"));
+        out.push(Token::raw(ident_sql(a)));
+    }
+    let target = table.clone();
+    if from_at.is_some() {
+        let mut using: Vec<Vec<Token>> = using_first;
         let mut k = first_end;
         while k < from.len() {
             let mut s = k;

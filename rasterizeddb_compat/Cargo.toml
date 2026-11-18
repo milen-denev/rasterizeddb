@@ -49,6 +49,9 @@ name = "capabilities"
 path = "src/bin/capabilities.rs"
 
 [dev-dependencies]
+# The SQL Server protocol's suite (`tests/mssql_protocol.rs`): a TDS client.
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono", "rust_decimal"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 # The power-loss harness (named failpoints, crash images) for the persistent
 # index suites (`index_store_power_loss.rs`, docs/persistent-indexes.md §11).
 # A dev-dependency feature, so only test builds carry it; a server binary

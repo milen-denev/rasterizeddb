@@ -144,8 +144,24 @@ impl AsyncRead for Shim {
         if this.passthrough {
             return this.poll_base_read(cx, buf);
         }
-        // Unwrap PRELOGIN packets.
+        // Unwrap PRELOGIN packets — until the client sends TLS records
+        // bare: a client whose side of a TLS 1.3 handshake is done (tiberius)
+        // sends its Finished unwrapped. A TDS packet starts 0x12 and a TLS
+        // record 0x14..=0x17, so the first byte tells them apart.
         while this.payload_left == 0 {
+            let first = match this.poll_fill(cx, 1) {
+                Poll::Ready(Ok(b)) => b,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            let mut back = first.clone();
+            back.extend_from_slice(&this.pending[this.pending_pos..]);
+            this.pending = back;
+            this.pending_pos = 0;
+            if (0x14..=0x17).contains(&first[0]) {
+                this.passthrough = true;
+                return this.poll_base_read(cx, buf);
+            }
             let header = match this.poll_fill(cx, 8) {
                 Poll::Ready(Ok(h)) => h,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
