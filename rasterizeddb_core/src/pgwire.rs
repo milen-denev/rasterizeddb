@@ -40,6 +40,7 @@ mod view_statements;
 mod sequence_statements;
 mod routine_statements;
 mod trigger_exec;
+mod merge_exec;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -4761,6 +4762,13 @@ pub(crate) async fn describe_query(
     let stmt = folded.as_ref();
     // A view read as the derived table it stands for, as the execute path
     // reads it (`rql::views`), so the description is of the same statement.
+    // A `MERGE … RETURNING`: its list, as a query over its source.
+    if let Some(Ok(merge)) = crate::core::rql::merge::parse_merge(stmt) {
+        return match merge_exec::describe_text(database, &merge) {
+            Some(text) => Box::pin(describe_query(database, &text)).await,
+            None => Ok(None),
+        };
+    }
     let inlined_calls;
     let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None).await {
         Ok(Some(text)) => {
@@ -7029,6 +7037,12 @@ where
     }
     if let Some(parsed) = crate::core::rql::triggers::parse_trigger_statement(stmt) {
         return trigger_exec::handle_trigger_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::merge::parse_merge(stmt) {
+        return match parsed {
+            Ok(merge) => merge_exec::run_merge(database, state, stream, merge, result_formats, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
     }
     // Table DDL checked against views, sequences and triggers
     // (`catalog_guards`).

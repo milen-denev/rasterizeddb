@@ -22,16 +22,18 @@
 use super::*;
 use crate::core::rql::triggers::{self, Event, PlBlock, PlStmt, Timing, TriggerDef, TriggerStatement};
 
-type Values = Vec<(String, Option<String>)>;
+pub(super) type Values = Vec<(String, Option<String>)>;
 
 /// A statement's rows as text: column names, and each row's values.
-struct Rows {
-    names: Vec<String>,
-    rows: Vec<Vec<Option<String>>>,
+pub(super) struct Rows {
+    pub(super) names: Vec<String>,
+    /// Each column's type OID, as the description gave it.
+    pub(super) types: Vec<u32>,
+    pub(super) rows: Vec<Vec<Option<String>>>,
     /// The `RowDescription` and `DataRow` messages as they came, for passing
     /// a `RETURNING` on.
-    description: Option<Vec<u8>>,
-    data: Vec<Vec<u8>>,
+    pub(super) description: Option<Vec<u8>>,
+    pub(super) data: Vec<Vec<u8>>,
 }
 
 /// Every message of a run's output: its type and its whole bytes.
@@ -48,7 +50,7 @@ fn messages(bytes: &[u8]) -> Vec<(u8, &[u8])> {
 }
 
 fn decode(output: &[u8]) -> Rows {
-    let mut rows = Rows { names: Vec::new(), rows: Vec::new(), description: None, data: Vec::new() };
+    let mut rows = Rows { names: Vec::new(), types: Vec::new(), rows: Vec::new(), description: None, data: Vec::new() };
     for (kind, message) in messages(output) {
         match kind {
             b'T' if rows.description.is_none() => {
@@ -58,6 +60,8 @@ fn decode(output: &[u8]) -> Rows {
                 for _ in 0..count {
                     let Some(nul) = message[i..].iter().position(|b| *b == 0) else { break };
                     rows.names.push(String::from_utf8_lossy(&message[i..i + nul]).into_owned());
+                    let t = i + nul + 1 + 6;
+                    rows.types.push(message.get(t..t + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]])));
                     i += nul + 1 + 18;
                 }
             }
@@ -86,13 +90,13 @@ fn decode(output: &[u8]) -> Rows {
 }
 
 /// Runs `sql` through the session's path and reads its rows (text form).
-async fn query(database: &Arc<Database>, state: &mut SessionState, sql: &str) -> io::Result<Result<Rows, String>> {
+pub(super) async fn query(database: &Arc<Database>, state: &mut SessionState, sql: &str) -> io::Result<Result<Rows, String>> {
     query_in(database, state, sql, &[]).await
 }
 
 /// [`query`], its rows in `result_formats` (a `RETURNING` passed on to an
 /// extended-protocol client is in the formats it bound).
-async fn query_in(
+pub(super) async fn query_in(
     database: &Arc<Database>,
     state: &mut SessionState,
     sql: &str,
@@ -111,15 +115,15 @@ async fn query_in(
 }
 
 /// An error raised while firing, with its SQLSTATE.
-type Failure = (String, String);
+pub(super) type Failure = (String, String);
 
-fn failure(message: String) -> Failure {
+pub(super) fn failure(message: String) -> Failure {
     (sqlstate_for(&message).to_string(), message)
 }
 
 /// The cast a value of `field` is written with, so an expression reading it
 /// computes on its type.
-fn cast_of(field: &crate::core::row::schema::SchemaField) -> Option<&'static str> {
+pub(super) fn cast_of(field: &crate::core::row::schema::SchemaField) -> Option<&'static str> {
     use crate::core::db_type::DbType;
     Some(match field.db_type {
         DbType::I8 | DbType::I16 => "smallint",
@@ -143,8 +147,32 @@ fn cast_of(field: &crate::core::row::schema::SchemaField) -> Option<&'static str
     })
 }
 
+/// The cast a value of type `oid` is written with, from a `RowDescription`.
+pub(super) fn cast_of_oid(oid: u32) -> Option<&'static str> {
+    Some(match oid {
+        16 => "boolean",
+        20 => "bigint",
+        21 => "smallint",
+        23 => "integer",
+        700 => "real",
+        701 => "double precision",
+        1700 => "numeric",
+        25 | 1043 | 1042 | 19 => "text",
+        1082 => "date",
+        1114 => "timestamp",
+        1184 => "timestamptz",
+        1083 => "time",
+        2950 => "uuid",
+        3802 => "jsonb",
+        114 => "json",
+        17 => "bytea",
+        1186 => "interval",
+        _ => return None,
+    })
+}
+
 /// `value` as a literal of `cast`'s type.
-fn literal(value: &Option<String>, cast: Option<&str>) -> String {
+pub(super) fn literal(value: &Option<String>, cast: Option<&str>) -> String {
     match value {
         None => match cast {
             Some(cast) => format!("CAST(NULL AS {cast})"),
@@ -170,7 +198,7 @@ struct Context<'a> {
     fields: &'a [crate::core::row::schema::SchemaField],
 }
 
-fn field<'a>(fields: &'a [crate::core::row::schema::SchemaField], name: &str) -> Option<&'a crate::core::row::schema::SchemaField> {
+pub(super) fn field<'a>(fields: &'a [crate::core::row::schema::SchemaField], name: &str) -> Option<&'a crate::core::row::schema::SchemaField> {
     fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
 }
 
@@ -540,7 +568,7 @@ async fn triggers_for(
 
 /// The columns that address one row: the primary key, or the first unique
 /// key.
-fn key_columns(schema: &crate::core::row::schema::TableSchema) -> Option<Vec<String>> {
+pub(super) fn key_columns(schema: &crate::core::row::schema::TableSchema) -> Option<Vec<String>> {
     if let Some(pk) = &schema.primary_key {
         let columns: Vec<String> = pk.split(',').map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
         if !columns.is_empty() {
@@ -551,7 +579,7 @@ fn key_columns(schema: &crate::core::row::schema::TableSchema) -> Option<Vec<Str
 }
 
 /// A table's visible columns, in order.
-fn visible_fields(schema: &crate::core::row::schema::TableSchema) -> Vec<crate::core::row::schema::SchemaField> {
+pub(super) fn visible_fields(schema: &crate::core::row::schema::TableSchema) -> Vec<crate::core::row::schema::SchemaField> {
     let mut fields: Vec<_> = schema
         .fields
         .iter()
@@ -562,7 +590,7 @@ fn visible_fields(schema: &crate::core::row::schema::TableSchema) -> Vec<crate::
     fields
 }
 
-fn quote_ident(name: &str) -> String {
+pub(super) fn quote_ident(name: &str) -> String {
     crate::core::rql::views::quote_ident(name)
 }
 
@@ -911,7 +939,7 @@ async fn fire_write(
 }
 
 /// `key = literal AND …` for the row `old`.
-fn key_match(schema: &crate::core::row::schema::TableSchema, fields: &[crate::core::row::schema::SchemaField], old: &Values) -> String {
+pub(super) fn key_match(schema: &crate::core::row::schema::TableSchema, fields: &[crate::core::row::schema::SchemaField], old: &Values) -> String {
     key_columns(schema)
         .unwrap_or_default()
         .iter()
