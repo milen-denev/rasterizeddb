@@ -913,7 +913,13 @@ pub(crate) fn return_value_int(out: &mut Vec<u8>, ordinal: u16, name: &str, valu
 
 /// RETURNVALUE of a procedure's OUTPUT parameter, sent as the engine type
 /// the client bound it with (`oid`).
-pub(crate) fn return_value(out: &mut Vec<u8>, ordinal: u16, name: &str, oid: u32, value: Option<&[u8]>) {
+pub(crate) fn return_value(
+    out: &mut Vec<u8>,
+    ordinal: u16,
+    name: &str,
+    oid: u32,
+    value: Option<&[u8]>,
+) {
     let ty = column_type(oid, -1).unwrap_or_else(|| {
         let (int, frac) = value
             .map(|v| decimal_shape(&String::from_utf8_lossy(v)))
@@ -1694,7 +1700,9 @@ pub(crate) struct BulkColumn {
 
 /// A bulk load's rows (a BulkLoadBCP message: COLMETADATA, ROW / NBCROW
 /// tokens, DONE), each cell as an RPC parameter's value and engine type.
-pub(crate) fn read_bulk(payload: &[u8]) -> io::Result<(Vec<BulkColumn>, Vec<Vec<(ParamValue, u32)>>)> {
+pub(crate) fn read_bulk(
+    payload: &[u8],
+) -> io::Result<(Vec<BulkColumn>, Vec<Vec<(ParamValue, u32)>>)> {
     let bad = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
     let mut r = Reader::new(payload);
     if r.u8()? != 0x81 {
@@ -1708,7 +1716,8 @@ pub(crate) fn read_bulk(payload: &[u8]) -> io::Result<(Vec<BulkColumn>, Vec<Vec<
         let start = r.pos;
         let ty = r.u8()?;
         match ty {
-            0x1f | 0x30 | 0x32 | 0x34 | 0x38 | 0x7f | 0x3b | 0x3e | 0x3c | 0x7a | 0x3d | 0x3a | 0x28 => {}
+            0x1f | 0x30 | 0x32 | 0x34 | 0x38 | 0x7f | 0x3b | 0x3e | 0x3c | 0x7a | 0x3d | 0x3a
+            | 0x28 => {}
             0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 | 0x29 | 0x2a | 0x2b => {
                 r.u8()?;
             }
@@ -1793,7 +1802,8 @@ fn read_bulk_cell(r: &mut Reader<'_>, type_info: &[u8]) -> io::Result<(ParamValu
         0x7f | 0x3e | 0x3c | 0x3d => {
             r.bytes(8)?;
         }
-        0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 | 0x6a | 0x6c | 0x37 | 0x3f | 0x28 | 0x29 | 0x2a | 0x2b => {
+        0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 | 0x6a | 0x6c | 0x37 | 0x3f | 0x28 | 0x29
+        | 0x2a | 0x2b => {
             let n = r.u8()? as usize;
             r.bytes(n)?;
         }
@@ -1899,7 +1909,10 @@ mod tests {
         b.extend_from_slice(&[5, 0, 5, 0, 0, 0]); // -0.05
         b.extend_from_slice(&[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let (cols, rows) = read_bulk(&b).unwrap();
-        assert_eq!(cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["id", "name", "price"]);
+        assert_eq!(
+            cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["id", "name", "price"]
+        );
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0][0].0, ParamValue::Text(t) if t == "7"));
         assert!(matches!(&rows[0][1].0, ParamValue::Text(t) if t == "Zoë"));

@@ -300,16 +300,43 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                     // A cursor statement names a cursor; otherwise the word
                     // is a column (`SET close = 1`, `SELECT open, close`).
                     "OPEN" | "CLOSE" | "DEALLOCATE" => {
-                        let names_cursor = tokens.get(j + 1).is_some_and(|n| {
-                            (n.ident().is_some() && !n.is_op(",")) || n.is_word("GLOBAL")
-                        }) && !tokens
-                            .get(j + 1)
-                            .and_then(|n| n.upper())
-                            .is_some_and(|w| matches!(w.as_str(), "FROM" | "AS" | "AND" | "OR" | "IS" | "IN" | "WHERE" | "ORDER" | "GROUP" | "THEN" | "END" | "ELSE" | "WHEN"));
+                        let names_cursor =
+                            tokens.get(j + 1).is_some_and(|n| {
+                                (n.ident().is_some() && !n.is_op(",")) || n.is_word("GLOBAL")
+                            }) && !tokens.get(j + 1).and_then(|n| n.upper()).is_some_and(|w| {
+                                matches!(
+                                    w.as_str(),
+                                    "FROM"
+                                        | "AS"
+                                        | "AND"
+                                        | "OR"
+                                        | "IS"
+                                        | "IN"
+                                        | "WHERE"
+                                        | "ORDER"
+                                        | "GROUP"
+                                        | "THEN"
+                                        | "END"
+                                        | "ELSE"
+                                        | "WHEN"
+                                )
+                            });
                         let after_expr_start = matches!(&tokens[j - 1].tok, Tok::Op(o) if o != ")")
                             || matches!(
                                 prev.as_str(),
-                                "SELECT" | "BY" | "SET" | "AS" | "AND" | "OR" | "ON" | "WHERE" | "THEN" | "ELSE" | "WHEN" | "DISTINCT" | "TOP"
+                                "SELECT"
+                                    | "BY"
+                                    | "SET"
+                                    | "AS"
+                                    | "AND"
+                                    | "OR"
+                                    | "ON"
+                                    | "WHERE"
+                                    | "THEN"
+                                    | "ELSE"
+                                    | "WHEN"
+                                    | "DISTINCT"
+                                    | "TOP"
                             );
                         !names_cursor || after_expr_start
                     }
@@ -1425,7 +1452,13 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 .get(1)
                 .and_then(|a| text_arg(a))
                 .map(|k| k.trim().to_ascii_uppercase());
-            let name = name.map(|n| if n.starts_with('#') { cx.env.temp_name(&n) } else { n });
+            let name = name.map(|n| {
+                if n.starts_with('#') {
+                    cx.env.temp_name(&n)
+                } else {
+                    n
+                }
+            });
             let exists = name.as_deref().is_some_and(|n| {
                 let table = cx.env.database().has_table(n);
                 let routine = cx.env.routines().iter().any(|(r, _)| r == n);
@@ -1492,8 +1525,14 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         // gates are the engine's; the sys schema is not readable as tables.
         "HAS_PERMS_BY_NAME" => {
             let r = raw();
-            let securable = r.first().and_then(|a| text_arg(a)).unwrap_or_default().to_ascii_lowercase();
-            let sys = securable.contains("[sys]") || securable.starts_with("sys.") || securable.contains(".sys.");
+            let securable = r
+                .first()
+                .and_then(|a| text_arg(a))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let sys = securable.contains("[sys]")
+                || securable.starts_with("sys.")
+                || securable.contains(".sys.");
             vec![Token::new(Tok::Num(if sys { "0" } else { "1" }.into()))]
         }
         // STUFF(s, start, length, replacement)
@@ -1915,24 +1954,59 @@ fn shape_for(tokens: &[Token], cx: &Cx, what: &str) -> Result<Shaped, TsqlError>
             i += 1;
         }
     }
-    let end = find_top(tokens, i, &["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "OFFSET"])
-        .unwrap_or(tokens.len());
+    let end = find_top(
+        tokens,
+        i,
+        &[
+            "FROM",
+            "WHERE",
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "UNION",
+            "EXCEPT",
+            "INTERSECT",
+            "OPTION",
+            "OFFSET",
+        ],
+    )
+    .unwrap_or(tokens.len());
     let mut items = Vec::new();
     for item in split_commas(&tokens[i..end]) {
         if item.len() == 1 && item[0].is_op("*") {
             // SELECT * FROM one table: its columns.
-            let from = find_top(tokens, end, &["FROM"]).ok_or_else(|| TsqlError::unsupported(format!("FOR {what} of SELECT *")))?;
-            let (table, after) = table_name_at(tokens, from + 1).ok_or_else(|| TsqlError::unsupported(format!("FOR {what} of SELECT *")))?;
-            if find_top(tokens, after, &["JOIN"]).is_some() || tokens.get(after).is_some_and(|t| t.is_op(",")) {
-                return Err(TsqlError::unsupported(format!("FOR {what} of SELECT * over a join")));
+            let from = find_top(tokens, end, &["FROM"])
+                .ok_or_else(|| TsqlError::unsupported(format!("FOR {what} of SELECT *")))?;
+            let (table, after) = table_name_at(tokens, from + 1)
+                .ok_or_else(|| TsqlError::unsupported(format!("FOR {what} of SELECT *")))?;
+            if find_top(tokens, after, &["JOIN"]).is_some()
+                || tokens.get(after).is_some_and(|t| t.is_op(","))
+            {
+                return Err(TsqlError::unsupported(format!(
+                    "FOR {what} of SELECT * over a join"
+                )));
             }
-            let view = cx.env.database().schema_view(&table).ok_or_else(|| TsqlError::new(208, format!("Invalid object name '{table}'.")))?;
-            for f in view.schema().fields.iter().filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name)) {
-                items.push((vec![Token::new(Tok::Quoted(f.name.clone()))], f.name.clone()));
+            let view =
+                cx.env.database().schema_view(&table).ok_or_else(|| {
+                    TsqlError::new(208, format!("Invalid object name '{table}'."))
+                })?;
+            for f in view
+                .schema()
+                .fields
+                .iter()
+                .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+            {
+                items.push((
+                    vec![Token::new(Tok::Quoted(f.name.clone()))],
+                    f.name.clone(),
+                ));
             }
             continue;
         }
-        let (expr, alias) = if item.len() >= 3 && item[1].is_op("=") && matches!(item[0].tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Str(_)) {
+        let (expr, alias) = if item.len() >= 3
+            && item[1].is_op("=")
+            && matches!(item[0].tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Str(_))
+        {
             let name = match &item[0].tok {
                 Tok::Word(w) | Tok::Quoted(w) => w.clone(),
                 Tok::Str(b) => String::from_utf8_lossy(b).into_owned(),
@@ -1943,21 +2017,41 @@ fn shape_for(tokens: &[Token], cx: &Cx, what: &str) -> Result<Shaped, TsqlError>
             split_alias(&item)
         };
         let column = expr.len() % 2 == 1
-            && expr.iter().enumerate().all(|(k, t)| if k % 2 == 1 { t.is_op(".") } else { matches!(t.tok, Tok::Word(_) | Tok::Quoted(_)) });
+            && expr.iter().enumerate().all(|(k, t)| {
+                if k % 2 == 1 {
+                    t.is_op(".")
+                } else {
+                    matches!(t.tok, Tok::Word(_) | Tok::Quoted(_))
+                }
+            });
         let key = match alias {
             Some(a) => a,
-            None if column => expr.last().and_then(|t| t.ident()).unwrap_or_default().to_string(),
+            None if column => expr
+                .last()
+                .and_then(|t| t.ident())
+                .unwrap_or_default()
+                .to_string(),
             None => String::new(),
         };
         let aggregate = expr.iter().enumerate().any(|(k, t)| {
-            t.upper().is_some_and(|w| matches!(w.as_str(), "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"))
-                && expr.get(k + 1).is_some_and(|o| o.is_op("("))
+            t.upper().is_some_and(|w| {
+                matches!(
+                    w.as_str(),
+                    "COUNT" | "COUNT_BIG" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+                )
+            }) && expr.get(k + 1).is_some_and(|o| o.is_op("("))
         });
         derived |= aggregate;
         items.push((expr, key));
     }
     let mut tail = tokens[end..].to_vec();
-    if find_top(&tail, 0, &["GROUP", "HAVING", "OFFSET", "UNION", "EXCEPT", "INTERSECT"]).is_some() {
+    if find_top(
+        &tail,
+        0,
+        &["GROUP", "HAVING", "OFFSET", "UNION", "EXCEPT", "INTERSECT"],
+    )
+    .is_some()
+    {
         derived = true;
     }
     let mut order = None;
@@ -1967,13 +2061,22 @@ fn shape_for(tokens: &[Token], cx: &Cx, what: &str) -> Result<Shaped, TsqlError>
             tail.truncate(o);
         }
     }
-    let subquery = items.iter().any(|(e, _)| e.windows(2).any(|w| w[0].is_op("(") && w[1].is_word("SELECT")));
+    let subquery = items.iter().any(|(e, _)| {
+        e.windows(2)
+            .any(|w| w[0].is_op("(") && w[1].is_word("SELECT"))
+    });
     if derived && subquery {
         return Err(TsqlError::unsupported(format!(
             "FOR {what} with a subquery in a query with DISTINCT, TOP, GROUP BY or aggregates"
         )));
     }
-    Ok(Shaped { items, tail, order, derived, subquery })
+    Ok(Shaped {
+        items,
+        tail,
+        order,
+        derived,
+        subquery,
+    })
 }
 
 /// The options after FOR JSON / FOR XML: (mode, its argument, ROOT,
@@ -2026,7 +2129,8 @@ fn is_json_already(expr: &[Token]) -> bool {
     (expr.first().is_some_and(|t| t.is_op("("))
         && kw(expr, 1, "SELECT")
         && matching_paren(expr, 0) == Some(expr.len() - 1)
-        && find_top(&expr[1..expr.len() - 1], 1, &["FOR"]).is_some_and(|f| kw(&expr[1..], f + 1, "JSON")))
+        && find_top(&expr[1..expr.len() - 1], 1, &["FOR"])
+            .is_some_and(|f| kw(&expr[1..], f + 1, "JSON")))
         || (kw(expr, 0, "JSON_QUERY") && expr.get(1).is_some_and(|t| t.is_op("(")))
 }
 
@@ -2040,14 +2144,21 @@ fn json_object_sql(members: &[(Vec<String>, String, bool)], include_nulls: bool)
             match groups.iter_mut().find(|(g, _)| *g == path[0]) {
                 Some((_, v)) => v.push((path[1..].to_vec(), value.clone(), *raw)),
                 None => {
-                    groups.push((path[0].clone(), vec![(path[1..].to_vec(), value.clone(), *raw)]));
+                    groups.push((
+                        path[0].clone(),
+                        vec![(path[1..].to_vec(), value.clone(), *raw)],
+                    ));
                     parts.push(format!("\u{0}{}", path[0]));
                 }
             }
             continue;
         }
         let key = json_key_sql(&format!("{}", path[0]));
-        let json = if *raw { format!("({value})") } else { format!("(to_jsonb({value}))::text") };
+        let json = if *raw {
+            format!("({value})")
+        } else {
+            format!("(to_jsonb({value}))::text")
+        };
         parts.push(if include_nulls {
             format!("{key} || ':' || coalesce({json}, 'null')")
         } else {
@@ -2059,22 +2170,36 @@ fn json_object_sql(members: &[(Vec<String>, String, bool)], include_nulls: bool)
         .map(|p| match p.strip_prefix('\u{0}') {
             Some(group) => {
                 let members = &groups.iter().find(|(g, _)| g == group).unwrap().1;
-                format!("{} || ':' || {}", json_key_sql(group), json_object_sql(members, include_nulls))
+                format!(
+                    "{} || ':' || {}",
+                    json_key_sql(group),
+                    json_object_sql(members, include_nulls)
+                )
             }
             None => p,
         })
         .collect();
-    format!("('{{' || coalesce(concat_ws(',', {}), '') || '}}')", parts.join(", "))
+    format!(
+        "('{{' || coalesce(concat_ws(',', {}), '') || '}}')",
+        parts.join(", ")
+    )
 }
 
-fn for_json(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Result<Vec<Token>, TsqlError> {
+fn for_json(
+    tokens: Vec<Token>,
+    at: usize,
+    cx: &mut Cx,
+    top_level: bool,
+) -> Result<Vec<Token>, TsqlError> {
     let (mode, _, root, words) = for_options(&tokens[at + 2..]);
     if mode != "PATH" && mode != "AUTO" {
         return Err(TsqlError::syntax("FOR JSON needs PATH or AUTO"));
     }
     let query = &tokens[..at];
     if mode == "AUTO" && find_top(query, 1, &["JOIN"]).is_some() {
-        return Err(TsqlError::unsupported("FOR JSON AUTO over a join (its nesting by table); use FOR JSON PATH"));
+        return Err(TsqlError::unsupported(
+            "FOR JSON AUTO over a join (its nesting by table); use FOR JSON PATH",
+        ));
     }
     let include_nulls = words.iter().any(|w| w == "INCLUDE_NULL_VALUES");
     let unwrapped = words.iter().any(|w| w == "WITHOUT_ARRAY_WRAPPER");
@@ -2086,23 +2211,45 @@ fn for_json(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Resu
         ));
     }
     let path = |key: &str| -> Vec<String> {
-        if mode == "PATH" { key.split('.').map(str::to_string).collect() } else { vec![key.to_string()] }
+        if mode == "PATH" {
+            key.split('.').map(str::to_string).collect()
+        } else {
+            vec![key.to_string()]
+        }
     };
     let (members, from_sql) = if shaped.derived {
         // The query as written, its items named c0, c1, …, read through a
         // derived table.
         let mut inner = vec![tokens[0].clone()];
-        let select_end = find_top(query, 1, &["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "OFFSET"]).unwrap_or(query.len());
-        let first_item = (1..select_end).find(|&k| {
-            !(kw(query, k, "DISTINCT") || kw(query, k, "ALL") || kw(query, k, "TOP"))
-        }).unwrap_or(1);
+        let select_end = find_top(
+            query,
+            1,
+            &[
+                "FROM",
+                "WHERE",
+                "GROUP",
+                "HAVING",
+                "ORDER",
+                "UNION",
+                "EXCEPT",
+                "INTERSECT",
+                "OPTION",
+                "OFFSET",
+            ],
+        )
+        .unwrap_or(query.len());
+        let first_item = (1..select_end)
+            .find(|&k| !(kw(query, k, "DISTINCT") || kw(query, k, "ALL") || kw(query, k, "TOP")))
+            .unwrap_or(1);
         let mut k = 1;
         while k < first_item {
             inner.push(query[k].clone());
             k += 1;
         }
         // TOP (n): keep its parenthesized count.
-        if kw(query, first_item.saturating_sub(1), "TOP") && query.get(first_item).is_some_and(|t| t.is_op("(")) {
+        if kw(query, first_item.saturating_sub(1), "TOP")
+            && query.get(first_item).is_some_and(|t| t.is_op("("))
+        {
             let close = matching_paren(query, first_item).unwrap_or(first_item);
             inner.extend(query[first_item..=close].iter().cloned());
         } else if kw(query, first_item.saturating_sub(1), "TOP") {
@@ -2122,7 +2269,13 @@ fn for_json(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Resu
             .items
             .iter()
             .enumerate()
-            .map(|(n, (expr, key))| (path(key), format!("__json.{}", quote_ident(&format!("c{n}"))), is_json_already(expr)))
+            .map(|(n, (expr, key))| {
+                (
+                    path(key),
+                    format!("__json.{}", quote_ident(&format!("c{n}"))),
+                    is_json_already(expr),
+                )
+            })
             .collect::<Vec<_>>();
         (members, format!("FROM ({body}) AS __json"))
     } else {
@@ -2147,52 +2300,93 @@ fn for_json(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Resu
         None => String::new(),
     };
     let rows = format!("string_agg({object}, ','{order})");
-    let mut value = if unwrapped { rows } else { format!("('[' || {rows} || ']')") };
+    let mut value = if unwrapped {
+        rows
+    } else {
+        format!("('[' || {rows} || ']')")
+    };
     if let Some(r) = root {
-        value = format!("('{{' || {} || ':' || coalesce({value}, '[]') || '}}')", json_key_sql(&r));
+        value = format!(
+            "('{{' || {} || ':' || coalesce({value}, '[]') || '}}')",
+            json_key_sql(&r)
+        );
     }
     // At the top a query of no rows answers no rows; as a subquery, NULL.
     // (With a subquery in its items: a row holding NULL.)
-    let having = if top_level && !shaped.subquery { " HAVING count(*) > 0" } else { "" };
-    Ok(vec![Token::raw(format!("SELECT {value} AS {} {from_sql}{having}", quote_ident(JSON_COLUMN)))])
+    let having = if top_level && !shaped.subquery {
+        " HAVING count(*) > 0"
+    } else {
+        ""
+    };
+    Ok(vec![Token::raw(format!(
+        "SELECT {value} AS {} {from_sql}{having}",
+        quote_ident(JSON_COLUMN)
+    ))])
 }
 
 fn xml_escape_sql(value: &str) -> String {
-    format!("replace(replace(replace(CAST({value} AS text), '&', '&amp;'), '<', '&lt;'), '>', '&gt;')")
+    format!(
+        "replace(replace(replace(CAST({value} AS text), '&', '&amp;'), '<', '&lt;'), '>', '&gt;')"
+    )
 }
 
 /// FOR XML PATH: rows as elements (`PATH('')`: none), columns as elements
 /// named by their aliases (an unnamed column: its text alone), ROOT.
-fn for_xml(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Result<Vec<Token>, TsqlError> {
+fn for_xml(
+    tokens: Vec<Token>,
+    at: usize,
+    cx: &mut Cx,
+    top_level: bool,
+) -> Result<Vec<Token>, TsqlError> {
     let (mode, arg, root, words) = for_options(&tokens[at + 2..]);
     if mode != "PATH" {
-        return Err(TsqlError::unsupported(format!("FOR XML {} (FOR XML PATH is)", mode.to_lowercase())));
+        return Err(TsqlError::unsupported(format!(
+            "FOR XML {} (FOR XML PATH is)",
+            mode.to_lowercase()
+        )));
     }
     if words.iter().any(|w| w != "TYPE") {
-        return Err(TsqlError::unsupported(format!("FOR XML … {}", words.join(", "))));
+        return Err(TsqlError::unsupported(format!(
+            "FOR XML … {}",
+            words.join(", ")
+        )));
     }
     let row = arg.unwrap_or_else(|| "row".into());
     let shaped = shape_for(&tokens[..at], cx, "XML")?;
     if shaped.derived {
-        return Err(TsqlError::unsupported("FOR XML over DISTINCT, TOP, GROUP BY or aggregates"));
+        return Err(TsqlError::unsupported(
+            "FOR XML over DISTINCT, TOP, GROUP BY or aggregates",
+        ));
     }
     let escape = !cx.xml_value;
     let mut parts = Vec::new();
     for (expr, key) in &shaped.items {
         let value = render_text(&rewrite_expr(expr.clone(), cx)?);
-        let text = if escape { xml_escape_sql(&value) } else { format!("CAST({value} AS text)") };
+        let text = if escape {
+            xml_escape_sql(&value)
+        } else {
+            format!("CAST({value} AS text)")
+        };
         // A column named by an alias is an element; an unnamed one (or
         // one aliased [*]) is its text.
         let named = !key.is_empty() && key != "*";
         parts.push(if named {
-            format!("CASE WHEN ({value}) IS NULL THEN NULL ELSE {} || {text} || {} END", sql_str(&format!("<{key}>")), sql_str(&format!("</{key}>")))
+            format!(
+                "CASE WHEN ({value}) IS NULL THEN NULL ELSE {} || {text} || {} END",
+                sql_str(&format!("<{key}>")),
+                sql_str(&format!("</{key}>"))
+            )
         } else {
             text
         });
     }
     let mut object = format!("concat({})", parts.join(", "));
     if !row.is_empty() {
-        object = format!("({} || {object} || {})", sql_str(&format!("<{row}>")), sql_str(&format!("</{row}>")));
+        object = format!(
+            "({} || {object} || {})",
+            sql_str(&format!("<{row}>")),
+            sql_str(&format!("</{row}>"))
+        );
     }
     let outer = std::mem::replace(&mut cx.past_select_list, true);
     let tail = rewrite_expr(shaped.tail.clone(), cx);
@@ -2204,10 +2398,21 @@ fn for_xml(tokens: Vec<Token>, at: usize, cx: &mut Cx, top_level: bool) -> Resul
     let (tail, order) = (render_text(&tail?), order?);
     let mut value = format!("string_agg({object}, ''{order})");
     if let Some(r) = root {
-        value = format!("({} || coalesce({value}, '') || {})", sql_str(&format!("<{r}>")), sql_str(&format!("</{r}>")));
+        value = format!(
+            "({} || coalesce({value}, '') || {})",
+            sql_str(&format!("<{r}>")),
+            sql_str(&format!("</{r}>"))
+        );
     }
-    let having = if top_level && !shaped.subquery { " HAVING count(*) > 0" } else { "" };
-    Ok(vec![Token::raw(format!("SELECT {value} AS {} {tail}{having}", quote_ident(XML_COLUMN)))])
+    let having = if top_level && !shaped.subquery {
+        " HAVING count(*) > 0"
+    } else {
+        ""
+    };
+    Ok(vec![Token::raw(format!(
+        "SELECT {value} AS {} {tail}{having}",
+        quote_ident(XML_COLUMN)
+    ))])
 }
 
 fn rewrite_select_inner(
@@ -3825,7 +4030,9 @@ pub(crate) fn assignment_select(
     // `SELECT @s = @s + x FROM t`: folded row by row in SQL Server.
     let accumulates = end < tokens.len()
         && parts.iter().any(|p| {
-            p.iter().skip(2).any(|t| matches!(&t.tok, Tok::UserVar(n) if assigned.contains(&n.as_str())))
+            p.iter()
+                .skip(2)
+                .any(|t| matches!(&t.tok, Tok::UserVar(n) if assigned.contains(&n.as_str())))
         });
     for (k, part) in parts.into_iter().enumerate() {
         let Some(Tok::UserVar(name)) = part.first().map(|t| &t.tok) else {
@@ -3965,7 +4172,10 @@ mod tests {
             r#"SELECT ((count(*))::integer) AS "Total" FROM t"#
         );
         assert_eq!(
-            tr(&e, "SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT COUNT(*) FROM v))"),
+            tr(
+                &e,
+                "SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT COUNT(*) FROM v))"
+            ),
             r#"SELECT a, ((count(*))::integer) AS "n" FROM t GROUP BY a HAVING COUNT(*) > 1 AND a IN (SELECT a FROM u WHERE b > (SELECT ((count(*))::integer) FROM v))"#
         );
         assert_eq!(

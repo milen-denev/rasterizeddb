@@ -54,7 +54,9 @@ impl Condition {
         match self {
             Condition::NotFound => state.starts_with("02"),
             Condition::Warning => state.starts_with("01"),
-            Condition::Exception => !state.starts_with("00") && !state.starts_with("01") && !state.starts_with("02"),
+            Condition::Exception => {
+                !state.starts_with("00") && !state.starts_with("01") && !state.starts_with("02")
+            }
             Condition::State(s) => s == state,
             Condition::Code(c) => *c == code,
         }
@@ -65,23 +67,61 @@ impl Condition {
 #[derive(Clone, Debug)]
 pub(crate) enum S {
     Sql(Vec<Token>),
-    Block { label: Option<String>, body: Vec<S> },
-    Declare { names: Vec<String>, default: Option<Vec<Token>> },
-    Cursor { name: String, select: Vec<Token> },
-    Handler { exit: bool, conditions: Vec<Condition>, body: Box<S> },
+    Block {
+        label: Option<String>,
+        body: Vec<S>,
+    },
+    Declare {
+        names: Vec<String>,
+        default: Option<Vec<Token>>,
+    },
+    Cursor {
+        name: String,
+        select: Vec<Token>,
+    },
+    Handler {
+        exit: bool,
+        conditions: Vec<Condition>,
+        body: Box<S>,
+    },
     /// SET's assignments: (target as written, value).
     Set(Vec<(Vec<Token>, Vec<Token>)>),
-    If { branches: Vec<(Vec<Token>, Vec<S>)>, otherwise: Option<Vec<S>> },
-    Case { operand: Option<Vec<Token>>, whens: Vec<(Vec<Token>, Vec<S>)>, otherwise: Option<Vec<S>> },
-    While { label: Option<String>, condition: Vec<Token>, body: Vec<S> },
-    Repeat { label: Option<String>, body: Vec<S>, until: Vec<Token> },
-    Loop { label: Option<String>, body: Vec<S> },
+    If {
+        branches: Vec<(Vec<Token>, Vec<S>)>,
+        otherwise: Option<Vec<S>>,
+    },
+    Case {
+        operand: Option<Vec<Token>>,
+        whens: Vec<(Vec<Token>, Vec<S>)>,
+        otherwise: Option<Vec<S>>,
+    },
+    While {
+        label: Option<String>,
+        condition: Vec<Token>,
+        body: Vec<S>,
+    },
+    Repeat {
+        label: Option<String>,
+        body: Vec<S>,
+        until: Vec<Token>,
+    },
+    Loop {
+        label: Option<String>,
+        body: Vec<S>,
+    },
     Leave(String),
     Iterate(String),
     Open(String),
-    Fetch { cursor: String, into: Vec<String> },
+    Fetch {
+        cursor: String,
+        into: Vec<String>,
+    },
     Close(String),
-    Signal { state: String, message: Option<Vec<Token>>, code: Option<u16> },
+    Signal {
+        state: String,
+        message: Option<Vec<Token>>,
+        code: Option<u16>,
+    },
     Resignal,
 }
 
@@ -101,7 +141,11 @@ fn ident_lower(tokens: &[Token], i: usize) -> Result<String, MyError> {
 /// IF() or REPEAT() function, or the word after END).
 fn opens_block(tokens: &[Token], i: usize) -> bool {
     let w = word(tokens, i);
-    let prev = if i > 0 { word(tokens, i - 1) } else { String::new() };
+    let prev = if i > 0 {
+        word(tokens, i - 1)
+    } else {
+        String::new()
+    };
     if prev == "END" {
         return false;
     }
@@ -114,7 +158,10 @@ fn opens_block(tokens: &[Token], i: usize) -> bool {
             i == 0
                 || tokens[i - 1].is_op(";")
                 || tokens[i - 1].is_op(":")
-                || matches!(prev.as_str(), "BEGIN" | "THEN" | "ELSE" | "DO" | "LOOP" | "REPEAT")
+                || matches!(
+                    prev.as_str(),
+                    "BEGIN" | "THEN" | "ELSE" | "DO" | "LOOP" | "REPEAT"
+                )
         }
         _ => false,
     }
@@ -151,7 +198,12 @@ pub(crate) fn split(tokens: Vec<Token>) -> Vec<Vec<Token>> {
         if routine && body_from == usize::MAX {
             // The body starts after the parameter list (or, for a trigger
             // or event, at its first BEGIN).
-            if current[n - 1].is_op(")") && matching_paren(&current, current.iter().position(|t| t.is_op("(")).unwrap_or(0)) == Some(n - 1) {
+            if current[n - 1].is_op(")")
+                && matching_paren(
+                    &current,
+                    current.iter().position(|t| t.is_op("(")).unwrap_or(0),
+                ) == Some(n - 1)
+            {
                 body_from = n;
             } else if current[n - 1].is_word("BEGIN") {
                 body_from = n - 1;
@@ -186,13 +238,22 @@ pub(crate) fn parse_create(tokens: &[Token]) -> Option<Result<ProcDef, MyError>>
     if kw(tokens, i, "DEFINER") {
         // DEFINER = user[@host] | CURRENT_USER[()]
         i += 2;
-        while i < tokens.len() && !matches!(word(tokens, i).as_str(), "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "VIEW" | "SQL" | "ALGORITHM") {
+        while i < tokens.len()
+            && !matches!(
+                word(tokens, i).as_str(),
+                "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "VIEW" | "SQL" | "ALGORITHM"
+            )
+        {
             i += 1;
         }
     }
     match word(tokens, i).as_str() {
         "PROCEDURE" => {}
-        "FUNCTION" => return Some(Err(MyError::unsupported("stored functions (CREATE FUNCTION)"))),
+        "FUNCTION" => {
+            return Some(Err(MyError::unsupported(
+                "stored functions (CREATE FUNCTION)",
+            )));
+        }
         "TRIGGER" => return Some(Err(MyError::unsupported("triggers"))),
         "EVENT" => return Some(Err(MyError::unsupported("events"))),
         _ => return None,
@@ -215,7 +276,8 @@ fn parse_definition(tokens: &[Token], mut i: usize) -> Result<ProcDef, MyError> 
     if !tokens.get(i).is_some_and(|t| t.is_op("(")) {
         return Err(MyError::syntax("CREATE PROCEDURE needs a parameter list"));
     }
-    let close = matching_paren(tokens, i).ok_or_else(|| MyError::syntax("unbalanced parameter list"))?;
+    let close =
+        matching_paren(tokens, i).ok_or_else(|| MyError::syntax("unbalanced parameter list"))?;
     let mut params = Vec::new();
     for part in split_commas(&tokens[i + 1..close]) {
         if part.is_empty() {
@@ -227,7 +289,10 @@ fn parse_definition(tokens: &[Token], mut i: usize) -> Result<ProcDef, MyError> 
             "INOUT" => (ParamMode::InOut, 1),
             _ => (ParamMode::In, 0),
         };
-        params.push(Param { mode, name: ident_lower(&part, at)? });
+        params.push(Param {
+            mode,
+            name: ident_lower(&part, at)?,
+        });
     }
     i = close + 1;
     // Characteristics: they change nothing here.
@@ -249,7 +314,12 @@ fn parse_definition(tokens: &[Token], mut i: usize) -> Result<ProcDef, MyError> 
     let body = tokens[i..].to_vec();
     // A body that does not parse is refused now.
     parse_body(&body)?;
-    Ok(ProcDef { name, if_not_exists, params, body })
+    Ok(ProcDef {
+        name,
+        if_not_exists,
+        params,
+        body,
+    })
 }
 
 /// A procedure's body: a BEGIN … END block or one statement.
@@ -276,7 +346,10 @@ fn parse_list(tokens: &[Token], mut i: usize, stops: &[&str]) -> Result<(Vec<S>,
             i += 1;
         }
         if i >= tokens.len() {
-            return Err(MyError::syntax(format!("{} was expected in the procedure", stops.join(" or "))));
+            return Err(MyError::syntax(format!(
+                "{} was expected in the procedure",
+                stops.join(" or ")
+            )));
         }
         if stops.contains(&word(tokens, i).as_str()) {
             return Ok((out, i));
@@ -308,7 +381,10 @@ fn until_word(tokens: &[Token], i: usize, stops: &[&str]) -> Result<usize, MyErr
             }
         }
     }
-    Err(MyError::syntax(format!("{} was expected in the procedure", stops.join(" or "))))
+    Err(MyError::syntax(format!(
+        "{} was expected in the procedure",
+        stops.join(" or ")
+    )))
 }
 
 /// `END word [label]` at `i`; the index after it (and its `;`).
@@ -324,7 +400,13 @@ fn expect_end(tokens: &[Token], mut i: usize, what: &str) -> Result<usize, MyErr
         i += 1;
     }
     // An optional closing label.
-    if tokens.get(i).is_some_and(|t| t.ident().is_some() && !t.is_op(";")) && !tokens.get(i).is_some_and(|t| matches!(t.tok, Tok::Word(ref w) if is_keyword(w))) {
+    if tokens
+        .get(i)
+        .is_some_and(|t| t.ident().is_some() && !t.is_op(";"))
+        && !tokens
+            .get(i)
+            .is_some_and(|t| matches!(t.tok, Tok::Word(ref w) if is_keyword(w)))
+    {
         i += 1;
     }
     if tokens.get(i).is_some_and(|t| t.is_op(";")) {
@@ -336,10 +418,42 @@ fn expect_end(tokens: &[Token], mut i: usize, what: &str) -> Result<usize, MyErr
 fn is_keyword(w: &str) -> bool {
     matches!(
         w.to_ascii_uppercase().as_str(),
-        "END" | "ELSE" | "ELSEIF" | "WHEN" | "UNTIL" | "IF" | "CASE" | "WHILE" | "LOOP" | "REPEAT" | "BEGIN"
-            | "DECLARE" | "SET" | "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "OPEN" | "CLOSE" | "FETCH" | "LEAVE"
-            | "ITERATE" | "CALL" | "SIGNAL" | "RESIGNAL" | "RETURN" | "REPLACE" | "CREATE" | "DROP" | "ALTER"
-            | "COMMIT" | "ROLLBACK" | "START" | "TRUNCATE" | "WITH" | "DO"
+        "END"
+            | "ELSE"
+            | "ELSEIF"
+            | "WHEN"
+            | "UNTIL"
+            | "IF"
+            | "CASE"
+            | "WHILE"
+            | "LOOP"
+            | "REPEAT"
+            | "BEGIN"
+            | "DECLARE"
+            | "SET"
+            | "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "OPEN"
+            | "CLOSE"
+            | "FETCH"
+            | "LEAVE"
+            | "ITERATE"
+            | "CALL"
+            | "SIGNAL"
+            | "RESIGNAL"
+            | "RETURN"
+            | "REPLACE"
+            | "CREATE"
+            | "DROP"
+            | "ALTER"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "START"
+            | "TRUNCATE"
+            | "WITH"
+            | "DO"
     )
 }
 
@@ -360,7 +474,9 @@ fn to_semicolon(tokens: &[Token], i: usize) -> usize {
 
 fn parse_stmt(tokens: &[Token], i: usize) -> Result<(S, usize), MyError> {
     // `label:` before BEGIN / WHILE / REPEAT / LOOP.
-    let (label, i) = if tokens.get(i).is_some_and(|t| t.ident().is_some()) && tokens.get(i + 1).is_some_and(|t| t.is_op(":")) {
+    let (label, i) = if tokens.get(i).is_some_and(|t| t.ident().is_some())
+        && tokens.get(i + 1).is_some_and(|t| t.is_op(":"))
+    {
         (Some(ident_lower(tokens, i)?), i + 2)
     } else {
         (None, i)
@@ -398,7 +514,13 @@ fn parse_stmt(tokens: &[Token], i: usize) -> Result<(S, usize), MyError> {
                     }
                 }
             }
-            Ok((S::If { branches, otherwise }, expect_end(tokens, j, "IF")?))
+            Ok((
+                S::If {
+                    branches,
+                    otherwise,
+                },
+                expect_end(tokens, j, "IF")?,
+            ))
         }
         "CASE" => {
             let first = until_word(tokens, i + 1, &["WHEN"])?;
@@ -425,27 +547,57 @@ fn parse_stmt(tokens: &[Token], i: usize) -> Result<(S, usize), MyError> {
                     }
                 }
             }
-            Ok((S::Case { operand, whens, otherwise }, expect_end(tokens, j, "CASE")?))
+            Ok((
+                S::Case {
+                    operand,
+                    whens,
+                    otherwise,
+                },
+                expect_end(tokens, j, "CASE")?,
+            ))
         }
         "WHILE" => {
             let d = until_word(tokens, i + 1, &["DO"])?;
             let (body, end) = parse_list(tokens, d + 1, &["END"])?;
-            Ok((S::While { label, condition: tokens[i + 1..d].to_vec(), body }, expect_end(tokens, end, "WHILE")?))
+            Ok((
+                S::While {
+                    label,
+                    condition: tokens[i + 1..d].to_vec(),
+                    body,
+                },
+                expect_end(tokens, end, "WHILE")?,
+            ))
         }
         "REPEAT" => {
             let (body, at) = parse_list(tokens, i + 1, &["UNTIL"])?;
             let end = until_word(tokens, at + 1, &["END"])?;
-            Ok((S::Repeat { label, body, until: tokens[at + 1..end].to_vec() }, expect_end(tokens, end, "REPEAT")?))
+            Ok((
+                S::Repeat {
+                    label,
+                    body,
+                    until: tokens[at + 1..end].to_vec(),
+                },
+                expect_end(tokens, end, "REPEAT")?,
+            ))
         }
         "LOOP" => {
             let (body, end) = parse_list(tokens, i + 1, &["END"])?;
             Ok((S::Loop { label, body }, expect_end(tokens, end, "LOOP")?))
         }
-        _ if label.is_some() => Err(MyError::syntax("a label goes before BEGIN, WHILE, REPEAT or LOOP")),
+        _ if label.is_some() => Err(MyError::syntax(
+            "a label goes before BEGIN, WHILE, REPEAT or LOOP",
+        )),
         "LEAVE" | "ITERATE" => {
             let l = ident_lower(tokens, i + 1)?;
             let end = to_semicolon(tokens, i);
-            Ok((if head == "LEAVE" { S::Leave(l) } else { S::Iterate(l) }, end + 1))
+            Ok((
+                if head == "LEAVE" {
+                    S::Leave(l)
+                } else {
+                    S::Iterate(l)
+                },
+                end + 1,
+            ))
         }
         "DECLARE" => {
             let end = to_semicolon(tokens, i);
@@ -456,7 +608,14 @@ fn parse_stmt(tokens: &[Token], i: usize) -> Result<(S, usize), MyError> {
         "OPEN" | "CLOSE" => {
             let name = ident_lower(tokens, i + 1)?;
             let end = to_semicolon(tokens, i);
-            Ok((if head == "OPEN" { S::Open(name) } else { S::Close(name) }, end + 1))
+            Ok((
+                if head == "OPEN" {
+                    S::Open(name)
+                } else {
+                    S::Close(name)
+                },
+                end + 1,
+            ))
         }
         "FETCH" => {
             let end = to_semicolon(tokens, i);
@@ -507,18 +666,30 @@ fn parse_stmt(tokens: &[Token], i: usize) -> Result<(S, usize), MyError> {
             let mut code = None;
             if kw(tokens, j + 1, "SET") {
                 for part in split_commas(&tokens[j + 2..end]) {
-                    let eq = part.iter().position(|t| t.is_op("=")).ok_or_else(|| MyError::syntax("SIGNAL … SET needs '='"))?;
+                    let eq = part
+                        .iter()
+                        .position(|t| t.is_op("="))
+                        .ok_or_else(|| MyError::syntax("SIGNAL … SET needs '='"))?;
                     match word(&part, 0).as_str() {
                         "MESSAGE_TEXT" => message = Some(part[eq + 1..].to_vec()),
-                        "MYSQL_ERRNO" => code = part.get(eq + 1).and_then(|t| match &t.tok {
-                            Tok::Num(n) => n.parse().ok(),
-                            _ => None,
-                        }),
+                        "MYSQL_ERRNO" => {
+                            code = part.get(eq + 1).and_then(|t| match &t.tok {
+                                Tok::Num(n) => n.parse().ok(),
+                                _ => None,
+                            })
+                        }
                         _ => {}
                     }
                 }
             }
-            Ok((S::Signal { state, message, code }, end + 1))
+            Ok((
+                S::Signal {
+                    state,
+                    message,
+                    code,
+                },
+                end + 1,
+            ))
         }
         "RESIGNAL" => Ok((S::Resignal, to_semicolon(tokens, i) + 1)),
         "RETURN" => Err(MyError::syntax("RETURN is only allowed in a FUNCTION")),
@@ -561,14 +732,18 @@ fn parse_declare(tokens: &[Token], i: usize, end: usize) -> Result<(S, usize), M
                         j += 1;
                     }
                     match tokens.get(j).map(|t| &t.tok) {
-                        Some(Tok::Str(s)) => conditions.push(Condition::State(String::from_utf8_lossy(s).into_owned())),
+                        Some(Tok::Str(s)) => conditions
+                            .push(Condition::State(String::from_utf8_lossy(s).into_owned())),
                         _ => return Err(MyError::syntax("SQLSTATE needs a string")),
                     }
                     j += 1;
                 }
                 _ => match tokens.get(j).map(|t| &t.tok) {
                     Some(Tok::Num(n)) => {
-                        conditions.push(Condition::Code(n.parse().map_err(|_| MyError::syntax("an error code was expected"))?));
+                        conditions.push(Condition::Code(
+                            n.parse()
+                                .map_err(|_| MyError::syntax("an error code was expected"))?,
+                        ));
                         j += 1;
                     }
                     _ => return Err(MyError::unsupported("handlers for named conditions")),
@@ -581,14 +756,27 @@ fn parse_declare(tokens: &[Token], i: usize, end: usize) -> Result<(S, usize), M
             break;
         }
         let (body, next) = parse_stmt(tokens, j)?;
-        return Ok((S::Handler { exit: w1 == "EXIT", conditions, body: Box::new(body) }, next));
+        return Ok((
+            S::Handler {
+                exit: w1 == "EXIT",
+                conditions,
+                body: Box::new(body),
+            },
+            next,
+        ));
     }
     let cursor_at = (i + 2..end).find(|&k| kw(tokens, k, "CURSOR"));
     if let Some(c) = cursor_at.filter(|&c| c == i + 2) {
         if !kw(tokens, c + 1, "FOR") {
             return Err(MyError::syntax("DECLARE … CURSOR FOR was expected"));
         }
-        return Ok((S::Cursor { name: ident_lower(tokens, i + 1)?, select: tokens[c + 2..end].to_vec() }, end + 1));
+        return Ok((
+            S::Cursor {
+                name: ident_lower(tokens, i + 1)?,
+                select: tokens[c + 2..end].to_vec(),
+            },
+            end + 1,
+        ));
     }
     if kw(tokens, i + 2, "CONDITION") {
         return Err(MyError::unsupported("DECLARE … CONDITION"));
@@ -621,7 +809,9 @@ pub(crate) fn substitute(tokens: &[Token], value_of: &dyn Fn(&str) -> Option<Tok
         };
         if let Some(name) = local {
             let after_dot = k > 0 && tokens[k - 1].is_op(".");
-            let qualifier = tokens.get(k + 1).is_some_and(|n| n.is_op(".") || n.is_op("("));
+            let qualifier = tokens
+                .get(k + 1)
+                .is_some_and(|n| n.is_op(".") || n.is_op("("));
             let alias = k > 0 && tokens[k - 1].is_word("AS");
             if !after_dot && !qualifier && !alias {
                 if let Some(mut v) = value_of(&name) {
@@ -644,13 +834,23 @@ pub(crate) fn select_into(tokens: &[Token]) -> Option<(Vec<Token>, Vec<String>)>
         return None;
     }
     let into = crate::sqlcompat::find_top(tokens, 1, &["INTO"])?;
-    let end = crate::sqlcompat::find_top(tokens, into, &["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "FOR", "UNION"])
-        .unwrap_or(tokens.len());
+    let end = crate::sqlcompat::find_top(
+        tokens,
+        into,
+        &[
+            "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "FOR", "UNION",
+        ],
+    )
+    .unwrap_or(tokens.len());
     let names = split_commas(&tokens[into + 1..end])
         .iter()
         .map(|p| match p.first().map(|t| &t.tok) {
             Some(Tok::UserVar(u)) => format!("@{}", u.to_lowercase()),
-            _ => p.first().and_then(|t| t.ident()).unwrap_or("").to_lowercase(),
+            _ => p
+                .first()
+                .and_then(|t| t.ident())
+                .unwrap_or("")
+                .to_lowercase(),
         })
         .collect();
     let mut query = tokens[..into].to_vec();
@@ -684,7 +884,9 @@ mod tests {
         assert_eq!(def.params.len(), 2);
         assert_eq!(def.params[1].mode, ParamMode::Out);
         let body = parse_body(&def.body).unwrap();
-        let S::Block { body, .. } = &body[0] else { panic!("{body:?}") };
+        let S::Block { body, .. } = &body[0] else {
+            panic!("{body:?}")
+        };
         assert_eq!(body.len(), 5, "{body:?}");
         assert!(matches!(&body[1], S::If { branches, otherwise: Some(_) } if branches.len() == 2));
         assert!(matches!(&body[2], S::While { label: Some(l), .. } if l == "l1"));
@@ -708,11 +910,18 @@ mod tests {
             END LOOP;
             CLOSE c;
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'stop', MYSQL_ERRNO = 5001;
-          END")).unwrap();
-        let S::Block { body, .. } = &body[0] else { panic!() };
+          END"))
+        .unwrap();
+        let S::Block { body, .. } = &body[0] else {
+            panic!()
+        };
         assert!(matches!(&body[2], S::Cursor { name, .. } if name == "c"));
-        assert!(matches!(&body[3], S::Handler { exit: false, conditions, .. } if conditions == &[Condition::NotFound]));
-        assert!(matches!(&body[4], S::Handler { exit: true, conditions, body } if conditions.len() == 2 && matches!(**body, S::Block { .. })));
+        assert!(
+            matches!(&body[3], S::Handler { exit: false, conditions, .. } if conditions == &[Condition::NotFound])
+        );
+        assert!(
+            matches!(&body[4], S::Handler { exit: true, conditions, body } if conditions.len() == 2 && matches!(**body, S::Block { .. }))
+        );
         assert!(matches!(&body[6], S::Loop { label: Some(_), body } if body.len() == 3));
         assert!(matches!(&body[8], S::Signal { state, code: Some(5001), .. } if state == "45000"));
         assert!(Condition::Exception.matches(1062, "23000"));
@@ -722,10 +931,19 @@ mod tests {
     #[test]
     fn variables_and_select_into() {
         let v = |n: &str| (n == "p_id").then(|| Token::new(Tok::Num("7".into())));
-        let out = substitute(&t("SELECT p_id AS p_id, t.p_id, p_id(1) FROM t WHERE id = p_id"), &v);
-        assert_eq!(crate::sqlcompat::render_text(&out), "SELECT 7 AS p_id, t.p_id, p_id(1) FROM t WHERE id = 7");
+        let out = substitute(
+            &t("SELECT p_id AS p_id, t.p_id, p_id(1) FROM t WHERE id = p_id"),
+            &v,
+        );
+        assert_eq!(
+            crate::sqlcompat::render_text(&out),
+            "SELECT 7 AS p_id, t.p_id, p_id(1) FROM t WHERE id = 7"
+        );
         let (q, names) = select_into(&t("SELECT a, b INTO x, @y FROM t WHERE c = 1")).unwrap();
-        assert_eq!(crate::sqlcompat::render_text(&q), "SELECT a, b FROM t WHERE c = 1");
+        assert_eq!(
+            crate::sqlcompat::render_text(&q),
+            "SELECT a, b FROM t WHERE c = 1"
+        );
         assert_eq!(names, ["x", "@y"]);
     }
 }

@@ -566,33 +566,56 @@ async fn mysql_temporary_tables_and_on_update() {
 
     // A temporary table hides a table of its name, for this connection
     // only, and is not committed or rolled back with a transaction.
-    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10))").await.unwrap();
+    c.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10))")
+        .await
+        .unwrap();
     c.execute("INSERT INTO t VALUES (1, 'real')").await.unwrap();
     c.execute("START TRANSACTION").await.unwrap();
-    c.execute("INSERT INTO t VALUES (2, 'real2')").await.unwrap();
-    c.execute("CREATE TEMPORARY TABLE t (id INT, v VARCHAR(10))").await.unwrap();
+    c.execute("INSERT INTO t VALUES (2, 'real2')")
+        .await
+        .unwrap();
+    c.execute("CREATE TEMPORARY TABLE t (id INT, v VARCHAR(10))")
+        .await
+        .unwrap();
     c.execute("INSERT INTO t VALUES (7, 'temp')").await.unwrap();
-    let v: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 7").fetch_one(&mut c).await.unwrap();
+    let v: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 7")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(v, "temp");
     c.execute("COMMIT").await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t").fetch_one(&mut other).await.unwrap();
-    assert_eq!(n, 2, "the other connection sees the real table, with the committed row");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&mut other)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 2,
+        "the other connection sees the real table, with the committed row"
+    );
     let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t AS x JOIN t2 ON 1 = 0")
         .fetch_one(&mut c)
         .await
         .map(|_: i64| 0)
         .unwrap_or(-1);
     assert_eq!(n, -1);
-    let names: Vec<String> = sqlx::query_scalar::<_, String>("SHOW TABLES").fetch_all(&mut c).await.unwrap();
+    let names: Vec<String> = sqlx::query_scalar::<_, String>("SHOW TABLES")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
     assert_eq!(names, ["t"], "{names:?}");
     c.execute("DROP TEMPORARY TABLE t").await.unwrap();
-    let v: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1").fetch_one(&mut c).await.unwrap();
+    let v: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(v, "real");
     let e = c.execute("DROP TEMPORARY TABLE t").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1051), "{e}");
     c.execute("DROP TEMPORARY TABLE IF EXISTS t").await.unwrap();
     // Gone when the connection closes.
-    c.execute("CREATE TEMPORARY TABLE scratch (a INT)").await.unwrap();
+    c.execute("CREATE TEMPORARY TABLE scratch (a INT)")
+        .await
+        .unwrap();
     drop(c);
     let mut c = mysql(&s).await;
     assert!(c.execute("SELECT * FROM scratch").await.is_err());
@@ -605,29 +628,75 @@ async fn mysql_temporary_tables_and_on_update() {
     )
     .await
     .unwrap();
-    c.execute("INSERT INTO posts (id, title) VALUES (1, 'a'), (2, 'b')").await.unwrap();
+    c.execute("INSERT INTO posts (id, title) VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
 
-    c.execute("UPDATE posts SET title = 'a' WHERE id = 1").await.unwrap();
-    assert!(changed(&mut c, 1).await.starts_with("2000-01-01"), "an unchanged row keeps it");
-    c.execute("UPDATE posts SET title = 'A' WHERE id = 1").await.unwrap();
-    assert!(!changed(&mut c, 1).await.starts_with("2000"), "a changed row gets the time");
-    assert!(changed(&mut c, 2).await.starts_with("2000-01-01"), "other rows keep it");
-    c.execute("UPDATE posts SET title = 'B', changed = '2010-05-05 00:00:00' WHERE id = 2").await.unwrap();
-    assert!(changed(&mut c, 2).await.starts_with("2010-05-05"), "set explicitly wins");
+    c.execute("UPDATE posts SET title = 'a' WHERE id = 1")
+        .await
+        .unwrap();
+    assert!(
+        changed(&mut c, 1).await.starts_with("2000-01-01"),
+        "an unchanged row keeps it"
+    );
+    c.execute("UPDATE posts SET title = 'A' WHERE id = 1")
+        .await
+        .unwrap();
+    assert!(
+        !changed(&mut c, 1).await.starts_with("2000"),
+        "a changed row gets the time"
+    );
+    assert!(
+        changed(&mut c, 2).await.starts_with("2000-01-01"),
+        "other rows keep it"
+    );
+    c.execute("UPDATE posts SET title = 'B', changed = '2010-05-05 00:00:00' WHERE id = 2")
+        .await
+        .unwrap();
+    assert!(
+        changed(&mut c, 2).await.starts_with("2010-05-05"),
+        "set explicitly wins"
+    );
     c.execute("INSERT INTO posts (id, title) VALUES (2, 'B2') ON DUPLICATE KEY UPDATE title = VALUES(title)").await.unwrap();
-    assert!(!changed(&mut c, 2).await.starts_with("2010"), "an upsert that changes the row sets it");
+    assert!(
+        !changed(&mut c, 2).await.starts_with("2010"),
+        "an upsert that changes the row sets it"
+    );
     // MODIFY without the attribute removes it.
-    c.execute("ALTER TABLE posts MODIFY changed DATETIME(6) DEFAULT '2000-01-01 00:00:00'").await.unwrap();
-    c.execute("UPDATE posts SET changed = '2001-01-01 00:00:00'").await.unwrap();
-    c.execute("UPDATE posts SET title = 'Z' WHERE id = 1").await.unwrap();
-    assert!(changed(&mut c, 1).await.starts_with("2001-01-01"), "no longer set");
+    c.execute("ALTER TABLE posts MODIFY changed DATETIME(6) DEFAULT '2000-01-01 00:00:00'")
+        .await
+        .unwrap();
+    c.execute("UPDATE posts SET changed = '2001-01-01 00:00:00'")
+        .await
+        .unwrap();
+    c.execute("UPDATE posts SET title = 'Z' WHERE id = 1")
+        .await
+        .unwrap();
+    assert!(
+        changed(&mut c, 1).await.starts_with("2001-01-01"),
+        "no longer set"
+    );
     // A table made through the attribute by RENAME keeps it.
-    c.execute("ALTER TABLE posts MODIFY changed DATETIME(6) NULL ON UPDATE CURRENT_TIMESTAMP(6)").await.unwrap();
+    c.execute("ALTER TABLE posts MODIFY changed DATETIME(6) NULL ON UPDATE CURRENT_TIMESTAMP(6)")
+        .await
+        .unwrap();
     c.execute("RENAME TABLE posts TO articles").await.unwrap();
-    c.execute("UPDATE articles SET title = 'Y' WHERE id = 1").await.unwrap();
-    let v: Option<String> = sqlx::query_scalar("SELECT CAST(changed AS CHAR) FROM articles WHERE id = 1").fetch_one(&mut c).await.unwrap();
-    assert!(v.is_some_and(|v| !v.starts_with("2001")), "renamed table keeps the attribute");
-    let names: Vec<String> = sqlx::query_scalar::<_, String>("SHOW TABLES").fetch_all(&mut c).await.unwrap();
+    c.execute("UPDATE articles SET title = 'Y' WHERE id = 1")
+        .await
+        .unwrap();
+    let v: Option<String> =
+        sqlx::query_scalar("SELECT CAST(changed AS CHAR) FROM articles WHERE id = 1")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+    assert!(
+        v.is_some_and(|v| !v.starts_with("2001")),
+        "renamed table keeps the attribute"
+    );
+    let names: Vec<String> = sqlx::query_scalar::<_, String>("SHOW TABLES")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
     assert!(!names.iter().any(|n| n.starts_with("__")), "{names:?}");
 }
 
@@ -639,8 +708,12 @@ async fn mysql_temporary_tables_and_on_update() {
 async fn mysql_stored_procedures() {
     let s = start(MyAuth::Password);
     let mut c = mysql(&s).await;
-    c.execute("CREATE TABLE acct (id INT PRIMARY KEY, owner VARCHAR(20), balance INT)").await.unwrap();
-    c.execute("INSERT INTO acct VALUES (1, 'ann', 100), (2, 'bo', 50), (3, 'cy', 0)").await.unwrap();
+    c.execute("CREATE TABLE acct (id INT PRIMARY KEY, owner VARCHAR(20), balance INT)")
+        .await
+        .unwrap();
+    c.execute("INSERT INTO acct VALUES (1, 'ann', 100), (2, 'bo', 50), (3, 'cy', 0)")
+        .await
+        .unwrap();
 
     // One query, as a client sends it after DELIMITER: the body's `;`s stay in it.
     c.execute(
@@ -664,12 +737,21 @@ async fn mysql_stored_procedures() {
     .await
     .unwrap();
     c.execute("CALL transfer(1, 2, 30, @st)").await.unwrap();
-    let st: String = sqlx::query_scalar("SELECT @st").fetch_one(&mut c).await.unwrap();
+    let st: String = sqlx::query_scalar("SELECT @st")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(st, "ok");
     c.execute("CALL transfer(3, 1, 10, @st)").await.unwrap();
-    let st: String = sqlx::query_scalar("SELECT @st").fetch_one(&mut c).await.unwrap();
+    let st: String = sqlx::query_scalar("SELECT @st")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(st, "insufficient");
-    let balances: Vec<i32> = sqlx::query_scalar("SELECT balance FROM acct ORDER BY id").fetch_all(&mut c).await.unwrap();
+    let balances: Vec<i32> = sqlx::query_scalar("SELECT balance FROM acct ORDER BY id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
     assert_eq!(balances, [70, 80, 0]);
 
     // A cursor loop with a CONTINUE handler, INOUT, a label, CASE, and a
@@ -696,10 +778,16 @@ async fn mysql_stored_procedures() {
     .await
     .unwrap();
     c.execute("SET @t = 1000").await.unwrap();
-    let row = sqlx::query("CALL summarize(@t)").fetch_one(&mut c).await.unwrap();
+    let row = sqlx::query("CALL summarize(@t)")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(row.get::<i64, _>("accounts"), 3);
     assert_eq!(row.get::<i64, _>("total"), 1000 + 70 + 160 + 0);
-    let t: i64 = sqlx::query_scalar("SELECT @t").fetch_one(&mut c).await.unwrap();
+    let t: i64 = sqlx::query_scalar("SELECT @t")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(t, 1230);
 
     // SIGNAL, an unknown procedure, a wrong argument count.
@@ -712,7 +800,10 @@ async fn mysql_stored_procedures() {
     let e = c.execute("CALL guard(1, 2)").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1318), "{e}");
     // The connection is in step after the errors.
-    let one: i32 = sqlx::query_scalar("SELECT 1").fetch_one(&mut c).await.unwrap();
+    let one: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(one, 1);
 
     // Catalogue: SHOW PROCEDURE STATUS, SHOW CREATE PROCEDURE, DROP.
@@ -724,14 +815,26 @@ async fn mysql_stored_procedures() {
         .map(|r| r.get::<String, _>("Name"))
         .collect();
     assert_eq!(names, ["guard", "summarize", "transfer"]);
-    let row = sqlx::query("SHOW CREATE PROCEDURE guard").fetch_one(&mut c).await.unwrap();
-    assert!(row.get::<String, _>("Create Procedure").contains("SIGNAL SQLSTATE '45000'"));
-    let e = c.execute("CREATE PROCEDURE guard() SELECT 1").await.unwrap_err();
+    let row = sqlx::query("SHOW CREATE PROCEDURE guard")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert!(
+        row.get::<String, _>("Create Procedure")
+            .contains("SIGNAL SQLSTATE '45000'")
+    );
+    let e = c
+        .execute("CREATE PROCEDURE guard() SELECT 1")
+        .await
+        .unwrap_err();
     assert_eq!(code(&e).0, Some(1304), "{e}");
     c.execute("DROP PROCEDURE guard").await.unwrap();
     c.execute("DROP PROCEDURE IF EXISTS guard").await.unwrap();
     let e = c.execute("DROP PROCEDURE guard").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1305), "{e}");
-    let e = c.execute("CREATE FUNCTION f() RETURNS INT RETURN 1").await.unwrap_err();
+    let e = c
+        .execute("CREATE FUNCTION f() RETURNS INT RETURN 1")
+        .await
+        .unwrap_err();
     assert_eq!(code(&e).0, Some(1235), "{e}");
 }

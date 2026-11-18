@@ -120,7 +120,9 @@ fn alias_at(tokens: &[Token], i: usize, stop: &[&str]) -> (Option<String>, usize
         j += 1;
     }
     match tokens.get(j) {
-        Some(t) if t.ident().is_some() && !t.upper().is_some_and(|w| stop.contains(&w.as_str())) => {
+        Some(t)
+            if t.ident().is_some() && !t.upper().is_some_and(|w| stop.contains(&w.as_str())) =>
+        {
             (Some(t.ident().unwrap().to_lowercase()), j + 1)
         }
         _ => (None, i),
@@ -160,28 +162,38 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<Merge, TsqlError> {
     }
     let k = j + 1;
     let (source, after) = if tokens.get(k).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(tokens, k).ok_or_else(|| TsqlError::syntax("unbalanced USING"))?;
+        let close =
+            matching_paren(tokens, k).ok_or_else(|| TsqlError::syntax("unbalanced USING"))?;
         (tokens[k..=close].to_vec(), close + 1)
     } else {
         let (name, _, after) =
             name_at(tokens, k).ok_or_else(|| TsqlError::syntax("MERGE … USING needs a source"))?;
         let mut after = after;
         if kw(tokens, after, "WITH") && tokens.get(after + 1).is_some_and(|t| t.is_op("(")) {
-            after = matching_paren(tokens, after + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))? + 1;
+            after = matching_paren(tokens, after + 1)
+                .ok_or_else(|| TsqlError::syntax("unbalanced hint"))?
+                + 1;
         }
         (name, after)
     };
     let (source_alias, mut k) = alias_at(tokens, after, &["ON"]);
     let source_alias = match source_alias {
         Some(a) => a,
-        None if !source.first().is_some_and(|t| t.is_op("(")) => {
-            source.last().and_then(|t| t.ident()).unwrap_or("source").to_lowercase()
+        None if !source.first().is_some_and(|t| t.is_op("(")) => source
+            .last()
+            .and_then(|t| t.ident())
+            .unwrap_or("source")
+            .to_lowercase(),
+        None => {
+            return Err(TsqlError::syntax(
+                "a derived table in MERGE … USING needs an alias",
+            ));
         }
-        None => return Err(TsqlError::syntax("a derived table in MERGE … USING needs an alias")),
     };
     let mut source_columns = None;
     if tokens.get(k).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(tokens, k).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
+        let close =
+            matching_paren(tokens, k).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
         source_columns = Some(tokens[k + 1..close].to_vec());
         k = close + 1;
     }
@@ -198,7 +210,9 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<Merge, TsqlError> {
     let mut clauses = Vec::new();
     let mut at = first_when;
     while at < end {
-        let next = find_clause_word(tokens, at + 1, &["WHEN"]).filter(|&n| n < end).unwrap_or(end);
+        let next = find_clause_word(tokens, at + 1, &["WHEN"])
+            .filter(|&n| n < end)
+            .unwrap_or(end);
         clauses.push(parse_clause(&tokens[at..next])?);
         at = next;
     }
@@ -210,7 +224,9 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<Merge, TsqlError> {
         ));
     }
     if count(When::Matched) > 2 || count(When::NotMatchedBySource) > 2 {
-        return Err(TsqlError::syntax("MERGE allows at most two WHEN MATCHED and two WHEN NOT MATCHED BY SOURCE clauses"));
+        return Err(TsqlError::syntax(
+            "MERGE allows at most two WHEN MATCHED and two WHEN NOT MATCHED BY SOURCE clauses",
+        ));
     }
     Ok(Merge {
         target,
@@ -240,11 +256,14 @@ fn parse_clause(tokens: &[Token]) -> Result<Clause, TsqlError> {
         if kw(tokens, i + 1, "SOURCE") && not {
             when = When::NotMatchedBySource;
         } else if !(kw(tokens, i + 1, "TARGET") && not) {
-            return Err(TsqlError::syntax("WHEN NOT MATCHED BY TARGET or BY SOURCE was expected"));
+            return Err(TsqlError::syntax(
+                "WHEN NOT MATCHED BY TARGET or BY SOURCE was expected",
+            ));
         }
         i += 2;
     }
-    let then = find_clause_word(tokens, i, &["THEN"]).ok_or_else(|| TsqlError::syntax("WHEN … needs THEN"))?;
+    let then = find_clause_word(tokens, i, &["THEN"])
+        .ok_or_else(|| TsqlError::syntax("WHEN … needs THEN"))?;
     let condition = if kw(tokens, i, "AND") {
         Some(tokens[i + 1..then].to_vec())
     } else if then == i {
@@ -264,29 +283,47 @@ fn parse_clause(tokens: &[Token]) -> Result<Clause, TsqlError> {
         let mut k = 1;
         let mut columns = None;
         if body.get(k).is_some_and(|t| t.is_op("(")) {
-            let close = matching_paren(body, k).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
+            let close = matching_paren(body, k)
+                .ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
             columns = Some(body[k + 1..close].to_vec());
             k = close + 1;
         }
         let values = if kw(body, k, "DEFAULT") && kw(body, k + 1, "VALUES") {
             None
         } else if kw(body, k, "VALUES") && body.get(k + 1).is_some_and(|t| t.is_op("(")) {
-            let close = matching_paren(body, k + 1).ok_or_else(|| TsqlError::syntax("unbalanced VALUES"))?;
+            let close = matching_paren(body, k + 1)
+                .ok_or_else(|| TsqlError::syntax("unbalanced VALUES"))?;
             Some(body[k + 2..close].to_vec())
         } else {
-            return Err(TsqlError::syntax("INSERT in MERGE needs VALUES or DEFAULT VALUES"));
+            return Err(TsqlError::syntax(
+                "INSERT in MERGE needs VALUES or DEFAULT VALUES",
+            ));
         };
         Action::Insert { columns, values }
     } else {
-        return Err(TsqlError::syntax("WHEN … THEN UPDATE SET, DELETE or INSERT was expected"));
+        return Err(TsqlError::syntax(
+            "WHEN … THEN UPDATE SET, DELETE or INSERT was expected",
+        ));
     };
     match (when, &action) {
         (When::NotMatched, Action::Insert { .. }) => {}
-        (When::NotMatched, _) => return Err(TsqlError::syntax("WHEN NOT MATCHED [BY TARGET] can only INSERT")),
-        (_, Action::Insert { .. }) => return Err(TsqlError::syntax("only WHEN NOT MATCHED [BY TARGET] can INSERT")),
+        (When::NotMatched, _) => {
+            return Err(TsqlError::syntax(
+                "WHEN NOT MATCHED [BY TARGET] can only INSERT",
+            ));
+        }
+        (_, Action::Insert { .. }) => {
+            return Err(TsqlError::syntax(
+                "only WHEN NOT MATCHED [BY TARGET] can INSERT",
+            ));
+        }
         _ => {}
     }
-    Ok(Clause { when, condition, action })
+    Ok(Clause {
+        when,
+        condition,
+        action,
+    })
 }
 
 /// T-SQL text as tokens, for the statements built here.
@@ -333,14 +370,20 @@ pub(crate) struct Steps {
     pub(crate) writes: Vec<Vec<Token>>,
 }
 
-pub(crate) fn steps(m: &Merge, source: &[Token], primary_key: Option<&str>) -> Result<Steps, TsqlError> {
+pub(crate) fn steps(
+    m: &Merge,
+    source: &[Token],
+    primary_key: Option<&str>,
+) -> Result<Steps, TsqlError> {
     let target = || m.target.clone();
     let alias = || ident(&m.alias);
     let on = paren(&m.on);
     // Columns the ON condition reads on the target side.
     let mut on_columns = Vec::new();
     for (k, tok) in m.on.iter().enumerate() {
-        if tok.ident().is_some_and(|a| a.eq_ignore_ascii_case(&m.alias))
+        if tok
+            .ident()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&m.alias))
             && m.on.get(k + 1).is_some_and(|d| d.is_op("."))
         {
             if let Some(c) = m.on.get(k + 2).and_then(|c| c.ident()) {
@@ -373,7 +416,9 @@ pub(crate) fn steps(m: &Merge, source: &[Token], primary_key: Option<&str>) -> R
         });
         match c.when {
             When::NotMatched => {
-                let Action::Insert { columns, values } = &c.action else { unreachable!() };
+                let Action::Insert { columns, values } = &c.action else {
+                    unreachable!()
+                };
                 let mut select = t("SELECT");
                 match values {
                     Some(v) => select.extend(v.iter().cloned()),
@@ -394,7 +439,12 @@ pub(crate) fn steps(m: &Merge, source: &[Token], primary_key: Option<&str>) -> R
                 let names = columns.as_ref().map(|cols| {
                     split_commas(cols)
                         .iter()
-                        .map(|p| p.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
+                        .map(|p| {
+                            p.last()
+                                .and_then(|t| t.ident())
+                                .unwrap_or("")
+                                .to_lowercase()
+                        })
                         .collect()
                 });
                 to_insert = Some((select, names, values.is_none()));
@@ -542,7 +592,10 @@ mod tests {
         // update, guarded against the delete's rows.
         assert!(render_text(&s.writes[0]).contains("NOT EXISTS"));
         let update = render_text(&s.writes[2]);
-        assert!(update.contains("CASE WHEN (s.Qty = 0) THEN 1 ELSE 0 END = 0"), "{update}");
+        assert!(
+            update.contains("CASE WHEN (s.Qty = 0) THEN 1 ELSE 0 END = 0"),
+            "{update}"
+        );
         let (insert, cols, default) = s.to_insert.unwrap();
         assert_eq!(cols, Some(vec!["id".to_string(), "qty".to_string()]));
         assert!(!default);
@@ -551,11 +604,29 @@ mod tests {
 
     #[test]
     fn refuses_what_would_answer_differently() {
-        let m = parse(&t("MERGE T USING S ON T.k = S.k WHEN MATCHED THEN UPDATE SET k = S.k2")).unwrap();
+        let m = parse(&t(
+            "MERGE T USING S ON T.k = S.k WHEN MATCHED THEN UPDATE SET k = S.k2",
+        ))
+        .unwrap();
         assert_eq!(m.alias, "t");
         assert!(steps(&m, &t("S AS s"), None).is_err());
-        assert!(parse(&t("MERGE T USING S ON T.k = S.k WHEN MATCHED THEN DELETE OUTPUT $action")).is_err());
-        assert!(parse(&t("MERGE TOP (5) T USING S ON T.k = S.k WHEN MATCHED THEN DELETE")).is_err());
-        assert!(parse(&t("MERGE T USING S ON T.k = S.k WHEN NOT MATCHED THEN DELETE")).is_err());
+        assert!(
+            parse(&t(
+                "MERGE T USING S ON T.k = S.k WHEN MATCHED THEN DELETE OUTPUT $action"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&t(
+                "MERGE TOP (5) T USING S ON T.k = S.k WHEN MATCHED THEN DELETE"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&t(
+                "MERGE T USING S ON T.k = S.k WHEN NOT MATCHED THEN DELETE"
+            ))
+            .is_err()
+        );
     }
 }

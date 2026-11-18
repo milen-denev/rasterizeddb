@@ -426,8 +426,18 @@ async fn batch(
 async fn tiberius_procedures_cursors_table_variables() {
     let s = start();
     let mut c = connect(&s).await;
-    batch(&mut c, "CREATE TABLE Nums (N int PRIMARY KEY, Label nvarchar(20))").await.unwrap();
-    batch(&mut c, "INSERT INTO Nums VALUES (1, N'one'), (2, N'two'), (3, N'three')").await.unwrap();
+    batch(
+        &mut c,
+        "CREATE TABLE Nums (N int PRIMARY KEY, Label nvarchar(20))",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "INSERT INTO Nums VALUES (1, N'one'), (2, N'two'), (3, N'three')",
+    )
+    .await
+    .unwrap();
 
     batch(
         &mut c,
@@ -447,21 +457,33 @@ async fn tiberius_procedures_cursors_table_variables() {
     )
     .await
     .unwrap();
-    let labels: Vec<&str> = r[0].iter().map(|row| row.get::<&str, _>(0).unwrap()).collect();
+    let labels: Vec<&str> = r[0]
+        .iter()
+        .map(|row| row.get::<&str, _>(0).unwrap())
+        .collect();
     assert_eq!(labels, ["two", "three"]);
     assert_eq!(r[1][0].get::<i32, _>("total"), Some(2));
     assert_eq!(r[1][0].get::<i32, _>("rc"), Some(7));
     // The default, positionally.
-    let r = batch(&mut c, "DECLARE @t int; EXEC CountAbove DEFAULT, @t OUTPUT; SELECT @t").await.unwrap();
+    let r = batch(
+        &mut c,
+        "DECLARE @t int; EXEC CountAbove DEFAULT, @t OUTPUT; SELECT @t",
+    )
+    .await
+    .unwrap();
     assert_eq!(r.last().unwrap()[0].get::<i32, _>(0), Some(3));
     // Errors by SQL Server's numbers.
     let e = batch(&mut c, "EXEC CountAbove").await.unwrap_err();
     assert_eq!(number(&e), Some(201), "{e}");
     let e = batch(&mut c, "EXEC NoSuchProc").await.unwrap_err();
     assert_eq!(number(&e), Some(2812), "{e}");
-    let e = batch(&mut c, "CREATE PROCEDURE CountAbove AS SELECT 1").await.unwrap_err();
+    let e = batch(&mut c, "CREATE PROCEDURE CountAbove AS SELECT 1")
+        .await
+        .unwrap_err();
     assert_eq!(number(&e), Some(2714), "{e}");
-    let e = batch(&mut c, "DECLARE @t int; EXEC CountAbove 1, @t OUTPUT, 5").await.unwrap_err();
+    let e = batch(&mut c, "DECLARE @t int; EXEC CountAbove 1, @t OUTPUT, 5")
+        .await
+        .unwrap_err();
     assert_eq!(number(&e), Some(8144), "{e}");
     // The catalogue sees it.
     let r = batch(
@@ -476,14 +498,28 @@ async fn tiberius_procedures_cursors_table_variables() {
     assert_eq!(r[0][0].get::<i32, _>("u"), Some(1));
     assert_eq!(r[1][0].get::<i32, _>("n"), Some(1));
     // CREATE OR ALTER replaces it; DROP removes it.
-    batch(&mut c, "CREATE OR ALTER PROCEDURE CountAbove @min int = 0, @total int OUTPUT AS SET @total = 99").await.unwrap();
-    let r = batch(&mut c, "DECLARE @t int; EXEC CountAbove @total = @t OUTPUT; SELECT @t").await.unwrap();
+    batch(
+        &mut c,
+        "CREATE OR ALTER PROCEDURE CountAbove @min int = 0, @total int OUTPUT AS SET @total = 99",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "DECLARE @t int; EXEC CountAbove @total = @t OUTPUT; SELECT @t",
+    )
+    .await
+    .unwrap();
     assert_eq!(r.last().unwrap()[0].get::<i32, _>(0), Some(99));
     batch(&mut c, "DROP PROCEDURE CountAbove").await.unwrap();
     let e = batch(&mut c, "EXEC CountAbove").await.unwrap_err();
     assert_eq!(number(&e), Some(2812), "{e}");
-    batch(&mut c, "DROP PROCEDURE IF EXISTS CountAbove").await.unwrap();
-    let e = batch(&mut c, "DROP PROCEDURE CountAbove").await.unwrap_err();
+    batch(&mut c, "DROP PROCEDURE IF EXISTS CountAbove")
+        .await
+        .unwrap();
+    let e = batch(&mut c, "DROP PROCEDURE CountAbove")
+        .await
+        .unwrap_err();
     assert_eq!(number(&e), Some(3701), "{e}");
 
     // A #table made in a procedure goes when it returns: a second call
@@ -530,7 +566,10 @@ async fn tiberius_procedures_cursors_table_variables() {
     )
     .await
     .unwrap();
-    let names: Vec<&str> = r[0].iter().map(|row| row.get::<&str, _>(0).unwrap()).collect();
+    let names: Vec<&str> = r[0]
+        .iter()
+        .map(|row| row.get::<&str, _>(0).unwrap())
+        .collect();
     assert_eq!(names, ["a", "B"]);
     assert_eq!(r[1][0].get::<i32, _>("c"), Some(2));
     assert!(batch(&mut c, "SELECT * FROM @t").await.is_err());
@@ -567,21 +606,43 @@ async fn tiberius_procedures_cursors_table_variables() {
     .unwrap();
     assert_eq!(r[0][0].get::<i32, _>(0), Some(3));
     assert_eq!(r[1][0].get::<&str, _>(1), Some("one"));
-    let e = batch(&mut c, "DECLARE f CURSOR FOR SELECT N FROM Nums; OPEN f; FETCH LAST FROM f").await.unwrap_err();
+    let e = batch(
+        &mut c,
+        "DECLARE f CURSOR FOR SELECT N FROM Nums; OPEN f; FETCH LAST FROM f",
+    )
+    .await
+    .unwrap_err();
     assert_eq!(number(&e), Some(16911), "{e}");
     let e = batch(&mut c, "OPEN nothere").await.unwrap_err();
     assert_eq!(number(&e), Some(16916), "{e}");
 
     // A batch's #table lasts for the connection, and only it sees it.
-    batch(&mut c, "CREATE TABLE #keep (a int); INSERT INTO #keep VALUES (1), (2)").await.unwrap();
-    batch(&mut c, "SELECT N INTO #copy FROM Nums WHERE N > 1").await.unwrap();
-    let r = batch(&mut c, "SELECT COUNT(*) AS k FROM #keep; SELECT COUNT(*) AS c FROM #copy").await.unwrap();
+    batch(
+        &mut c,
+        "CREATE TABLE #keep (a int); INSERT INTO #keep VALUES (1), (2)",
+    )
+    .await
+    .unwrap();
+    batch(&mut c, "SELECT N INTO #copy FROM Nums WHERE N > 1")
+        .await
+        .unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT COUNT(*) AS k FROM #keep; SELECT COUNT(*) AS c FROM #copy",
+    )
+    .await
+    .unwrap();
     assert_eq!(r[0][0].get::<i32, _>("k"), Some(2));
     assert_eq!(r[1][0].get::<i32, _>("c"), Some(2));
     let mut other = connect(&s).await;
     let e = batch(&mut other, "SELECT * FROM #keep").await.unwrap_err();
     assert_eq!(number(&e), Some(208), "{e}");
-    batch(&mut other, "CREATE TABLE #keep (b nvarchar(5)); INSERT INTO #keep VALUES (N'x')").await.unwrap();
+    batch(
+        &mut other,
+        "CREATE TABLE #keep (b nvarchar(5)); INSERT INTO #keep VALUES (N'x')",
+    )
+    .await
+    .unwrap();
     let r = batch(&mut other, "SELECT b FROM #keep").await.unwrap();
     assert_eq!(r[0][0].get::<&str, _>(0), Some("x"));
     let r = batch(
@@ -599,8 +660,18 @@ async fn tiberius_procedures_cursors_table_variables() {
 async fn tiberius_merge() {
     let s = start();
     let mut c = connect(&s).await;
-    batch(&mut c, "CREATE TABLE Stock (Id int PRIMARY KEY, Qty int, Note nvarchar(10))").await.unwrap();
-    batch(&mut c, "INSERT INTO Stock VALUES (1, 10, N'a'), (2, 20, N'b'), (3, 30, N'c'), (4, 40, N'd')").await.unwrap();
+    batch(
+        &mut c,
+        "CREATE TABLE Stock (Id int PRIMARY KEY, Qty int, Note nvarchar(10))",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "INSERT INTO Stock VALUES (1, 10, N'a'), (2, 20, N'b'), (3, 30, N'c'), (4, 40, N'd')",
+    )
+    .await
+    .unwrap();
     // 1: updated; 2: deleted (Qty 0); 3: untouched by source → deleted by
     // BY SOURCE only when Qty > 25; 4: not in source, Qty 40 → deleted;
     // 5: inserted.
@@ -621,15 +692,29 @@ async fn tiberius_merge() {
     assert_eq!(r[0][0].get::<i32, _>("n"), Some(5));
     let rows: Vec<(i32, i32, String)> = r[1]
         .iter()
-        .map(|row| (row.get(0).unwrap(), row.get(1).unwrap(), row.get::<&str, _>(2).unwrap().to_string()))
+        .map(|row| {
+            (
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get::<&str, _>(2).unwrap().to_string(),
+            )
+        })
         .collect();
     assert_eq!(
         rows,
-        [(1, 15, "big".to_string()), (3, 30, "kept".to_string()), (5, 7, "new".to_string())]
+        [
+            (1, 15, "big".to_string()),
+            (3, 30, "kept".to_string()),
+            (5, 7, "new".to_string())
+        ]
     );
     // From a table, with parameters.
-    batch(&mut c, "CREATE TABLE Incoming (Id int, Qty int)").await.unwrap();
-    batch(&mut c, "INSERT INTO Incoming VALUES (3, 1), (6, 2)").await.unwrap();
+    batch(&mut c, "CREATE TABLE Incoming (Id int, Qty int)")
+        .await
+        .unwrap();
+    batch(&mut c, "INSERT INTO Incoming VALUES (3, 1), (6, 2)")
+        .await
+        .unwrap();
     let n = c
         .execute(
             "MERGE Stock AS t USING Incoming AS s ON t.Id = s.Id
@@ -640,7 +725,12 @@ async fn tiberius_merge() {
         .await
         .unwrap();
     assert_eq!(n.total(), 2);
-    let r = batch(&mut c, "SELECT Qty, Note FROM Stock WHERE Id IN (3, 6) ORDER BY Id").await.unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT Qty, Note FROM Stock WHERE Id IN (3, 6) ORDER BY Id",
+    )
+    .await
+    .unwrap();
     assert_eq!(r[0][0].get::<i32, _>(0), Some(100));
     assert_eq!(r[0][1].get::<i32, _>(0), Some(200));
     assert_eq!(r[0][1].get::<&str, _>(1), Some("param"));
@@ -654,7 +744,12 @@ async fn tiberius_merge() {
     .await
     .unwrap_err();
     assert_eq!(number(&e), Some(8672), "{e}");
-    let r = batch(&mut c, "SELECT Qty FROM Stock WHERE Id = 1; SELECT COUNT(*) FROM Stock WHERE Id > 100").await.unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT Qty FROM Stock WHERE Id = 1; SELECT COUNT(*) FROM Stock WHERE Id > 100",
+    )
+    .await
+    .unwrap();
     assert_eq!(r[0][0].get::<i32, _>(0), Some(15));
     assert_eq!(r[1][0].get::<i32, _>(0), Some(0));
     // Inside a transaction that is rolled back.
@@ -666,7 +761,9 @@ async fn tiberius_merge() {
     )
     .await
     .unwrap();
-    let r = batch(&mut c, "SELECT Qty FROM Stock WHERE Id = 1").await.unwrap();
+    let r = batch(&mut c, "SELECT Qty FROM Stock WHERE Id = 1")
+        .await
+        .unwrap();
     assert_eq!(r[0][0].get::<i32, _>(0), Some(15));
 }
 
@@ -676,18 +773,46 @@ async fn tiberius_merge() {
 async fn tiberius_for_json_and_xml() {
     let s = start();
     let mut c = connect(&s).await;
-    batch(&mut c, "CREATE TABLE Authors (Id int PRIMARY KEY, Name nvarchar(40), Born int)").await.unwrap();
-    batch(&mut c, "CREATE TABLE Books (Id int PRIMARY KEY, AuthorId int, Title nvarchar(60))").await.unwrap();
-    batch(&mut c, "INSERT INTO Authors VALUES (1, N'Ann \"A\" <x>', 1970), (2, N'Bo', NULL)").await.unwrap();
-    batch(&mut c, "INSERT INTO Books VALUES (10, 1, N'First'), (11, 1, N'Second'), (12, 2, N'Third')").await.unwrap();
+    batch(
+        &mut c,
+        "CREATE TABLE Authors (Id int PRIMARY KEY, Name nvarchar(40), Born int)",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "CREATE TABLE Books (Id int PRIMARY KEY, AuthorId int, Title nvarchar(60))",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "INSERT INTO Authors VALUES (1, N'Ann \"A\" <x>', 1970), (2, N'Bo', NULL)",
+    )
+    .await
+    .unwrap();
+    batch(
+        &mut c,
+        "INSERT INTO Books VALUES (10, 1, N'First'), (11, 1, N'Second'), (12, 2, N'Third')",
+    )
+    .await
+    .unwrap();
 
     let json = |r: &Vec<Vec<tiberius::Row>>| r[0][0].get::<&str, _>(0).unwrap().to_string();
     // Compact, in column order, NULLs left out, nested by dotted names.
     let r = batch(&mut c, "SELECT Id, Name AS [person.name], Born AS [person.born] FROM Authors ORDER BY Id FOR JSON PATH").await.unwrap();
-    assert_eq!(json(&r), r#"[{"Id":1,"person":{"name":"Ann \"A\" <x>","born":1970}},{"Id":2,"person":{"name":"Bo"}}]"#);
+    assert_eq!(
+        json(&r),
+        r#"[{"Id":1,"person":{"name":"Ann \"A\" <x>","born":1970}},{"Id":2,"person":{"name":"Bo"}}]"#
+    );
     let r = batch(&mut c, "SELECT Id, Born FROM Authors WHERE Id = 2 FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER").await.unwrap();
     assert_eq!(json(&r), r#"{"Id":2,"Born":null}"#);
-    let r = batch(&mut c, "SELECT Id FROM Authors ORDER BY Id DESC FOR JSON AUTO, ROOT('authors')").await.unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT Id FROM Authors ORDER BY Id DESC FOR JSON AUTO, ROOT('authors')",
+    )
+    .await
+    .unwrap();
     assert_eq!(json(&r), r#"{"authors":[{"Id":2},{"Id":1}]}"#);
     // A nested FOR JSON is JSON, not a string; aggregates go through a
     // derived table.
@@ -706,15 +831,29 @@ async fn tiberius_for_json_and_xml() {
     let r = batch(&mut c, "SELECT AuthorId AS a, COUNT(*) AS n FROM Books GROUP BY AuthorId ORDER BY AuthorId FOR JSON PATH").await.unwrap();
     assert_eq!(json(&r), r#"[{"a":1,"n":2},{"a":2,"n":1}]"#);
     // No rows: no rows at the top, NULL in a subquery.
-    let r = batch(&mut c, "SELECT Id FROM Authors WHERE Id > 5 FOR JSON PATH").await.unwrap();
+    let r = batch(&mut c, "SELECT Id FROM Authors WHERE Id > 5 FOR JSON PATH")
+        .await
+        .unwrap();
     assert!(r.is_empty() || r[0].is_empty(), "{r:?}");
-    let r = batch(&mut c, "SELECT ISNULL((SELECT Id FROM Authors WHERE Id > 5 FOR JSON PATH), '[]') AS j").await.unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT ISNULL((SELECT Id FROM Authors WHERE Id > 5 FOR JSON PATH), '[]') AS j",
+    )
+    .await
+    .unwrap();
     assert_eq!(json(&r), "[]");
-    let e = batch(&mut c, "SELECT Id + 1 FROM Authors FOR JSON PATH").await.unwrap_err();
+    let e = batch(&mut c, "SELECT Id + 1 FROM Authors FOR JSON PATH")
+        .await
+        .unwrap_err();
     assert_eq!(number(&e), Some(13605), "{e}");
 
     // FOR XML PATH: elements, escaping, and the string-joining idioms.
-    let r = batch(&mut c, "SELECT Id, Name FROM Authors ORDER BY Id FOR XML PATH('author'), ROOT('authors')").await.unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT Id, Name FROM Authors ORDER BY Id FOR XML PATH('author'), ROOT('authors')",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         json(&r),
         "<authors><author><Id>1</Id><Name>Ann \"A\" &lt;x&gt;</Name></author><author><Id>2</Id><Name>Bo</Name></author></authors>"
@@ -736,9 +875,17 @@ async fn tiberius_for_json_and_xml() {
     .await
     .unwrap();
     assert_eq!(r[0][0].get::<&str, _>("raw"), Some(";Ann \"A\" <x>;Bo"));
-    assert_eq!(r[0][0].get::<&str, _>("escaped"), Some(";Ann \"A\" &lt;x&gt;;Bo"));
+    assert_eq!(
+        r[0][0].get::<&str, _>("escaped"),
+        Some(";Ann \"A\" &lt;x&gt;;Bo")
+    );
 
     // TOP inside a subquery.
-    let r = batch(&mut c, "SELECT (SELECT TOP 1 Title FROM Books ORDER BY Id DESC) AS last").await.unwrap();
+    let r = batch(
+        &mut c,
+        "SELECT (SELECT TOP 1 Title FROM Books ORDER BY Id DESC) AS last",
+    )
+    .await
+    .unwrap();
     assert_eq!(r[0][0].get::<&str, _>("last"), Some("Third"));
 }

@@ -51,11 +51,29 @@ pub(crate) struct ProcDef {
 pub(crate) fn type_flags(ty: &str) -> (bool, bool) {
     let string = matches!(
         ty,
-        "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "XML" | "UNIQUEIDENTIFIER"
+        "CHAR"
+            | "NCHAR"
+            | "VARCHAR"
+            | "NVARCHAR"
+            | "TEXT"
+            | "NTEXT"
+            | "SYSNAME"
+            | "XML"
+            | "UNIQUEIDENTIFIER"
     );
     let numeric = matches!(
         ty,
-        "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "BIT" | "DECIMAL" | "NUMERIC" | "MONEY" | "SMALLMONEY" | "FLOAT" | "REAL"
+        "INT"
+            | "BIGINT"
+            | "SMALLINT"
+            | "TINYINT"
+            | "BIT"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "MONEY"
+            | "SMALLMONEY"
+            | "FLOAT"
+            | "REAL"
     );
     (string, numeric)
 }
@@ -80,7 +98,8 @@ pub(crate) fn parse_create(tokens: &[Token]) -> Option<Result<ProcDef, TsqlError
     let proc_at = |i: usize| kw(tokens, i, "PROC") || kw(tokens, i, "PROCEDURE");
     let (mode, at) = if kw(tokens, 0, "CREATE") && proc_at(1) {
         (Mode::Create, 2)
-    } else if kw(tokens, 0, "CREATE") && kw(tokens, 1, "OR") && kw(tokens, 2, "ALTER") && proc_at(3) {
+    } else if kw(tokens, 0, "CREATE") && kw(tokens, 1, "OR") && kw(tokens, 2, "ALTER") && proc_at(3)
+    {
         (Mode::CreateOrAlter, 4)
     } else if kw(tokens, 0, "ALTER") && proc_at(1) {
         (Mode::Alter, 2)
@@ -91,8 +110,8 @@ pub(crate) fn parse_create(tokens: &[Token]) -> Option<Result<ProcDef, TsqlError
 }
 
 fn parse_definition(tokens: &[Token], mode: Mode, at: usize) -> Result<ProcDef, TsqlError> {
-    let (name, mut i) =
-        object_name_at(tokens, at).ok_or_else(|| TsqlError::syntax("CREATE PROCEDURE needs a name"))?;
+    let (name, mut i) = object_name_at(tokens, at)
+        .ok_or_else(|| TsqlError::syntax("CREATE PROCEDURE needs a name"))?;
     if tokens.get(i).is_some_and(|t| t.is_op(";")) {
         return Err(TsqlError::unsupported("numbered procedures"));
     }
@@ -141,7 +160,9 @@ fn parse_definition(tokens: &[Token], mode: Mode, at: usize) -> Result<ProcDef, 
         i += 1;
     }
     if i >= tokens.len() {
-        return Err(TsqlError::syntax("CREATE PROCEDURE needs AS before its body"));
+        return Err(TsqlError::syntax(
+            "CREATE PROCEDURE needs AS before its body",
+        ));
     }
     let body_start = i + 1;
     if body_start >= tokens.len() {
@@ -169,7 +190,9 @@ fn parse_param(part: &[Token]) -> Result<ProcParam, TsqlError> {
         .ok_or_else(|| TsqlError::syntax(format!("parameter @{name} needs a type")))?;
     k += 1;
     if part.get(k).is_some_and(|t| t.is_op("(")) {
-        k = crate::sqlcompat::matching_paren(part, k).map(|c| c + 1).unwrap_or(part.len());
+        k = crate::sqlcompat::matching_paren(part, k)
+            .map(|c| c + 1)
+            .unwrap_or(part.len());
     }
     if kw(part, k, "VARYING") {
         k += 1;
@@ -193,11 +216,18 @@ fn parse_param(part: &[Token]) -> Result<ProcParam, TsqlError> {
         match t.upper().as_deref() {
             Some("OUTPUT") | Some("OUT") => output = true,
             Some("READONLY") => return Err(TsqlError::unsupported("table-valued parameters")),
-            _ => return Err(TsqlError::syntax(format!("Incorrect syntax in parameter @{name}."))),
+            _ => {
+                return Err(TsqlError::syntax(format!(
+                    "Incorrect syntax in parameter @{name}."
+                )));
+            }
         }
     }
     if ty == "TABLE" || ty == "CURSOR" {
-        return Err(TsqlError::unsupported(format!("{} parameters", ty.to_lowercase())));
+        return Err(TsqlError::unsupported(format!(
+            "{} parameters",
+            ty.to_lowercase()
+        )));
     }
     Ok(ProcParam {
         name: name.clone(),
@@ -231,7 +261,8 @@ pub(crate) fn parse_cursor(tokens: &[Token]) -> Option<Result<CursorDecl, TsqlEr
     let mut k = 2;
     while k < tokens.len() && !kw(tokens, k, "FOR") {
         match tokens[k].upper().as_deref() {
-            Some("SCROLL") | Some("STATIC") | Some("KEYSET") | Some("INSENSITIVE") | Some("DYNAMIC") => scroll |= !kw(tokens, k, "DYNAMIC"),
+            Some("SCROLL") | Some("STATIC") | Some("KEYSET") | Some("INSENSITIVE")
+            | Some("DYNAMIC") => scroll |= !kw(tokens, k, "DYNAMIC"),
             Some("LOCAL") => local = true,
             _ => {}
         }
@@ -239,14 +270,18 @@ pub(crate) fn parse_cursor(tokens: &[Token]) -> Option<Result<CursorDecl, TsqlEr
     }
     let _ = cursor;
     if k >= tokens.len() {
-        return Some(Err(TsqlError::syntax("DECLARE CURSOR needs FOR and a query")));
+        return Some(Err(TsqlError::syntax(
+            "DECLARE CURSOR needs FOR and a query",
+        )));
     }
     let mut select = tokens[k + 1..].to_vec();
     // A trailing FOR UPDATE [OF …] / FOR READ ONLY.
     if let Some(f) = crate::sqlcompat::find_top(&select, 1, &["FOR"]) {
         if kw(&select, f + 1, "UPDATE") || kw(&select, f + 1, "READ") {
             if kw(&select, f + 1, "UPDATE") {
-                return Some(Err(TsqlError::unsupported("updatable cursors (FOR UPDATE)")));
+                return Some(Err(TsqlError::unsupported(
+                    "updatable cursors (FOR UPDATE)",
+                )));
             }
             select.truncate(f);
         }
@@ -305,12 +340,17 @@ mod tests {
         let t = lex("ALTER PROCEDURE p AS SELECT 2").unwrap();
         assert_eq!(parse_create(&t).unwrap().unwrap().mode, Mode::Alter);
         assert!(parse_create(&lex("CREATE TABLE p (a int)").unwrap()).is_none());
-        assert!(parse_create(&lex("CREATE PROCEDURE p @t dbo.Ids READONLY AS SELECT 1").unwrap()).unwrap().is_err());
+        assert!(
+            parse_create(&lex("CREATE PROCEDURE p @t dbo.Ids READONLY AS SELECT 1").unwrap())
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
     fn cursors() {
-        let t = lex("DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT a, b FROM t ORDER BY a").unwrap();
+        let t =
+            lex("DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT a, b FROM t ORDER BY a").unwrap();
         let c = parse_cursor(&t).unwrap().unwrap();
         assert_eq!(c.name, "c");
         assert!(c.local && !c.scroll);
@@ -320,7 +360,11 @@ mod tests {
         assert!(c.scroll);
         assert_eq!(c.select.len(), 4);
         assert!(parse_cursor(&lex("DECLARE @a int").unwrap()).is_none());
-        assert!(parse_cursor(&lex("DECLARE c CURSOR FOR SELECT a FROM t FOR UPDATE").unwrap()).unwrap().is_err());
+        assert!(
+            parse_cursor(&lex("DECLARE c CURSOR FOR SELECT a FROM t FOR UPDATE").unwrap())
+                .unwrap()
+                .is_err()
+        );
         assert_eq!(fetch_target(-1, 3, "NEXT", 0), 0);
         assert_eq!(fetch_target(2, 3, "NEXT", 0), 3);
         assert_eq!(fetch_target(0, 3, "PRIOR", 0), -1);

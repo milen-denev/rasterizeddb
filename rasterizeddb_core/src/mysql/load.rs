@@ -77,7 +77,11 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<LoadSpec, MyError> {
     }
     let file = String::from_utf8_lossy(&string_at(tokens, i + 1)?).into_owned();
     i += 2;
-    let mut duplicates = if local { Duplicates::Ignore } else { Duplicates::Error };
+    let mut duplicates = if local {
+        Duplicates::Ignore
+    } else {
+        Duplicates::Error
+    };
     if kw(tokens, i, "REPLACE") {
         duplicates = Duplicates::Replace;
         i += 1;
@@ -113,9 +117,18 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<LoadSpec, MyError> {
         let w = tokens[i].upper().unwrap_or_default();
         match w.as_str() {
             "CHARACTER" if kw(tokens, i + 1, "SET") => {
-                let cs = tokens.get(i + 2).and_then(|t| t.ident()).unwrap_or("").to_ascii_lowercase();
-                if !matches!(cs.as_str(), "utf8" | "utf8mb4" | "utf8mb3" | "binary" | "ascii") {
-                    return Err(MyError::unsupported(format!("LOAD DATA … CHARACTER SET {cs}")));
+                let cs = tokens
+                    .get(i + 2)
+                    .and_then(|t| t.ident())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if !matches!(
+                    cs.as_str(),
+                    "utf8" | "utf8mb4" | "utf8mb3" | "binary" | "ascii"
+                ) {
+                    return Err(MyError::unsupported(format!(
+                        "LOAD DATA … CHARACTER SET {cs}"
+                    )));
                 }
                 i += 3;
             }
@@ -155,7 +168,9 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<LoadSpec, MyError> {
             }
             "IGNORE" => {
                 ignore_lines = match tokens.get(i + 1).map(|t| &t.tok) {
-                    Some(Tok::Num(n)) => n.parse().map_err(|_| MyError::syntax("IGNORE needs a number"))?,
+                    Some(Tok::Num(n)) => n
+                        .parse()
+                        .map_err(|_| MyError::syntax("IGNORE needs a number"))?,
                     _ => return Err(MyError::syntax("IGNORE needs a number of lines")),
                 };
                 i += 3; // IGNORE n LINES|ROWS
@@ -188,7 +203,9 @@ pub(crate) fn parse(tokens: &[Token]) -> Result<LoadSpec, MyError> {
         }
     }
     if format.line_end.is_empty() {
-        return Err(MyError::unsupported("LOAD DATA with an empty LINES TERMINATED BY"));
+        return Err(MyError::unsupported(
+            "LOAD DATA with an empty LINES TERMINATED BY",
+        ));
     }
     Ok(LoadSpec {
         local,
@@ -402,14 +419,17 @@ fn find(b: &[u8], from: usize, s: &[u8]) -> Option<usize> {
     if s.is_empty() || from >= b.len() {
         return None;
     }
-    b[from..].windows(s.len()).position(|w| w == s).map(|p| p + from)
+    b[from..]
+        .windows(s.len())
+        .position(|w| w == s)
+        .map(|p| p + from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mysql::lex::lex;
     use crate::mysql::lex::Mode;
+    use crate::mysql::lex::lex;
 
     fn spec(sql: &str) -> LoadSpec {
         parse(&lex(sql.as_bytes(), Mode::default()).unwrap()).unwrap()
@@ -434,9 +454,18 @@ mod tests {
         assert_eq!(l.format.enclosed, Some(b'"'));
         assert_eq!(l.format.line_end, b"\r\n");
         assert_eq!(l.ignore_lines, 1);
-        assert_eq!(l.columns, Some(vec![Some("a".into()), None, Some("b".into())]));
-        assert_eq!(spec("LOAD DATA INFILE 'f' INTO TABLE t").duplicates, Duplicates::Error);
-        assert_eq!(spec("LOAD DATA LOCAL INFILE 'f' INTO TABLE t").duplicates, Duplicates::Ignore);
+        assert_eq!(
+            l.columns,
+            Some(vec![Some("a".into()), None, Some("b".into())])
+        );
+        assert_eq!(
+            spec("LOAD DATA INFILE 'f' INTO TABLE t").duplicates,
+            Duplicates::Error
+        );
+        assert_eq!(
+            spec("LOAD DATA LOCAL INFILE 'f' INTO TABLE t").duplicates,
+            Duplicates::Ignore
+        );
     }
 
     #[test]

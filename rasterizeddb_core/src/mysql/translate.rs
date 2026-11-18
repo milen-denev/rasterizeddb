@@ -177,7 +177,12 @@ fn meta_statements(cx: &Cx) -> Vec<String> {
 /// `, c = CASE WHEN a IS DISTINCT FROM (new a) OR … THEN CURRENT_TIMESTAMP
 /// ELSE c END` for each ON UPDATE column not assigned: MySQL sets it when
 /// the row changes.
-fn on_update_assignments(cx: &Cx, table: &str, qualifier: &str, assigned: &[(String, String)]) -> String {
+fn on_update_assignments(
+    cx: &Cx,
+    table: &str,
+    qualifier: &str,
+    assigned: &[(String, String)],
+) -> String {
     let columns = cx.env.on_update_columns(table);
     if columns.is_empty() || assigned.is_empty() {
         return String::new();
@@ -1864,7 +1869,11 @@ fn rewrite_insert(
 /// only collide through its default, which for an auto-increment key never
 /// happens. Empty when there is no such key, which leaves the choice to the
 /// engine.
-pub(crate) fn conflict_target(database: &Database, table: &str, given: Option<&[String]>) -> String {
+pub(crate) fn conflict_target(
+    database: &Database,
+    table: &str,
+    given: Option<&[String]>,
+) -> String {
     let Some(view) = database.schema_view(table) else {
         return String::new();
     };
@@ -2031,7 +2040,10 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         if kw(main, a, "AS") {
             a += 1;
         }
-        main.get(a).and_then(|t| t.ident()).map(str::to_lowercase).unwrap_or_else(|| table.clone())
+        main.get(a)
+            .and_then(|t| t.ident())
+            .map(str::to_lowercase)
+            .unwrap_or_else(|| table.clone())
     } else {
         String::new()
     };
@@ -2345,12 +2357,17 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
                 // ON UPDATE CURRENT_TIMESTAMP[(n)]: recorded, and set by
                 // UPDATE when the row changes.
                 let now = def.get(k + 2).and_then(|t| t.upper()).unwrap_or_default();
-                if !matches!(now.as_str(), "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME") {
+                if !matches!(
+                    now.as_str(),
+                    "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME"
+                ) {
                     return Err(MyError::unsupported(format!("ON UPDATE {now}")));
                 }
                 k += 3;
                 if def.get(k).is_some_and(|t| t.is_op("(")) {
-                    k = matching_paren(def, k).ok_or_else(|| MyError::syntax("unbalanced ON UPDATE"))? + 1;
+                    k = matching_paren(def, k)
+                        .ok_or_else(|| MyError::syntax("unbalanced ON UPDATE"))?
+                        + 1;
                 }
                 let table = cx
                     .table
@@ -2766,7 +2783,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                             .and_then(|t| t.ident())
                             .ok_or_else(|| MyError::syntax("a column name was expected"))?;
                         statements.push(format!("ALTER TABLE {t} DROP COLUMN {}", ident_sql(name)));
-                        cx.meta.push(MetaOp::Unset(table.clone(), name.to_lowercase()));
+                        cx.meta
+                            .push(MetaOp::Unset(table.clone(), name.to_lowercase()));
                     }
                 }
             }
@@ -2867,7 +2885,11 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                         ident_sql(a),
                         ident_sql(b)
                     ));
-                    cx.meta.push(MetaOp::RenameColumn(table.clone(), a.to_lowercase(), b.to_lowercase()));
+                    cx.meta.push(MetaOp::RenameColumn(
+                        table.clone(),
+                        a.to_lowercase(),
+                        b.to_lowercase(),
+                    ));
                 } else if kw(&spec, 1, "INDEX") || kw(&spec, 1, "KEY") {
                     return Err(MyError::unsupported("RENAME INDEX"));
                 } else {
@@ -2878,7 +2900,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                     let (new, _) = table_name_at(&spec, k)
                         .ok_or_else(|| MyError::syntax("a table name was expected"))?;
                     statements.push(format!("ALTER TABLE {t} RENAME TO {}", ident_sql(&new)));
-                    cx.meta.push(MetaOp::RenameTable(table.clone(), new.clone()));
+                    cx.meta
+                        .push(MetaOp::RenameTable(table.clone(), new.clone()));
                 }
             }
             // Storage options: the engine chooses its own. DISABLE/ENABLE
@@ -3607,9 +3630,19 @@ mod tests {
             1235
         );
         // ON UPDATE CURRENT_TIMESTAMP: the column, and its record.
-        let created = tr(&e, "CREATE TABLE t (a INT, b TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP(6))");
-        assert!(created.starts_with("CREATE TABLE t (a integer, b timestamptz DEFAULT CURRENT_TIMESTAMP)"), "{created}");
-        assert!(created.contains("CREATE TABLE IF NOT EXISTS __rdb_mysql_on_update"), "{created}");
+        let created = tr(
+            &e,
+            "CREATE TABLE t (a INT, b TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP(6))",
+        );
+        assert!(
+            created
+                .starts_with("CREATE TABLE t (a integer, b timestamptz DEFAULT CURRENT_TIMESTAMP)"),
+            "{created}"
+        );
+        assert!(
+            created.contains("CREATE TABLE IF NOT EXISTS __rdb_mysql_on_update"),
+            "{created}"
+        );
         assert!(created.contains("VALUES ('t.b', 't', 'b')"), "{created}");
         assert_eq!(
             err(&e, "CREATE TABLE t (a TIMESTAMP ON UPDATE NULL)").code,

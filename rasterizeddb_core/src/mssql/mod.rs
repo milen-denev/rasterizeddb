@@ -17,8 +17,8 @@
 pub(crate) mod conn;
 pub(crate) mod lex;
 pub(crate) mod merge;
-pub(crate) mod tds;
 pub(crate) mod routines;
+pub(crate) mod tds;
 pub(crate) mod translate;
 
 use std::io;
