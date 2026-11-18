@@ -170,6 +170,16 @@ with variables, `IF`/`WHILE`/`TRY…CATCH`, `sp_executesql` and the RPC calls
 drivers make, and the `sys.*` / `INFORMATION_SCHEMA` views. An error inside a
 transaction fails only its statement, as in both of those databases.
 
+What the engine does not have, the front ends keep: stored procedures (T-SQL
+and MySQL's language, with cursors and handlers), temporary tables (`#t`,
+table variables, `CREATE TEMPORARY TABLE`), cursors (T-SQL's and MySQL's
+`COM_STMT_FETCH`), T-SQL's `MERGE`, `FOR JSON` / `FOR XML PATH`, bulk load
+(`SqlBulkCopy`), MySQL's `LOAD DATA LOCAL INFILE` and
+`ON UPDATE CURRENT_TIMESTAMP`. See
+[docs/mysql-and-sql-server.md](docs/mysql-and-sql-server.md) for what each
+dialect is translated into, and what is refused rather than answered
+differently.
+
 Verified with the `mysql` 8.4 and `mariadb` 11.4 clients, a `mysqldump`
 loaded as is, sqlx-mysql, SQLAlchemy 2 + PyMySQL, Microsoft.Data.SqlClient,
 Dapper, EF Core 10, tiberius and ODBC `sqlcmd`. Text compares as bytes (the

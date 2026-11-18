@@ -86,12 +86,41 @@ foreign keys a `CREATE TABLE` declares and adds them when it is switched back
 on, which is how a `mysqldump` loads; `LOCK TABLES` is accepted and does
 nothing. Comment-only queries answer OK.
 
-**Refused** (an error, never a different answer): `ON UPDATE
-CURRENT_TIMESTAMP`, `FULLTEXT`/`SPATIAL` indexes and `MATCH … AGAINST`,
-`PARTITION BY`, `CREATE TABLE … LIKE/SELECT`, stored procedures and
-`CALL`, `XOR`, `LOAD DATA`, a `REPLACE` that leaves columns out (MySQL resets
-them to their defaults), `sql_select_limit`, character sets other than
-`utf8mb4`/`utf8`/`ascii`/`binary`, and cursors (`COM_STMT_FETCH`).
+**Kept by the front end** (the engine has none of these):
+
+- **Stored procedures.** `CREATE [DEFINER=…] PROCEDURE`, `DROP PROCEDURE`,
+  `CALL`, `SHOW PROCEDURE STATUS`, `SHOW CREATE PROCEDURE`. The body runs in
+  the session: `IN`/`OUT`/`INOUT` parameters (`OUT` into `@variables`),
+  `DECLARE`, `SET`, `IF`, `CASE`, `WHILE`, `REPEAT`, `LOOP` with labels,
+  `LEAVE`, `ITERATE`, `SELECT … INTO`, cursors, `CONTINUE`/`EXIT` handlers
+  (`NOT FOUND`, `SQLEXCEPTION`, `SQLWARNING`, `SQLSTATE`, codes), `SIGNAL`,
+  `RESIGNAL`, nested `CALL`. A `CALL` answers with its queries' result sets
+  and one OK, as MySQL does. Definitions are kept in the database's
+  `__rdb_routines` table.
+- **`CREATE TEMPORARY TABLE`**: a table for the connection, which hides a
+  table of its name, outlives a rolled-back transaction, and goes when the
+  connection closes or is reset. It is a real table under a name of its own
+  (`__rdb_tmp_…`), so making one costs what making a table costs.
+- **`ON UPDATE CURRENT_TIMESTAMP`**: recorded in `__rdb_mysql_on_update`;
+  `UPDATE` and `ON DUPLICATE KEY UPDATE` set the column when an assigned
+  value changes and the statement does not set it itself. Only statements
+  sent over the MySQL protocol set it.
+- **`LOAD DATA LOCAL INFILE`**, with MySQL's field, enclosure, escape and line
+  options, a column list and `IGNORE n LINES`; one transaction. A server-side
+  file (`LOAD DATA INFILE`) is refused as under `secure_file_priv`.
+- **Server-side cursors**: `COM_STMT_EXECUTE` with a cursor type and
+  `COM_STMT_FETCH` (Connector/J's `useCursorFetch`).
+
+Tables whose names start with `__` are not listed by `SHOW TABLES`; a
+PostgreSQL client sees them.
+
+**Refused** (an error, never a different answer): stored functions, triggers
+and events (they would run inside the engine's queries), `FULLTEXT`/`SPATIAL`
+indexes and `MATCH … AGAINST`, `PARTITION BY`, `CREATE TABLE … LIKE/SELECT`,
+`XOR`, `LOAD DATA … SET`, a `REPLACE` that leaves columns out (MySQL resets
+them to their defaults), `SELECT @v = @v + …` over more than one row (MySQL
+folds it row by row; use `GROUP_CONCAT` or `SUM`), `sql_select_limit`, and
+character sets other than `utf8mb4`/`utf8`/`ascii`/`binary`.
 
 `BIGINT UNSIGNED` is a `bigint` (values past 2^63 are refused).
 
@@ -137,18 +166,58 @@ transaction with ENVCHANGE; `SET IMPLICIT_TRANSACTIONS ON` and
 `master`, `model`, `msdb` and `tempdb` are the default database, so a
 client can create and drop its own (`EnsureCreated`, `EnsureDeleted`).
 
-**Refused**: general `MERGE`, cursors, table variables, stored procedures
-other than the system ones above, `FOR JSON`/`FOR XML`, `rowversion`,
-computed columns, filtered indexes, `SET ROWCOUNT`, `TOP … PERCENT/WITH
-TIES`, bulk load (`SqlBulkCopy`), `OUTPUT … INTO`, and Windows
-authentication. `TRY_CAST`/`TRY_CONVERT` raise the conversion error where
-SQL Server would return NULL.
+**Kept by the front end** (the engine has none of these):
+
+- **Stored procedures**: `CREATE [OR ALTER] / ALTER / DROP PROCEDURE`, `EXEC`
+  with positional and named arguments, defaults, `OUTPUT` and the return
+  status, and calls by RPC (`CommandType.StoredProcedure`, with `OUTPUT` and
+  return-value parameters). Each call has its own variables; `#tables` it
+  makes go when it returns; nesting stops at 32. Procedures show in
+  `OBJECT_ID`, `sys.objects`, `sys.procedures`, `sys.sql_modules` and
+  `INFORMATION_SCHEMA.ROUTINES`. Definitions are kept in `__rdb_routines`.
+- **`#temp` tables, `##global` ones and table variables** (`DECLARE @t
+  TABLE`): real tables named per connection (`__rdb_tmp_…`), dropped when
+  their batch, procedure or connection ends, or when a pooled connection is
+  reset. Making one costs what making a table costs. A table variable is
+  rolled back with a transaction here, where SQL Server keeps its rows.
+- **Cursors**: `DECLARE … CURSOR [LOCAL] [SCROLL|STATIC|FAST_FORWARD] FOR
+  SELECT`, `OPEN` (which reads the rows), `FETCH NEXT/PRIOR/FIRST/LAST/
+  ABSOLUTE/RELATIVE [INTO]`, `@@FETCH_STATUS`, `CLOSE`, `DEALLOCATE`.
+  Updatable cursors (`FOR UPDATE`, `WHERE CURRENT OF`) are refused.
+- **`MERGE`** with `WHEN MATCHED [AND …] THEN UPDATE/DELETE`, `WHEN NOT
+  MATCHED [BY TARGET] THEN INSERT`, `WHEN NOT MATCHED BY SOURCE [AND …]`,
+  from a table, a subquery or `VALUES`: run atomically as statements the
+  engine has; a target row matched twice is error 8672.
+- **`FOR JSON PATH/AUTO`** (`ROOT`, `INCLUDE_NULL_VALUES`,
+  `WITHOUT_ARRAY_WRAPPER`, nested `FOR JSON`) and **`FOR XML PATH`** (with
+  `TYPE` and `.value('.', …)`, which `STUFF((… FOR XML PATH('')), 1, n, '')`
+  string joins use).
+- **Bulk load**: `INSERT BULK` and the bulk-load message `SqlBulkCopy` and
+  `bcp` send, in one transaction; `SET FMTONLY ON` answers a query's
+  columns as the table declares them.
+
+**Refused**: `MERGE … OUTPUT` (other than EF Core's insert form) and a `MERGE`
+that updates a column its `ON` reads, `FOR XML RAW/AUTO/EXPLICIT`, stored
+functions and triggers, `rowversion`, computed columns, filtered indexes,
+`SET ROWCOUNT`, `TOP … PERCENT/WITH TIES`, `OUTPUT … INTO`, `SELECT @v = @v
++ … FROM` over more than one row, and Windows authentication.
+`TRY_CAST`/`TRY_CONVERT` raise the conversion error where SQL Server would
+return NULL.
 
 ## Verified with
 
-`mysql` 8.4 and `mariadb` 11.4 clients (TCP, TLS, unix socket), a
-`mysqldump` from MySQL 8.4 loaded as is, sqlx-mysql (prepared statements,
-binary rows), SQLAlchemy 2 + PyMySQL (ORM), Microsoft.Data.SqlClient 7.1,
-Dapper, EF Core 10, tiberius, and ODBC Driver 13 `sqlcmd`.
-`rasterizeddb_compat/tests/mysql_protocol.rs` and `mssql_protocol.rs` run in
-the compat suite.
+`mysql` 8.4 and `mariadb` 11.4 clients (TCP, TLS, unix socket, `LOAD DATA
+LOCAL INFILE`), a `mysqldump` from MySQL 8.4 loaded as is, sqlx-mysql
+(prepared statements, binary rows, procedures), MySQL Connector/J 9.1
+(server-side cursors), SQLAlchemy 2 + PyMySQL (ORM), Microsoft.Data.SqlClient
+7.1 (`SqlBulkCopy`, stored procedures by RPC), Dapper, EF Core 10, tiberius,
+and ODBC Driver 13 `sqlcmd`. `rasterizeddb_compat/tests/mysql_protocol.rs`
+and `mssql_protocol.rs` run in the compat suite; the client harnesses are in
+`.claude/reviews/wire-compat`.
+
+## Not offered
+
+Case-insensitive collations (both databases' default) and full-text search
+need the engine: a front end that folded case could not make a unique key or
+an index compare the same way, and MySQL's relevance ranking cannot be
+answered from a filter.
