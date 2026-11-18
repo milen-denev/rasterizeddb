@@ -551,7 +551,7 @@ pub(crate) fn initial_variables(tls: bool, port: u16) -> BTreeMap<String, Value>
         ("innodb_lock_wait_timeout", i(50)),
         ("interactive_timeout", i(28800)),
         ("license", s("GPL")),
-        ("local_infile", i(0)),
+        ("local_infile", i(1)),
         ("lock_wait_timeout", i(31536000)),
         ("log_bin", i(0)),
         ("lower_case_table_names", i(1)),

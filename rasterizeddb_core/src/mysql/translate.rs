@@ -1592,7 +1592,7 @@ pub(crate) fn auto_increment_column(database: &Database, table: &str) -> Option<
         .map(|d| d.column.clone())
 }
 
-fn table_columns(database: &Database, table: &str) -> Option<Vec<String>> {
+pub(crate) fn table_columns(database: &Database, table: &str) -> Option<Vec<String>> {
     let view = database.schema_view(table)?;
     Some(
         view.schema()
@@ -1864,7 +1864,7 @@ fn rewrite_insert(
 /// only collide through its default, which for an auto-increment key never
 /// happens. Empty when there is no such key, which leaves the choice to the
 /// engine.
-fn conflict_target(database: &Database, table: &str, given: Option<&[String]>) -> String {
+pub(crate) fn conflict_target(database: &Database, table: &str, given: Option<&[String]>) -> String {
     let Some(view) = database.schema_view(table) else {
         return String::new();
     };

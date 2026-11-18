@@ -38,6 +38,7 @@ use super::{MyAuth, MyTls, Registered, SERVER_VERSION, Shared};
 const CLIENT_LONG_PASSWORD: u32 = 1;
 const CLIENT_FOUND_ROWS: u32 = 2;
 const CLIENT_LONG_FLAG: u32 = 4;
+const CLIENT_LOCAL_FILES: u32 = 128;
 const CLIENT_CONNECT_WITH_DB: u32 = 8;
 const CLIENT_NO_SCHEMA: u32 = 16;
 const CLIENT_IGNORE_SPACE: u32 = 256;
@@ -60,6 +61,7 @@ const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
 const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_FOUND_ROWS
     | CLIENT_LONG_FLAG
+    | CLIENT_LOCAL_FILES
     | CLIENT_CONNECT_WITH_DB
     | CLIENT_NO_SCHEMA
     | CLIENT_IGNORE_SPACE
@@ -1436,6 +1438,9 @@ impl Session {
             return Ok(true);
         }
         let tokens = temp.tokens;
+        if crate::sqlcompat::kw(&tokens, 0, "LOAD") && crate::sqlcompat::kw(&tokens, 1, "DATA") {
+            return self.load_data(&tokens, more).await;
+        }
         let (action, filter) = admin::classify(&tokens);
         let keeps_warnings = matches!(action, Action::Show(Show::Warnings | Show::CountWarnings))
             || tokens
@@ -2961,6 +2966,225 @@ impl Session {
         }
         self.statements.insert(id, prepared);
         Ok(())
+    }
+}
+
+/// LOAD DATA LOCAL INFILE: the client sends the file; its records are
+/// inserted as they arrive, in one transaction.
+impl Session {
+    async fn load_data(&mut self, tokens: &[Token], more: bool) -> io::Result<bool> {
+        let spec = match super::load::parse(tokens) {
+            Ok(s) => s,
+            Err(e) => {
+                self.err(&e);
+                return Ok(false);
+            }
+        };
+        if !spec.local {
+            self.err(&MyError::new(
+                1290,
+                "HY000",
+                "The MySQL server is running with the --secure-file-priv option so it cannot execute this statement",
+            ));
+            return Ok(false);
+        }
+        if self.caps & CLIENT_LOCAL_FILES == 0 {
+            self.err(&MyError::new(
+                3948,
+                "42000",
+                "Loading local data is disabled; this must be enabled on both the client and server sides",
+            ));
+            return Ok(false);
+        }
+        let table = self
+            .temp_tables
+            .get(&spec.table)
+            .cloned()
+            .unwrap_or_else(|| spec.table.clone());
+        let database = self.bridge().database.clone();
+        let all = translate::table_columns(&database, &table);
+        // Ask for the file.
+        let mut ask = vec![0xfb];
+        ask.extend_from_slice(spec.file.as_bytes());
+        self.io.packet(&ask);
+        self.io.flush().await?;
+
+        let mut failed = match &all {
+            Some(_) => None,
+            None => Some(MyError::new(1146, "42S02", format!("Table '{}.{}' doesn't exist", self.database_name(), spec.table))),
+        };
+        let all = all.unwrap_or_default();
+        let targets: Vec<Option<String>> = match &spec.columns {
+            Some(c) => c.clone(),
+            None => all.iter().cloned().map(Some).collect(),
+        };
+        if failed.is_none() {
+            if let Some(bad) = targets.iter().flatten().find(|c| !all.contains(c)) {
+                failed = Some(MyError::new(1054, "42S22", format!("Unknown column '{bad}' in 'field list'")));
+            }
+        }
+        let columns: Vec<String> = targets.iter().flatten().cloned().collect();
+        let in_block = self.bridge().in_block();
+        let autocommit = self.autocommit();
+        if failed.is_none() {
+            let begin = if in_block { "SAVEPOINT rdb_mysql_load".to_string() } else { self.begin_sql(None, None) };
+            if let Err(e) = self.silent(&begin).await {
+                failed = Some(results::error_from_engine(&e));
+            }
+        }
+        let began = failed.is_none();
+        let mut reader = super::load::Reader::new(spec.format.clone(), spec.ignore_lines);
+        let mut pending: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+        let (mut records, mut inserted) = (0u64, 0u64);
+        loop {
+            // Every packet is read, an error or not: the client sends the
+            // whole file and then an empty packet.
+            let chunk = self.io.read().await?;
+            let done = chunk.is_empty();
+            let rows = if done { reader.finish() } else { reader.feed(&chunk) };
+            records += rows.len() as u64;
+            if failed.is_none() {
+                pending.extend(rows);
+                if pending.len() >= 1000 || (done && !pending.is_empty()) {
+                    let batch = std::mem::take(&mut pending);
+                    match self.insert_loaded(&database, &table, &targets, &columns, &spec.duplicates, batch).await {
+                        Ok(n) => inserted += n,
+                        Err(e) => failed = Some(e),
+                    }
+                }
+            }
+            if done {
+                break;
+            }
+        }
+        if began {
+            let end = match (&failed, in_block, autocommit) {
+                (None, true, _) => Some("RELEASE SAVEPOINT rdb_mysql_load"),
+                (None, false, true) => Some("COMMIT"),
+                (None, false, false) => None,
+                (Some(_), true, _) => Some("ROLLBACK TO SAVEPOINT rdb_mysql_load"),
+                (Some(_), false, _) => Some("ROLLBACK"),
+            };
+            if let Some(end) = end {
+                if let Err(e) = self.silent(end).await {
+                    failed.get_or_insert(results::error_from_engine(&e));
+                }
+            }
+            if in_block && failed.is_some() {
+                let _ = self.silent("RELEASE SAVEPOINT rdb_mysql_load").await;
+            }
+        }
+        if let Some(e) = failed {
+            self.err(&e);
+            return Ok(false);
+        }
+        self.row_count = inserted as i64;
+        let skipped = records.saturating_sub(inserted);
+        let info = format!("Records: {records}  Deleted: 0  Skipped: {skipped}  Warnings: 0");
+        let status = self.status(more);
+        let warnings = self.warnings.len() as u16;
+        results::write_ok(&mut self.io, inserted, 0, status, warnings, &info, false);
+        Ok(true)
+    }
+
+    /// One batch of a LOAD DATA's records as one INSERT.
+    async fn insert_loaded(
+        &mut self,
+        database: &Arc<Database>,
+        table: &str,
+        targets: &[Option<String>],
+        columns: &[String],
+        duplicates: &super::load::Duplicates,
+        rows: Vec<Vec<Option<Vec<u8>>>>,
+    ) -> Result<u64, MyError> {
+        use super::load::Duplicates;
+        let target = translate::conflict_target(database, table, Some(columns));
+        // REPLACE: a later record of the same key replaces an earlier one,
+        // which one INSERT … ON CONFLICT DO UPDATE cannot do: the batch keeps
+        // each key's last record.
+        let rows = if *duplicates == Duplicates::Replace && !target.trim().is_empty() {
+            let keys: Vec<usize> = target
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .filter_map(|k| {
+                    let k = k.trim().trim_matches('"').to_string();
+                    let field = targets.iter().position(|t| t.as_deref() == Some(k.as_str()))?;
+                    Some(field)
+                })
+                .collect();
+            let key_of = |row: &Vec<Option<Vec<u8>>>| -> Vec<Option<Vec<u8>>> {
+                keys.iter().map(|&k| row.get(k).cloned().flatten()).collect()
+            };
+            let mut last = HashMap::new();
+            for (n, row) in rows.iter().enumerate() {
+                last.insert(key_of(row), n);
+            }
+            rows.into_iter()
+                .enumerate()
+                .filter(|(n, row)| last.get(&key_of(row)) == Some(n))
+                .map(|(_, r)| r)
+                .collect()
+        } else {
+            rows
+        };
+        let mut values = Vec::with_capacity(rows.len());
+        let mut bound: Vec<(i16, Option<Vec<u8>>)> = Vec::with_capacity(rows.len() * columns.len());
+        for row in rows {
+            let mut slots = Vec::with_capacity(columns.len());
+            // Fields to their columns; `@variables` dropped; a missing
+            // field NULL, extra ones ignored.
+            let mut fields = row.into_iter();
+            for target in targets {
+                let field = fields.next().unwrap_or(None);
+                if target.is_some() {
+                    bound.push((0, field));
+                    slots.push(format!("${}", bound.len()));
+                }
+            }
+            values.push(format!("({})", slots.join(", ")));
+        }
+        let cols = columns.iter().map(|c| crate::sqlcompat::ident_sql(c)).collect::<Vec<_>>().join(", ");
+        let on_conflict = match duplicates {
+            Duplicates::Error => String::new(),
+            Duplicates::Ignore => format!(" ON CONFLICT{target} DO NOTHING"),
+            Duplicates::Replace => format!(
+                " ON CONFLICT{target} DO UPDATE SET {}",
+                columns
+                    .iter()
+                    .map(|c| format!("{0} = excluded.{0}", crate::sqlcompat::ident_sql(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let sql = format!(
+            "INSERT INTO {} ({cols}) VALUES {}{on_conflict}",
+            crate::sqlcompat::ident_sql(table),
+            values.join(", ")
+        );
+        let b = self.bridge();
+        let oids = vec![0u32; bound.len()];
+        b.parse("", &sql, &oids);
+        let refs: Vec<(i16, Option<&[u8]>)> = bound.iter().map(|(f, v)| (*f, v.as_deref())).collect();
+        b.bind("", "", &refs, &[0]);
+        b.execute("", 0);
+        b.sync();
+        let mut error = None;
+        let mut tag = String::new();
+        loop {
+            let frame = b.next().await.map_err(|e| MyError::new(2013, "HY000", e.to_string()))?;
+            match frame.tag {
+                b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
+                b'C' => tag = String::from_utf8_lossy(frame.body.strip_suffix(&[0]).unwrap_or(frame.body)).into_owned(),
+                b'Z' => break,
+                _ => {}
+            }
+        }
+        match error {
+            Some(e) => Err(results::error_from_engine(&e)),
+            None => Ok(tag_count(&tag).unwrap_or(0)),
+        }
     }
 }
 
