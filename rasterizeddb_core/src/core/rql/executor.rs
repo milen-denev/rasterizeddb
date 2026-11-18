@@ -396,13 +396,30 @@ fn in_select_list(sql: &str, start: usize) -> bool {
 /// where a bare literal would not carry the type: a temporal value is quoted
 /// text, and a boolean was written `1`/`0`. Numbers and text stand as they
 /// are.
-fn select_list_typed_literal(literal: String, column_type: Option<&crate::core::db_type::DbType>) -> String {
+///
+/// `zoned`: whether a timestamp item is a `timestamptz` (`Some(true)`) or a
+/// `timestamp` (`Some(false)`), as `cte::zoned_timestamp_items` reads the
+/// inner item, or not known (`None`). A stored `timestamp` reaches here as
+/// the eight bytes a `timestamptz` has, and cast as one it was shown with
+/// `+00`; one whose zone is not known is left uncast.
+fn select_list_typed_literal(
+    literal: String,
+    column_type: Option<&crate::core::db_type::DbType>,
+    zoned: Option<bool>,
+) -> String {
     use crate::core::db_type::DbType;
     if literal == "NULL" {
         return literal;
     }
     let cast = match column_type {
-        Some(DbType::DATETIME) => "timestamptz",
+        Some(DbType::DATETIME) => match zoned {
+            Some(true) => "timestamptz",
+            Some(false) => "timestamp",
+            // Not known (a join, an expression the item reader cannot
+            // parse): the untyped literal it was, whose text is right
+            // either way.
+            None => return literal,
+        },
         Some(DbType::TIMESTAMP) => "timestamp",
         Some(DbType::DATE) => "date",
         Some(DbType::INTERVAL) => "interval",
@@ -1246,11 +1263,11 @@ pub async fn substitute_in_subqueries(
             .first()
             .copied()
             .unwrap_or(false);
-        let zoned = crate::core::rql::cte::zoned_timestamp_items(&found.inner_sql, database)
+        let zoned_item = crate::core::rql::cte::zoned_timestamp_items(&found.inner_sql, database)
             .first()
             .copied()
-            .flatten()
-            .unwrap_or(false);
+            .flatten();
+        let zoned = zoned_item.unwrap_or(false);
         let literal = subquery::rows_to_scalar(&rows, document, exact, zoned)?;
         // A whole select item keeps the name PostgreSQL gives it: the inner
         // item's (`(SELECT max(x) …)` is `max`, `(SELECT x AS y …)` is `y`,
@@ -1276,7 +1293,7 @@ pub async fn substitute_in_subqueries(
         // boolean was the number 1 (`(SELECT true) AND true` failed).
         let literal = if in_select_list(&current, found.start) {
             let column_type = rows.first().and_then(|r| r.columns.first()).map(|c| c.column_type.clone());
-            select_list_typed_literal(literal, column_type.as_ref())
+            select_list_typed_literal(literal, column_type.as_ref(), zoned_item)
         } else {
             literal
         };

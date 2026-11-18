@@ -437,6 +437,37 @@ async fn a_folded_subquery_keeps_its_type_and_current_date_is_a_date() {
             Some("boolean")
         ])]
     );
+    // A stored `timestamp` is the same eight bytes as a `timestamptz`: read
+    // through a subquery it stays a `timestamp`, shown with no offset, bare,
+    // under max/min, and through a join (left untyped there).
+    ok(
+        &db,
+        &mut s,
+        "CREATE TABLE tz (id BIGINT PRIMARY KEY, t TIMESTAMP, z TIMESTAMPTZ)",
+    )
+    .await;
+    ok(
+        &db,
+        &mut s,
+        "INSERT INTO tz VALUES (1, '2024-01-01 10:00', '2024-01-01 10:00+00')",
+    )
+    .await;
+    assert_eq!(
+        one(
+            &db,
+            &mut s,
+            "SELECT (SELECT t FROM tz), (SELECT max(t) FROM tz), (SELECT max(z) FROM tz), \
+             (SELECT a.t FROM tz a JOIN tz b ON a.id = b.id), pg_typeof((SELECT min(t) FROM tz))"
+        )
+        .await,
+        vec![r(&[
+            Some("2024-01-01 10:00:00"),
+            Some("2024-01-01 10:00:00"),
+            Some("2024-01-01 10:00:00+00"),
+            Some("2024-01-01 10:00:00"),
+            Some("timestamp without time zone"),
+        ])]
+    );
     // A predicate's subquery stays an untyped constant, read as the column.
     ok(
         &db,

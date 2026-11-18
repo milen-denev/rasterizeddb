@@ -2043,11 +2043,41 @@ pub(crate) fn zoned_timestamp_items(query: &str, database: &Arc<Database>) -> Ve
         .map(|item| item.trim())
         .take_while(|item| !(*item == "*" || item.ends_with(".*")))
         .map(|item| {
-            let expr = crate::core::rql::expr::parse(split_alias(item).0, &fields).ok()?;
+            let text = split_alias(item).0.trim();
+            // `min(x)` and `max(x)` are `x`'s type; the expression parser
+            // does not read aggregates.
+            let text = min_max_argument(text).unwrap_or(text);
+            let expr = crate::core::rql::expr::parse(text, &fields).ok()?;
             (crate::core::rql::expr::static_type(&expr) == DbType::DATETIME)
                 .then(|| !crate::core::rql::expr::yields_timestamp(&expr))
         })
         .collect()
+}
+
+/// The argument of `min(…)` or `max(…)` when `item` is exactly one such call.
+fn min_max_argument(item: &str) -> Option<&str> {
+    let head = item.get(..4)?;
+    if !(head.eq_ignore_ascii_case("min(") || head.eq_ignore_ascii_case("max(")) || !item.ends_with(')') {
+        return None;
+    }
+    let inner = &item[4..item.len() - 1];
+    // The closing parenthesis is the call's own: `max(a) + (b)` is not one.
+    let mut depth = 0i32;
+    let mut quote = false;
+    for c in inner.chars() {
+        match c {
+            '\'' => quote = !quote,
+            '(' if !quote => depth += 1,
+            ')' if !quote => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    (depth == 0 && !inner.trim().is_empty()).then_some(inner.trim())
 }
 
 /// Which output columns of `query`, by position, are stored documents, for
