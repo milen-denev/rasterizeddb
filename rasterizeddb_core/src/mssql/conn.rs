@@ -34,6 +34,16 @@ const STATEMENT_SAVEPOINT: &str = "rdb_tds_statement";
 
 const VERSION_TEXT: &str = "Microsoft SQL Server 2022 (RTM) - 16.0.4000.0 (X64) \n\tRasterizedDB (SQL Server protocol)";
 
+/// SQL Server's system databases are the default database here: a client
+/// connects to `master` to create or drop its own.
+fn resolve_database<'a>(shared: &'a Shared, name: &'a str) -> &'a str {
+    if name.is_empty() || matches!(name.to_ascii_lowercase().as_str(), "master" | "model" | "msdb" | "tempdb") {
+        shared.catalog.default_name()
+    } else {
+        name
+    }
+}
+
 /// What a statement leaves the batch doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flow {
@@ -127,11 +137,8 @@ pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdA
         Ok(Err(e)) => return Err(e),
         Err(_) => return Ok(()),
     };
-    let database = if login_packet.database.is_empty() {
-        shared.catalog.default_name().to_string()
-    } else {
-        login_packet.database.clone()
-    };
+    let database = resolve_database(&shared, &login_packet.database).to_string();
+    let shown = if login_packet.database.is_empty() { database.clone() } else { login_packet.database.clone() };
     let mut session = Session {
         wire,
         shared: shared.clone(),
@@ -165,8 +172,8 @@ pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdA
     match session.open(&database).await {
         Ok(()) => {
             let out = session.wire.reply();
-            tds::env_change_text(out, 1, &database, "master");
-            tds::message(out, false, 5701, 2, 0, &format!("Changed database context to '{database}'."), SERVER_NAME, 1);
+            tds::env_change_text(out, 1, &shown, "master");
+            tds::message(out, false, 5701, 2, 0, &format!("Changed database context to '{shown}'."), SERVER_NAME, 1);
             tds::env_change_bytes(out, 7, &tds::COLLATION, &[]);
             tds::env_change_text(out, 2, "us_english", "");
             tds::login_ack(out);
@@ -273,7 +280,7 @@ async fn handshake(wire: &mut Wire, shared: &StdArc<Shared>, over_limit: bool) -
         wire.send(tds::PT_REPLY).await?;
         return Ok(None);
     }
-    let database_name = if login.database.is_empty() { shared.catalog.default_name().to_string() } else { login.database.clone() };
+    let database_name = resolve_database(shared, &login.database).to_string();
     let Some(database) = shared.catalog.get(&database_name) else {
         refuse(wire, 4060, &format!("Cannot open database \"{database_name}\" requested by the login. The login failed."));
         wire.send(tds::PT_REPLY).await?;
@@ -346,6 +353,9 @@ impl Env for Scope<'_> {
     }
     fn user(&self) -> &str {
         &self.s.login.user
+    }
+    fn databases(&self) -> Vec<String> {
+        self.s.shared.catalog.names()
     }
     fn variable(&self, name: &str) -> Option<Value> {
         self.s.vars.get(name).map(|v| v.value.clone())
@@ -694,7 +704,13 @@ impl Session {
     }
 
     /// One statement on the engine, its rows streamed to the client.
-    async fn exchange(&mut self, sql: &str, params: &[(i16, Option<Vec<u8>>, u32)], capture: bool) -> io::Result<Outcome> {
+    async fn exchange(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+        capture: bool,
+        extra: Option<&(String, Vec<String>)>,
+    ) -> io::Result<Outcome> {
         {
             let b = self.bridge.as_mut().unwrap();
             if params.is_empty() {
@@ -741,6 +757,10 @@ impl Session {
                             }
                         })
                         .collect();
+                    let mut cols = cols;
+                    if let Some((name, _)) = extra {
+                        cols.push(Column { name: name.clone(), ty: ColType::Int(4), oid: 23 });
+                    }
                     if !capture {
                         if unknown {
                             held = Some(Vec::new());
@@ -759,8 +779,13 @@ impl Session {
                         }
                         continue;
                     }
+                    let extra_value: Option<Vec<u8>> = extra.and_then(|(_, values)| values.get(count as usize - 1)).map(|v| v.as_bytes().to_vec());
                     if let Some(rows) = held.as_mut() {
-                        rows.push(cells.iter().map(|c| c.map(|v| v.to_vec())).collect());
+                        let mut row: Vec<Option<Vec<u8>>> = cells.iter().map(|c| c.map(|v| v.to_vec())).collect();
+                        if extra.is_some() {
+                            row.push(extra_value);
+                        }
+                        rows.push(row);
                         continue;
                     }
                     if encode_error.is_some() {
@@ -770,7 +795,11 @@ impl Session {
                     let at = self.wire.reply_len();
                     let out = self.wire.reply();
                     out.push(0xd1);
-                    for (k, cell) in cells.iter().enumerate() {
+                    let mut all: Vec<Option<&[u8]>> = cells.iter().copied().collect();
+                    if extra.is_some() {
+                        all.push(extra_value.as_deref());
+                    }
+                    for (k, cell) in all.iter().enumerate() {
                         let ty = cols.get(k).map(|c| c.ty.clone()).unwrap_or(ColType::NVarChar(None));
                         if let Err(e) = tds::put_value(out, &ty, *cell) {
                             out.truncate(at);
@@ -944,7 +973,7 @@ impl Session {
         let mut last = None;
         let mut affected = 0u64;
         for sql in forward.statements.iter().filter(|s| !s.is_empty()) {
-            let outcome = self.exchange(sql, &bound, capture).await?;
+            let outcome = self.exchange(sql, &bound, capture, forward.extra_column.as_ref()).await?;
             let failed = matches!(outcome, Outcome::Failed(..));
             if let Outcome::Done { tag, .. } = &outcome {
                 affected += tag_count(tag).unwrap_or(0);
@@ -1333,8 +1362,14 @@ impl Session {
                     _ => Err(TsqlError::unsupported("WAITFOR other than DELAY")),
                 }
             }
-            "GRANT" | "DENY" | "REVOKE" | "DBCC" | "BACKUP" | "RESTORE" | "OPEN" | "CLOSE" | "FETCH" | "DEALLOCATE" | "GOTO" | "KILL" | "MERGE" => {
+            "GRANT" | "DENY" | "REVOKE" | "DBCC" | "BACKUP" | "RESTORE" | "OPEN" | "CLOSE" | "FETCH" | "DEALLOCATE" | "GOTO" | "KILL" => {
                 Err(TsqlError::unsupported(head))
+            }
+            "ALTER" if next == "DATABASE" => {
+                // SET SINGLE_USER, RECOVERY, COLLATE …: storage and access
+                // settings the engine does not have.
+                self.statement_done(0, 0, 0);
+                Ok(Flow::Next)
             }
             "CHECKPOINT" => {
                 self.statement_done(0, 0, 0);
@@ -1351,6 +1386,10 @@ impl Session {
                     p.used.lock().clear();
                 }
                 let translated = translate::translate(text, tokens.to_vec(), &Scope { s: self, params });
+                match &translated {
+                    Ok(f) => log::debug!("T-SQL {:?} -> {:?}", crate::sqlcompat::render_text(tokens), f.statements),
+                    Err(e) => log::debug!("T-SQL {:?} refused: {}", crate::sqlcompat::render_text(tokens), e.message),
+                }
                 match translated {
                     Ok(forward) => match self.forward(forward, params).await? {
                         Ok(()) => Ok(Flow::Next),
@@ -1457,7 +1496,9 @@ impl Session {
         }
     }
 
-    async fn use_database(&mut self, db: &str) -> Result<Flow, TsqlError> {
+    async fn use_database(&mut self, shown: &str) -> Result<Flow, TsqlError> {
+        let db = resolve_database(&self.shared, shown).to_string();
+        let db = db.as_str();
         if self.bridge().in_block() {
             return Err(TsqlError::new(574, "USE inside a transaction is not supported: COMMIT or ROLLBACK first."));
         }
@@ -1469,8 +1510,8 @@ impl Session {
             self.prepared.clear();
             self.open(db).await?;
         }
-        tds::env_change_text(self.wire.reply(), 1, db, &old);
-        self.info_token(5701, &format!("Changed database context to '{db}'."));
+        tds::env_change_text(self.wire.reply(), 1, shown, &old);
+        self.info_token(5701, &format!("Changed database context to '{shown}'."));
         self.statement_done(0, 0, 0);
         Ok(Flow::Next)
     }

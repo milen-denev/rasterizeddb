@@ -97,6 +97,9 @@ pub(crate) trait Env {
     fn database(&self) -> &Arc<Database>;
     fn database_name(&self) -> &str;
     fn user(&self) -> &str;
+    fn databases(&self) -> Vec<String> {
+        vec![self.database_name().to_string()]
+    }
     fn variable(&self, name: &str) -> Option<Value>;
     fn param(&self, name: &str) -> Option<ParamSlot>;
     /// Whether a parameter's value (known at each execution) is NULL.
@@ -125,6 +128,10 @@ pub(crate) enum Kind {
 pub(crate) struct Forward {
     pub(crate) statements: Vec<String>,
     pub(crate) kind: Kind,
+    /// A column added after the engine's, row by row (a MERGE's source
+    /// position, which an INSERT's RETURNING cannot name): its name and
+    /// each row's value.
+    pub(crate) extra_column: Option<(String, Vec<String>)>,
 }
 
 /// A statement of a batch, with T-SQL's control flow.
@@ -1221,10 +1228,11 @@ fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, Tsq
         }
         ("sys", "schemas") => "(SELECT * FROM (VALUES ('dbo', 1, 1), ('sys', 4, 4), ('INFORMATION_SCHEMA', 3, 4)) AS v(name, schema_id, principal_id))".into(),
         ("sys", "databases") => {
-            let mut names = cx.env.database().name.clone();
-            names.clear();
-            let _ = names;
-            format!("(SELECT * FROM (VALUES ({}, 5, 'Latin1_General_BIN2', 0, 'ONLINE', 160)) AS v(name, database_id, collation_name, state, state_desc, compatibility_level))", sql_str(&db))
+            let mut rows = vec!["('master', 1, 'Latin1_General_BIN2', 0, 'ONLINE', 160)".to_string()];
+            for (k, name) in cx.env.databases().iter().enumerate() {
+                rows.push(format!("({}, {}, 'Latin1_General_BIN2', 0, 'ONLINE', 160)", sql_str(name), k + 5));
+            }
+            format!("(SELECT * FROM (VALUES {}) AS v(name, database_id, collation_name, state, state_desc, compatibility_level))", rows.join(", "))
         }
         ("sys", "columns") | ("sys", "all_columns") => {
             let cols = ["object_id", "name", "column_id", "system_type_id", "user_type_id", "max_length", "precision", "scale", "is_nullable", "is_identity", "is_computed"];
@@ -1670,6 +1678,7 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
     Ok(Forward {
         statements: vec![render_text(&out)],
         kind,
+        extra_column: None,
     })
 }
 
@@ -1796,6 +1805,7 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     Ok(Forward {
         statements: vec![render_text(&out)],
         kind,
+        extra_column: None,
     })
 }
 
@@ -1866,6 +1876,7 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     Ok(Forward {
         statements: vec![render_text(&out)],
         kind,
+        extra_column: None,
     })
 }
 
@@ -2112,7 +2123,7 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         defs.join(", ")
     )];
     statements.extend(later);
-    Ok(Forward { statements, kind: Kind::Ddl })
+    Ok(Forward { statements, kind: Kind::Ddl, extra_column: None })
 }
 
 fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
@@ -2187,7 +2198,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
     if statements.is_empty() {
         statements.push(String::new());
     }
-    Ok(Forward { statements, kind: Kind::Ddl })
+    Ok(Forward { statements, kind: Kind::Ddl, extra_column: None })
 }
 
 fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
@@ -2212,6 +2223,7 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
             cols.join(", ")
         )],
         kind: Kind::Ddl,
+        extra_column: None,
     })
 }
 
@@ -2255,7 +2267,137 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
         "VIEW" => vec![render_text(&rewrite_expr(tokens, cx)?)],
         other => return Err(TsqlError::unsupported(format!("DROP {other}"))),
     };
-    Ok(Forward { statements, kind: Kind::Ddl })
+    Ok(Forward { statements, kind: Kind::Ddl, extra_column: None })
+}
+
+/// The one MERGE drivers write to insert several rows and learn their keys
+/// (EF Core's batched insert):
+///
+/// ```sql
+/// MERGE t USING (VALUES (…, 0), (…, 1)) AS i (a, b, _Position) ON 1=0
+/// WHEN NOT MATCHED THEN INSERT (a, b) VALUES (i.a, i.b)
+/// OUTPUT INSERTED.Id, i._Position;
+/// ```
+///
+/// It is an INSERT of those rows. The source columns OUTPUT names cannot
+/// be RETURNED, so each row's are put back by position: the engine returns
+/// an INSERT's rows in the order of its VALUES.
+fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
+    let refuse = || TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated)");
+    let mut i = 1;
+    if kw(&tokens, i, "INTO") {
+        i += 1;
+    }
+    let (table, mut j) = table_name_at(&tokens, i).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [1]")))?;
+    if kw(&tokens, j, "WITH") && tokens.get(j + 1).is_some_and(|t| t.is_op("(")) {
+        j = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [2]")))? + 1;
+    }
+    if kw(&tokens, j, "AS") {
+        j += 2;
+    } else if tokens.get(j).is_some_and(|t| t.ident().is_some() && !t.is_word("USING")) {
+        j += 1;
+    }
+    if !kw(&tokens, j, "USING") || !tokens.get(j + 1).is_some_and(|t| t.is_op("(")) || !kw(&tokens, j + 2, "VALUES") {
+        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+    }
+    let close = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [3]")))?;
+    let rows: Vec<Vec<Vec<Token>>> = split_commas(&tokens[j + 3..close])
+        .into_iter()
+        .map(|row| {
+            let inner = if row.first().is_some_and(|t| t.is_op("(")) && row.last().is_some_and(|t| t.is_op(")")) {
+                row[1..row.len() - 1].to_vec()
+            } else {
+                row
+            };
+            split_commas(&inner)
+        })
+        .collect();
+    let mut k = close + 1;
+    if kw(&tokens, k, "AS") {
+        k += 1;
+    }
+    let alias = tokens.get(k).and_then(|t| t.ident()).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [4]")))?.to_lowercase();
+    k += 1;
+    let source_close = matching_paren(&tokens, k).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [5]")))?;
+    let source_cols: Vec<String> = split_commas(&tokens[k + 1..source_close])
+        .iter()
+        .map(|c| c.first().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
+        .collect();
+    let on = source_close + 1;
+    let always_false = kw(&tokens, on, "ON")
+        && matches!((tokens.get(on + 1), tokens.get(on + 2), tokens.get(on + 3)), (Some(a), Some(eq), Some(b)) if eq.is_op("=") && matches!((&a.tok, &b.tok), (Tok::Num(x), Tok::Num(y)) if x != y));
+    if !always_false {
+        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+    }
+    let insert = find_top(&tokens, on, &["INSERT"]).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [6]")))?;
+    if find_top(&tokens, on, &["MATCHED"]).is_none() || find_top(&tokens, on, &["UPDATE", "DELETE"]).is_some_and(|u| u < insert) {
+        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+    }
+    let cols_open = insert + 1;
+    let cols_close = matching_paren(&tokens, cols_open).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [7]")))?;
+    let target_cols: Vec<String> = split_commas(&tokens[cols_open + 1..cols_close])
+        .iter()
+        .map(|c| c.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
+        .collect();
+    if !kw(&tokens, cols_close + 1, "VALUES") {
+        return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+    }
+    let values_close = matching_paren(&tokens, cols_close + 2).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [8]")))?;
+    // Each inserted value is a source column: which one.
+    let mut picks = Vec::new();
+    for v in split_commas(&tokens[cols_close + 3..values_close]) {
+        let name = v.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+        let at = source_cols.iter().position(|c| *c == name).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [9]")))?;
+        picks.push(at);
+    }
+    // OUTPUT: inserted columns, then source columns put back by position.
+    let output = find_top(&tokens, values_close + 1, &["OUTPUT"]).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [10]")))?;
+    let mut returning = Vec::new();
+    let mut extra: Option<(String, usize)> = None;
+    for part in split_commas(&tokens[output + 1..]) {
+        let names: Vec<String> = part.iter().filter_map(|t| t.ident().map(|s| s.to_lowercase())).collect();
+        if names.first().map(String::as_str) == Some(alias.as_str()) {
+            if extra.is_some() {
+                return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+            }
+            let col = names.get(1).cloned().unwrap_or_default();
+            let at = source_cols.iter().position(|c| *c == col).ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [11]")))?;
+            let written = part.last().and_then(|t| t.ident()).unwrap_or(&col).to_string();
+            extra = Some((written, at));
+        } else if extra.is_some() {
+            return Err(TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated) [r]"));
+        } else {
+            let written = part.last().and_then(|t| t.ident()).unwrap_or("").to_string();
+            let col = names.last().cloned().unwrap_or_default();
+            returning.push(format!("{} AS {}", ident_sql(&col), quote_ident(&written)));
+        }
+    }
+    let mut row_sql = Vec::new();
+    let mut positions = Vec::new();
+    for row in &rows {
+        let mut vals = Vec::new();
+        for &p in &picks {
+            let v = row.get(p).cloned().ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [12]")))?;
+            vals.push(render_text(&rewrite_expr(v, cx)?));
+        }
+        row_sql.push(format!("({})", vals.join(", ")));
+        if let Some((_, at)) = &extra {
+            let v = row.get(*at).cloned().ok_or_else(|| TsqlError::unsupported(format!("MERGE (only the insert-only form with ON 1 = 0 is translated) [13]")))?;
+            positions.push(render_text(&rewrite_expr(v, cx)?));
+        }
+    }
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES {}{}",
+        ident_sql(&table),
+        target_cols.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", "),
+        row_sql.join(", "),
+        if returning.is_empty() { String::new() } else { format!(" RETURNING {}", returning.join(", ")) }
+    );
+    Ok(Forward {
+        statements: vec![sql],
+        kind: if returning.is_empty() && extra.is_none() { Kind::Insert { identity: None } } else { Kind::Query },
+        extra_column: extra.map(|(name, _)| (name, positions)),
+    })
 }
 
 /// Translates one data statement.
@@ -2278,16 +2420,19 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
                         render_text(&body)
                     )],
                     kind: Kind::Write,
+                    extra_column: None,
                 });
             }
             Ok(Forward {
                 statements: vec![render_text(&rewrite_select(sql, tokens, &mut cx, true)?)],
                 kind: Kind::Query,
+                extra_column: None,
             })
         }
         _ if tokens.first().is_some_and(|t| t.is_op("(")) => Ok(Forward {
             statements: vec![render_text(&rewrite_select(sql, tokens, &mut cx, true)?)],
             kind: Kind::Query,
+            extra_column: None,
         }),
         "WITH" => {
             let main = find_top(&tokens, 1, &["SELECT", "INSERT", "UPDATE", "DELETE"]);
@@ -2298,12 +2443,13 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
             Ok(Forward {
                 statements: vec![render_text(&rewrite_expr(tokens, &mut cx)?)],
                 kind,
+                extra_column: None,
             })
         }
         "INSERT" => rewrite_insert(sql, tokens, &mut cx),
         "UPDATE" => rewrite_update(tokens, &mut cx),
         "DELETE" => rewrite_delete(tokens, &mut cx),
-        "MERGE" => Err(TsqlError::unsupported("MERGE")),
+        "MERGE" => rewrite_merge_insert(tokens, &mut cx),
         "CREATE" => {
             let second = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
             match second.as_str() {
@@ -2314,12 +2460,13 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
                     Ok(Forward {
                         statements: vec![format!("CREATE DATABASE {}", ident_sql(name))],
                         kind: Kind::Ddl,
+                        extra_column: None,
                     })
                 }
                 "SCHEMA" => {
                     let name = tokens.get(2).and_then(|t| t.ident()).unwrap_or("");
                     if name.eq_ignore_ascii_case("dbo") {
-                        Ok(Forward { statements: vec![String::new()], kind: Kind::Ddl })
+                        Ok(Forward { statements: vec![String::new()], kind: Kind::Ddl, extra_column: None })
                     } else {
                         Err(TsqlError::unsupported("schemas other than dbo"))
                     }
@@ -2328,7 +2475,7 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
                     let at = find_top(&tokens, 2, &["AS"]).ok_or_else(|| TsqlError::syntax("CREATE VIEW needs AS"))?;
                     let mut out = rewrite_expr(tokens[..=at].to_vec(), &mut cx)?;
                     out.extend(rewrite_select(sql, tokens[at + 1..].to_vec(), &mut cx, false)?);
-                    Ok(Forward { statements: vec![render_text(&out)], kind: Kind::Ddl })
+                    Ok(Forward { statements: vec![render_text(&out)], kind: Kind::Ddl, extra_column: None })
                 }
                 other => Err(TsqlError::unsupported(format!("CREATE {other}"))),
             }
@@ -2346,11 +2493,13 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
             Ok(Forward {
                 statements: vec![format!("TRUNCATE TABLE {}", ident_sql(&table))],
                 kind: Kind::Ddl,
+                extra_column: None,
             })
         }
         _ => Ok(Forward {
             statements: vec![render_text(&rewrite_expr(tokens, &mut cx)?)],
             kind: Kind::Other,
+            extra_column: None,
         }),
     }
 }
@@ -2481,7 +2630,7 @@ mod tests {
         let e = env();
         assert_eq!(tr(&e, "SELECT TOP (5) [Name] FROM [dbo].[Users] WITH (NOLOCK) ORDER BY [Name]"), r#"SELECT name AS "Name" FROM users ORDER BY name LIMIT 5"#);
         assert_eq!(tr(&e, "SELECT a FROM t ORDER BY a OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY"), "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10");
-        assert_eq!(tr(&e, "SELECT Total = COUNT(*) FROM t"), r#"SELECT (count(*)::integer) AS "Total" FROM t"#);
+        assert_eq!(tr(&e, "SELECT Total = COUNT(*) FROM t"), r#"SELECT ((count(*))::integer) AS "Total" FROM t"#);
         assert_eq!(tr(&e, "SELECT 'a' + name + N'b' FROM t"), "SELECT 'a' || name || 'b' FROM t");
         assert_eq!(tr(&e, "SELECT a + 1 FROM t WHERE x = @p0 AND y = @p1 + 'z'"), "SELECT a + 1 FROM t WHERE x = $1 AND y = $2 || 'z'");
         assert_eq!(tr(&e, "SELECT ISNULL(a, 0), LEN(b), GETDATE() FROM t"), "SELECT coalesce(a, 0), char_length(rtrim(CAST(b AS text))), localtimestamp FROM t");
@@ -2502,6 +2651,19 @@ mod tests {
             tr(&e, "UPDATE a SET a.x = b.y FROM t a INNER JOIN u b ON a.id = b.id WHERE b.z = 1"),
             "UPDATE t AS a SET x = b.y FROM u b WHERE (a.id = b.id) AND (b.z = 1)"
         );
+    }
+
+    #[test]
+    fn ef_core_merge_insert() {
+        let e = env();
+        let sql = "MERGE [Blogs] USING (VALUES (@p0, @p1, 0), (@p0, @p1, 1)) AS i ([Created], [Url], _Position) ON 1=0 \
+                   WHEN NOT MATCHED THEN INSERT ([Created], [Url]) VALUES (i.[Created], i.[Url]) OUTPUT INSERTED.[Id], i._Position;";
+        let tokens = lex(sql).unwrap();
+        let stmts = parse_batch(&tokens).unwrap();
+        let Stmt::Simple(t) = &stmts[0] else { panic!() };
+        let f = translate(sql, t.clone(), &e).map_err(|e| e.message).unwrap();
+        assert_eq!(f.statements[0], r#"INSERT INTO blogs (created, url) VALUES ($1, $2), ($1, $2) RETURNING id AS "Id""#);
+        assert_eq!(f.extra_column, Some(("_Position".to_string(), vec!["0".to_string(), "1".to_string()])));
     }
 
     #[test]
