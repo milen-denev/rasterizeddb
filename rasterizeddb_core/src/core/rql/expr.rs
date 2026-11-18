@@ -6649,6 +6649,29 @@ pub(crate) fn from_engine_scale(mut value: Value, field: &SchemaField) -> Result
             db_type: DbType::STRING,
         });
     }
+    // Text bound for a type whose literal is text with a syntax of its own
+    // (bytea, an array, an address, a geometric type, a range, …) is read by
+    // that type's input, as the same literal written directly is
+    // (`lexer_ur::value_to_mb`). Its bytes were copied into the slot:
+    // `SET b = CASE WHEN … THEN '\x0909' ELSE b END` stored the six
+    // characters, and an array column could not read the text back at all and
+    // answered NULL. A value its input refuses is refused, never stored.
+    if let Value::Data { db_type: DbType::STRING | DbType::CHAR, .. } = &value {
+        let text_input = matches!(field.db_type, DbType::BYTEA | DbType::ARRAY | DbType::INET)
+            || crate::core::value_codec::has_text_literal(&field.db_type);
+        if text_input {
+            let text = as_text(&value);
+            let read = if field.db_type == DbType::BYTEA {
+                crate::core::value_codec::byteain(&text).ok()
+            } else {
+                crate::core::value_codec::encode_literal(&field.db_type, &text)
+            };
+            return match read {
+                Some(bytes) => Ok(Value::Data { bytes, db_type: field.db_type.clone() }),
+                None => Err(crate::core::value_codec::refusal_message(&field.db_type, &text)),
+            };
+        }
+    }
     // Any other value bound for a text column is its text, PostgreSQL's
     // assignment cast to a string type. Its bytes were copied into the slot:
     // `SET v = n + 1` stored the integer's four bytes, `SET v = (1e1)` a

@@ -135,3 +135,71 @@ async fn a_computed_null_into_a_not_null_column_is_refused() {
         ]
     );
 }
+
+/// A literal reaching an UPDATE through an expression (a `CASE` branch, a
+/// `COALESCE` fallback) is read by the column's type, as the same literal
+/// written directly is. A bytea stored the escape's characters (`'\x0909'`
+/// as six bytes) and an array column read back as NULL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_literal_through_an_expression_is_read_as_the_column_type() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE b2 (id BIGINT PRIMARY KEY, b BYTEA, a TEXT[], ia INT[], ip INET, r INT4RANGE)").await;
+    ok(&db, &mut s, "INSERT INTO b2 (id) VALUES (1), (2)").await;
+    ok(
+        &db,
+        &mut s,
+        "UPDATE b2 SET b = CASE WHEN id = 1 THEN '\\x0909' ELSE b END, a = CASE WHEN id = 1 THEN '{x,y}' ELSE a END, \
+         ia = CASE WHEN id = 1 THEN '{1,2,3}' ELSE ia END, ip = CASE WHEN id = 1 THEN '10.0.0.1/8' ELSE ip END, \
+         r = CASE WHEN id = 1 THEN '[1,5)' ELSE r END",
+    )
+    .await;
+    assert_eq!(
+        one(
+            &db,
+            &mut s,
+            "SELECT id, length(b), b, a[2], ia[3], ip, r FROM b2 ORDER BY id"
+        )
+        .await,
+        vec![
+            r(&[
+                Some("1"),
+                Some("2"),
+                Some("\\x0909"),
+                Some("y"),
+                Some("3"),
+                Some("10.0.0.1/8"),
+                Some("[1,5)")
+            ]),
+            r(&[Some("2"), None, None, None, None, None, None]),
+        ]
+    );
+    ok(
+        &db,
+        &mut s,
+        "UPDATE b2 SET b = COALESCE(b, '\\x01'), a = COALESCE(a, '{q}')",
+    )
+    .await;
+    assert_eq!(
+        one(&db, &mut s, "SELECT b, a FROM b2 WHERE id = 2").await,
+        vec![r(&[Some("\\x01"), Some("{q}")])]
+    );
+    // What the type's input refuses is refused, and nothing is written.
+    for (sql, state) in [
+        (
+            "UPDATE b2 SET b = CASE WHEN id = 1 THEN '\\xzz' ELSE b END",
+            "22023",
+        ),
+        (
+            "UPDATE b2 SET ia = CASE WHEN id = 1 THEN '{1,x}' ELSE ia END",
+            "22P02",
+        ),
+    ] {
+        let e = rows(&db, &mut s, sql).await.expect_err(sql);
+        assert_eq!(sqlstate_of(&e), state, "{sql}: {e}");
+    }
+    assert_eq!(
+        one(&db, &mut s, "SELECT b, ia[1] FROM b2 WHERE id = 1").await,
+        vec![r(&[Some("\\x0909"), Some("1")])]
+    );
+}
