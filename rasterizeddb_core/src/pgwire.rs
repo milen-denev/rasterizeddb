@@ -59,6 +59,8 @@ mod engine_bug_tests;
 mod shape_repair_tests;
 mod fixed_rows;
 mod native_session;
+#[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
+pub(crate) mod proxied;
 mod wire_out;
 
 pub(crate) use native_session::NativeSession;
