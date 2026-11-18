@@ -465,6 +465,36 @@ pub fn respell_qualifier(text: &str, from: &str, to: &str) -> String {
     out
 }
 
+/// The last segment of a possibly schema-qualified name as written
+/// (`public.t` → `t`, `"public"."T"` → `"T"`, `"a.b"` → `"a.b"`): dots inside
+/// double quotes do not split it. Quotes are kept for the caller to trim.
+///
+/// The catalogue has one namespace and every reader resolves a qualified
+/// relation by its last segment, so a name that is stored must be stored the
+/// same way: `CREATE TABLE "public"."q1"` once stored `public"."q1`, which no
+/// reader, and not even `DROP TABLE`, could name again.
+pub fn last_name_segment(raw: &str) -> &str {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    let mut start = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = quoted_end(bytes, i, b'"'),
+            b'.' => {
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let last = &raw[start..];
+    if last.is_empty() {
+        raw
+    } else {
+        last
+    }
+}
+
 /// The qualifiers a single relation is known by: its alias alone when it has
 /// one (PostgreSQL hides the name behind it), else its name and its name in
 /// the default schema (`t`, `public.t`), and the schema-qualified name as
@@ -1591,6 +1621,19 @@ fn read_hex(body: &[u8], at: usize, width: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_last_name_segment_ignores_dots_inside_quotes() {
+        use super::last_name_segment as l;
+        assert_eq!(l("t"), "t");
+        assert_eq!(l("public.t"), "t");
+        assert_eq!(l("\"public\".\"Q1\""), "\"Q1\"");
+        assert_eq!(l("app.\"a.b\""), "\"a.b\"");
+        assert_eq!(l("\"a.b\""), "\"a.b\"");
+        assert_eq!(l("\"x\"\".y\".z"), "z");
+        assert_eq!(l("db.public.t"), "t");
+        assert_eq!(l("t."), "t.");
+    }
+
     #[test]
     fn a_quantified_subquery_is_an_in_list() {
         use super::quantified_subqueries as q;

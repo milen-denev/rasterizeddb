@@ -190,7 +190,9 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         if let Some(ws_idx) = table_name.find(char::is_whitespace) {
             table_name = &table_name[..ws_idx];
         }
-        let table_name = table_name.trim_matches('"').to_string();
+        let table_name = crate::core::sql_scan::last_name_segment(table_name)
+            .trim_matches('"')
+            .to_string();
         // Find the part between the first '(' and the last ')'.
         //
         // Not the column list's matching `)`, though `top_level_pieces` could
