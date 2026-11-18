@@ -8874,6 +8874,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         // PostgreSQL's own codes for a generation expression it refuses:
         // a subquery is a missing feature, the rest a bad definition.
         "0A000"
+    } else if has("both default and identity specified") || has("drop identity instead") {
+        // PostgreSQL's codes for an identity declaration it refuses.
+        "42601"
+    } else if has("identity column type must be") {
+        "22023"
     } else if has("both default and generation expression") {
         // PostgreSQL reports the two clauses together as a syntax error.
         "42601"

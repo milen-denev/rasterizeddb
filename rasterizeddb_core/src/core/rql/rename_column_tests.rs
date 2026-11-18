@@ -358,6 +358,7 @@ async fn a_rename_onto_a_name_with_a_leftover_default_does_not_inherit_it() {
             column: "c".to_string(),
             expression: "5".to_string(),
             is_deleted: false,
+            identity: None,
         },
     )
     .await
@@ -598,6 +599,7 @@ async fn seed_leftover_default(db: &Arc<Database>, table: &str, column: &str, ex
             column: column.to_string(),
             expression: expression.to_string(),
             is_deleted: false,
+            identity: None,
         },
     )
     .await

@@ -408,6 +408,8 @@ pub fn follow_rename(
                 column: d.column.clone(),
                 expression: format!("nextval('{}')", to),
                 is_deleted: false,
+                // An identity column stays one under its table's new name.
+                identity: d.identity,
             };
             Some((rewritten, from, to))
         })
@@ -471,6 +473,144 @@ pub fn max_of_column(
         }
     }
     max
+}
+
+/// Reads a `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( options ) ]`
+/// clause out of a column definition: the definition without it, and the
+/// kind. `Ok((definition, None))` when the definition has none.
+///
+/// An identity column is built as a `SERIAL` is: `NOT NULL`, defaulting to
+/// `nextval` of the sequence `<table>_<column>_seq`. The sequence options
+/// PostgreSQL defaults to are accepted as written; any other is refused by
+/// name, as the counter here always starts above the column's largest value
+/// and steps by one.
+pub fn split_identity_clause(
+    definition: &str,
+) -> Result<(String, Option<crate::core::rql::column_default::IdentityKind>), String> {
+    use crate::core::rql::column_default::IdentityKind;
+    use crate::core::rql::join::find_keyword;
+    let Some(at) = find_keyword(definition, "GENERATED", 0) else {
+        return Ok((definition.to_string(), None));
+    };
+    let mut words = WordReader { text: definition, at: at + "GENERATED".len() };
+    let kind = if words.eat("ALWAYS") {
+        IdentityKind::Always
+    } else if words.eat("BY") {
+        if !words.eat("DEFAULT") {
+            return Ok((definition.to_string(), None));
+        }
+        IdentityKind::ByDefault
+    } else {
+        return Ok((definition.to_string(), None));
+    };
+    if !words.eat("AS") || !words.eat("IDENTITY") {
+        // `GENERATED ALWAYS AS (…) STORED`, which `generated::split_clause`
+        // reads.
+        return Ok((definition.to_string(), None));
+    }
+    let mut end = words.at;
+    let rest = &definition[end..];
+    let skipped = rest.len() - rest.trim_start().len();
+    if rest.trim_start().starts_with('(') {
+        let open = end + skipped;
+        let close = crate::core::sql_scan::matching_close(definition, open)
+            .ok_or_else(|| "syntax error in the identity options".to_string())?;
+        identity_options(&definition[open + 1..close])?;
+        end = close + 1;
+    }
+    let mut out = String::with_capacity(definition.len());
+    out.push_str(definition[..at].trim_end());
+    out.push(' ');
+    out.push_str(definition[end..].trim_start());
+    Ok((out.trim_end().to_string(), Some(kind)))
+}
+
+/// Checks the options of an identity column's sequence: those that restate
+/// what this sequence does are accepted, any other is refused by name.
+fn identity_options(options: &str) -> Result<(), String> {
+    let words: Vec<String> = options.split_whitespace().map(|w| w.to_ascii_uppercase()).collect();
+    let refuse = |what: &str| -> Result<(), String> {
+        Err(format!(
+            "identity option {what} is not supported: an identity column here starts at 1 (above the \
+             column's largest value) and increments by 1"
+        ))
+    };
+    let number = |w: Option<&String>| -> Option<i64> { w.and_then(|w| w.parse::<i64>().ok()) };
+    let mut i = 0;
+    while i < words.len() {
+        match words[i].as_str() {
+            "START" => {
+                i += 1;
+                if words.get(i).map(String::as_str) == Some("WITH") {
+                    i += 1;
+                }
+                if number(words.get(i)) != Some(1) {
+                    return refuse(&format!("START WITH {}", words.get(i).map(String::as_str).unwrap_or("")));
+                }
+                i += 1;
+            }
+            "INCREMENT" => {
+                i += 1;
+                if words.get(i).map(String::as_str) == Some("BY") {
+                    i += 1;
+                }
+                if number(words.get(i)) != Some(1) {
+                    return refuse(&format!("INCREMENT BY {}", words.get(i).map(String::as_str).unwrap_or("")));
+                }
+                i += 1;
+            }
+            "MINVALUE" => {
+                if number(words.get(i + 1)) != Some(1) {
+                    return refuse(&format!("MINVALUE {}", words.get(i + 1).map(String::as_str).unwrap_or("")));
+                }
+                i += 2;
+            }
+            "NO" => match words.get(i + 1).map(String::as_str) {
+                Some("MINVALUE" | "MAXVALUE" | "CYCLE") => i += 2,
+                other => return refuse(&format!("NO {}", other.unwrap_or(""))),
+            },
+            // Values are handed out one at a time from memory; a cache is
+            // only how many PostgreSQL reserves at once.
+            "CACHE" if number(words.get(i + 1)).is_some_and(|n| n >= 1) => i += 2,
+            "MAXVALUE" if number(words.get(i + 1)).is_some() => i += 2,
+            other => return refuse(other),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a column type can be an identity column's: PostgreSQL allows the
+/// three integer widths only.
+pub fn identity_type_ok(db_type: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType;
+    matches!(db_type, DbType::I16 | DbType::I32 | DbType::I64)
+}
+
+/// Reads keywords one after another, skipping whitespace.
+struct WordReader<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl WordReader<'_> {
+    fn eat(&mut self, word: &str) -> bool {
+        let rest = &self.text[self.at..];
+        let start = self.at + (rest.len() - rest.trim_start().len());
+        let tail = &self.text[start..];
+        let end = start + word.len();
+        let fits = tail.len() >= word.len() && tail.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes());
+        let bounded = self
+            .text
+            .as_bytes()
+            .get(end)
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if fits && bounded {
+            self.at = end;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +833,7 @@ mod tests {
             column: column.to_string(),
             expression: expression.to_string(),
             is_deleted: false,
+            identity: None,
         }
     }
 

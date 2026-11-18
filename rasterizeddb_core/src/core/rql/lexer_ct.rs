@@ -320,6 +320,20 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 crate::core::rql::generated::split_clause(col_def);
             let col_def = col_def_owned.as_str();
 
+            // `GENERATED … AS IDENTITY` too, for the same reason: its options
+            // are a parenthesised group. It used to be left in, read as no
+            // clause at all, so the column was created with no default and
+            // every insert stored NULL in it (or failed NOT NULL).
+            let (col_def_owned, identity) =
+                match crate::core::rql::sequence::split_identity_clause(col_def) {
+                    Ok(split) => split,
+                    Err(reason) => {
+                        rejection.replace(reason);
+                        return None;
+                    }
+                };
+            let col_def = col_def_owned.as_str();
+
             // The DEFAULT clause is taken out before the type and constraints
             // are read, so its expression cannot be mistaken for either.
             let (col_def_owned, default_expression) =
@@ -370,7 +384,8 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             // table. It is expanded here so everything downstream sees an
             // ordinary column with an ordinary default.
             let serial = crate::core::rql::sequence::serial_type(&type_phrase);
-            let constraints = parse_constraints(&tokens[1 + tokens_used..], serial.is_some());
+            let constraints =
+                parse_constraints(&tokens[1 + tokens_used..], serial.is_some() || identity.is_some());
             // `b INT UNIQUE NULLS NOT DISTINCT`: the flag above is a plain
             // UNIQUE, under which two NULLs never conflict.
             if tokens[1 + tokens_used..]
@@ -481,7 +496,43 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 }
             }
 
-            if let Some(expression) = default_expression {
+            if identity.is_some() {
+                // PostgreSQL's checks, in its words.
+                let refusal = if default_expression.is_some() {
+                    Some(format!(
+                        "both default and identity specified for column \"{name}\" of table \"{table_name}\""
+                    ))
+                } else if serial.is_some() {
+                    // A SERIAL is a default; PostgreSQL says the same.
+                    Some(format!(
+                        "both default and identity specified for column \"{name}\" of table \"{table_name}\""
+                    ))
+                } else if !crate::core::rql::sequence::identity_type_ok(&data_type) {
+                    Some("identity column type must be smallint, integer, or bigint".to_string())
+                } else {
+                    None
+                };
+                if let Some(reason) = refusal {
+                    rejection.replace(reason);
+                    return None;
+                }
+                let expression = format!(
+                    "nextval('{}')",
+                    crate::core::rql::sequence::sequence_name(&table_name, &name)
+                );
+                if expression.len() > crate::core::rql::column_default::MAX_IDENTITY_EXPRESSION_LEN {
+                    rejection.replace(format!(
+                        "the identity column \"{name}\" of table \"{table_name}\" has a name too long for its sequence"
+                    ));
+                    return None;
+                }
+                defaults.push(crate::core::rql::column_default::ColumnDefault {
+                    column: name.clone(),
+                    expression,
+                    is_deleted: false,
+                    identity,
+                });
+            } else if let Some(expression) = default_expression {
                 if let Err(reason) =
                     crate::core::rql::column_default::validate(
                         &expression,
@@ -499,6 +550,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                     column: name.clone(),
                     expression,
                     is_deleted: false,
+                    identity: None,
                 });
             } else if serial.is_some() {
                 // An explicit `DEFAULT` written alongside `SERIAL` wins, which
@@ -511,6 +563,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                         crate::core::rql::sequence::sequence_name(&table_name, &name)
                     ),
                     is_deleted: false,
+                    identity: None,
                 });
             }
 

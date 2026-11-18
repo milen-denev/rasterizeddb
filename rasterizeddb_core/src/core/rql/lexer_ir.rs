@@ -533,6 +533,42 @@ pub fn assignments_of_insert(sql: &str) -> Option<Vec<(String, String)>> {
     Some(columns.into_iter().zip(values).collect())
 }
 
+/// `OVERRIDING SYSTEM VALUE` or `OVERRIDING USER VALUE` in an `INSERT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overriding {
+    System,
+    User,
+}
+
+/// The `INSERT` without its `OVERRIDING { SYSTEM | USER } VALUE` clause, and
+/// which one it was; the text unchanged and `None` when it has none. The
+/// clause sits between the column list and `VALUES` or the query, at the
+/// top level.
+pub fn split_overriding(sql: &str) -> Result<(String, Option<Overriding>), String> {
+    let Some(at) = crate::core::rql::join::find_keyword(sql, "OVERRIDING", 0) else {
+        return Ok((sql.to_string(), None));
+    };
+    let malformed = || "syntax error at or near \"OVERRIDING\": expected OVERRIDING SYSTEM VALUE or OVERRIDING USER VALUE".to_string();
+    let rest = &sql[at + "OVERRIDING".len()..];
+    let mut words = rest.split_whitespace();
+    let kind = match words.next().map(str::to_ascii_uppercase).as_deref() {
+        Some("SYSTEM") => Overriding::System,
+        Some("USER") => Overriding::User,
+        _ => return Err(malformed()),
+    };
+    let value_word = words.next().ok_or_else(malformed)?;
+    if !value_word.eq_ignore_ascii_case("VALUE") {
+        return Err(malformed());
+    }
+    // The end of `VALUE`, found in the text after the clause's second word.
+    let after_kind = rest.trim_start();
+    let after_kind = &after_kind[after_kind.find(char::is_whitespace).ok_or_else(malformed)?..];
+    let value_at = after_kind.len() - after_kind.trim_start().len();
+    let end = sql.len() - after_kind.len() + value_at + "VALUE".len();
+    let text = format!("{} {}", sql[..at].trim_end(), sql[end..].trim_start());
+    Ok((text, Some(kind)))
+}
+
 /// The `INSERT` with the assignments of the columns in `names` taken out of
 /// its column list and its `VALUES` tuple, the rest of the statement as
 /// written; `None` when it does not have the shape
@@ -926,6 +962,15 @@ pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
         if name_end > INSERT_INTO.len() && (starts_word(rest, "SELECT") || starts_word(rest, "WITH")) {
             return Some((&trimmed[..name_end], rest));
         }
+        // `INSERT INTO t OVERRIDING … VALUE SELECT …`: the clause stays with
+        // the prefix, where the tuple path reads it (`split_overriding`).
+        let skip = overriding_len(rest);
+        if name_end > INSERT_INTO.len() && skip > 0 {
+            let query = &rest[skip..];
+            if starts_word(query, "SELECT") || starts_word(query, "WITH") {
+                return Some((&trimmed[..at + skip], query));
+            }
+        }
     }
 
     let open = trimmed.find('(')?;
@@ -943,12 +988,34 @@ pub fn insert_select_source(sql: &str) -> Option<(&str, &str)> {
     let after_columns = close + 1;
     let offset = trimmed[after_columns..].find(|c: char| !c.is_whitespace())? + after_columns;
     let rest = &trimmed[offset..];
+    let skip = overriding_len(rest);
+    let (head_end, rest) = (if skip > 0 { offset + skip } else { after_columns }, &rest[skip..]);
 
     if !starts_word(rest, "SELECT") && !starts_word(rest, "WITH") {
         return None;
     }
 
-    Some((&trimmed[..after_columns], rest))
+    Some((&trimmed[..head_end], rest))
+}
+
+/// The length of a leading `OVERRIDING { SYSTEM | USER } VALUE` in `text`,
+/// with the whitespace after it; 0 when it does not start with one.
+fn overriding_len(text: &str) -> usize {
+    let mut at = 0usize;
+    for (i, options) in [&["OVERRIDING"][..], &["SYSTEM", "USER"][..], &["VALUE"][..]].into_iter().enumerate() {
+        let rest = &text[at..];
+        let start = rest.len() - rest.trim_start().len();
+        if i == 0 && start != 0 {
+            return 0;
+        }
+        let word_end = rest[start..].find(|c: char| c.is_whitespace()).map_or(rest.len(), |e| start + e);
+        if !options.iter().any(|w| rest[start..word_end].eq_ignore_ascii_case(w)) {
+            return 0;
+        }
+        at += word_end;
+    }
+    let rest = &text[at..];
+    at + (rest.len() - rest.trim_start().len())
 }
 
 /// A byte that can sit inside an identifier, so `RETURNING` next to one is part
@@ -1822,6 +1889,36 @@ mod tests {
             // A relation whose name starts with the keyword is still not one.
             assert!(insert_select_source("INSERT INTO t selection").is_none());
             assert!(insert_select_source("INSERT INTO t VALUES ((SELECT 1))").is_none());
+        }
+
+        #[test]
+        fn an_overriding_clause_stays_with_the_prefix() {
+            use super::super::{insert_select_source, split_overriding, Overriding};
+            let (prefix, source) =
+                insert_select_source("INSERT INTO t (a, b) OVERRIDING SYSTEM VALUE SELECT x, y FROM u").unwrap();
+            assert_eq!(prefix.trim_end(), "INSERT INTO t (a, b) OVERRIDING SYSTEM VALUE");
+            assert_eq!(source, "SELECT x, y FROM u");
+            let (prefix, source) =
+                insert_select_source("INSERT INTO t overriding user value  WITH c AS (SELECT 1) SELECT * FROM c")
+                    .unwrap();
+            assert_eq!(prefix.trim_end(), "INSERT INTO t overriding user value");
+            assert!(source.starts_with("WITH c"));
+            assert!(insert_select_source("INSERT INTO t (a) OVERRIDING SYSTEM VALUES (1)").is_none());
+
+            assert_eq!(
+                split_overriding("INSERT INTO t (a) OVERRIDING SYSTEM VALUE VALUES (1)").unwrap(),
+                ("INSERT INTO t (a) VALUES (1)".to_string(), Some(Overriding::System))
+            );
+            assert_eq!(
+                split_overriding("INSERT INTO t overriding  user\nvalue VALUES (1)").unwrap(),
+                ("INSERT INTO t VALUES (1)".to_string(), Some(Overriding::User))
+            );
+            assert_eq!(
+                split_overriding("INSERT INTO t (a) VALUES ('OVERRIDING SYSTEM VALUE')").unwrap(),
+                ("INSERT INTO t (a) VALUES ('OVERRIDING SYSTEM VALUE')".to_string(), None)
+            );
+            assert!(split_overriding("INSERT INTO t (a) OVERRIDING FOO VALUE VALUES (1)").is_err());
+            assert!(split_overriding("INSERT INTO t (a) OVERRIDING SYSTEM VALUES (1)").is_err());
         }
 
         #[test]

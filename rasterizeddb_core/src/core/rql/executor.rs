@@ -10390,6 +10390,78 @@ pub(crate) fn insert_arity_refusal(
     crate::core::rql::lexer_ir::values_arity_error(sql, writable)
 }
 
+/// The `INSERT` with its `OVERRIDING { SYSTEM | USER } VALUE` clause read and
+/// taken out, and the identity columns it assigns checked; `None` when there
+/// is neither a clause nor an identity column to check.
+///
+/// - A value written for a `GENERATED ALWAYS AS IDENTITY` column is refused
+///   (428C9), as PostgreSQL refuses it, unless the statement says
+///   `OVERRIDING SYSTEM VALUE`. `DEFAULT` is always allowed.
+/// - `OVERRIDING USER VALUE` drops what was written for every identity
+///   column, so each takes the next value of its sequence.
+///
+/// Per tuple, after a multi-row `VALUES` is split, with its column list.
+fn identity_insert_rewrite(
+    row_data: &crate::core::rql::lexer_s1::InsertRowData,
+    schema: Option<&crate::core::row::schema::TableSchema>,
+) -> Option<Result<crate::core::rql::lexer_s1::InsertRowData, String>> {
+    use crate::core::rql::column_default::{identity_of, IdentityKind};
+    let (text, overriding) = match crate::core::rql::lexer_ir::split_overriding(&row_data.query) {
+        Ok(split) => split,
+        Err(reason) => return Some(Err(reason)),
+    };
+    let has_identity = schema.is_some_and(|s| s.defaults.iter().any(|d| !d.is_deleted && d.identity.is_some()));
+    if overriding.is_none() && !has_identity {
+        return None;
+    }
+    let mut text = text;
+    if let Some(schema) = schema.filter(|_| has_identity) {
+        let assignments = crate::core::rql::lexer_ir::assignments_of_insert(&text).unwrap_or_default();
+        let mut ignored: Vec<String> = Vec::new();
+        for (name, value) in &assignments {
+            let Some(kind) = identity_of(name, &schema.defaults) else {
+                continue;
+            };
+            if value.trim().eq_ignore_ascii_case("DEFAULT") {
+                continue;
+            }
+            match overriding {
+                Some(crate::core::rql::lexer_ir::Overriding::User) => ignored.push(name.clone()),
+                Some(crate::core::rql::lexer_ir::Overriding::System) => {}
+                None if kind == IdentityKind::Always => {
+                    return Some(Err(format!(
+                        "cannot insert a non-DEFAULT value into column \"{}\": it is an identity column \
+                         defined as GENERATED ALWAYS (use OVERRIDING SYSTEM VALUE to override)",
+                        name
+                    )));
+                }
+                None => {}
+            }
+        }
+        if !ignored.is_empty() {
+            match crate::core::rql::lexer_ir::without_insert_assignments(&text, &ignored) {
+                Some(rewritten) => text = rewritten,
+                None => {
+                    return Some(Err(
+                        "OVERRIDING USER VALUE could not drop the identity column's value from this INSERT"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    if text == row_data.query {
+        return None;
+    }
+    Some(Ok(crate::core::rql::lexer_s1::InsertRowData {
+        table_name: row_data.table_name.clone(),
+        query: text,
+        on_conflict_do_nothing: row_data.on_conflict_do_nothing,
+        on_conflict_update: row_data.on_conflict_update.clone(),
+        on_conflict_target: row_data.on_conflict_target.clone(),
+    }))
+}
+
 /// The statement with its column list supplied, for an `INSERT … VALUES`
 /// that named none; `None` when it already had one or is another form.
 ///
@@ -10728,6 +10800,34 @@ fn validate_checks(create_table: &crate::core::rql::lexer_ct::CreateTable) -> Re
         }
     }
     Ok(())
+}
+
+/// The refusal for an `UPDATE` that assigns a `GENERATED ALWAYS AS IDENTITY`
+/// column anything but `DEFAULT` (428C9), as PostgreSQL refuses it. Read
+/// from the statement as written, before `default_update_statement` puts the
+/// column's next value where its `DEFAULT` was.
+fn identity_update_refusal(
+    query: &QueryPurpose,
+    schema: &crate::core::row::schema::TableSchema,
+) -> Option<String> {
+    use crate::core::rql::column_default::{identity_of, IdentityKind};
+    let QueryPurpose::UpdateRow(sql) = query else {
+        return None;
+    };
+    if !schema.defaults.iter().any(|d| !d.is_deleted && d.identity == Some(IdentityKind::Always)) {
+        return None;
+    }
+    let assignments = crate::core::rql::lexer_ur::assignments_of_update(sql)?;
+    assignments.iter().find_map(|(name, value)| {
+        (identity_of(name, &schema.defaults) == Some(IdentityKind::Always)
+            && !value.trim().eq_ignore_ascii_case("DEFAULT"))
+        .then(|| {
+            format!(
+                "column \"{}\" can only be updated to DEFAULT: it is an identity column defined as GENERATED ALWAYS",
+                name.trim_matches('"')
+            )
+        })
+    })
 }
 
 /// `UPDATE … SET c = DEFAULT`, with each such assignment of a column that is
@@ -15907,6 +16007,7 @@ async fn execute_alter_table_action(
                             column: name.clone(),
                             expression,
                             is_deleted: false,
+                            identity: None,
                         }]
                     })
                     .unwrap_or_default();
@@ -16022,6 +16123,7 @@ async fn execute_alter_table_action(
                             column: name.clone(),
                             expression,
                             is_deleted: false,
+                            identity: None,
                         };
                         crate::core::rql::column_default::stage(&*io_schema, &mut writes, &entry)
                             .map_err(|e| e.to_string())?;
@@ -16638,12 +16740,22 @@ async fn execute_alter_table_action(
             {
                 return ddl_error(&format!("column '{}' does not exist", name));
             }
+            // An identity column's default is its sequence; PostgreSQL
+            // refuses to set or drop it (42601).
+            if crate::core::rql::column_default::identity_of(&name, &schema.defaults).is_some() {
+                return ddl_error(&format!(
+                    "column \"{}\" of relation \"{}\" is an identity column (use ALTER TABLE ... ALTER COLUMN \
+                     ... DROP IDENTITY instead)",
+                    name, plan.table_name
+                ));
+            }
             let entry = crate::core::rql::column_default::ColumnDefault {
                 column: name,
                 // Dropping a default is recorded as a tombstone, so the newest
                 // record still decides and the file keeps its stride.
                 expression: expression.clone().unwrap_or_default(),
                 is_deleted: expression.is_none(),
+                identity: None,
             };
             // §7 step 3: the reload's work.
             return match database
@@ -20100,6 +20212,17 @@ async fn insert_row_resolved(
     // rebinding only one of them left the computed value in a statement
     // nothing went on to parse — the column stayed NULL and the insert
     // still reported success.
+    // `OVERRIDING { SYSTEM | USER } VALUE` and identity columns, before
+    // anything reads the column list: see `identity_insert_rewrite`.
+    let identity_rewrite = match identity_insert_rewrite(row_data, target.as_ref().map(|t| t.schema())) {
+        Some(Ok(data)) => Some(QueryPurpose::InsertRow(data)),
+        Some(Err(e)) => return ddl_error(&e),
+        None => None,
+    };
+    let (row_data, query) = match &identity_rewrite {
+        Some(purpose @ QueryPurpose::InsertRow(data)) => (data, purpose),
+        _ => (row_data, query),
+    };
     let generated_rewrite =
         match supply_generated_values(row_data, target.as_ref().map(|t| t.schema()), &database) {
             Some(Ok(data)) => Some(QueryPurpose::InsertRow(data)),
@@ -21149,6 +21272,9 @@ pub(crate) async fn execute_with_need(
             // shape the parser reads. The rewrite replaces `query` in place
             // rather than being re-dispatched, as the INSERT arm's does, so
             // the check sees only what the client wrote.
+            if let Some(reason) = identity_update_refusal(&query, &table.schema) {
+                return ddl_error(&reason);
+            }
             // `SET c = DEFAULT` is the column's default, or NULL.
             let default_rewrite = default_update_statement(&query, &table.schema, database.id);
             let query = default_rewrite.as_ref().unwrap_or(&query);
