@@ -378,6 +378,25 @@ pub(crate) fn render_text(tokens: &[Token]) -> String {
     out
 }
 
+/// Session temporary tables. The engine has none, so the MySQL and SQL
+/// Server front ends keep them as real tables named per connection (names
+/// starting with `__` are hidden from both catalogues) and drop them when
+/// their scope or connection ends. The boot id keeps the names of a run
+/// apart from tables a crashed run left behind.
+pub(crate) const TEMP_PREFIX: &str = "__rdb_tmp_";
+
+pub(crate) fn temp_table_prefix(protocol: &str, connection: u64) -> String {
+    static BOOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let boot = *BOOT.get_or_init(|| fastrand::u32(..));
+    format!("{TEMP_PREFIX}{protocol}_{boot:08x}_{connection}_")
+}
+
+/// A number for each connection of this process.
+pub(crate) fn next_connection_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn kw(tokens: &[Token], i: usize, word: &str) -> bool {
     tokens.get(i).is_some_and(|t| t.is_word(word))
 }

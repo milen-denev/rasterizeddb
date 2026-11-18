@@ -112,6 +112,14 @@ pub(crate) trait Env {
     fn param(&self, name: &str) -> Option<ParamSlot>;
     fn system(&self, name: &str) -> Option<Value>;
     fn function(&self, name: &str) -> Option<Value>;
+    /// The database's stored procedures: (name, definition).
+    fn routines(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// The table a `#table` of this connection is kept in.
+    fn temp_name(&self, name: &str) -> String {
+        name.to_lowercase()
+    }
 }
 
 /// What a statement answers with.
@@ -287,10 +295,23 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                             })
                     }
                     "END" | "ELSE" => in_case,
-                    "OPEN" | "CLOSE" | "FETCH" => {
-                        matches!(prev.as_str(), "NEXT" | "FIRST")
-                            || head == "SELECT"
-                            || head == "DECLARE"
+                    // `OFFSET 5 ROWS FETCH NEXT …`: part of a query.
+                    "FETCH" => matches!(prev.as_str(), "ROWS" | "ROW"),
+                    // A cursor statement names a cursor; otherwise the word
+                    // is a column (`SET close = 1`, `SELECT open, close`).
+                    "OPEN" | "CLOSE" | "DEALLOCATE" => {
+                        let names_cursor = tokens.get(j + 1).is_some_and(|n| {
+                            (n.ident().is_some() && !n.is_op(",")) || n.is_word("GLOBAL")
+                        }) && !tokens
+                            .get(j + 1)
+                            .and_then(|n| n.upper())
+                            .is_some_and(|w| matches!(w.as_str(), "FROM" | "AS" | "AND" | "OR" | "IS" | "IN" | "WHERE" | "ORDER" | "GROUP" | "THEN" | "END" | "ELSE" | "WHEN"));
+                        let after_expr_start = matches!(&tokens[j - 1].tok, Tok::Op(o) if o != ")")
+                            || matches!(
+                                prev.as_str(),
+                                "SELECT" | "BY" | "SET" | "AS" | "AND" | "OR" | "ON" | "WHERE" | "THEN" | "ELSE" | "WHEN" | "DISTINCT" | "TOP"
+                            );
+                        !names_cursor || after_expr_start
                     }
                     "BEGIN" => false,
                     "ROLLBACK" | "COMMIT" => prev == "ON",
@@ -1368,9 +1389,22 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 .first()
                 .and_then(|a| text_arg(a))
                 .map(|t| object_name_in(&t));
-            let exists = name
-                .as_deref()
-                .is_some_and(|n| cx.env.database().has_table(n));
+            // OBJECT_ID('name', 'U' | 'P' | …): tables and procedures.
+            let kind = r
+                .get(1)
+                .and_then(|a| text_arg(a))
+                .map(|k| k.trim().to_ascii_uppercase());
+            let name = name.map(|n| if n.starts_with('#') { cx.env.temp_name(&n) } else { n });
+            let exists = name.as_deref().is_some_and(|n| {
+                let table = cx.env.database().has_table(n);
+                let routine = cx.env.routines().iter().any(|(r, _)| r == n);
+                match kind.as_deref() {
+                    Some("U") => table,
+                    Some("P") => routine,
+                    Some(_) => false,
+                    None => table || routine,
+                }
+            });
             vec![match name {
                 Some(n) if exists => Token::new(Tok::Num(object_id(&n).to_string())),
                 _ => Token::raw("CAST(NULL AS integer)"),
@@ -1387,6 +1421,7 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                     .database()
                     .table_names()
                     .into_iter()
+                    .chain(cx.env.routines().into_iter().map(|(n, _)| n))
                     .find(|n| object_id(n) == id)
             });
             vec![match name {
@@ -1543,15 +1578,23 @@ fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, Tsq
             .collect()
     };
     let sql = match (schema.as_str(), view.as_str()) {
-        ("sys", "tables") | ("sys", "objects") | ("sys", "all_objects") => {
+        ("sys", "tables") | ("sys", "objects") | ("sys", "all_objects") | ("sys", "procedures") => {
             let cols = ["name", "object_id", "principal_id", "schema_id", "parent_object_id", "type", "type_desc", "create_date", "modify_date", "is_ms_shipped"];
-            let rows = tables
-                .iter()
-                .map(|t| format!("({}, {}, NULL::integer, 1, 0, 'U', 'USER_TABLE', localtimestamp, localtimestamp, false)", sql_str(t), object_id(t)))
-                .collect();
+            let mut rows: Vec<String> = Vec::new();
+            if view != "procedures" {
+                rows.extend(tables.iter().map(|t| format!("({}, {}, NULL::integer, 1, 0, 'U', 'USER_TABLE', localtimestamp, localtimestamp, false)", sql_str(t), object_id(t))));
+            }
+            if view != "tables" {
+                rows.extend(cx.env.routines().iter().map(|(n, _)| format!("({}, {}, NULL::integer, 1, 0, 'P', 'SQL_STORED_PROCEDURE', localtimestamp, localtimestamp, false)", sql_str(n), object_id(n))));
+            }
             values(rows, &cols, empty(&cols))
         }
-        ("sys", "views") | ("sys", "procedures") | ("sys", "triggers") | ("sys", "sequences") | ("sys", "synonyms") => {
+        ("sys", "sql_modules") | ("sys", "all_sql_modules") => {
+            let cols = ["object_id", "definition", "uses_ansi_nulls", "uses_quoted_identifier", "is_schema_bound"];
+            let rows = cx.env.routines().iter().map(|(n, d)| format!("({}, {}, true, true, false)", object_id(n), sql_str(d))).collect();
+            values(rows, &cols, empty(&cols))
+        }
+        ("sys", "views") | ("sys", "triggers") | ("sys", "sequences") | ("sys", "synonyms") => {
             empty(&["name", "object_id", "schema_id", "type", "type_desc"])
         }
         ("sys", "schemas") => "(SELECT * FROM (VALUES ('dbo', 1, 1), ('sys', 4, 4), ('INFORMATION_SCHEMA', 3, 4)) AS v(name, schema_id, principal_id))".into(),
@@ -1648,7 +1691,12 @@ fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, Tsq
             values(rows, &cols, empty(&cols))
         }
         ("information_schema", "schemata") => format!("(SELECT * FROM (VALUES ({}, 'dbo', 'dbo')) AS v(catalog_name, schema_name, schema_owner))", sql_str(&db)),
-        ("information_schema", "views") | ("information_schema", "routines") | ("information_schema", "table_constraints") | ("information_schema", "key_column_usage") | ("information_schema", "referential_constraints") => {
+        ("information_schema", "routines") => {
+            let cols = ["specific_catalog", "specific_schema", "specific_name", "routine_catalog", "routine_schema", "routine_name", "routine_type", "routine_definition", "created", "last_altered"];
+            let rows = cx.env.routines().iter().map(|(n, d)| format!("({db}, 'dbo', {n}, {db}, 'dbo', {n}, 'PROCEDURE', {d}, localtimestamp, localtimestamp)", db = sql_str(&db), n = sql_str(n), d = sql_str(d))).collect();
+            values(rows, &cols, empty(&cols))
+        }
+        ("information_schema", "views") | ("information_schema", "table_constraints") | ("information_schema", "key_column_usage") | ("information_schema", "referential_constraints") => {
             empty(&["table_catalog", "table_schema", "table_name"])
         }
         _ => return Err(TsqlError::new(208, format!("Invalid object name '{schema}.{view}'."))),
@@ -3467,6 +3515,12 @@ mod tests {
         let sql = "CREATE TABLE a (id int, b int REFERENCES c (id) ON DELETE CASCADE) SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END";
         assert_eq!(parse_batch(&lex(sql).unwrap()).unwrap().len(), 2);
         let sql = "WITH c AS (SELECT 1 AS x) SELECT x FROM c; DROP TABLE IF EXISTS t";
+        assert_eq!(parse_batch(&lex(sql).unwrap()).unwrap().len(), 2);
+        // Cursor statements stand alone; `open`/`close` columns do not.
+        let sql = "DECLARE c CURSOR FOR SELECT a FROM t ORDER BY a OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY OPEN c FETCH NEXT FROM c INTO @a WHILE @@FETCH_STATUS = 0 FETCH NEXT FROM c INTO @a CLOSE c DEALLOCATE c";
+        let stmts = parse_batch(&lex(sql).unwrap()).unwrap();
+        assert_eq!(stmts.len(), 6, "{stmts:?}");
+        let sql = "UPDATE prices SET close = 1, open = 2 WHERE close > open SELECT open, close FROM prices";
         assert_eq!(parse_batch(&lex(sql).unwrap()).unwrap().len(), 2);
     }
 

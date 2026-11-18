@@ -411,3 +411,185 @@ async fn tiberius_socket_and_refusals() {
     .expect("a wrong password is refused");
     assert_eq!(number(&e), Some(18456), "{e}");
 }
+
+async fn batch(
+    c: &mut Client<Compat<tokio::net::TcpStream>>,
+    sql: &str,
+) -> Result<Vec<Vec<tiberius::Row>>, tiberius::error::Error> {
+    c.simple_query(sql).await?.into_results().await
+}
+
+/// Stored procedures (parameters, defaults, OUTPUT, RETURN, nesting, their
+/// own #tables), table variables and cursors: kept by the front end, since
+/// the engine has none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiberius_procedures_cursors_table_variables() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(&mut c, "CREATE TABLE Nums (N int PRIMARY KEY, Label nvarchar(20))").await.unwrap();
+    batch(&mut c, "INSERT INTO Nums VALUES (1, N'one'), (2, N'two'), (3, N'three')").await.unwrap();
+
+    batch(
+        &mut c,
+        "CREATE PROCEDURE dbo.CountAbove @min int = 0, @total int OUTPUT AS
+         BEGIN
+           SET NOCOUNT ON;
+           SELECT @total = COUNT(*) FROM Nums WHERE N > @min;
+           SELECT Label FROM Nums WHERE N > @min ORDER BY N;
+           RETURN 7
+         END",
+    )
+    .await
+    .unwrap();
+    let r = batch(
+        &mut c,
+        "DECLARE @t int, @rc int; EXEC @rc = CountAbove @min = 1, @total = @t OUTPUT; SELECT @t AS total, @rc AS rc",
+    )
+    .await
+    .unwrap();
+    let labels: Vec<&str> = r[0].iter().map(|row| row.get::<&str, _>(0).unwrap()).collect();
+    assert_eq!(labels, ["two", "three"]);
+    assert_eq!(r[1][0].get::<i32, _>("total"), Some(2));
+    assert_eq!(r[1][0].get::<i32, _>("rc"), Some(7));
+    // The default, positionally.
+    let r = batch(&mut c, "DECLARE @t int; EXEC CountAbove DEFAULT, @t OUTPUT; SELECT @t").await.unwrap();
+    assert_eq!(r.last().unwrap()[0].get::<i32, _>(0), Some(3));
+    // Errors by SQL Server's numbers.
+    let e = batch(&mut c, "EXEC CountAbove").await.unwrap_err();
+    assert_eq!(number(&e), Some(201), "{e}");
+    let e = batch(&mut c, "EXEC NoSuchProc").await.unwrap_err();
+    assert_eq!(number(&e), Some(2812), "{e}");
+    let e = batch(&mut c, "CREATE PROCEDURE CountAbove AS SELECT 1").await.unwrap_err();
+    assert_eq!(number(&e), Some(2714), "{e}");
+    let e = batch(&mut c, "DECLARE @t int; EXEC CountAbove 1, @t OUTPUT, 5").await.unwrap_err();
+    assert_eq!(number(&e), Some(8144), "{e}");
+    // The catalogue sees it.
+    let r = batch(
+        &mut c,
+        "SELECT CASE WHEN OBJECT_ID(N'dbo.CountAbove', N'P') IS NOT NULL THEN 1 ELSE 0 END AS p,
+                CASE WHEN OBJECT_ID(N'dbo.CountAbove', N'U') IS NULL THEN 1 ELSE 0 END AS u;
+         SELECT COUNT(*) AS n FROM sys.procedures WHERE name = N'countabove'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<i32, _>("p"), Some(1));
+    assert_eq!(r[0][0].get::<i32, _>("u"), Some(1));
+    assert_eq!(r[1][0].get::<i32, _>("n"), Some(1));
+    // CREATE OR ALTER replaces it; DROP removes it.
+    batch(&mut c, "CREATE OR ALTER PROCEDURE CountAbove @min int = 0, @total int OUTPUT AS SET @total = 99").await.unwrap();
+    let r = batch(&mut c, "DECLARE @t int; EXEC CountAbove @total = @t OUTPUT; SELECT @t").await.unwrap();
+    assert_eq!(r.last().unwrap()[0].get::<i32, _>(0), Some(99));
+    batch(&mut c, "DROP PROCEDURE CountAbove").await.unwrap();
+    let e = batch(&mut c, "EXEC CountAbove").await.unwrap_err();
+    assert_eq!(number(&e), Some(2812), "{e}");
+    batch(&mut c, "DROP PROCEDURE IF EXISTS CountAbove").await.unwrap();
+    let e = batch(&mut c, "DROP PROCEDURE CountAbove").await.unwrap_err();
+    assert_eq!(number(&e), Some(3701), "{e}");
+
+    // A #table made in a procedure goes when it returns: a second call
+    // makes it again.
+    batch(
+        &mut c,
+        "CREATE PROCEDURE Fill AS BEGIN
+           CREATE TABLE #work (n int);
+           INSERT INTO #work SELECT N FROM Nums;
+           SELECT COUNT(*) AS c FROM #work
+         END",
+    )
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let r = batch(&mut c, "EXEC Fill").await.unwrap();
+        assert_eq!(r.last().unwrap()[0].get::<i32, _>("c"), Some(3));
+    }
+    // Nesting stops at 32.
+    batch(
+        &mut c,
+        "CREATE PROCEDURE Deep @n int AS BEGIN DECLARE @m int = @n - 1; IF @n > 0 EXEC Deep @m END",
+    )
+    .await
+    .unwrap();
+    batch(&mut c, "EXEC Deep 10").await.unwrap();
+    let e = batch(&mut c, "EXEC Deep 40").await.unwrap_err();
+    assert_eq!(number(&e), Some(217), "{e}");
+
+    // Table variables: declared once per scope, gone after the batch.
+    let r = batch(
+        &mut c,
+        "DECLARE @t TABLE (id int, name nvarchar(10));
+         DECLARE @i int = 0;
+         WHILE @i < 2 BEGIN
+           DECLARE @again TABLE (x int);
+           INSERT INTO @again VALUES (@i);
+           SET @i = @i + 1
+         END
+         INSERT INTO @t VALUES (1, N'a'), (2, N'b');
+         UPDATE @t SET name = N'B' WHERE id = 2;
+         SELECT t.name FROM @t AS t ORDER BY t.id;
+         SELECT COUNT(*) AS c FROM @again",
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = r[0].iter().map(|row| row.get::<&str, _>(0).unwrap()).collect();
+    assert_eq!(names, ["a", "B"]);
+    assert_eq!(r[1][0].get::<i32, _>("c"), Some(2));
+    assert!(batch(&mut c, "SELECT * FROM @t").await.is_err());
+
+    // A cursor loop, and a scrollable cursor read without INTO.
+    let r = batch(
+        &mut c,
+        "DECLARE @n int, @sum int = 0;
+         DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT N FROM Nums ORDER BY N;
+         OPEN c;
+         FETCH NEXT FROM c INTO @n;
+         WHILE @@FETCH_STATUS = 0
+         BEGIN
+           SET @sum = @sum + @n;
+           FETCH NEXT FROM c INTO @n;
+         END
+         CLOSE c;
+         DEALLOCATE c;
+         SELECT @sum AS s",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.last().unwrap()[0].get::<i32, _>("s"), Some(6));
+    let r = batch(
+        &mut c,
+        "DECLARE s SCROLL CURSOR FOR SELECT N, Label FROM Nums ORDER BY N;
+         OPEN s;
+         FETCH LAST FROM s;
+         FETCH ABSOLUTE 1 FROM s;
+         CLOSE s;
+         DEALLOCATE s",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r[0][0].get::<i32, _>(0), Some(3));
+    assert_eq!(r[1][0].get::<&str, _>(1), Some("one"));
+    let e = batch(&mut c, "DECLARE f CURSOR FOR SELECT N FROM Nums; OPEN f; FETCH LAST FROM f").await.unwrap_err();
+    assert_eq!(number(&e), Some(16911), "{e}");
+    let e = batch(&mut c, "OPEN nothere").await.unwrap_err();
+    assert_eq!(number(&e), Some(16916), "{e}");
+
+    // A batch's #table lasts for the connection, and only it sees it.
+    batch(&mut c, "CREATE TABLE #keep (a int); INSERT INTO #keep VALUES (1), (2)").await.unwrap();
+    batch(&mut c, "SELECT N INTO #copy FROM Nums WHERE N > 1").await.unwrap();
+    let r = batch(&mut c, "SELECT COUNT(*) AS k FROM #keep; SELECT COUNT(*) AS c FROM #copy").await.unwrap();
+    assert_eq!(r[0][0].get::<i32, _>("k"), Some(2));
+    assert_eq!(r[1][0].get::<i32, _>("c"), Some(2));
+    let mut other = connect(&s).await;
+    let e = batch(&mut other, "SELECT * FROM #keep").await.unwrap_err();
+    assert_eq!(number(&e), Some(208), "{e}");
+    batch(&mut other, "CREATE TABLE #keep (b nvarchar(5)); INSERT INTO #keep VALUES (N'x')").await.unwrap();
+    let r = batch(&mut other, "SELECT b FROM #keep").await.unwrap();
+    assert_eq!(r[0][0].get::<&str, _>(0), Some("x"));
+    let r = batch(
+        &mut c,
+        "IF OBJECT_ID('tempdb..#keep') IS NOT NULL DROP TABLE #keep;
+         SELECT CASE WHEN OBJECT_ID('tempdb..#keep') IS NULL THEN 1 ELSE 0 END AS gone",
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.last().unwrap()[0].get::<i32, _>("gone"), Some(1));
+}

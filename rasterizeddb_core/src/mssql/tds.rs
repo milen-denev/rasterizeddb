@@ -911,6 +911,33 @@ pub(crate) fn return_value_int(out: &mut Vec<u8>, ordinal: u16, name: &str, valu
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// RETURNVALUE of a procedure's OUTPUT parameter, sent as the engine type
+/// the client bound it with (`oid`).
+pub(crate) fn return_value(out: &mut Vec<u8>, ordinal: u16, name: &str, oid: u32, value: Option<&[u8]>) {
+    let ty = column_type(oid, -1).unwrap_or_else(|| {
+        let (int, frac) = value
+            .map(|v| decimal_shape(&String::from_utf8_lossy(v)))
+            .unwrap_or((1, 0));
+        let frac = frac.min(38 - int.min(38));
+        ColType::Decimal {
+            precision: (int + frac).clamp(1, 38) as u8,
+            scale: frac as u8,
+        }
+    });
+    out.push(0xac);
+    out.extend_from_slice(&ordinal.to_le_bytes());
+    put_b_varchar(out, name);
+    out.push(0x01);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    type_info(out, &ty);
+    let at = out.len();
+    if put_value(out, &ty, value).is_err() {
+        out.truncate(at);
+        let _ = put_value(out, &ty, None);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Column types and values
 // ---------------------------------------------------------------------------

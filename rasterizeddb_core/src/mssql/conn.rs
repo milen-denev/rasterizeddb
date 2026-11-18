@@ -22,12 +22,13 @@ use tokio::io::AsyncWriteExt;
 
 use crate::core::database::Database;
 use crate::pgwire::proxied::{
-    BridgeOptions, OpenRefused, PgBridge, PgNotice, ProxiedLogin, data_row_cells,
+    BridgeOptions, OpenRefused, PgBridge, PgField, PgNotice, ProxiedLogin, data_row_cells,
     parse_row_description, tag_count,
 };
-use crate::sqlcompat::{Tok, Token, find_top, ident_sql, split_commas};
+use crate::sqlcompat::{Tok, Token, find_top, ident_sql, kw, split_commas};
 
 use super::lex;
+use super::routines::{self, ProcDef};
 use super::tds::{self, ColType, Column, Message, ParamValue, Reader, TdsStream, Wire};
 use super::translate::{self, Env, Forward, Kind, ParamSlot, Stmt, TsqlError, Value};
 use super::{MsAuth, MsTls, Shared};
@@ -89,6 +90,49 @@ struct Prepared {
     decls: Vec<(String, bool, u32)>,
 }
 
+/// What ends with a batch, a piece of dynamic SQL or a procedure.
+#[derive(Default)]
+struct LocalScope {
+    /// Whether `#tables` made here are dropped when it ends (dynamic SQL and
+    /// procedures); a batch's last for the connection.
+    owns_temps: bool,
+    /// Temporary tables to drop at the end: table variables, and the
+    /// `#tables` made here when it owns them.
+    drop: Vec<String>,
+    /// `@name` → the temporary table holding it.
+    table_vars: HashMap<String, String>,
+    local_cursors: Vec<String>,
+}
+
+/// A declared cursor; its rows are read when it is opened.
+struct Cursor {
+    select: Vec<Token>,
+    scroll: bool,
+    open: Option<CursorRows>,
+}
+
+struct CursorRows {
+    fields: Vec<PgField>,
+    rows: Vec<Vec<Option<String>>>,
+    /// -1 before the first row, `rows.len()` after the last.
+    pos: i64,
+}
+
+/// An argument of EXEC: its parameter name if named, its value (`None` for
+/// DEFAULT), and whether it asks for the parameter's value back (OUTPUT).
+struct ProcArg {
+    name: Option<String>,
+    value: Option<Value>,
+    output: bool,
+}
+
+struct ProcOutcome {
+    status: i32,
+    /// (argument index, value) of each OUTPUT argument.
+    outputs: Vec<(usize, Value)>,
+    flow: Flow,
+}
+
 enum Outcome {
     Rows {
         count: u64,
@@ -129,6 +173,25 @@ struct Session {
     last_done: Option<usize>,
     try_depth: usize,
     peer_watch: Option<StdArc<crate::pgwire::PeerWatch>>,
+    /// @@NESTLEVEL: how deep in procedure calls.
+    nest_level: u32,
+    /// What the running procedure's RETURN said.
+    return_value: Option<i32>,
+    scopes: Vec<LocalScope>,
+    cursors: HashMap<String, Cursor>,
+    fetch_status: i32,
+    temp_seq: u64,
+    /// `#tables` made at batch level: they last until the connection is
+    /// reset or closed.
+    session_temps: Vec<String>,
+    /// The database's procedures (name, definition), read when a batch
+    /// looks at the catalogue.
+    routine_cache: Option<Vec<(String, String)>>,
+    /// OUTPUT parameters of the RPC call running: (ordinal, name, engine
+    /// type, value), sent after its return status.
+    rpc_outputs: Vec<(u16, String, u32, Value)>,
+    /// What this connection's `#tables` are named with.
+    temp_prefix: String,
 }
 
 pub(crate) async fn serve_connection(
@@ -187,6 +250,16 @@ pub(crate) async fn serve_connection(
         last_done: None,
         try_depth: 0,
         peer_watch: watch,
+        nest_level: 0,
+        return_value: None,
+        scopes: Vec::new(),
+        cursors: HashMap::new(),
+        fetch_status: -1,
+        temp_seq: 0,
+        session_temps: Vec::new(),
+        routine_cache: None,
+        rpc_outputs: Vec::new(),
+        temp_prefix: crate::sqlcompat::temp_table_prefix("tds", crate::sqlcompat::next_connection_id()),
     };
     let packet_size = match login_packet.packet_size {
         0 => tds::DEFAULT_PACKET,
@@ -233,6 +306,7 @@ pub(crate) async fn serve_connection(
         }
     }
     let result = session.request_loop().await;
+    session.drop_temps_at_close().await;
     if let Some(bridge) = session.bridge.take() {
         bridge.terminate().await;
     }
@@ -492,12 +566,18 @@ impl Env for Scope<'_> {
             "textsize" => Value::Int(2147483647),
             "microsoftversion" => Value::Int(0x10000FA0),
             "langid" => Value::Int(0),
-            "nestlevel" => Value::Int(0),
+            "nestlevel" => Value::Int(s.nest_level as i64),
             "procid" => Value::Int(0),
-            "fetch_status" => Value::Int(-1),
+            "fetch_status" => Value::Int(s.fetch_status as i64),
             "dbts" => Value::Bytes(vec![0; 8]),
             _ => return None,
         })
+    }
+    fn routines(&self) -> Vec<(String, String)> {
+        self.s.routine_cache.clone().unwrap_or_default()
+    }
+    fn temp_name(&self, name: &str) -> String {
+        self.s.temp_name(name)
     }
     fn function(&self, name: &str) -> Option<Value> {
         let s = self.s;
@@ -721,6 +801,11 @@ impl Session {
             self.savepoints.clear();
         }
         self.vars.clear();
+        self.cursors.clear();
+        self.fetch_status = -1;
+        for t in std::mem::take(&mut self.session_temps) {
+            let _ = self.silent(&format!("DROP TABLE IF EXISTS {}", ident_sql(&t))).await;
+        }
         self.nocount = false;
         self.xact_abort = false;
         self.implicit_transactions = false;
@@ -817,6 +902,16 @@ impl Session {
         sql: &str,
         params: &[(i16, Option<Vec<u8>>, u32)],
     ) -> Result<(Vec<u32>, Vec<Vec<Option<String>>>), PgNotice> {
+        let (fields, rows) = self.fetch_fields(sql, params).await?;
+        Ok((fields.iter().map(|f| f.type_oid).collect(), rows))
+    }
+
+    /// [`Session::fetch`], with the columns' names and types.
+    async fn fetch_fields(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+    ) -> Result<(Vec<PgField>, Vec<Vec<Option<String>>>), PgNotice> {
         let b = self.bridge();
         if params.is_empty() {
             b.query(sql);
@@ -831,7 +926,7 @@ impl Session {
             b.sync();
         }
         let mut error = None;
-        let mut oids = Vec::new();
+        let mut fields = Vec::new();
         let mut rows = Vec::new();
         loop {
             let frame = b.next().await.map_err(|e| PgNotice {
@@ -841,11 +936,7 @@ impl Session {
             })?;
             match frame.tag {
                 b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
-                b'T' => {
-                    oids = parse_row_description(frame.body)
-                        .map(|f| f.iter().map(|x| x.type_oid).collect())
-                        .unwrap_or_default()
-                }
+                b'T' => fields = parse_row_description(frame.body).unwrap_or_default(),
                 b'D' => {
                     if let Ok(cells) = data_row_cells(frame.body) {
                         rows.push(
@@ -862,7 +953,7 @@ impl Session {
         }
         match error {
             Some(e) => Err(e),
-            None => Ok((oids, rows)),
+            None => Ok((fields, rows)),
         }
     }
 
@@ -1331,6 +1422,20 @@ impl Session {
                 return Ok(Flow::Abort);
             }
         };
+        self.refresh_routines_for(text).await;
+        if let Some(r) = self.procedure_ddl(text, &tokens).await {
+            return Ok(match r {
+                Ok(()) => {
+                    self.statement_done(0, 0, 0);
+                    Flow::Next
+                }
+                Err(e) => {
+                    self.error_token(&e);
+                    self.statement_done(tds::DONE_ERROR, 0, 0);
+                    Flow::Abort
+                }
+            });
+        }
         let stmts = match translate::parse_batch(&tokens) {
             Ok(s) => s,
             Err(e) => {
@@ -1339,7 +1444,13 @@ impl Session {
                 return Ok(Flow::Abort);
             }
         };
-        match self.run_list(text, &stmts, params).await? {
+        self.scopes.push(LocalScope {
+            owns_temps: params.is_some(),
+            ..Default::default()
+        });
+        let r = self.run_list(text, &stmts, params).await;
+        self.end_scope().await;
+        match r? {
             Ok(flow) => Ok(flow),
             Err(e) => {
                 self.error_token(&e);
@@ -1462,6 +1573,14 @@ impl Session {
         tokens: &[Token],
         params: Option<&ParamCtx>,
     ) -> Result<bool, TsqlError> {
+        let bound;
+        let tokens = match self.bind_names(tokens) {
+            Some(b) => {
+                bound = b;
+                &bound[..]
+            }
+            None => tokens,
+        };
         if let Some(p) = params {
             p.used.lock().clear();
         }
@@ -1484,6 +1603,14 @@ impl Session {
         tokens: &[Token],
         params: Option<&ParamCtx>,
     ) -> Result<Value, TsqlError> {
+        let bound;
+        let tokens = match self.bind_names(tokens) {
+            Some(b) => {
+                bound = b;
+                &bound[..]
+            }
+            None => tokens,
+        };
         match tokens {
             [t] => match &t.tok {
                 Tok::Str(s) => return Ok(Value::Str(String::from_utf8_lossy(s).into_owned())),
@@ -1555,10 +1682,25 @@ impl Session {
         tokens: &[Token],
         params: Option<&ParamCtx>,
     ) -> io::Result<Result<Flow, TsqlError>> {
+        let bound;
+        let tokens = match self.bind_names(tokens) {
+            Some(b) => {
+                bound = b;
+                &bound[..]
+            }
+            None => tokens,
+        };
         let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
         let next = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
+        let made_temp = temp_table_made(tokens);
         let r: Result<Flow, TsqlError> = match head.as_str() {
             "DECLARE" => self.declare(tokens, params).await,
+            "DROP" if matches!(next.as_str(), "PROC" | "PROCEDURE") => {
+                self.drop_procedure(tokens).await
+            }
+            "OPEN" | "CLOSE" | "FETCH" | "DEALLOCATE" => {
+                self.cursor_statement(&head, tokens, params).await
+            }
             "SET" if matches!(tokens.get(1).map(|t| &t.tok), Some(Tok::UserVar(_))) => {
                 let Some(Tok::UserVar(name)) = tokens.get(1).map(|t| &t.tok) else {
                     unreachable!()
@@ -1629,6 +1771,14 @@ impl Session {
                     }
                 }
             }
+            "RETURN" if tokens.len() > 1 => match self.evaluate(&tokens[1..], params).await {
+                Ok(v) => {
+                    let n = v.text().and_then(|t| t.trim().parse::<f64>().ok()).unwrap_or(0.0);
+                    self.return_value = Some(n as i32);
+                    Ok(Flow::Return)
+                }
+                Err(e) => Err(e),
+            },
             "RETURN" => Ok(Flow::Return),
             "BREAK" => Ok(Flow::Break),
             "CONTINUE" => Ok(Flow::Continue),
@@ -1703,8 +1853,9 @@ impl Session {
                     _ => Err(TsqlError::unsupported("WAITFOR other than DELAY")),
                 }
             }
-            "GRANT" | "DENY" | "REVOKE" | "DBCC" | "BACKUP" | "RESTORE" | "OPEN" | "CLOSE"
-            | "FETCH" | "DEALLOCATE" | "GOTO" | "KILL" => Err(TsqlError::unsupported(head)),
+            "GRANT" | "DENY" | "REVOKE" | "DBCC" | "BACKUP" | "RESTORE" | "GOTO" | "KILL" => {
+                Err(TsqlError::unsupported(head))
+            }
             "ALTER" if next == "DATABASE" => {
                 // SET SINGLE_USER, RECOVERY, COLLATE …: storage and access
                 // settings the engine does not have.
@@ -1751,6 +1902,9 @@ impl Session {
                 }
             }
         };
+        if let (Ok(_), Some(name)) = (&r, made_temp) {
+            self.note_temp(name);
+        }
         Ok(r)
     }
 
@@ -1759,6 +1913,15 @@ impl Session {
         tokens: &[Token],
         params: Option<&ParamCtx>,
     ) -> Result<Flow, TsqlError> {
+        if let Some(cursor) = routines::parse_cursor(tokens) {
+            return self.declare_cursor(cursor?);
+        }
+        if matches!(tokens.get(1).map(|t| &t.tok), Some(Tok::UserVar(_)))
+            && (crate::sqlcompat::kw(tokens, 2, "TABLE")
+                || (crate::sqlcompat::kw(tokens, 2, "AS") && crate::sqlcompat::kw(tokens, 3, "TABLE")))
+        {
+            return self.declare_table_var(tokens).await;
+        }
         for part in split_commas(&tokens[1..]) {
             let Some(Tok::UserVar(name)) = part.first().map(|t| &t.tok) else {
                 return Err(TsqlError::unsupported("DECLARE of a cursor"));
@@ -1770,7 +1933,10 @@ impl Session {
             }
             let ty = part.get(k).and_then(|t| t.upper()).unwrap_or_default();
             if ty == "TABLE" {
-                return Err(TsqlError::unsupported("table variables"));
+                return Err(TsqlError::syntax("a table variable is declared on its own"));
+            }
+            if ty == "CURSOR" {
+                return Err(TsqlError::unsupported("cursor variables"));
             }
             let string = matches!(
                 ty.as_str(),
@@ -2040,10 +2206,12 @@ impl Session {
         }
         // EXEC @rc = proc …
         let mut rest = rest;
-        if matches!(rest.first().map(|t| &t.tok), Some(Tok::UserVar(_)))
-            && rest.get(1).is_some_and(|t| t.is_op("="))
-        {
-            rest = &rest[2..];
+        let mut status_var = None;
+        if let (Some(Tok::UserVar(v)), Some(eq)) = (rest.first().map(|t| &t.tok), rest.get(1)) {
+            if eq.is_op("=") {
+                status_var = Some(v.clone());
+                rest = &rest[2..];
+            }
         }
         let mut k = 0;
         let mut name = String::new();
@@ -2061,20 +2229,59 @@ impl Session {
         let args = split_commas(&rest[k..]);
         let mut values = Vec::new();
         let mut named: Vec<(Option<String>, Value)> = Vec::new();
+        let mut proc_args = Vec::new();
+        let mut out_vars: Vec<Option<String>> = Vec::new();
         for a in &args {
             if a.is_empty() {
                 continue;
             }
+            let mut a = &a[..];
+            let mut output = false;
+            if a.last().is_some_and(|t| t.is_word("OUTPUT") || t.is_word("OUT")) {
+                output = true;
+                a = &a[..a.len() - 1];
+            }
+            let mut arg_name = None;
             if let (Some(Tok::UserVar(n)), Some(eq)) = (a.first().map(|t| &t.tok), a.get(1)) {
                 if eq.is_op("=") {
-                    let v = self.evaluate(&a[2..], params).await?;
-                    named.push((Some(n.clone()), v));
-                    continue;
+                    arg_name = Some(n.clone());
+                    a = &a[2..];
                 }
             }
-            let v = self.evaluate(a, params).await?;
-            values.push(v.clone());
-            named.push((None, v));
+            let out_var = match (output, a) {
+                (false, _) => None,
+                (true, [t]) => match &t.tok {
+                    Tok::UserVar(v) => Some(v.clone()),
+                    _ => {
+                        return Err(TsqlError::new(
+                            179,
+                            "Cannot use the OUTPUT option when passing a constant to a stored procedure.",
+                        ));
+                    }
+                },
+                (true, _) => {
+                    return Err(TsqlError::new(
+                        179,
+                        "Cannot use the OUTPUT option when passing a constant to a stored procedure.",
+                    ));
+                }
+            };
+            let v = if matches!(a, [t] if t.is_word("DEFAULT")) {
+                None
+            } else {
+                Some(self.evaluate(a, params).await?)
+            };
+            let plain = v.clone().unwrap_or(Value::Null);
+            if arg_name.is_none() {
+                values.push(plain.clone());
+            }
+            named.push((arg_name.clone(), plain));
+            proc_args.push(ProcArg {
+                name: arg_name,
+                value: v,
+                output,
+            });
+            out_vars.push(out_var);
         }
         match name.as_str() {
             "sp_executesql" => {
@@ -2152,10 +2359,21 @@ impl Session {
                 Ok(Flow::Next)
             }
             "" => Err(TsqlError::syntax("EXEC needs a procedure")),
-            other => Err(TsqlError::new(
-                2812,
-                format!("Could not find stored procedure '{other}'."),
-            )),
+            other => {
+                let outcome = self.call_procedure(other, proc_args).await?;
+                for (k, v) in outcome.outputs {
+                    if let Some(Some(var)) = out_vars.get(k) {
+                        self.assign(var, v)?;
+                    }
+                }
+                if let Some(var) = status_var {
+                    self.assign(&var, Value::Int(outcome.status as i64))?;
+                }
+                Ok(match outcome.flow {
+                    Flow::Abort => Flow::Abort,
+                    _ => Flow::Next,
+                })
+            }
         }
     }
 
@@ -2167,9 +2385,21 @@ impl Session {
         params: Option<&ParamCtx>,
     ) -> Result<Flow, TsqlError> {
         let tokens = lex::lex(sql).map_err(|e| TsqlError::syntax(e.0))?;
+        self.refresh_routines_for(sql).await;
+        if let Some(r) = self.procedure_ddl(sql, &tokens).await {
+            r?;
+            self.statement_done(0, 0, 0);
+            return Ok(Flow::Next);
+        }
         let stmts = translate::parse_batch(&tokens)?;
         let owned = sql.to_string();
-        match self.run_list(&owned, &stmts, params).await {
+        self.scopes.push(LocalScope {
+            owns_temps: true,
+            ..Default::default()
+        });
+        let r = self.run_list(&owned, &stmts, params).await;
+        self.end_scope().await;
+        match r {
             Ok(Ok(Flow::Return)) | Ok(Ok(Flow::Next)) => Ok(Flow::Next),
             Ok(Ok(Flow::Abort)) => Ok(Flow::Abort),
             Ok(Ok(other)) => Ok(other),
@@ -2223,9 +2453,18 @@ impl Session {
                 }
             };
             let more = r.remaining() > 0 && matches!(r.buf[r.pos], 0x80 | 0xff);
-            let status = self.call(&proc_name, params).await?;
+            self.rpc_outputs.clear();
+            let (status, failed) = self.call(&proc_name, params).await?;
             tds::return_status(self.wire.reply(), status);
-            let mut done = if status != 0 { tds::DONE_ERROR } else { 0 };
+            for (ordinal, name, oid, value) in std::mem::take(&mut self.rpc_outputs) {
+                let bytes = match value {
+                    Value::Null => None,
+                    Value::Bytes(b) => Some(b),
+                    other => other.text().map(String::into_bytes),
+                };
+                tds::return_value(self.wire.reply(), ordinal, &name, oid, bytes.as_deref());
+            }
+            let mut done = if failed { tds::DONE_ERROR } else { 0 };
             if more {
                 done |= tds::DONE_MORE;
             }
@@ -2244,7 +2483,7 @@ impl Session {
     }
 
     /// One RPC call; its return status.
-    async fn call(&mut self, name: &str, params: Vec<tds::Param>) -> io::Result<i32> {
+    async fn call(&mut self, name: &str, params: Vec<tds::Param>) -> io::Result<(i32, bool)> {
         let text = |p: Option<&tds::Param>| match p.map(|p| &p.value) {
             Some(ParamValue::Text(t)) => t.clone(),
             Some(ParamValue::Bytes(b)) => String::from_utf8_lossy(b).into_owned(),
@@ -2256,6 +2495,7 @@ impl Session {
         };
         let failed_before = self.error_number;
         self.error_number = 0;
+        let mut proc_status = None;
         let result: Result<(), TsqlError> = match name {
             "sp_executesql" => {
                 let sql = text(params.first());
@@ -2321,9 +2561,34 @@ impl Session {
                 self.reset(false).await;
                 Ok(())
             }
+            other if !other.starts_with("sp_") => {
+                let args = params
+                    .iter()
+                    .map(|p| ProcArg {
+                        name: (!p.name.is_empty())
+                            .then(|| p.name.trim_start_matches('@').to_lowercase()),
+                        value: Some(match &p.value {
+                            ParamValue::Null => Value::Null,
+                            ParamValue::Text(t) => value_of(p.oid, Some(t.clone())),
+                            ParamValue::Bytes(b) => Value::Bytes(b.clone()),
+                        }),
+                        output: p.output,
+                    })
+                    .collect();
+                match self.call_procedure(other, args).await {
+                    Ok(outcome) => {
+                        proc_status = Some(outcome.status);
+                        for (k, v) in outcome.outputs {
+                            let p = &params[k];
+                            self.rpc_outputs.push((k as u16, p.name.clone(), p.oid, v));
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             other => {
-                // A procedure by name: sp_executesql spelled out, or EXEC of
-                // anything else, refused there.
+                // A system procedure by name, run as EXEC would.
                 let mut tokens = vec![Token::word("EXEC"), Token::raw(other.to_string())];
                 for (k, p) in params.iter().enumerate() {
                     if k > 0 {
@@ -2348,11 +2613,16 @@ impl Session {
             self.error_token(&e);
             self.statement_done(tds::DONE_ERROR, 0, 0);
         }
-        let status = if self.error_number != 0 { 1 } else { 0 };
+        let failed = self.error_number != 0;
+        let status = match proc_status {
+            Some(s) => s,
+            None if failed => 1,
+            None => 0,
+        };
         if self.error_number == 0 {
             self.error_number = failed_before.min(0);
         }
-        Ok(status)
+        Ok((status, failed))
     }
 
     async fn run_rpc_batch(
@@ -2370,11 +2640,24 @@ impl Session {
             Ok(t) => t,
             Err(e) => return Ok(Err(TsqlError::syntax(e.0))),
         };
+        self.refresh_routines_for(sql).await;
+        if let Some(r) = self.procedure_ddl(sql, &tokens).await {
+            if r.is_ok() {
+                self.statement_done(0, 0, 0);
+            }
+            return Ok(r);
+        }
         let stmts = match translate::parse_batch(&tokens) {
             Ok(s) => s,
             Err(e) => return Ok(Err(e)),
         };
-        match self.run_list(sql, &stmts, Some(&ctx)).await? {
+        self.scopes.push(LocalScope {
+            owns_temps: true,
+            ..Default::default()
+        });
+        let r = self.run_list(sql, &stmts, Some(&ctx)).await;
+        self.end_scope().await;
+        match r? {
             Ok(_) => Ok(Ok(())),
             Err(e) => Ok(Err(e)),
         }
@@ -2441,6 +2724,694 @@ impl Session {
 
 /// The values of a call's parameters, in the order of the declarations
 /// (by name, or by position when unnamed).
+/// The `#table` a statement makes (`CREATE TABLE #t`, `SELECT … INTO #t`).
+fn temp_table_made(tokens: &[Token]) -> Option<String> {
+    let name_at = |i: usize| match tokens.get(i).map(|t| &t.tok) {
+        Some(Tok::Quoted(q)) if q.starts_with(crate::sqlcompat::TEMP_PREFIX) => Some(q.clone()),
+        _ => None,
+    };
+    if kw(tokens, 0, "CREATE") && kw(tokens, 1, "TABLE") {
+        return name_at(2);
+    }
+    if kw(tokens, 0, "SELECT") {
+        if let Some(into) = find_top(tokens, 1, &["INTO"]) {
+            return name_at(into + 1);
+        }
+    }
+    None
+}
+
+fn text_param(v: &str) -> (i16, Option<Vec<u8>>, u32) {
+    (0, Some(v.as_bytes().to_vec()), 25)
+}
+
+const ROUTINE_SAVEPOINT: &str = "rdb_tds_routine";
+
+/// Procedures, table variables, cursors and the scopes they live in.
+impl Session {
+    fn note_temp(&mut self, name: String) {
+        match self.scopes.last_mut() {
+            Some(scope) if scope.owns_temps => scope.drop.push(name),
+            _ => {
+                if !self.session_temps.contains(&name) {
+                    self.session_temps.push(name);
+                }
+            }
+        }
+    }
+
+    /// Ends the innermost scope: its local cursors, table variables and the
+    /// `#tables` it owns go.
+    async fn end_scope(&mut self) {
+        let Some(scope) = self.scopes.pop() else {
+            return;
+        };
+        for c in scope.local_cursors {
+            self.cursors.remove(&c);
+        }
+        for t in scope.drop {
+            if let Err(e) = self
+                .silent_guarded(&format!("DROP TABLE IF EXISTS {}", ident_sql(&t)))
+                .await
+            {
+                log::debug!("dropping {t} at the end of its scope: {}", e.message);
+            }
+        }
+    }
+
+    /// The table a `#table` (`##table`: every connection's) is kept in.
+    fn temp_name(&self, name: &str) -> String {
+        let name = name.to_lowercase();
+        match name.strip_prefix("##") {
+            Some(global) => format!("{}tds_global_{global}", crate::sqlcompat::TEMP_PREFIX),
+            None => format!("{}{}", self.temp_prefix, name.trim_start_matches('#')),
+        }
+    }
+
+    /// The statement with each `#table` and table variable named as the
+    /// table that holds it; `None` when it names none.
+    fn bind_names(&self, tokens: &[Token]) -> Option<Vec<Token>> {
+        let empty = HashMap::new();
+        let vars = self.scopes.last().map(|s| &s.table_vars).unwrap_or(&empty);
+        let mut hit = false;
+        let out = tokens
+            .iter()
+            .enumerate()
+            .map(|(k, t)| {
+                let name = match &t.tok {
+                    Tok::UserVar(n)
+                        if vars.contains_key(n)
+                            && !kw(tokens, k + 1, "TABLE")
+                            && !(kw(tokens, k + 1, "AS") && kw(tokens, k + 2, "TABLE")) =>
+                    {
+                        vars[n].clone()
+                    }
+                    Tok::Quoted(q) if q.starts_with('#') => self.temp_name(q),
+                    _ => return t.clone(),
+                };
+                hit = true;
+                Token {
+                    tok: Tok::Quoted(name),
+                    space: t.space,
+                    span: t.span,
+                }
+            })
+            .collect();
+        hit.then_some(out)
+    }
+
+    /// A connection's `#tables` and table variables go with it.
+    async fn drop_temps_at_close(&mut self) {
+        if self.bridge.is_none() {
+            return;
+        }
+        let mut tables = std::mem::take(&mut self.session_temps);
+        for scope in std::mem::take(&mut self.scopes) {
+            tables.extend(scope.drop);
+        }
+        if tables.is_empty() {
+            return;
+        }
+        if self.bridge().in_block() {
+            let _ = self.silent("ROLLBACK").await;
+        }
+        for t in tables {
+            let _ = self.silent(&format!("DROP TABLE IF EXISTS {}", ident_sql(&t))).await;
+        }
+    }
+
+    /// Translates T-SQL and runs it without answering the client.
+    async fn run_quietly(&mut self, tokens: Vec<Token>) -> Result<(), TsqlError> {
+        let forward = translate::translate("", tokens, &Scope { s: self, params: None })?;
+        for sql in forward.statements {
+            self.silent_guarded(&sql).await.map_err(|e| error_from_engine(&e))?;
+        }
+        Ok(())
+    }
+
+    /// A statement that, inside a transaction, must not fail it: run under a
+    /// savepoint.
+    async fn silent_guarded(&mut self, sql: &str) -> Result<String, PgNotice> {
+        let guard = self.bridge().in_block();
+        if guard {
+            self.silent(&format!("SAVEPOINT {ROUTINE_SAVEPOINT}")).await?;
+        }
+        let r = self.silent(sql).await;
+        if guard {
+            if r.is_err() {
+                let _ = self.silent(&format!("ROLLBACK TO SAVEPOINT {ROUTINE_SAVEPOINT}")).await;
+            }
+            let _ = self.silent(&format!("RELEASE SAVEPOINT {ROUTINE_SAVEPOINT}")).await;
+        }
+        r
+    }
+
+    async fn fetch_guarded(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+    ) -> Result<(Vec<u32>, Vec<Vec<Option<String>>>), PgNotice> {
+        let guard = self.bridge().in_block();
+        if guard {
+            self.silent(&format!("SAVEPOINT {ROUTINE_SAVEPOINT}")).await?;
+        }
+        let r = self.fetch(sql, params).await;
+        if guard {
+            if r.is_err() {
+                let _ = self.silent(&format!("ROLLBACK TO SAVEPOINT {ROUTINE_SAVEPOINT}")).await;
+            }
+            let _ = self.silent(&format!("RELEASE SAVEPOINT {ROUTINE_SAVEPOINT}")).await;
+        }
+        r
+    }
+
+    // -- table variables ----------------------------------------------------
+
+    async fn declare_table_var(&mut self, tokens: &[Token]) -> Result<Flow, TsqlError> {
+        let Some(Tok::UserVar(name)) = tokens.get(1).map(|t| &t.tok) else {
+            return Err(TsqlError::syntax("DECLARE @table TABLE (…) was expected"));
+        };
+        let name = name.clone();
+        let table_at = if kw(tokens, 2, "TABLE") { 2 } else { 3 };
+        if self.scopes.is_empty() {
+            self.scopes.push(LocalScope::default());
+        }
+        // Declared once: a DECLARE inside a loop does not make it again.
+        if self.scopes.last().is_some_and(|s| s.table_vars.contains_key(&name)) {
+            return Ok(Flow::Next);
+        }
+        if !tokens.get(table_at + 1).is_some_and(|t| t.is_op("(")) {
+            return Err(TsqlError::syntax("a table variable needs a column list"));
+        }
+        self.temp_seq += 1;
+        let table = self.temp_name(&format!("#tv{}_{}", self.temp_seq, name));
+        let mut create = vec![
+            Token::word("CREATE"),
+            Token::word("TABLE"),
+            Token::new(Tok::Quoted(table.clone())),
+        ];
+        create.extend(tokens[table_at + 1..].iter().cloned());
+        self.run_quietly(create).await?;
+        let scope = self.scopes.last_mut().expect("a scope");
+        scope.table_vars.insert(name, table.clone());
+        scope.drop.push(table);
+        Ok(Flow::Next)
+    }
+
+    // -- cursors ------------------------------------------------------------
+
+    fn declare_cursor(&mut self, decl: routines::CursorDecl) -> Result<Flow, TsqlError> {
+        if self.cursors.contains_key(&decl.name) {
+            return Err(TsqlError::new(
+                16915,
+                format!("A cursor with the name '{}' already exists.", decl.name),
+            ));
+        }
+        if decl.local {
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.local_cursors.push(decl.name.clone());
+            }
+        }
+        self.cursors.insert(
+            decl.name,
+            Cursor {
+                select: decl.select,
+                scroll: decl.scroll,
+                open: None,
+            },
+        );
+        Ok(Flow::Next)
+    }
+
+    async fn cursor_statement(
+        &mut self,
+        head: &str,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<Flow, TsqlError> {
+        let mut k = 1;
+        let mut how = "NEXT".to_string();
+        let mut n = 0i64;
+        if head == "FETCH" {
+            if let Some(w) = tokens.get(k).and_then(|t| t.upper()) {
+                if matches!(w.as_str(), "NEXT" | "PRIOR" | "FIRST" | "LAST" | "ABSOLUTE" | "RELATIVE") {
+                    how = w;
+                    k += 1;
+                    if how == "ABSOLUTE" || how == "RELATIVE" {
+                        let end = (k..tokens.len()).find(|&j| kw(tokens, j, "FROM")).unwrap_or(tokens.len());
+                        n = self
+                            .evaluate(&tokens[k..end], params)
+                            .await?
+                            .text()
+                            .and_then(|t| t.trim().parse::<f64>().ok())
+                            .unwrap_or(0.0) as i64;
+                        k = end;
+                    }
+                }
+            }
+            if kw(tokens, k, "FROM") {
+                k += 1;
+            }
+        }
+        if kw(tokens, k, "GLOBAL") {
+            k += 1;
+        }
+        let name = tokens
+            .get(k)
+            .and_then(|t| t.ident())
+            .map(str::to_lowercase)
+            .ok_or_else(|| TsqlError::syntax(format!("{head} needs a cursor name")))?;
+        k += 1;
+        let missing = || {
+            TsqlError::new(16916, format!("A cursor with the name '{name}' does not exist."))
+        };
+        let not_open = || TsqlError::new(16917, "Cursor is not open.");
+        match head {
+            "OPEN" => {
+                let cursor = self.cursors.get(&name).ok_or_else(missing)?;
+                if cursor.open.is_some() {
+                    return Err(TsqlError::new(16905, "The cursor is already open."));
+                }
+                let select = cursor.select.clone();
+                let select = self.bind_names(&select).unwrap_or(select);
+                if let Some(p) = params {
+                    p.used.lock().clear();
+                }
+                let forward = translate::translate("", select, &Scope { s: self, params })?;
+                let sql = forward
+                    .statements
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| TsqlError::syntax("a cursor needs a query"))?;
+                let bound = bound_values(params);
+                let (fields, rows) = self
+                    .fetch_fields(&sql, &bound)
+                    .await
+                    .map_err(|e| error_from_engine(&e))?;
+                if let Some(c) = self.cursors.get_mut(&name) {
+                    c.open = Some(CursorRows { fields, rows, pos: -1 });
+                }
+            }
+            "CLOSE" => {
+                let cursor = self.cursors.get_mut(&name).ok_or_else(missing)?;
+                cursor.open.take().ok_or_else(not_open)?;
+            }
+            "DEALLOCATE" => {
+                self.cursors.remove(&name).ok_or_else(missing)?;
+                for scope in &mut self.scopes {
+                    scope.local_cursors.retain(|c| *c != name);
+                }
+            }
+            _ => {
+                let mut into = Vec::new();
+                if kw(tokens, k, "INTO") {
+                    for part in split_commas(&tokens[k + 1..]) {
+                        match part.as_slice() {
+                            [t] => match &t.tok {
+                                Tok::UserVar(v) => into.push(v.clone()),
+                                _ => return Err(TsqlError::syntax("FETCH … INTO takes variables")),
+                            },
+                            _ => return Err(TsqlError::syntax("FETCH … INTO takes variables")),
+                        }
+                    }
+                } else if k < tokens.len() {
+                    return Err(TsqlError::syntax(format!("Incorrect syntax near '{}'.", crate::sqlcompat::render_text(&tokens[k..k + 1]))));
+                }
+                let cursor = self.cursors.get_mut(&name).ok_or_else(missing)?;
+                if how != "NEXT" && !cursor.scroll {
+                    return Err(TsqlError::new(
+                        16911,
+                        format!("fetch: The fetch type {how} cannot be used with forward only cursors."),
+                    ));
+                }
+                let open = cursor.open.as_mut().ok_or_else(not_open)?;
+                let len = open.rows.len() as i64;
+                open.pos = routines::fetch_target(open.pos, len, &how, n);
+                let row = (open.pos >= 0 && open.pos < len).then(|| open.rows[open.pos as usize].clone());
+                let fields = open.fields.clone();
+                self.fetch_status = if row.is_some() { 0 } else { -1 };
+                if into.is_empty() {
+                    self.send_rows(&fields, row.into_iter().collect());
+                    return Ok(Flow::Next);
+                }
+                if into.len() != fields.len() {
+                    return Err(TsqlError::new(
+                        16924,
+                        "Cursorfetch: The number of variables declared in the INTO list must match that of selected columns.",
+                    ));
+                }
+                if let Some(row) = row {
+                    for (j, var) in into.iter().enumerate() {
+                        let v = value_of(fields[j].type_oid, row[j].clone());
+                        self.assign(var, v)?;
+                    }
+                }
+            }
+        }
+        self.statement_done(0, 0, 0);
+        Ok(Flow::Next)
+    }
+
+    /// Rows held here (a cursor's), sent as a result.
+    fn send_rows(&mut self, fields: &[PgField], rows: Vec<Vec<Option<String>>>) {
+        let cols: Vec<Column> = fields
+            .iter()
+            .enumerate()
+            .map(|(k, f)| Column {
+                name: f.name.clone(),
+                ty: tds::column_type(f.type_oid, f.type_modifier).unwrap_or_else(|| {
+                    let (mut int, mut frac) = (1usize, 0usize);
+                    for r in &rows {
+                        if let Some(Some(v)) = r.get(k) {
+                            let (i, f) = tds::decimal_shape(v);
+                            int = int.max(i);
+                            frac = frac.max(f);
+                        }
+                    }
+                    let frac = frac.min(38 - int.min(38));
+                    ColType::Decimal {
+                        precision: (int + frac).clamp(1, 38) as u8,
+                        scale: frac as u8,
+                    }
+                }),
+                oid: f.type_oid,
+            })
+            .collect();
+        tds::col_metadata(self.wire.reply(), &cols);
+        for r in &rows {
+            let out = self.wire.reply();
+            let at = out.len();
+            out.push(0xd1);
+            for (k, cell) in r.iter().enumerate() {
+                let ty = cols.get(k).map(|c| c.ty.clone()).unwrap_or(ColType::NVarChar(None));
+                if tds::put_value(out, &ty, cell.as_deref().map(str::as_bytes)).is_err() {
+                    out.truncate(at);
+                    break;
+                }
+            }
+        }
+        self.rowcount = rows.len() as i64;
+        self.statement_done(
+            if self.nocount { 0 } else { tds::DONE_COUNT },
+            0xc1,
+            rows.len() as u64,
+        );
+    }
+
+    // -- procedures ---------------------------------------------------------
+
+    fn has_routine_table(&self) -> bool {
+        self.bridge
+            .as_ref()
+            .is_some_and(|b| b.database.has_table(routines::ROUTINE_TABLE))
+    }
+
+    /// Reads the procedures when a batch looks at the catalogue (OBJECT_ID,
+    /// sys.procedures, …), for the translation to see them.
+    async fn refresh_routines_for(&mut self, text: &str) {
+        let lower = text.to_ascii_lowercase();
+        let looks = ["object_id", "object_name", "procedures", "routines", "objects", "sql_modules", "object_definition"]
+            .iter()
+            .any(|w| lower.contains(w));
+        if !looks {
+            return;
+        }
+        let mut found = Vec::new();
+        if self.has_routine_table() {
+            if let Ok((_, rows)) = self
+                .fetch_guarded(
+                    "SELECT name, definition FROM __rdb_routines WHERE dialect = 'tsql' ORDER BY name",
+                    &[],
+                )
+                .await
+            {
+                found = rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        let mut r = r.into_iter();
+                        Some((r.next()??, r.next()??))
+                    })
+                    .collect();
+            }
+        }
+        self.routine_cache = Some(found);
+    }
+
+    async fn load_procedure(&mut self, name: &str) -> Result<Option<String>, TsqlError> {
+        if !self.has_routine_table() {
+            return Ok(None);
+        }
+        let (_, rows) = self
+            .fetch_guarded(
+                "SELECT definition FROM __rdb_routines WHERE name = $1 AND dialect = 'tsql'",
+                &[text_param(name)],
+            )
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        Ok(rows.into_iter().next().and_then(|r| r.into_iter().next().flatten()))
+    }
+
+    /// CREATE / ALTER PROCEDURE, which is its batch.
+    async fn procedure_ddl(
+        &mut self,
+        text: &str,
+        tokens: &[Token],
+    ) -> Option<Result<(), TsqlError>> {
+        let def = routines::parse_create(tokens)?;
+        Some(match def {
+            Ok(d) => self.define_procedure(text, tokens, d).await,
+            Err(e) => Err(e),
+        })
+    }
+
+    async fn define_procedure(
+        &mut self,
+        text: &str,
+        tokens: &[Token],
+        def: ProcDef,
+    ) -> Result<(), TsqlError> {
+        // A body that does not parse is refused now, as SQL Server does.
+        translate::parse_batch(&tokens[def.body_start..])?;
+        // Kept as CREATE PROCEDURE …, however it was made.
+        let proc_at = match def.mode {
+            routines::Mode::Create => 1,
+            routines::Mode::CreateOrAlter => 3,
+            routines::Mode::Alter => 1,
+        };
+        let definition = format!("CREATE {}", text[tokens[proc_at].span.0..].trim_end());
+        let taken = || {
+            TsqlError::new(
+                2714,
+                format!("There is already an object named '{}' in the database.", def.name),
+            )
+        };
+        if self.bridge().database.has_table(&def.name) {
+            return Err(taken());
+        }
+        if !self.has_routine_table() {
+            self.silent_guarded(routines::CREATE_ROUTINE_TABLE)
+                .await
+                .map_err(|e| error_from_engine(&e))?;
+        }
+        let (_, rows) = self
+            .fetch_guarded(
+                "SELECT dialect FROM __rdb_routines WHERE name = $1",
+                &[text_param(&def.name)],
+            )
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        let existing = rows.into_iter().next().and_then(|r| r.into_iter().next().flatten());
+        match (def.mode, existing.as_deref()) {
+            (_, Some(d)) if d != "tsql" => return Err(taken()),
+            (routines::Mode::Create, Some(_)) => return Err(taken()),
+            (routines::Mode::Alter, None) => {
+                return Err(TsqlError::new(208, format!("Invalid object name '{}'.", def.name)));
+            }
+            _ => {}
+        }
+        let sql = if existing.is_some() {
+            "UPDATE __rdb_routines SET definition = $2 WHERE name = $1"
+        } else {
+            "INSERT INTO __rdb_routines (name, dialect, definition) VALUES ($1, 'tsql', $2)"
+        };
+        self.fetch_guarded(sql, &[text_param(&def.name), text_param(&definition)])
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        self.routine_cache = None;
+        Ok(())
+    }
+
+    async fn drop_procedure(&mut self, tokens: &[Token]) -> Result<Flow, TsqlError> {
+        let if_exists = kw(tokens, 2, "IF") && kw(tokens, 3, "EXISTS");
+        let mut k = if if_exists { 4 } else { 2 };
+        let mut names = Vec::new();
+        loop {
+            let (name, j) = routines::object_name_at(tokens, k)
+                .ok_or_else(|| TsqlError::syntax("DROP PROCEDURE needs a name"))?;
+            names.push(name);
+            k = j;
+            if tokens.get(k).is_some_and(|t| t.is_op(",")) {
+                k += 1;
+                continue;
+            }
+            break;
+        }
+        for name in names {
+            let removed = if self.has_routine_table() {
+                let tag = self
+                    .silent_guarded(&format!(
+                        "DELETE FROM __rdb_routines WHERE name = {} AND dialect = 'tsql'",
+                        crate::sqlcompat::string_sql(name.as_bytes())
+                    ))
+                    .await
+                    .map_err(|e| error_from_engine(&e))?;
+                tag_count(&tag).unwrap_or(0)
+            } else {
+                0
+            };
+            if removed == 0 && !if_exists {
+                return Err(TsqlError::new(
+                    3701,
+                    format!("Cannot drop the procedure '{name}', because it does not exist or you do not have permission."),
+                ));
+            }
+        }
+        self.routine_cache = None;
+        self.statement_done(0, 0, 0);
+        Ok(Flow::Next)
+    }
+
+    /// Runs a stored procedure: its parameters are its variables, in a
+    /// scope of their own.
+    async fn call_procedure(
+        &mut self,
+        name: &str,
+        args: Vec<ProcArg>,
+    ) -> Result<ProcOutcome, TsqlError> {
+        let definition = self.load_procedure(name).await?.ok_or_else(|| {
+            TsqlError::new(2812, format!("Could not find stored procedure '{name}'."))
+        })?;
+        let tokens = lex::lex(&definition).map_err(|e| TsqlError::syntax(e.0))?;
+        let def = routines::parse_create(&tokens)
+            .ok_or_else(|| TsqlError::syntax("a stored definition is not a procedure"))??;
+        if self.nest_level >= routines::MAX_NESTING {
+            return Err(TsqlError::new(
+                217,
+                "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+            ));
+        }
+        // Arguments to parameters: positional first, then by name.
+        let mut values: Vec<Option<Value>> = vec![None; def.params.len()];
+        let mut supplied = vec![false; def.params.len()];
+        let mut wants: Vec<Option<usize>> = vec![None; def.params.len()];
+        let mut position = 0usize;
+        for (a, arg) in args.iter().enumerate() {
+            let k = match &arg.name {
+                Some(n) => def.params.iter().position(|p| p.name == *n).ok_or_else(|| {
+                    TsqlError::new(8145, format!("@{n} is not a parameter for procedure {name}."))
+                })?,
+                None => {
+                    if position >= def.params.len() {
+                        return Err(TsqlError::new(
+                            8144,
+                            format!("Procedure or function {name} has too many arguments specified."),
+                        ));
+                    }
+                    position += 1;
+                    position - 1
+                }
+            };
+            if arg.output {
+                if !def.params[k].output {
+                    return Err(TsqlError::new(
+                        8162,
+                        format!(
+                            "The formal parameter \"@{}\" was not declared as an OUTPUT parameter, but the actual parameter passed in requested output.",
+                            def.params[k].name
+                        ),
+                    ));
+                }
+                wants[k] = Some(a);
+            }
+            if let Some(v) = &arg.value {
+                values[k] = Some(v.clone());
+                supplied[k] = true;
+            }
+        }
+        for (k, p) in def.params.iter().enumerate() {
+            if supplied[k] {
+                continue;
+            }
+            match &p.default {
+                Some(d) => values[k] = Some(self.evaluate(d, None).await?),
+                None => {
+                    return Err(TsqlError::new(
+                        201,
+                        format!("Procedure or function '{name}' expects parameter '@{}', which was not supplied.", p.name),
+                    ));
+                }
+            }
+        }
+        let saved_vars = std::mem::take(&mut self.vars);
+        let saved_return = self.return_value.take();
+        let mut bound = Ok(());
+        for (k, p) in def.params.iter().enumerate() {
+            let (string, numeric) = routines::type_flags(&p.ty);
+            self.vars.insert(
+                p.name.clone(),
+                Var {
+                    value: Value::Null,
+                    string,
+                    numeric,
+                },
+            );
+            if let Err(e) = self.assign(&p.name, values[k].take().unwrap_or(Value::Null)) {
+                bound = Err(e);
+                break;
+            }
+        }
+        let run = match bound {
+            Ok(()) => {
+                self.nest_level += 1;
+                self.scopes.push(LocalScope {
+                    owns_temps: true,
+                    ..Default::default()
+                });
+                let r = match translate::parse_batch(&tokens[def.body_start..]) {
+                    Ok(stmts) => self.run_list(&definition, &stmts, None).await,
+                    Err(e) => Ok(Err(e)),
+                };
+                self.end_scope().await;
+                self.nest_level -= 1;
+                r
+            }
+            Err(e) => Ok(Err(e)),
+        };
+        let outputs = def
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(k, p)| {
+                let a = wants[k]?;
+                Some((a, self.vars.get(&p.name).map(|v| v.value.clone()).unwrap_or(Value::Null)))
+            })
+            .collect();
+        let status = self.return_value.take().unwrap_or(0);
+        self.return_value = saved_return;
+        self.vars = saved_vars;
+        let flow = match run {
+            Ok(Ok(flow)) => flow,
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(TsqlError::new(50000, e.to_string())),
+        };
+        Ok(ProcOutcome {
+            status,
+            outputs,
+            flow,
+        })
+    }
+}
+
 fn bind_values(decls: &[(String, bool, u32)], params: &[tds::Param]) -> Vec<ParamValue> {
     let mut out = vec![ParamValue::Null; decls.len()];
     let mut position = 0;
