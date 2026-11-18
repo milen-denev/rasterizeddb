@@ -630,3 +630,108 @@ async fn mysql_temporary_tables_and_on_update() {
     let names: Vec<String> = sqlx::query_scalar::<_, String>("SHOW TABLES").fetch_all(&mut c).await.unwrap();
     assert!(!names.iter().any(|n| n.starts_with("__")), "{names:?}");
 }
+
+/// Stored procedures in MySQL's language, run by the front end: parameters
+/// (IN, OUT into user variables, INOUT), variables, IF/CASE/loops with
+/// labels, a cursor loop with a NOT FOUND handler, an EXIT handler, SIGNAL,
+/// result sets from the body, and the catalogue statements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_stored_procedures() {
+    let s = start(MyAuth::Password);
+    let mut c = mysql(&s).await;
+    c.execute("CREATE TABLE acct (id INT PRIMARY KEY, owner VARCHAR(20), balance INT)").await.unwrap();
+    c.execute("INSERT INTO acct VALUES (1, 'ann', 100), (2, 'bo', 50), (3, 'cy', 0)").await.unwrap();
+
+    // One query, as a client sends it after DELIMITER: the body's `;`s stay in it.
+    c.execute(
+        "CREATE DEFINER=`root`@`%` PROCEDURE transfer(IN p_from INT, IN p_to INT, IN p_amount INT, OUT p_status VARCHAR(20))
+         MODIFIES SQL DATA
+         BEGIN
+           DECLARE have INT DEFAULT 0;
+           DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; SET p_status = 'failed'; END;
+           SELECT balance INTO have FROM acct WHERE id = p_from;
+           IF have < p_amount THEN
+             SET p_status = 'insufficient';
+           ELSE
+             START TRANSACTION;
+             UPDATE acct SET balance = balance - p_amount WHERE id = p_from;
+             UPDATE acct SET balance = balance + p_amount WHERE id = p_to;
+             COMMIT;
+             SET p_status = 'ok';
+           END IF;
+         END",
+    )
+    .await
+    .unwrap();
+    c.execute("CALL transfer(1, 2, 30, @st)").await.unwrap();
+    let st: String = sqlx::query_scalar("SELECT @st").fetch_one(&mut c).await.unwrap();
+    assert_eq!(st, "ok");
+    c.execute("CALL transfer(3, 1, 10, @st)").await.unwrap();
+    let st: String = sqlx::query_scalar("SELECT @st").fetch_one(&mut c).await.unwrap();
+    assert_eq!(st, "insufficient");
+    let balances: Vec<i32> = sqlx::query_scalar("SELECT balance FROM acct ORDER BY id").fetch_all(&mut c).await.unwrap();
+    assert_eq!(balances, [70, 80, 0]);
+
+    // A cursor loop with a CONTINUE handler, INOUT, a label, CASE, and a
+    // result set from the body.
+    c.execute(
+        "CREATE PROCEDURE summarize(INOUT p_total INT)
+         BEGIN
+           DECLARE done INT DEFAULT FALSE;
+           DECLARE v INT;
+           DECLARE n INT DEFAULT 0;
+           DECLARE cur CURSOR FOR SELECT balance FROM acct ORDER BY id;
+           DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+           OPEN cur;
+           read_loop: LOOP
+             FETCH cur INTO v;
+             IF done THEN LEAVE read_loop; END IF;
+             SET n = n + 1;
+             CASE WHEN v > 75 THEN SET p_total = p_total + v * 2; ELSE SET p_total = p_total + v; END CASE;
+           END LOOP;
+           CLOSE cur;
+           SELECT n AS accounts, p_total AS total;
+         END",
+    )
+    .await
+    .unwrap();
+    c.execute("SET @t = 1000").await.unwrap();
+    let row = sqlx::query("CALL summarize(@t)").fetch_one(&mut c).await.unwrap();
+    assert_eq!(row.get::<i64, _>("accounts"), 3);
+    assert_eq!(row.get::<i64, _>("total"), 1000 + 70 + 160 + 0);
+    let t: i64 = sqlx::query_scalar("SELECT @t").fetch_one(&mut c).await.unwrap();
+    assert_eq!(t, 1230);
+
+    // SIGNAL, an unknown procedure, a wrong argument count.
+    c.execute("CREATE PROCEDURE guard(IN x INT) BEGIN IF x < 0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'negative'; END IF; SELECT x; END").await.unwrap();
+    let e = c.execute("CALL guard(-1)").await.unwrap_err();
+    assert_eq!(code(&e), (Some(1644), Some("45000".into())), "{e}");
+    assert!(e.to_string().contains("negative"), "{e}");
+    let e = c.execute("CALL nothere()").await.unwrap_err();
+    assert_eq!(code(&e).0, Some(1305), "{e}");
+    let e = c.execute("CALL guard(1, 2)").await.unwrap_err();
+    assert_eq!(code(&e).0, Some(1318), "{e}");
+    // The connection is in step after the errors.
+    let one: i32 = sqlx::query_scalar("SELECT 1").fetch_one(&mut c).await.unwrap();
+    assert_eq!(one, 1);
+
+    // Catalogue: SHOW PROCEDURE STATUS, SHOW CREATE PROCEDURE, DROP.
+    let names: Vec<String> = sqlx::query("SHOW PROCEDURE STATUS")
+        .fetch_all(&mut c)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("Name"))
+        .collect();
+    assert_eq!(names, ["guard", "summarize", "transfer"]);
+    let row = sqlx::query("SHOW CREATE PROCEDURE guard").fetch_one(&mut c).await.unwrap();
+    assert!(row.get::<String, _>("Create Procedure").contains("SIGNAL SQLSTATE '45000'"));
+    let e = c.execute("CREATE PROCEDURE guard() SELECT 1").await.unwrap_err();
+    assert_eq!(code(&e).0, Some(1304), "{e}");
+    c.execute("DROP PROCEDURE guard").await.unwrap();
+    c.execute("DROP PROCEDURE IF EXISTS guard").await.unwrap();
+    let e = c.execute("DROP PROCEDURE guard").await.unwrap_err();
+    assert_eq!(code(&e).0, Some(1305), "{e}");
+    let e = c.execute("CREATE FUNCTION f() RETURNS INT RETURN 1").await.unwrap_err();
+    assert_eq!(code(&e).0, Some(1235), "{e}");
+}

@@ -188,6 +188,10 @@ pub(crate) struct Session {
     /// Open cursors (an execute with CURSOR_TYPE_READ_ONLY), by statement:
     /// the columns and the rows not fetched yet.
     cursors: HashMap<u32, (Vec<MyColumn>, std::collections::VecDeque<Vec<Option<String>>>)>,
+    /// The error last written, for a procedure's handlers.
+    last_error: Option<MyError>,
+    /// How deep in CALLs.
+    call_depth: u32,
     statements: HashMap<u32, Prepared>,
     next_statement: u32,
     next_isolation: Option<String>,
@@ -276,6 +280,8 @@ pub(crate) async fn serve_connection(
         temp_tables: HashMap::new(),
         temp_prefix: crate::sqlcompat::temp_table_prefix("my", crate::sqlcompat::next_connection_id()),
         cursors: HashMap::new(),
+        last_error: None,
+        call_depth: 0,
         statements: HashMap::new(),
         next_statement: 1,
         next_isolation: None,
@@ -855,6 +861,7 @@ impl Session {
     }
 
     fn err(&mut self, error: &MyError) {
+        self.last_error = Some(error.clone());
         results::write_err(&mut self.io, error);
     }
 
@@ -1396,7 +1403,7 @@ impl Session {
                 return Ok(());
             }
         };
-        let statements = lex::split_statements(tokens);
+        let statements = super::routine::split(tokens);
         if statements.is_empty() {
             // Comments alone are an empty statement, answered OK (the mysql
             // client sends a dump's comments on their own); only a query
@@ -1449,6 +1456,9 @@ impl Session {
         let tokens = temp.tokens;
         if crate::sqlcompat::kw(&tokens, 0, "LOAD") && crate::sqlcompat::kw(&tokens, 1, "DATA") {
             return self.load_data(&tokens, more).await;
+        }
+        if let Some(r) = self.routine_statement(sql, &tokens, more, rows_mode).await {
+            return r;
         }
         let (action, filter) = admin::classify(&tokens);
         let keeps_warnings = matches!(action, Action::Show(Show::Warnings | Show::CountWarnings))
@@ -2804,6 +2814,12 @@ impl Session {
             long_data: HashMap::new(),
         };
         let mut columns: Vec<MyColumn> = Vec::new();
+        // `@v` and `@@v` are read at each execute in MySQL; their values are
+        // written into the translation, so such a statement is translated
+        // again at each execute rather than prepared on the engine.
+        let reads_variables = tokens
+            .iter()
+            .any(|t| matches!(t.tok, Tok::UserVar(_) | Tok::SysVar(_)));
         if matches!(action, Action::Data) {
             self.load_on_update(&tokens).await;
             let forward = match translate::translate(sql, tokens, self, true) {
@@ -2817,6 +2833,7 @@ impl Session {
             if forward.statements.len() == 1
                 && forward.found_rows.is_none()
                 && forward.kind != Kind::Ddl
+                && !reads_variables
             {
                 let name = format!("my{}_{}", self.conn_id, id);
                 let b = self.bridge();
@@ -3325,6 +3342,793 @@ impl Session {
         if !rows.is_empty() {
             self.cursors.insert(id, (columns, rows));
         }
+    }
+}
+
+/// A block of a running procedure: its variables, cursors and handlers.
+#[derive(Default)]
+struct ProcScope {
+    vars: HashMap<String, Value>,
+    cursors: HashMap<String, (Vec<Token>, Option<std::collections::VecDeque<Vec<Value>>>)>,
+    handlers: Vec<(bool, Vec<super::routine::Condition>, super::routine::S)>,
+}
+
+struct ProcCtx {
+    /// The definition's text, which the body's tokens point into.
+    text: Vec<u8>,
+    scopes: Vec<ProcScope>,
+    rows: Rows,
+    /// The error a handler is running for (RESIGNAL).
+    handling: Option<MyError>,
+}
+
+/// How a procedure statement ended.
+enum Ctl {
+    Next,
+    Leave(String),
+    Iterate(String),
+    /// An EXIT handler ran: leave the block at this scope depth.
+    Exit(usize),
+    /// An error no handler took.
+    Fail(MyError),
+    /// An error that was already sent (its output could not be taken back).
+    Sent,
+}
+
+fn value_of_cell(oid: u32, text: Option<String>) -> Value {
+    match text {
+        None => Value::Null,
+        Some(v) if matches!(oid, 20 | 21 | 23) => v.parse().map(Value::Int).unwrap_or(Value::Str(v)),
+        Some(v) if oid == 16 => Value::Int((v == "t") as i64),
+        Some(v) => Value::Str(v),
+    }
+}
+
+fn truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Int(n) => *n != 0,
+        Value::Str(s) => {
+            let t = s.trim();
+            t.parse::<f64>().map(|f| f != 0.0).unwrap_or(t == "t" || t.eq_ignore_ascii_case("true"))
+        }
+    }
+}
+
+/// A SQLSTATE that SIGNAL names, kept for the life of the process (MyError
+/// holds a static one); the same state is kept once.
+fn static_state(state: &str) -> &'static str {
+    static STATES: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<&'static str>>> = std::sync::OnceLock::new();
+    let mut set = STATES.get_or_init(Default::default).lock();
+    if let Some(s) = set.get(state) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(state.to_string().into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
+fn no_data() -> MyError {
+    MyError::new(1329, "02000", "No data - zero rows fetched, selected, or processed")
+}
+
+/// Stored procedures: CREATE / DROP / CALL / SHOW, and the interpreter that
+/// runs their bodies. A CALL answers with the result sets of the body's
+/// queries, then an OK; the OKs of the statements inside are not sent.
+impl Session {
+    async fn routine_statement(
+        &mut self,
+        sql: &[u8],
+        tokens: &[Token],
+        more: bool,
+        rows_mode: Rows,
+    ) -> Option<io::Result<bool>> {
+        use crate::sqlcompat::kw;
+        if let Some(def) = super::routine::parse_create(tokens) {
+            return Some(match def {
+                Ok(d) => self.define_procedure(sql, tokens, d, more).await,
+                Err(e) => {
+                    self.err(&e);
+                    Ok(false)
+                }
+            });
+        }
+        if kw(tokens, 0, "DROP") && (kw(tokens, 1, "PROCEDURE") || kw(tokens, 1, "FUNCTION")) {
+            return Some(self.drop_procedure(tokens, more).await);
+        }
+        if kw(tokens, 0, "CALL") {
+            return Some(self.call(tokens, more, rows_mode).await);
+        }
+        if kw(tokens, 0, "SHOW") && kw(tokens, 1, "PROCEDURE") && kw(tokens, 2, "STATUS") {
+            let (_, filter) = admin::classify(tokens);
+            return Some(self.show_procedures(filter, more, rows_mode).await);
+        }
+        if kw(tokens, 0, "SHOW") && kw(tokens, 1, "CREATE") && kw(tokens, 2, "PROCEDURE") {
+            return Some(self.show_create_procedure(tokens, more, rows_mode).await);
+        }
+        None
+    }
+
+    fn has_routines(&mut self) -> bool {
+        self.bridge().database.has_table(super::routine::ROUTINE_TABLE)
+    }
+
+    async fn procedure_definition(&mut self, name: &str) -> Result<Option<String>, MyError> {
+        if !self.has_routines() {
+            return Ok(None);
+        }
+        let sql = format!(
+            "SELECT definition FROM {} WHERE name = {} AND dialect = 'mysql'",
+            super::routine::ROUTINE_TABLE,
+            crate::sqlcompat::string_sql(name.as_bytes())
+        );
+        let (_, rows) = self.fetch(&sql).await.map_err(|e| results::error_from_engine(&e))?;
+        Ok(rows.into_iter().next().and_then(|r| r.into_iter().next().flatten()))
+    }
+
+    /// DDL commits what is open first, in MySQL.
+    async fn implicit_commit(&mut self) -> Result<(), MyError> {
+        if self.bridge().in_block() {
+            self.silent("COMMIT").await.map_err(|e| results::error_from_engine(&e))?;
+        }
+        Ok(())
+    }
+
+    async fn define_procedure(
+        &mut self,
+        sql: &[u8],
+        tokens: &[Token],
+        def: super::routine::ProcDef,
+        more: bool,
+    ) -> io::Result<bool> {
+        let r: Result<(), MyError> = async {
+            self.implicit_commit().await?;
+            let start = tokens.first().map(|t| t.span.0).unwrap_or(0);
+            let end = tokens.last().map(|t| t.span.1).unwrap_or(sql.len()).min(sql.len());
+            let definition = String::from_utf8_lossy(&sql[start..end]).into_owned();
+            if !self.has_routines() {
+                self.silent(super::routine::CREATE_ROUTINE_TABLE)
+                    .await
+                    .map_err(|e| results::error_from_engine(&e))?;
+            }
+            let lit = |s: &str| crate::sqlcompat::string_sql(s.as_bytes());
+            let (_, rows) = self
+                .fetch(&format!("SELECT dialect FROM {} WHERE name = {}", super::routine::ROUTINE_TABLE, lit(&def.name)))
+                .await
+                .map_err(|e| results::error_from_engine(&e))?;
+            if !rows.is_empty() {
+                if def.if_not_exists {
+                    self.warnings.push(("Note".into(), 1304, format!("PROCEDURE {} already exists", def.name)));
+                    return Ok(());
+                }
+                return Err(MyError::new(1304, "42000", format!("PROCEDURE {} already exists", def.name)));
+            }
+            self.silent(&format!(
+                "INSERT INTO {} (name, dialect, definition) VALUES ({}, 'mysql', {})",
+                super::routine::ROUTINE_TABLE,
+                lit(&def.name),
+                lit(&definition)
+            ))
+            .await
+            .map_err(|e| results::error_from_engine(&e))?;
+            Ok(())
+        }
+        .await;
+        match r {
+            Ok(()) => {
+                self.ok_more(more);
+                Ok(true)
+            }
+            Err(e) => {
+                self.err(&e);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn drop_procedure(&mut self, tokens: &[Token], more: bool) -> io::Result<bool> {
+        use crate::sqlcompat::kw;
+        let kind = if kw(tokens, 1, "FUNCTION") { "FUNCTION" } else { "PROCEDURE" };
+        let if_exists = kw(tokens, 2, "IF") && kw(tokens, 3, "EXISTS");
+        let mut at = if if_exists { 4 } else { 2 };
+        if tokens.get(at + 1).is_some_and(|t| t.is_op(".")) {
+            at += 2;
+        }
+        let name = tokens.get(at).and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+        let r: Result<u64, MyError> = async {
+            self.implicit_commit().await?;
+            if kind == "FUNCTION" || !self.has_routines() {
+                return Ok(0);
+            }
+            let tag = self
+                .silent(&format!(
+                    "DELETE FROM {} WHERE name = {} AND dialect = 'mysql'",
+                    super::routine::ROUTINE_TABLE,
+                    crate::sqlcompat::string_sql(name.as_bytes())
+                ))
+                .await
+                .map_err(|e| results::error_from_engine(&e))?;
+            Ok(tag_count(&tag).unwrap_or(0))
+        }
+        .await;
+        match r {
+            Ok(0) if !if_exists => {
+                let db = self.database_name().to_string();
+                self.err(&MyError::new(1305, "42000", format!("{kind} {db}.{name} does not exist")));
+                Ok(false)
+            }
+            Ok(n) => {
+                if n == 0 {
+                    let db = self.database_name().to_string();
+                    self.warnings.push(("Note".into(), 1305, format!("{kind} {db}.{name} does not exist")));
+                }
+                self.ok_more(more);
+                Ok(true)
+            }
+            Err(e) => {
+                self.err(&e);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn show_procedures(&mut self, filter: Filter, more: bool, rows_mode: Rows) -> io::Result<bool> {
+        let db = self.database_name().to_string();
+        let mut names = Vec::new();
+        if self.has_routines() {
+            match self
+                .fetch(&format!("SELECT name FROM {} WHERE dialect = 'mysql' ORDER BY name", super::routine::ROUTINE_TABLE))
+                .await
+            {
+                Ok((_, rows)) => names = rows.into_iter().filter_map(|r| r.into_iter().next().flatten()).collect(),
+                Err(e) => {
+                    self.err(&results::error_from_engine(&e));
+                    return Ok(false);
+                }
+            }
+        }
+        let cols = [
+            "Db", "Name", "Type", "Definer", "Modified", "Created", "Security_type", "Comment",
+            "character_set_client", "collation_connection", "Database Collation",
+        ];
+        let columns = cols.iter().map(|c| MyColumn::text(c)).collect();
+        // LIKE filters on Name: the name goes first for the filter.
+        let rows = names
+            .into_iter()
+            .map(|n| {
+                vec![
+                    Some(db.clone()),
+                    Some(n),
+                    Some("PROCEDURE".into()),
+                    Some(format!("{}@%", self.user)),
+                    Some("1970-01-01 00:00:00".into()),
+                    Some("1970-01-01 00:00:00".into()),
+                    Some("DEFINER".into()),
+                    Some(String::new()),
+                    Some("utf8mb4".into()),
+                    Some("utf8mb4_bin".into()),
+                    Some("utf8mb4_bin".into()),
+                ]
+            })
+            .filter(|r| match &filter.like {
+                Some(p) => admin::like_matches(p, r[1].as_deref().unwrap_or("")),
+                None => true,
+            })
+            .collect();
+        let filter = Filter { like: None, condition: filter.condition };
+        self.send_rows(columns, rows, filter, more, rows_mode).await
+    }
+
+    async fn show_create_procedure(&mut self, tokens: &[Token], more: bool, rows_mode: Rows) -> io::Result<bool> {
+        let mut at = 3;
+        if tokens.get(at + 1).is_some_and(|t| t.is_op(".")) {
+            at += 2;
+        }
+        let name = tokens.get(at).and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+        match self.procedure_definition(&name).await {
+            Ok(Some(def)) => {
+                let columns = ["Procedure", "sql_mode", "Create Procedure", "character_set_client", "collation_connection", "Database Collation"]
+                    .iter()
+                    .map(|c| MyColumn::text(c))
+                    .collect();
+                let sql_mode = self.vars.get("sql_mode").and_then(|v| v.text()).unwrap_or_default();
+                let rows = vec![vec![
+                    Some(name),
+                    Some(sql_mode),
+                    Some(def),
+                    Some("utf8mb4".into()),
+                    Some("utf8mb4_bin".into()),
+                    Some("utf8mb4_bin".into()),
+                ]];
+                self.send_rows(columns, rows, Filter::default(), more, rows_mode).await
+            }
+            Ok(None) => {
+                let db = self.database_name().to_string();
+                self.err(&MyError::new(1305, "42000", format!("PROCEDURE {db}.{name} does not exist")));
+                Ok(false)
+            }
+            Err(e) => {
+                self.err(&e);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn call(&mut self, tokens: &[Token], more: bool, rows_mode: Rows) -> io::Result<bool> {
+        use super::routine::ParamMode;
+        let mut at = 1;
+        if tokens.get(at + 1).is_some_and(|t| t.is_op(".")) {
+            at += 2;
+        }
+        let name = tokens.get(at).and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+        let args: Vec<Vec<Token>> = match tokens.get(at + 1) {
+            Some(t) if t.is_op("(") => {
+                let close = crate::sqlcompat::matching_paren(tokens, at + 1).unwrap_or(tokens.len() - 1);
+                crate::sqlcompat::split_commas(&tokens[at + 2..close]).into_iter().filter(|a| !a.is_empty()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let db = self.database_name().to_string();
+        let prepared: Result<(String, super::routine::ProcDef, Vec<super::routine::S>), MyError> = async {
+            let text = self
+                .procedure_definition(&name)
+                .await?
+                .ok_or_else(|| MyError::new(1305, "42000", format!("PROCEDURE {db}.{name} does not exist")))?;
+            let toks = lex::lex(text.as_bytes(), self.mode()).map_err(|e| MyError::syntax(e.0))?;
+            let def = super::routine::parse_create(&toks)
+                .ok_or_else(|| MyError::syntax("a stored definition is not a procedure"))??;
+            let body = super::routine::parse_body(&def.body)?;
+            Ok((text, def, body))
+        }
+        .await;
+        let (text, def, body) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                self.err(&e);
+                return Ok(false);
+            }
+        };
+        if args.len() != def.params.len() {
+            self.err(&MyError::new(
+                1318,
+                "42000",
+                format!("Incorrect number of arguments for PROCEDURE {db}.{name}; expected {}, got {}", def.params.len(), args.len()),
+            ));
+            return Ok(false);
+        }
+        if self.call_depth >= super::routine::MAX_DEPTH {
+            self.err(&MyError::new(1456, "HY000", format!("Recursive limit {} was exceeded for routine {name}", super::routine::MAX_DEPTH)));
+            return Ok(false);
+        }
+        // Parameters: IN takes the argument's value; OUT and INOUT name the
+        // user variable they are returned in.
+        let mut scope = ProcScope::default();
+        let mut outs = Vec::new();
+        for (k, (p, arg)) in def.params.iter().zip(&args).enumerate() {
+            let out_var = match (p.mode, arg.as_slice()) {
+                (ParamMode::In, _) => None,
+                (_, [t]) => match &t.tok {
+                    Tok::UserVar(v) => Some(v.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if p.mode != ParamMode::In && out_var.is_none() {
+                self.err(&MyError::new(
+                    1414,
+                    "42000",
+                    format!("OUT or INOUT argument {} for routine {db}.{name} is not a variable or NEW pseudo-variable in BEFORE trigger", k + 1),
+                ));
+                return Ok(false);
+            }
+            let value = if p.mode == ParamMode::Out {
+                Value::Null
+            } else {
+                match self.evaluate(arg).await {
+                    Ok(v) => v.unwrap_or(Value::Null),
+                    Err(e) => {
+                        self.err(&e);
+                        return Ok(false);
+                    }
+                }
+            };
+            scope.vars.insert(p.name.clone(), value);
+            if let Some(v) = out_var {
+                outs.push((p.name.clone(), v));
+            }
+        }
+        let mut ctx = ProcCtx {
+            text: text.into_bytes(),
+            scopes: vec![scope],
+            rows: rows_mode,
+            handling: None,
+        };
+        self.call_depth += 1;
+        let r = self.run_list(&mut ctx, &body).await;
+        self.call_depth -= 1;
+        match r? {
+            Ctl::Fail(e) => {
+                self.err(&e);
+                return Ok(false);
+            }
+            Ctl::Sent => return Ok(false),
+            _ => {}
+        }
+        for (param, var) in outs {
+            let v = ctx.scopes[0].vars.get(&param).cloned().unwrap_or(Value::Null);
+            self.user_vars.insert(var, v);
+        }
+        self.ok_more(more);
+        Ok(true)
+    }
+
+    fn var_value(ctx: &ProcCtx, name: &str) -> Option<Value> {
+        ctx.scopes.iter().rev().find_map(|s| s.vars.get(name).cloned())
+    }
+
+    fn set_var(ctx: &mut ProcCtx, name: &str, value: Value) -> bool {
+        match ctx.scopes.iter_mut().rev().find(|s| s.vars.contains_key(name)) {
+            Some(s) => {
+                s.vars.insert(name.to_string(), value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn subst(ctx: &ProcCtx, tokens: &[Token]) -> Vec<Token> {
+        super::routine::substitute(tokens, &|n| Self::var_value(ctx, n).map(|v| v.token()))
+    }
+
+    async fn proc_eval(&mut self, ctx: &ProcCtx, tokens: &[Token]) -> Result<Value, MyError> {
+        let t = Self::subst(ctx, tokens);
+        Ok(self.evaluate(&t).await?.unwrap_or(Value::Null))
+    }
+
+    /// A query's rows, for the procedure (SELECT … INTO, a cursor).
+    async fn proc_query(&mut self, ctx: &ProcCtx, tokens: &[Token]) -> Result<Vec<Vec<Value>>, MyError> {
+        let t = self.rename_temp_references(Self::subst(ctx, tokens));
+        let forward = translate::translate(&ctx.text, t, self, false)?;
+        let sql = forward.statements.last().cloned().unwrap_or_default();
+        let (fields, rows) = self.fetch(&sql).await.map_err(|e| results::error_from_engine(&e))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .enumerate()
+                    .map(|(k, c)| value_of_cell(fields.get(k).map(|f| f.type_oid).unwrap_or(25), c))
+                    .collect()
+            })
+            .collect())
+    }
+
+    fn assign_target(&mut self, ctx: &mut ProcCtx, name: &str, value: Value) -> Result<(), MyError> {
+        if let Some(user) = name.strip_prefix('@') {
+            self.user_vars.insert(user.to_string(), value);
+            return Ok(());
+        }
+        if Self::set_var(ctx, name, value) {
+            Ok(())
+        } else {
+            Err(MyError::new(1327, "42000", format!("Undeclared variable: {name}")))
+        }
+    }
+
+    /// An error in the body: the innermost handler for it runs, or it ends
+    /// the CALL (`fatal`; otherwise it is only a warning, as SELECT … INTO
+    /// of no rows is).
+    fn raise<'a>(
+        &'a mut self,
+        ctx: &'a mut ProcCtx,
+        error: MyError,
+        fatal: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Ctl>> + Send + 'a>> {
+        Box::pin(async move {
+            let found = ctx.scopes.iter().enumerate().rev().find_map(|(d, s)| {
+                s.handlers
+                    .iter()
+                    .find(|(_, conds, _)| conds.iter().any(|c| c.matches(error.code, error.state)))
+                    .map(|(exit, _, body)| (d, *exit, body.clone()))
+            });
+            let Some((depth, exit, body)) = found else {
+                if fatal {
+                    return Ok(Ctl::Fail(error));
+                }
+                self.warnings.push(("Warning".into(), error.code, error.message));
+                return Ok(Ctl::Next);
+            };
+            let previous = ctx.handling.replace(error);
+            let r = self.run_s(ctx, &body).await?;
+            ctx.handling = previous;
+            Ok(match r {
+                Ctl::Fail(e) => Ctl::Fail(e),
+                Ctl::Sent => Ctl::Sent,
+                _ if exit => Ctl::Exit(depth),
+                _ => Ctl::Next,
+            })
+        })
+    }
+
+    fn run_list<'a>(
+        &'a mut self,
+        ctx: &'a mut ProcCtx,
+        list: &'a [super::routine::S],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Ctl>> + Send + 'a>> {
+        Box::pin(async move {
+            for s in list {
+                match self.run_s(ctx, s).await? {
+                    Ctl::Next => {}
+                    other => return Ok(other),
+                }
+            }
+            Ok(Ctl::Next)
+        })
+    }
+
+    /// A loop's body once: whether to go on, or how the loop ends.
+    fn loop_turn(ctl: Ctl, label: &Option<String>) -> Result<bool, Ctl> {
+        match ctl {
+            Ctl::Next => Ok(true),
+            Ctl::Iterate(l) if label.as_deref() == Some(l.as_str()) => Ok(true),
+            Ctl::Leave(l) if label.as_deref() == Some(l.as_str()) => Ok(false),
+            other => Err(other),
+        }
+    }
+
+    fn run_s<'a>(
+        &'a mut self,
+        ctx: &'a mut ProcCtx,
+        s: &'a super::routine::S,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Ctl>> + Send + 'a>> {
+        use super::routine::S;
+        Box::pin(async move {
+            const MAX_TURNS: u64 = 10_000_000;
+            macro_rules! eval {
+                ($tokens:expr) => {
+                    match self.proc_eval(ctx, $tokens).await {
+                        Ok(v) => v,
+                        Err(e) => return self.raise(ctx, e, true).await,
+                    }
+                };
+            }
+            match s {
+                S::Sql(tokens) => {
+                    if let Some((query, names)) = super::routine::select_into(tokens) {
+                        let rows = match self.proc_query(ctx, &query).await {
+                            Ok(r) => r,
+                            Err(e) => return self.raise(ctx, e, true).await,
+                        };
+                        if rows.len() > 1 {
+                            return self.raise(ctx, MyError::new(1172, "42000", "Result consisted of more than one row"), true).await;
+                        }
+                        let Some(row) = rows.into_iter().next() else {
+                            return self.raise(ctx, no_data(), false).await;
+                        };
+                        if row.len() != names.len() {
+                            return self.raise(ctx, MyError::new(1222, "21000", "The used SELECT statements have a different number of columns"), true).await;
+                        }
+                        for (n, v) in names.iter().zip(row) {
+                            if let Err(e) = self.assign_target(ctx, n, v) {
+                                return self.raise(ctx, e, true).await;
+                            }
+                        }
+                        return Ok(Ctl::Next);
+                    }
+                    let t = Self::subst(ctx, tokens);
+                    self.inner_statement(ctx, t).await
+                }
+                S::Block { label, body } => {
+                    ctx.scopes.push(ProcScope::default());
+                    let depth = ctx.scopes.len() - 1;
+                    let r = self.run_list(ctx, body).await;
+                    ctx.scopes.pop();
+                    Ok(match r? {
+                        Ctl::Exit(d) if d == depth => Ctl::Next,
+                        Ctl::Leave(l) if label.as_deref() == Some(l.as_str()) => Ctl::Next,
+                        other => other,
+                    })
+                }
+                S::Declare { names, default } => {
+                    let v = match default {
+                        Some(d) => eval!(d),
+                        None => Value::Null,
+                    };
+                    let scope = ctx.scopes.last_mut().expect("a scope");
+                    for n in names {
+                        scope.vars.insert(n.clone(), v.clone());
+                    }
+                    Ok(Ctl::Next)
+                }
+                S::Cursor { name, select } => {
+                    ctx.scopes.last_mut().expect("a scope").cursors.insert(name.clone(), (select.clone(), None));
+                    Ok(Ctl::Next)
+                }
+                S::Handler { exit, conditions, body } => {
+                    ctx.scopes.last_mut().expect("a scope").handlers.push((*exit, conditions.clone(), (**body).clone()));
+                    Ok(Ctl::Next)
+                }
+                S::Set(assignments) => {
+                    for (target, expr) in assignments {
+                        let local = match target.as_slice() {
+                            [t] => t.ident().map(str::to_lowercase).filter(|n| Self::var_value(ctx, n).is_some()),
+                            _ => None,
+                        };
+                        match local {
+                            Some(n) => {
+                                let v = eval!(expr);
+                                Self::set_var(ctx, &n, v);
+                            }
+                            None => {
+                                let mut t = vec![Token::word("SET")];
+                                t.extend(target.iter().cloned());
+                                t.push(Token::op("="));
+                                t.extend(Self::subst(ctx, expr));
+                                match self.inner_statement(ctx, t).await? {
+                                    Ctl::Next => {}
+                                    other => return Ok(other),
+                                }
+                            }
+                        }
+                    }
+                    Ok(Ctl::Next)
+                }
+                S::If { branches, otherwise } => {
+                    for (cond, body) in branches {
+                        let v = eval!(cond);
+                        if truthy(&v) {
+                            return self.run_list(ctx, body).await;
+                        }
+                    }
+                    match otherwise {
+                        Some(body) => self.run_list(ctx, body).await,
+                        None => Ok(Ctl::Next),
+                    }
+                }
+                S::Case { operand, whens, otherwise } => {
+                    for (when, body) in whens {
+                        let cond = match operand {
+                            Some(o) => {
+                                let mut c = vec![Token::op("(")];
+                                c.extend(o.iter().cloned());
+                                c.extend([Token::op(")"), Token::op("="), Token::op("(")]);
+                                c.extend(when.iter().cloned());
+                                c.push(Token::op(")"));
+                                c
+                            }
+                            None => when.clone(),
+                        };
+                        let v = eval!(&cond);
+                        if truthy(&v) {
+                            return self.run_list(ctx, body).await;
+                        }
+                    }
+                    match otherwise {
+                        Some(body) => self.run_list(ctx, body).await,
+                        None => self.raise(ctx, MyError::new(1339, "20000", "Case not found for CASE statement"), true).await,
+                    }
+                }
+                S::While { label, condition, body } => {
+                    for _ in 0..MAX_TURNS {
+                        let v = eval!(condition);
+                        if !truthy(&v) {
+                            return Ok(Ctl::Next);
+                        }
+                        let r = self.run_list(ctx, body).await?;
+                        match Self::loop_turn(r, label) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(Ctl::Next),
+                            Err(other) => return Ok(other),
+                        }
+                    }
+                    Ok(Ctl::Fail(MyError::new(50000, "HY000", "a loop ran more than ten million times; stopped")))
+                }
+                S::Repeat { label, body, until } => {
+                    for _ in 0..MAX_TURNS {
+                        let r = self.run_list(ctx, body).await?;
+                        match Self::loop_turn(r, label) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(Ctl::Next),
+                            Err(other) => return Ok(other),
+                        }
+                        let v = eval!(until);
+                        if truthy(&v) {
+                            return Ok(Ctl::Next);
+                        }
+                    }
+                    Ok(Ctl::Fail(MyError::new(50000, "HY000", "a loop ran more than ten million times; stopped")))
+                }
+                S::Loop { label, body } => {
+                    for _ in 0..MAX_TURNS {
+                        let r = self.run_list(ctx, body).await?;
+                        match Self::loop_turn(r, label) {
+                            Ok(true) => {}
+                            Ok(false) => return Ok(Ctl::Next),
+                            Err(other) => return Ok(other),
+                        }
+                    }
+                    Ok(Ctl::Fail(MyError::new(50000, "HY000", "a loop ran more than ten million times; stopped")))
+                }
+                S::Leave(l) => Ok(Ctl::Leave(l.clone())),
+                S::Iterate(l) => Ok(Ctl::Iterate(l.clone())),
+                S::Open(name) => {
+                    let Some(d) = ctx.scopes.iter().rposition(|s| s.cursors.contains_key(name)) else {
+                        return self.raise(ctx, MyError::new(1324, "42000", format!("Undefined CURSOR: {name}")), true).await;
+                    };
+                    let (select, open) = ctx.scopes[d].cursors[name].clone();
+                    if open.is_some() {
+                        return self.raise(ctx, MyError::new(1325, "24000", "Cursor is already open"), true).await;
+                    }
+                    let rows = match self.proc_query(ctx, &select).await {
+                        Ok(r) => r,
+                        Err(e) => return self.raise(ctx, e, true).await,
+                    };
+                    ctx.scopes[d].cursors.insert(name.clone(), (select, Some(rows.into_iter().collect())));
+                    Ok(Ctl::Next)
+                }
+                S::Fetch { cursor, into } => {
+                    let Some(d) = ctx.scopes.iter().rposition(|s| s.cursors.contains_key(cursor)) else {
+                        return self.raise(ctx, MyError::new(1324, "42000", format!("Undefined CURSOR: {cursor}")), true).await;
+                    };
+                    let row = match ctx.scopes[d].cursors.get_mut(cursor).and_then(|c| c.1.as_mut()) {
+                        None => return self.raise(ctx, MyError::new(1326, "24000", "Cursor is not open"), true).await,
+                        Some(rows) => rows.pop_front(),
+                    };
+                    let Some(row) = row else {
+                        return self.raise(ctx, no_data(), true).await;
+                    };
+                    if row.len() != into.len() {
+                        return self.raise(ctx, MyError::new(1328, "HY000", "Incorrect number of FETCH variables"), true).await;
+                    }
+                    for (n, v) in into.iter().zip(row) {
+                        if let Err(e) = self.assign_target(ctx, n, v) {
+                            return self.raise(ctx, e, true).await;
+                        }
+                    }
+                    Ok(Ctl::Next)
+                }
+                S::Close(name) => {
+                    let Some(d) = ctx.scopes.iter().rposition(|s| s.cursors.contains_key(name)) else {
+                        return self.raise(ctx, MyError::new(1324, "42000", format!("Undefined CURSOR: {name}")), true).await;
+                    };
+                    let open = ctx.scopes[d].cursors.get_mut(name).map(|c| c.1.take());
+                    if !matches!(open, Some(Some(_))) {
+                        return self.raise(ctx, MyError::new(1326, "24000", "Cursor is not open"), true).await;
+                    }
+                    Ok(Ctl::Next)
+                }
+                S::Signal { state, message, code } => {
+                    let text = match message {
+                        Some(m) => eval!(m).text().unwrap_or_default(),
+                        None => "Unhandled user-defined exception condition".to_string(),
+                    };
+                    let error = MyError::new(code.unwrap_or(if state.starts_with("45") { 1644 } else { 1644 }), static_state(state), text);
+                    self.raise(ctx, error, !state.starts_with("01")).await
+                }
+                S::Resignal => match ctx.handling.clone() {
+                    Some(e) => Ok(Ctl::Fail(e)),
+                    None => Ok(Ctl::Fail(MyError::new(1645, "0K000", "RESIGNAL when handler not active"))),
+                },
+            }
+        })
+    }
+
+    /// A statement of the body through the session, answering only with a
+    /// result set: an OK is taken back, an error goes to the handlers.
+    async fn inner_statement(&mut self, ctx: &mut ProcCtx, tokens: Vec<Token>) -> io::Result<Ctl> {
+        let mark = self.io.mark();
+        let text = ctx.text.clone();
+        let ok = self.statement(&text, tokens, true, ctx.rows).await?;
+        if ok {
+            if self.io.first_since(mark) == Some(0x00) {
+                self.io.rewind(mark);
+            }
+            return Ok(Ctl::Next);
+        }
+        let error = self.last_error.clone().unwrap_or_else(|| MyError::new(1105, "HY000", "a statement in the procedure failed"));
+        if !self.io.rewind(mark) {
+            return Ok(Ctl::Sent);
+        }
+        self.raise(ctx, error, true).await
     }
 }
 

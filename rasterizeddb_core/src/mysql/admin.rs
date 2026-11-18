@@ -279,7 +279,10 @@ pub(crate) fn classify(tokens: &[Token]) -> (Action, Filter) {
             )),
             none,
         ),
-        "CALL" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "HANDLER" | "LOAD" | "XA" => {
+        // CALL and LOAD DATA are run by the session (conn.rs) before this;
+        // here they are only classified for a prepared statement.
+        "CALL" => (Action::Ok, none),
+        "PREPARE" | "EXECUTE" | "DEALLOCATE" | "HANDLER" | "LOAD" | "XA" => {
             (Action::Error(MyError::unsupported(head)), none)
         }
         _ => (Action::Data, none),

@@ -25,6 +25,7 @@ pub(crate) mod lex;
 pub(crate) mod load;
 pub(crate) mod packet;
 pub(crate) mod results;
+pub(crate) mod routine;
 pub(crate) mod translate;
 
 use std::collections::HashMap;

@@ -125,6 +125,17 @@ pub(crate) struct Packets {
     /// The largest packet accepted: small until the client has logged in, so
     /// an unauthenticated one cannot make the server hold megabytes.
     pub(crate) max_packet: usize,
+    /// How many times the output was sent: a [`Mark`] from before a send
+    /// cannot be rewound to.
+    flushes: u64,
+}
+
+/// A point in the output, to take back what was written after it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mark {
+    at: usize,
+    seq: u8,
+    flushes: u64,
 }
 
 /// What a client may send before it has authenticated.
@@ -140,7 +151,35 @@ impl Packets {
             seq: 0,
             exact: true,
             max_packet: MAX_LOGIN_PACKET,
+            flushes: 0,
         }
+    }
+
+    pub(crate) fn mark(&self) -> Mark {
+        Mark {
+            at: self.out.len(),
+            seq: self.seq,
+            flushes: self.flushes,
+        }
+    }
+
+    /// The first byte of the first packet written since `mark` (0x00 OK,
+    /// 0xff ERR, else a result set's column count), if it is still here.
+    pub(crate) fn first_since(&self, mark: Mark) -> Option<u8> {
+        if mark.flushes != self.flushes {
+            return None;
+        }
+        self.out.get(mark.at + 4).copied()
+    }
+
+    /// Takes back what was written since `mark`; false when it was sent.
+    pub(crate) fn rewind(&mut self, mark: Mark) -> bool {
+        if mark.flushes != self.flushes || self.out.len() < mark.at {
+            return false;
+        }
+        self.out.truncate(mark.at);
+        self.seq = mark.seq;
+        true
     }
 
     async fn fill(&mut self, want: usize) -> io::Result<()> {
@@ -267,6 +306,7 @@ impl Packets {
 
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
         if !self.out.is_empty() {
+            self.flushes += 1;
             self.stream.write_all(&self.out).await?;
             self.out.clear();
             if self.out.capacity() > 1024 * 1024 {
