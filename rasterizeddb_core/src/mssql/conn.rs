@@ -2804,8 +2804,6 @@ impl Session {
     }
 }
 
-/// The values of a call's parameters, in the order of the declarations
-/// (by name, or by position when unnamed).
 /// The `#table` a statement makes (`CREATE TABLE #t`, `SELECT … INTO #t`).
 fn temp_table_made(tokens: &[Token]) -> Option<String> {
     let name_at = |i: usize| match tokens.get(i).map(|t| &t.tok) {
@@ -3878,6 +3876,8 @@ impl Session {
     }
 }
 
+/// The values of a call's parameters, in the order of the declarations
+/// (by name, or by position when unnamed).
 fn bind_values(decls: &[(String, bool, u32)], params: &[tds::Param]) -> Vec<ParamValue> {
     let mut out = vec![ParamValue::Null; decls.len()];
     let mut position = 0;

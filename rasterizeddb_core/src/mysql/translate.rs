@@ -110,6 +110,102 @@ pub(crate) trait Env {
     fn connection_id(&self) -> u32;
     fn user(&self) -> &str;
     fn mode(&self) -> Mode;
+    /// A table's `ON UPDATE CURRENT_TIMESTAMP` columns (lower case).
+    fn on_update_columns(&self, _table: &str) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// Where `ON UPDATE CURRENT_TIMESTAMP` columns are recorded, one row per
+/// column: the engine has no such attribute, so UPDATE sets them here.
+pub(crate) const ON_UPDATE_TABLE: &str = "__rdb_mysql_on_update";
+
+/// A change DDL makes to [`ON_UPDATE_TABLE`].
+#[derive(Clone, Debug)]
+pub(crate) enum MetaOp {
+    Set(String, String),
+    Unset(String, String),
+    DropTable(String),
+    RenameTable(String, String),
+    RenameColumn(String, String, String),
+}
+
+/// The statements that keep [`ON_UPDATE_TABLE`] in step with a DDL
+/// statement, run after it.
+fn meta_statements(cx: &Cx) -> Vec<String> {
+    if cx.meta.is_empty() {
+        return Vec::new();
+    }
+    let exists = cx.env.database().has_table(ON_UPDATE_TABLE);
+    if !exists && !cx.meta.iter().any(|m| matches!(m, MetaOp::Set(..))) {
+        return Vec::new();
+    }
+    let lit = |s: &str| crate::sqlcompat::string_sql(s.as_bytes());
+    let key = |t: &str, c: &str| lit(&format!("{t}.{c}"));
+    let mut out = Vec::new();
+    if !exists {
+        out.push(format!(
+            "CREATE TABLE IF NOT EXISTS {ON_UPDATE_TABLE} (id text PRIMARY KEY, tbl text NOT NULL, col text NOT NULL)"
+        ));
+    }
+    for op in &cx.meta {
+        out.push(match op {
+            MetaOp::Set(t, c) => format!(
+                "INSERT INTO {ON_UPDATE_TABLE} (id, tbl, col) VALUES ({}, {}, {}) ON CONFLICT (id) DO NOTHING",
+                key(t, c),
+                lit(t),
+                lit(c)
+            ),
+            MetaOp::Unset(t, c) => format!("DELETE FROM {ON_UPDATE_TABLE} WHERE id = {}", key(t, c)),
+            MetaOp::DropTable(t) => format!("DELETE FROM {ON_UPDATE_TABLE} WHERE tbl = {}", lit(t)),
+            MetaOp::RenameTable(a, b) => format!(
+                "UPDATE {ON_UPDATE_TABLE} SET tbl = {b}, id = {b} || '.' || col WHERE tbl = {a}",
+                a = lit(a),
+                b = lit(b)
+            ),
+            MetaOp::RenameColumn(t, a, b) => format!(
+                "UPDATE {ON_UPDATE_TABLE} SET col = {}, id = {} WHERE id = {}",
+                lit(b),
+                key(t, b),
+                key(t, a)
+            ),
+        });
+    }
+    out
+}
+
+/// `, c = CASE WHEN a IS DISTINCT FROM (new a) OR … THEN CURRENT_TIMESTAMP
+/// ELSE c END` for each ON UPDATE column not assigned: MySQL sets it when
+/// the row changes.
+fn on_update_assignments(cx: &Cx, table: &str, qualifier: &str, assigned: &[(String, String)]) -> String {
+    let columns = cx.env.on_update_columns(table);
+    if columns.is_empty() || assigned.is_empty() {
+        return String::new();
+    }
+    let q = |c: &str| {
+        if qualifier.is_empty() {
+            ident_sql(c)
+        } else {
+            format!("{}.{}", ident_sql(qualifier), ident_sql(c))
+        }
+    };
+    let changed = assigned
+        .iter()
+        .map(|(c, e)| format!("{} IS DISTINCT FROM ({e})", q(c)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut out = String::new();
+    for c in columns {
+        if assigned.iter().any(|(a, _)| *a == c) {
+            continue;
+        }
+        out.push_str(&format!(
+            ", {} = CASE WHEN {changed} THEN CURRENT_TIMESTAMP ELSE {} END",
+            ident_sql(&c),
+            q(&c)
+        ));
+    }
+    out
 }
 
 /// What kind of answer a forwarded statement gives.
@@ -187,6 +283,10 @@ pub(crate) struct Cx<'a> {
     ddl: bool,
     /// Select-list aliases, as written: a later reference keeps their case.
     aliases: Vec<String>,
+    /// The table a CREATE / ALTER TABLE is defining.
+    table: Option<String>,
+    /// What the DDL changes in the ON UPDATE record.
+    meta: Vec<MetaOp>,
 }
 
 impl<'a> Cx<'a> {
@@ -196,6 +296,8 @@ impl<'a> Cx<'a> {
             placeholders,
             ddl: false,
             aliases: Vec::new(),
+            table: None,
+            meta: Vec::new(),
         }
     }
 }
@@ -1701,6 +1803,7 @@ fn rewrite_insert(
         }
         // Targets are bare names in the engine's SET: `t.a = …` → `a = …`.
         let mut parts = Vec::new();
+        let mut assigned = Vec::new();
         for part in split_commas(&assignments) {
             let eq = part
                 .iter()
@@ -1711,8 +1814,14 @@ fn rewrite_insert(
                 .and_then(|t| t.ident())
                 .ok_or_else(|| MyError::syntax("a column name was expected"))?;
             let mut p = vec![Token::raw(ident_sql(name)), Token::op("=")];
-            p.extend(rewrite_expr(part[eq + 1..].to_vec(), cx)?);
+            let value = rewrite_expr(part[eq + 1..].to_vec(), cx)?;
+            assigned.push((name.to_lowercase(), render(&value)?));
+            p.extend(value);
             parts.push(p);
+        }
+        let extra = on_update_assignments(cx, &table, &table, &assigned);
+        if !extra.is_empty() {
+            parts.push(vec![Token::raw(extra.trim_start_matches(", ").to_string())]);
         }
         out.push(Token::raw(format!(
             "ON CONFLICT{} DO UPDATE SET",
@@ -1891,6 +2000,7 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         (table, None, None)
     };
     out.push(Token::word("SET"));
+    let mut assigned = Vec::new();
     for (n, part) in split_commas(&tokens[set_at + 1..assign_end])
         .into_iter()
         .enumerate()
@@ -1908,7 +2018,26 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         }
         out.push(Token::raw(ident_sql(name)));
         out.push(Token::op("="));
-        out.extend(rewrite_expr(part[eq + 1..].to_vec(), cx)?);
+        let value = rewrite_expr(part[eq + 1..].to_vec(), cx)?;
+        assigned.push((name.to_lowercase(), render(&value)?));
+        out.extend(value);
+    }
+    // ON UPDATE CURRENT_TIMESTAMP columns: qualified by the target's alias
+    // when other tables are in the statement.
+    let qualifier = if from_clause.is_some() {
+        let main = &target[..join_at.unwrap_or(target.len())];
+        let (_, after) = table_name_at(main, 0).unwrap_or((table.clone(), main.len()));
+        let mut a = after;
+        if kw(main, a, "AS") {
+            a += 1;
+        }
+        main.get(a).and_then(|t| t.ident()).map(str::to_lowercase).unwrap_or_else(|| table.clone())
+    } else {
+        String::new()
+    };
+    let extra = on_update_assignments(cx, &table, &qualifier, &assigned);
+    if !extra.is_empty() {
+        out.push(Token::raw(extra));
     }
     if let Some(from) = from_clause.take() {
         out.push(Token::word("FROM"));
@@ -2213,9 +2342,21 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
             "CHARSET" | "COLLATE" => k += 2,
             "VISIBLE" | "INVISIBLE" => k += 1,
             "ON" if kw(def, k + 1, "UPDATE") => {
-                return Err(MyError::unsupported(
-                    "ON UPDATE CURRENT_TIMESTAMP (set the column in the UPDATE)",
-                ));
+                // ON UPDATE CURRENT_TIMESTAMP[(n)]: recorded, and set by
+                // UPDATE when the row changes.
+                let now = def.get(k + 2).and_then(|t| t.upper()).unwrap_or_default();
+                if !matches!(now.as_str(), "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME") {
+                    return Err(MyError::unsupported(format!("ON UPDATE {now}")));
+                }
+                k += 3;
+                if def.get(k).is_some_and(|t| t.is_op("(")) {
+                    k = matching_paren(def, k).ok_or_else(|| MyError::syntax("unbalanced ON UPDATE"))? + 1;
+                }
+                let table = cx
+                    .table
+                    .clone()
+                    .ok_or_else(|| MyError::unsupported("ON UPDATE CURRENT_TIMESTAMP here"))?;
+                cx.meta.push(MetaOp::Set(table, name.to_lowercase()));
             }
             "REFERENCES" | "CHECK" | "CONSTRAINT" => {
                 let previous = std::mem::replace(&mut cx.ddl, true);
@@ -2285,6 +2426,10 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
     }
     let (table, after) =
         table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("CREATE TABLE needs a name"))?;
+    cx.table = Some(table.clone());
+    // IF NOT EXISTS over a table that is there makes nothing, so records
+    // nothing.
+    let records = !(if_not_exists && cx.env.database().has_table(&table));
     if kw(&tokens, after, "LIKE") {
         return Err(MyError::unsupported("CREATE TABLE … LIKE"));
     }
@@ -2439,6 +2584,9 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         defs.join(", ")
     )];
     statements.extend(after_statements);
+    if !records {
+        cx.meta.clear();
+    }
     Ok(Forward {
         statements,
         kind: Kind::Ddl,
@@ -2457,6 +2605,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
     i += 1; // TABLE
     let (table, after) =
         table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("ALTER TABLE needs a name"))?;
+    cx.table = Some(table.clone());
     let t = ident_sql(&table);
     let database = cx.env.database().clone();
     let mut statements = Vec::new();
@@ -2617,6 +2766,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                             .and_then(|t| t.ident())
                             .ok_or_else(|| MyError::syntax("a column name was expected"))?;
                         statements.push(format!("ALTER TABLE {t} DROP COLUMN {}", ident_sql(name)));
+                        cx.meta.push(MetaOp::Unset(table.clone(), name.to_lowercase()));
                     }
                 }
             }
@@ -2647,6 +2797,9 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                         ident_sql(&new)
                     ));
                 }
+                // MODIFY/CHANGE replace the definition: ON UPDATE goes
+                // unless the new one says it again.
+                cx.meta.push(MetaOp::Unset(table.clone(), old.clone()));
                 let (column, checks) = column_definition(&def, cx)?;
                 // `name type attrs…` → TYPE, then NULL-ness and default.
                 let without_name = column.splitn(2, ' ').nth(1).unwrap_or("").to_string();
@@ -2714,6 +2867,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                         ident_sql(a),
                         ident_sql(b)
                     ));
+                    cx.meta.push(MetaOp::RenameColumn(table.clone(), a.to_lowercase(), b.to_lowercase()));
                 } else if kw(&spec, 1, "INDEX") || kw(&spec, 1, "KEY") {
                     return Err(MyError::unsupported("RENAME INDEX"));
                 } else {
@@ -2724,6 +2878,7 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                     let (new, _) = table_name_at(&spec, k)
                         .ok_or_else(|| MyError::syntax("a table name was expected"))?;
                     statements.push(format!("ALTER TABLE {t} RENAME TO {}", ident_sql(&new)));
+                    cx.meta.push(MetaOp::RenameTable(table.clone(), new.clone()));
                 }
             }
             // Storage options: the engine chooses its own. DISABLE/ENABLE
@@ -2898,6 +3053,7 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
             for part in split_commas(&tokens[i..end]) {
                 let (name, _) = table_name_at(&part, 0)
                     .ok_or_else(|| MyError::syntax("a table name was expected"))?;
+                cx.meta.push(MetaOp::DropTable(name.clone()));
                 names.push(ident_sql(&name));
             }
             names
@@ -3095,6 +3251,7 @@ pub(crate) fn translate(
                     .ok_or_else(|| MyError::syntax("a table name was expected"))?;
                 let (b, _) = table_name_at(&part, to + 1)
                     .ok_or_else(|| MyError::syntax("a table name was expected"))?;
+                cx.meta.push(MetaOp::RenameTable(a.clone(), b.clone()));
                 statements.push(format!(
                     "ALTER TABLE {} RENAME TO {}",
                     ident_sql(&a),
@@ -3143,6 +3300,7 @@ pub(crate) fn translate(
             deferred: Vec::new(),
         },
     };
+    forward.statements.extend(meta_statements(&cx));
     forward.params = params;
     Ok(forward)
 }
@@ -3448,12 +3606,13 @@ mod tests {
             err(&e, "CREATE TABLE t (a INT, FULLTEXT KEY f (a))").code,
             1235
         );
+        // ON UPDATE CURRENT_TIMESTAMP: the column, and its record.
+        let created = tr(&e, "CREATE TABLE t (a INT, b TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP(6))");
+        assert!(created.starts_with("CREATE TABLE t (a integer, b timestamptz DEFAULT CURRENT_TIMESTAMP)"), "{created}");
+        assert!(created.contains("CREATE TABLE IF NOT EXISTS __rdb_mysql_on_update"), "{created}");
+        assert!(created.contains("VALUES ('t.b', 't', 'b')"), "{created}");
         assert_eq!(
-            err(
-                &e,
-                "CREATE TABLE t (a TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
-            )
-            .code,
+            err(&e, "CREATE TABLE t (a TIMESTAMP ON UPDATE NULL)").code,
             1235
         );
     }

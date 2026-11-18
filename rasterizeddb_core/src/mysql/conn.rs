@@ -173,6 +173,13 @@ pub(crate) struct Session {
     found_rows: u64,
     row_count: i64,
     warnings: Vec<(String, u16, String)>,
+    /// The ON UPDATE CURRENT_TIMESTAMP columns of each table, read before a
+    /// write is translated.
+    on_update: HashMap<String, Vec<String>>,
+    /// TEMPORARY tables: their name → the table that holds them (the engine
+    /// has no temporary tables; see [`crate::sqlcompat::TEMP_PREFIX`]).
+    temp_tables: HashMap<String, String>,
+    temp_prefix: String,
     statements: HashMap<u32, Prepared>,
     next_statement: u32,
     next_isolation: Option<String>,
@@ -257,6 +264,9 @@ pub(crate) async fn serve_connection(
         found_rows: 0,
         row_count: -1,
         warnings: Vec::new(),
+        on_update: HashMap::new(),
+        temp_tables: HashMap::new(),
+        temp_prefix: crate::sqlcompat::temp_table_prefix("my", crate::sqlcompat::next_connection_id()),
         statements: HashMap::new(),
         next_statement: 1,
         next_isolation: None,
@@ -278,6 +288,7 @@ pub(crate) async fn serve_connection(
         }
     };
     super::registry().lock().remove(&conn_id);
+    session.drop_temp_tables().await;
     if let Some(bridge) = session.bridge.take() {
         bridge.terminate().await;
     }
@@ -601,6 +612,9 @@ impl Env for Session {
     fn user(&self) -> &str {
         &self.user
     }
+    fn on_update_columns(&self, table: &str) -> Vec<String> {
+        self.on_update.get(table).cloned().unwrap_or_default()
+    }
     fn mode(&self) -> Mode {
         Mode::from_sql_mode(
             self.vars
@@ -848,6 +862,7 @@ impl Session {
         if self.bridge.as_ref().is_some_and(|b| b.in_block()) {
             let _ = self.silent("ROLLBACK").await;
         }
+        self.drop_temp_tables().await;
         let names: Vec<String> = self
             .statements
             .drain()
@@ -970,6 +985,39 @@ impl Session {
         match error {
             Some(e) => Err(e),
             None => Ok(tag),
+        }
+    }
+
+    /// Before a write is translated: the tables' ON UPDATE CURRENT_TIMESTAMP
+    /// columns, when any are recorded.
+    async fn load_on_update(&mut self, tokens: &[Token]) {
+        self.on_update.clear();
+        let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
+        if !matches!(head.as_str(), "UPDATE" | "INSERT" | "REPLACE") {
+            return;
+        }
+        if !self.bridge().database.has_table(translate::ON_UPDATE_TABLE) {
+            return;
+        }
+        let guard = self.bridge().in_block();
+        if guard {
+            let _ = self.silent("SAVEPOINT rdb_mysql_meta").await;
+        }
+        let read = self
+            .fetch(&format!("SELECT tbl, col FROM {}", translate::ON_UPDATE_TABLE))
+            .await;
+        if guard {
+            if read.is_err() {
+                let _ = self.silent("ROLLBACK TO SAVEPOINT rdb_mysql_meta").await;
+            }
+            let _ = self.silent("RELEASE SAVEPOINT rdb_mysql_meta").await;
+        }
+        if let Ok((_, rows)) = read {
+            for row in rows {
+                if let (Some(Some(t)), Some(Some(c))) = (row.first(), row.get(1)) {
+                    self.on_update.entry(t.clone()).or_default().push(c.clone());
+                }
+            }
         }
     }
 
@@ -1376,6 +1424,18 @@ impl Session {
         more: bool,
         rows_mode: Rows,
     ) -> io::Result<bool> {
+        let temp = match self.bind_temp_tables(tokens) {
+            Ok(t) => t,
+            Err(e) => {
+                self.err(&e);
+                return Ok(false);
+            }
+        };
+        if temp.noop {
+            self.ok_more(more);
+            return Ok(true);
+        }
+        let tokens = temp.tokens;
         let (action, filter) = admin::classify(&tokens);
         let keeps_warnings = matches!(action, Action::Show(Show::Warnings | Show::CountWarnings))
             || tokens
@@ -1386,9 +1446,26 @@ impl Session {
         }
         match action {
             Action::Data => {
+                self.load_on_update(&tokens).await;
                 let translated = translate::translate(sql, tokens, self, false);
                 match translated {
-                    Ok(forward) => self.forward(forward, more, rows_mode, None).await,
+                    Ok(mut forward) => {
+                        // CREATE / DROP TEMPORARY TABLE do not commit what
+                        // is open, in MySQL.
+                        if temp.created.is_some() || !temp.dropped.is_empty() {
+                            forward.kind = Kind::Write;
+                        }
+                        let ok = self.forward(forward, more, rows_mode, None).await?;
+                        if ok {
+                            if let Some((name, table)) = temp.created {
+                                self.temp_tables.insert(name, table);
+                            }
+                            for name in temp.dropped {
+                                self.temp_tables.remove(&name);
+                            }
+                        }
+                        Ok(ok)
+                    }
                     Err(e) => {
                         self.err(&e);
                         Ok(false)
@@ -1921,9 +1998,9 @@ impl Session {
             Show::Tables { full, database } => {
                 let target = database.unwrap_or_else(|| db.clone());
                 let listing = if target == db {
-                    self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' ORDER BY table_name").await
+                    self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' AND substring(table_name, 1, 2) <> '__' ORDER BY table_name").await
                 } else {
-                    match self.other_database_fetch(&target, "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' ORDER BY table_name").await {
+                    match self.other_database_fetch(&target, "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' AND substring(table_name, 1, 2) <> '__' ORDER BY table_name").await {
                         Ok(r) => r,
                         Err(e) => {
                             self.err(&e);
@@ -2296,7 +2373,7 @@ impl Session {
                 .await
             }
             Show::TableStatus => {
-                let rows = match self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' ORDER BY table_name").await {
+                let rows = match self.fetch("SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'public' AND table_name <> 'rdb_roles' AND substring(table_name, 1, 2) <> '__' ORDER BY table_name").await {
                     Ok((_, rows)) => rows,
                     Err(e) => {
                         self.err(&results::error_from_engine(&e));
@@ -2695,7 +2772,7 @@ impl Session {
             }));
             return Ok(());
         }
-        let tokens = statements.pop().unwrap();
+        let tokens = self.rename_temp_references(statements.pop().unwrap());
         let params = tokens
             .iter()
             .filter(|t| matches!(t.tok, Tok::Param(_)))
@@ -2714,6 +2791,7 @@ impl Session {
         };
         let mut columns: Vec<MyColumn> = Vec::new();
         if matches!(action, Action::Data) {
+            self.load_on_update(&tokens).await;
             let forward = match translate::translate(sql, tokens, self, true) {
                 Ok(f) => f,
                 Err(e) => {
@@ -2883,6 +2961,160 @@ impl Session {
         }
         self.statements.insert(id, prepared);
         Ok(())
+    }
+}
+
+/// A statement with its TEMPORARY tables named as the tables holding them.
+struct TempBound {
+    tokens: Vec<Token>,
+    /// CREATE TEMPORARY TABLE: (its name, the table made).
+    created: Option<(String, String)>,
+    /// DROP TABLE of temporary tables: their names.
+    dropped: Vec<String>,
+    /// DROP TEMPORARY TABLE IF EXISTS of none: answered OK, nothing runs.
+    noop: bool,
+}
+
+/// TEMPORARY tables, which the engine does not have: a table per
+/// connection, under a name of its own, dropped when the connection ends
+/// or is reset. A temporary table hides a table of its name, as in MySQL.
+impl Session {
+    fn temp_name(&self, name: &str) -> String {
+        format!("{}{}", self.temp_prefix, name.to_lowercase())
+    }
+
+    fn bind_temp_tables(&self, tokens: Vec<Token>) -> Result<TempBound, MyError> {
+        use crate::sqlcompat::kw;
+        let quoted = |t: &Token, name: String| Token {
+            tok: Tok::Quoted(name),
+            space: t.space,
+            span: t.span,
+        };
+        // CREATE TEMPORARY TABLE [IF NOT EXISTS] name …
+        if kw(&tokens, 0, "CREATE") && kw(&tokens, 1, "TEMPORARY") && kw(&tokens, 2, "TABLE") {
+            let mut at = 3;
+            if kw(&tokens, at, "IF") && kw(&tokens, at + 1, "NOT") && kw(&tokens, at + 2, "EXISTS") {
+                at += 3;
+            }
+            let mut name_at = at;
+            if tokens.get(at + 1).is_some_and(|t| t.is_op(".")) {
+                name_at = at + 2;
+            }
+            let name = tokens
+                .get(name_at)
+                .and_then(|t| t.ident())
+                .ok_or_else(|| MyError::syntax("CREATE TEMPORARY TABLE needs a name"))?
+                .to_lowercase();
+            let table = self.temp_name(&name);
+            let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+            for (k, t) in tokens.iter().enumerate() {
+                if k == 1 {
+                    continue;
+                }
+                if k == at && name_at != at {
+                    continue;
+                }
+                if k == at + 1 && name_at != at {
+                    continue;
+                }
+                out.push(if k == name_at { quoted(t, table.clone()) } else { t.clone() });
+            }
+            return Ok(TempBound {
+                tokens: out,
+                created: Some((name, table)),
+                dropped: Vec::new(),
+                noop: false,
+            });
+        }
+        // DROP [TEMPORARY] TABLE [IF EXISTS] a, b
+        let mut dropped = Vec::new();
+        if kw(&tokens, 0, "DROP") && (kw(&tokens, 1, "TABLE") || (kw(&tokens, 1, "TEMPORARY") && kw(&tokens, 2, "TABLE"))) {
+            let temporary = kw(&tokens, 1, "TEMPORARY");
+            let mut at = if temporary { 3 } else { 2 };
+            let if_exists = kw(&tokens, at, "IF") && kw(&tokens, at + 1, "EXISTS");
+            if if_exists {
+                at += 2;
+            }
+            for part in crate::sqlcompat::split_commas(&tokens[at..]) {
+                let name = part.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+                if self.temp_tables.contains_key(&name) {
+                    dropped.push(name);
+                } else if temporary && !if_exists {
+                    return Err(MyError::new(1051, "42S02", format!("Unknown table '{name}'")));
+                }
+            }
+            if temporary {
+                // Only the temporary tables named.
+                if dropped.is_empty() {
+                    return Ok(TempBound { tokens, created: None, dropped, noop: true });
+                }
+                let mut out = vec![tokens[0].clone(), tokens[2].clone()];
+                for (n, name) in dropped.iter().enumerate() {
+                    if n > 0 {
+                        out.push(Token::op(","));
+                    }
+                    out.push(Token::new(Tok::Quoted(self.temp_tables[name].clone())));
+                }
+                return Ok(TempBound { tokens: out, created: None, dropped, noop: false });
+            }
+        }
+        Ok(TempBound {
+            tokens: self.rename_temp_references(tokens),
+            created: None,
+            dropped,
+            noop: false,
+        })
+    }
+
+    /// Each temporary table's name, where a table's name stands, as the
+    /// table holding it.
+    fn rename_temp_references(&self, tokens: Vec<Token>) -> Vec<Token> {
+        if self.temp_tables.is_empty() {
+            return tokens;
+        }
+        let mut in_tables = false;
+        let mut out = Vec::with_capacity(tokens.len());
+        for k in 0..tokens.len() {
+            let t = &tokens[k];
+            let word = match &t.tok {
+                Tok::Word(w) => Some(w.to_ascii_uppercase()),
+                _ => None,
+            };
+            let table = t.ident().and_then(|n| self.temp_tables.get(&n.to_lowercase()));
+            let prev_dot = k > 0 && tokens[k - 1].is_op(".");
+            let next_dot = tokens.get(k + 1).is_some_and(|n| n.is_op("."));
+            let next_call = tokens.get(k + 1).is_some_and(|n| n.is_op("("));
+            match (table, word.as_deref()) {
+                (Some(table), _) if !prev_dot && !next_call && (in_tables || next_dot) => {
+                    out.push(Token {
+                        tok: Tok::Quoted(table.clone()),
+                        space: t.space,
+                        span: t.span,
+                    });
+                    continue;
+                }
+                (_, Some("FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE" | "TABLES" | "DESCRIBE" | "DESC" | "EXPLAIN")) => in_tables = true,
+                (_, Some("WHERE" | "ON" | "SET" | "GROUP" | "ORDER" | "LIMIT" | "USING" | "VALUES" | "VALUE" | "SELECT" | "HAVING" | "UNION" | "LIKE" | "WITH")) => in_tables = false,
+                _ => {}
+            }
+            if t.is_op("(") {
+                in_tables = false;
+            }
+            out.push(t.clone());
+        }
+        out
+    }
+
+    async fn drop_temp_tables(&mut self) {
+        if self.temp_tables.is_empty() || self.bridge.is_none() {
+            return;
+        }
+        if self.bridge().in_block() {
+            let _ = self.silent("ROLLBACK").await;
+        }
+        for (_, table) in std::mem::take(&mut self.temp_tables) {
+            let _ = self.silent(&format!("DROP TABLE IF EXISTS {}", crate::sqlcompat::ident_sql(&table))).await;
+        }
     }
 }
 
