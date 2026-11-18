@@ -36,6 +36,47 @@ pub(super) async fn run_internal(database: &Arc<Database>, state: &mut SessionSt
     Ok(Ok(last_command_tag(sink.get_ref())))
 }
 
+/// [`run_internal`] for table DDL: inside a block, made undoable as the
+/// block's own DDL is (`execute_recorded`): a `DROP TABLE` deferred to the
+/// block's commit, and any other kept aside by `block_ddl_prepare`, so a
+/// `ROLLBACK` takes it back. Run as a plain internal statement, a
+/// materialized view's table, a temporary table or a rename survived the
+/// block's ROLLBACK.
+pub(super) async fn run_internal_ddl(database: &Arc<Database>, state: &mut SessionState, sql: &str) -> io::Result<Result<String, String>> {
+    let Some(root) = state.transaction.as_ref().map(|t| t.id) else {
+        return run_internal(database, state, sql).await;
+    };
+    // The statement's ACCESS EXCLUSIVE, taken as the block path takes it:
+    // kept to the block's end when the DDL is the block's to undo (a
+    // ROLLBACK drops or restores the table under it).
+    let ddl = crate::core::rql::executor::BlockDdl::begin(database, root, sql);
+    let mut transactional = false;
+    let result = if let Some(drops) = deferred_drops(database, root, sql) {
+        transactional = true;
+        Ok(match drops {
+            Ok(drops) => database.block_drop_defer(root, drops).await.map(|_| "DROP TABLE".to_string()),
+            Err((_, message)) => Err(message),
+        })
+    } else {
+        match database.block_ddl_prepare(root, sql).await {
+            Ok(t) => {
+                transactional = t;
+                run_internal(database, state, sql).await
+            }
+            Err(e) => Ok(Err(e)),
+        }
+    };
+    if transactional {
+        state.kept_ddl_locks = true;
+    }
+    if let Some(ddl) = ddl
+        && !transactional
+    {
+        ddl.end(database);
+    }
+    result
+}
+
 /// [`run_internal`] for a query: the column names its `RowDescription` gave.
 async fn run_for_view_described(
     database: &Arc<Database>,
@@ -310,7 +351,7 @@ where
             expanded,
             if with_data { "" } else { " WITH NO DATA" }
         );
-        match run_internal(database, state, &ctas).await? {
+        match run_internal_ddl(database, state, &ctas).await? {
             Ok(tag) => tag,
             Err(e) => return report_run_failure(stream, &e).await,
         }
@@ -415,7 +456,7 @@ where
         }
         if view.kind == ViewKind::Materialized {
             let sql = format!("DROP TABLE {}", views::quote_ident(&view.name));
-            if let Err(e) = run_internal(database, state, &sql).await? {
+            if let Err(e) = run_internal_ddl(database, state, &sql).await? {
                 report_run_failure(stream, &e).await?;
                 return Ok(Err(()));
             }
@@ -557,7 +598,7 @@ where
     }
     if view.kind == ViewKind::Materialized {
         let sql = format!("ALTER TABLE {} RENAME TO {}", views::quote_ident(from), views::quote_ident(to));
-        if let Err(e) = run_internal(database, state, &sql).await? {
+        if let Err(e) = run_internal_ddl(database, state, &sql).await? {
             return report_run_failure(stream, &e).await;
         }
     }
@@ -682,7 +723,7 @@ where
                 return Ok(false);
             }
             // The rename, then its views pointed at the new name.
-            match run_internal(database, state, stmt).await? {
+            match run_internal_ddl(database, state, stmt).await? {
                 Ok(_) => {}
                 Err(e) => {
                     report_run_failure(stream, &e).await?;

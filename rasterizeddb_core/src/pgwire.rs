@@ -41,6 +41,7 @@ mod sequence_statements;
 mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
+mod temp_tables;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -2378,6 +2379,8 @@ where
         t.abort_unless_aborted(database);
         t.owner.release();
     }
+    // The session's temporary tables go with it.
+    temp_tables::drop_all(database, &mut state).await;
     result
 }
 
@@ -2787,6 +2790,14 @@ struct SessionState {
     /// The tables whose triggers are held off while this session writes the
     /// rows they were run for (`trigger_exec`).
     triggers_suppressed: Vec<String>,
+    /// Set when a statement run for this one (`run_internal_ddl`) made DDL
+    /// the block undoes: the statement's table locks are then the block's,
+    /// kept to its end, as for the block's own DDL.
+    kept_ddl_locks: bool,
+    /// This session's temporary tables (`temp_tables`).
+    temp_tables: Vec<temp_tables::TempTable>,
+    /// What this session's temporary tables' real names are made unique by.
+    temp_session: u64,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -3161,6 +3172,9 @@ impl SessionState {
             refreshing_materialized: None,
             sequence_values: StdArc::default(),
             triggers_suppressed: Vec::new(),
+            kept_ddl_locks: false,
+            temp_tables: Vec::new(),
+            temp_session: fastrand::u64(..),
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -3971,9 +3985,13 @@ async fn description_now(
         Some(fields) => Some((fields, true)),
         // Nothing to describe: the reply is `NoData` whatever the tables hold.
         None if value_free == Some(ValueFreeShape::NoRows) => None,
-        None => describe_for_wire(database, query)
-            .await?
-            .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select)),
+        None => {
+            // A temporary table is described under its real name, as it runs.
+            let temp_rewritten = temp_tables::rewrite(&state.temp_tables, query);
+            describe_for_wire(database, temp_rewritten.as_deref().unwrap_or(query))
+                .await?
+                .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select))
+        }
     };
 
     if let Some((fields, true)) = &description {
@@ -6226,6 +6244,11 @@ where
                             if let Some(t) = state.transaction.as_mut() {
                                 t.ddl_mark = None;
                             }
+                            // DDL a statement ran for this one is the block's
+                            // too (`run_internal_ddl`).
+                            if std::mem::take(&mut state.kept_ddl_locks) {
+                                transactional = true;
+                            }
                             result
                         }),
                     )
@@ -6992,6 +7015,9 @@ where
     )
     .await;
     crate::core::rql::sequence_catalog::flush(database).await;
+    if !state.view_internal {
+        temp_tables::end_of_transaction(database, state).await;
+    }
     if ran.is_ok() && !state.statement_failed && let Some(ddl) = crate::core::rql::views::table_ddl(stmt) {
         trigger_exec::after_table_ddl(database, state.current_tx(), &ddl).await;
     }
@@ -7023,6 +7049,35 @@ where
     };
     let stmt = rewritten.as_ref();
 
+    // Temporary tables (`temp_tables`): created here, and every reference to
+    // one written as its real name before anything else reads the text.
+    if temp_tables::handle_create(database, state, stream, stmt).await? {
+        return Ok(());
+    }
+    {
+        let lower = stmt.trim().trim_end_matches(';').to_ascii_lowercase();
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        match words.as_slice() {
+            ["discard", "all"] if state.transaction.is_none() => {
+                temp_tables::drop_all(database, state).await;
+                *state.sequence_values.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+            }
+            ["discard", "temp" | "temporary"] => temp_tables::drop_all(database, state).await,
+            ["discard", "sequences"] => {
+                *state.sequence_values.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+            }
+            _ => {}
+        }
+    }
+    let temp_rewritten;
+    let stmt = match temp_tables::rewrite(&state.temp_tables, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            temp_rewritten = text;
+            temp_rewritten.as_str()
+        }
+        None => stmt,
+    };
     // Views (`core::rql::views`): their own statements are answered here,
     // table DDL is checked against them, and a statement reading one is
     // given its query as a derived table, before anything else plans it.

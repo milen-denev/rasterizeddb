@@ -137,7 +137,7 @@ where
                             crate::core::rql::views::quote_ident(table),
                             crate::core::rql::views::quote_ident(column)
                         );
-                        if let Err(e) = super::view_statements::run_internal(database, state, &sql).await? {
+                        if let Err(e) = super::view_statements::run_internal_ddl(database, state, &sql).await? {
                             return send_error_response(stream, sqlstate_for(&e), &e).await;
                         }
                     }
