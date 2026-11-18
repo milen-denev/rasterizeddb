@@ -129,15 +129,19 @@ pub async fn bind(config: MsConfig) -> io::Result<MsListener> {
                     ),
                 ));
             }
-            let (listener, file) = rastcp::net::SocketFile::bind(&socket.path, socket.mode, socket.group)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let (listener, file) =
+                rastcp::net::SocketFile::bind(&socket.path, socket.mode, socket.group)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
             Some((tokio::net::UnixListener::from_std(listener)?, file))
         }
         None => None,
     };
     #[cfg(not(unix))]
     if config.socket.is_some() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "unix sockets are not supported on this platform"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix sockets are not supported on this platform",
+        ));
     }
     let tcp = match &config.tcp {
         Some((addr, port)) => Some(tokio::net::TcpListener::bind(format!("{addr}:{port}")).await?),
@@ -158,7 +162,9 @@ pub struct MsServer {
 
 pub async fn serve(listener: MsListener, catalog: Arc<DatabaseCatalog>) -> io::Result<MsServer> {
     let config = listener.config.clone();
-    if config.auth == MsAuth::Password || config.socket.as_ref().and_then(|s| s.auth) == Some(MsAuth::Password) {
+    if config.auth == MsAuth::Password
+        || config.socket.as_ref().and_then(|s| s.auth) == Some(MsAuth::Password)
+    {
         for database in catalog.all() {
             crate::auth::ensure_role_catalogue(
                 &database,
@@ -179,7 +185,10 @@ pub async fn serve(listener: MsListener, catalog: Arc<DatabaseCatalog>) -> io::R
         )?),
     };
     if let Some((addr, port)) = &config.tcp {
-        let public = addr.parse::<std::net::IpAddr>().map(|ip| !ip.is_loopback()).unwrap_or(true);
+        let public = addr
+            .parse::<std::net::IpAddr>()
+            .map(|ip| !ip.is_loopback())
+            .unwrap_or(true);
         if public && config.tls != MsTls::Require {
             log::warn!(
                 "the SQL Server protocol is bound to {addr}:{port} with TLS {:?}: a client that declines \
@@ -202,7 +211,10 @@ pub async fn serve(listener: MsListener, catalog: Arc<DatabaseCatalog>) -> io::R
         log::info!("SQL Server protocol listening on {addr}:{port}");
     }
     if let Some(socket) = shared.config.socket.as_ref() {
-        log::info!("SQL Server protocol listening on unix socket {}", socket.path.display());
+        log::info!(
+            "SQL Server protocol listening on unix socket {}",
+            socket.path.display()
+        );
     }
     Ok(MsServer { shared, task })
 }
@@ -261,9 +273,11 @@ async fn accept_loop(listener: MsListener, shared: StdArc<Shared>) {
             Ok((base, peer)) => {
                 backoff = Duration::from_millis(50);
                 let shared = shared.clone();
-                let over = shared.active.fetch_add(1, Ordering::AcqRel) >= shared.config.limits.max_connections;
+                let over = shared.active.fetch_add(1, Ordering::AcqRel)
+                    >= shared.config.limits.max_connections;
                 tokio::spawn(async move {
-                    let result = conn::serve_connection(base, peer.clone(), shared.clone(), over).await;
+                    let result =
+                        conn::serve_connection(base, peer.clone(), shared.clone(), over).await;
                     shared.active.fetch_sub(1, Ordering::AcqRel);
                     if let Err(e) = result {
                         log::debug!("SQL Server connection from {peer} ended: {e}");

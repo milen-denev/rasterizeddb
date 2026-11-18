@@ -114,7 +114,6 @@ impl MyColumn {
             conv: Conv::Plain,
         }
     }
-
 }
 
 /// The MySQL column for an engine column.
@@ -123,9 +122,30 @@ pub(crate) fn column_for(field: &PgField) -> MyColumn {
         16 => (T_TINY, CHARSET_BINARY, 1, F_NUM | F_BINARY, 0, Conv::Bool),
         21 => (T_SHORT, CHARSET_BINARY, 6, F_NUM | F_BINARY, 0, Conv::Plain),
         23 | 26 => (T_LONG, CHARSET_BINARY, 11, F_NUM | F_BINARY, 0, Conv::Plain),
-        20 => (T_LONGLONG, CHARSET_BINARY, 20, F_NUM | F_BINARY, 0, Conv::Plain),
-        700 => (T_FLOAT, CHARSET_BINARY, 12, F_NUM | F_BINARY, 31, Conv::Plain),
-        701 => (T_DOUBLE, CHARSET_BINARY, 22, F_NUM | F_BINARY, 31, Conv::Plain),
+        20 => (
+            T_LONGLONG,
+            CHARSET_BINARY,
+            20,
+            F_NUM | F_BINARY,
+            0,
+            Conv::Plain,
+        ),
+        700 => (
+            T_FLOAT,
+            CHARSET_BINARY,
+            12,
+            F_NUM | F_BINARY,
+            31,
+            Conv::Plain,
+        ),
+        701 => (
+            T_DOUBLE,
+            CHARSET_BINARY,
+            22,
+            F_NUM | F_BINARY,
+            31,
+            Conv::Plain,
+        ),
         1700 => {
             let (precision, scale) = if field.type_modifier >= 4 {
                 let m = field.type_modifier - 4;
@@ -133,15 +153,43 @@ pub(crate) fn column_for(field: &PgField) -> MyColumn {
             } else {
                 (65, 30)
             };
-            (T_NEWDECIMAL, CHARSET_BINARY, (precision + 2) as u32, F_NUM | F_BINARY, scale as u8, Conv::Plain)
+            (
+                T_NEWDECIMAL,
+                CHARSET_BINARY,
+                (precision + 2) as u32,
+                F_NUM | F_BINARY,
+                scale as u8,
+                Conv::Plain,
+            )
         }
         1082 => (T_DATE, CHARSET_BINARY, 10, F_BINARY, 0, Conv::Plain),
         1114 => (T_DATETIME, CHARSET_BINARY, 26, F_BINARY, 6, Conv::Plain),
-        1184 => (T_TIMESTAMP, CHARSET_BINARY, 26, F_BINARY | F_TIMESTAMP, 6, Conv::Zoned),
+        1184 => (
+            T_TIMESTAMP,
+            CHARSET_BINARY,
+            26,
+            F_BINARY | F_TIMESTAMP,
+            6,
+            Conv::Zoned,
+        ),
         1083 => (T_TIME, CHARSET_BINARY, 15, F_BINARY, 6, Conv::Plain),
         1266 => (T_TIME, CHARSET_BINARY, 15, F_BINARY, 6, Conv::Zoned),
-        17 => (T_BLOB, CHARSET_BINARY, 65535, F_BLOB | F_BINARY, 0, Conv::Bytea),
-        114 | 3802 => (T_JSON, CHARSET_BINARY, u32::MAX, F_BLOB | F_BINARY, 0, Conv::Plain),
+        17 => (
+            T_BLOB,
+            CHARSET_BINARY,
+            65535,
+            F_BLOB | F_BINARY,
+            0,
+            Conv::Bytea,
+        ),
+        114 | 3802 => (
+            T_JSON,
+            CHARSET_BINARY,
+            u32::MAX,
+            F_BLOB | F_BINARY,
+            0,
+            Conv::Plain,
+        ),
         2950 => (T_STRING, CHARSET_UTF8MB4_BIN, 144, 0, 0, Conv::Plain),
         1043 | 1042 if field.type_modifier > 4 => (
             T_VAR_STRING,
@@ -151,7 +199,14 @@ pub(crate) fn column_for(field: &PgField) -> MyColumn {
             0,
             Conv::Plain,
         ),
-        _ => (T_VAR_STRING, CHARSET_UTF8MB4_BIN, 262_140, 0, 0, Conv::Plain),
+        _ => (
+            T_VAR_STRING,
+            CHARSET_UTF8MB4_BIN,
+            262_140,
+            0,
+            0,
+            Conv::Plain,
+        ),
     };
     MyColumn {
         name: field.name.clone(),
@@ -222,7 +277,10 @@ fn strip_zone(value: &[u8]) -> &[u8] {
     let Some(colon) = value.iter().position(|b| *b == b':') else {
         return value;
     };
-    match value[colon..].iter().rposition(|b| *b == b'+' || *b == b'-') {
+    match value[colon..]
+        .iter()
+        .rposition(|b| *b == b'+' || *b == b'-')
+    {
         Some(at) => &value[..colon + at],
         None => value,
     }
@@ -264,7 +322,11 @@ fn parse_time(s: &str) -> Option<(u8, u8, u8, u32)> {
     let sec = sec.parse().ok()?;
     let mut micros = 0u32;
     if !frac.is_empty() {
-        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).take(6).collect();
+        let digits: String = frac
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .take(6)
+            .collect();
         micros = format!("{:0<6}", digits).parse().ok()?;
     }
     Some((h, m, sec, micros))
@@ -273,24 +335,51 @@ fn parse_time(s: &str) -> Option<(u8, u8, u8, u32)> {
 /// One value in the binary protocol's encoding for `column`'s type.
 fn put_binary_value(out: &mut Vec<u8>, column: &MyColumn, value: &[u8]) -> Result<(), String> {
     let text = || std::str::from_utf8(value).map_err(|_| "a value is not text".to_string());
-    let bad = |what: &str| format!("{what} {:?} cannot be sent in MySQL's binary encoding", String::from_utf8_lossy(value));
+    let bad = |what: &str| {
+        format!(
+            "{what} {:?} cannot be sent in MySQL's binary encoding",
+            String::from_utf8_lossy(value)
+        )
+    };
     match column.type_code {
         T_TINY => {
             let v: i8 = match text_value(column.conv, value).as_ref() {
                 b"1" => 1,
                 b"0" => 0,
-                other => std::str::from_utf8(other).ok().and_then(|s| s.parse().ok()).ok_or_else(|| bad("the integer"))?,
+                other => std::str::from_utf8(other)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| bad("the integer"))?,
             };
             out.push(v as u8);
         }
-        T_SHORT => out.extend_from_slice(&text()?.parse::<i16>().map_err(|_| bad("the integer"))?.to_le_bytes()),
-        T_LONG => out.extend_from_slice(&text()?.parse::<i32>().map_err(|_| bad("the integer"))?.to_le_bytes()),
-        T_LONGLONG => out.extend_from_slice(&text()?.parse::<i64>().map_err(|_| bad("the integer"))?.to_le_bytes()),
+        T_SHORT => out.extend_from_slice(
+            &text()?
+                .parse::<i16>()
+                .map_err(|_| bad("the integer"))?
+                .to_le_bytes(),
+        ),
+        T_LONG => out.extend_from_slice(
+            &text()?
+                .parse::<i32>()
+                .map_err(|_| bad("the integer"))?
+                .to_le_bytes(),
+        ),
+        T_LONGLONG => out.extend_from_slice(
+            &text()?
+                .parse::<i64>()
+                .map_err(|_| bad("the integer"))?
+                .to_le_bytes(),
+        ),
         T_FLOAT => {
             let v = parse_float(text()?).ok_or_else(|| bad("the number"))? as f32;
             out.extend_from_slice(&v.to_le_bytes());
         }
-        T_DOUBLE => out.extend_from_slice(&parse_float(text()?).ok_or_else(|| bad("the number"))?.to_le_bytes()),
+        T_DOUBLE => out.extend_from_slice(
+            &parse_float(text()?)
+                .ok_or_else(|| bad("the number"))?
+                .to_le_bytes(),
+        ),
         T_DATE => {
             let (y, m, d) = parse_date(text()?).ok_or_else(|| bad("the date"))?;
             out.push(4);
@@ -337,7 +426,11 @@ fn parse_float(s: &str) -> Option<f64> {
 }
 
 /// A binary-protocol row.
-pub(crate) fn write_binary_row(io: &mut Packets, columns: &[MyColumn], cells: &[Option<&[u8]>]) -> Result<(), String> {
+pub(crate) fn write_binary_row(
+    io: &mut Packets,
+    columns: &[MyColumn],
+    cells: &[Option<&[u8]>],
+) -> Result<(), String> {
     let at = io.begin();
     let out = io.buf();
     out.push(0);
@@ -351,7 +444,10 @@ pub(crate) fn write_binary_row(io: &mut Packets, columns: &[MyColumn], cells: &[
                 out[bitmap_at + bit / 8] |= 1 << (bit % 8);
             }
             Some(v) => {
-                let column = columns.get(k).cloned().unwrap_or_else(|| MyColumn::text(""));
+                let column = columns
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| MyColumn::text(""));
                 if let Err(e) = put_binary_value(out, &column, v) {
                     // The row is not sent at all: the error that follows
                     // ends the result.
@@ -367,7 +463,15 @@ pub(crate) fn write_binary_row(io: &mut Packets, columns: &[MyColumn], cells: &[
 
 /// An OK packet. `eof` marks the one that ends a result set under
 /// CLIENT_DEPRECATE_EOF.
-pub(crate) fn write_ok(io: &mut Packets, affected: u64, insert_id: u64, status: u16, warnings: u16, info: &str, eof: bool) {
+pub(crate) fn write_ok(
+    io: &mut Packets,
+    affected: u64,
+    insert_id: u64,
+    status: u16,
+    warnings: u16,
+    info: &str,
+    eof: bool,
+) {
     let at = io.begin();
     let out = io.buf();
     out.push(if eof { 0xfe } else { 0x00 });
@@ -453,18 +557,33 @@ mod tests {
     fn text_values() {
         assert_eq!(text_value(Conv::Bool, b"t").as_ref(), b"1");
         assert_eq!(text_value(Conv::Bytea, b"\\x00ff").as_ref(), &[0u8, 0xff]);
-        assert_eq!(text_value(Conv::Zoned, b"2024-01-02 03:04:05.5+02").as_ref(), b"2024-01-02 03:04:05.5");
-        assert_eq!(text_value(Conv::Zoned, b"2024-01-02 03:04:05-05:30").as_ref(), b"2024-01-02 03:04:05");
-        assert_eq!(text_value(Conv::Zoned, b"10:00:00+00").as_ref(), b"10:00:00");
+        assert_eq!(
+            text_value(Conv::Zoned, b"2024-01-02 03:04:05.5+02").as_ref(),
+            b"2024-01-02 03:04:05.5"
+        );
+        assert_eq!(
+            text_value(Conv::Zoned, b"2024-01-02 03:04:05-05:30").as_ref(),
+            b"2024-01-02 03:04:05"
+        );
+        assert_eq!(
+            text_value(Conv::Zoned, b"10:00:00+00").as_ref(),
+            b"10:00:00"
+        );
     }
 
     #[test]
     fn binary_dates() {
-        let column = MyColumn { type_code: T_DATETIME, ..MyColumn::text("t") };
+        let column = MyColumn {
+            type_code: T_DATETIME,
+            ..MyColumn::text("t")
+        };
         let mut out = Vec::new();
         put_binary_value(&mut out, &column, b"2024-01-02 03:04:05.000250").unwrap();
         assert_eq!(out, vec![11, 0xe8, 0x07, 1, 2, 3, 4, 5, 0xfa, 0, 0, 0]);
-        let column = MyColumn { type_code: T_TIME, ..MyColumn::text("t") };
+        let column = MyColumn {
+            type_code: T_TIME,
+            ..MyColumn::text("t")
+        };
         let mut out = Vec::new();
         put_binary_value(&mut out, &column, b"25:00:01").unwrap();
         assert_eq!(out, vec![8, 0, 1, 0, 0, 0, 1, 0, 1]);

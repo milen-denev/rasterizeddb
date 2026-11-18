@@ -89,11 +89,16 @@ fn start(auth: MyAuth) -> Servers {
 }
 
 fn mysql_url(s: &Servers, db: &str, ssl: &str) -> String {
-    format!("mysql://rasterized:{PASSWORD}@127.0.0.1:{}/{db}?ssl-mode={ssl}", s.mysql_port)
+    format!(
+        "mysql://rasterized:{PASSWORD}@127.0.0.1:{}/{db}?ssl-mode={ssl}",
+        s.mysql_port
+    )
 }
 
 async fn mysql(s: &Servers) -> sqlx::MySqlConnection {
-    sqlx::MySqlConnection::connect(&mysql_url(s, "postgres", "required")).await.expect("mysql connect")
+    sqlx::MySqlConnection::connect(&mysql_url(s, "postgres", "required"))
+        .await
+        .expect("mysql connect")
 }
 
 fn code(e: &sqlx::Error) -> (Option<u16>, Option<String>) {
@@ -114,9 +119,15 @@ async fn mysql_driver_end_to_end() {
     let mut c = mysql(&s).await;
     let mut c2 = mysql(&s).await;
 
-    let v: String = sqlx::query_scalar("SELECT @@version_comment").fetch_one(&mut c).await.unwrap();
+    let v: String = sqlx::query_scalar("SELECT @@version_comment")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert!(v.contains("RasterizedDB"), "{v}");
-    let db: String = sqlx::query_scalar("SELECT DATABASE()").fetch_one(&mut c2).await.unwrap();
+    let db: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut c2)
+        .await
+        .unwrap();
     assert_eq!(db, "postgres");
 
     c.execute(
@@ -138,7 +149,10 @@ async fn mysql_driver_end_to_end() {
 
     // A prepared insert with typed binds; the auto-increment id comes back
     // in the OK packet.
-    let seen = chrono::NaiveDate::from_ymd_opt(2024, 5, 6).unwrap().and_hms_micro_opt(7, 8, 9, 123456).unwrap();
+    let seen = chrono::NaiveDate::from_ymd_opt(2024, 5, 6)
+        .unwrap()
+        .and_hms_micro_opt(7, 8, 9, 123456)
+        .unwrap();
     let r = sqlx::query("INSERT INTO items (Name, qty, price, ok, seen, `blob`, ratio) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind("widget")
         .bind(3i32)
@@ -152,29 +166,46 @@ async fn mysql_driver_end_to_end() {
         .unwrap();
     assert_eq!(r.rows_affected(), 1);
     assert_eq!(r.last_insert_id(), 1);
-    let r = sqlx::query("INSERT INTO items (Name) VALUES (?), (?)").bind("gadget").bind("gizmo").execute(&mut c).await.unwrap();
+    let r = sqlx::query("INSERT INTO items (Name) VALUES (?), (?)")
+        .bind("gadget")
+        .bind("gizmo")
+        .execute(&mut c)
+        .await
+        .unwrap();
     assert_eq!(r.rows_affected(), 2);
     assert_eq!(r.last_insert_id(), 2, "the first id of a multi-row insert");
 
     // Binary rows decode to the right Rust types.
-    let row = sqlx::query("SELECT id, Name, qty, price, ok, seen, `blob`, ratio FROM items WHERE id = ?")
-        .bind(1i64)
-        .fetch_one(&mut c)
-        .await
-        .unwrap();
+    let row =
+        sqlx::query("SELECT id, Name, qty, price, ok, seen, `blob`, ratio FROM items WHERE id = ?")
+            .bind(1i64)
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
     assert_eq!(row.get::<i64, _>("id"), 1);
     assert_eq!(row.get::<String, _>("Name"), "widget");
     assert_eq!(row.get::<i32, _>("qty"), 3);
-    assert_eq!(row.get::<rust_decimal::Decimal, _>("price"), rust_decimal::Decimal::new(1999, 2));
+    assert_eq!(
+        row.get::<rust_decimal::Decimal, _>("price"),
+        rust_decimal::Decimal::new(1999, 2)
+    );
     assert!(!row.get::<bool, _>("ok"));
     assert_eq!(row.get::<chrono::NaiveDateTime, _>("seen"), seen);
     assert_eq!(row.get::<Vec<u8>, _>("blob"), vec![0u8, 1, 255]);
     assert_eq!(row.get::<f64, _>("ratio"), 0.25);
 
     // NULLs and the text protocol.
-    let rows = c.fetch_all("SELECT id, price, `blob` FROM items ORDER BY id").await.unwrap();
+    let rows = c
+        .fetch_all("SELECT id, price, `blob` FROM items ORDER BY id")
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 3);
-    assert!(rows[1].try_get::<Option<rust_decimal::Decimal>, _>("price").unwrap().is_none());
+    assert!(
+        rows[1]
+            .try_get::<Option<rust_decimal::Decimal>, _>("price")
+            .unwrap()
+            .is_none()
+    );
 
     // Upsert on the unique key, and INSERT IGNORE.
     sqlx::query("INSERT INTO items (Name, qty) VALUES (?, ?) ON DUPLICATE KEY UPDATE qty = qty + VALUES(qty)")
@@ -183,17 +214,29 @@ async fn mysql_driver_end_to_end() {
         .execute(&mut c)
         .await
         .unwrap();
-    let qty: i32 = sqlx::query_scalar("SELECT qty FROM items WHERE Name = 'widget'").fetch_one(&mut c).await.unwrap();
+    let qty: i32 = sqlx::query_scalar("SELECT qty FROM items WHERE Name = 'widget'")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(qty, 13);
-    let r = c.execute("INSERT IGNORE INTO items (Name) VALUES ('widget')").await.unwrap();
+    let r = c
+        .execute("INSERT IGNORE INTO items (Name) VALUES ('widget')")
+        .await
+        .unwrap();
     assert_eq!(r.rows_affected(), 0);
 
     // A duplicate is ER_DUP_ENTRY, SQLSTATE 23000.
-    let e = c.execute("INSERT INTO items (Name) VALUES ('gadget')").await.unwrap_err();
+    let e = c
+        .execute("INSERT INTO items (Name) VALUES ('gadget')")
+        .await
+        .unwrap_err();
     assert_eq!(code(&e), (Some(1062), Some("23000".into())), "{e}");
     let e = c.execute("SELECT nope FROM items").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1054), "{e}");
-    let e = c.execute("SELECT nope AS Nope FROM items").await.unwrap_err();
+    let e = c
+        .execute("SELECT nope AS Nope FROM items")
+        .await
+        .unwrap_err();
     assert_eq!(code(&e).0, Some(1054), "{e}");
     let e = c.execute("SELECT * FROM missing_table").await.unwrap_err();
     assert_eq!(code(&e).0, Some(1146), "{e}");
@@ -202,41 +245,83 @@ async fn mysql_driver_end_to_end() {
     // rest commits.
     {
         let mut tx = c.begin().await.unwrap();
-        tx.execute("INSERT INTO items (Name) VALUES ('t1')").await.unwrap();
-        assert!(tx.execute("INSERT INTO items (Name) VALUES ('gadget')").await.is_err());
-        tx.execute("INSERT INTO items (Name) VALUES ('t2')").await.unwrap();
+        tx.execute("INSERT INTO items (Name) VALUES ('t1')")
+            .await
+            .unwrap();
+        assert!(
+            tx.execute("INSERT INTO items (Name) VALUES ('gadget')")
+                .await
+                .is_err()
+        );
+        tx.execute("INSERT INTO items (Name) VALUES ('t2')")
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name IN ('t1', 't2')").fetch_one(&mut c).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name IN ('t1', 't2')")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(n, 2);
     {
         let mut tx = c.begin().await.unwrap();
-        tx.execute("DELETE FROM items WHERE Name = 't1'").await.unwrap();
+        tx.execute("DELETE FROM items WHERE Name = 't1'")
+            .await
+            .unwrap();
         tx.rollback().await.unwrap();
     }
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 't1'").fetch_one(&mut c).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 't1'")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(n, 1, "the rolled-back delete is undone");
 
     // autocommit = 0: work is held until COMMIT, and ROLLBACK drops it.
     c2.execute("SET autocommit = 0").await.unwrap();
-    c2.execute("INSERT INTO items (Name) VALUES ('held')").await.unwrap();
-    let seen_elsewhere: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 'held'").fetch_one(&mut c).await.unwrap();
-    assert_eq!(seen_elsewhere, 0, "uncommitted work is not visible to another connection");
+    c2.execute("INSERT INTO items (Name) VALUES ('held')")
+        .await
+        .unwrap();
+    let seen_elsewhere: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 'held'")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        seen_elsewhere, 0,
+        "uncommitted work is not visible to another connection"
+    );
     c2.execute("ROLLBACK").await.unwrap();
     c2.execute("SET autocommit = 1").await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 'held'").fetch_one(&mut c2).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 'held'")
+        .fetch_one(&mut c2)
+        .await
+        .unwrap();
     assert_eq!(n, 0);
 
     // MySQL's division, LIMIT offset, and functions.
-    let row = c.fetch_one("SELECT 7 / 2 AS q, 7 DIV 2 AS d, IFNULL(NULL, 'x') AS f, CONCAT('a', 1) AS c").await.unwrap();
-    assert_eq!(row.get::<rust_decimal::Decimal, _>("q"), rust_decimal::Decimal::new(35, 1));
+    let row = c
+        .fetch_one("SELECT 7 / 2 AS q, 7 DIV 2 AS d, IFNULL(NULL, 'x') AS f, CONCAT('a', 1) AS c")
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<rust_decimal::Decimal, _>("q"),
+        rust_decimal::Decimal::new(35, 1)
+    );
     assert_eq!(row.get::<i64, _>("d"), 3);
     assert_eq!(row.get::<String, _>("f"), "x");
-    let names: Vec<String> = sqlx::query_scalar("SELECT Name FROM items ORDER BY id LIMIT 1, 2").fetch_all(&mut c).await.unwrap();
+    let names: Vec<String> = sqlx::query_scalar("SELECT Name FROM items ORDER BY id LIMIT 1, 2")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
     assert_eq!(names, vec!["gadget".to_string(), "gizmo".to_string()]);
 
     // SHOW and DESCRIBE.
-    let tables: Vec<String> = c.fetch_all("SHOW TABLES").await.unwrap().iter().map(|r| r.get::<String, _>(0)).collect();
+    let tables: Vec<String> = c
+        .fetch_all("SHOW TABLES")
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>(0))
+        .collect();
     assert_eq!(tables, vec!["items".to_string()]);
     let fields = c.fetch_all("DESCRIBE items").await.unwrap();
     assert_eq!(fields[0].get::<String, _>("Field"), "id");
@@ -245,24 +330,43 @@ async fn mysql_driver_end_to_end() {
 
     // The same rows over PostgreSQL, at the same time.
     let (pg, conn) = tokio_postgres::connect(
-        &format!("host=127.0.0.1 port={} user=rasterized password={PASSWORD} dbname=postgres", s.pg_port),
+        &format!(
+            "host=127.0.0.1 port={} user=rasterized password={PASSWORD} dbname=postgres",
+            s.pg_port
+        ),
         tokio_postgres::NoTls,
     )
     .await
     .unwrap();
     tokio::spawn(conn);
-    let n: i64 = pg.query_one("SELECT COUNT(*) FROM items", &[]).await.unwrap().get(0);
+    let n: i64 = pg
+        .query_one("SELECT COUNT(*) FROM items", &[])
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(n, 5);
-    pg.execute("INSERT INTO items (name) VALUES ('from-pg')", &[]).await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 'from-pg'").fetch_one(&mut c).await.unwrap();
+    pg.execute("INSERT INTO items (name) VALUES ('from-pg')", &[])
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE Name = 'from-pg'")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(n, 1);
 
     // Databases: CREATE DATABASE, then a connection to it, then USE.
-    c.execute("CREATE DATABASE IF NOT EXISTS shop").await.unwrap();
-    let mut c3 = sqlx::MySqlConnection::connect(&mysql_url(&s, "shop", "required")).await.unwrap();
+    c.execute("CREATE DATABASE IF NOT EXISTS shop")
+        .await
+        .unwrap();
+    let mut c3 = sqlx::MySqlConnection::connect(&mysql_url(&s, "shop", "required"))
+        .await
+        .unwrap();
     c3.execute("CREATE TABLE t (a INT)").await.unwrap();
     c.execute("USE shop").await.unwrap();
-    let db: String = sqlx::query_scalar("SELECT DATABASE()").fetch_one(&mut c).await.unwrap();
+    let db: String = sqlx::query_scalar("SELECT DATABASE()")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(db, "shop");
 
     c.close().await.unwrap();
@@ -273,23 +377,38 @@ async fn mysql_driver_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_refuses_a_wrong_password_and_plain_first_login() {
     let s = start(MyAuth::Password);
-    let wrong = format!("mysql://rasterized:nope@127.0.0.1:{}/postgres?ssl-mode=required", s.mysql_port);
+    let wrong = format!(
+        "mysql://rasterized:nope@127.0.0.1:{}/postgres?ssl-mode=required",
+        s.mysql_port
+    );
     let e = sqlx::MySqlConnection::connect(&wrong).await.unwrap_err();
     assert_eq!(code(&e).0, Some(1045), "{e}");
     // Without TLS, a first login has no way to send its password safely.
-    let e = sqlx::MySqlConnection::connect(&mysql_url(&s, "postgres", "disabled")).await.unwrap_err();
-    assert!(e.to_string().to_lowercase().contains("secure") || e.to_string().contains("RSA") || code(&e).0.is_some(), "{e}");
+    let e = sqlx::MySqlConnection::connect(&mysql_url(&s, "postgres", "disabled"))
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().to_lowercase().contains("secure")
+            || e.to_string().contains("RSA")
+            || code(&e).0.is_some(),
+        "{e}"
+    );
     // An unknown database.
-    let e = sqlx::MySqlConnection::connect(&mysql_url(&s, "nosuch", "required")).await.unwrap_err();
+    let e = sqlx::MySqlConnection::connect(&mysql_url(&s, "nosuch", "required"))
+        .await
+        .unwrap_err();
     assert_eq!(code(&e).0, Some(1049), "{e}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mysql_prepared_session_statements_and_catalogue() {
     let s = start(MyAuth::Trust);
-    let mut c = sqlx::MySqlConnection::connect(&format!("mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled", s.mysql_port))
-        .await
-        .unwrap();
+    let mut c = sqlx::MySqlConnection::connect(&format!(
+        "mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled",
+        s.mysql_port
+    ))
+    .await
+    .unwrap();
     c.execute("CREATE TABLE people (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20), born DATE, t TIME)").await.unwrap();
     sqlx::query("INSERT INTO people (name, born, t) VALUES (?, ?, ?)")
         .bind("ada")
@@ -300,16 +419,36 @@ async fn mysql_prepared_session_statements_and_catalogue() {
         .unwrap();
     // Statements the engine does not prepare (SHOW, SET) still prepare, and
     // answer in the binary row format.
-    let rows = sqlx::query("SHOW COLUMNS FROM people").fetch_all(&mut c).await.unwrap();
+    let rows = sqlx::query("SHOW COLUMNS FROM people")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[1].get::<String, _>("Field"), "name");
-    sqlx::query("SET @who = ?").bind("ada").execute(&mut c).await.unwrap();
-    let name: String = sqlx::query_scalar("SELECT name FROM people WHERE name = @who").fetch_one(&mut c).await.unwrap();
+    sqlx::query("SET @who = ?")
+        .bind("ada")
+        .execute(&mut c)
+        .await
+        .unwrap();
+    let name: String = sqlx::query_scalar("SELECT name FROM people WHERE name = @who")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
     assert_eq!(name, "ada");
     // Dates and times round-trip through binds and binary rows.
-    let row = sqlx::query("SELECT born, t FROM people WHERE id = ?").bind(1).fetch_one(&mut c).await.unwrap();
-    assert_eq!(row.get::<chrono::NaiveDate, _>("born"), chrono::NaiveDate::from_ymd_opt(1815, 12, 10).unwrap());
-    assert_eq!(row.get::<chrono::NaiveTime, _>("t"), chrono::NaiveTime::from_hms_opt(13, 14, 15).unwrap());
+    let row = sqlx::query("SELECT born, t FROM people WHERE id = ?")
+        .bind(1)
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<chrono::NaiveDate, _>("born"),
+        chrono::NaiveDate::from_ymd_opt(1815, 12, 10).unwrap()
+    );
+    assert_eq!(
+        row.get::<chrono::NaiveTime, _>("t"),
+        chrono::NaiveTime::from_hms_opt(13, 14, 15).unwrap()
+    );
     // MySQL's information_schema calls the database TABLE_SCHEMA.
     let found: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
@@ -321,10 +460,16 @@ async fn mysql_prepared_session_statements_and_catalogue() {
     .unwrap();
     assert_eq!(found, 1);
     // A query cancelled with KILL QUERY from another connection.
-    let id: i64 = sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut c).await.unwrap();
-    let mut killer = sqlx::MySqlConnection::connect(&format!("mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled", s.mysql_port))
+    let id: i64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(&mut c)
         .await
         .unwrap();
+    let mut killer = sqlx::MySqlConnection::connect(&format!(
+        "mysql://anyone@127.0.0.1:{}/postgres?ssl-mode=disabled",
+        s.mysql_port
+    ))
+    .await
+    .unwrap();
     let kill = format!("KILL QUERY {id}");
     killer.execute(sqlx::AssertSqlSafe(kill)).await.unwrap();
     c.close().await.unwrap();
@@ -336,27 +481,50 @@ async fn mysql_prepared_session_statements_and_catalogue() {
 #[ignore]
 async fn mysql_point_select_overhead() {
     let s = start(MyAuth::Trust);
-    let mut my = sqlx::MySqlConnection::connect(&format!("mysql://rasterized@127.0.0.1:{}/postgres?ssl-mode=disabled", s.mysql_port))
+    let mut my = sqlx::MySqlConnection::connect(&format!(
+        "mysql://rasterized@127.0.0.1:{}/postgres?ssl-mode=disabled",
+        s.mysql_port
+    ))
+    .await
+    .unwrap();
+    let mut pg = sqlx::PgConnection::connect(&format!(
+        "postgres://rasterized:{PASSWORD}@127.0.0.1:{}/postgres?sslmode=disable",
+        s.pg_port
+    ))
+    .await
+    .unwrap();
+    my.execute("CREATE TABLE bench (id INT PRIMARY KEY, v VARCHAR(40))")
         .await
         .unwrap();
-    let mut pg = sqlx::PgConnection::connect(&format!("postgres://rasterized:{PASSWORD}@127.0.0.1:{}/postgres?sslmode=disable", s.pg_port))
-        .await
-        .unwrap();
-    my.execute("CREATE TABLE bench (id INT PRIMARY KEY, v VARCHAR(40))").await.unwrap();
     for start in (1..=10_000).step_by(1000) {
-        let values: Vec<String> = (start..start + 1000).map(|i| format!("({i}, 'value {i}')")).collect();
-        my.execute(sqlx::AssertSqlSafe(format!("INSERT INTO bench VALUES {}", values.join(",")))).await.unwrap();
+        let values: Vec<String> = (start..start + 1000)
+            .map(|i| format!("({i}, 'value {i}')"))
+            .collect();
+        my.execute(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO bench VALUES {}",
+            values.join(",")
+        )))
+        .await
+        .unwrap();
     }
     const N: usize = 5000;
     for round in 0..2 {
         let t = std::time::Instant::now();
         for i in 0..N {
-            let _: String = sqlx::query_scalar("SELECT v FROM bench WHERE id = $1").bind((i % 10_000 + 1) as i32).fetch_one(&mut pg).await.unwrap();
+            let _: String = sqlx::query_scalar("SELECT v FROM bench WHERE id = $1")
+                .bind((i % 10_000 + 1) as i32)
+                .fetch_one(&mut pg)
+                .await
+                .unwrap();
         }
         let pg_us = t.elapsed().as_micros() as f64 / N as f64;
         let t = std::time::Instant::now();
         for i in 0..N {
-            let _: String = sqlx::query_scalar("SELECT v FROM bench WHERE id = ?").bind((i % 10_000 + 1) as i32).fetch_one(&mut my).await.unwrap();
+            let _: String = sqlx::query_scalar("SELECT v FROM bench WHERE id = ?")
+                .bind((i % 10_000 + 1) as i32)
+                .fetch_one(&mut my)
+                .await
+                .unwrap();
         }
         let my_prep_us = t.elapsed().as_micros() as f64 / N as f64;
         let t = std::time::Instant::now();
@@ -368,7 +536,10 @@ async fn mysql_point_select_overhead() {
         let t = std::time::Instant::now();
         for i in 0..N {
             let q = format!("SELECT v FROM bench WHERE id = {}", i % 10_000 + 1);
-            let _ = pg.fetch_one(sqlx::raw_sql(sqlx::AssertSqlSafe(q))).await.unwrap();
+            let _ = pg
+                .fetch_one(sqlx::raw_sql(sqlx::AssertSqlSafe(q)))
+                .await
+                .unwrap();
         }
         let pg_text_us = t.elapsed().as_micros() as f64 / N as f64;
         println!(

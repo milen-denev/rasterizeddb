@@ -135,7 +135,11 @@ impl PgNotice {
         while p < body.len() && body[p] != 0 {
             let field = body[p];
             p += 1;
-            let end = body[p..].iter().position(|b| *b == 0).map(|e| p + e).unwrap_or(body.len());
+            let end = body[p..]
+                .iter()
+                .position(|b| *b == 0)
+                .map(|e| p + e)
+                .unwrap_or(body.len());
             let value = String::from_utf8_lossy(&body[p..end]).into_owned();
             p = end + 1;
             match field {
@@ -170,7 +174,13 @@ pub(crate) fn parse_row_description(body: &[u8]) -> io::Result<Vec<PgField>> {
     let mut p = 2usize;
     let mut fields = Vec::with_capacity(count.max(0) as usize);
     for _ in 0..count {
-        let end = body.get(p..).ok_or_else(bad)?.iter().position(|b| *b == 0).ok_or_else(bad)? + p;
+        let end = body
+            .get(p..)
+            .ok_or_else(bad)?
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or_else(bad)?
+            + p;
         let name = String::from_utf8_lossy(&body[p..end]).into_owned();
         p = end + 1;
         let fixed = body.get(p..p + 18).ok_or_else(bad)?;
@@ -418,9 +428,13 @@ impl PgBridge {
         loop {
             let avail = self.rbuf.len() - self.rpos;
             if avail >= 5 {
-                let len = i32::from_be_bytes(self.rbuf[self.rpos + 1..self.rpos + 5].try_into().unwrap());
+                let len =
+                    i32::from_be_bytes(self.rbuf[self.rpos + 1..self.rpos + 5].try_into().unwrap());
                 if len < 4 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad backend frame"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad backend frame",
+                    ));
                 }
                 let total = 1 + len as usize;
                 if avail >= total {
@@ -444,7 +458,10 @@ impl PgBridge {
             match n {
                 Ok(0) => {
                     self.rbuf.truncate(old);
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the session ended"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the session ended",
+                    ));
                 }
                 Ok(n) => self.rbuf.truncate(old + n),
                 Err(e) => {
@@ -470,7 +487,10 @@ impl PgBridge {
 
 /// A TLS acceptor for a front end's listener: the certificate and key given,
 /// or a self-signed pair made now, as pgwire's.
-pub(crate) fn tls_acceptor(cert_path: Option<String>, key_path: Option<String>) -> io::Result<TlsAcceptor> {
+pub(crate) fn tls_acceptor(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+) -> io::Result<TlsAcceptor> {
     build_tls_acceptor(&TlsConfig {
         mode: TlsMode::Require,
         cert_path,
@@ -489,7 +509,8 @@ pub(crate) fn tls_acceptor_with_alpn(
     ensure_crypto_provider();
     let (certs, key) = match (&cert_path, &key_path) {
         (Some(cert_path), Some(key_path)) => load_tls_from_pem(cert_path, key_path)?,
-        (None, None) => rastcp::cert::generate_self_signed_cert().map_err(|e| io::Error::other(e.to_string()))?,
+        (None, None) => rastcp::cert::generate_self_signed_cert()
+            .map_err(|e| io::Error::other(e.to_string()))?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

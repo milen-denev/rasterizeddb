@@ -15,17 +15,31 @@ pub(crate) enum Action {
     /// Answer OK and do nothing.
     Ok,
     Use(String),
-    Begin { read_only: Option<bool>, isolation: Option<String> },
-    Commit { chain: bool },
-    Rollback { chain: bool },
+    Begin {
+        read_only: Option<bool>,
+        isolation: Option<String>,
+    },
+    Commit {
+        chain: bool,
+    },
+    Rollback {
+        chain: bool,
+    },
     /// SAVEPOINT / RELEASE / ROLLBACK TO: sent as written.
     Savepoint(String),
     Set(Vec<Assignment>),
     /// `SET TRANSACTION …`: the next transaction (`session` false) or every
     /// later one.
-    SetTransaction { session: bool, isolation: Option<String>, read_only: Option<bool> },
+    SetTransaction {
+        session: bool,
+        isolation: Option<String>,
+        read_only: Option<bool>,
+    },
     Show(Show),
-    Kill { id: u32, query_only: bool },
+    Kill {
+        id: u32,
+        query_only: bool,
+    },
     Error(MyError),
 }
 
@@ -45,11 +59,23 @@ pub(crate) struct Assignment {
 #[derive(Debug)]
 pub(crate) enum Show {
     Databases,
-    Tables { full: bool, database: Option<String> },
-    Columns { full: bool, table: String },
-    Index { table: String },
-    CreateTable { table: String },
-    CreateDatabase { name: String },
+    Tables {
+        full: bool,
+        database: Option<String>,
+    },
+    Columns {
+        full: bool,
+        table: String,
+    },
+    Index {
+        table: String,
+    },
+    CreateTable {
+        table: String,
+    },
+    CreateDatabase {
+        name: String,
+    },
     Variables,
     Status,
     Warnings,
@@ -104,14 +130,16 @@ fn isolation_of(tokens: &[Token], from: usize) -> Option<String> {
     let at = (from..tokens.len()).find(|&i| word(tokens, i) == "ISOLATION")?;
     let a = word(tokens, at + 2);
     let b = word(tokens, at + 3);
-    Some(match (a.as_str(), b.as_str()) {
-        ("READ", "UNCOMMITTED") => "READ UNCOMMITTED",
-        ("READ", "COMMITTED") => "READ COMMITTED",
-        ("REPEATABLE", "READ") => "REPEATABLE READ",
-        ("SERIALIZABLE", _) => "SERIALIZABLE",
-        _ => return None,
-    }
-    .to_string())
+    Some(
+        match (a.as_str(), b.as_str()) {
+            ("READ", "UNCOMMITTED") => "READ UNCOMMITTED",
+            ("READ", "COMMITTED") => "READ COMMITTED",
+            ("REPEATABLE", "READ") => "REPEATABLE READ",
+            ("SERIALIZABLE", _) => "SERIALIZABLE",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 fn read_only_of(tokens: &[Token], from: usize) -> Option<bool> {
@@ -136,9 +164,18 @@ pub(crate) fn classify(tokens: &[Token]) -> (Action, Filter) {
     match head.as_str() {
         "USE" => match ident(tokens, 1) {
             Some(db) => (Action::Use(db), none),
-            None => (Action::Error(MyError::syntax("USE needs a database name")), none),
+            None => (
+                Action::Error(MyError::syntax("USE needs a database name")),
+                none,
+            ),
         },
-        "BEGIN" if tokens.len() == 1 || word(tokens, 1) == "WORK" => (Action::Begin { read_only: None, isolation: None }, none),
+        "BEGIN" if tokens.len() == 1 || word(tokens, 1) == "WORK" => (
+            Action::Begin {
+                read_only: None,
+                isolation: None,
+            },
+            none,
+        ),
         "START" if word(tokens, 1) == "TRANSACTION" => (
             Action::Begin {
                 read_only: read_only_of(tokens, 2),
@@ -148,21 +185,34 @@ pub(crate) fn classify(tokens: &[Token]) -> (Action, Filter) {
         ),
         "COMMIT" => (
             Action::Commit {
-                chain: tokens.iter().enumerate().any(|(i, t)| t.is_word("CHAIN") && !word(tokens, i - 1).eq("NO")),
+                chain: tokens
+                    .iter()
+                    .enumerate()
+                    .any(|(i, t)| t.is_word("CHAIN") && !word(tokens, i - 1).eq("NO")),
             },
             none,
         ),
         "ROLLBACK" if !tokens.iter().any(|t| t.is_word("TO")) => (
             Action::Rollback {
-                chain: tokens.iter().enumerate().any(|(i, t)| t.is_word("CHAIN") && !word(tokens, i - 1).eq("NO")),
+                chain: tokens
+                    .iter()
+                    .enumerate()
+                    .any(|(i, t)| t.is_word("CHAIN") && !word(tokens, i - 1).eq("NO")),
             },
             none,
         ),
         "ROLLBACK" | "SAVEPOINT" | "RELEASE" => {
             // ROLLBACK [WORK] TO [SAVEPOINT] x, SAVEPOINT x, RELEASE SAVEPOINT x
-            let name = tokens.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+            let name = tokens
+                .last()
+                .and_then(|t| t.ident())
+                .unwrap_or("")
+                .to_lowercase();
             let sql = match head.as_str() {
-                "ROLLBACK" => format!("ROLLBACK TO SAVEPOINT {}", super::translate::ident_sql(&name)),
+                "ROLLBACK" => format!(
+                    "ROLLBACK TO SAVEPOINT {}",
+                    super::translate::ident_sql(&name)
+                ),
                 "SAVEPOINT" => format!("SAVEPOINT {}", super::translate::ident_sql(&name)),
                 _ => format!("RELEASE SAVEPOINT {}", super::translate::ident_sql(&name)),
             };
@@ -170,7 +220,22 @@ pub(crate) fn classify(tokens: &[Token]) -> (Action, Filter) {
         }
         "SET" => (classify_set(tokens), none),
         "SHOW" => classify_show(tokens),
-        "DESCRIBE" | "DESC" | "EXPLAIN" if tokens.len() >= 2 && !matches!(word(tokens, 1).as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "WITH" | "FORMAT" | "EXTENDED" | "ANALYZE" | "PARTITIONS") => {
+        "DESCRIBE" | "DESC" | "EXPLAIN"
+            if tokens.len() >= 2
+                && !matches!(
+                    word(tokens, 1).as_str(),
+                    "SELECT"
+                        | "INSERT"
+                        | "UPDATE"
+                        | "DELETE"
+                        | "REPLACE"
+                        | "WITH"
+                        | "FORMAT"
+                        | "EXTENDED"
+                        | "ANALYZE"
+                        | "PARTITIONS"
+                ) =>
+        {
             match table_at(tokens, 1) {
                 Some((table, _)) => (Action::Show(Show::Columns { full: false, table }), none),
                 None => (Action::Data, none),
@@ -188,16 +253,32 @@ pub(crate) fn classify(tokens: &[Token]) -> (Action, Filter) {
             match tokens.get(i).map(|t| &t.tok) {
                 Some(Tok::Num(n)) => match n.parse() {
                     Ok(id) => (Action::Kill { id, query_only }, none),
-                    Err(_) => (Action::Error(MyError::new(1094, "HY000", format!("Unknown thread id: {n}"))), none),
+                    Err(_) => (
+                        Action::Error(MyError::new(
+                            1094,
+                            "HY000",
+                            format!("Unknown thread id: {n}"),
+                        )),
+                        none,
+                    ),
                 },
-                _ => (Action::Error(MyError::syntax("KILL needs a connection id")), none),
+                _ => (
+                    Action::Error(MyError::syntax("KILL needs a connection id")),
+                    none,
+                ),
             }
         }
         // Accepted and ignored: table locks (sessions isolate through
         // transactions here), caches, statistics, and the binary log.
-        "LOCK" | "UNLOCK" | "FLUSH" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "PURGE" | "RESET" => (Action::Ok, none),
+        "LOCK" | "UNLOCK" | "FLUSH" | "ANALYZE" | "OPTIMIZE" | "CHECK" | "REPAIR" | "PURGE"
+        | "RESET" => (Action::Ok, none),
         "DO" => (Action::Ok, none),
-        "GRANT" | "REVOKE" => (Action::Error(MyError::unsupported("GRANT and REVOKE in MySQL's form (use CREATE ROLE / ALTER ROLE)")), none),
+        "GRANT" | "REVOKE" => (
+            Action::Error(MyError::unsupported(
+                "GRANT and REVOKE in MySQL's form (use CREATE ROLE / ALTER ROLE)",
+            )),
+            none,
+        ),
         "CALL" | "PREPARE" | "EXECUTE" | "DEALLOCATE" | "HANDLER" | "LOAD" | "XA" => {
             (Action::Error(MyError::unsupported(head)), none)
         }
@@ -221,13 +302,18 @@ fn classify_set(tokens: &[Token]) -> Action {
         };
     }
     if w1 == "PASSWORD" {
-        return Action::Error(MyError::unsupported("SET PASSWORD (use ALTER ROLE … PASSWORD)"));
+        return Action::Error(MyError::unsupported(
+            "SET PASSWORD (use ALTER ROLE … PASSWORD)",
+        ));
     }
     let mut assignments = Vec::new();
     for part in split_commas(&tokens[1..]) {
         let mut p = 0usize;
         let mut scope_seen = false;
-        while matches!(word(&part, p).as_str(), "SESSION" | "LOCAL" | "GLOBAL" | "PERSIST" | "PERSIST_ONLY") {
+        while matches!(
+            word(&part, p).as_str(),
+            "SESSION" | "LOCAL" | "GLOBAL" | "PERSIST" | "PERSIST_ONLY"
+        ) {
             p += 1;
             scope_seen = true;
         }
@@ -246,7 +332,11 @@ fn classify_set(tokens: &[Token]) -> Action {
             continue;
         }
         if first.is_word("CHARSET") || (first.is_word("CHARACTER") && word(&part, p + 1) == "SET") {
-            let at = if first.is_word("CHARSET") { p + 1 } else { p + 2 };
+            let at = if first.is_word("CHARSET") {
+                p + 1
+            } else {
+                p + 2
+            };
             let cs = part.get(at).map(set_word).unwrap_or_default();
             assignments.push(Assignment {
                 target: Target::Names(cs),
@@ -262,7 +352,9 @@ fn classify_set(tokens: &[Token]) -> Action {
                 if part.get(p + 1).is_some_and(|t| t.is_op(".")) {
                     match ident(&part, p + 2) {
                         Some(n) => (Target::System(n.to_lowercase()), p + 3),
-                        None => return Action::Error(MyError::syntax("a variable name was expected")),
+                        None => {
+                            return Action::Error(MyError::syntax("a variable name was expected"));
+                        }
                     }
                 } else {
                     (Target::System(name.to_lowercase()), p + 1)
@@ -308,26 +400,48 @@ fn classify_show(tokens: &[Token]) -> (Action, Filter) {
     let show = match what.as_str() {
         "DATABASES" | "SCHEMAS" => Show::Databases,
         "TABLES" => {
-            let database = if matches!(word(tokens, i + 1).as_str(), "FROM" | "IN") { ident(tokens, i + 2) } else { None };
+            let database = if matches!(word(tokens, i + 1).as_str(), "FROM" | "IN") {
+                ident(tokens, i + 2)
+            } else {
+                None
+            };
             Show::Tables { full, database }
         }
         "COLUMNS" | "FIELDS" => {
             if !matches!(word(tokens, i + 1).as_str(), "FROM" | "IN") {
-                return (Action::Error(MyError::syntax("SHOW COLUMNS needs FROM table")), filter);
+                return (
+                    Action::Error(MyError::syntax("SHOW COLUMNS needs FROM table")),
+                    filter,
+                );
             }
             match table_at(tokens, i + 2) {
                 Some((table, _)) => Show::Columns { full, table },
-                None => return (Action::Error(MyError::syntax("SHOW COLUMNS needs a table")), filter),
+                None => {
+                    return (
+                        Action::Error(MyError::syntax("SHOW COLUMNS needs a table")),
+                        filter,
+                    );
+                }
             }
         }
         "INDEX" | "INDEXES" | "KEYS" => match table_at(tokens, i + 2) {
             Some((table, _)) => Show::Index { table },
-            None => return (Action::Error(MyError::syntax("SHOW INDEX needs a table")), filter),
+            None => {
+                return (
+                    Action::Error(MyError::syntax("SHOW INDEX needs a table")),
+                    filter,
+                );
+            }
         },
         "CREATE" => match word(tokens, i + 1).as_str() {
             "TABLE" => match table_at(tokens, i + 2) {
                 Some((table, _)) => Show::CreateTable { table },
-                None => return (Action::Error(MyError::syntax("SHOW CREATE TABLE needs a table")), filter),
+                None => {
+                    return (
+                        Action::Error(MyError::syntax("SHOW CREATE TABLE needs a table")),
+                        filter,
+                    );
+                }
             },
             "DATABASE" | "SCHEMA" => {
                 let mut at = i + 2;
@@ -336,10 +450,20 @@ fn classify_show(tokens: &[Token]) -> (Action, Filter) {
                 }
                 match ident(tokens, at) {
                     Some(name) => Show::CreateDatabase { name },
-                    None => return (Action::Error(MyError::syntax("SHOW CREATE DATABASE needs a name")), filter),
+                    None => {
+                        return (
+                            Action::Error(MyError::syntax("SHOW CREATE DATABASE needs a name")),
+                            filter,
+                        );
+                    }
                 }
             }
-            other => return (Action::Error(MyError::unsupported(format!("SHOW CREATE {other}"))), filter),
+            other => {
+                return (
+                    Action::Error(MyError::unsupported(format!("SHOW CREATE {other}"))),
+                    filter,
+                );
+            }
         },
         "VARIABLES" => Show::Variables,
         "STATUS" => Show::Status,
@@ -351,12 +475,29 @@ fn classify_show(tokens: &[Token]) -> (Action, Filter) {
         "PROCESSLIST" => Show::Processlist,
         "GRANTS" => Show::Grants,
         "TABLE" if word(tokens, i + 1) == "STATUS" => Show::TableStatus,
-        "TRIGGERS" => Show::Empty(vec!["Trigger", "Event", "Table", "Statement", "Timing", "Created", "sql_mode", "Definer"]),
+        "TRIGGERS" => Show::Empty(vec![
+            "Trigger",
+            "Event",
+            "Table",
+            "Statement",
+            "Timing",
+            "Created",
+            "sql_mode",
+            "Definer",
+        ]),
         "EVENTS" => Show::Empty(vec!["Db", "Name", "Definer", "Time zone", "Type"]),
         "PLUGINS" => Show::Empty(vec!["Name", "Status", "Type", "Library", "License"]),
-        "PROCEDURE" | "FUNCTION" => Show::Empty(vec!["Db", "Name", "Type", "Definer", "Modified", "Created"]),
-        "MASTER" | "BINARY" | "REPLICA" | "SLAVE" | "BINLOG" | "OPEN" | "PRIVILEGES" | "PROFILES" => Show::Empty(vec!["Value"]),
-        other => return (Action::Error(MyError::unsupported(format!("SHOW {other}"))), filter),
+        "PROCEDURE" | "FUNCTION" => {
+            Show::Empty(vec!["Db", "Name", "Type", "Definer", "Modified", "Created"])
+        }
+        "MASTER" | "BINARY" | "REPLICA" | "SLAVE" | "BINLOG" | "OPEN" | "PRIVILEGES"
+        | "PROFILES" => Show::Empty(vec!["Value"]),
+        other => {
+            return (
+                Action::Error(MyError::unsupported(format!("SHOW {other}"))),
+                filter,
+            );
+        }
     };
     (Action::Show(show), filter)
 }
@@ -414,7 +555,10 @@ pub(crate) fn initial_variables(tls: bool, port: u16) -> BTreeMap<String, Value>
         ("lock_wait_timeout", i(31536000)),
         ("log_bin", i(0)),
         ("lower_case_table_names", i(1)),
-        ("max_allowed_packet", i(super::packet::MAX_ALLOWED_PACKET as i64)),
+        (
+            "max_allowed_packet",
+            i(super::packet::MAX_ALLOWED_PACKET as i64),
+        ),
         ("max_execution_time", i(0)),
         ("net_buffer_length", i(16384)),
         ("net_read_timeout", i(30)),
@@ -432,11 +576,19 @@ pub(crate) fn initial_variables(tls: bool, port: u16) -> BTreeMap<String, Value>
         ("session_track_system_variables", s("")),
         ("session_track_transaction_info", s("OFF")),
         ("sql_auto_is_null", i(0)),
-        ("sql_mode", s("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION")),
+        (
+            "sql_mode",
+            s(
+                "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+            ),
+        ),
         ("sql_notes", i(1)),
         ("sql_quote_show_create", i(1)),
         ("sql_safe_updates", i(0)),
-        ("sql_select_limit", Value::Str("18446744073709551615".into())),
+        (
+            "sql_select_limit",
+            Value::Str("18446744073709551615".into()),
+        ),
         ("sql_warnings", i(0)),
         ("storage_engine", s("InnoDB")),
         ("super_read_only", i(0)),
@@ -474,13 +626,15 @@ pub(crate) fn as_switch(value: &Value) -> Option<i64> {
 /// The isolation level a variable names (`READ-COMMITTED`), in the engine's
 /// words.
 pub(crate) fn isolation_words(value: &str) -> Option<&'static str> {
-    Some(match value.to_ascii_uppercase().replace(['-', '_'], " ").as_str() {
-        "READ UNCOMMITTED" => "READ UNCOMMITTED",
-        "READ COMMITTED" => "READ COMMITTED",
-        "REPEATABLE READ" => "REPEATABLE READ",
-        "SERIALIZABLE" => "SERIALIZABLE",
-        _ => return None,
-    })
+    Some(
+        match value.to_ascii_uppercase().replace(['-', '_'], " ").as_str() {
+            "READ UNCOMMITTED" => "READ UNCOMMITTED",
+            "READ COMMITTED" => "READ COMMITTED",
+            "REPEATABLE READ" => "REPEATABLE READ",
+            "SERIALIZABLE" => "SERIALIZABLE",
+            _ => return None,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -495,15 +649,50 @@ mod tests {
     #[test]
     fn session_statements() {
         assert!(matches!(classify_sql("USE app"), Action::Use(db) if db == "app"));
-        assert!(matches!(classify_sql("START TRANSACTION READ ONLY"), Action::Begin { read_only: Some(true), .. }));
-        assert!(matches!(classify_sql("COMMIT"), Action::Commit { chain: false }));
-        assert!(matches!(classify_sql("ROLLBACK TO SAVEPOINT a"), Action::Savepoint(s) if s == "ROLLBACK TO SAVEPOINT a"));
-        assert!(matches!(classify_sql("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci"), Action::Set(a) if matches!(&a[0].target, Target::Names(n) if n == "utf8mb4")));
+        assert!(matches!(
+            classify_sql("START TRANSACTION READ ONLY"),
+            Action::Begin {
+                read_only: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_sql("COMMIT"),
+            Action::Commit { chain: false }
+        ));
+        assert!(
+            matches!(classify_sql("ROLLBACK TO SAVEPOINT a"), Action::Savepoint(s) if s == "ROLLBACK TO SAVEPOINT a")
+        );
+        assert!(
+            matches!(classify_sql("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci"), Action::Set(a) if matches!(&a[0].target, Target::Names(n) if n == "utf8mb4"))
+        );
         assert!(matches!(classify_sql("SET autocommit=0, @x = 1"), Action::Set(a) if a.len() == 2));
-        assert!(matches!(classify_sql("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"), Action::SetTransaction { session: true, isolation: Some(_), .. }));
-        assert!(matches!(classify_sql("SHOW FULL TABLES FROM app LIKE 'a%'"), Action::Show(Show::Tables { full: true, database: Some(_) })));
-        assert!(matches!(classify_sql("DESCRIBE t"), Action::Show(Show::Columns { .. })));
-        assert!(matches!(classify_sql("KILL QUERY 12"), Action::Kill { id: 12, query_only: true }));
+        assert!(matches!(
+            classify_sql("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+            Action::SetTransaction {
+                session: true,
+                isolation: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_sql("SHOW FULL TABLES FROM app LIKE 'a%'"),
+            Action::Show(Show::Tables {
+                full: true,
+                database: Some(_)
+            })
+        ));
+        assert!(matches!(
+            classify_sql("DESCRIBE t"),
+            Action::Show(Show::Columns { .. })
+        ));
+        assert!(matches!(
+            classify_sql("KILL QUERY 12"),
+            Action::Kill {
+                id: 12,
+                query_only: true
+            }
+        ));
         assert!(matches!(classify_sql("SELECT 1"), Action::Data));
     }
 

@@ -91,7 +91,9 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Token>, LexError> {
                 padded.extend_from_slice(digits);
                 let bytes = padded
                     .chunks(2)
-                    .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap_or("00"), 16).unwrap_or(0))
+                    .map(|p| {
+                        u8::from_str_radix(std::str::from_utf8(p).unwrap_or("00"), 16).unwrap_or(0)
+                    })
                     .collect();
                 Tok::Hex(bytes)
             }
@@ -143,8 +145,8 @@ pub(crate) fn lex(sql: &str) -> Result<Vec<Token>, LexError> {
             }
             _ => {
                 const OPS: [&str; 22] = [
-                    "<>", "!=", "<=", ">=", "!<", "!>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::", "(", ")",
-                    ",", ";", ".", "=", "<",
+                    "<>", "!=", "<=", ">=", "!<", "!>", "+=", "-=", "*=", "/=", "%=", "&=", "|=",
+                    "^=", "::", "(", ")", ",", ";", ".", "=", "<",
                 ];
                 let op = OPS
                     .iter()
@@ -222,7 +224,14 @@ mod tests {
         assert_eq!(toks("[my]]col]"), vec![Tok::Quoted("my]col".into())]);
         assert_eq!(toks("N'it''s'"), vec![Tok::Str(b"it's".to_vec())]);
         assert_eq!(toks(r"'a\n'"), vec![Tok::Str(br"a\n".to_vec())]);
-        assert_eq!(toks("@p1 @@IDENTITY #tmp"), vec![Tok::UserVar("p1".into()), Tok::SysVar("identity".into()), Tok::Quoted("#tmp".into())]);
+        assert_eq!(
+            toks("@p1 @@IDENTITY #tmp"),
+            vec![
+                Tok::UserVar("p1".into()),
+                Tok::SysVar("identity".into()),
+                Tok::Quoted("#tmp".into())
+            ]
+        );
         assert_eq!(toks("/* a /* b */ c */ 1--x"), vec![Tok::Num("1".into())]);
         assert_eq!(toks("0x0aFF"), vec![Tok::Hex(vec![0x0a, 0xff])]);
     }

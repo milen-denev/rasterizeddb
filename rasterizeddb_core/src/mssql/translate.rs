@@ -19,7 +19,9 @@ use rclite::Arc;
 
 use super::lex::{Tok, Token, matching_paren, split_commas};
 use crate::core::database::Database;
-use crate::sqlcompat::{call, find_top, ident_sql, kw, literal_str, quote_ident, render_text, wrap};
+use crate::sqlcompat::{
+    call, find_top, ident_sql, kw, literal_str, quote_ident, render_text, wrap,
+};
 
 /// A local variable's, or a function's, value.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,7 +83,13 @@ impl TsqlError {
     }
 
     pub(crate) fn unsupported(what: impl Into<String>) -> Self {
-        TsqlError::new(40000, format!("'{}' is not supported by RasterizedDB's SQL Server protocol", what.into()))
+        TsqlError::new(
+            40000,
+            format!(
+                "'{}' is not supported by RasterizedDB's SQL Server protocol",
+                what.into()
+            ),
+        )
     }
 }
 
@@ -112,7 +120,9 @@ pub(crate) enum Kind {
     Query,
     /// An INSERT; `identity` is the column whose generated value is
     /// captured (a RETURNING the client does not see).
-    Insert { identity: Option<String> },
+    Insert {
+        identity: Option<String>,
+    },
     /// UPDATE / DELETE, and an INSERT whose OUTPUT returns rows (`Query`
     /// then).
     Write,
@@ -135,9 +145,19 @@ pub(crate) struct Forward {
 pub(crate) enum Stmt {
     Simple(Vec<Token>),
     Block(Vec<Stmt>),
-    If { condition: Vec<Token>, then: Box<Stmt>, otherwise: Option<Box<Stmt>> },
-    While { condition: Vec<Token>, body: Box<Stmt> },
-    Try { body: Vec<Stmt>, catch: Vec<Stmt> },
+    If {
+        condition: Vec<Token>,
+        then: Box<Stmt>,
+        otherwise: Option<Box<Stmt>>,
+    },
+    While {
+        condition: Vec<Token>,
+        body: Box<Stmt>,
+    },
+    Try {
+        body: Vec<Stmt>,
+        catch: Vec<Stmt>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -145,10 +165,49 @@ pub(crate) enum Stmt {
 // ---------------------------------------------------------------------------
 
 const STARTS: &[&str] = &[
-    "SELECT", "INSERT", "UPDATE", "DELETE", "SET", "DECLARE", "PRINT", "EXEC", "EXECUTE", "CREATE", "ALTER", "DROP",
-    "TRUNCATE", "BEGIN", "COMMIT", "ROLLBACK", "SAVE", "RETURN", "RAISERROR", "THROW", "IF", "WHILE", "USE", "MERGE",
-    "WITH", "GRANT", "DENY", "REVOKE", "BREAK", "CONTINUE", "END", "ELSE", "GOTO", "WAITFOR", "OPEN", "CLOSE", "FETCH",
-    "DEALLOCATE", "CHECKPOINT", "DBCC", "KILL", "BACKUP", "RESTORE",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "SET",
+    "DECLARE",
+    "PRINT",
+    "EXEC",
+    "EXECUTE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "TRUNCATE",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVE",
+    "RETURN",
+    "RAISERROR",
+    "THROW",
+    "IF",
+    "WHILE",
+    "USE",
+    "MERGE",
+    "WITH",
+    "GRANT",
+    "DENY",
+    "REVOKE",
+    "BREAK",
+    "CONTINUE",
+    "END",
+    "ELSE",
+    "GOTO",
+    "WAITFOR",
+    "OPEN",
+    "CLOSE",
+    "FETCH",
+    "DEALLOCATE",
+    "CHECKPOINT",
+    "DBCC",
+    "KILL",
+    "BACKUP",
+    "RESTORE",
 ];
 
 /// Where the simple statement starting at `start` ends (exclusive).
@@ -188,24 +247,51 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                 }
                 let continues = match w.as_str() {
                     "SELECT" => {
-                        matches!(prev.as_str(), "UNION" | "ALL" | "EXCEPT" | "INTERSECT" | "AS" | "FOR")
-                            || (head == "INSERT" && !insert_body)
+                        matches!(
+                            prev.as_str(),
+                            "UNION" | "ALL" | "EXCEPT" | "INTERSECT" | "AS" | "FOR"
+                        ) || (head == "INSERT" && !insert_body)
                             || (head == "WITH" && !main_verb)
                             || (head == "CREATE" && prev == "AS")
                     }
-                    "SET" => (!seen_set && (head == "UPDATE" || main_verb_is(tokens, start, j, "UPDATE"))) || prev == "UPDATE",
+                    "SET" => {
+                        (!seen_set
+                            && (head == "UPDATE" || main_verb_is(tokens, start, j, "UPDATE")))
+                            || prev == "UPDATE"
+                    }
                     "INSERT" | "UPDATE" | "DELETE" => {
-                        matches!(prev.as_str(), "ON" | "FOR" | "OF" | "THEN" | "INSTEAD") || prev_op && head == "CREATE" || (head == "WITH" && !main_verb)
+                        matches!(prev.as_str(), "ON" | "FOR" | "OF" | "THEN" | "INSTEAD")
+                            || prev_op && head == "CREATE"
+                            || (head == "WITH" && !main_verb)
                     }
                     "DROP" | "ALTER" => head == "ALTER",
-                    "IF" => matches!(prev.as_str(), "TABLE" | "VIEW" | "INDEX" | "DATABASE" | "SCHEMA" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "COLUMN" | "CONSTRAINT"),
+                    "IF" => matches!(
+                        prev.as_str(),
+                        "TABLE"
+                            | "VIEW"
+                            | "INDEX"
+                            | "DATABASE"
+                            | "SCHEMA"
+                            | "PROCEDURE"
+                            | "FUNCTION"
+                            | "TRIGGER"
+                            | "COLUMN"
+                            | "CONSTRAINT"
+                    ),
                     "WITH" => {
                         // A table hint or options, not a CTE.
-                        tokens.get(j + 1).is_some_and(|n| n.is_op("(")) || matches!(prev.as_str(), "ROLLUP" | "CUBE")
-                            || tokens.get(j + 1).is_some_and(|n| n.is_word("CHECK") || n.is_word("TIES") || n.is_word("GRANT"))
+                        tokens.get(j + 1).is_some_and(|n| n.is_op("("))
+                            || matches!(prev.as_str(), "ROLLUP" | "CUBE")
+                            || tokens.get(j + 1).is_some_and(|n| {
+                                n.is_word("CHECK") || n.is_word("TIES") || n.is_word("GRANT")
+                            })
                     }
                     "END" | "ELSE" => in_case,
-                    "OPEN" | "CLOSE" | "FETCH" => matches!(prev.as_str(), "NEXT" | "FIRST") || head == "SELECT" || head == "DECLARE",
+                    "OPEN" | "CLOSE" | "FETCH" => {
+                        matches!(prev.as_str(), "NEXT" | "FIRST")
+                            || head == "SELECT"
+                            || head == "DECLARE"
+                    }
                     "BEGIN" => false,
                     "ROLLBACK" | "COMMIT" => prev == "ON",
                     _ => false,
@@ -213,7 +299,11 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                 if w == "SET" && continues {
                     seen_set = true;
                 }
-                if matches!(w.as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE") && head == "WITH" {
+                if matches!(
+                    w.as_str(),
+                    "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+                ) && head == "WITH"
+                {
                     main_verb = true;
                 }
                 if !continues {
@@ -249,17 +339,27 @@ pub(crate) fn parse_batch(tokens: &[Token]) -> Result<Vec<Stmt>, TsqlError> {
 
 fn parse_stmt(tokens: &[Token], i: usize) -> Result<(Stmt, usize), TsqlError> {
     let head = tokens[i].upper().unwrap_or_default();
-    let next = tokens.get(i + 1).and_then(|t| t.upper()).unwrap_or_default();
+    let next = tokens
+        .get(i + 1)
+        .and_then(|t| t.upper())
+        .unwrap_or_default();
     match head.as_str() {
         "BEGIN" if next == "TRY" => {
             let (body, j) = parse_until(tokens, i + 2, "TRY")?;
             if !(kw(tokens, j, "BEGIN") && kw(tokens, j + 1, "CATCH")) {
-                return Err(TsqlError::syntax("BEGIN TRY needs a BEGIN CATCH after END TRY"));
+                return Err(TsqlError::syntax(
+                    "BEGIN TRY needs a BEGIN CATCH after END TRY",
+                ));
             }
             let (catch, k) = parse_until(tokens, j + 2, "CATCH")?;
             Ok((Stmt::Try { body, catch }, k))
         }
-        "BEGIN" if !matches!(next.as_str(), "TRAN" | "TRANSACTION" | "DISTRIBUTED" | "DIALOG" | "CONVERSATION") => {
+        "BEGIN"
+            if !matches!(
+                next.as_str(),
+                "TRAN" | "TRANSACTION" | "DISTRIBUTED" | "DIALOG" | "CONVERSATION"
+            ) =>
+        {
             let (body, j) = parse_until(tokens, i + 1, "")?;
             Ok((Stmt::Block(body), j))
         }
@@ -279,15 +379,30 @@ fn parse_stmt(tokens: &[Token], i: usize) -> Result<(Stmt, usize), TsqlError> {
                 otherwise = Some(Box::new(e));
                 j = k;
             }
-            Ok((Stmt::If { condition, then: Box::new(then), otherwise }, j))
+            Ok((
+                Stmt::If {
+                    condition,
+                    then: Box::new(then),
+                    otherwise,
+                },
+                j,
+            ))
         }
         "WHILE" => {
             let cond_end = condition_end(tokens, i + 1);
             let condition = tokens[i + 1..cond_end].to_vec();
             let (body, j) = parse_stmt(tokens, cond_end)?;
-            Ok((Stmt::While { condition, body: Box::new(body) }, j))
+            Ok((
+                Stmt::While {
+                    condition,
+                    body: Box::new(body),
+                },
+                j,
+            ))
         }
-        "END" | "ELSE" => Err(TsqlError::syntax(format!("Incorrect syntax near the keyword '{head}'."))),
+        "END" | "ELSE" => Err(TsqlError::syntax(format!(
+            "Incorrect syntax near the keyword '{head}'."
+        ))),
         _ => {
             let end = statement_end(tokens, i);
             Ok((Stmt::Simple(tokens[i..end].to_vec()), end))
@@ -297,7 +412,11 @@ fn parse_stmt(tokens: &[Token], i: usize) -> Result<(Stmt, usize), TsqlError> {
 
 /// Statements up to the END [suffix] that closes a block; returns them and
 /// the index after it.
-fn parse_until(tokens: &[Token], mut i: usize, suffix: &str) -> Result<(Vec<Stmt>, usize), TsqlError> {
+fn parse_until(
+    tokens: &[Token],
+    mut i: usize,
+    suffix: &str,
+) -> Result<(Vec<Stmt>, usize), TsqlError> {
     let mut out = Vec::new();
     loop {
         while tokens.get(i).is_some_and(|t| t.is_op(";")) {
@@ -364,7 +483,8 @@ pub(crate) fn map_type(tokens: &[Token]) -> Result<String, TsqlError> {
         .to_ascii_uppercase();
     let mut args: Vec<String> = Vec::new();
     if tokens.get(1).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(tokens, 1).ok_or_else(|| TsqlError::syntax("unbalanced type arguments"))?;
+        let close = matching_paren(tokens, 1)
+            .ok_or_else(|| TsqlError::syntax("unbalanced type arguments"))?;
         for part in split_commas(&tokens[2..close]) {
             args.push(render_text(&part));
         }
@@ -409,7 +529,10 @@ pub(crate) fn map_type(tokens: &[Token]) -> Result<String, TsqlError> {
 
 fn is_string_type(tokens: &[Token]) -> bool {
     tokens.first().and_then(|t| t.upper()).is_some_and(|n| {
-        matches!(n.as_str(), "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "XML")
+        matches!(
+            n.as_str(),
+            "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "XML"
+        )
     })
 }
 
@@ -426,14 +549,44 @@ pub(crate) struct Cx<'a> {
 
 impl<'a> Cx<'a> {
     pub(crate) fn new(env: &'a dyn Env) -> Self {
-        Cx { env, aliases: Vec::new(), window_next: false }
+        Cx {
+            env,
+            aliases: Vec::new(),
+            window_next: false,
+        }
     }
 }
 
 const STRING_FUNCTIONS: &[&str] = &[
-    "CONCAT", "CONCAT_WS", "UPPER", "LOWER", "LTRIM", "RTRIM", "TRIM", "SUBSTRING", "LEFT", "RIGHT", "REPLACE",
-    "REPLICATE", "REVERSE", "STR", "FORMAT", "DB_NAME", "USER_NAME", "SUSER_SNAME", "SUSER_NAME", "HOST_NAME",
-    "APP_NAME", "QUOTENAME", "STRING_AGG", "CHAR", "NCHAR", "SPACE", "OBJECT_NAME", "SCHEMA_NAME", "NEWID",
+    "CONCAT",
+    "CONCAT_WS",
+    "UPPER",
+    "LOWER",
+    "LTRIM",
+    "RTRIM",
+    "TRIM",
+    "SUBSTRING",
+    "LEFT",
+    "RIGHT",
+    "REPLACE",
+    "REPLICATE",
+    "REVERSE",
+    "STR",
+    "FORMAT",
+    "DB_NAME",
+    "USER_NAME",
+    "SUSER_SNAME",
+    "SUSER_NAME",
+    "HOST_NAME",
+    "APP_NAME",
+    "QUOTENAME",
+    "STRING_AGG",
+    "CHAR",
+    "NCHAR",
+    "SPACE",
+    "OBJECT_NAME",
+    "SCHEMA_NAME",
+    "NEWID",
 ];
 
 /// Whether the operand in `tokens[start..=end]` is plainly a string.
@@ -463,7 +616,9 @@ fn stringish(tokens: &[Token], start: usize, end: usize, cx: &Cx) -> bool {
             }
             if upper == "ISNULL" || upper == "COALESCE" {
                 let args = split_commas(&tokens[start + 2..end]);
-                return args.iter().any(|a| !a.is_empty() && stringish(a, 0, a.len() - 1, cx));
+                return args
+                    .iter()
+                    .any(|a| !a.is_empty() && stringish(a, 0, a.len() - 1, cx));
             }
         }
         Tok::Op(o) if o == "(" => {
@@ -471,7 +626,8 @@ fn stringish(tokens: &[Token], start: usize, end: usize, cx: &Cx) -> bool {
                 if close == end && close > start + 1 {
                     let inner = &tokens[start + 1..close];
                     // A parenthesised concatenation is a string.
-                    return inner.iter().any(|t| matches!(t.tok, Tok::Str(_))) && !inner.iter().any(|t| t.is_word("SELECT"));
+                    return inner.iter().any(|t| matches!(t.tok, Tok::Str(_)))
+                        && !inner.iter().any(|t| t.is_word("SELECT"));
                 }
             }
         }
@@ -584,10 +740,17 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
         let t = &tokens[i];
         // `db.dbo.t`, `dbo.t`: the engine has one schema.
         if let Some(name) = t.ident() {
-            if tokens.get(i + 1).is_some_and(|d| d.is_op(".")) && !out.last().is_some_and(|p| p.is_op(".")) {
-                let schema_next = tokens.get(i + 2).and_then(|x| x.ident()).is_some_and(|s| s.eq_ignore_ascii_case("dbo"))
+            if tokens.get(i + 1).is_some_and(|d| d.is_op("."))
+                && !out.last().is_some_and(|p| p.is_op("."))
+            {
+                let schema_next = tokens
+                    .get(i + 2)
+                    .and_then(|x| x.ident())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("dbo"))
                     && tokens.get(i + 3).is_some_and(|d| d.is_op("."));
-                if name.eq_ignore_ascii_case("dbo") && tokens.get(i + 2).is_some_and(|x| x.ident().is_some()) {
+                if name.eq_ignore_ascii_case("dbo")
+                    && tokens.get(i + 2).is_some_and(|x| x.ident().is_some())
+                {
                     i += 2;
                     continue;
                 }
@@ -605,7 +768,11 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 if let Some(view) = tokens.get(i + 2).and_then(|x| x.ident()) {
                     if let Some(sql) = catalog_view(name, view, cx)? {
                         out.push(Token::raw(sql));
-                        let alias_given = tokens.get(i + 3).is_some_and(|a| a.is_word("AS") || (matches!(a.tok, Tok::Word(_) | Tok::Quoted(_)) && !is_clause_word(a)));
+                        let alias_given = tokens.get(i + 3).is_some_and(|a| {
+                            a.is_word("AS")
+                                || (matches!(a.tok, Tok::Word(_) | Tok::Quoted(_))
+                                    && !is_clause_word(a))
+                        });
                         if !alias_given {
                             out.push(Token::raw(quote_ident(&view.to_lowercase())));
                         }
@@ -616,18 +783,31 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             }
         }
         // A table hint, WITH (NOLOCK), or query hints, OPTION (…): dropped.
-        if (t.is_word("WITH") && matches!(out.last().map(|p| &p.tok), Some(Tok::Word(_) | Tok::Quoted(_) | Tok::Raw(_))) && !out.last().is_some_and(|p| p.upper().is_some_and(|w| matches!(w.as_str(), "AS" | "SELECT"))))
+        if (t.is_word("WITH")
+            && matches!(
+                out.last().map(|p| &p.tok),
+                Some(Tok::Word(_) | Tok::Quoted(_) | Tok::Raw(_))
+            )
+            && !out.last().is_some_and(|p| {
+                p.upper()
+                    .is_some_and(|w| matches!(w.as_str(), "AS" | "SELECT"))
+            }))
             || t.is_word("OPTION")
         {
             if tokens.get(i + 1).is_some_and(|p| p.is_op("(")) {
-                let close = matching_paren(&tokens, i + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))?;
+                let close = matching_paren(&tokens, i + 1)
+                    .ok_or_else(|| TsqlError::syntax("unbalanced hint"))?;
                 i = close + 1;
                 continue;
             }
         }
         if let Tok::Word(word) = &t.tok {
-            if tokens.get(i + 1).is_some_and(|p| p.is_op("(")) && !out.last().is_some_and(|p| p.is_op(".")) && !is_clause_word(t) {
-                let close = matching_paren(&tokens, i + 1).ok_or_else(|| TsqlError::syntax("unbalanced parentheses"))?;
+            if tokens.get(i + 1).is_some_and(|p| p.is_op("("))
+                && !out.last().is_some_and(|p| p.is_op("."))
+                && !is_clause_word(t)
+            {
+                let close = matching_paren(&tokens, i + 1)
+                    .ok_or_else(|| TsqlError::syntax("unbalanced parentheses"))?;
                 cx.window_next = kw(&tokens, close + 1, "OVER");
                 if let Some(replacement) = rewrite_call(word, &tokens[i + 2..close], cx)? {
                     out.extend(replacement);
@@ -655,7 +835,10 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                     v.space = t.space;
                     out.push(v);
                 } else {
-                    return Err(TsqlError::new(137, format!("Must declare the scalar variable \"@{name}\".")));
+                    return Err(TsqlError::new(
+                        137,
+                        format!("Must declare the scalar variable \"@{name}\"."),
+                    ));
                 }
             }
             Tok::SysVar(name) => {
@@ -670,8 +853,11 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 let left_string = out.last().is_some_and(|p| p.is_op("||"))
                     || operand_start(&out, out.len().saturating_sub(1))
                         .is_some_and(|s| !out.is_empty() && stringish(&out, s, out.len() - 1, cx));
-                let right_string = operand_end(&tokens, i + 1).is_some_and(|e| stringish(&tokens, i + 1, e, cx));
-                let unary = out.last().is_none_or(|p| matches!(&p.tok, Tok::Op(o) if o != ")"));
+                let right_string =
+                    operand_end(&tokens, i + 1).is_some_and(|e| stringish(&tokens, i + 1, e, cx));
+                let unary = out
+                    .last()
+                    .is_none_or(|p| matches!(&p.tok, Tok::Op(o) if o != ")"));
                 if (left_string || right_string) && !unary {
                     out.push(Token::op("||"));
                 } else {
@@ -688,22 +874,34 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                         continue;
                     }
                     "CURRENT_TIMESTAMP" => out.push(Token::raw("localtimestamp")),
-                    "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" | "USER" if !tokens.get(i + 1).is_some_and(|p| p.is_op("(")) => {
+                    "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" | "USER"
+                        if !tokens.get(i + 1).is_some_and(|p| p.is_op("(")) =>
+                    {
                         out.push(literal_str(cx.env.user()));
                     }
-                    "WITH" if tokens.get(i + 1).is_some_and(|p| p.is_op("(")) && matches!(out.last().map(|p| &p.tok), Some(Tok::Word(_) | Tok::Quoted(_) | Tok::Raw(_))) => {
+                    "WITH"
+                        if tokens.get(i + 1).is_some_and(|p| p.is_op("("))
+                            && matches!(
+                                out.last().map(|p| &p.tok),
+                                Some(Tok::Word(_) | Tok::Quoted(_) | Tok::Raw(_))
+                            ) =>
+                    {
                         // A table hint: WITH (NOLOCK).
-                        let close = matching_paren(&tokens, i + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))?;
+                        let close = matching_paren(&tokens, i + 1)
+                            .ok_or_else(|| TsqlError::syntax("unbalanced hint"))?;
                         i = close + 1;
                         continue;
                     }
                     "OPTION" if tokens.get(i + 1).is_some_and(|p| p.is_op("(")) => {
-                        let close = matching_paren(&tokens, i + 1).ok_or_else(|| TsqlError::syntax("unbalanced OPTION"))?;
+                        let close = matching_paren(&tokens, i + 1)
+                            .ok_or_else(|| TsqlError::syntax("unbalanced OPTION"))?;
                         i = close + 1;
                         continue;
                     }
-                    "NOLOCK" | "READUNCOMMITTED" | "ROWLOCK" | "UPDLOCK" | "HOLDLOCK" | "READPAST" | "TABLOCK" | "TABLOCKX"
-                        if out.last().is_some_and(|p| p.is_op("(")) && tokens.get(i + 1).is_some_and(|p| p.is_op(")")) =>
+                    "NOLOCK" | "READUNCOMMITTED" | "ROWLOCK" | "UPDLOCK" | "HOLDLOCK"
+                    | "READPAST" | "TABLOCK" | "TABLOCKX"
+                        if out.last().is_some_and(|p| p.is_op("("))
+                            && tokens.get(i + 1).is_some_and(|p| p.is_op(")")) =>
                     {
                         // An old-style hint: t (NOLOCK).
                         out.pop();
@@ -712,7 +910,9 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                     }
                     _ => {
                         if let Some(alias) = cx.aliases.iter().find(|a| a.eq_ignore_ascii_case(w)) {
-                            if !out.last().is_some_and(|p| p.is_op(".")) && !tokens.get(i + 1).is_some_and(|p| p.is_op(".")) {
+                            if !out.last().is_some_and(|p| p.is_op("."))
+                                && !tokens.get(i + 1).is_some_and(|p| p.is_op("."))
+                            {
                                 let mut v = Token::raw(quote_ident(alias));
                                 v.space = t.space;
                                 out.push(v);
@@ -726,7 +926,9 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             }
             Tok::Quoted(name) => {
                 if let Some(alias) = cx.aliases.iter().find(|a| a.eq_ignore_ascii_case(name)) {
-                    if !out.last().is_some_and(|p| p.is_op(".")) && !tokens.get(i + 1).is_some_and(|p| p.is_op(".")) {
+                    if !out.last().is_some_and(|p| p.is_op("."))
+                        && !tokens.get(i + 1).is_some_and(|p| p.is_op("."))
+                    {
                         let mut v = Token::raw(quote_ident(alias));
                         v.space = t.space;
                         out.push(v);
@@ -747,9 +949,38 @@ fn is_clause_word(t: &Token) -> bool {
     t.upper().is_some_and(|w| {
         matches!(
             w.as_str(),
-            "WHERE" | "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "ON" | "GROUP" | "ORDER" | "HAVING" | "UNION"
-                | "OUTER" | "WITH" | "OPTION" | "FOR" | "EXCEPT" | "INTERSECT" | "SELECT" | "INSERT" | "UPDATE" | "DELETE"
-                | "SET" | "DECLARE" | "PRINT" | "EXEC" | "IF" | "END" | "ELSE" | "BEGIN" | "OFFSET" | "FETCH"
+            "WHERE"
+                | "JOIN"
+                | "INNER"
+                | "LEFT"
+                | "RIGHT"
+                | "FULL"
+                | "CROSS"
+                | "ON"
+                | "GROUP"
+                | "ORDER"
+                | "HAVING"
+                | "UNION"
+                | "OUTER"
+                | "WITH"
+                | "OPTION"
+                | "FOR"
+                | "EXCEPT"
+                | "INTERSECT"
+                | "SELECT"
+                | "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "SET"
+                | "DECLARE"
+                | "PRINT"
+                | "EXEC"
+                | "IF"
+                | "END"
+                | "ELSE"
+                | "BEGIN"
+                | "OFFSET"
+                | "FETCH"
         )
     })
 }
@@ -768,13 +999,24 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         if want.contains(&a.len()) {
             Ok(())
         } else {
-            Err(TsqlError::new(174, format!("The {upper} function requires {} argument(s).", want[0])))
+            Err(TsqlError::new(
+                174,
+                format!("The {upper} function requires {} argument(s).", want[0]),
+            ))
         }
     };
     let text_arg = |a: &[Token]| -> Option<String> {
         match a {
-            [Token { tok: Tok::Str(s), .. }] => Some(String::from_utf8_lossy(s).into_owned()),
-            [Token { tok: Tok::Word(w), .. }] => Some(w.clone()),
+            [
+                Token {
+                    tok: Tok::Str(s), ..
+                },
+            ] => Some(String::from_utf8_lossy(s).into_owned()),
+            [
+                Token {
+                    tok: Tok::Word(w), ..
+                },
+            ] => Some(w.clone()),
             _ => None,
         }
     };
@@ -834,7 +1076,10 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "CHOOSE" => {
             let a = args(cx)?;
             if a.len() < 2 {
-                return Err(TsqlError::new(174, "The CHOOSE function requires at least 2 arguments."));
+                return Err(TsqlError::new(
+                    174,
+                    "The CHOOSE function requires at least 2 arguments.",
+                ));
             }
             let mut it = a.into_iter();
             let mut out = vec![Token::raw("(CASE")];
@@ -898,10 +1143,15 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "ROUND" => {
             let a = args(cx)?;
             if a.len() == 3 {
-                let truncate = !matches!(a[2].as_slice(), [Token { tok: Tok::Num(n), .. }] if n == "0");
+                let truncate =
+                    !matches!(a[2].as_slice(), [Token { tok: Tok::Num(n), .. }] if n == "0");
                 let mut a = a;
                 a.truncate(2);
-                if truncate { call("trunc", a) } else { call("round", a) }
+                if truncate {
+                    call("trunc", a)
+                } else {
+                    call("round", a)
+                }
             } else {
                 call("round", a)
             }
@@ -917,7 +1167,14 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "QUOTENAME" => {
             let a = args(cx)?;
             let mut out = vec![Token::raw("('[' ||")];
-            out.extend(call("replace", vec![a.into_iter().next().unwrap_or_default(), vec![literal_str("]")], vec![literal_str("]]")]]));
+            out.extend(call(
+                "replace",
+                vec![
+                    a.into_iter().next().unwrap_or_default(),
+                    vec![literal_str("]")],
+                    vec![literal_str("]]")],
+                ],
+            ));
             out.push(Token::raw("|| ']')"));
             out
         }
@@ -934,10 +1191,15 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "DATEADD" => {
             let r = raw();
             if r.len() != 3 {
-                return Err(TsqlError::new(174, "The DATEADD function requires 3 argument(s)."));
+                return Err(TsqlError::new(
+                    174,
+                    "The DATEADD function requires 3 argument(s).",
+                ));
             }
             let part = text_arg(&r[0]).unwrap_or_default();
-            let (unit, factor) = interval_unit(&part).ok_or_else(|| TsqlError::new(155, format!("'{part}' is not a recognized dateadd option.")))?;
+            let (unit, factor) = interval_unit(&part).ok_or_else(|| {
+                TsqlError::new(155, format!("'{part}' is not a recognized dateadd option."))
+            })?;
             let amount = rewrite_expr(r[1].clone(), cx)?;
             let date = rewrite_expr(r[2].clone(), cx)?;
             let mut out = wrap(date);
@@ -950,25 +1212,40 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "DATEDIFF" | "DATEDIFF_BIG" => {
             let r = raw();
             if r.len() != 3 {
-                return Err(TsqlError::new(174, "The DATEDIFF function requires 3 argument(s)."));
+                return Err(TsqlError::new(
+                    174,
+                    "The DATEDIFF function requires 3 argument(s).",
+                ));
             }
             let part = text_arg(&r[0]).unwrap_or_default().to_ascii_lowercase();
             let a = render_text(&rewrite_expr(r[1].clone(), cx)?);
             let b = render_text(&rewrite_expr(r[2].clone(), cx)?);
             // Boundaries crossed, as SQL Server counts.
             let sql = match part.as_str() {
-                "year" | "yy" | "yyyy" => format!("(extract(year from ({b})::timestamp) - extract(year from ({a})::timestamp))::int"),
+                "year" | "yy" | "yyyy" => format!(
+                    "(extract(year from ({b})::timestamp) - extract(year from ({a})::timestamp))::int"
+                ),
                 "quarter" | "qq" | "q" => format!(
                     "((extract(year from ({b})::timestamp) - extract(year from ({a})::timestamp)) * 4 + extract(quarter from ({b})::timestamp) - extract(quarter from ({a})::timestamp))::int"
                 ),
                 "month" | "mm" | "m" => format!(
                     "((extract(year from ({b})::timestamp) - extract(year from ({a})::timestamp)) * 12 + extract(month from ({b})::timestamp) - extract(month from ({a})::timestamp))::int"
                 ),
-                "day" | "dd" | "d" | "dayofyear" | "dy" | "y" => format!("(({b})::date - ({a})::date)"),
-                "hour" | "hh" => format!("(extract(epoch from date_trunc('hour', ({b})::timestamp) - date_trunc('hour', ({a})::timestamp)) / 3600)::int"),
-                "minute" | "mi" | "n" => format!("(extract(epoch from date_trunc('minute', ({b})::timestamp) - date_trunc('minute', ({a})::timestamp)) / 60)::int"),
-                "second" | "ss" | "s" => format!("(extract(epoch from date_trunc('second', ({b})::timestamp) - date_trunc('second', ({a})::timestamp)))::bigint"),
-                "millisecond" | "ms" => format!("(extract(epoch from ({b})::timestamp - ({a})::timestamp) * 1000)::bigint"),
+                "day" | "dd" | "d" | "dayofyear" | "dy" | "y" => {
+                    format!("(({b})::date - ({a})::date)")
+                }
+                "hour" | "hh" => format!(
+                    "(extract(epoch from date_trunc('hour', ({b})::timestamp) - date_trunc('hour', ({a})::timestamp)) / 3600)::int"
+                ),
+                "minute" | "mi" | "n" => format!(
+                    "(extract(epoch from date_trunc('minute', ({b})::timestamp) - date_trunc('minute', ({a})::timestamp)) / 60)::int"
+                ),
+                "second" | "ss" | "s" => format!(
+                    "(extract(epoch from date_trunc('second', ({b})::timestamp) - date_trunc('second', ({a})::timestamp)))::bigint"
+                ),
+                "millisecond" | "ms" => format!(
+                    "(extract(epoch from ({b})::timestamp - ({a})::timestamp) * 1000)::bigint"
+                ),
                 other => return Err(TsqlError::unsupported(format!("DATEDIFF by {other}"))),
             };
             vec![Token::raw(sql)]
@@ -976,16 +1253,24 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "DATEPART" | "DATENAME" => {
             let r = raw();
             if r.len() != 2 {
-                return Err(TsqlError::new(174, format!("The {upper} function requires 2 argument(s).")));
+                return Err(TsqlError::new(
+                    174,
+                    format!("The {upper} function requires 2 argument(s)."),
+                ));
             }
             let part = text_arg(&r[0]).unwrap_or_default();
-            let field = extract_field(&part).ok_or_else(|| TsqlError::unsupported(format!("{upper} of {part}")))?;
+            let field = extract_field(&part)
+                .ok_or_else(|| TsqlError::unsupported(format!("{upper} of {part}")))?;
             let d = rewrite_expr(r[1].clone(), cx)?;
             let mut out = vec![Token::raw(format!("(extract({field} from"))];
             let mut ts = wrap(d);
             ts.push(Token::raw("::timestamp"));
             out.extend(wrap(ts));
-            out.push(Token::raw(if field == "dow" { ")::int + 1)" } else { ")::int)" }));
+            out.push(Token::raw(if field == "dow" {
+                ")::int + 1)"
+            } else {
+                ")::int)"
+            }));
             if upper == "DATENAME" {
                 let mut cast = vec![Token::raw("CAST(")];
                 cast.extend(out);
@@ -998,7 +1283,10 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "YEAR" | "MONTH" | "DAY" => {
             let a = args(cx)?;
             arity(&a, &[1])?;
-            let mut out = vec![Token::raw(format!("(extract({} from", upper.to_lowercase()))];
+            let mut out = vec![Token::raw(format!(
+                "(extract({} from",
+                upper.to_lowercase()
+            ))];
             let mut ts = wrap(a.into_iter().next().unwrap());
             ts.push(Token::raw("::timestamp"));
             out.extend(wrap(ts));
@@ -1009,16 +1297,22 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let a = args(cx)?;
             arity(&a, &[1])?;
             let d = render_text(&a[0]);
-            vec![Token::raw(format!("((date_trunc('month', ({d})::timestamp) + interval '1 month' - interval '1 day')::date)"))]
+            vec![Token::raw(format!(
+                "((date_trunc('month', ({d})::timestamp) + interval '1 month' - interval '1 day')::date)"
+            ))]
         }
         "DATEFROMPARTS" => {
             let a = args(cx)?;
             arity(&a, &[3])?;
             let parts: Vec<String> = a.iter().map(|x| render_text(x)).collect();
-            vec![Token::raw(format!("CAST(concat({}, '-', {}, '-', {}) AS date)", parts[0], parts[1], parts[2]))]
+            vec![Token::raw(format!(
+                "CAST(concat({}, '-', {}, '-', {}) AS date)",
+                parts[0], parts[1], parts[2]
+            ))]
         }
         "CAST" | "TRY_CAST" => {
-            let at = find_top(inner, 0, &["AS"]).ok_or_else(|| TsqlError::syntax("CAST needs AS"))?;
+            let at =
+                find_top(inner, 0, &["AS"]).ok_or_else(|| TsqlError::syntax("CAST needs AS"))?;
             let value = rewrite_expr(inner[..at].to_vec(), cx)?;
             let target = map_type(&inner[at + 1..])?;
             let mut out = vec![Token::raw("CAST"), Token::op("(")];
@@ -1030,7 +1324,10 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "CONVERT" | "TRY_CONVERT" => {
             let r = raw();
             if r.len() < 2 {
-                return Err(TsqlError::new(174, "The CONVERT function requires at least 2 argument(s)."));
+                return Err(TsqlError::new(
+                    174,
+                    "The CONVERT function requires at least 2 argument(s).",
+                ));
             }
             let target = map_type(&r[0])?;
             let value = rewrite_expr(r[1].clone(), cx)?;
@@ -1039,7 +1336,11 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 (Some(s), t) if t == "text" || t.starts_with("varchar") => match s {
                     23 => Some("YYYY-MM-DD"),
                     120 | 20 => Some("YYYY-MM-DD HH24:MI:SS"),
-                    121 | 21 | 126 | 127 => Some(if s >= 126 { "YYYY-MM-DD\"T\"HH24:MI:SS.MS" } else { "YYYY-MM-DD HH24:MI:SS.MS" }),
+                    121 | 21 | 126 | 127 => Some(if s >= 126 {
+                        "YYYY-MM-DD\"T\"HH24:MI:SS.MS"
+                    } else {
+                        "YYYY-MM-DD HH24:MI:SS.MS"
+                    }),
                     112 => Some("YYYYMMDD"),
                     101 => Some("MM/DD/YYYY"),
                     103 => Some("DD/MM/YYYY"),
@@ -1063,8 +1364,13 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         }
         "OBJECT_ID" => {
             let r = raw();
-            let name = r.first().and_then(|a| text_arg(a)).map(|t| object_name_in(&t));
-            let exists = name.as_deref().is_some_and(|n| cx.env.database().has_table(n));
+            let name = r
+                .first()
+                .and_then(|a| text_arg(a))
+                .map(|t| object_name_in(&t));
+            let exists = name
+                .as_deref()
+                .is_some_and(|n| cx.env.database().has_table(n));
             vec![match name {
                 Some(n) if exists => Token::new(Tok::Num(object_id(&n).to_string())),
                 _ => Token::raw("CAST(NULL AS integer)"),
@@ -1072,8 +1378,17 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         }
         "OBJECT_NAME" => {
             let r = raw();
-            let id: Option<i64> = r.first().and_then(|a| text_arg(a)).and_then(|t| t.parse().ok());
-            let name = id.and_then(|id| cx.env.database().table_names().into_iter().find(|n| object_id(n) == id));
+            let id: Option<i64> = r
+                .first()
+                .and_then(|a| text_arg(a))
+                .and_then(|t| t.parse().ok());
+            let name = id.and_then(|id| {
+                cx.env
+                    .database()
+                    .table_names()
+                    .into_iter()
+                    .find(|n| object_id(n) == id)
+            });
             vec![match name {
                 Some(n) => literal_str(&n),
                 None => Token::raw("CAST(NULL AS text)"),
@@ -1081,27 +1396,39 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         }
         "SCHEMA_ID" => {
             let r = raw();
-            let name = r.first().and_then(|a| text_arg(a)).unwrap_or_else(|| "dbo".into());
-            vec![if name.eq_ignore_ascii_case("dbo") { Token::new(Tok::Num("1".into())) } else { Token::raw("CAST(NULL AS integer)") }]
+            let name = r
+                .first()
+                .and_then(|a| text_arg(a))
+                .unwrap_or_else(|| "dbo".into());
+            vec![if name.eq_ignore_ascii_case("dbo") {
+                Token::new(Tok::Num("1".into()))
+            } else {
+                Token::raw("CAST(NULL AS integer)")
+            }]
         }
         "SCHEMA_NAME" => vec![literal_str("dbo")],
         "DB_NAME" => vec![literal_str(cx.env.database_name())],
         "DB_ID" => vec![Token::new(Tok::Num("5".into()))],
-        "USER_NAME" | "SUSER_NAME" | "SUSER_SNAME" | "ORIGINAL_LOGIN" | "USER_ID" if inner.is_empty() || upper != "USER_ID" => {
+        "USER_NAME" | "SUSER_NAME" | "SUSER_SNAME" | "ORIGINAL_LOGIN" | "USER_ID"
+            if inner.is_empty() || upper != "USER_ID" =>
+        {
             vec![literal_str(cx.env.user())]
         }
-        "COLUMNPROPERTY" | "OBJECTPROPERTY" | "OBJECTPROPERTYEX" | "INDEXPROPERTY" | "COLLATIONPROPERTY" => vec![Token::raw("CAST(NULL AS integer)")],
+        "COLUMNPROPERTY" | "OBJECTPROPERTY" | "OBJECTPROPERTYEX" | "INDEXPROPERTY"
+        | "COLLATIONPROPERTY" => vec![Token::raw("CAST(NULL AS integer)")],
         "SERVERPROPERTY" | "DATABASEPROPERTYEX" => {
             let r = raw();
             let prop = r.last().and_then(|a| text_arg(a)).unwrap_or_default();
             let v = server_property(&prop);
             vec![v.token()]
         }
-        "STRING_SPLIT" | "OPENJSON" | "OPENXML" | "OPENQUERY" | "OPENROWSET" | "PATINDEX" | "STUFF" | "FORMAT" | "TRANSLATE" | "SOUNDEX" | "DIFFERENCE" => {
+        "STRING_SPLIT" | "OPENJSON" | "OPENXML" | "OPENQUERY" | "OPENROWSET" | "PATINDEX"
+        | "STUFF" | "FORMAT" | "TRANSLATE" | "SOUNDEX" | "DIFFERENCE" => {
             return Err(TsqlError::unsupported(upper));
         }
-        "ERROR_MESSAGE" | "ERROR_NUMBER" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE" | "ERROR_PROCEDURE" | "XACT_STATE"
-        | "SCOPE_IDENTITY" | "IDENT_CURRENT" | "ROWCOUNT_BIG" | "HOST_NAME" | "APP_NAME" | "IS_SRVROLEMEMBER" | "IS_MEMBER"
+        "ERROR_MESSAGE" | "ERROR_NUMBER" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE"
+        | "ERROR_PROCEDURE" | "XACT_STATE" | "SCOPE_IDENTITY" | "IDENT_CURRENT"
+        | "ROWCOUNT_BIG" | "HOST_NAME" | "APP_NAME" | "IS_SRVROLEMEMBER" | "IS_MEMBER"
         | "HAS_DBACCESS" | "SESSIONPROPERTY" => {
             let v = cx.env.function(&upper).unwrap_or(Value::Null);
             vec![v.token()]
@@ -1123,7 +1450,11 @@ pub(crate) fn server_property(name: &str) -> Value {
         "servername" | "machinename" => s("rasterizeddb"),
         "instancename" => Value::Null,
         "collation" => s("Latin1_General_BIN2"),
-        "isclustered" | "isfulltextinstalled" | "isintegratedsecurityonly" | "ishadrenabled" | "isxtpsupported" => Value::Int(0),
+        "isclustered"
+        | "isfulltextinstalled"
+        | "isintegratedsecurityonly"
+        | "ishadrenabled"
+        | "isxtpsupported" => Value::Int(0),
         "issingleuser" => Value::Int(0),
         "status" => s("ONLINE"),
         "updateability" => s("READ_WRITE"),
@@ -1154,14 +1485,21 @@ fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, Tsq
     let mut tables: Vec<String> = database
         .table_names()
         .into_iter()
-        .filter(|n| !n.starts_with("__") && n != crate::auth::ROLE_TABLE && !n.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX))
+        .filter(|n| {
+            !n.starts_with("__")
+                && n != crate::auth::ROLE_TABLE
+                && !n.starts_with(crate::core::rql::json_map::SHADOW_TABLE_PREFIX)
+        })
         .collect();
     tables.sort();
     let db = cx.env.database_name().to_string();
     let empty = |cols: &[&str]| -> String {
         format!(
             "(SELECT {} WHERE 1 = 0)",
-            cols.iter().map(|c| format!("CAST(NULL AS text) AS {}", ident_sql(c))).collect::<Vec<_>>().join(", ")
+            cols.iter()
+                .map(|c| format!("CAST(NULL AS text) AS {}", ident_sql(c)))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     };
     let values = |rows: Vec<String>, cols: &[&str], fallback: String| -> String {
@@ -1171,21 +1509,33 @@ fn catalog_view(schema: &str, view: &str, cx: &Cx) -> Result<Option<String>, Tsq
             format!(
                 "(SELECT * FROM (VALUES {}) AS v({}))",
                 rows.join(", "),
-                cols.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", ")
+                cols.iter()
+                    .map(|c| ident_sql(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }
     };
     let columns_of = |table: &str| -> Vec<(String, String, bool, Option<String>, bool)> {
         // (name, type, nullable, default, identity)
-        let Some(view) = database.schema_view(table) else { return Vec::new() };
+        let Some(view) = database.schema_view(table) else {
+            return Vec::new();
+        };
         let schema = view.schema();
         schema
             .fields
             .iter()
             .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
             .map(|f| {
-                let default = schema.defaults.iter().filter(|d| !d.is_deleted && d.column == f.name).map(|d| d.expression.clone()).next_back();
-                let identity = default.as_deref().is_some_and(|d| d.to_ascii_lowercase().starts_with("nextval("));
+                let default = schema
+                    .defaults
+                    .iter()
+                    .filter(|d| !d.is_deleted && d.column == f.name)
+                    .map(|d| d.expression.clone())
+                    .next_back();
+                let identity = default
+                    .as_deref()
+                    .is_some_and(|d| d.to_ascii_lowercase().starts_with("nextval("));
                 let pk = schema.primary_key.as_deref() == Some(f.name.as_str());
                 let ty = tsql_type_name(&f.db_type, f.without_time_zone, f.json_text);
                 (f.name.clone(), ty, !pk, default, identity)
@@ -1374,7 +1724,12 @@ fn identity_column(database: &Database, table: &str) -> Option<String> {
         .defaults
         .iter()
         .filter(|d| !d.is_deleted)
-        .find(|d| d.expression.trim_start().to_ascii_lowercase().starts_with("nextval("))
+        .find(|d| {
+            d.expression
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("nextval(")
+        })
         .map(|d| d.column.clone())
 }
 
@@ -1384,12 +1739,17 @@ fn primary_key(database: &Database, table: &str) -> Option<String> {
 
 /// `TOP (n)` / `TOP n` right after `SELECT [DISTINCT]`: removed, and its
 /// count returned.
-fn take_top(tokens: &mut Vec<Token>, at: usize, cx: &mut Cx) -> Result<Option<Vec<Token>>, TsqlError> {
+fn take_top(
+    tokens: &mut Vec<Token>,
+    at: usize,
+    cx: &mut Cx,
+) -> Result<Option<Vec<Token>>, TsqlError> {
     if !kw(tokens, at, "TOP") {
         return Ok(None);
     }
     let (count, end) = if tokens.get(at + 1).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(tokens, at + 1).ok_or_else(|| TsqlError::syntax("unbalanced TOP"))?;
+        let close =
+            matching_paren(tokens, at + 1).ok_or_else(|| TsqlError::syntax("unbalanced TOP"))?;
         (tokens[at + 2..close].to_vec(), close + 1)
     } else {
         (tokens.get(at + 1).cloned().into_iter().collect(), at + 2)
@@ -1402,7 +1762,12 @@ fn take_top(tokens: &mut Vec<Token>, at: usize, cx: &mut Cx) -> Result<Option<Ve
 }
 
 /// Rewrites a SELECT. `name_items` names unaliased columns as written.
-fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) -> Result<Vec<Token>, TsqlError> {
+fn rewrite_select(
+    sql: &str,
+    tokens: Vec<Token>,
+    cx: &mut Cx,
+    name_items: bool,
+) -> Result<Vec<Token>, TsqlError> {
     let mut tokens = tokens;
     let mut i = 0usize;
     let mut out = Vec::new();
@@ -1420,13 +1785,33 @@ fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) 
         i += 1;
     }
     let top = take_top(&mut tokens, i, cx)?;
-    let end = find_top(&tokens, i, &["FROM", "INTO", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "EXCEPT", "INTERSECT", "OPTION", "FOR", "OFFSET"])
-        .unwrap_or(tokens.len());
+    let end = find_top(
+        &tokens,
+        i,
+        &[
+            "FROM",
+            "INTO",
+            "WHERE",
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "UNION",
+            "EXCEPT",
+            "INTERSECT",
+            "OPTION",
+            "FOR",
+            "OFFSET",
+        ],
+    )
+    .unwrap_or(tokens.len());
     let items = split_commas(&tokens[i..end]);
     let mut prepared = Vec::new();
     for item in items {
         // T-SQL's `alias = expr`.
-        let (expr, alias) = if item.len() >= 3 && item[1].is_op("=") && matches!(item[0].tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Str(_)) {
+        let (expr, alias) = if item.len() >= 3
+            && item[1].is_op("=")
+            && matches!(item[0].tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Str(_))
+        {
             let name = match &item[0].tok {
                 Tok::Word(w) | Tok::Quoted(w) => w.clone(),
                 Tok::Str(s) => String::from_utf8_lossy(s).into_owned(),
@@ -1439,7 +1824,13 @@ fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) 
         if let Some(a) = &alias {
             cx.aliases.push(a.clone());
         }
-        let name = alias.or_else(|| if name_items { implicit_name(sql, &expr) } else { None });
+        let name = alias.or_else(|| {
+            if name_items {
+                implicit_name(sql, &expr)
+            } else {
+                None
+            }
+        });
         prepared.push((expr, name));
     }
     let saved = std::mem::take(&mut cx.aliases);
@@ -1465,12 +1856,20 @@ fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) 
     let mut rest: Vec<Token> = tokens[end..].to_vec();
     if let Some(order) = find_top(&rest, 0, &["ORDER"]) {
         if kw(&rest, order + 1, "BY") && !item_texts.is_empty() {
-            let stop = find_top(&rest, order + 2, &["OFFSET", "OPTION", "FOR", "UNION", "EXCEPT", "INTERSECT"]).unwrap_or(rest.len());
+            let stop = find_top(
+                &rest,
+                order + 2,
+                &["OFFSET", "OPTION", "FOR", "UNION", "EXCEPT", "INTERSECT"],
+            )
+            .unwrap_or(rest.len());
             let mut terms = Vec::new();
             for term in split_commas(&rest[order + 2..stop]) {
                 let mut body = term.clone();
                 let mut direction = Vec::new();
-                if body.last().is_some_and(|t| t.is_word("ASC") || t.is_word("DESC")) {
+                if body
+                    .last()
+                    .is_some_and(|t| t.is_word("ASC") || t.is_word("DESC"))
+                {
                     direction.push(body.pop().unwrap());
                 }
                 let mut probe = Cx::new(cx.env);
@@ -1499,11 +1898,13 @@ fn rewrite_select(sql: &str, tokens: Vec<Token>, cx: &mut Cx, name_items: bool) 
     let mut limit: Option<Vec<Token>> = top;
     let mut offset: Option<Vec<Token>> = None;
     if let Some(at) = find_top(&rest, 0, &["OFFSET"]) {
-        let rows_at = find_top(&rest, at, &["ROWS", "ROW"]).ok_or_else(|| TsqlError::syntax("OFFSET needs ROWS"))?;
+        let rows_at = find_top(&rest, at, &["ROWS", "ROW"])
+            .ok_or_else(|| TsqlError::syntax("OFFSET needs ROWS"))?;
         offset = Some(rest[at + 1..rows_at].to_vec());
         let mut tail_start = rows_at + 1;
         if kw(&rest, tail_start, "FETCH") {
-            let rows2 = find_top(&rest, tail_start, &["ROWS", "ROW"]).ok_or_else(|| TsqlError::syntax("FETCH needs ROWS ONLY"))?;
+            let rows2 = find_top(&rest, tail_start, &["ROWS", "ROW"])
+                .ok_or_else(|| TsqlError::syntax("FETCH needs ROWS ONLY"))?;
             limit = Some(rest[tail_start + 2..rows2].to_vec());
             tail_start = rows2 + 1;
             if kw(&rest, tail_start, "ONLY") {
@@ -1561,14 +1962,27 @@ fn split_alias(item: &[Token]) -> (Vec<Token>, Option<String>) {
     if n >= 2 {
         let last = &item[n - 1];
         let before = &item[n - 2];
-        const NOT_ALIAS: &[&str] = &["END", "NULL", "AS", "AND", "OR", "NOT", "IS", "IN", "LIKE", "THEN", "ELSE", "WHEN", "CASE", "BETWEEN", "DESC", "ASC", "DISTINCT", "COLLATE"];
+        const NOT_ALIAS: &[&str] = &[
+            "END", "NULL", "AS", "AND", "OR", "NOT", "IS", "IN", "LIKE", "THEN", "ELSE", "WHEN",
+            "CASE", "BETWEEN", "DESC", "ASC", "DISTINCT", "COLLATE",
+        ];
         let implicit = match &last.tok {
             Tok::Quoted(_) | Tok::Str(_) => true,
             Tok::Word(w) => !NOT_ALIAS.iter().any(|k| k.eq_ignore_ascii_case(w)),
             _ => false,
         };
-        let operand_before = matches!(before.tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Num(_) | Tok::Str(_) | Tok::UserVar(_) | Tok::SysVar(_)) || before.is_op(")");
-        let before_keyword = before.upper().is_some_and(|w| NOT_ALIAS.contains(&w.as_str()) && w != "END" && w != "NULL");
+        let operand_before = matches!(
+            before.tok,
+            Tok::Word(_)
+                | Tok::Quoted(_)
+                | Tok::Num(_)
+                | Tok::Str(_)
+                | Tok::UserVar(_)
+                | Tok::SysVar(_)
+        ) || before.is_op(")");
+        let before_keyword = before
+            .upper()
+            .is_some_and(|w| NOT_ALIAS.contains(&w.as_str()) && w != "END" && w != "NULL");
         if implicit && operand_before && !before_keyword && !before.is_op(".") {
             if let Some(a) = name_of(last) {
                 return (item[..n - 1].to_vec(), Some(a));
@@ -1583,7 +1997,13 @@ fn implicit_name(_sql: &str, item: &[Token]) -> Option<String> {
         return None;
     }
     let is_column = item.len() % 2 == 1
-        && item.iter().enumerate().all(|(k, t)| if k % 2 == 1 { t.is_op(".") } else { matches!(t.tok, Tok::Word(_) | Tok::Quoted(_)) });
+        && item.iter().enumerate().all(|(k, t)| {
+            if k % 2 == 1 {
+                t.is_op(".")
+            } else {
+                matches!(t.tok, Tok::Word(_) | Tok::Quoted(_))
+            }
+        });
     if is_column {
         let name = item.last()?.ident()?.to_string();
         if name == name.to_lowercase() {
@@ -1595,7 +2015,13 @@ fn implicit_name(_sql: &str, item: &[Token]) -> Option<String> {
 }
 
 /// `OUTPUT INSERTED.a, DELETED.b` as a RETURNING list.
-fn output_clause(tokens: &[Token], at: usize, end: usize, deleted_ok: bool, cx: &mut Cx) -> Result<Vec<Token>, TsqlError> {
+fn output_clause(
+    tokens: &[Token],
+    at: usize,
+    end: usize,
+    deleted_ok: bool,
+    cx: &mut Cx,
+) -> Result<Vec<Token>, TsqlError> {
     let mut items = Vec::new();
     for part in split_commas(&tokens[at + 1..end]) {
         if part.iter().any(|t| t.is_word("INTO")) {
@@ -1607,7 +2033,9 @@ fn output_clause(tokens: &[Token], at: usize, end: usize, deleted_ok: bool, cx: 
             let t = &part[k];
             if let Some(w) = t.ident() {
                 let lw = w.to_ascii_lowercase();
-                if (lw == "inserted" || lw == "deleted") && part.get(k + 1).is_some_and(|d| d.is_op(".")) {
+                if (lw == "inserted" || lw == "deleted")
+                    && part.get(k + 1).is_some_and(|d| d.is_op("."))
+                {
                     if lw == "deleted" && !deleted_ok {
                         return Err(TsqlError::unsupported("OUTPUT DELETED in an UPDATE"));
                     }
@@ -1647,13 +2075,19 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
     if kw(&tokens, i, "INTO") {
         i += 1;
     }
-    let (table, mut j) = table_name_at(&tokens, i).ok_or_else(|| TsqlError::syntax("INSERT needs a table"))?;
-    let mut out = vec![Token::word("INSERT"), Token::word("INTO"), Token::raw(ident_sql(&table))];
+    let (table, mut j) =
+        table_name_at(&tokens, i).ok_or_else(|| TsqlError::syntax("INSERT needs a table"))?;
+    let mut out = vec![
+        Token::word("INSERT"),
+        Token::word("INTO"),
+        Token::raw(ident_sql(&table)),
+    ];
     if kw(&tokens, j, "WITH") && tokens.get(j + 1).is_some_and(|t| t.is_op("(")) {
         j = matching_paren(&tokens, j + 1).ok_or_else(|| TsqlError::syntax("unbalanced hint"))? + 1;
     }
     if tokens.get(j).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(&tokens, j).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
+        let close = matching_paren(&tokens, j)
+            .ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
         if !kw(&tokens, j + 1, "SELECT") {
             let names: Vec<String> = split_commas(&tokens[j + 1..close])
                 .iter()
@@ -1665,7 +2099,12 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
     }
     let mut returning = None;
     if kw(&tokens, j, "OUTPUT") {
-        let end = find_top(&tokens, j, &["VALUES", "SELECT", "DEFAULT", "EXEC", "EXECUTE"]).ok_or_else(|| TsqlError::syntax("OUTPUT needs VALUES or SELECT after it"))?;
+        let end = find_top(
+            &tokens,
+            j,
+            &["VALUES", "SELECT", "DEFAULT", "EXEC", "EXECUTE"],
+        )
+        .ok_or_else(|| TsqlError::syntax("OUTPUT needs VALUES or SELECT after it"))?;
         returning = Some(output_clause(&tokens, j, end, false, cx)?);
         j = end;
     }
@@ -1688,7 +2127,9 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
         None => match identity_column(&database, &table) {
             Some(col) => {
                 out.push(Token::raw(format!("RETURNING {}", ident_sql(&col))));
-                Kind::Insert { identity: Some(col) }
+                Kind::Insert {
+                    identity: Some(col),
+                }
             }
             None => Kind::Insert { identity: None },
         },
@@ -1701,8 +2142,15 @@ fn rewrite_insert(sql: &str, tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward,
 }
 
 /// `… TOP (n)` on UPDATE / DELETE: the rows chosen by primary key.
-fn limited(table: &str, where_sql: Option<String>, count: Vec<Token>, cx: &mut Cx) -> Result<String, TsqlError> {
-    let key = primary_key(cx.env.database(), table).ok_or_else(|| TsqlError::unsupported("UPDATE/DELETE TOP on a table without a primary key"))?;
+fn limited(
+    table: &str,
+    where_sql: Option<String>,
+    count: Vec<Token>,
+    cx: &mut Cx,
+) -> Result<String, TsqlError> {
+    let key = primary_key(cx.env.database(), table).ok_or_else(|| {
+        TsqlError::unsupported("UPDATE/DELETE TOP on a table without a primary key")
+    })?;
     let key = ident_sql(&key);
     Ok(format!(
         "{key} IN (SELECT {key} FROM {}{} LIMIT {})",
@@ -1715,13 +2163,19 @@ fn limited(table: &str, where_sql: Option<String>, count: Vec<Token>, cx: &mut C
 fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     let mut tokens = tokens;
     let top = take_top(&mut tokens, 1, cx)?;
-    let set_at = find_top(&tokens, 1, &["SET"]).ok_or_else(|| TsqlError::syntax("UPDATE needs SET"))?;
+    let set_at =
+        find_top(&tokens, 1, &["SET"]).ok_or_else(|| TsqlError::syntax("UPDATE needs SET"))?;
     let target = tokens[1..set_at].to_vec();
-    let (target_name, _) = table_name_at(&target, 0).ok_or_else(|| TsqlError::syntax("UPDATE needs a table"))?;
+    let (target_name, _) =
+        table_name_at(&target, 0).ok_or_else(|| TsqlError::syntax("UPDATE needs a table"))?;
     let output_at = find_top(&tokens, set_at, &["OUTPUT"]);
     let from_at = find_top(&tokens, set_at, &["FROM"]);
     let where_at = find_top(&tokens, set_at, &["WHERE"]);
-    let assign_end = [output_at, from_at, where_at].into_iter().flatten().min().unwrap_or(tokens.len());
+    let assign_end = [output_at, from_at, where_at]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(tokens.len());
 
     // `UPDATE a SET … FROM t a JOIN b ON …`: the target is an alias.
     let mut table = target_name.clone();
@@ -1731,11 +2185,28 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     if let Some(f) = from_at {
         let from_end = where_at.unwrap_or(tokens.len());
         let from = tokens[f + 1..from_end].to_vec();
-        let first_end = find_top(&from, 0, &["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"]).unwrap_or(from.len());
+        let first_end = find_top(
+            &from,
+            0,
+            &["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"],
+        )
+        .unwrap_or(from.len());
         let first = split_commas(&from[..first_end]);
-        let (first_table, after) = table_name_at(&first[0], 0).ok_or_else(|| TsqlError::syntax("FROM needs a table"))?;
-        let first_alias = first[0].get(after).and_then(|t| if t.is_word("AS") { first[0].get(after + 1) } else { Some(t) }).and_then(|t| t.ident()).map(|s| s.to_lowercase());
-        let target_is_first = first_alias.as_deref() == Some(target_name.as_str()) || first_table == target_name;
+        let (first_table, after) =
+            table_name_at(&first[0], 0).ok_or_else(|| TsqlError::syntax("FROM needs a table"))?;
+        let first_alias = first[0]
+            .get(after)
+            .and_then(|t| {
+                if t.is_word("AS") {
+                    first[0].get(after + 1)
+                } else {
+                    Some(t)
+                }
+            })
+            .and_then(|t| t.ident())
+            .map(|s| s.to_lowercase());
+        let target_is_first =
+            first_alias.as_deref() == Some(target_name.as_str()) || first_table == target_name;
         let mut others: Vec<Vec<Token>> = Vec::new();
         if target_is_first {
             table = first_table;
@@ -1754,8 +2225,14 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
             if !from[s].is_word("JOIN") {
                 return Err(TsqlError::unsupported("an outer join in UPDATE … FROM"));
             }
-            let on = find_top(&from, s, &["ON"]).ok_or_else(|| TsqlError::syntax("JOIN needs ON"))?;
-            let next = find_top(&from, on, &["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"]).unwrap_or(from.len());
+            let on =
+                find_top(&from, s, &["ON"]).ok_or_else(|| TsqlError::syntax("JOIN needs ON"))?;
+            let next = find_top(
+                &from,
+                on,
+                &["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS"],
+            )
+            .unwrap_or(from.len());
             others.push(from[s + 1..on].to_vec());
             conditions.push(rewrite_expr(from[on + 1..next].to_vec(), cx)?);
             k = next;
@@ -1773,12 +2250,24 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         out.push(Token::raw(ident_sql(a)));
     }
     out.push(Token::word("SET"));
-    for (n, part) in split_commas(&tokens[set_at + 1..assign_end]).into_iter().enumerate() {
-        let eq = part.iter().position(|t| t.is_op("=") || t.is_op("+=") || t.is_op("-=")).ok_or_else(|| TsqlError::syntax("SET needs col = value"))?;
-        if part.first().is_some_and(|t| matches!(t.tok, Tok::UserVar(_))) {
+    for (n, part) in split_commas(&tokens[set_at + 1..assign_end])
+        .into_iter()
+        .enumerate()
+    {
+        let eq = part
+            .iter()
+            .position(|t| t.is_op("=") || t.is_op("+=") || t.is_op("-="))
+            .ok_or_else(|| TsqlError::syntax("SET needs col = value"))?;
+        if part
+            .first()
+            .is_some_and(|t| matches!(t.tok, Tok::UserVar(_)))
+        {
             return Err(TsqlError::unsupported("assigning a variable in UPDATE"));
         }
-        let name = part[..eq].last().and_then(|t| t.ident()).ok_or_else(|| TsqlError::syntax("a column name was expected"))?;
+        let name = part[..eq]
+            .last()
+            .and_then(|t| t.ident())
+            .ok_or_else(|| TsqlError::syntax("a column name was expected"))?;
         if n > 0 {
             out.push(Token::op(","));
         }
@@ -1801,7 +2290,12 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         None => None,
     };
     if let Some(count) = top {
-        conditions.push(vec![Token::raw(limited(&table, where_sql.clone(), count, cx)?)]);
+        conditions.push(vec![Token::raw(limited(
+            &table,
+            where_sql.clone(),
+            count,
+            cx,
+        )?)]);
     } else if let Some(w) = where_sql {
         conditions.push(vec![Token::raw(w)]);
     }
@@ -1816,7 +2310,12 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     }
     let mut kind = Kind::Write;
     if let Some(o) = output_at {
-        let end = [from_at, where_at].into_iter().flatten().filter(|x| *x > o).min().unwrap_or(tokens.len());
+        let end = [from_at, where_at]
+            .into_iter()
+            .flatten()
+            .filter(|x| *x > o)
+            .min()
+            .unwrap_or(tokens.len());
         out.extend(output_clause(&tokens, o, end, false, cx)?);
         kind = Kind::Query;
     }
@@ -1834,7 +2333,8 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     if kw(&tokens, i, "FROM") {
         i += 1;
     }
-    let (target, after) = table_name_at(&tokens, i).ok_or_else(|| TsqlError::syntax("DELETE needs a table"))?;
+    let (target, after) =
+        table_name_at(&tokens, i).ok_or_else(|| TsqlError::syntax("DELETE needs a table"))?;
     let output_at = find_top(&tokens, after, &["OUTPUT"]);
     let from_at = find_top(&tokens, after, &["FROM"]);
     let where_at = find_top(&tokens, after, &["WHERE"]);
@@ -1849,8 +2349,20 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         from = tokens[f + 1..where_at.unwrap_or(tokens.len())].to_vec();
         first_end = find_top(&from, 0, &["JOIN", "INNER"]).unwrap_or(from.len());
         for part in split_commas(&from[..first_end]) {
-            let Some((name, after)) = table_name_at(&part, 0) else { continue };
-            let part_alias = part.get(after).and_then(|t| if t.is_word("AS") { part.get(after + 1) } else { Some(t) }).and_then(|t| t.ident()).map(|s| s.to_lowercase());
+            let Some((name, after)) = table_name_at(&part, 0) else {
+                continue;
+            };
+            let part_alias = part
+                .get(after)
+                .and_then(|t| {
+                    if t.is_word("AS") {
+                        part.get(after + 1)
+                    } else {
+                        Some(t)
+                    }
+                })
+                .and_then(|t| t.ident())
+                .map(|s| s.to_lowercase());
             if name == target || part_alias.as_deref() == Some(target.as_str()) {
                 table = name;
                 alias = part_alias.filter(|a| *a != table);
@@ -1859,7 +2371,11 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
             }
         }
     }
-    let mut out = vec![Token::word("DELETE"), Token::word("FROM"), Token::raw(ident_sql(&table))];
+    let mut out = vec![
+        Token::word("DELETE"),
+        Token::word("FROM"),
+        Token::raw(ident_sql(&table)),
+    ];
     if let Some(a) = &alias {
         out.push(Token::word("AS"));
         out.push(Token::raw(ident_sql(a)));
@@ -1873,7 +2389,8 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
             if from[s].is_word("INNER") {
                 s += 1;
             }
-            let on = find_top(&from, s, &["ON"]).ok_or_else(|| TsqlError::syntax("JOIN needs ON"))?;
+            let on =
+                find_top(&from, s, &["ON"]).ok_or_else(|| TsqlError::syntax("JOIN needs ON"))?;
             let next = find_top(&from, on, &["JOIN", "INNER"]).unwrap_or(from.len());
             using.push(from[s + 1..on].to_vec());
             conditions.push(rewrite_expr(from[on + 1..next].to_vec(), cx)?);
@@ -1894,7 +2411,12 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
         None => None,
     };
     if let Some(count) = top {
-        conditions.push(vec![Token::raw(limited(&target, where_sql.clone(), count, cx)?)]);
+        conditions.push(vec![Token::raw(limited(
+            &target,
+            where_sql.clone(),
+            count,
+            cx,
+        )?)]);
     } else if let Some(w) = where_sql {
         conditions.push(vec![Token::raw(w)]);
     }
@@ -1909,7 +2431,12 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError>
     }
     let mut kind = Kind::Write;
     if let Some(o) = output_at {
-        let end = [from_at, where_at].into_iter().flatten().filter(|x| *x > o).min().unwrap_or(tokens.len());
+        let end = [from_at, where_at]
+            .into_iter()
+            .flatten()
+            .filter(|x| *x > o)
+            .min()
+            .unwrap_or(tokens.len());
         out.extend(output_clause(&tokens, o, end, true, cx)?);
         kind = Kind::Query;
     }
@@ -1927,7 +2454,20 @@ fn default_expr(tokens: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
         t = &t[1..t.len() - 1];
     }
     match t {
-        [w, open, close] if open.is_op("(") && close.is_op(")") && w.upper().is_some_and(|u| matches!(u.as_str(), "GETDATE" | "SYSDATETIME" | "GETUTCDATE" | "SYSUTCDATETIME" | "SYSDATETIMEOFFSET")) => {
+        [w, open, close]
+            if open.is_op("(")
+                && close.is_op(")")
+                && w.upper().is_some_and(|u| {
+                    matches!(
+                        u.as_str(),
+                        "GETDATE"
+                            | "SYSDATETIME"
+                            | "GETUTCDATE"
+                            | "SYSUTCDATETIME"
+                            | "SYSDATETIMEOFFSET"
+                    )
+                }) =>
+        {
             Ok("CURRENT_TIMESTAMP".into())
         }
         [w] if w.is_word("CURRENT_TIMESTAMP") => Ok("CURRENT_TIMESTAMP".into()),
@@ -1937,10 +2477,30 @@ fn default_expr(tokens: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
 
 /// A column definition; returns it and any index made with it.
 fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
-    let name = def.first().and_then(|t| t.ident()).ok_or_else(|| TsqlError::syntax("a column name was expected"))?;
+    let name = def
+        .first()
+        .and_then(|t| t.ident())
+        .ok_or_else(|| TsqlError::syntax("a column name was expected"))?;
     const ATTRS: &[&str] = &[
-        "NOT", "NULL", "DEFAULT", "IDENTITY", "PRIMARY", "UNIQUE", "CONSTRAINT", "COLLATE", "REFERENCES", "CHECK", "ROWGUIDCOL",
-        "SPARSE", "FOREIGN", "INDEX", "AS", "FILESTREAM", "MASKED", "ENCRYPTED", "GENERATED",
+        "NOT",
+        "NULL",
+        "DEFAULT",
+        "IDENTITY",
+        "PRIMARY",
+        "UNIQUE",
+        "CONSTRAINT",
+        "COLLATE",
+        "REFERENCES",
+        "CHECK",
+        "ROWGUIDCOL",
+        "SPARSE",
+        "FOREIGN",
+        "INDEX",
+        "AS",
+        "FILESTREAM",
+        "MASKED",
+        "ENCRYPTED",
+        "GENERATED",
     ];
     let mut k = 1;
     let mut type_end = def.len();
@@ -1977,11 +2537,15 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
             "DEFAULT" => {
                 let mut e = k + 1;
                 if def.get(e).is_some_and(|t| t.is_op("(")) {
-                    e = matching_paren(def, e).ok_or_else(|| TsqlError::syntax("unbalanced DEFAULT"))? + 1;
+                    e = matching_paren(def, e)
+                        .ok_or_else(|| TsqlError::syntax("unbalanced DEFAULT"))?
+                        + 1;
                 } else {
                     e += 1;
                     if def.get(e).is_some_and(|t| t.is_op("(")) {
-                        e = matching_paren(def, e).ok_or_else(|| TsqlError::syntax("unbalanced DEFAULT"))? + 1;
+                        e = matching_paren(def, e)
+                            .ok_or_else(|| TsqlError::syntax("unbalanced DEFAULT"))?
+                            + 1;
                     }
                 }
                 attrs.push(format!("DEFAULT {}", default_expr(&def[k + 1..e], cx)?));
@@ -1991,7 +2555,9 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
                 identity = true;
                 k += 1;
                 if def.get(k).is_some_and(|t| t.is_op("(")) {
-                    k = matching_paren(def, k).ok_or_else(|| TsqlError::syntax("unbalanced IDENTITY"))? + 1;
+                    k = matching_paren(def, k)
+                        .ok_or_else(|| TsqlError::syntax("unbalanced IDENTITY"))?
+                        + 1;
                 }
             }
             "PRIMARY" => {
@@ -2014,7 +2580,12 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
                 attrs.push(render_text(&rewrite_expr(def[k..].to_vec(), cx)?));
                 k = def.len();
             }
-            _ => return Err(TsqlError::syntax(format!("Incorrect syntax near '{}'.", render_text(std::slice::from_ref(&def[k]))))),
+            _ => {
+                return Err(TsqlError::syntax(format!(
+                    "Incorrect syntax near '{}'.",
+                    render_text(std::slice::from_ref(&def[k]))
+                )));
+            }
         }
     }
     if identity {
@@ -2022,7 +2593,11 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
             "smallint" => "smallserial".into(),
             "integer" => "serial".into(),
             "bigint" | "numeric(18,0)" | "numeric(19,0)" | "numeric(38,0)" => "bigserial".into(),
-            other => return Err(TsqlError::unsupported(format!("IDENTITY on a {other} column"))),
+            other => {
+                return Err(TsqlError::unsupported(format!(
+                    "IDENTITY on a {other} column"
+                )));
+            }
         };
         attrs.retain(|a| !a.starts_with("DEFAULT"));
     }
@@ -2037,7 +2612,10 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
 fn index_columns(tokens: &[Token]) -> Result<Vec<String>, TsqlError> {
     let mut out = Vec::new();
     for part in split_commas(tokens) {
-        let name = part.first().and_then(|t| t.ident()).ok_or_else(|| TsqlError::unsupported("an index on an expression"))?;
+        let name = part
+            .first()
+            .and_then(|t| t.ident())
+            .ok_or_else(|| TsqlError::unsupported("an index on an expression"))?;
         let mut c = ident_sql(name);
         if part.last().is_some_and(|t| t.is_word("DESC")) {
             c.push_str(" DESC");
@@ -2049,7 +2627,11 @@ fn index_columns(tokens: &[Token]) -> Result<Vec<String>, TsqlError> {
 
 /// A table constraint (PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK) or inline
 /// INDEX. Returns the definition, or the statement an index becomes.
-fn table_constraint(part: &[Token], table: &str, cx: &mut Cx) -> Result<(Option<String>, Option<String>), TsqlError> {
+fn table_constraint(
+    part: &[Token],
+    table: &str,
+    cx: &mut Cx,
+) -> Result<(Option<String>, Option<String>), TsqlError> {
     let mut p = 0;
     let mut name = None;
     if part[0].is_word("CONSTRAINT") {
@@ -2057,19 +2639,28 @@ fn table_constraint(part: &[Token], table: &str, cx: &mut Cx) -> Result<(Option<
         p = 2;
     }
     let head = part.get(p).and_then(|t| t.upper()).unwrap_or_default();
-    let named = name.as_ref().map(|n| format!("CONSTRAINT {} ", ident_sql(n))).unwrap_or_default();
+    let named = name
+        .as_ref()
+        .map(|n| format!("CONSTRAINT {} ", ident_sql(n)))
+        .unwrap_or_default();
     let paren = part.iter().position(|t| t.is_op("("));
     match head.as_str() {
         "PRIMARY" | "UNIQUE" => {
             let open = paren.ok_or_else(|| TsqlError::syntax("a key needs columns"))?;
-            let close = matching_paren(part, open).ok_or_else(|| TsqlError::syntax("unbalanced key"))?;
+            let close =
+                matching_paren(part, open).ok_or_else(|| TsqlError::syntax("unbalanced key"))?;
             let cols = index_columns(&part[open + 1..close])?;
-            let kind = if head == "PRIMARY" { "PRIMARY KEY" } else { "UNIQUE" };
+            let kind = if head == "PRIMARY" {
+                "PRIMARY KEY"
+            } else {
+                "UNIQUE"
+            };
             Ok((Some(format!("{named}{kind} ({})", cols.join(", "))), None))
         }
         "FOREIGN" => {
             let open = paren.ok_or_else(|| TsqlError::syntax("a key needs columns"))?;
-            let close = matching_paren(part, open).ok_or_else(|| TsqlError::syntax("unbalanced key"))?;
+            let close =
+                matching_paren(part, open).ok_or_else(|| TsqlError::syntax("unbalanced key"))?;
             let cols = index_columns(&part[open + 1..close])?;
             let mut rest = part[close + 1..].to_vec();
             // NOT FOR REPLICATION
@@ -2079,13 +2670,26 @@ fn table_constraint(part: &[Token], table: &str, cx: &mut Cx) -> Result<(Option<
                 }
             }
             let rest = render_text(&rewrite_expr(rest, cx)?);
-            Ok((Some(format!("{named}FOREIGN KEY ({}) {rest}", cols.join(", "))), None))
+            Ok((
+                Some(format!("{named}FOREIGN KEY ({}) {rest}", cols.join(", "))),
+                None,
+            ))
         }
-        "CHECK" => Ok((Some(format!("{named}{}", render_text(&rewrite_expr(part[p..].to_vec(), cx)?))), None)),
+        "CHECK" => Ok((
+            Some(format!(
+                "{named}{}",
+                render_text(&rewrite_expr(part[p..].to_vec(), cx)?)
+            )),
+            None,
+        )),
         "INDEX" => {
-            let index = part.get(p + 1).and_then(|t| t.ident()).ok_or_else(|| TsqlError::syntax("INDEX needs a name"))?;
+            let index = part
+                .get(p + 1)
+                .and_then(|t| t.ident())
+                .ok_or_else(|| TsqlError::syntax("INDEX needs a name"))?;
             let open = paren.ok_or_else(|| TsqlError::syntax("an index needs columns"))?;
-            let close = matching_paren(part, open).ok_or_else(|| TsqlError::syntax("unbalanced index"))?;
+            let close =
+                matching_paren(part, open).ok_or_else(|| TsqlError::syntax("unbalanced index"))?;
             let unique = part[p..open].iter().any(|t| t.is_word("UNIQUE"));
             let cols = index_columns(&part[open + 1..close])?;
             Ok((
@@ -2099,13 +2703,21 @@ fn table_constraint(part: &[Token], table: &str, cx: &mut Cx) -> Result<(Option<
                 )),
             ))
         }
-        _ => Err(TsqlError::syntax(format!("Incorrect syntax near '{head}'."))),
+        _ => Err(TsqlError::syntax(format!(
+            "Incorrect syntax near '{head}'."
+        ))),
     }
 }
 
 fn is_constraint_start(part: &[Token]) -> bool {
     part.first().is_some_and(|t| {
-        matches!(t.tok, Tok::Word(_)) && t.upper().is_some_and(|w| matches!(w.as_str(), "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK" | "INDEX"))
+        matches!(t.tok, Tok::Word(_))
+            && t.upper().is_some_and(|w| {
+                matches!(
+                    w.as_str(),
+                    "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "FOREIGN" | "CHECK" | "INDEX"
+                )
+            })
     })
 }
 
@@ -2119,13 +2731,17 @@ fn strip_storage(tokens: &[Token]) -> Result<(), TsqlError> {
             "ON" | "TEXTIMAGE_ON" | "FILESTREAM_ON" => k += 2,
             "WITH" => {
                 if tokens.get(k + 1).is_some_and(|t| t.is_op("(")) {
-                    k = matching_paren(tokens, k + 1).ok_or_else(|| TsqlError::syntax("unbalanced WITH"))? + 1;
+                    k = matching_paren(tokens, k + 1)
+                        .ok_or_else(|| TsqlError::syntax("unbalanced WITH"))?
+                        + 1;
                 } else {
                     k += 1;
                 }
             }
             "INCLUDE" => {
-                k = matching_paren(tokens, k + 1).ok_or_else(|| TsqlError::syntax("unbalanced INCLUDE"))? + 1;
+                k = matching_paren(tokens, k + 1)
+                    .ok_or_else(|| TsqlError::syntax("unbalanced INCLUDE"))?
+                    + 1;
             }
             _ if tokens[k].is_op("(") || tokens[k].is_op(")") || tokens[k].is_op(",") => k += 1,
             _ => k += 1,
@@ -2135,12 +2751,14 @@ fn strip_storage(tokens: &[Token]) -> Result<(), TsqlError> {
 }
 
 fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
-    let (table, after) = table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("CREATE TABLE needs a name"))?;
+    let (table, after) =
+        table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("CREATE TABLE needs a name"))?;
     let temporary = table.starts_with('#');
     if !tokens.get(after).is_some_and(|t| t.is_op("(")) {
         return Err(TsqlError::syntax("CREATE TABLE needs a column list"));
     }
-    let close = matching_paren(&tokens, after).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
+    let close = matching_paren(&tokens, after)
+        .ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
     strip_storage(&tokens[close + 1..])?;
     let mut defs = Vec::new();
     let mut later = Vec::new();
@@ -2163,11 +2781,16 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         defs.join(", ")
     )];
     statements.extend(later);
-    Ok(Forward { statements, kind: Kind::Ddl, extra_column: None })
+    Ok(Forward {
+        statements,
+        kind: Kind::Ddl,
+        extra_column: None,
+    })
 }
 
 fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
-    let (table, after) = table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("ALTER TABLE needs a name"))?;
+    let (table, after) =
+        table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("ALTER TABLE needs a name"))?;
     let t = ident_sql(&table);
     let mut statements = Vec::new();
     let mut k = after;
@@ -2193,7 +2816,10 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                     if p.first().is_some_and(|x| x.is_word("COLUMN")) {
                         p.remove(0);
                     }
-                    statements.push(format!("ALTER TABLE {t} ADD COLUMN {}", column_definition(&p, cx)?));
+                    statements.push(format!(
+                        "ALTER TABLE {t} ADD COLUMN {}",
+                        column_definition(&p, cx)?
+                    ));
                 }
             }
         }
@@ -2210,7 +2836,10 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
                 rest.drain(..2);
             }
             for part in split_commas(&rest) {
-                let name = part.first().and_then(|x| x.ident()).ok_or_else(|| TsqlError::syntax("a name was expected"))?;
+                let name = part
+                    .first()
+                    .and_then(|x| x.ident())
+                    .ok_or_else(|| TsqlError::syntax("a name was expected"))?;
                 statements.push(format!(
                     "ALTER TABLE {t} DROP {} {}{}",
                     if constraint { "CONSTRAINT" } else { "COLUMN" },
@@ -2222,14 +2851,29 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
         "ALTER" => {
             // ALTER COLUMN c type [NULL | NOT NULL]
             let def = &tokens[k + 2..];
-            let name = def.first().and_then(|x| x.ident()).ok_or_else(|| TsqlError::syntax("a column name was expected"))?;
-            let null_at = def.iter().position(|x| x.is_word("NULL") || x.is_word("NOT") || x.is_word("COLLATE")).unwrap_or(def.len());
+            let name = def
+                .first()
+                .and_then(|x| x.ident())
+                .ok_or_else(|| TsqlError::syntax("a column name was expected"))?;
+            let null_at = def
+                .iter()
+                .position(|x| x.is_word("NULL") || x.is_word("NOT") || x.is_word("COLLATE"))
+                .unwrap_or(def.len());
             let ty = map_type(&def[1..null_at])?;
-            statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} TYPE {ty}", ident_sql(name)));
+            statements.push(format!(
+                "ALTER TABLE {t} ALTER COLUMN {} TYPE {ty}",
+                ident_sql(name)
+            ));
             if def[null_at..].iter().any(|x| x.is_word("NOT")) {
-                statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} SET NOT NULL", ident_sql(name)));
+                statements.push(format!(
+                    "ALTER TABLE {t} ALTER COLUMN {} SET NOT NULL",
+                    ident_sql(name)
+                ));
             } else if def[null_at..].iter().any(|x| x.is_word("NULL")) {
-                statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} DROP NOT NULL", ident_sql(name)));
+                statements.push(format!(
+                    "ALTER TABLE {t} ALTER COLUMN {} DROP NOT NULL",
+                    ident_sql(name)
+                ));
             }
         }
         "CHECK" | "NOCHECK" | "ENABLE" | "DISABLE" | "SET" | "REBUILD" | "SWITCH" => {}
@@ -2238,18 +2882,33 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlE
     if statements.is_empty() {
         statements.push(String::new());
     }
-    Ok(Forward { statements, kind: Kind::Ddl, extra_column: None })
+    Ok(Forward {
+        statements,
+        kind: Kind::Ddl,
+        extra_column: None,
+    })
 }
 
 fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     let _ = cx;
     let unique = tokens.iter().take(4).any(|t| t.is_word("UNIQUE"));
-    let at = tokens.iter().position(|t| t.is_word("INDEX")).ok_or_else(|| TsqlError::syntax("CREATE INDEX was expected"))?;
-    let name = tokens.get(at + 1).and_then(|t| t.ident()).ok_or_else(|| TsqlError::syntax("CREATE INDEX needs a name"))?;
-    let on = find_top(&tokens, at, &["ON"]).ok_or_else(|| TsqlError::syntax("CREATE INDEX needs ON"))?;
-    let (table, after) = table_name_at(&tokens, on + 1).ok_or_else(|| TsqlError::syntax("CREATE INDEX needs a table"))?;
-    let open = (after..tokens.len()).find(|&k| tokens[k].is_op("(")).ok_or_else(|| TsqlError::syntax("CREATE INDEX needs columns"))?;
-    let close = matching_paren(&tokens, open).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
+    let at = tokens
+        .iter()
+        .position(|t| t.is_word("INDEX"))
+        .ok_or_else(|| TsqlError::syntax("CREATE INDEX was expected"))?;
+    let name = tokens
+        .get(at + 1)
+        .and_then(|t| t.ident())
+        .ok_or_else(|| TsqlError::syntax("CREATE INDEX needs a name"))?;
+    let on =
+        find_top(&tokens, at, &["ON"]).ok_or_else(|| TsqlError::syntax("CREATE INDEX needs ON"))?;
+    let (table, after) = table_name_at(&tokens, on + 1)
+        .ok_or_else(|| TsqlError::syntax("CREATE INDEX needs a table"))?;
+    let open = (after..tokens.len())
+        .find(|&k| tokens[k].is_op("("))
+        .ok_or_else(|| TsqlError::syntax("CREATE INDEX needs columns"))?;
+    let close =
+        matching_paren(&tokens, open).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
     let cols = index_columns(&tokens[open + 1..close])?;
     if find_top(&tokens, close, &["WHERE"]).is_some() {
         return Err(TsqlError::unsupported("filtered indexes"));
@@ -2279,35 +2938,57 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
     let statements = match what.as_str() {
         "TABLE" => split_commas(&tokens[i..])
             .iter()
-            .map(|p| table_name_at(p, 0).map(|(n, _)| format!("DROP TABLE {ie}{}", ident_sql(&n))).ok_or_else(|| TsqlError::syntax("a table name was expected")))
+            .map(|p| {
+                table_name_at(p, 0)
+                    .map(|(n, _)| format!("DROP TABLE {ie}{}", ident_sql(&n)))
+                    .ok_or_else(|| TsqlError::syntax("a table name was expected"))
+            })
             .collect::<Result<Vec<_>, _>>()?,
         "INDEX" => {
             // DROP INDEX ix ON t, or DROP INDEX t.ix
             let mut out = Vec::new();
             for part in split_commas(&tokens[i..]) {
                 let (table, name) = if let Some(on) = part.iter().position(|t| t.is_word("ON")) {
-                    let n = part.first().and_then(|t| t.ident()).unwrap_or("").to_string();
-                    let (t, _) = table_name_at(&part, on + 1).ok_or_else(|| TsqlError::syntax("a table name was expected"))?;
+                    let n = part
+                        .first()
+                        .and_then(|t| t.ident())
+                        .unwrap_or("")
+                        .to_string();
+                    let (t, _) = table_name_at(&part, on + 1)
+                        .ok_or_else(|| TsqlError::syntax("a table name was expected"))?;
                     (t, n)
                 } else {
                     let idents: Vec<&str> = part.iter().filter_map(|t| t.ident()).collect();
                     if idents.len() < 2 {
                         return Err(TsqlError::syntax("DROP INDEX needs ON table"));
                     }
-                    (idents[idents.len() - 2].to_lowercase(), idents[idents.len() - 1].to_string())
+                    (
+                        idents[idents.len() - 2].to_lowercase(),
+                        idents[idents.len() - 1].to_string(),
+                    )
                 };
-                out.push(format!("DROP INDEX {ie}{}", ident_sql(&crate::sqlcompat::index_name(&table, &name))));
+                out.push(format!(
+                    "DROP INDEX {ie}{}",
+                    ident_sql(&crate::sqlcompat::index_name(&table, &name))
+                ));
             }
             out
         }
         "DATABASE" => {
-            let name = tokens.get(i).and_then(|t| t.ident()).ok_or_else(|| TsqlError::syntax("a database name was expected"))?;
+            let name = tokens
+                .get(i)
+                .and_then(|t| t.ident())
+                .ok_or_else(|| TsqlError::syntax("a database name was expected"))?;
             vec![format!("DROP DATABASE {ie}{}", ident_sql(name))]
         }
         "VIEW" => vec![render_text(&rewrite_expr(tokens, cx)?)],
         other => return Err(TsqlError::unsupported(format!("DROP {other}"))),
     };
-    Ok(Forward { statements, kind: Kind::Ddl, extra_column: None })
+    Ok(Forward {
+        statements,
+        kind: Kind::Ddl,
+        extra_column: None,
+    })
 }
 
 /// The one MERGE drivers write to insert several rows and learn their keys
@@ -2337,17 +3018,25 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     }
     if kw(&tokens, j, "AS") {
         j += 2;
-    } else if tokens.get(j).is_some_and(|t| t.ident().is_some() && !t.is_word("USING")) {
+    } else if tokens
+        .get(j)
+        .is_some_and(|t| t.ident().is_some() && !t.is_word("USING"))
+    {
         j += 1;
     }
-    if !kw(&tokens, j, "USING") || !tokens.get(j + 1).is_some_and(|t| t.is_op("(")) || !kw(&tokens, j + 2, "VALUES") {
+    if !kw(&tokens, j, "USING")
+        || !tokens.get(j + 1).is_some_and(|t| t.is_op("("))
+        || !kw(&tokens, j + 2, "VALUES")
+    {
         return Err(merge_refused());
     }
     let close = matching_paren(&tokens, j + 1).ok_or_else(merge_refused)?;
     let rows: Vec<Vec<Vec<Token>>> = split_commas(&tokens[j + 3..close])
         .into_iter()
         .map(|row| {
-            let inner = if row.first().is_some_and(|t| t.is_op("(")) && row.last().is_some_and(|t| t.is_op(")")) {
+            let inner = if row.first().is_some_and(|t| t.is_op("("))
+                && row.last().is_some_and(|t| t.is_op(")"))
+            {
                 row[1..row.len() - 1].to_vec()
             } else {
                 row
@@ -2359,12 +3048,21 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     if kw(&tokens, k, "AS") {
         k += 1;
     }
-    let alias = tokens.get(k).and_then(|t| t.ident()).ok_or_else(merge_refused)?.to_lowercase();
+    let alias = tokens
+        .get(k)
+        .and_then(|t| t.ident())
+        .ok_or_else(merge_refused)?
+        .to_lowercase();
     k += 1;
     let source_close = matching_paren(&tokens, k).ok_or_else(merge_refused)?;
     let source_cols: Vec<String> = split_commas(&tokens[k + 1..source_close])
         .iter()
-        .map(|c| c.first().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
+        .map(|c| {
+            c.first()
+                .and_then(|t| t.ident())
+                .unwrap_or("")
+                .to_lowercase()
+        })
         .collect();
     let on = source_close + 1;
     let always_false = kw(&tokens, on, "ON")
@@ -2373,14 +3071,21 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
         return Err(merge_refused());
     }
     let insert = find_top(&tokens, on, &["INSERT"]).ok_or_else(merge_refused)?;
-    if find_top(&tokens, on, &["MATCHED"]).is_none() || find_top(&tokens, on, &["UPDATE", "DELETE"]).is_some_and(|u| u < insert) {
+    if find_top(&tokens, on, &["MATCHED"]).is_none()
+        || find_top(&tokens, on, &["UPDATE", "DELETE"]).is_some_and(|u| u < insert)
+    {
         return Err(merge_refused());
     }
     let cols_open = insert + 1;
     let cols_close = matching_paren(&tokens, cols_open).ok_or_else(merge_refused)?;
     let target_cols: Vec<String> = split_commas(&tokens[cols_open + 1..cols_close])
         .iter()
-        .map(|c| c.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase())
+        .map(|c| {
+            c.last()
+                .and_then(|t| t.ident())
+                .unwrap_or("")
+                .to_lowercase()
+        })
         .collect();
     if !kw(&tokens, cols_close + 1, "VALUES") {
         return Err(merge_refused());
@@ -2389,8 +3094,15 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     // Each inserted value is a source column: which one.
     let mut picks = Vec::new();
     for v in split_commas(&tokens[cols_close + 3..values_close]) {
-        let name = v.last().and_then(|t| t.ident()).unwrap_or("").to_lowercase();
-        let at = source_cols.iter().position(|c| *c == name).ok_or_else(merge_refused)?;
+        let name = v
+            .last()
+            .and_then(|t| t.ident())
+            .unwrap_or("")
+            .to_lowercase();
+        let at = source_cols
+            .iter()
+            .position(|c| *c == name)
+            .ok_or_else(merge_refused)?;
         picks.push(at);
     }
     // OUTPUT: inserted columns, then source columns put back by position.
@@ -2398,19 +3110,33 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     let mut returning = Vec::new();
     let mut extra: Option<(String, usize)> = None;
     for part in split_commas(&tokens[output + 1..]) {
-        let names: Vec<String> = part.iter().filter_map(|t| t.ident().map(|s| s.to_lowercase())).collect();
+        let names: Vec<String> = part
+            .iter()
+            .filter_map(|t| t.ident().map(|s| s.to_lowercase()))
+            .collect();
         if names.first().map(String::as_str) == Some(alias.as_str()) {
             if extra.is_some() {
                 return Err(merge_refused());
             }
             let col = names.get(1).cloned().unwrap_or_default();
-            let at = source_cols.iter().position(|c| *c == col).ok_or_else(merge_refused)?;
-            let written = part.last().and_then(|t| t.ident()).unwrap_or(&col).to_string();
+            let at = source_cols
+                .iter()
+                .position(|c| *c == col)
+                .ok_or_else(merge_refused)?;
+            let written = part
+                .last()
+                .and_then(|t| t.ident())
+                .unwrap_or(&col)
+                .to_string();
             extra = Some((written, at));
         } else if extra.is_some() {
             return Err(merge_refused());
         } else {
-            let written = part.last().and_then(|t| t.ident()).unwrap_or("").to_string();
+            let written = part
+                .last()
+                .and_then(|t| t.ident())
+                .unwrap_or("")
+                .to_string();
             let col = names.last().cloned().unwrap_or_default();
             returning.push(format!("{} AS {}", ident_sql(&col), quote_ident(&written)));
         }
@@ -2432,33 +3158,54 @@ fn rewrite_merge_insert(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, Tsql
     let sql = format!(
         "INSERT INTO {} ({}) VALUES {}{}",
         ident_sql(&table),
-        target_cols.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", "),
+        target_cols
+            .iter()
+            .map(|c| ident_sql(c))
+            .collect::<Vec<_>>()
+            .join(", "),
         row_sql.join(", "),
-        if returning.is_empty() { String::new() } else { format!(" RETURNING {}", returning.join(", ")) }
+        if returning.is_empty() {
+            String::new()
+        } else {
+            format!(" RETURNING {}", returning.join(", "))
+        }
     );
     Ok(Forward {
         statements: vec![sql],
-        kind: if returning.is_empty() && extra.is_none() { Kind::Insert { identity: None } } else { Kind::Query },
+        kind: if returning.is_empty() && extra.is_none() {
+            Kind::Insert { identity: None }
+        } else {
+            Kind::Query
+        },
         extra_column: extra.map(|(name, _)| (name, positions)),
     })
 }
 
 /// Translates one data statement.
-pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<Forward, TsqlError> {
+pub(crate) fn translate(
+    sql: &str,
+    tokens: Vec<Token>,
+    env: &dyn Env,
+) -> Result<Forward, TsqlError> {
     let mut cx = Cx::new(env);
     let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
     match head.as_str() {
         "SELECT" => {
             // SELECT … INTO t FROM …
             if let Some(into) = find_top(&tokens, 1, &["INTO"]) {
-                let (table, after) = table_name_at(&tokens, into + 1).ok_or_else(|| TsqlError::syntax("INTO needs a table"))?;
+                let (table, after) = table_name_at(&tokens, into + 1)
+                    .ok_or_else(|| TsqlError::syntax("INTO needs a table"))?;
                 let mut select = tokens[..into].to_vec();
                 select.extend(tokens[after..].iter().cloned());
                 let body = rewrite_select(sql, select, &mut cx, false)?;
                 return Ok(Forward {
                     statements: vec![format!(
                         "CREATE {}TABLE {} AS {}",
-                        if table.starts_with('#') { "TEMPORARY " } else { "" },
+                        if table.starts_with('#') {
+                            "TEMPORARY "
+                        } else {
+                            ""
+                        },
                         ident_sql(&table),
                         render_text(&body)
                     )],
@@ -2497,9 +3244,14 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
             let second = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
             match second.as_str() {
                 "TABLE" => rewrite_create_table(tokens, &mut cx),
-                "INDEX" | "UNIQUE" | "CLUSTERED" | "NONCLUSTERED" => rewrite_create_index(tokens, &mut cx),
+                "INDEX" | "UNIQUE" | "CLUSTERED" | "NONCLUSTERED" => {
+                    rewrite_create_index(tokens, &mut cx)
+                }
                 "DATABASE" => {
-                    let name = tokens.get(2).and_then(|t| t.ident()).ok_or_else(|| TsqlError::syntax("a database name was expected"))?;
+                    let name = tokens
+                        .get(2)
+                        .and_then(|t| t.ident())
+                        .ok_or_else(|| TsqlError::syntax("a database name was expected"))?;
                     Ok(Forward {
                         statements: vec![format!("CREATE DATABASE {}", ident_sql(name))],
                         kind: Kind::Ddl,
@@ -2509,16 +3261,30 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
                 "SCHEMA" => {
                     let name = tokens.get(2).and_then(|t| t.ident()).unwrap_or("");
                     if name.eq_ignore_ascii_case("dbo") {
-                        Ok(Forward { statements: vec![String::new()], kind: Kind::Ddl, extra_column: None })
+                        Ok(Forward {
+                            statements: vec![String::new()],
+                            kind: Kind::Ddl,
+                            extra_column: None,
+                        })
                     } else {
                         Err(TsqlError::unsupported("schemas other than dbo"))
                     }
                 }
                 "VIEW" | "OR" => {
-                    let at = find_top(&tokens, 2, &["AS"]).ok_or_else(|| TsqlError::syntax("CREATE VIEW needs AS"))?;
+                    let at = find_top(&tokens, 2, &["AS"])
+                        .ok_or_else(|| TsqlError::syntax("CREATE VIEW needs AS"))?;
                     let mut out = rewrite_expr(tokens[..=at].to_vec(), &mut cx)?;
-                    out.extend(rewrite_select(sql, tokens[at + 1..].to_vec(), &mut cx, false)?);
-                    Ok(Forward { statements: vec![render_text(&out)], kind: Kind::Ddl, extra_column: None })
+                    out.extend(rewrite_select(
+                        sql,
+                        tokens[at + 1..].to_vec(),
+                        &mut cx,
+                        false,
+                    )?);
+                    Ok(Forward {
+                        statements: vec![render_text(&out)],
+                        kind: Kind::Ddl,
+                        extra_column: None,
+                    })
                 }
                 other => Err(TsqlError::unsupported(format!("CREATE {other}"))),
             }
@@ -2527,12 +3293,16 @@ pub(crate) fn translate(sql: &str, tokens: Vec<Token>, env: &dyn Env) -> Result<
             if kw(&tokens, 1, "TABLE") {
                 rewrite_alter_table(tokens, &mut cx)
             } else {
-                Err(TsqlError::unsupported(format!("ALTER {}", tokens.get(1).and_then(|t| t.upper()).unwrap_or_default())))
+                Err(TsqlError::unsupported(format!(
+                    "ALTER {}",
+                    tokens.get(1).and_then(|t| t.upper()).unwrap_or_default()
+                )))
             }
         }
         "DROP" => rewrite_drop(tokens, &mut cx),
         "TRUNCATE" => {
-            let (table, _) = table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("TRUNCATE TABLE needs a table"))?;
+            let (table, _) = table_name_at(&tokens, 2)
+                .ok_or_else(|| TsqlError::syntax("TRUNCATE TABLE needs a table"))?;
             Ok(Forward {
                 statements: vec![format!("TRUNCATE TABLE {}", ident_sql(&table))],
                 kind: Kind::Ddl,
@@ -2563,7 +3333,11 @@ pub(crate) fn value_query(tokens: Vec<Token>, env: &dyn Env) -> Result<String, T
 
 /// A `SELECT @a = x, @b = y FROM …` as a query of the values, and the
 /// variables in order; `None` when the select assigns nothing.
-pub(crate) fn assignment_select(sql: &str, tokens: &[Token], env: &dyn Env) -> Result<Option<(String, Vec<String>)>, TsqlError> {
+pub(crate) fn assignment_select(
+    sql: &str,
+    tokens: &[Token],
+    env: &dyn Env,
+) -> Result<Option<(String, Vec<String>)>, TsqlError> {
     let mut i = 1;
     if kw(tokens, i, "TOP") {
         return Ok(None);
@@ -2571,15 +3345,27 @@ pub(crate) fn assignment_select(sql: &str, tokens: &[Token], env: &dyn Env) -> R
     if kw(tokens, i, "DISTINCT") {
         i += 1;
     }
-    if !matches!(tokens.get(i).map(|t| &t.tok), Some(Tok::UserVar(_))) || !tokens.get(i + 1).is_some_and(|t| t.is_op("=")) {
+    if !matches!(tokens.get(i).map(|t| &t.tok), Some(Tok::UserVar(_)))
+        || !tokens.get(i + 1).is_some_and(|t| t.is_op("="))
+    {
         return Ok(None);
     }
-    let end = find_top(tokens, i, &["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "OPTION"]).unwrap_or(tokens.len());
+    let end = find_top(
+        tokens,
+        i,
+        &[
+            "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "UNION", "OPTION",
+        ],
+    )
+    .unwrap_or(tokens.len());
     let mut names = Vec::new();
     let mut select = vec![tokens[0].clone()];
     for (k, part) in split_commas(&tokens[i..end]).into_iter().enumerate() {
         let Some(Tok::UserVar(name)) = part.first().map(|t| &t.tok) else {
-            return Err(TsqlError::new(141, "A SELECT statement that assigns a value to a variable must not be combined with data-retrieval operations."));
+            return Err(TsqlError::new(
+                141,
+                "A SELECT statement that assigns a value to a variable must not be combined with data-retrieval operations.",
+            ));
         };
         names.push(name.clone());
         if k > 0 {
@@ -2621,8 +3407,14 @@ mod tests {
         }
         fn param(&self, name: &str) -> Option<ParamSlot> {
             match name {
-                "p0" => Some(ParamSlot { index: 0, string: false }),
-                "p1" => Some(ParamSlot { index: 1, string: true }),
+                "p0" => Some(ParamSlot {
+                    index: 0,
+                    string: false,
+                }),
+                "p1" => Some(ParamSlot {
+                    index: 1,
+                    string: true,
+                }),
                 _ => None,
             }
         }
@@ -2646,9 +3438,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(crate::core::database::catalog::DatabaseCatalog::open(None, "app"))
+            .block_on(crate::core::database::catalog::DatabaseCatalog::open(
+                None, "app",
+            ))
             .unwrap();
-        TestEnv { database: catalog.get("app").unwrap() }
+        TestEnv {
+            database: catalog.get("app").unwrap(),
+        }
     }
 
     fn tr(e: &TestEnv, sql: &str) -> String {
@@ -2661,7 +3457,13 @@ mod tests {
         let sql = "SET NOCOUNT ON SELECT 1 INSERT INTO t (a) SELECT b FROM u UPDATE t SET a = 1 WHERE a = 2 IF @n > 1 BEGIN SELECT 2 END ELSE SELECT 3";
         let stmts = parse_batch(&lex(sql).unwrap()).unwrap();
         assert_eq!(stmts.len(), 5, "{stmts:?}");
-        assert!(matches!(&stmts[4], Stmt::If { otherwise: Some(_), .. }));
+        assert!(matches!(
+            &stmts[4],
+            Stmt::If {
+                otherwise: Some(_),
+                ..
+            }
+        ));
         let sql = "CREATE TABLE a (id int, b int REFERENCES c (id) ON DELETE CASCADE) SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END";
         assert_eq!(parse_batch(&lex(sql).unwrap()).unwrap().len(), 2);
         let sql = "WITH c AS (SELECT 1 AS x) SELECT x FROM c; DROP TABLE IF EXISTS t";
@@ -2671,27 +3473,81 @@ mod tests {
     #[test]
     fn selects() {
         let e = env();
-        assert_eq!(tr(&e, "SELECT TOP (5) [Name] FROM [dbo].[Users] WITH (NOLOCK) ORDER BY [Name]"), r#"SELECT name AS "Name" FROM users ORDER BY "Name" LIMIT 5"#);
-        assert_eq!(tr(&e, "SELECT a FROM t ORDER BY a OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY"), "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10");
-        assert_eq!(tr(&e, "SELECT Total = COUNT(*) FROM t"), r#"SELECT ((count(*))::integer) AS "Total" FROM t"#);
-        assert_eq!(tr(&e, "SELECT 'a' + name + N'b' FROM t"), "SELECT 'a' || name || 'b' FROM t");
-        assert_eq!(tr(&e, "SELECT a + 1 FROM t WHERE x = @p0 AND y = @p1 + 'z'"), "SELECT a + 1 FROM t WHERE x = $1 AND y = $2 || 'z'");
-        assert_eq!(tr(&e, "SELECT ISNULL(a, 0), LEN(b), GETDATE() FROM t"), "SELECT coalesce(a, 0), char_length(rtrim(CAST(b AS text))), localtimestamp FROM t");
-        assert_eq!(tr(&e, "SELECT @@VERSION"), "SELECT 'Microsoft SQL Server 2022'");
+        assert_eq!(
+            tr(
+                &e,
+                "SELECT TOP (5) [Name] FROM [dbo].[Users] WITH (NOLOCK) ORDER BY [Name]"
+            ),
+            r#"SELECT name AS "Name" FROM users ORDER BY "Name" LIMIT 5"#
+        );
+        assert_eq!(
+            tr(
+                &e,
+                "SELECT a FROM t ORDER BY a OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY"
+            ),
+            "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 10"
+        );
+        assert_eq!(
+            tr(&e, "SELECT Total = COUNT(*) FROM t"),
+            r#"SELECT ((count(*))::integer) AS "Total" FROM t"#
+        );
+        assert_eq!(
+            tr(&e, "SELECT 'a' + name + N'b' FROM t"),
+            "SELECT 'a' || name || 'b' FROM t"
+        );
+        assert_eq!(
+            tr(&e, "SELECT a + 1 FROM t WHERE x = @p0 AND y = @p1 + 'z'"),
+            "SELECT a + 1 FROM t WHERE x = $1 AND y = $2 || 'z'"
+        );
+        assert_eq!(
+            tr(&e, "SELECT ISNULL(a, 0), LEN(b), GETDATE() FROM t"),
+            "SELECT coalesce(a, 0), char_length(rtrim(CAST(b AS text))), localtimestamp FROM t"
+        );
+        assert_eq!(
+            tr(&e, "SELECT @@VERSION"),
+            "SELECT 'Microsoft SQL Server 2022'"
+        );
         assert_eq!(tr(&e, "SELECT SCOPE_IDENTITY()"), "SELECT 7");
-        assert_eq!(tr(&e, "SELECT DATEADD(day, 1, d) FROM t"), "SELECT ((d) + ((1) * interval '1 days')) FROM t");
-        assert_eq!(tr(&e, "SELECT CONVERT(varchar(10), d, 23) FROM t"), "SELECT to_char((d)::timestamp, 'YYYY-MM-DD') FROM t");
-        assert_eq!(tr(&e, "SELECT IIF(a > 1, 'y', 'n') FROM t"), "SELECT (CASE WHEN a > 1 THEN 'y' ELSE 'n' END) FROM t");
+        assert_eq!(
+            tr(&e, "SELECT DATEADD(day, 1, d) FROM t"),
+            "SELECT ((d) + ((1) * interval '1 days')) FROM t"
+        );
+        assert_eq!(
+            tr(&e, "SELECT CONVERT(varchar(10), d, 23) FROM t"),
+            "SELECT to_char((d)::timestamp, 'YYYY-MM-DD') FROM t"
+        );
+        assert_eq!(
+            tr(&e, "SELECT IIF(a > 1, 'y', 'n') FROM t"),
+            "SELECT (CASE WHEN a > 1 THEN 'y' ELSE 'n' END) FROM t"
+        );
     }
 
     #[test]
     fn writes() {
         let e = env();
-        assert_eq!(tr(&e, "INSERT INTO [t] ([a], [b]) OUTPUT INSERTED.[Id] VALUES (@p0, @p1)"), r#"INSERT INTO t (a, b) VALUES ($1, $2) RETURNING id AS "Id""#);
-        assert_eq!(tr(&e, "UPDATE [t] SET [a] = @p0 OUTPUT INSERTED.[v] WHERE [id] = @p1"), r#"UPDATE t SET a = $1 WHERE (id = $2) RETURNING v AS "v""#);
-        assert_eq!(tr(&e, "DELETE FROM [t] WHERE [id] = 3"), "DELETE FROM t WHERE (id = 3)");
         assert_eq!(
-            tr(&e, "UPDATE a SET a.x = b.y FROM t a INNER JOIN u b ON a.id = b.id WHERE b.z = 1"),
+            tr(
+                &e,
+                "INSERT INTO [t] ([a], [b]) OUTPUT INSERTED.[Id] VALUES (@p0, @p1)"
+            ),
+            r#"INSERT INTO t (a, b) VALUES ($1, $2) RETURNING id AS "Id""#
+        );
+        assert_eq!(
+            tr(
+                &e,
+                "UPDATE [t] SET [a] = @p0 OUTPUT INSERTED.[v] WHERE [id] = @p1"
+            ),
+            r#"UPDATE t SET a = $1 WHERE (id = $2) RETURNING v AS "v""#
+        );
+        assert_eq!(
+            tr(&e, "DELETE FROM [t] WHERE [id] = 3"),
+            "DELETE FROM t WHERE (id = 3)"
+        );
+        assert_eq!(
+            tr(
+                &e,
+                "UPDATE a SET a.x = b.y FROM t a INNER JOIN u b ON a.id = b.id WHERE b.z = 1"
+            ),
             "UPDATE t AS a SET x = b.y FROM u b WHERE (a.id = b.id) AND (b.z = 1)"
         );
     }
@@ -2704,9 +3560,20 @@ mod tests {
         let tokens = lex(sql).unwrap();
         let stmts = parse_batch(&tokens).unwrap();
         let Stmt::Simple(t) = &stmts[0] else { panic!() };
-        let f = translate(sql, t.clone(), &e).map_err(|e| e.message).unwrap();
-        assert_eq!(f.statements[0], r#"INSERT INTO blogs (created, url) VALUES ($1, $2), ($1, $2) RETURNING id AS "Id""#);
-        assert_eq!(f.extra_column, Some(("_Position".to_string(), vec!["0".to_string(), "1".to_string()])));
+        let f = translate(sql, t.clone(), &e)
+            .map_err(|e| e.message)
+            .unwrap();
+        assert_eq!(
+            f.statements[0],
+            r#"INSERT INTO blogs (created, url) VALUES ($1, $2), ($1, $2) RETURNING id AS "Id""#
+        );
+        assert_eq!(
+            f.extra_column,
+            Some((
+                "_Position".to_string(),
+                vec!["0".to_string(), "1".to_string()]
+            ))
+        );
     }
 
     #[test]
@@ -2727,9 +3594,15 @@ mod tests {
              CONSTRAINT pk_blogs PRIMARY KEY (id))"
         );
         assert_eq!(
-            tr(&e, "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)"),
+            tr(
+                &e,
+                "CREATE NONCLUSTERED INDEX [IX_Posts_BlogId] ON [Posts] ([BlogId] ASC) WITH (ONLINE = ON)"
+            ),
             "CREATE INDEX posts__ix_posts_blogid ON posts (blogid)"
         );
-        assert_eq!(tr(&e, "ALTER TABLE [t] ADD [c] int NULL"), "ALTER TABLE t ADD COLUMN c integer NULL");
+        assert_eq!(
+            tr(&e, "ALTER TABLE [t] ADD [c] int NULL"),
+            "ALTER TABLE t ADD COLUMN c integer NULL"
+        );
     }
 }

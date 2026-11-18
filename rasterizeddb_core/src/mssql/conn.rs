@@ -21,23 +21,32 @@ use rclite::Arc;
 use tokio::io::AsyncWriteExt;
 
 use crate::core::database::Database;
-use crate::pgwire::proxied::{BridgeOptions, OpenRefused, PgBridge, PgNotice, ProxiedLogin, data_row_cells, parse_row_description, tag_count};
+use crate::pgwire::proxied::{
+    BridgeOptions, OpenRefused, PgBridge, PgNotice, ProxiedLogin, data_row_cells,
+    parse_row_description, tag_count,
+};
 use crate::sqlcompat::{Tok, Token, find_top, ident_sql, split_commas};
 
 use super::lex;
-use super::tds::{self, Column, ColType, Message, ParamValue, Reader, TdsStream, Wire};
+use super::tds::{self, ColType, Column, Message, ParamValue, Reader, TdsStream, Wire};
 use super::translate::{self, Env, Forward, Kind, ParamSlot, Stmt, TsqlError, Value};
 use super::{MsAuth, MsTls, Shared};
 
 const SERVER_NAME: &str = "rasterizeddb";
 const STATEMENT_SAVEPOINT: &str = "rdb_tds_statement";
 
-const VERSION_TEXT: &str = "Microsoft SQL Server 2022 (RTM) - 16.0.4000.0 (X64) \n\tRasterizedDB (SQL Server protocol)";
+const VERSION_TEXT: &str =
+    "Microsoft SQL Server 2022 (RTM) - 16.0.4000.0 (X64) \n\tRasterizedDB (SQL Server protocol)";
 
 /// SQL Server's system databases are the default database here: a client
 /// connects to `master` to create or drop its own.
 fn resolve_database<'a>(shared: &'a Shared, name: &'a str) -> &'a str {
-    if name.is_empty() || matches!(name.to_ascii_lowercase().as_str(), "master" | "model" | "msdb" | "tempdb") {
+    if name.is_empty()
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "master" | "model" | "msdb" | "tempdb"
+        )
+    {
         shared.catalog.default_name()
     } else {
         name
@@ -81,8 +90,13 @@ struct Prepared {
 }
 
 enum Outcome {
-    Rows { count: u64 },
-    Done { tag: String, identity: Option<i64> },
+    Rows {
+        count: u64,
+    },
+    Done {
+        tag: String,
+        identity: Option<i64>,
+    },
     /// The statement failed; `started` if its COLMETADATA had been sent.
     Failed(PgNotice, bool),
 }
@@ -117,7 +131,12 @@ struct Session {
     peer_watch: Option<StdArc<crate::pgwire::PeerWatch>>,
 }
 
-pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdArc<Shared>, over_limit: bool) -> io::Result<()> {
+pub(crate) async fn serve_connection(
+    base: tds::Base,
+    peer: String,
+    shared: StdArc<Shared>,
+    over_limit: bool,
+) -> io::Result<()> {
     #[cfg(unix)]
     let watch = {
         use std::os::fd::AsFd;
@@ -138,7 +157,11 @@ pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdA
         Err(_) => return Ok(()),
     };
     let database = resolve_database(&shared, &login_packet.database).to_string();
-    let shown = if login_packet.database.is_empty() { database.clone() } else { login_packet.database.clone() };
+    let shown = if login_packet.database.is_empty() {
+        database.clone()
+    } else {
+        login_packet.database.clone()
+    };
     let mut session = Session {
         wire,
         shared: shared.clone(),
@@ -173,11 +196,25 @@ pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdA
         Ok(()) => {
             let out = session.wire.reply();
             tds::env_change_text(out, 1, &shown, "master");
-            tds::message(out, false, 5701, 2, 0, &format!("Changed database context to '{shown}'."), SERVER_NAME, 1);
+            tds::message(
+                out,
+                false,
+                5701,
+                2,
+                0,
+                &format!("Changed database context to '{shown}'."),
+                SERVER_NAME,
+                1,
+            );
             tds::env_change_bytes(out, 7, &tds::COLLATION, &[]);
             tds::env_change_text(out, 2, "us_english", "");
             tds::login_ack(out);
-            tds::env_change_text(out, 4, &packet_size.to_string(), &tds::DEFAULT_PACKET.to_string());
+            tds::env_change_text(
+                out,
+                4,
+                &packet_size.to_string(),
+                &tds::DEFAULT_PACKET.to_string(),
+            );
             if login_packet.wants_features {
                 // FEATUREEXTACK: no feature acknowledged.
                 out.extend_from_slice(&[0xae, 0xff]);
@@ -205,25 +242,39 @@ pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdA
 }
 
 /// PRELOGIN, TLS and LOGIN7. `None` when the client was refused (and told).
-async fn handshake(wire: &mut Wire, shared: &StdArc<Shared>, over_limit: bool) -> io::Result<Option<(tds::Login, ProxiedLogin)>> {
+async fn handshake(
+    wire: &mut Wire,
+    shared: &StdArc<Shared>,
+    over_limit: bool,
+) -> io::Result<Option<(tds::Login, ProxiedLogin)>> {
     let tls_available = shared.acceptor.is_some();
     let first = wire.peek_byte().await?;
     if first == 0x16 {
         // TDS 8.0: TLS first, then PRELOGIN inside it.
         let Some(acceptor) = shared.acceptor.clone() else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "TDS 8.0 client, but TLS is not configured"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TDS 8.0 client, but TLS is not configured",
+            ));
         };
         upgrade(wire, acceptor, true).await?;
         let prelogin = wire.read().await?;
         if prelogin.kind != tds::PT_PRELOGIN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "PRELOGIN was expected"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PRELOGIN was expected",
+            ));
         }
-        wire.reply().extend_from_slice(&tds::prelogin_reply(tds::ENCRYPT_ON));
+        wire.reply()
+            .extend_from_slice(&tds::prelogin_reply(tds::ENCRYPT_ON));
         wire.send(tds::PT_REPLY).await?;
     } else {
         let prelogin = wire.read().await?;
         if prelogin.kind != tds::PT_PRELOGIN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "PRELOGIN was expected"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PRELOGIN was expected",
+            ));
         }
         let client = tds::prelogin_encryption(&prelogin.payload);
         let (reply, encrypt) = if !tls_available || wire.stream.is_unix() {
@@ -258,7 +309,10 @@ async fn handshake(wire: &mut Wire, shared: &StdArc<Shared>, over_limit: bool) -
 
     let message = wire.read().await?;
     if message.kind != tds::PT_LOGIN7 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "LOGIN7 was expected"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LOGIN7 was expected",
+        ));
     }
     let login = tds::parse_login7(&message.payload)?;
     let refuse = |wire: &mut Wire, number: i32, text: &str| {
@@ -267,28 +321,51 @@ async fn handshake(wire: &mut Wire, shared: &StdArc<Shared>, over_limit: bool) -
         tds::done(out, tds::TOKEN_DONE, tds::DONE_ERROR, 0, 0);
     };
     if over_limit {
-        refuse(wire, 17809, "Could not connect because the maximum number of user connections has already been reached.");
+        refuse(
+            wire,
+            17809,
+            "Could not connect because the maximum number of user connections has already been reached.",
+        );
         wire.send(tds::PT_REPLY).await?;
         return Ok(None);
     }
     if shared.config.tls == MsTls::Require && !wire.stream.is_tls() && !wire.stream.is_unix() {
-        refuse(wire, 18456, "Login failed: this server requires an encrypted connection.");
+        refuse(
+            wire,
+            18456,
+            "Login failed: this server requires an encrypted connection.",
+        );
         wire.send(tds::PT_REPLY).await?;
         return Ok(None);
     }
     if login.integrated {
-        refuse(wire, 18452, "Login failed. Windows authentication is not supported; use SQL Server authentication.");
+        refuse(
+            wire,
+            18452,
+            "Login failed. Windows authentication is not supported; use SQL Server authentication.",
+        );
         wire.send(tds::PT_REPLY).await?;
         return Ok(None);
     }
     let database_name = resolve_database(shared, &login.database).to_string();
     let Some(database) = shared.catalog.get(&database_name) else {
-        refuse(wire, 4060, &format!("Cannot open database \"{database_name}\" requested by the login. The login failed."));
+        refuse(
+            wire,
+            4060,
+            &format!(
+                "Cannot open database \"{database_name}\" requested by the login. The login failed."
+            ),
+        );
         wire.send(tds::PT_REPLY).await?;
         return Ok(None);
     };
     let method = if wire.stream.is_unix() {
-        shared.config.socket.as_ref().and_then(|s| s.auth).unwrap_or(shared.config.auth)
+        shared
+            .config
+            .socket
+            .as_ref()
+            .and_then(|s| s.auth)
+            .unwrap_or(shared.config.auth)
     } else {
         shared.config.auth
     };
@@ -300,10 +377,17 @@ async fn handshake(wire: &mut Wire, shared: &StdArc<Shared>, over_limit: bool) -
         },
         MsAuth::Password => {
             let role = crate::auth::lookup_role(&database, &login.user).await;
-            let verifier = role.as_ref().and_then(|r| r.verifier.clone()).unwrap_or(crate::auth::Verifier::Plain(String::new()));
+            let verifier = role
+                .as_ref()
+                .and_then(|r| r.verifier.clone())
+                .unwrap_or(crate::auth::Verifier::Plain(String::new()));
             let may = role.as_ref().is_some_and(|r| r.can_login);
             if !may || !crate::auth::verify_password(&verifier, &login.user, &login.password) {
-                refuse(wire, 18456, &format!("Login failed for user '{}'.", login.user));
+                refuse(
+                    wire,
+                    18456,
+                    &format!("Login failed for user '{}'.", login.user),
+                );
                 wire.send(tds::PT_REPLY).await?;
                 return Ok(None);
             }
@@ -319,7 +403,11 @@ async fn handshake(wire: &mut Wire, shared: &StdArc<Shared>, over_limit: bool) -
 
 /// TLS over the connection: inside PRELOGIN packets for the handshake
 /// (TDS 7.x), or directly (TDS 8.0).
-async fn upgrade(wire: &mut Wire, acceptor: tokio_rustls::TlsAcceptor, strict: bool) -> io::Result<()> {
+async fn upgrade(
+    wire: &mut Wire,
+    acceptor: tokio_rustls::TlsAcceptor,
+    strict: bool,
+) -> io::Result<()> {
     let buffered = wire.take_buffered();
     let stream = std::mem::replace(&mut wire.stream, TdsStream::Upgrading);
     let TdsStream::Plain(mut shim) = stream else {
@@ -372,15 +460,26 @@ impl Env for Scope<'_> {
                 used.len() - 1
             }
         };
-        Some(ParamSlot { index, string: p.decls[k].1 })
+        Some(ParamSlot {
+            index,
+            string: p.decls[k].1,
+        })
     }
     fn system(&self, name: &str) -> Option<Value> {
         let s = self.s;
         Some(match name {
             "version" => Value::Str(VERSION_TEXT.into()),
-            "spid" => Value::Int(s.bridge.as_ref().map(|b| b.pid as i64 & 0x7fff).unwrap_or(0)),
+            "spid" => Value::Int(
+                s.bridge
+                    .as_ref()
+                    .map(|b| b.pid as i64 & 0x7fff)
+                    .unwrap_or(0),
+            ),
             "rowcount" => Value::Int(s.rowcount),
-            "identity" => s.last_identity.map(|v| Value::Num(v.to_string())).unwrap_or(Value::Null),
+            "identity" => s
+                .last_identity
+                .map(|v| Value::Num(v.to_string()))
+                .unwrap_or(Value::Null),
             "trancount" => Value::Int(s.trancount as i64),
             "error" => Value::Int(s.error_number as i64),
             "servername" => Value::Str(SERVER_NAME.into()),
@@ -404,18 +503,27 @@ impl Env for Scope<'_> {
         let s = self.s;
         let e = s.last_error.as_ref();
         Some(match name {
-            "SCOPE_IDENTITY" | "IDENT_CURRENT" => s.last_identity.map(|v| Value::Num(v.to_string())).unwrap_or(Value::Null),
+            "SCOPE_IDENTITY" | "IDENT_CURRENT" => s
+                .last_identity
+                .map(|v| Value::Num(v.to_string()))
+                .unwrap_or(Value::Null),
             "ROWCOUNT_BIG" => Value::Int(s.rowcount),
             "HOST_NAME" => Value::Str(s.host.clone()),
             "APP_NAME" => Value::Str(s.app.clone()),
-            "ERROR_MESSAGE" => e.map(|e| Value::Str(e.message.clone())).unwrap_or(Value::Null),
-            "ERROR_NUMBER" => e.map(|e| Value::Int(e.number as i64)).unwrap_or(Value::Null),
+            "ERROR_MESSAGE" => e
+                .map(|e| Value::Str(e.message.clone()))
+                .unwrap_or(Value::Null),
+            "ERROR_NUMBER" => e
+                .map(|e| Value::Int(e.number as i64))
+                .unwrap_or(Value::Null),
             "ERROR_SEVERITY" => e.map(|e| Value::Int(e.class as i64)).unwrap_or(Value::Null),
             "ERROR_STATE" => e.map(|e| Value::Int(e.state as i64)).unwrap_or(Value::Null),
             "ERROR_LINE" => e.map(|_| Value::Int(1)).unwrap_or(Value::Null),
             "ERROR_PROCEDURE" => Value::Null,
             "XACT_STATE" => Value::Int((s.trancount > 0) as i64),
-            "IS_SRVROLEMEMBER" | "IS_MEMBER" => Value::Int((!s.login.authenticated || s.login.superuser) as i64),
+            "IS_SRVROLEMEMBER" | "IS_MEMBER" => {
+                Value::Int((!s.login.authenticated || s.login.superuser) as i64)
+            }
             "HAS_DBACCESS" => Value::Int(1),
             "SESSIONPROPERTY" => Value::Int(1),
             _ => return None,
@@ -498,10 +606,15 @@ fn parse_declarations(text: &str) -> Result<Vec<(String, bool, u32)>, TsqlError>
             if part.is_empty() {
                 continue;
             }
-            return Err(TsqlError::syntax(format!("Incorrect syntax in the parameter list '{text}'.")));
+            return Err(TsqlError::syntax(format!(
+                "Incorrect syntax in the parameter list '{text}'."
+            )));
         };
         let ty = part.get(1).and_then(|t| t.upper()).unwrap_or_default();
-        let string = matches!(ty.as_str(), "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "XML");
+        let string = matches!(
+            ty.as_str(),
+            "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "XML"
+        );
         let oid = match ty.as_str() {
             "VARBINARY" | "BINARY" | "IMAGE" => 17,
             _ => 0,
@@ -532,8 +645,18 @@ impl Session {
                 }
                 Ok(())
             }
-            Err(OpenRefused::NoDatabase) => Err(TsqlError::new(911, format!("Database '{database}' does not exist. Make sure that the name is entered correctly."))),
-            Err(OpenRefused::Loading) => Err(TsqlError::new(922, format!("Database '{database}' is being recovered. Waiting until recovery is finished."))),
+            Err(OpenRefused::NoDatabase) => Err(TsqlError::new(
+                911,
+                format!(
+                    "Database '{database}' does not exist. Make sure that the name is entered correctly."
+                ),
+            )),
+            Err(OpenRefused::Loading) => Err(TsqlError::new(
+                922,
+                format!(
+                    "Database '{database}' is being recovered. Waiting until recovery is finished."
+                ),
+            )),
             Err(OpenRefused::Io(e)) => Err(TsqlError::new(50000, e.to_string())),
         }
     }
@@ -550,8 +673,10 @@ impl Session {
                 _ = stopping.wait_for(|s| *s) => return Ok(()),
             };
             self.last_done = None;
-            if message.status & (tds::ST_RESET_CONNECTION | tds::ST_RESET_CONNECTION_SKIP_TRAN) != 0 {
-                self.reset(message.status & tds::ST_RESET_CONNECTION_SKIP_TRAN != 0).await;
+            if message.status & (tds::ST_RESET_CONNECTION | tds::ST_RESET_CONNECTION_SKIP_TRAN) != 0
+            {
+                self.reset(message.status & tds::ST_RESET_CONNECTION_SKIP_TRAN != 0)
+                    .await;
                 tds::env_change_bytes(self.wire.reply(), 18, &[], &[]);
             }
             match message.kind {
@@ -564,12 +689,17 @@ impl Session {
                     continue;
                 }
                 tds::PT_BULK => {
-                    self.error_token(&TsqlError::unsupported("bulk load (BULK INSERT / SqlBulkCopy)"));
+                    self.error_token(&TsqlError::unsupported(
+                        "bulk load (BULK INSERT / SqlBulkCopy)",
+                    ));
                     self.final_done();
                 }
                 tds::PT_SSPI => return Ok(()),
                 other => {
-                    self.error_token(&TsqlError::new(50000, format!("Unsupported TDS message type {other:#04x}")));
+                    self.error_token(&TsqlError::new(
+                        50000,
+                        format!("Unsupported TDS message type {other:#04x}"),
+                    ));
                     self.final_done();
                 }
             }
@@ -605,7 +735,16 @@ impl Session {
     }
 
     fn error_token(&mut self, e: &TsqlError) {
-        tds::message(self.wire.reply(), true, e.number, e.state, e.class, &e.message, SERVER_NAME, 1);
+        tds::message(
+            self.wire.reply(),
+            true,
+            e.number,
+            e.state,
+            e.class,
+            &e.message,
+            SERVER_NAME,
+            1,
+        );
         self.last_error = Some(e.clone());
         self.error_number = e.number;
     }
@@ -616,7 +755,11 @@ impl Session {
 
     /// The DONE (or DONEINPROC) after a statement.
     fn statement_done(&mut self, status: u16, command: u16, rows: u64) {
-        let token = if self.in_rpc { tds::TOKEN_DONEINPROC } else { tds::TOKEN_DONE };
+        let token = if self.in_rpc {
+            tds::TOKEN_DONEINPROC
+        } else {
+            tds::TOKEN_DONE
+        };
         let mut status = status | tds::DONE_MORE;
         if self.trancount > 0 {
             status |= tds::DONE_INXACT;
@@ -646,10 +789,18 @@ impl Session {
         let mut error = None;
         let mut tag = String::new();
         loop {
-            let frame = b.next().await.map_err(|e| PgNotice { code: "08006".into(), message: e.to_string(), ..Default::default() })?;
+            let frame = b.next().await.map_err(|e| PgNotice {
+                code: "08006".into(),
+                message: e.to_string(),
+                ..Default::default()
+            })?;
             match frame.tag {
                 b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
-                b'C' => tag = String::from_utf8_lossy(frame.body.strip_suffix(&[0]).unwrap_or(frame.body)).into_owned(),
+                b'C' => {
+                    tag =
+                        String::from_utf8_lossy(frame.body.strip_suffix(&[0]).unwrap_or(frame.body))
+                            .into_owned()
+                }
                 b'Z' => break,
                 _ => {}
             }
@@ -661,14 +812,19 @@ impl Session {
     }
 
     /// A query whose rows are the session's (a condition, a variable).
-    async fn fetch(&mut self, sql: &str, params: &[(i16, Option<Vec<u8>>, u32)]) -> Result<(Vec<u32>, Vec<Vec<Option<String>>>), PgNotice> {
+    async fn fetch(
+        &mut self,
+        sql: &str,
+        params: &[(i16, Option<Vec<u8>>, u32)],
+    ) -> Result<(Vec<u32>, Vec<Vec<Option<String>>>), PgNotice> {
         let b = self.bridge();
         if params.is_empty() {
             b.query(sql);
         } else {
             let oids: Vec<u32> = params.iter().map(|p| p.2).collect();
             b.parse("", sql, &oids);
-            let refs: Vec<(i16, Option<&[u8]>)> = params.iter().map(|(f, v, _)| (*f, v.as_deref())).collect();
+            let refs: Vec<(i16, Option<&[u8]>)> =
+                params.iter().map(|(f, v, _)| (*f, v.as_deref())).collect();
             b.bind("", "", &refs, &[0]);
             b.describe(b'P', "");
             b.execute("", 0);
@@ -678,13 +834,26 @@ impl Session {
         let mut oids = Vec::new();
         let mut rows = Vec::new();
         loop {
-            let frame = b.next().await.map_err(|e| PgNotice { code: "08006".into(), message: e.to_string(), ..Default::default() })?;
+            let frame = b.next().await.map_err(|e| PgNotice {
+                code: "08006".into(),
+                message: e.to_string(),
+                ..Default::default()
+            })?;
             match frame.tag {
                 b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
-                b'T' => oids = parse_row_description(frame.body).map(|f| f.iter().map(|x| x.type_oid).collect()).unwrap_or_default(),
+                b'T' => {
+                    oids = parse_row_description(frame.body)
+                        .map(|f| f.iter().map(|x| x.type_oid).collect())
+                        .unwrap_or_default()
+                }
                 b'D' => {
                     if let Ok(cells) = data_row_cells(frame.body) {
-                        rows.push(cells.iter().map(|c| c.map(|v| String::from_utf8_lossy(v).into_owned())).collect());
+                        rows.push(
+                            cells
+                                .iter()
+                                .map(|c| c.map(|v| String::from_utf8_lossy(v).into_owned()))
+                                .collect(),
+                        );
                     }
                 }
                 b'Z' => break,
@@ -712,7 +881,8 @@ impl Session {
             } else {
                 let oids: Vec<u32> = params.iter().map(|p| p.2).collect();
                 b.parse("", sql, &oids);
-                let refs: Vec<(i16, Option<&[u8]>)> = params.iter().map(|(f, v, _)| (*f, v.as_deref())).collect();
+                let refs: Vec<(i16, Option<&[u8]>)> =
+                    params.iter().map(|(f, v, _)| (*f, v.as_deref())).collect();
                 b.bind("", "", &refs, &[0]);
                 b.describe(b'P', "");
                 b.execute("", 0);
@@ -745,15 +915,26 @@ impl Session {
                             Column {
                                 // SQL Server leaves an unaliased expression
                                 // unnamed.
-                                name: if f.name == "?column?" { String::new() } else { f.name.clone() },
-                                ty: ty.unwrap_or(ColType::Decimal { precision: 38, scale: 0 }),
+                                name: if f.name == "?column?" {
+                                    String::new()
+                                } else {
+                                    f.name.clone()
+                                },
+                                ty: ty.unwrap_or(ColType::Decimal {
+                                    precision: 38,
+                                    scale: 0,
+                                }),
                                 oid: f.type_oid,
                             }
                         })
                         .collect();
                     let mut cols = cols;
                     if let Some((name, _)) = extra {
-                        cols.push(Column { name: name.clone(), ty: ColType::Int(4), oid: 23 });
+                        cols.push(Column {
+                            name: name.clone(),
+                            ty: ColType::Int(4),
+                            oid: 23,
+                        });
                     }
                     if !capture {
                         if unknown {
@@ -773,9 +954,12 @@ impl Session {
                         }
                         continue;
                     }
-                    let extra_value: Option<Vec<u8>> = extra.and_then(|(_, values)| values.get(count as usize - 1)).map(|v| v.as_bytes().to_vec());
+                    let extra_value: Option<Vec<u8>> = extra
+                        .and_then(|(_, values)| values.get(count as usize - 1))
+                        .map(|v| v.as_bytes().to_vec());
                     if let Some(rows) = held.as_mut() {
-                        let mut row: Vec<Option<Vec<u8>>> = cells.iter().map(|c| c.map(|v| v.to_vec())).collect();
+                        let mut row: Vec<Option<Vec<u8>>> =
+                            cells.iter().map(|c| c.map(|v| v.to_vec())).collect();
                         if extra.is_some() {
                             row.push(extra_value);
                         }
@@ -794,7 +978,10 @@ impl Session {
                         all.push(extra_value.as_deref());
                     }
                     for (k, cell) in all.iter().enumerate() {
-                        let ty = cols.get(k).map(|c| c.ty.clone()).unwrap_or(ColType::NVarChar(None));
+                        let ty = cols
+                            .get(k)
+                            .map(|c| c.ty.clone())
+                            .unwrap_or(ColType::NVarChar(None));
                         if let Err(e) = tds::put_value(out, &ty, *cell) {
                             out.truncate(at);
                             encode_error = Some(e);
@@ -805,7 +992,11 @@ impl Session {
                         self.wire.flush_partial(tds::PT_REPLY).await?;
                     }
                 }
-                b'C' => tag = String::from_utf8_lossy(frame.body.strip_suffix(&[0]).unwrap_or(frame.body)).into_owned(),
+                b'C' => {
+                    tag =
+                        String::from_utf8_lossy(frame.body.strip_suffix(&[0]).unwrap_or(frame.body))
+                            .into_owned()
+                }
                 b'E' if error.is_none() => error = Some(PgNotice::parse(frame.body)),
                 b'N' => {
                     let n = PgNotice::parse(frame.body);
@@ -818,7 +1009,15 @@ impl Session {
         if let (Some(rows), Some(cols)) = (held, columns.as_mut()) {
             // The scale of each undeclared numeric: the most any value has.
             for (k, c) in cols.iter_mut().enumerate() {
-                if c.oid == 1700 && matches!(c.ty, ColType::Decimal { precision: 38, scale: 0 }) {
+                if c.oid == 1700
+                    && matches!(
+                        c.ty,
+                        ColType::Decimal {
+                            precision: 38,
+                            scale: 0
+                        }
+                    )
+                {
                     let (mut int, mut frac) = (1usize, 0usize);
                     for r in &rows {
                         if let Some(Some(v)) = r.get(k) {
@@ -828,7 +1027,10 @@ impl Session {
                         }
                     }
                     let frac = frac.min(38 - int.min(38));
-                    c.ty = ColType::Decimal { precision: (int + frac).clamp(1, 38) as u8, scale: frac as u8 };
+                    c.ty = ColType::Decimal {
+                        precision: (int + frac).clamp(1, 38) as u8,
+                        scale: frac as u8,
+                    };
                 }
             }
             tds::col_metadata(self.wire.reply(), cols);
@@ -837,7 +1039,10 @@ impl Session {
                 let at = out.len();
                 out.push(0xd1);
                 for (k, cell) in r.iter().enumerate() {
-                    let ty = cols.get(k).map(|c| c.ty.clone()).unwrap_or(ColType::NVarChar(None));
+                    let ty = cols
+                        .get(k)
+                        .map(|c| c.ty.clone())
+                        .unwrap_or(ColType::NVarChar(None));
                     if let Err(e) = tds::put_value(out, &ty, cell.as_deref()) {
                         out.truncate(at);
                         encode_error = Some(e);
@@ -854,7 +1059,14 @@ impl Session {
             return Ok(Outcome::Failed(e, started));
         }
         if let Some(e) = encode_error {
-            return Ok(Outcome::Failed(PgNotice { code: "22003".into(), message: e, ..Default::default() }, started));
+            return Ok(Outcome::Failed(
+                PgNotice {
+                    code: "22003".into(),
+                    message: e,
+                    ..Default::default()
+                },
+                started,
+            ));
         }
         if columns.is_some() && !capture {
             return Ok(Outcome::Rows { count });
@@ -894,16 +1106,25 @@ impl Session {
 
     async fn commit(&mut self) -> Result<(), TsqlError> {
         if self.trancount == 0 {
-            return Err(TsqlError::new(3902, "The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION."));
+            return Err(TsqlError::new(
+                3902,
+                "The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION.",
+            ));
         }
         self.trancount -= 1;
         if self.trancount == 0 {
-            let tag = self.silent("COMMIT").await.map_err(|e| error_from_engine(&e));
+            let tag = self
+                .silent("COMMIT")
+                .await
+                .map_err(|e| error_from_engine(&e));
             let rolled_back = matches!(&tag, Ok(t) if t == "ROLLBACK");
             self.sync_transaction(!rolled_back);
             tag?;
             if rolled_back {
-                return Err(TsqlError::new(3998, "The transaction was rolled back instead of committed: a statement in it had failed."));
+                return Err(TsqlError::new(
+                    3998,
+                    "The transaction was rolled back instead of committed: a statement in it had failed.",
+                ));
             }
         }
         Ok(())
@@ -914,14 +1135,22 @@ impl Session {
             let lower = n.to_lowercase();
             if let Some(pos) = self.savepoints.iter().rposition(|s| *s == lower) {
                 self.savepoints.truncate(pos + 1);
-                self.silent(&format!("ROLLBACK TO SAVEPOINT {}", ident_sql(&lower))).await.map_err(|e| error_from_engine(&e))?;
+                self.silent(&format!("ROLLBACK TO SAVEPOINT {}", ident_sql(&lower)))
+                    .await
+                    .map_err(|e| error_from_engine(&e))?;
                 return Ok(());
             }
         }
         if self.trancount == 0 && !self.bridge().in_block() {
-            return Err(TsqlError::new(3903, "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION."));
+            return Err(TsqlError::new(
+                3903,
+                "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION.",
+            ));
         }
-        let r = self.silent("ROLLBACK").await.map_err(|e| error_from_engine(&e));
+        let r = self
+            .silent("ROLLBACK")
+            .await
+            .map_err(|e| error_from_engine(&e));
         self.trancount = 0;
         self.sync_transaction(false);
         r.map(|_| ())
@@ -929,7 +1158,11 @@ impl Session {
 
     /// Runs a translated statement and answers for it. `Err` is the
     /// statement's error, not yet written.
-    async fn forward(&mut self, forward: Forward, params: Option<&ParamCtx>) -> io::Result<Result<(), TsqlError>> {
+    async fn forward(
+        &mut self,
+        forward: Forward,
+        params: Option<&ParamCtx>,
+    ) -> io::Result<Result<(), TsqlError>> {
         let ddl = forward.kind == Kind::Ddl;
         if self.bridge().status == b'E' {
             log::warn!("SQL Server session: a failed transaction was found open; rolling it back");
@@ -943,7 +1176,10 @@ impl Session {
         }
         let guarded = self.bridge().in_block() && !self.xact_abort;
         if guarded {
-            if let Err(e) = self.silent(&format!("SAVEPOINT {STATEMENT_SAVEPOINT}")).await {
+            if let Err(e) = self
+                .silent(&format!("SAVEPOINT {STATEMENT_SAVEPOINT}"))
+                .await
+            {
                 return Ok(Err(error_from_engine(&e)));
             }
         }
@@ -956,7 +1192,9 @@ impl Session {
                     let oid = p.decls[k].2;
                     match p.values.get(k).cloned().unwrap_or(ParamValue::Null) {
                         ParamValue::Null => (0, None, oid),
-                        ParamValue::Text(t) => (0, Some(t.into_bytes()), if oid == 17 { 0 } else { oid }),
+                        ParamValue::Text(t) => {
+                            (0, Some(t.into_bytes()), if oid == 17 { 0 } else { oid })
+                        }
                         ParamValue::Bytes(b) => (1, Some(b), 17),
                     }
                 })
@@ -967,7 +1205,9 @@ impl Session {
         let mut last = None;
         let mut affected = 0u64;
         for sql in forward.statements.iter().filter(|s| !s.is_empty()) {
-            let outcome = self.exchange(sql, &bound, capture, forward.extra_column.as_ref()).await?;
+            let outcome = self
+                .exchange(sql, &bound, capture, forward.extra_column.as_ref())
+                .await?;
             let failed = matches!(outcome, Outcome::Failed(..));
             if let Outcome::Done { tag, .. } = &outcome {
                 affected += tag_count(tag).unwrap_or(0);
@@ -977,7 +1217,10 @@ impl Session {
                 break;
             }
         }
-        let outcome = last.unwrap_or(Outcome::Done { tag: String::new(), identity: None });
+        let outcome = last.unwrap_or(Outcome::Done {
+            tag: String::new(),
+            identity: None,
+        });
         match outcome {
             Outcome::Failed(n, started) => {
                 let mut e = error_from_engine(&n);
@@ -994,8 +1237,12 @@ impl Session {
                     if n.code == "40001" || n.code == "40P01" {
                         let _ = self.silent("ROLLBACK").await;
                     } else {
-                        let _ = self.silent(&format!("ROLLBACK TO SAVEPOINT {STATEMENT_SAVEPOINT}")).await;
-                        let _ = self.silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}")).await;
+                        let _ = self
+                            .silent(&format!("ROLLBACK TO SAVEPOINT {STATEMENT_SAVEPOINT}"))
+                            .await;
+                        let _ = self
+                            .silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}"))
+                            .await;
                     }
                 } else if self.xact_abort && self.bridge().in_block() {
                     let _ = self.silent("ROLLBACK").await;
@@ -1006,7 +1253,9 @@ impl Session {
             }
             Outcome::Rows { count } => {
                 if guarded {
-                    let _ = self.silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}")).await;
+                    let _ = self
+                        .silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}"))
+                        .await;
                 }
                 self.rowcount = count as i64;
                 self.sync_transaction(true);
@@ -1019,12 +1268,18 @@ impl Session {
             }
             Outcome::Done { tag, identity } => {
                 if guarded {
-                    let _ = self.silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}")).await;
+                    let _ = self
+                        .silent(&format!("RELEASE SAVEPOINT {STATEMENT_SAVEPOINT}"))
+                        .await;
                 }
                 if let Some(id) = identity {
                     self.last_identity = Some(id);
                 }
-                let rows = if ddl { 0 } else { tag_count(&tag).unwrap_or(affected) };
+                let rows = if ddl {
+                    0
+                } else {
+                    tag_count(&tag).unwrap_or(affected)
+                };
                 self.rowcount = rows as i64;
                 self.sync_transaction(true);
                 let command = match tag.split(' ').next().unwrap_or("") {
@@ -1035,7 +1290,11 @@ impl Session {
                     _ => 0,
                 };
                 let counted = !ddl && command != 0 && !self.nocount;
-                self.statement_done(if counted { tds::DONE_COUNT } else { 0 }, command, if counted { rows } else { 0 });
+                self.statement_done(
+                    if counted { tds::DONE_COUNT } else { 0 },
+                    command,
+                    if counted { rows } else { 0 },
+                );
                 Ok(Ok(()))
             }
         }
@@ -1095,7 +1354,9 @@ impl Session {
         text: &'a str,
         stmts: &'a [Stmt],
         params: Option<&'a ParamCtx>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Result<Flow, TsqlError>>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = io::Result<Result<Flow, TsqlError>>> + Send + 'a>,
+    > {
         Box::pin(async move {
             for s in stmts {
                 match self.run(text, s, params).await? {
@@ -1129,12 +1390,18 @@ impl Session {
         text: &'a str,
         stmt: &'a Stmt,
         params: Option<&'a ParamCtx>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Result<Flow, TsqlError>>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = io::Result<Result<Flow, TsqlError>>> + Send + 'a>,
+    > {
         Box::pin(async move {
             match stmt {
                 Stmt::Simple(tokens) => self.simple(text, tokens, params).await,
                 Stmt::Block(body) => self.run_list(text, body, params).await,
-                Stmt::If { condition, then, otherwise } => {
+                Stmt::If {
+                    condition,
+                    then,
+                    otherwise,
+                } => {
                     let truth = match self.condition(condition, params).await {
                         Ok(t) => t,
                         Err(e) => return Ok(Err(e)),
@@ -1159,7 +1426,10 @@ impl Session {
                         }
                         rounds += 1;
                         if rounds > 1_000_000 {
-                            return Ok(Err(TsqlError::new(50000, "a WHILE loop ran more than a million times; stopped")));
+                            return Ok(Err(TsqlError::new(
+                                50000,
+                                "a WHILE loop ran more than a million times; stopped",
+                            )));
                         }
                         match self.run(text, body, params).await? {
                             Ok(Flow::Break) => break,
@@ -1187,31 +1457,59 @@ impl Session {
         })
     }
 
-    async fn condition(&mut self, tokens: &[Token], params: Option<&ParamCtx>) -> Result<bool, TsqlError> {
+    async fn condition(
+        &mut self,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<bool, TsqlError> {
         if let Some(p) = params {
             p.used.lock().clear();
         }
         let sql = translate::condition_query(tokens.to_vec(), &Scope { s: self, params })?;
         let bound = bound_values(params);
-        let (_, rows) = self.fetch(&sql, &bound).await.map_err(|e| error_from_engine(&e))?;
-        Ok(rows.first().and_then(|r| r.first().cloned().flatten()).as_deref() == Some("1"))
+        let (_, rows) = self
+            .fetch(&sql, &bound)
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        Ok(rows
+            .first()
+            .and_then(|r| r.first().cloned().flatten())
+            .as_deref()
+            == Some("1"))
     }
 
     /// Evaluates an expression to a value.
-    async fn evaluate(&mut self, tokens: &[Token], params: Option<&ParamCtx>) -> Result<Value, TsqlError> {
+    async fn evaluate(
+        &mut self,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<Value, TsqlError> {
         match tokens {
             [t] => match &t.tok {
                 Tok::Str(s) => return Ok(Value::Str(String::from_utf8_lossy(s).into_owned())),
-                Tok::Num(n) => return Ok(n.parse::<i64>().map(Value::Int).unwrap_or(Value::Num(n.clone()))),
+                Tok::Num(n) => {
+                    return Ok(n
+                        .parse::<i64>()
+                        .map(Value::Int)
+                        .unwrap_or(Value::Num(n.clone())));
+                }
                 Tok::UserVar(name) if params.is_none() => {
-                    return self.vars.get(name).map(|v| v.value.clone()).ok_or_else(|| TsqlError::new(137, format!("Must declare the scalar variable \"@{name}\".")));
+                    return self.vars.get(name).map(|v| v.value.clone()).ok_or_else(|| {
+                        TsqlError::new(
+                            137,
+                            format!("Must declare the scalar variable \"@{name}\"."),
+                        )
+                    });
                 }
                 Tok::Word(w) if w.eq_ignore_ascii_case("NULL") => return Ok(Value::Null),
                 _ => {}
             },
             [m, t] if m.is_op("-") => {
                 if let Tok::Num(n) = &t.tok {
-                    return Ok(n.parse::<i64>().map(|v| Value::Int(-v)).unwrap_or(Value::Num(format!("-{n}"))));
+                    return Ok(n
+                        .parse::<i64>()
+                        .map(|v| Value::Int(-v))
+                        .unwrap_or(Value::Num(format!("-{n}"))));
                 }
             }
             _ => {}
@@ -1221,14 +1519,29 @@ impl Session {
         }
         let sql = translate::value_query(tokens.to_vec(), &Scope { s: self, params })?;
         let bound = bound_values(params);
-        let (oids, rows) = self.fetch(&sql, &bound).await.map_err(|e| error_from_engine(&e))?;
-        Ok(value_of(oids.first().copied().unwrap_or(25), rows.first().and_then(|r| r.first().cloned()).flatten()))
+        let (oids, rows) = self
+            .fetch(&sql, &bound)
+            .await
+            .map_err(|e| error_from_engine(&e))?;
+        Ok(value_of(
+            oids.first().copied().unwrap_or(25),
+            rows.first().and_then(|r| r.first().cloned()).flatten(),
+        ))
     }
 
     fn assign(&mut self, name: &str, value: Value) -> Result<(), TsqlError> {
-        let var = self.vars.get_mut(name).ok_or_else(|| TsqlError::new(137, format!("Must declare the scalar variable \"@{name}\".")))?;
+        let var = self.vars.get_mut(name).ok_or_else(|| {
+            TsqlError::new(
+                137,
+                format!("Must declare the scalar variable \"@{name}\"."),
+            )
+        })?;
         var.value = match (&value, var.numeric, var.string) {
-            (Value::Str(s), true, _) => s.trim().parse::<i64>().map(Value::Int).unwrap_or_else(|_| Value::Num(s.trim().to_string())),
+            (Value::Str(s), true, _) => s
+                .trim()
+                .parse::<i64>()
+                .map(Value::Int)
+                .unwrap_or_else(|_| Value::Num(s.trim().to_string())),
             (Value::Int(n), _, true) => Value::Str(n.to_string()),
             (Value::Num(n), _, true) => Value::Str(n.clone()),
             _ => value,
@@ -1236,23 +1549,32 @@ impl Session {
         Ok(())
     }
 
-    async fn simple(&mut self, text: &str, tokens: &[Token], params: Option<&ParamCtx>) -> io::Result<Result<Flow, TsqlError>> {
+    async fn simple(
+        &mut self,
+        text: &str,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> io::Result<Result<Flow, TsqlError>> {
         let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
         let next = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
         let r: Result<Flow, TsqlError> = match head.as_str() {
             "DECLARE" => self.declare(tokens, params).await,
             "SET" if matches!(tokens.get(1).map(|t| &t.tok), Some(Tok::UserVar(_))) => {
-                let Some(Tok::UserVar(name)) = tokens.get(1).map(|t| &t.tok) else { unreachable!() };
+                let Some(Tok::UserVar(name)) = tokens.get(1).map(|t| &t.tok) else {
+                    unreachable!()
+                };
                 let name = name.clone();
                 let op = tokens.get(2).map(|t| t.tok.clone());
                 match op {
-                    Some(Tok::Op(o)) if o == "=" => match self.evaluate(&tokens[3..], params).await {
+                    Some(Tok::Op(o)) if o == "=" => match self.evaluate(&tokens[3..], params).await
+                    {
                         Ok(v) => self.assign(&name, v).map(|_| Flow::Next),
                         Err(e) => Err(e),
                     },
                     Some(Tok::Op(o)) if o.len() == 2 && o.ends_with('=') => {
                         // SET @x += 1
-                        let mut expr = vec![Token::new(Tok::UserVar(name.clone())), Token::op(&o[..1])];
+                        let mut expr =
+                            vec![Token::new(Tok::UserVar(name.clone())), Token::op(&o[..1])];
                         expr.push(Token::op("("));
                         expr.extend(tokens[3..].iter().cloned());
                         expr.push(Token::op(")"));
@@ -1286,13 +1608,23 @@ impl Session {
                     Err(self.last_error.clone().unwrap_or_else(|| TsqlError::new(10704, "To rethrow an error, a THROW statement must be used inside a CATCH block.")))
                 } else {
                     let args = split_commas(&tokens[1..]);
-                    let number = render_value(&args[0]).and_then(|v| v.parse().ok()).unwrap_or(50000);
+                    let number = render_value(&args[0])
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(50000);
                     let message = match args.get(1) {
-                        Some(a) => self.evaluate(a, params).await.map(|v| v.text().unwrap_or_default()),
+                        Some(a) => self
+                            .evaluate(a, params)
+                            .await
+                            .map(|v| v.text().unwrap_or_default()),
                         None => Ok(String::new()),
                     };
                     match message {
-                        Ok(m) => Err(TsqlError { number, class: 16, state: 1, message: m }),
+                        Ok(m) => Err(TsqlError {
+                            number,
+                            class: 16,
+                            state: 1,
+                            message: m,
+                        }),
                         Err(e) => Err(e),
                     }
                 }
@@ -1301,7 +1633,11 @@ impl Session {
             "BREAK" => Ok(Flow::Break),
             "CONTINUE" => Ok(Flow::Continue),
             "USE" => {
-                let db = tokens.get(1).and_then(|t| t.ident()).unwrap_or("").to_string();
+                let db = tokens
+                    .get(1)
+                    .and_then(|t| t.ident())
+                    .unwrap_or("")
+                    .to_string();
                 self.use_database(&db).await
             }
             "BEGIN" if matches!(next.as_str(), "TRAN" | "TRANSACTION" | "DISTRIBUTED") => {
@@ -1328,11 +1664,21 @@ impl Session {
                 r.map(|_| Flow::Next)
             }
             "SAVE" => {
-                let name = tokens.get(2).and_then(|t| t.ident()).unwrap_or("").to_lowercase();
+                let name = tokens
+                    .get(2)
+                    .and_then(|t| t.ident())
+                    .unwrap_or("")
+                    .to_lowercase();
                 if self.trancount == 0 {
-                    Err(TsqlError::new(628, "Cannot issue SAVE TRANSACTION when there is no active transaction."))
+                    Err(TsqlError::new(
+                        628,
+                        "Cannot issue SAVE TRANSACTION when there is no active transaction.",
+                    ))
                 } else {
-                    let r = self.silent(&format!("SAVEPOINT {}", ident_sql(&name))).await.map_err(|e| error_from_engine(&e));
+                    let r = self
+                        .silent(&format!("SAVEPOINT {}", ident_sql(&name)))
+                        .await
+                        .map_err(|e| error_from_engine(&e));
                     if r.is_ok() {
                         self.savepoints.push(name);
                     }
@@ -1350,15 +1696,15 @@ impl Session {
                     ("DELAY", Some(d)) => {
                         let parts: Vec<f64> = d.split(':').filter_map(|p| p.parse().ok()).collect();
                         let secs = parts.iter().fold(0.0, |acc, p| acc * 60.0 + p);
-                        tokio::time::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0))).await;
+                        tokio::time::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)))
+                            .await;
                         Ok(Flow::Next)
                     }
                     _ => Err(TsqlError::unsupported("WAITFOR other than DELAY")),
                 }
             }
-            "GRANT" | "DENY" | "REVOKE" | "DBCC" | "BACKUP" | "RESTORE" | "OPEN" | "CLOSE" | "FETCH" | "DEALLOCATE" | "GOTO" | "KILL" => {
-                Err(TsqlError::unsupported(head))
-            }
+            "GRANT" | "DENY" | "REVOKE" | "DBCC" | "BACKUP" | "RESTORE" | "OPEN" | "CLOSE"
+            | "FETCH" | "DEALLOCATE" | "GOTO" | "KILL" => Err(TsqlError::unsupported(head)),
             "ALTER" if next == "DATABASE" => {
                 // SET SINGLE_USER, RECOVERY, COLLATE …: storage and access
                 // settings the engine does not have.
@@ -1370,8 +1716,11 @@ impl Session {
                 Ok(Flow::Next)
             }
             "SELECT"
-                if (matches!(tokens.get(1).map(|t| &t.tok), Some(Tok::UserVar(_))) && tokens.get(2).is_some_and(|t| t.is_op("=")))
-                    || (next == "DISTINCT" && matches!(tokens.get(2).map(|t| &t.tok), Some(Tok::UserVar(_))) && tokens.get(3).is_some_and(|t| t.is_op("="))) =>
+                if (matches!(tokens.get(1).map(|t| &t.tok), Some(Tok::UserVar(_)))
+                    && tokens.get(2).is_some_and(|t| t.is_op("=")))
+                    || (next == "DISTINCT"
+                        && matches!(tokens.get(2).map(|t| &t.tok), Some(Tok::UserVar(_)))
+                        && tokens.get(3).is_some_and(|t| t.is_op("="))) =>
             {
                 self.assignment_select(text, tokens, params).await
             }
@@ -1379,10 +1728,19 @@ impl Session {
                 if let Some(p) = params {
                     p.used.lock().clear();
                 }
-                let translated = translate::translate(text, tokens.to_vec(), &Scope { s: self, params });
+                let translated =
+                    translate::translate(text, tokens.to_vec(), &Scope { s: self, params });
                 match &translated {
-                    Ok(f) => log::debug!("T-SQL {:?} -> {:?}", crate::sqlcompat::render_text(tokens), f.statements),
-                    Err(e) => log::debug!("T-SQL {:?} refused: {}", crate::sqlcompat::render_text(tokens), e.message),
+                    Ok(f) => log::debug!(
+                        "T-SQL {:?} -> {:?}",
+                        crate::sqlcompat::render_text(tokens),
+                        f.statements
+                    ),
+                    Err(e) => log::debug!(
+                        "T-SQL {:?} refused: {}",
+                        crate::sqlcompat::render_text(tokens),
+                        e.message
+                    ),
                 }
                 match translated {
                     Ok(forward) => match self.forward(forward, params).await? {
@@ -1396,7 +1754,11 @@ impl Session {
         Ok(r)
     }
 
-    async fn declare(&mut self, tokens: &[Token], params: Option<&ParamCtx>) -> Result<Flow, TsqlError> {
+    async fn declare(
+        &mut self,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<Flow, TsqlError> {
         for part in split_commas(&tokens[1..]) {
             let Some(Tok::UserVar(name)) = part.first().map(|t| &t.tok) else {
                 return Err(TsqlError::unsupported("DECLARE of a cursor"));
@@ -1410,9 +1772,39 @@ impl Session {
             if ty == "TABLE" {
                 return Err(TsqlError::unsupported("table variables"));
             }
-            let string = matches!(ty.as_str(), "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "XML" | "UNIQUEIDENTIFIER");
-            let numeric = matches!(ty.as_str(), "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "BIT" | "DECIMAL" | "NUMERIC" | "MONEY" | "FLOAT" | "REAL");
-            self.vars.insert(name.clone(), Var { value: Value::Null, string, numeric });
+            let string = matches!(
+                ty.as_str(),
+                "CHAR"
+                    | "NCHAR"
+                    | "VARCHAR"
+                    | "NVARCHAR"
+                    | "TEXT"
+                    | "NTEXT"
+                    | "SYSNAME"
+                    | "XML"
+                    | "UNIQUEIDENTIFIER"
+            );
+            let numeric = matches!(
+                ty.as_str(),
+                "INT"
+                    | "BIGINT"
+                    | "SMALLINT"
+                    | "TINYINT"
+                    | "BIT"
+                    | "DECIMAL"
+                    | "NUMERIC"
+                    | "MONEY"
+                    | "FLOAT"
+                    | "REAL"
+            );
+            self.vars.insert(
+                name.clone(),
+                Var {
+                    value: Value::Null,
+                    string,
+                    numeric,
+                },
+            );
             if let Some(eq) = part.iter().position(|t| t.is_op("=")) {
                 let v = self.evaluate(&part[eq + 1..], params).await?;
                 self.assign(&name, v)?;
@@ -1421,28 +1813,49 @@ impl Session {
         Ok(Flow::Next)
     }
 
-    async fn assignment_select(&mut self, text: &str, tokens: &[Token], params: Option<&ParamCtx>) -> Result<Flow, TsqlError> {
+    async fn assignment_select(
+        &mut self,
+        text: &str,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<Flow, TsqlError> {
         if let Some(p) = params {
             p.used.lock().clear();
         }
-        let Some((sql, names)) = translate::assignment_select(text, tokens, &Scope { s: self, params })? else {
+        let Some((sql, names)) =
+            translate::assignment_select(text, tokens, &Scope { s: self, params })?
+        else {
             return Err(TsqlError::syntax("an assignment SELECT was expected"));
         };
         let bound = bound_values(params);
-        let (oids, rows) = self.fetch(&sql, &bound).await.map_err(|e| error_from_engine(&e))?;
+        let (oids, rows) = self
+            .fetch(&sql, &bound)
+            .await
+            .map_err(|e| error_from_engine(&e))?;
         // The last row's values, as SQL Server leaves them.
         if let Some(row) = rows.last() {
             for (k, name) in names.iter().enumerate() {
-                let v = value_of(oids.get(k).copied().unwrap_or(25), row.get(k).cloned().flatten());
+                let v = value_of(
+                    oids.get(k).copied().unwrap_or(25),
+                    row.get(k).cloned().flatten(),
+                );
                 self.assign(name, v)?;
             }
         }
         self.rowcount = rows.len() as i64;
-        self.statement_done(if self.nocount { 0 } else { tds::DONE_COUNT }, 0xc1, rows.len() as u64);
+        self.statement_done(
+            if self.nocount { 0 } else { tds::DONE_COUNT },
+            0xc1,
+            rows.len() as u64,
+        );
         Ok(Flow::Next)
     }
 
-    async fn raiserror(&mut self, tokens: &[Token], params: Option<&ParamCtx>) -> Result<Flow, TsqlError> {
+    async fn raiserror(
+        &mut self,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<Flow, TsqlError> {
         let mut inner = &tokens[1..];
         if inner.first().is_some_and(|t| t.is_op("(")) {
             let close = crate::sqlcompat::matching_paren(inner, 0).unwrap_or(inner.len() - 1);
@@ -1450,14 +1863,29 @@ impl Session {
         }
         let args = split_commas(inner);
         if args.len() < 3 {
-            return Err(TsqlError::syntax("RAISERROR needs a message, a severity and a state"));
+            return Err(TsqlError::syntax(
+                "RAISERROR needs a message, a severity and a state",
+            ));
         }
-        let msg = self.evaluate(&args[0], params).await?.text().unwrap_or_default();
-        let severity = render_value(&args[1]).and_then(|v| v.parse::<u8>().ok()).unwrap_or(16);
-        let state = render_value(&args[2]).and_then(|v| v.parse::<u8>().ok()).unwrap_or(1);
+        let msg = self
+            .evaluate(&args[0], params)
+            .await?
+            .text()
+            .unwrap_or_default();
+        let severity = render_value(&args[1])
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(16);
+        let state = render_value(&args[2])
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1);
         let mut values = Vec::new();
         for a in args.iter().skip(3) {
-            values.push(self.evaluate(a, params).await?.text().unwrap_or_else(|| "(null)".into()));
+            values.push(
+                self.evaluate(a, params)
+                    .await?
+                    .text()
+                    .unwrap_or_else(|| "(null)".into()),
+            );
         }
         // %s, %d, %i substituted in order.
         let mut text = String::new();
@@ -1486,7 +1914,12 @@ impl Session {
             self.info_token(50000, &text);
             Ok(Flow::Next)
         } else {
-            Err(TsqlError { number: 50000, class: severity.min(18), state, message: text })
+            Err(TsqlError {
+                number: 50000,
+                class: severity.min(18),
+                state,
+                message: text,
+            })
         }
     }
 
@@ -1494,10 +1927,18 @@ impl Session {
         let db = resolve_database(&self.shared, shown).to_string();
         let db = db.as_str();
         if self.bridge().in_block() {
-            return Err(TsqlError::new(574, "USE inside a transaction is not supported: COMMIT or ROLLBACK first."));
+            return Err(TsqlError::new(
+                574,
+                "USE inside a transaction is not supported: COMMIT or ROLLBACK first.",
+            ));
         }
         if self.shared.catalog.get(db).is_none() {
-            return Err(TsqlError::new(911, format!("Database '{db}' does not exist. Make sure that the name is entered correctly.")));
+            return Err(TsqlError::new(
+                911,
+                format!(
+                    "Database '{db}' does not exist. Make sure that the name is entered correctly."
+                ),
+            ));
         }
         let old = self.bridge().database_name.clone();
         if old != db {
@@ -1519,26 +1960,44 @@ impl Session {
             "XACT_ABORT" => self.xact_abort = on(),
             "IMPLICIT_TRANSACTIONS" => self.implicit_transactions = on(),
             "TRANSACTION" => {
-                let at = words.iter().position(|w| w == "LEVEL").ok_or_else(|| TsqlError::syntax("SET TRANSACTION ISOLATION LEVEL was expected"))?;
-                let level = match (words.get(at + 1).map(String::as_str), words.get(at + 2).map(String::as_str)) {
+                let at = words.iter().position(|w| w == "LEVEL").ok_or_else(|| {
+                    TsqlError::syntax("SET TRANSACTION ISOLATION LEVEL was expected")
+                })?;
+                let level = match (
+                    words.get(at + 1).map(String::as_str),
+                    words.get(at + 2).map(String::as_str),
+                ) {
                     (Some("READ"), Some("UNCOMMITTED")) => "READ UNCOMMITTED",
                     (Some("READ"), Some("COMMITTED")) => "READ COMMITTED",
                     (Some("REPEATABLE"), _) => "REPEATABLE READ",
                     (Some("SERIALIZABLE"), _) | (Some("SNAPSHOT"), _) => "SERIALIZABLE",
                     _ => return Err(TsqlError::syntax("an isolation level was expected")),
                 };
-                self.silent(&format!("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {level}"))
-                    .await
-                    .map_err(|e| error_from_engine(&e))?;
+                self.silent(&format!(
+                    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {level}"
+                ))
+                .await
+                .map_err(|e| error_from_engine(&e))?;
             }
             "LOCK_TIMEOUT" => {
-                let ms: i64 = tokens.get(2).and_then(|t| match &t.tok {
-                    Tok::Num(n) => n.parse().ok(),
-                    _ => None,
-                }).or_else(|| if tokens.get(2).is_some_and(|t| t.is_op("-")) { Some(-1) } else { None })
-                .unwrap_or(-1);
+                let ms: i64 = tokens
+                    .get(2)
+                    .and_then(|t| match &t.tok {
+                        Tok::Num(n) => n.parse().ok(),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        if tokens.get(2).is_some_and(|t| t.is_op("-")) {
+                            Some(-1)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(-1);
                 let value = if ms < 0 { 0 } else { ms.max(1) };
-                self.silent(&format!("SET lock_timeout = {value}")).await.map_err(|e| error_from_engine(&e))?;
+                self.silent(&format!("SET lock_timeout = {value}"))
+                    .await
+                    .map_err(|e| error_from_engine(&e))?;
             }
             "ROWCOUNT" => {
                 let n = render_value(&tokens[2..]).unwrap_or_default();
@@ -1546,8 +2005,12 @@ impl Session {
                     return Err(TsqlError::unsupported("SET ROWCOUNT (use TOP)"));
                 }
             }
-            "FMTONLY" | "NOEXEC" | "PARSEONLY" if on() => return Err(TsqlError::unsupported(format!("SET {first} ON"))),
-            "SHOWPLAN_ALL" | "SHOWPLAN_TEXT" | "SHOWPLAN_XML" if on() => return Err(TsqlError::unsupported(format!("SET {first} ON"))),
+            "FMTONLY" | "NOEXEC" | "PARSEONLY" if on() => {
+                return Err(TsqlError::unsupported(format!("SET {first} ON")));
+            }
+            "SHOWPLAN_ALL" | "SHOWPLAN_TEXT" | "SHOWPLAN_XML" if on() => {
+                return Err(TsqlError::unsupported(format!("SET {first} ON")));
+            }
             // Accepted, with no effect here: ANSI_NULLS, QUOTED_IDENTIFIER,
             // ANSI_WARNINGS, ANSI_PADDING, ARITHABORT, CONCAT_NULL_YIELDS_NULL,
             // TEXTSIZE, DATEFORMAT, DATEFIRST, LANGUAGE, DEADLOCK_PRIORITY,
@@ -1558,17 +2021,28 @@ impl Session {
     }
 
     /// EXEC: a string as a batch, or one of the system procedures.
-    async fn exec_statement(&mut self, tokens: &[Token], params: Option<&ParamCtx>) -> Result<Flow, TsqlError> {
+    async fn exec_statement(
+        &mut self,
+        tokens: &[Token],
+        params: Option<&ParamCtx>,
+    ) -> Result<Flow, TsqlError> {
         let rest = &tokens[1..];
         if rest.first().is_some_and(|t| t.is_op("(")) {
             // EXEC('…') / EXEC(@sql)
-            let close = crate::sqlcompat::matching_paren(rest, 0).ok_or_else(|| TsqlError::syntax("unbalanced EXEC"))?;
-            let sql = self.evaluate(&rest[1..close], params).await?.text().unwrap_or_default();
+            let close = crate::sqlcompat::matching_paren(rest, 0)
+                .ok_or_else(|| TsqlError::syntax("unbalanced EXEC"))?;
+            let sql = self
+                .evaluate(&rest[1..close], params)
+                .await?
+                .text()
+                .unwrap_or_default();
             return self.nested_batch(&sql, None).await;
         }
         // EXEC @rc = proc …
         let mut rest = rest;
-        if matches!(rest.first().map(|t| &t.tok), Some(Tok::UserVar(_))) && rest.get(1).is_some_and(|t| t.is_op("=")) {
+        if matches!(rest.first().map(|t| &t.tok), Some(Tok::UserVar(_)))
+            && rest.get(1).is_some_and(|t| t.is_op("="))
+        {
             rest = &rest[2..];
         }
         let mut k = 0;
@@ -1604,14 +2078,22 @@ impl Session {
         }
         match name.as_str() {
             "sp_executesql" => {
-                let stmt = named.first().and_then(|(_, v)| v.text()).unwrap_or_default();
+                let stmt = named
+                    .first()
+                    .and_then(|(_, v)| v.text())
+                    .unwrap_or_default();
                 let decl = named.get(1).and_then(|(_, v)| v.text()).unwrap_or_default();
                 let decls = parse_declarations(&decl)?;
                 let mut vals = vec![ParamValue::Null; decls.len()];
                 let mut position = 0;
                 for (n, v) in named.iter().skip(2) {
                     let k = match n {
-                        Some(n) => decls.iter().position(|d| d.0 == *n).ok_or_else(|| TsqlError::new(8145, format!("@{n} is not a parameter for procedure sp_executesql.")))?,
+                        Some(n) => decls.iter().position(|d| d.0 == *n).ok_or_else(|| {
+                            TsqlError::new(
+                                8145,
+                                format!("@{n} is not a parameter for procedure sp_executesql."),
+                            )
+                        })?,
                         None => {
                             position += 1;
                             position - 1
@@ -1625,20 +2107,41 @@ impl Session {
                         };
                     }
                 }
-                let ctx = ParamCtx { decls, values: vals, used: parking_lot::Mutex::new(Vec::new()) };
+                let ctx = ParamCtx {
+                    decls,
+                    values: vals,
+                    used: parking_lot::Mutex::new(Vec::new()),
+                };
                 self.nested_batch(&stmt, Some(&ctx)).await
             }
             "sp_rename" => {
                 let old = values.first().and_then(|v| v.text()).unwrap_or_default();
                 let new = values.get(1).and_then(|v| v.text()).unwrap_or_default();
-                let kind = values.get(2).and_then(|v| v.text()).unwrap_or_default().to_ascii_uppercase();
-                let parts: Vec<String> = old.split('.').map(|p| p.trim_matches(['[', ']']).to_lowercase()).filter(|p| p != "dbo").collect();
+                let kind = values
+                    .get(2)
+                    .and_then(|v| v.text())
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let parts: Vec<String> = old
+                    .split('.')
+                    .map(|p| p.trim_matches(['[', ']']).to_lowercase())
+                    .filter(|p| p != "dbo")
+                    .collect();
                 let sql = if kind == "COLUMN" && parts.len() >= 2 {
-                    format!("ALTER TABLE {} RENAME COLUMN {} TO {}", ident_sql(&parts[parts.len() - 2]), ident_sql(&parts[parts.len() - 1]), ident_sql(&new.to_lowercase()))
+                    format!(
+                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                        ident_sql(&parts[parts.len() - 2]),
+                        ident_sql(&parts[parts.len() - 1]),
+                        ident_sql(&new.to_lowercase())
+                    )
                 } else if kind == "INDEX" {
                     return Err(TsqlError::unsupported("sp_rename of an index"));
                 } else {
-                    format!("ALTER TABLE {} RENAME TO {}", ident_sql(parts.last().map(String::as_str).unwrap_or("")), ident_sql(&new.to_lowercase()))
+                    format!(
+                        "ALTER TABLE {} RENAME TO {}",
+                        ident_sql(parts.last().map(String::as_str).unwrap_or("")),
+                        ident_sql(&new.to_lowercase())
+                    )
                 };
                 self.silent(&sql).await.map_err(|e| error_from_engine(&e))?;
                 self.statement_done(0, 0, 0);
@@ -1649,13 +2152,20 @@ impl Session {
                 Ok(Flow::Next)
             }
             "" => Err(TsqlError::syntax("EXEC needs a procedure")),
-            other => Err(TsqlError::new(2812, format!("Could not find stored procedure '{other}'."))),
+            other => Err(TsqlError::new(
+                2812,
+                format!("Could not find stored procedure '{other}'."),
+            )),
         }
     }
 
     /// A batch inside this one (EXEC, sp_executesql): its errors are its
     /// own, and do not end the outer batch.
-    async fn nested_batch(&mut self, sql: &str, params: Option<&ParamCtx>) -> Result<Flow, TsqlError> {
+    async fn nested_batch(
+        &mut self,
+        sql: &str,
+        params: Option<&ParamCtx>,
+    ) -> Result<Flow, TsqlError> {
         let tokens = lex::lex(sql).map_err(|e| TsqlError::syntax(e.0))?;
         let stmts = translate::parse_batch(&tokens)?;
         let owned = sql.to_string();
@@ -1701,7 +2211,13 @@ impl Session {
                 Ok(p) => p,
                 Err(e) => {
                     self.error_token(&TsqlError::new(8016, format!("The incoming tabular data stream (TDS) remote procedure call (RPC) protocol stream is incorrect: {e}")));
-                    tds::done(self.wire.reply(), tds::TOKEN_DONEPROC, tds::DONE_ERROR, 0, 0);
+                    tds::done(
+                        self.wire.reply(),
+                        tds::TOKEN_DONEPROC,
+                        tds::DONE_ERROR,
+                        0,
+                        0,
+                    );
                     self.in_rpc = false;
                     return Ok(());
                 }
@@ -1759,26 +2275,42 @@ impl Session {
                     Ok(decls) => {
                         let handle = self.next_handle;
                         self.next_handle += 1;
-                        self.prepared.insert(handle, Prepared { sql: sql.clone(), decls: decls.clone() });
+                        self.prepared.insert(
+                            handle,
+                            Prepared {
+                                sql: sql.clone(),
+                                decls: decls.clone(),
+                            },
+                        );
                         let r = if name == "sp_prepexec" {
                             let values = bind_values(&decls, &params[3.min(params.len())..]);
                             self.run_rpc_batch(&sql, decls, values).await?
                         } else {
                             Ok(())
                         };
-                        tds::return_value_int(self.wire.reply(), 0, params.first().map(|p| p.name.as_str()).unwrap_or("@handle"), handle);
+                        tds::return_value_int(
+                            self.wire.reply(),
+                            0,
+                            params.first().map(|p| p.name.as_str()).unwrap_or("@handle"),
+                            handle,
+                        );
                         r
                     }
                     Err(e) => Err(e),
                 }
             }
-            "sp_execute" => match int(params.first()).and_then(|h| self.prepared.get(&h).cloned()) {
-                Some(p) => {
-                    let values = bind_values(&p.decls, &params[1.min(params.len())..]);
-                    self.run_rpc_batch(&p.sql, p.decls, values).await?
+            "sp_execute" => {
+                match int(params.first()).and_then(|h| self.prepared.get(&h).cloned()) {
+                    Some(p) => {
+                        let values = bind_values(&p.decls, &params[1.min(params.len())..]);
+                        self.run_rpc_batch(&p.sql, p.decls, values).await?
+                    }
+                    None => Err(TsqlError::new(
+                        8179,
+                        "Could not find prepared statement with handle.",
+                    )),
                 }
-                None => Err(TsqlError::new(8179, "Could not find prepared statement with handle.")),
-            },
+            }
             "sp_unprepare" => {
                 if let Some(h) = int(params.first()) {
                     self.prepared.remove(&h);
@@ -1798,7 +2330,9 @@ impl Session {
                         tokens.push(Token::op(","));
                     }
                     if !p.name.is_empty() {
-                        tokens.push(Token::new(Tok::UserVar(p.name.trim_start_matches('@').to_lowercase())));
+                        tokens.push(Token::new(Tok::UserVar(
+                            p.name.trim_start_matches('@').to_lowercase(),
+                        )));
                         tokens.push(Token::op("="));
                     }
                     tokens.push(match &p.value {
@@ -1821,8 +2355,17 @@ impl Session {
         Ok(status)
     }
 
-    async fn run_rpc_batch(&mut self, sql: &str, decls: Vec<(String, bool, u32)>, values: Vec<ParamValue>) -> io::Result<Result<(), TsqlError>> {
-        let ctx = ParamCtx { decls, values, used: parking_lot::Mutex::new(Vec::new()) };
+    async fn run_rpc_batch(
+        &mut self,
+        sql: &str,
+        decls: Vec<(String, bool, u32)>,
+        values: Vec<ParamValue>,
+    ) -> io::Result<Result<(), TsqlError>> {
+        let ctx = ParamCtx {
+            decls,
+            values,
+            used: parking_lot::Mutex::new(Vec::new()),
+        };
         let tokens = match lex::lex(sql) {
             Ok(t) => t,
             Err(e) => return Ok(Err(TsqlError::syntax(e.0))),
@@ -1859,7 +2402,8 @@ impl Session {
                     self.trancount = self.trancount.min(1);
                     self.commit().await
                 } else {
-                    self.rollback(if name.is_empty() { None } else { Some(&name) }).await
+                    self.rollback(if name.is_empty() { None } else { Some(&name) })
+                        .await
                 };
                 if res.is_ok() && flags & 0x01 != 0 {
                     let isolation = r.u8().unwrap_or(0);
@@ -1870,13 +2414,18 @@ impl Session {
             }
             9 => {
                 let name = r.b_varchar().unwrap_or_default().to_lowercase();
-                let res = self.silent(&format!("SAVEPOINT {}", ident_sql(&name))).await.map_err(|e| error_from_engine(&e));
+                let res = self
+                    .silent(&format!("SAVEPOINT {}", ident_sql(&name)))
+                    .await
+                    .map_err(|e| error_from_engine(&e));
                 if res.is_ok() {
                     self.savepoints.push(name);
                 }
                 res.map(|_| ())
             }
-            other => Err(TsqlError::unsupported(format!("transaction manager request {other}"))),
+            other => Err(TsqlError::unsupported(format!(
+                "transaction manager request {other}"
+            ))),
         };
         let status = match result {
             Ok(()) => 0,
@@ -1918,11 +2467,13 @@ fn bound_values(params: Option<&ParamCtx>) -> Vec<(i16, Option<Vec<u8>>, u32)> {
     p.used
         .lock()
         .iter()
-        .map(|&k| match p.values.get(k).cloned().unwrap_or(ParamValue::Null) {
-            ParamValue::Null => (0, None, 0),
-            ParamValue::Text(t) => (0, Some(t.into_bytes()), 0),
-            ParamValue::Bytes(b) => (1, Some(b), 17),
-        })
+        .map(
+            |&k| match p.values.get(k).cloned().unwrap_or(ParamValue::Null) {
+                ParamValue::Null => (0, None, 0),
+                ParamValue::Text(t) => (0, Some(t.into_bytes()), 0),
+                ParamValue::Bytes(b) => (1, Some(b), 17),
+            },
+        )
         .collect()
 }
 

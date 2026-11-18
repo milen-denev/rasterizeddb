@@ -87,13 +87,21 @@ macro_rules! each {
 }
 
 impl AsyncRead for MyStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         each!(self, s => Pin::new(s).poll_read(cx, buf))
     }
 }
 
 impl AsyncWrite for MyStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         each!(self, s => Pin::new(s).poll_write(cx, buf))
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -143,13 +151,20 @@ impl Packets {
             }
             let have = self.rbuf.len();
             let need = want - have;
-            let chunk = if self.exact { need } else { need.max(16 * 1024) };
+            let chunk = if self.exact {
+                need
+            } else {
+                need.max(16 * 1024)
+            };
             self.rbuf.resize(have + chunk, 0);
             let n = self.stream.read(&mut self.rbuf[have..]).await;
             match n {
                 Ok(0) => {
                     self.rbuf.truncate(have);
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client closed the connection"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "client closed the connection",
+                    ));
                 }
                 Ok(n) => self.rbuf.truncate(have + n),
                 Err(e) => {
@@ -171,7 +186,10 @@ impl Packets {
             self.seq = h[3].wrapping_add(1);
             self.rpos += 4;
             if payload.len() + len > self.max_packet {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "packet larger than max_allowed_packet"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "packet larger than max_allowed_packet",
+                ));
             }
             self.fill(len).await?;
             payload.extend_from_slice(&self.rbuf[self.rpos..self.rpos + len]);
@@ -224,7 +242,8 @@ impl Packets {
         let mut last_full = false;
         while let Some(chunk) = chunks.next() {
             let n = chunk.len();
-            self.out.extend_from_slice(&[n as u8, (n >> 8) as u8, (n >> 16) as u8, self.seq]);
+            self.out
+                .extend_from_slice(&[n as u8, (n >> 8) as u8, (n >> 16) as u8, self.seq]);
             self.seq = self.seq.wrapping_add(1);
             self.out.extend_from_slice(chunk);
             last_full = n == MAX_PAYLOAD && chunks.peek().is_none();
@@ -289,7 +308,10 @@ pub(crate) struct Reader<'a> {
 }
 
 fn short() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "packet shorter than its contents")
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "packet shorter than its contents",
+    )
 }
 
 impl<'a> Reader<'a> {
@@ -361,7 +383,16 @@ mod tests {
 
     #[test]
     fn lenenc_round_trips() {
-        for n in [0u64, 250, 251, 65535, 65536, (1 << 24) - 1, 1 << 24, u64::MAX] {
+        for n in [
+            0u64,
+            250,
+            251,
+            65535,
+            65536,
+            (1 << 24) - 1,
+            1 << 24,
+            u64::MAX,
+        ] {
             let mut out = Vec::new();
             put_lenenc_int(&mut out, n);
             assert_eq!(Reader::new(&out).lenenc_int().unwrap(), n);

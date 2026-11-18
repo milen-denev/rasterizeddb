@@ -46,7 +46,9 @@ impl Mode {
     }
 }
 
-pub(crate) use crate::sqlcompat::{LexError, Tok, Token, matching_paren, split_commas, split_statements};
+pub(crate) use crate::sqlcompat::{
+    LexError, Tok, Token, matching_paren, split_commas, split_statements,
+};
 
 /// Splits `sql` into tokens. Placeholders are numbered across the whole text.
 pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
@@ -74,7 +76,11 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
             space = true;
             continue;
         }
-        if c == b'-' && i + 1 < n && sql[i + 1] == b'-' && (i + 2 >= n || sql[i + 2].is_ascii_whitespace() || sql[i + 2] < 0x20) {
+        if c == b'-'
+            && i + 1 < n
+            && sql[i + 1] == b'-'
+            && (i + 2 >= n || sql[i + 2].is_ascii_whitespace() || sql[i + 2] < 0x20)
+        {
             while i < n && sql[i] != b'\n' {
                 i += 1;
             }
@@ -152,7 +158,10 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
                     let mut name = read_word(sql, &mut i);
                     // `@@session.x`, `@@global.x`, `@@local.x`.
                     let lower = name.to_ascii_lowercase();
-                    if (lower == "session" || lower == "global" || lower == "local" || lower == "persist")
+                    if (lower == "session"
+                        || lower == "global"
+                        || lower == "local"
+                        || lower == "persist")
                         && i < n
                         && sql[i] == b'.'
                     {
@@ -184,7 +193,11 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
                     Tok::UserVar(name.to_ascii_lowercase())
                 }
             }
-            b'0' if i + 1 < n && (sql[i + 1] == b'x') && i + 2 < n && sql[i + 2].is_ascii_hexdigit() => {
+            b'0' if i + 1 < n
+                && (sql[i + 1] == b'x')
+                && i + 2 < n
+                && sql[i + 2].is_ascii_hexdigit() =>
+            {
                 i += 2;
                 let s = i;
                 while i < n && sql[i].is_ascii_hexdigit() {
@@ -196,7 +209,11 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
                 }
                 Tok::Hex(hex_bytes(&sql[s..i]))
             }
-            b'0' if i + 1 < n && sql[i + 1] == b'b' && i + 2 < n && (sql[i + 2] == b'0' || sql[i + 2] == b'1') => {
+            b'0' if i + 1 < n
+                && sql[i + 1] == b'b'
+                && i + 2 < n
+                && (sql[i + 2] == b'0' || sql[i + 2] == b'1') =>
+            {
                 i += 2;
                 let s = i;
                 while i < n && (sql[i] == b'0' || sql[i] == b'1') {
@@ -239,7 +256,12 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
                 i = end;
                 Tok::Str(value)
             }
-            c if c.is_ascii_digit() || (c == b'.' && i + 1 < n && sql[i + 1].is_ascii_digit() && !prev_is_operand(&out)) => {
+            c if c.is_ascii_digit()
+                || (c == b'.'
+                    && i + 1 < n
+                    && sql[i + 1].is_ascii_digit()
+                    && !prev_is_operand(&out)) =>
+            {
                 let s = i;
                 while i < n && sql[i].is_ascii_digit() {
                     i += 1;
@@ -282,7 +304,13 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
                     while j < n && sql[j].is_ascii_whitespace() {
                         j += 1;
                     }
-                    if j < n && (sql[j] == b'\'' || (sql[j] == b'"' && !mode.ansi_quotes) || ((sql[j] == b'x' || sql[j] == b'X') && j + 1 < n && sql[j + 1] == b'\'')) {
+                    if j < n
+                        && (sql[j] == b'\''
+                            || (sql[j] == b'"' && !mode.ansi_quotes)
+                            || ((sql[j] == b'x' || sql[j] == b'X')
+                                && j + 1 < n
+                                && sql[j + 1] == b'\''))
+                    {
                         i = j;
                         space = true;
                         continue;
@@ -312,7 +340,15 @@ pub(crate) fn lex(sql: &[u8], mode: Mode) -> Result<Vec<Token>, LexError> {
 fn is_introducer(word: &str) -> bool {
     matches!(
         word.to_ascii_lowercase().as_str(),
-        "_utf8mb4" | "_utf8mb3" | "_utf8" | "_latin1" | "_binary" | "_ascii" | "_ucs2" | "_utf16" | "_utf32"
+        "_utf8mb4"
+            | "_utf8mb3"
+            | "_utf8"
+            | "_latin1"
+            | "_binary"
+            | "_ascii"
+            | "_ucs2"
+            | "_utf16"
+            | "_utf32"
     )
 }
 
@@ -361,13 +397,20 @@ fn bits_value(digits: &[u8]) -> Result<u64, LexError> {
     if digits.len() > 64 || !digits.iter().all(|b| *b == b'0' || *b == b'1') {
         return Err(LexError("malformed bit literal".into()));
     }
-    Ok(digits.iter().fold(0u64, |acc, b| acc << 1 | (b - b'0') as u64))
+    Ok(digits
+        .iter()
+        .fold(0u64, |acc, b| acc << 1 | (b - b'0') as u64))
 }
 
 /// A string literal starting at the opening quote `sql[start]`: its value
 /// and the index after the closing quote. Adjacent literals (`'a' 'b'`) are
 /// concatenated, as MySQL does.
-fn string_body(sql: &[u8], start: usize, quote: u8, mode: Mode) -> Result<(Vec<u8>, usize), LexError> {
+fn string_body(
+    sql: &[u8],
+    start: usize,
+    quote: u8,
+    mode: Mode,
+) -> Result<(Vec<u8>, usize), LexError> {
     let mut value = Vec::new();
     let mut i = start + 1;
     let n = sql.len();
@@ -447,8 +490,8 @@ fn quoted_ident(sql: &[u8], start: usize, quote: u8) -> Result<(String, usize), 
 
 fn operator_at(sql: &[u8], i: usize) -> &'static str {
     const OPS: [&str; 25] = [
-        "<=>", "->>", "<=", ">=", "<>", "!=", "||", "&&", "<<", ">>", ":=", "->", "(", ")", ",", ";", ".", "=",
-        "<", ">", "+", "-", "*", "/", "%",
+        "<=>", "->>", "<=", ">=", "<>", "!=", "||", "&&", "<<", ">>", ":=", "->", "(", ")", ",",
+        ";", ".", "=", "<", ">", "+", "-", "*", "/", "%",
     ];
     for op in OPS {
         if sql[i..].starts_with(op.as_bytes()) {
@@ -475,7 +518,11 @@ mod tests {
     use super::*;
 
     fn toks(sql: &str) -> Vec<Tok> {
-        lex(sql.as_bytes(), Mode::default()).unwrap().into_iter().map(|t| t.tok).collect()
+        lex(sql.as_bytes(), Mode::default())
+            .unwrap()
+            .into_iter()
+            .map(|t| t.tok)
+            .collect()
     }
 
     #[test]
@@ -493,21 +540,42 @@ mod tests {
             Tok::Quoted("col".into())
         );
         let raw = Mode::from_sql_mode("NO_BACKSLASH_ESCAPES");
-        assert_eq!(lex(br"'a\n'", raw).unwrap()[0].tok, Tok::Str(br"a\n".to_vec()));
+        assert_eq!(
+            lex(br"'a\n'", raw).unwrap()[0].tok,
+            Tok::Str(br"a\n".to_vec())
+        );
     }
 
     #[test]
     fn comments_and_executable_comments() {
         assert_eq!(
             toks("SELECT 1 # c\n, 2 -- d\n /* e */"),
-            vec![Tok::Word("SELECT".into()), Tok::Num("1".into()), Tok::Op(",".into()), Tok::Num("2".into())]
+            vec![
+                Tok::Word("SELECT".into()),
+                Tok::Num("1".into()),
+                Tok::Op(",".into()),
+                Tok::Num("2".into())
+            ]
         );
         assert_eq!(
             toks("/*!40101 SET x = 1 */"),
-            vec![Tok::Word("SET".into()), Tok::Word("x".into()), Tok::Op("=".into()), Tok::Num("1".into())]
+            vec![
+                Tok::Word("SET".into()),
+                Tok::Word("x".into()),
+                Tok::Op("=".into()),
+                Tok::Num("1".into())
+            ]
         );
         // `--x` is minus minus x, not a comment.
-        assert_eq!(toks("1--1"), vec![Tok::Num("1".into()), Tok::Op("-".into()), Tok::Op("-".into()), Tok::Num("1".into())]);
+        assert_eq!(
+            toks("1--1"),
+            vec![
+                Tok::Num("1".into()),
+                Tok::Op("-".into()),
+                Tok::Op("-".into()),
+                Tok::Num("1".into())
+            ]
+        );
     }
 
     #[test]
@@ -515,13 +583,33 @@ mod tests {
         assert_eq!(toks("x'0aFF'"), vec![Tok::Hex(vec![0x0a, 0xff])]);
         assert_eq!(toks("0xABC"), vec![Tok::Hex(vec![0x0a, 0xbc])]);
         assert_eq!(toks("b'101'"), vec![Tok::Num("5".into())]);
-        assert_eq!(toks("@@session.SQL_MODE"), vec![Tok::SysVar("sql_mode".into())]);
+        assert_eq!(
+            toks("@@session.SQL_MODE"),
+            vec![Tok::SysVar("sql_mode".into())]
+        );
         assert_eq!(toks("@x"), vec![Tok::UserVar("x".into())]);
         assert_eq!(toks("? ?"), vec![Tok::Param(0), Tok::Param(1)]);
         assert_eq!(toks("_utf8mb4'x'"), vec![Tok::Str(b"x".to_vec())]);
-        assert_eq!(toks("1.5e3 .5"), vec![Tok::Num("1.5e3".into()), Tok::Num(".5".into())]);
-        assert_eq!(toks("t.c"), vec![Tok::Word("t".into()), Tok::Op(".".into()), Tok::Word("c".into())]);
-        assert_eq!(toks("a<=>b"), vec![Tok::Word("a".into()), Tok::Op("<=>".into()), Tok::Word("b".into())]);
+        assert_eq!(
+            toks("1.5e3 .5"),
+            vec![Tok::Num("1.5e3".into()), Tok::Num(".5".into())]
+        );
+        assert_eq!(
+            toks("t.c"),
+            vec![
+                Tok::Word("t".into()),
+                Tok::Op(".".into()),
+                Tok::Word("c".into())
+            ]
+        );
+        assert_eq!(
+            toks("a<=>b"),
+            vec![
+                Tok::Word("a".into()),
+                Tok::Op("<=>".into()),
+                Tok::Word("b".into())
+            ]
+        );
     }
 
     #[test]

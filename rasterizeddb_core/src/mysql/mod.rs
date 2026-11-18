@@ -186,15 +186,19 @@ pub async fn bind(config: MyConfig) -> io::Result<MyListener> {
                     ),
                 ));
             }
-            let (listener, file) = rastcp::net::SocketFile::bind(&socket.path, socket.mode, socket.group)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let (listener, file) =
+                rastcp::net::SocketFile::bind(&socket.path, socket.mode, socket.group)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
             Some((tokio::net::UnixListener::from_std(listener)?, file))
         }
         None => None,
     };
     #[cfg(not(unix))]
     if config.socket.is_some() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "unix sockets are not supported on this platform"));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unix sockets are not supported on this platform",
+        ));
     }
     let tcp = match &config.tcp {
         Some((addr, port)) => Some(tokio::net::TcpListener::bind(format!("{addr}:{port}")).await?),
@@ -218,7 +222,9 @@ pub struct MyServer {
 /// the accept loop in a task.
 pub async fn serve(listener: MyListener, catalog: Arc<DatabaseCatalog>) -> io::Result<MyServer> {
     let config = listener.config.clone();
-    if config.auth == MyAuth::Password || config.socket.as_ref().and_then(|s| s.auth) == Some(MyAuth::Password) {
+    if config.auth == MyAuth::Password
+        || config.socket.as_ref().and_then(|s| s.auth) == Some(MyAuth::Password)
+    {
         for database in catalog.all() {
             crate::auth::ensure_role_catalogue(
                 &database,
@@ -232,10 +238,16 @@ pub async fn serve(listener: MyListener, catalog: Arc<DatabaseCatalog>) -> io::R
     }
     let acceptor = match config.tls {
         MyTls::Disable => None,
-        _ => Some(crate::pgwire::proxied::tls_acceptor(config.cert_path.clone(), config.key_path.clone())?),
+        _ => Some(crate::pgwire::proxied::tls_acceptor(
+            config.cert_path.clone(),
+            config.key_path.clone(),
+        )?),
     };
     if let Some((addr, port)) = &config.tcp {
-        let public = addr.parse::<std::net::IpAddr>().map(|ip| !ip.is_loopback()).unwrap_or(true);
+        let public = addr
+            .parse::<std::net::IpAddr>()
+            .map(|ip| !ip.is_loopback())
+            .unwrap_or(true);
         if public && config.tls != MyTls::Require {
             log::warn!(
                 "the MySQL protocol is bound to {addr}:{port} with TLS {:?}: clients may connect unencrypted \
@@ -260,7 +272,10 @@ pub async fn serve(listener: MyListener, catalog: Arc<DatabaseCatalog>) -> io::R
         log::info!("MySQL protocol listening on {}:{}", addr.0, addr.1);
     }
     if let Some(socket) = shared.config.socket.as_ref() {
-        log::info!("MySQL protocol listening on unix socket {}", socket.path.display());
+        log::info!(
+            "MySQL protocol listening on unix socket {}",
+            socket.path.display()
+        );
     }
     Ok(MyServer { shared, task })
 }
@@ -327,9 +342,12 @@ async fn accept_loop(listener: MyListener, shared: StdArc<Shared>) {
             Ok((stream, peer, uid)) => {
                 backoff = Duration::from_millis(50);
                 let shared = shared.clone();
-                let over = shared.active.fetch_add(1, Ordering::AcqRel) >= shared.config.limits.max_connections;
+                let over = shared.active.fetch_add(1, Ordering::AcqRel)
+                    >= shared.config.limits.max_connections;
                 tokio::spawn(async move {
-                    let result = conn::serve_connection(stream, peer.clone(), uid, shared.clone(), over).await;
+                    let result =
+                        conn::serve_connection(stream, peer.clone(), uid, shared.clone(), over)
+                            .await;
                     shared.active.fetch_sub(1, Ordering::AcqRel);
                     if let Err(e) = result {
                         log::debug!("MySQL connection from {peer} ended: {e}");

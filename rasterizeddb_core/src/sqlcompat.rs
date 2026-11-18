@@ -90,7 +90,6 @@ impl Token {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LexError(pub(crate) String);
 
-
 /// Splits tokens into statements at `;`. Empty statements are dropped.
 pub(crate) fn split_statements(tokens: Vec<Token>) -> Vec<Vec<Token>> {
     let mut out = Vec::new();
@@ -148,7 +147,6 @@ pub(crate) fn split_commas(tokens: &[Token]) -> Vec<Vec<Token>> {
     out
 }
 
-
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -166,7 +164,9 @@ pub(crate) fn ident_sql(name: &str) -> String {
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-        && lower.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && lower
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && !is_pg_reserved(&lower);
     if plain { lower } else { quote_ident(&lower) }
 }
@@ -174,16 +174,84 @@ pub(crate) fn ident_sql(name: &str) -> String {
 fn is_pg_reserved(word: &str) -> bool {
     matches!(
         word,
-        "all" | "analyse" | "analyze" | "and" | "any" | "array" | "as" | "asc" | "asymmetric" | "both" | "case"
-            | "cast" | "check" | "collate" | "column" | "constraint" | "create" | "current_catalog"
-            | "current_date" | "current_role" | "current_time" | "current_timestamp" | "current_user"
-            | "default" | "deferrable" | "desc" | "distinct" | "do" | "else" | "end" | "except" | "false"
-            | "fetch" | "for" | "foreign" | "from" | "grant" | "group" | "having" | "in" | "initially"
-            | "intersect" | "into" | "lateral" | "leading" | "limit" | "localtime" | "localtimestamp" | "not"
-            | "null" | "offset" | "on" | "only" | "or" | "order" | "placing" | "primary" | "references"
-            | "returning" | "select" | "session_user" | "some" | "symmetric" | "system_user" | "table"
-            | "then" | "to" | "trailing" | "true" | "union" | "unique" | "user" | "using" | "variadic"
-            | "when" | "where" | "window" | "with"
+        "all"
+            | "analyse"
+            | "analyze"
+            | "and"
+            | "any"
+            | "array"
+            | "as"
+            | "asc"
+            | "asymmetric"
+            | "both"
+            | "case"
+            | "cast"
+            | "check"
+            | "collate"
+            | "column"
+            | "constraint"
+            | "create"
+            | "current_catalog"
+            | "current_date"
+            | "current_role"
+            | "current_time"
+            | "current_timestamp"
+            | "current_user"
+            | "default"
+            | "deferrable"
+            | "desc"
+            | "distinct"
+            | "do"
+            | "else"
+            | "end"
+            | "except"
+            | "false"
+            | "fetch"
+            | "for"
+            | "foreign"
+            | "from"
+            | "grant"
+            | "group"
+            | "having"
+            | "in"
+            | "initially"
+            | "intersect"
+            | "into"
+            | "lateral"
+            | "leading"
+            | "limit"
+            | "localtime"
+            | "localtimestamp"
+            | "not"
+            | "null"
+            | "offset"
+            | "on"
+            | "only"
+            | "or"
+            | "order"
+            | "placing"
+            | "primary"
+            | "references"
+            | "returning"
+            | "select"
+            | "session_user"
+            | "some"
+            | "symmetric"
+            | "system_user"
+            | "table"
+            | "then"
+            | "to"
+            | "trailing"
+            | "true"
+            | "union"
+            | "unique"
+            | "user"
+            | "using"
+            | "variadic"
+            | "when"
+            | "where"
+            | "window"
+            | "with"
     )
 }
 
@@ -192,11 +260,55 @@ fn is_pg_reserved(word: &str) -> bool {
 fn is_keyword_before_paren(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
-        "SELECT" | "IN" | "VALUES" | "AND" | "OR" | "NOT" | "EXISTS" | "WHERE" | "ON" | "AS" | "FROM" | "JOIN"
-            | "USING" | "WHEN" | "THEN" | "ELSE" | "CASE" | "BY" | "ALL" | "ANY" | "SOME" | "INTO" | "TABLE"
-            | "LIKE" | "IS" | "BETWEEN" | "DISTINCT" | "UNION" | "RETURNING" | "SET" | "LIMIT" | "OFFSET"
-            | "HAVING" | "WITH" | "RECURSIVE" | "LATERAL" | "INTERSECT" | "EXCEPT" | "KEY" | "UNIQUE" | "CHECK"
-            | "REFERENCES" | "FOREIGN" | "PRIMARY" | "DEFAULT" | "OVER" | "PARTITION" | "FILTER" | "WITHIN"
+        "SELECT"
+            | "IN"
+            | "VALUES"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "EXISTS"
+            | "WHERE"
+            | "ON"
+            | "AS"
+            | "FROM"
+            | "JOIN"
+            | "USING"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "CASE"
+            | "BY"
+            | "ALL"
+            | "ANY"
+            | "SOME"
+            | "INTO"
+            | "TABLE"
+            | "LIKE"
+            | "IS"
+            | "BETWEEN"
+            | "DISTINCT"
+            | "UNION"
+            | "RETURNING"
+            | "SET"
+            | "LIMIT"
+            | "OFFSET"
+            | "HAVING"
+            | "WITH"
+            | "RECURSIVE"
+            | "LATERAL"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "KEY"
+            | "UNIQUE"
+            | "CHECK"
+            | "REFERENCES"
+            | "FOREIGN"
+            | "PRIMARY"
+            | "DEFAULT"
+            | "OVER"
+            | "PARTITION"
+            | "FILTER"
+            | "WITHIN"
     )
 }
 
@@ -242,7 +354,10 @@ pub(crate) fn render_text(tokens: &[Token]) -> String {
         }
         match &t.tok {
             Tok::Word(w) => {
-                if w.chars().next().is_some_and(|c| c.is_ascii_digit()) || w.contains('$') || !w.is_ascii() {
+                if w.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    || w.contains('$')
+                    || !w.is_ascii()
+                {
                     out.push_str(&quote_ident(&w.to_lowercase()));
                 } else {
                     out.push_str(w);
@@ -262,7 +377,6 @@ pub(crate) fn render_text(tokens: &[Token]) -> String {
     }
     out
 }
-
 
 pub(crate) fn kw(tokens: &[Token], i: usize, word: &str) -> bool {
     tokens.get(i).is_some_and(|t| t.is_word(word))
@@ -310,7 +424,6 @@ pub(crate) fn literal_str(text: &str) -> Token {
     Token::new(Tok::Str(text.as_bytes().to_vec()))
 }
 
-
 /// MySQL's and SQL Server's index names are per table; the engine's are per database. An
 /// index made here is named `<table>__<name>`, which [`plain_index_name`]
 /// takes apart again.
@@ -320,6 +433,6 @@ pub(crate) fn index_name(table: &str, name: &str) -> String {
 
 /// An index name as MySQL shows it.
 pub(crate) fn plain_index_name<'a>(table: &str, name: &'a str) -> &'a str {
-    name.strip_prefix(&format!("{}__", table.to_lowercase())).unwrap_or(name)
+    name.strip_prefix(&format!("{}__", table.to_lowercase()))
+        .unwrap_or(name)
 }
-

@@ -26,7 +26,9 @@
 use rclite::Arc;
 
 use super::lex::{Mode, Tok, Token, matching_paren, split_commas};
-pub(crate) use crate::sqlcompat::{call, find_top, ident_sql, kw, literal_str, quote_ident, string_sql, wrap};
+pub(crate) use crate::sqlcompat::{
+    call, find_top, ident_sql, kw, literal_str, quote_ident, string_sql, wrap,
+};
 
 /// Tokens back to text. Never fails today; kept fallible so a rewrite that
 /// leaves something unrenderable can say so.
@@ -88,7 +90,10 @@ impl MyError {
         MyError::new(
             1235,
             "42000",
-            format!("This version of RasterizedDB doesn't yet support '{}'", what.into()),
+            format!(
+                "This version of RasterizedDB doesn't yet support '{}'",
+                what.into()
+            ),
         )
     }
 }
@@ -142,13 +147,25 @@ pub(crate) struct Forward {
 
 /// The words that never start an implicit alias.
 const NOT_ALIAS: &[&str] = &[
-    "END", "NULL", "TRUE", "FALSE", "FROM", "AS", "AND", "OR", "NOT", "IS", "IN", "LIKE", "THEN", "ELSE", "WHEN",
-    "CASE", "BETWEEN", "DESC", "ASC", "DISTINCT", "UNKNOWN", "INTERVAL", "BINARY", "COLLATE", "ESCAPE",
+    "END", "NULL", "TRUE", "FALSE", "FROM", "AS", "AND", "OR", "NOT", "IS", "IN", "LIKE", "THEN",
+    "ELSE", "WHEN", "CASE", "BETWEEN", "DESC", "ASC", "DISTINCT", "UNKNOWN", "INTERVAL", "BINARY",
+    "COLLATE", "ESCAPE",
 ];
 
 /// Where the select list ends.
 const SELECT_LIST_END: &[&str] = &[
-    "FROM", "INTO", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "FOR", "UNION", "WINDOW", "LOCK", "EXCEPT",
+    "FROM",
+    "INTO",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "LIMIT",
+    "FOR",
+    "UNION",
+    "WINDOW",
+    "LOCK",
+    "EXCEPT",
     "INTERSECT",
 ];
 
@@ -215,14 +232,32 @@ fn interval_expr(amount: Vec<Token>, unit: &Token) -> Result<Vec<Token>, MyError
     };
     // A plain literal becomes one interval literal; anything else is a
     // multiple of one unit.
-    if let [Token { tok: Tok::Num(n), .. }] = amount.as_slice() {
+    if let [
+        Token {
+            tok: Tok::Num(n), ..
+        },
+    ] = amount.as_slice()
+    {
         if let Ok(v) = n.parse::<i64>() {
-            return Ok(vec![Token::raw(format!("interval '{} {}'", v * factor, unit))]);
+            return Ok(vec![Token::raw(format!(
+                "interval '{} {}'",
+                v * factor,
+                unit
+            ))]);
         }
     }
-    if let [Token { tok: Tok::Str(s), .. }] = amount.as_slice() {
+    if let [
+        Token {
+            tok: Tok::Str(s), ..
+        },
+    ] = amount.as_slice()
+    {
         if let Ok(v) = String::from_utf8_lossy(s).trim().parse::<i64>() {
-            return Ok(vec![Token::raw(format!("interval '{} {}'", v * factor, unit))]);
+            return Ok(vec![Token::raw(format!(
+                "interval '{} {}'",
+                v * factor,
+                unit
+            ))]);
         }
     }
     let mut out = wrap(amount);
@@ -254,7 +289,11 @@ fn operand_start(tokens: &[Token], i: usize) -> Option<usize> {
             j -= 1;
         }
         // A function call: its name is part of the operand.
-        if j > 0 && matches!(tokens[j - 1].tok, Tok::Word(_) | Tok::Raw(_)) && !tokens[j - 1].is_word("AND") && !tokens[j - 1].is_word("OR") {
+        if j > 0
+            && matches!(tokens[j - 1].tok, Tok::Word(_) | Tok::Raw(_))
+            && !tokens[j - 1].is_word("AND")
+            && !tokens[j - 1].is_word("OR")
+        {
             j -= 1;
         }
     }
@@ -276,7 +315,9 @@ fn operand_end(tokens: &[Token], i: usize) -> Option<usize> {
     if t.is_op("(") {
         return matching_paren(tokens, j);
     }
-    if matches!(t.tok, Tok::Word(_) | Tok::Raw(_)) && tokens.get(j + 1).is_some_and(|n| n.is_op("(")) {
+    if matches!(t.tok, Tok::Word(_) | Tok::Raw(_))
+        && tokens.get(j + 1).is_some_and(|n| n.is_op("("))
+    {
         return matching_paren(tokens, j + 1);
     }
     while tokens.get(j + 1).is_some_and(|n| n.is_op(".")) && tokens.get(j + 2).is_some() {
@@ -287,7 +328,13 @@ fn operand_end(tokens: &[Token], i: usize) -> Option<usize> {
 
 /// A MySQL JSON path (`$.a.b[0]`) as a chain of `->` steps.
 fn json_path_steps(path: &str) -> Result<Vec<String>, MyError> {
-    let bad = || MyError::new(3143, "42000", format!("Invalid JSON path expression '{path}'"));
+    let bad = || {
+        MyError::new(
+            3143,
+            "42000",
+            format!("Invalid JSON path expression '{path}'"),
+        )
+    };
     let mut rest = path.trim().strip_prefix('$').ok_or_else(bad)?;
     let mut steps = Vec::new();
     while !rest.is_empty() {
@@ -307,7 +354,10 @@ fn json_path_steps(path: &str) -> Result<Vec<String>, MyError> {
             }
         } else if let Some(r) = rest.strip_prefix('[') {
             let end = r.find(']').ok_or_else(bad)?;
-            let index: i64 = r[..end].trim().parse().map_err(|_| MyError::unsupported("JSON path wildcards or ranges"))?;
+            let index: i64 = r[..end]
+                .trim()
+                .parse()
+                .map_err(|_| MyError::unsupported("JSON path wildcards or ranges"))?;
             steps.push(index.to_string());
             rest = &r[end + 1..];
         } else {
@@ -336,7 +386,11 @@ fn json_chain(doc: Vec<Token>, path: &str, unquote: bool) -> Result<Vec<Token>, 
 
 fn str_of(tokens: &[Token]) -> Option<String> {
     match tokens {
-        [Token { tok: Tok::Str(s), .. }] => Some(String::from_utf8_lossy(s).into_owned()),
+        [
+            Token {
+                tok: Tok::Str(s), ..
+            },
+        ] => Some(String::from_utf8_lossy(s).into_owned()),
         _ => None,
     }
 }
@@ -351,7 +405,10 @@ fn date_format_pattern(fmt: &str) -> Result<String, MyError> {
         if literal.is_empty() {
             return;
         }
-        if literal.chars().any(|c| c.is_alphanumeric() || c == '"' || c == '\\') {
+        if literal
+            .chars()
+            .any(|c| c.is_alphanumeric() || c == '"' || c == '\\')
+        {
             out.push('"');
             out.push_str(&literal.replace('"', "\\\""));
             out.push('"');
@@ -396,7 +453,11 @@ fn date_format_pattern(fmt: &str) -> Result<String, MyError> {
                 literal.push('%');
                 continue;
             }
-            other => return Err(MyError::unsupported(format!("DATE_FORMAT specifier %{other}"))),
+            other => {
+                return Err(MyError::unsupported(format!(
+                    "DATE_FORMAT specifier %{other}"
+                )));
+            }
         };
         flush(&mut out, &mut literal);
         out.push_str(pg);
@@ -418,7 +479,8 @@ pub(crate) fn map_type(tokens: &[Token], for_cast: bool) -> Result<String, MyErr
     let mut args: Vec<String> = Vec::new();
     let mut idx = 1;
     if tokens.get(1).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(tokens, 1).ok_or_else(|| MyError::syntax("unbalanced type arguments"))?;
+        let close = matching_paren(tokens, 1)
+            .ok_or_else(|| MyError::syntax("unbalanced type arguments"))?;
         for part in split_commas(&tokens[2..close]) {
             args.push(render(&part)?);
         }
@@ -444,15 +506,25 @@ pub(crate) fn map_type(tokens: &[Token], for_cast: bool) -> Result<String, MyErr
         "BINARY" | "VARBINARY" if for_cast => "bytea".into(),
         // Integers. Unsigned widens to the next type that holds its range;
         // BIGINT UNSIGNED stays bigint (values past 2^63 are refused).
-        "TINYINT" if args.first().map(|a| a == "1").unwrap_or(false) && !unsigned => "boolean".into(),
+        "TINYINT" if args.first().map(|a| a == "1").unwrap_or(false) && !unsigned => {
+            "boolean".into()
+        }
         "BOOL" | "BOOLEAN" => "boolean".into(),
         "TINYINT" => "smallint".into(),
         "SMALLINT" => {
-            if unsigned { "integer".into() } else { "smallint".into() }
+            if unsigned {
+                "integer".into()
+            } else {
+                "smallint".into()
+            }
         }
         "MEDIUMINT" => "integer".into(),
         "INT" | "INTEGER" | "INT4" => {
-            if unsigned { "bigint".into() } else { "integer".into() }
+            if unsigned {
+                "bigint".into()
+            } else {
+                "integer".into()
+            }
         }
         "BIGINT" | "INT8" => "bigint".into(),
         "SERIAL" => "bigserial".into(),
@@ -502,8 +574,11 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
         let t = &tokens[i];
         // Function calls: a word directly followed by `(`.
         if let Tok::Word(word) = &t.tok {
-            if tokens.get(i + 1).is_some_and(|p| p.is_op("(")) && !out.last().is_some_and(|p| p.is_op(".")) {
-                let close = matching_paren(&tokens, i + 1).ok_or_else(|| MyError::syntax("unbalanced parentheses"))?;
+            if tokens.get(i + 1).is_some_and(|p| p.is_op("("))
+                && !out.last().is_some_and(|p| p.is_op("."))
+            {
+                let close = matching_paren(&tokens, i + 1)
+                    .ok_or_else(|| MyError::syntax("unbalanced parentheses"))?;
                 if let Some(replacement) = rewrite_call(word, &tokens[i + 2..close], cx)? {
                     out.extend(replacement);
                     i = close + 1;
@@ -529,17 +604,18 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 ));
             }
             Tok::SysVar(name) => {
-                let value = cx
-                    .env
-                    .system_variable(name)
-                    .ok_or_else(|| MyError::new(1193, "HY000", format!("Unknown system variable '{name}'")))?;
+                let value = cx.env.system_variable(name).ok_or_else(|| {
+                    MyError::new(1193, "HY000", format!("Unknown system variable '{name}'"))
+                })?;
                 let mut v = value.token();
                 v.space = t.space;
                 out.push(v);
             }
             Tok::UserVar(name) => {
                 if tokens.get(i + 1).is_some_and(|p| p.is_op(":=")) {
-                    return Err(MyError::unsupported("assigning a user variable inside a statement"));
+                    return Err(MyError::unsupported(
+                        "assigning a user variable inside a statement",
+                    ));
                 }
                 let mut v = cx.env.user_variable(name).token();
                 v.space = t.space;
@@ -557,12 +633,16 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 }
                 "->" | "->>" => {
                     // `col->'$.a'`: the path is a MySQL JSON path.
-                    let Some(path) = tokens.get(i + 1).and_then(|p| str_of(std::slice::from_ref(p))) else {
+                    let Some(path) = tokens
+                        .get(i + 1)
+                        .and_then(|p| str_of(std::slice::from_ref(p)))
+                    else {
                         out.push(t.clone());
                         i += 1;
                         continue;
                     };
-                    let start = operand_start(&out, out.len()).ok_or_else(|| MyError::syntax("'->' needs a column"))?;
+                    let start = operand_start(&out, out.len())
+                        .ok_or_else(|| MyError::syntax("'->' needs a column"))?;
                     let doc: Vec<Token> = out.drain(start..).collect();
                     out.extend(json_chain(doc, &path, o == "->>")?);
                     i += 2;
@@ -574,16 +654,22 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             Tok::Word(w) => {
                 let upper = w.to_ascii_uppercase();
                 match upper.as_str() {
-                    "TRUE" | "FALSE" if !cx.ddl && !matches!(out.last(), Some(p) if p.is_word("IS") || p.is_word("NOT")) => {
-                        let mut v = Token::new(Tok::Num(if upper == "TRUE" { "1" } else { "0" }.into()));
+                    "TRUE" | "FALSE"
+                        if !cx.ddl
+                            && !matches!(out.last(), Some(p) if p.is_word("IS") || p.is_word("NOT")) =>
+                    {
+                        let mut v =
+                            Token::new(Tok::Num(if upper == "TRUE" { "1" } else { "0" }.into()));
                         v.space = t.space;
                         out.push(v);
                     }
                     "DIV" => {
-                        let start = operand_start(&out, out.len()).ok_or_else(|| MyError::syntax("DIV needs operands"))?;
+                        let start = operand_start(&out, out.len())
+                            .ok_or_else(|| MyError::syntax("DIV needs operands"))?;
                         let left: Vec<Token> = out.drain(start..).collect();
                         let rest = rewrite_expr(tokens[i + 1..].to_vec(), cx)?;
-                        let end = operand_end(&rest, 0).ok_or_else(|| MyError::syntax("DIV needs operands"))?;
+                        let end = operand_end(&rest, 0)
+                            .ok_or_else(|| MyError::syntax("DIV needs operands"))?;
                         let right: Vec<Token> = rest[..=end].to_vec();
                         // MySQL's DIV is a BIGINT whatever its operands.
                         let mut quotient = call("div", vec![left, right]);
@@ -602,7 +688,10 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                             out.push(Token::op("~"));
                         }
                     }
-                    "BINARY" if tokens.get(i + 1).is_some_and(|p| !p.is_op("(") && !p.is_op(",") && !p.is_op(")")) => {}
+                    "BINARY"
+                        if tokens
+                            .get(i + 1)
+                            .is_some_and(|p| !p.is_op("(") && !p.is_op(",") && !p.is_op(")")) => {}
                     "COLLATE" => {
                         // The collation name goes too: comparisons here are
                         // binary whatever is asked.
@@ -610,27 +699,39 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                         continue;
                     }
                     "INTERVAL" => {
-                        let end = operand_end(&tokens, i + 1).ok_or_else(|| MyError::syntax("INTERVAL needs a value"))?;
+                        let end = operand_end(&tokens, i + 1)
+                            .ok_or_else(|| MyError::syntax("INTERVAL needs a value"))?;
                         let amount = rewrite_expr(tokens[i + 1..=end].to_vec(), cx)?;
-                        let unit = tokens.get(end + 1).ok_or_else(|| MyError::syntax("INTERVAL needs a unit"))?;
+                        let unit = tokens
+                            .get(end + 1)
+                            .ok_or_else(|| MyError::syntax("INTERVAL needs a unit"))?;
                         out.extend(interval_expr(amount, unit)?);
                         i = end + 2;
                         continue;
                     }
                     "CURRENT_TIME" => out.push(Token::raw("(now()::time)")),
                     "CURRENT_USER" => out.push(literal_str(&format!("{}@%", cx.env.user()))),
-                    "UNKNOWN" if out.last().is_some_and(|p| p.is_word("IS")) => out.push(Token::word("NULL")),
+                    "UNKNOWN" if out.last().is_some_and(|p| p.is_word("IS")) => {
+                        out.push(Token::word("NULL"))
+                    }
                     "DUAL" if out.last().is_some_and(|p| p.is_word("FROM")) => {
                         out.pop();
                     }
-                    "LOCK" if kw(&tokens, i + 1, "IN") && kw(&tokens, i + 2, "SHARE") && kw(&tokens, i + 3, "MODE") => {
+                    "LOCK"
+                        if kw(&tokens, i + 1, "IN")
+                            && kw(&tokens, i + 2, "SHARE")
+                            && kw(&tokens, i + 3, "MODE") =>
+                    {
                         out.push(Token::raw("FOR SHARE"));
                         i += 4;
                         continue;
                     }
                     "USE" | "FORCE" | "IGNORE"
                         if (kw(&tokens, i + 1, "INDEX") || kw(&tokens, i + 1, "KEY"))
-                            && matches!(out.last().map(|p| &p.tok), Some(Tok::Word(_) | Tok::Quoted(_))) =>
+                            && matches!(
+                                out.last().map(|p| &p.tok),
+                                Some(Tok::Word(_) | Tok::Quoted(_))
+                            ) =>
                     {
                         // An index hint: `USE INDEX [FOR JOIN] (…)`.
                         let mut j = i + 2;
@@ -643,17 +744,22 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                             }
                         }
                         if tokens.get(j).is_some_and(|p| p.is_op("(")) {
-                            let close = matching_paren(&tokens, j).ok_or_else(|| MyError::syntax("unbalanced index hint"))?;
+                            let close = matching_paren(&tokens, j)
+                                .ok_or_else(|| MyError::syntax("unbalanced index hint"))?;
                             i = close + 1;
                             continue;
                         }
                         out.push(t.clone());
                     }
                     "STRAIGHT_JOIN" => out.push(Token::word("JOIN")),
-                    "MATCH" => return Err(MyError::unsupported("MATCH … AGAINST (full-text search)")),
+                    "MATCH" => {
+                        return Err(MyError::unsupported("MATCH … AGAINST (full-text search)"));
+                    }
                     _ => {
                         if let Some(alias) = cx.aliases.iter().find(|a| a.eq_ignore_ascii_case(w)) {
-                            if !out.last().is_some_and(|p| p.is_op(".")) && !tokens.get(i + 1).is_some_and(|p| p.is_op(".")) {
+                            if !out.last().is_some_and(|p| p.is_op("."))
+                                && !tokens.get(i + 1).is_some_and(|p| p.is_op("."))
+                            {
                                 let mut v = Token::raw(quote_ident(alias));
                                 v.space = t.space;
                                 out.push(v);
@@ -667,7 +773,9 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             }
             Tok::Quoted(name) => {
                 if let Some(alias) = cx.aliases.iter().find(|a| a.eq_ignore_ascii_case(name)) {
-                    if !out.last().is_some_and(|p| p.is_op(".")) && !tokens.get(i + 1).is_some_and(|p| p.is_op(".")) {
+                    if !out.last().is_some_and(|p| p.is_op("."))
+                        && !tokens.get(i + 1).is_some_and(|p| p.is_op("."))
+                    {
                         let mut v = Token::raw(quote_ident(alias));
                         v.space = t.space;
                         out.push(v);
@@ -766,8 +874,13 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             match it.next() {
                 None => ts,
                 Some(fmt) => {
-                    let pattern = str_of(&fmt).ok_or_else(|| MyError::unsupported("a FROM_UNIXTIME format that is not a literal"))?;
-                    call("to_char", vec![ts, vec![literal_str(&date_format_pattern(&pattern)?)]])
+                    let pattern = str_of(&fmt).ok_or_else(|| {
+                        MyError::unsupported("a FROM_UNIXTIME format that is not a literal")
+                    })?;
+                    call(
+                        "to_char",
+                        vec![ts, vec![literal_str(&date_format_pattern(&pattern)?)]],
+                    )
                 }
             }
         }
@@ -775,16 +888,28 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             if !inner.is_empty() {
                 return Err(MyError::unsupported("LAST_INSERT_ID(expr)"));
             }
-            vec![Token::raw(format!("({}::bigint)", cx.env.last_insert_id().to_string()))]
+            vec![Token::raw(format!(
+                "({}::bigint)",
+                cx.env.last_insert_id().to_string()
+            ))]
         }
         "DATABASE" | "SCHEMA" => vec![literal_str(cx.env.database_name())],
         "VERSION" => vec![literal_str(super::SERVER_VERSION)],
-        "CONNECTION_ID" => vec![Token::raw(format!("({}::bigint)", cx.env.connection_id().to_string()))],
+        "CONNECTION_ID" => vec![Token::raw(format!(
+            "({}::bigint)",
+            cx.env.connection_id().to_string()
+        ))],
         "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => {
             vec![literal_str(&format!("{}@%", cx.env.user()))]
         }
-        "FOUND_ROWS" => vec![Token::raw(format!("({}::bigint)", cx.env.found_rows().to_string()))],
-        "ROW_COUNT" => vec![Token::raw(format!("({}::bigint)", cx.env.row_count().to_string()))],
+        "FOUND_ROWS" => vec![Token::raw(format!(
+            "({}::bigint)",
+            cx.env.found_rows().to_string()
+        ))],
+        "ROW_COUNT" => vec![Token::raw(format!(
+            "({}::bigint)",
+            cx.env.row_count().to_string()
+        ))],
         "LCASE" => call("lower", args(cx)?),
         "UCASE" => call("upper", args(cx)?),
         "LENGTH" | "OCTET_LENGTH" => call("octet_length", args(cx)?),
@@ -827,7 +952,11 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "TRUNCATE" => call("trunc", args(cx)?),
         "LOG" => {
             let a = args(cx)?;
-            if a.len() == 1 { call("ln", a) } else { call("log", a) }
+            if a.len() == 1 {
+                call("ln", a)
+            } else {
+                call("log", a)
+            }
         }
         "LOG2" => {
             let mut a = args(cx)?;
@@ -865,7 +994,8 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             let mut body: Vec<Token> = inner.to_vec();
             let mut separator = ",".to_string();
             if let Some(at) = find_top(&body, 0, &["SEPARATOR"]) {
-                separator = str_of(&body[at + 1..]).ok_or_else(|| MyError::syntax("SEPARATOR needs a string"))?;
+                separator = str_of(&body[at + 1..])
+                    .ok_or_else(|| MyError::syntax("SEPARATOR needs a string"))?;
                 body.truncate(at);
             }
             let mut order: Vec<Token> = Vec::new();
@@ -942,7 +1072,9 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE" => {
             let raw = raw_args();
             if raw.len() != 2 {
-                return Err(MyError::syntax(format!("{name} takes a date and an interval")));
+                return Err(MyError::syntax(format!(
+                    "{name} takes a date and an interval"
+                )));
             }
             let date = rewrite_expr(raw[0].clone(), cx)?;
             let second = &raw[1];
@@ -986,36 +1118,55 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
         "DATE_FORMAT" => {
             let a = args(cx)?;
             arity(&a, &[2])?;
-            let pattern = str_of(&a[1]).ok_or_else(|| MyError::unsupported("a DATE_FORMAT format that is not a literal"))?;
+            let pattern = str_of(&a[1]).ok_or_else(|| {
+                MyError::unsupported("a DATE_FORMAT format that is not a literal")
+            })?;
             // MySQL takes a date in a string too.
             let mut date = wrap(a[0].clone());
             date.push(Token::raw("::timestamp"));
-            call("to_char", vec![date, vec![literal_str(&date_format_pattern(&pattern)?)]])
+            call(
+                "to_char",
+                vec![date, vec![literal_str(&date_format_pattern(&pattern)?)]],
+            )
         }
         "STR_TO_DATE" => {
             let a = args(cx)?;
             arity(&a, &[2])?;
-            let pattern = str_of(&a[1]).ok_or_else(|| MyError::unsupported("a STR_TO_DATE format that is not a literal"))?;
-            let mut out = call("to_timestamp", vec![a[0].clone(), vec![literal_str(&date_format_pattern(&pattern)?)]]);
+            let pattern = str_of(&a[1]).ok_or_else(|| {
+                MyError::unsupported("a STR_TO_DATE format that is not a literal")
+            })?;
+            let mut out = call(
+                "to_timestamp",
+                vec![
+                    a[0].clone(),
+                    vec![literal_str(&date_format_pattern(&pattern)?)],
+                ],
+            );
             out.push(Token::raw("at time zone 'UTC'"));
             wrap(out)
         }
         "JSON_EXTRACT" => {
             let a = args(cx)?;
             arity(&a, &[2])?;
-            let path = str_of(&a[1]).ok_or_else(|| MyError::unsupported("a JSON path that is not a literal"))?;
+            let path = str_of(&a[1])
+                .ok_or_else(|| MyError::unsupported("a JSON path that is not a literal"))?;
             json_chain(a[0].clone(), &path, false)?
         }
         "JSON_UNQUOTE" => {
             let raw = raw_args();
             if raw.len() == 1 {
                 let first = &raw[0];
-                if first.first().is_some_and(|t| t.is_word("JSON_EXTRACT")) && first.get(1).is_some_and(|t| t.is_op("(")) {
-                    let close = matching_paren(first, 1).ok_or_else(|| MyError::syntax("unbalanced parentheses"))?;
+                if first.first().is_some_and(|t| t.is_word("JSON_EXTRACT"))
+                    && first.get(1).is_some_and(|t| t.is_op("("))
+                {
+                    let close = matching_paren(first, 1)
+                        .ok_or_else(|| MyError::syntax("unbalanced parentheses"))?;
                     let inner_args = split_commas(&first[2..close]);
                     if inner_args.len() == 2 {
                         let doc = rewrite_expr(inner_args[0].clone(), cx)?;
-                        let path = str_of(&inner_args[1]).ok_or_else(|| MyError::unsupported("a JSON path that is not a literal"))?;
+                        let path = str_of(&inner_args[1]).ok_or_else(|| {
+                            MyError::unsupported("a JSON path that is not a literal")
+                        })?;
                         return Ok(Some(json_chain(doc, &path, true)?));
                     }
                 }
@@ -1059,7 +1210,10 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
             // `VALUES(col)` in ON DUPLICATE KEY UPDATE.
             let a = raw_args();
             if a.len() == 1 && a[0].len() == 1 && a[0][0].ident().is_some() {
-                vec![Token::raw(format!("excluded.{}", ident_sql(a[0][0].ident().unwrap())))]
+                vec![Token::raw(format!(
+                    "excluded.{}",
+                    ident_sql(a[0][0].ident().unwrap())
+                ))]
             } else {
                 return Ok(None);
             }
@@ -1114,7 +1268,11 @@ pub(crate) fn rewrite_select(
         } else if SELECT_MODIFIERS.iter().any(|m| t.is_word(m)) {
             i += 1;
         } else if t.is_word("DISTINCT") || t.is_word("ALL") || t.is_word("DISTINCTROW") {
-            out.push(if t.is_word("DISTINCTROW") { Token::word("DISTINCT") } else { t.clone() });
+            out.push(if t.is_word("DISTINCTROW") {
+                Token::word("DISTINCT")
+            } else {
+                t.clone()
+            });
             i += 1;
         } else {
             break;
@@ -1129,12 +1287,15 @@ pub(crate) fn rewrite_select(
         if let Some(a) = &alias {
             cx.aliases.push(a.clone());
         }
-        prepared.push((expr, alias.or_else(|| {
-            if !name_items {
-                return None;
-            }
-            implicit_name(sql, &item)
-        })));
+        prepared.push((
+            expr,
+            alias.or_else(|| {
+                if !name_items {
+                    return None;
+                }
+                implicit_name(sql, &item)
+            }),
+        ));
     }
     let saved = std::mem::take(&mut cx.aliases);
     // Each named item's rewritten text: an ORDER BY of the same expression
@@ -1159,12 +1320,20 @@ pub(crate) fn rewrite_select(
     let mut rest: Vec<Token> = tokens[end..].to_vec();
     if let Some(order) = find_top(&rest, 0, &["ORDER"]) {
         if kw(&rest, order + 1, "BY") && !item_texts.is_empty() {
-            let stop = find_top(&rest, order + 2, &["LIMIT", "FOR", "LOCK", "UNION", "EXCEPT", "INTERSECT"]).unwrap_or(rest.len());
+            let stop = find_top(
+                &rest,
+                order + 2,
+                &["LIMIT", "FOR", "LOCK", "UNION", "EXCEPT", "INTERSECT"],
+            )
+            .unwrap_or(rest.len());
             let mut terms = Vec::new();
             for term in split_commas(&rest[order + 2..stop]) {
                 let mut body = term.clone();
                 let mut direction = Vec::new();
-                if body.last().is_some_and(|t| t.is_word("ASC") || t.is_word("DESC")) {
+                if body
+                    .last()
+                    .is_some_and(|t| t.is_word("ASC") || t.is_word("DESC"))
+                {
                     direction.push(body.pop().unwrap());
                 }
                 let mut probe = Cx::new(cx.env, cx.placeholders);
@@ -1232,14 +1401,27 @@ fn split_alias(item: &[Token]) -> (Vec<Token>, Option<String>) {
     if n >= 2 {
         let last = &item[n - 1];
         let before = &item[n - 2];
-        let operand_before = matches!(before.tok, Tok::Word(_) | Tok::Quoted(_) | Tok::Num(_) | Tok::Str(_) | Tok::SysVar(_) | Tok::UserVar(_))
-            || before.is_op(")");
+        let operand_before = matches!(
+            before.tok,
+            Tok::Word(_)
+                | Tok::Quoted(_)
+                | Tok::Num(_)
+                | Tok::Str(_)
+                | Tok::SysVar(_)
+                | Tok::UserVar(_)
+        ) || before.is_op(")");
         let implicit = match &last.tok {
             Tok::Quoted(_) | Tok::Str(_) => true,
             Tok::Word(w) => !NOT_ALIAS.iter().any(|k| k.eq_ignore_ascii_case(w)),
             _ => false,
         };
-        let before_is_keyword = before.upper().is_some_and(|w| NOT_ALIAS.contains(&w.as_str()) && w != "END" && w != "NULL" && w != "TRUE" && w != "FALSE");
+        let before_is_keyword = before.upper().is_some_and(|w| {
+            NOT_ALIAS.contains(&w.as_str())
+                && w != "END"
+                && w != "NULL"
+                && w != "TRUE"
+                && w != "FALSE"
+        });
         if implicit && operand_before && !before_is_keyword && !before.is_op(".") {
             if let Some(name) = alias_name(last) {
                 return (item[..n - 1].to_vec(), Some(name));
@@ -1266,7 +1448,11 @@ fn implicit_name(sql: &[u8], item: &[Token]) -> Option<String> {
     }
     // `col`, `t.col`, `` `t`.`col` ``.
     let is_column = item.iter().enumerate().all(|(k, t)| {
-        if k % 2 == 1 { t.is_op(".") } else { matches!(t.tok, Tok::Word(_) | Tok::Quoted(_)) }
+        if k % 2 == 1 {
+            t.is_op(".")
+        } else {
+            matches!(t.tok, Tok::Word(_) | Tok::Quoted(_))
+        }
     }) && item.len() % 2 == 1;
     if is_column {
         let name = item.last()?.ident()?.to_string();
@@ -1295,7 +1481,12 @@ pub(crate) fn auto_increment_column(database: &Database, table: &str) -> Option<
         .defaults
         .iter()
         .filter(|d| !d.is_deleted)
-        .find(|d| d.expression.trim_start().to_ascii_lowercase().starts_with("nextval("))
+        .find(|d| {
+            d.expression
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("nextval(")
+        })
         .map(|d| d.column.clone())
 }
 
@@ -1327,7 +1518,12 @@ fn table_name_at(tokens: &[Token], i: usize) -> Option<(String, usize)> {
     Some((first.to_lowercase(), i + 1))
 }
 
-fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) -> Result<Forward, MyError> {
+fn rewrite_insert(
+    sql: &[u8],
+    tokens: Vec<Token>,
+    cx: &mut Cx,
+    replace: bool,
+) -> Result<Forward, MyError> {
     let mut i = 1usize;
     let mut ignore = false;
     while let Some(t) = tokens.get(i) {
@@ -1343,7 +1539,8 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
     if kw(&tokens, i, "INTO") {
         i += 1;
     }
-    let (table, mut j) = table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("INSERT needs a table"))?;
+    let (table, mut j) =
+        table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("INSERT needs a table"))?;
     let table_tokens = tokens[i..j].to_vec();
     if kw(&tokens, j, "PARTITION") {
         return Err(MyError::unsupported("INSERT … PARTITION"));
@@ -1351,12 +1548,16 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
     let database = cx.env.database().clone();
     let mut columns: Option<Vec<String>> = None;
     if tokens.get(j).is_some_and(|t| t.is_op("(")) {
-        let close = matching_paren(&tokens, j).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
+        let close =
+            matching_paren(&tokens, j).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
         // `INSERT INTO t (SELECT …)` is a parenthesised query, not columns.
         if !kw(&tokens, j + 1, "SELECT") {
             let mut list = Vec::new();
             for part in split_commas(&tokens[j + 1..close]) {
-                let name = part.last().and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+                let name = part
+                    .last()
+                    .and_then(|t| t.ident())
+                    .ok_or_else(|| MyError::syntax("a column name was expected"))?;
                 list.push(name.to_lowercase());
             }
             columns = Some(list);
@@ -1367,17 +1568,26 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
     out.extend(table_tokens);
 
     // The body: VALUES, SET, or a query; then ON DUPLICATE KEY UPDATE.
-    let dup_at = (j..tokens.len()).find(|&k| kw(&tokens, k, "ON") && kw(&tokens, k + 1, "DUPLICATE"));
+    let dup_at =
+        (j..tokens.len()).find(|&k| kw(&tokens, k, "ON") && kw(&tokens, k + 1, "DUPLICATE"));
     let returning_at = find_top(&tokens, j, &["RETURNING"]);
     let body_end = dup_at.or(returning_at).unwrap_or(tokens.len());
     let mut body: Vec<Token> = tokens[j..body_end].to_vec();
     // `VALUES (…) AS new [(a, b)]`: the alias names the inserted row.
     let mut row_alias: Option<String> = None;
     if let Some(at) = find_top(&body, 0, &["AS"]) {
-        if body.first().is_some_and(|t| t.is_word("VALUES") || t.is_word("VALUE")) {
-            row_alias = body.get(at + 1).and_then(|t| t.ident()).map(|s| s.to_lowercase());
+        if body
+            .first()
+            .is_some_and(|t| t.is_word("VALUES") || t.is_word("VALUE"))
+        {
+            row_alias = body
+                .get(at + 1)
+                .and_then(|t| t.ident())
+                .map(|s| s.to_lowercase());
             if body.get(at + 2).is_some_and(|t| t.is_op("(")) {
-                return Err(MyError::unsupported("column aliases on an INSERT row alias"));
+                return Err(MyError::unsupported(
+                    "column aliases on an INSERT row alias",
+                ));
             }
             body.truncate(at);
         }
@@ -1387,14 +1597,24 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
         let mut names = Vec::new();
         let mut values = Vec::new();
         for part in split_commas(&body[1..]) {
-            let eq = part.iter().position(|t| t.is_op("=")).ok_or_else(|| MyError::syntax("SET needs col = value"))?;
-            let name = part[..eq].last().and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+            let eq = part
+                .iter()
+                .position(|t| t.is_op("="))
+                .ok_or_else(|| MyError::syntax("SET needs col = value"))?;
+            let name = part[..eq]
+                .last()
+                .and_then(|t| t.ident())
+                .ok_or_else(|| MyError::syntax("a column name was expected"))?;
             names.push(name.to_lowercase());
             values.push(rewrite_expr(part[eq + 1..].to_vec(), cx)?);
         }
         out.push(Token::raw(format!(
             "({})",
-            names.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", ")
+            names
+                .iter()
+                .map(|c| ident_sql(c))
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
         out.push(Token::word("VALUES"));
         let mut row = Vec::new();
@@ -1410,7 +1630,10 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
         if let Some(cols) = &columns {
             out.push(Token::raw(format!(
                 "({})",
-                cols.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", ")
+                cols.iter()
+                    .map(|c| ident_sql(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         if body.first().is_some_and(|t| t.is_word("VALUE")) {
@@ -1419,7 +1642,11 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
         if body.first().is_some_and(|t| t.is_word("VALUES")) {
             out.push(Token::word("VALUES"));
             // `VALUES ROW(…)` is MySQL 8's row constructor.
-            let rows: Vec<Token> = body[1..].iter().filter(|t| !t.is_word("ROW")).cloned().collect();
+            let rows: Vec<Token> = body[1..]
+                .iter()
+                .filter(|t| !t.is_word("ROW"))
+                .cloned()
+                .collect();
             out.extend(rewrite_expr(rows, cx)?);
         } else {
             let mut found = false;
@@ -1461,7 +1688,9 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
         while k < end {
             let t = &tokens[k];
             if let (Some(alias), Some(name)) = (&row_alias, t.ident()) {
-                if name.eq_ignore_ascii_case(alias) && tokens.get(k + 1).is_some_and(|d| d.is_op(".")) {
+                if name.eq_ignore_ascii_case(alias)
+                    && tokens.get(k + 1).is_some_and(|d| d.is_op("."))
+                {
                     assignments.push(Token::raw("excluded"));
                     k += 1;
                     continue;
@@ -1473,13 +1702,22 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
         // Targets are bare names in the engine's SET: `t.a = …` → `a = …`.
         let mut parts = Vec::new();
         for part in split_commas(&assignments) {
-            let eq = part.iter().position(|t| t.is_op("=")).ok_or_else(|| MyError::syntax("UPDATE needs col = value"))?;
-            let name = part[..eq].last().and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+            let eq = part
+                .iter()
+                .position(|t| t.is_op("="))
+                .ok_or_else(|| MyError::syntax("UPDATE needs col = value"))?;
+            let name = part[..eq]
+                .last()
+                .and_then(|t| t.ident())
+                .ok_or_else(|| MyError::syntax("a column name was expected"))?;
             let mut p = vec![Token::raw(ident_sql(name)), Token::op("=")];
             p.extend(rewrite_expr(part[eq + 1..].to_vec(), cx)?);
             parts.push(p);
         }
-        out.push(Token::raw(format!("ON CONFLICT{} DO UPDATE SET", conflict_target(&database, &table, columns.as_deref()))));
+        out.push(Token::raw(format!(
+            "ON CONFLICT{} DO UPDATE SET",
+            conflict_target(&database, &table, columns.as_deref())
+        )));
         for (n, p) in parts.into_iter().enumerate() {
             if n > 0 {
                 out.push(Token::op(","));
@@ -1499,7 +1737,11 @@ fn rewrite_insert(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx, replace: bool) ->
     }
     Ok(Forward {
         statements: vec![render(&out)?],
-        kind: if returning_at.is_some() { Kind::Query } else { Kind::Insert { auto } },
+        kind: if returning_at.is_some() {
+            Kind::Query
+        } else {
+            Kind::Insert { auto }
+        },
         found_rows: None,
         params: 0,
         deferred: Vec::new(),
@@ -1531,15 +1773,31 @@ fn conflict_target(database: &Database, table: &str, given: Option<&[String]>) -
     if let Some(pk) = &schema.primary_key {
         keys.push(vec![pk.clone()]);
     }
-    for key in schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
+    for key in schema
+        .unique_keys
+        .iter()
+        .filter(|k| !k.is_deleted && k.predicate.is_none())
+    {
         keys.push(key.columns.clone());
     }
-    for field in schema.fields.iter().filter(|f| f.is_unique && !f.is_deleted) {
+    for field in schema
+        .fields
+        .iter()
+        .filter(|f| f.is_unique && !f.is_deleted)
+    {
         keys.push(vec![field.name.clone()]);
     }
     keys.into_iter()
         .find(|cols| cols.iter().all(|c| given.contains(c)))
-        .map(|cols| format!(" ({})", cols.iter().map(|c| ident_sql(c)).collect::<Vec<_>>().join(", ")))
+        .map(|cols| {
+            format!(
+                " ({})",
+                cols.iter()
+                    .map(|c| ident_sql(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -1558,17 +1816,24 @@ fn limited_by_key(
 ) -> Result<Vec<Token>, MyError> {
     let database = cx.env.database().clone();
     let Some(key) = primary_key(&database, table) else {
-        return Err(MyError::unsupported("UPDATE or DELETE with LIMIT on a table without a primary key"));
+        return Err(MyError::unsupported(
+            "UPDATE or DELETE with LIMIT on a table without a primary key",
+        ));
     };
     let key = ident_sql(&key);
-    let mut sub = vec![Token::raw(format!("{key} IN (SELECT {key} FROM {}", ident_sql(table)))];
+    let mut sub = vec![Token::raw(format!(
+        "{key} IN (SELECT {key} FROM {}",
+        ident_sql(table)
+    ))];
     if let Some(w) = where_at {
         sub.extend(rewrite_expr(tokens[w..tail_at].to_vec(), cx)?);
     }
     let mut tail = tokens[tail_at..].to_vec();
     if let Some(l) = find_top(&tail, 0, &["LIMIT"]) {
         if split_commas(&tail[l + 1..]).len() > 1 {
-            return Err(MyError::syntax("UPDATE and DELETE take LIMIT n, not LIMIT offset, n"));
+            return Err(MyError::syntax(
+                "UPDATE and DELETE take LIMIT n, not LIMIT offset, n",
+            ));
         }
     }
     sub.extend(rewrite_expr(std::mem::take(&mut tail), cx)?);
@@ -1578,10 +1843,14 @@ fn limited_by_key(
 
 fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
     let mut i = 1usize;
-    while tokens.get(i).is_some_and(|t| t.is_word("LOW_PRIORITY") || t.is_word("IGNORE")) {
+    while tokens
+        .get(i)
+        .is_some_and(|t| t.is_word("LOW_PRIORITY") || t.is_word("IGNORE"))
+    {
         i += 1;
     }
-    let set_at = find_top(&tokens, i, &["SET"]).ok_or_else(|| MyError::syntax("UPDATE needs SET"))?;
+    let set_at =
+        find_top(&tokens, i, &["SET"]).ok_or_else(|| MyError::syntax("UPDATE needs SET"))?;
     let target = &tokens[i..set_at];
     let where_at = find_top(&tokens, set_at, &["WHERE"]);
     let tail_at = find_top(&tokens, set_at, &["ORDER", "LIMIT"]);
@@ -1593,7 +1862,8 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
     let mut out = vec![Token::word("UPDATE")];
     let (table, mut from_clause, mut join_condition) = if let Some(jat) = join_at {
         let main = target[..jat].to_vec();
-        let (table, _) = table_name_at(&main, 0).ok_or_else(|| MyError::syntax("UPDATE needs a table"))?;
+        let (table, _) =
+            table_name_at(&main, 0).ok_or_else(|| MyError::syntax("UPDATE needs a table"))?;
         let mut k = jat;
         if target[k].is_word("INNER") {
             k += 1;
@@ -1601,8 +1871,11 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
         if !target.get(k).is_some_and(|t| t.is_word("JOIN")) {
             return Err(MyError::unsupported("this form of multi-table UPDATE"));
         }
-        let on_at = find_top(target, k, &["ON"]).ok_or_else(|| MyError::unsupported("a multi-table UPDATE without ON"))?;
-        if find_top(target, k + 1, &["JOIN"]).is_some_and(|x| x < on_at) || find_top(target, on_at, &["JOIN"]).is_some() {
+        let on_at = find_top(target, k, &["ON"])
+            .ok_or_else(|| MyError::unsupported("a multi-table UPDATE without ON"))?;
+        if find_top(target, k + 1, &["JOIN"]).is_some_and(|x| x < on_at)
+            || find_top(target, on_at, &["JOIN"]).is_some()
+        {
             return Err(MyError::unsupported("UPDATE across more than two tables"));
         }
         out.extend(rewrite_expr(main, cx)?);
@@ -1612,14 +1885,24 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
             Some(rewrite_expr(target[on_at + 1..].to_vec(), cx)?),
         )
     } else {
-        let (table, _) = table_name_at(target, 0).ok_or_else(|| MyError::syntax("UPDATE needs a table"))?;
+        let (table, _) =
+            table_name_at(target, 0).ok_or_else(|| MyError::syntax("UPDATE needs a table"))?;
         out.extend(rewrite_expr(target.to_vec(), cx)?);
         (table, None, None)
     };
     out.push(Token::word("SET"));
-    for (n, part) in split_commas(&tokens[set_at + 1..assign_end]).into_iter().enumerate() {
-        let eq = part.iter().position(|t| t.is_op("=")).ok_or_else(|| MyError::syntax("SET needs col = value"))?;
-        let name = part[..eq].last().and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+    for (n, part) in split_commas(&tokens[set_at + 1..assign_end])
+        .into_iter()
+        .enumerate()
+    {
+        let eq = part
+            .iter()
+            .position(|t| t.is_op("="))
+            .ok_or_else(|| MyError::syntax("SET needs col = value"))?;
+        let name = part[..eq]
+            .last()
+            .and_then(|t| t.ident())
+            .ok_or_else(|| MyError::syntax("a column name was expected"))?;
         if n > 0 {
             out.push(Token::op(","));
         }
@@ -1637,9 +1920,17 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
     }
     if let Some(t) = tail_at {
         if join_at.is_some() {
-            return Err(MyError::unsupported("ORDER BY or LIMIT on a multi-table UPDATE"));
+            return Err(MyError::unsupported(
+                "ORDER BY or LIMIT on a multi-table UPDATE",
+            ));
         }
-        conditions.push(limited_by_key(&tokens, &table, where_at.map(|w| w + 1), t, cx)?);
+        conditions.push(limited_by_key(
+            &tokens,
+            &table,
+            where_at.map(|w| w + 1),
+            t,
+            cx,
+        )?);
     } else if let Some(w) = where_at {
         conditions.push(rewrite_expr(tokens[w + 1..].to_vec(), cx)?);
     }
@@ -1663,34 +1954,49 @@ fn rewrite_update(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
 
 fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
     let mut i = 1usize;
-    while tokens.get(i).is_some_and(|t| t.is_word("LOW_PRIORITY") || t.is_word("QUICK") || t.is_word("IGNORE")) {
+    while tokens
+        .get(i)
+        .is_some_and(|t| t.is_word("LOW_PRIORITY") || t.is_word("QUICK") || t.is_word("IGNORE"))
+    {
         i += 1;
     }
     let mut out = vec![Token::word("DELETE")];
     if !kw(&tokens, i, "FROM") {
         // `DELETE t1 FROM t1 JOIN t2 ON c WHERE w` →
         // `DELETE FROM t1 USING t2 WHERE c AND w`.
-        let from_at = find_top(&tokens, i, &["FROM"]).ok_or_else(|| MyError::syntax("DELETE needs FROM"))?;
+        let from_at =
+            find_top(&tokens, i, &["FROM"]).ok_or_else(|| MyError::syntax("DELETE needs FROM"))?;
         let targets = split_commas(&tokens[i..from_at]);
         if targets.len() != 1 {
             return Err(MyError::unsupported("DELETE from more than one table"));
         }
         let where_at = find_top(&tokens, from_at, &["WHERE"]);
         let sources = &tokens[from_at + 1..where_at.unwrap_or(tokens.len())];
-        let join_at = find_top(sources, 0, &["JOIN", "INNER"]).ok_or_else(|| MyError::unsupported("this form of multi-table DELETE"))?;
+        let join_at = find_top(sources, 0, &["JOIN", "INNER"])
+            .ok_or_else(|| MyError::unsupported("this form of multi-table DELETE"))?;
         let mut k = join_at;
         if sources[k].is_word("INNER") {
             k += 1;
         }
-        let on_at = find_top(sources, k, &["ON"]).ok_or_else(|| MyError::unsupported("a multi-table DELETE without ON"))?;
+        let on_at = find_top(sources, k, &["ON"])
+            .ok_or_else(|| MyError::unsupported("a multi-table DELETE without ON"))?;
         if find_top(sources, on_at, &["JOIN"]).is_some() {
             return Err(MyError::unsupported("DELETE across more than two tables"));
         }
         let main = &sources[..join_at];
-        let target = targets[0].last().and_then(|t| t.ident()).unwrap_or("").to_lowercase();
-        let main_names: Vec<String> = main.iter().filter_map(|t| t.ident().map(|s| s.to_lowercase())).collect();
+        let target = targets[0]
+            .last()
+            .and_then(|t| t.ident())
+            .unwrap_or("")
+            .to_lowercase();
+        let main_names: Vec<String> = main
+            .iter()
+            .filter_map(|t| t.ident().map(|s| s.to_lowercase()))
+            .collect();
         if !main_names.contains(&target) {
-            return Err(MyError::unsupported("a multi-table DELETE whose target is not the first table"));
+            return Err(MyError::unsupported(
+                "a multi-table DELETE whose target is not the first table",
+            ));
         }
         out.push(Token::word("FROM"));
         out.extend(rewrite_expr(main.to_vec(), cx)?);
@@ -1710,14 +2016,21 @@ fn rewrite_delete(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
             deferred: Vec::new(),
         });
     }
-    let (table, after) = table_name_at(&tokens, i + 1).ok_or_else(|| MyError::syntax("DELETE needs a table"))?;
+    let (table, after) =
+        table_name_at(&tokens, i + 1).ok_or_else(|| MyError::syntax("DELETE needs a table"))?;
     let where_at = find_top(&tokens, after, &["WHERE"]);
     let tail_at = find_top(&tokens, after, &["ORDER", "LIMIT"]);
     let head_end = where_at.or(tail_at).unwrap_or(tokens.len());
     out.extend(rewrite_expr(tokens[i..head_end].to_vec(), cx)?);
     if let Some(t) = tail_at {
         out.push(Token::word("WHERE"));
-        out.extend(limited_by_key(&tokens, &table, where_at.map(|w| w + 1), t, cx)?);
+        out.extend(limited_by_key(
+            &tokens,
+            &table,
+            where_at.map(|w| w + 1),
+            t,
+            cx,
+        )?);
     } else if let Some(w) = where_at {
         out.extend(rewrite_expr(tokens[w..].to_vec(), cx)?);
     }
@@ -1741,9 +2054,10 @@ pub(crate) use crate::sqlcompat::{index_name, plain_index_name};
 fn index_columns(tokens: &[Token]) -> Result<Vec<String>, MyError> {
     let mut out = Vec::new();
     for part in split_commas(tokens) {
-        let name = part.first().and_then(|t| t.ident()).ok_or_else(|| {
-            MyError::unsupported("an index on an expression")
-        })?;
+        let name = part
+            .first()
+            .and_then(|t| t.ident())
+            .ok_or_else(|| MyError::unsupported("an index on an expression"))?;
         let mut column = ident_sql(name);
         if part.last().is_some_and(|t| t.is_word("DESC")) {
             column.push_str(" DESC");
@@ -1756,13 +2070,35 @@ fn index_columns(tokens: &[Token]) -> Result<Vec<String>, MyError> {
 /// One column definition: name, then type, then attributes. Returns the
 /// engine's definition and any CHECK an ENUM adds.
 fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>), MyError> {
-    let name = def.first().and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+    let name = def
+        .first()
+        .and_then(|t| t.ident())
+        .ok_or_else(|| MyError::syntax("a column name was expected"))?;
     let column = ident_sql(name);
     // The type runs to the first attribute keyword.
     const ATTRS: &[&str] = &[
-        "NOT", "NULL", "DEFAULT", "AUTO_INCREMENT", "PRIMARY", "UNIQUE", "KEY", "COMMENT", "CHARACTER", "CHARSET",
-        "COLLATE", "ON", "REFERENCES", "CHECK", "CONSTRAINT", "GENERATED", "AS", "VISIBLE", "INVISIBLE",
-        "COLUMN_FORMAT", "STORAGE", "SRID",
+        "NOT",
+        "NULL",
+        "DEFAULT",
+        "AUTO_INCREMENT",
+        "PRIMARY",
+        "UNIQUE",
+        "KEY",
+        "COMMENT",
+        "CHARACTER",
+        "CHARSET",
+        "COLLATE",
+        "ON",
+        "REFERENCES",
+        "CHECK",
+        "CONSTRAINT",
+        "GENERATED",
+        "AS",
+        "VISIBLE",
+        "INVISIBLE",
+        "COLUMN_FORMAT",
+        "STORAGE",
+        "SRID",
     ];
     let mut k = 1usize;
     let mut type_end = def.len();
@@ -1778,7 +2114,10 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
         k += 1;
     }
     let type_tokens = &def[1..type_end];
-    let type_name = type_tokens.first().and_then(|t| t.upper()).unwrap_or_default();
+    let type_name = type_tokens
+        .first()
+        .and_then(|t| t.upper())
+        .unwrap_or_default();
     let mut checks = Vec::new();
     let mut pg_type = map_type(type_tokens, false)?;
     if type_name == "ENUM" {
@@ -1816,19 +2155,33 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
                 // The default runs to the next attribute.
                 let mut e = k + 1;
                 if def.get(e).is_some_and(|t| t.is_op("(")) {
-                    e = matching_paren(def, e).ok_or_else(|| MyError::syntax("unbalanced DEFAULT"))? + 1;
+                    e = matching_paren(def, e)
+                        .ok_or_else(|| MyError::syntax("unbalanced DEFAULT"))?
+                        + 1;
                 } else {
                     e += 1;
                     if def.get(e).is_some_and(|t| t.is_op("(")) {
-                        e = matching_paren(def, e).ok_or_else(|| MyError::syntax("unbalanced DEFAULT"))? + 1;
+                        e = matching_paren(def, e)
+                            .ok_or_else(|| MyError::syntax("unbalanced DEFAULT"))?
+                            + 1;
                     }
                 }
                 let value = &def[k + 1..e];
                 let rendered = match value {
-                    [v, open, ..] if (v.is_word("CURRENT_TIMESTAMP") || v.is_word("NOW") || v.is_word("LOCALTIMESTAMP")) && open.is_op("(") => {
+                    [v, open, ..]
+                        if (v.is_word("CURRENT_TIMESTAMP")
+                            || v.is_word("NOW")
+                            || v.is_word("LOCALTIMESTAMP"))
+                            && open.is_op("(") =>
+                    {
                         "CURRENT_TIMESTAMP".to_string()
                     }
-                    [v] if v.is_word("CURRENT_TIMESTAMP") || v.is_word("LOCALTIMESTAMP") || v.is_word("NOW") => "CURRENT_TIMESTAMP".to_string(),
+                    [v] if v.is_word("CURRENT_TIMESTAMP")
+                        || v.is_word("LOCALTIMESTAMP")
+                        || v.is_word("NOW") =>
+                    {
+                        "CURRENT_TIMESTAMP".to_string()
+                    }
                     _ => {
                         let previous = std::mem::replace(&mut cx.ddl, true);
                         let r = render(&rewrite_expr(value.to_vec(), cx)?);
@@ -1860,7 +2213,9 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
             "CHARSET" | "COLLATE" => k += 2,
             "VISIBLE" | "INVISIBLE" => k += 1,
             "ON" if kw(def, k + 1, "UPDATE") => {
-                return Err(MyError::unsupported("ON UPDATE CURRENT_TIMESTAMP (set the column in the UPDATE)"));
+                return Err(MyError::unsupported(
+                    "ON UPDATE CURRENT_TIMESTAMP (set the column in the UPDATE)",
+                ));
             }
             "REFERENCES" | "CHECK" | "CONSTRAINT" => {
                 let previous = std::mem::replace(&mut cx.ddl, true);
@@ -1869,8 +2224,15 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
                 attrs.push(r?);
                 k = def.len();
             }
-            "GENERATED" | "AS" => return Err(MyError::unsupported("generated columns in MySQL's syntax")),
-            _ => return Err(MyError::syntax(format!("unexpected '{}' in the definition of column {name}", render(std::slice::from_ref(t))?))),
+            "GENERATED" | "AS" => {
+                return Err(MyError::unsupported("generated columns in MySQL's syntax"));
+            }
+            _ => {
+                return Err(MyError::syntax(format!(
+                    "unexpected '{}' in the definition of column {name}",
+                    render(std::slice::from_ref(t))?
+                )));
+            }
         }
     }
     if auto_increment {
@@ -1878,7 +2240,11 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
             "smallint" => "smallserial".into(),
             "integer" => "serial".into(),
             "bigint" | "bigserial" => "bigserial".into(),
-            other => return Err(MyError::unsupported(format!("AUTO_INCREMENT on a {other} column"))),
+            other => {
+                return Err(MyError::unsupported(format!(
+                    "AUTO_INCREMENT on a {other} column"
+                )));
+            }
         };
         attrs.retain(|a| !a.starts_with("DEFAULT"));
     }
@@ -1894,7 +2260,9 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
 /// engine chooses for itself.
 fn check_table_options(tokens: &[Token]) -> Result<(), MyError> {
     if find_top(tokens, 0, &["PARTITION"]).is_some() {
-        return Err(MyError::unsupported("MySQL's PARTITION BY (use the PostgreSQL form)"));
+        return Err(MyError::unsupported(
+            "MySQL's PARTITION BY (use the PostgreSQL form)",
+        ));
     }
     if tokens.iter().any(|t| t.is_word("SELECT")) {
         return Err(MyError::unsupported("CREATE TABLE … SELECT"));
@@ -1915,14 +2283,16 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         if_not_exists = true;
         i += 3;
     }
-    let (table, after) = table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("CREATE TABLE needs a name"))?;
+    let (table, after) =
+        table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("CREATE TABLE needs a name"))?;
     if kw(&tokens, after, "LIKE") {
         return Err(MyError::unsupported("CREATE TABLE … LIKE"));
     }
     if !tokens.get(after).is_some_and(|t| t.is_op("(")) {
         return Err(MyError::syntax("CREATE TABLE needs a column list"));
     }
-    let close = matching_paren(&tokens, after).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
+    let close =
+        matching_paren(&tokens, after).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
     check_table_options(&tokens[close + 1..])?;
 
     let mut defs: Vec<String> = Vec::new();
@@ -1935,7 +2305,11 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         let mut constraint_name: Option<String> = None;
         if upper == "CONSTRAINT" {
             if let Some(n) = part.get(1).and_then(|t| t.ident()) {
-                if !["PRIMARY", "UNIQUE", "FOREIGN", "CHECK"].iter().any(|k| n.eq_ignore_ascii_case(k)) || matches!(part[1].tok, Tok::Quoted(_)) {
+                if !["PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+                    .iter()
+                    .any(|k| n.eq_ignore_ascii_case(k))
+                    || matches!(part[1].tok, Tok::Quoted(_))
+                {
                     constraint_name = Some(n.to_lowercase());
                     p = 2;
                 } else {
@@ -1944,7 +2318,18 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
             }
         }
         let head = part.get(p).and_then(|t| t.upper()).unwrap_or_default();
-        let is_column = p == 0 && !matches!(head.as_str(), "PRIMARY" | "UNIQUE" | "KEY" | "INDEX" | "FOREIGN" | "FULLTEXT" | "SPATIAL" | "CHECK")
+        let is_column = p == 0
+            && !matches!(
+                head.as_str(),
+                "PRIMARY"
+                    | "UNIQUE"
+                    | "KEY"
+                    | "INDEX"
+                    | "FOREIGN"
+                    | "FULLTEXT"
+                    | "SPATIAL"
+                    | "CHECK"
+            )
             || (p == 0 && matches!(first.tok, Tok::Quoted(_)));
         if is_column {
             let (def, checks) = column_definition(&part, cx)?;
@@ -1952,11 +2337,18 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
             defs.extend(checks);
             continue;
         }
-        let paren = part.iter().position(|t| t.is_op("(")).ok_or_else(|| MyError::syntax("a key needs a column list"))?;
-        let pclose = matching_paren(&part, paren).ok_or_else(|| MyError::syntax("unbalanced key"))?;
+        let paren = part
+            .iter()
+            .position(|t| t.is_op("("))
+            .ok_or_else(|| MyError::syntax("a key needs a column list"))?;
+        let pclose =
+            matching_paren(&part, paren).ok_or_else(|| MyError::syntax("unbalanced key"))?;
         match head.as_str() {
             "PRIMARY" => {
-                defs.push(format!("PRIMARY KEY ({})", index_columns(&part[paren + 1..pclose])?.join(", ")));
+                defs.push(format!(
+                    "PRIMARY KEY ({})",
+                    index_columns(&part[paren + 1..pclose])?.join(", ")
+                ));
             }
             "UNIQUE" => {
                 // UNIQUE [KEY|INDEX] [name] (cols)
@@ -1964,17 +2356,37 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
                 if kw(&part, q, "KEY") || kw(&part, q, "INDEX") {
                     q += 1;
                 }
-                let name = if q < paren { part[q].ident().map(|s| s.to_lowercase()) } else { None }.or(constraint_name);
+                let name = if q < paren {
+                    part[q].ident().map(|s| s.to_lowercase())
+                } else {
+                    None
+                }
+                .or(constraint_name);
                 let cols = index_columns(&part[paren + 1..pclose])?;
                 match name {
-                    Some(n) => defs.push(format!("CONSTRAINT {} UNIQUE ({})", ident_sql(&index_name(&table, &n)), cols.join(", "))),
+                    Some(n) => defs.push(format!(
+                        "CONSTRAINT {} UNIQUE ({})",
+                        ident_sql(&index_name(&table, &n)),
+                        cols.join(", ")
+                    )),
                     None => defs.push(format!("UNIQUE ({})", cols.join(", "))),
                 }
             }
             "KEY" | "INDEX" => {
-                let name = if p + 1 < paren { part[p + 1].ident().map(|s| s.to_lowercase()) } else { None };
+                let name = if p + 1 < paren {
+                    part[p + 1].ident().map(|s| s.to_lowercase())
+                } else {
+                    None
+                };
                 let cols = index_columns(&part[paren + 1..pclose])?;
-                let name = name.unwrap_or_else(|| cols[0].trim_matches('"').split(' ').next().unwrap_or("idx").to_string());
+                let name = name.unwrap_or_else(|| {
+                    cols[0]
+                        .trim_matches('"')
+                        .split(' ')
+                        .next()
+                        .unwrap_or("idx")
+                        .to_string()
+                });
                 after_statements.push(format!(
                     "CREATE INDEX {}{} ON {} ({})",
                     if if_not_exists { "IF NOT EXISTS " } else { "" },
@@ -1990,7 +2402,9 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
                 // FOREIGN KEY [index name] (cols) REFERENCES …
                 let cols = index_columns(&part[paren + 1..pclose])?;
                 let rest = render(&rewrite_expr(part[pclose + 1..].to_vec(), cx)?)?;
-                let named = constraint_name.map(|n| format!("CONSTRAINT {} ", ident_sql(&n))).unwrap_or_default();
+                let named = constraint_name
+                    .map(|n| format!("CONSTRAINT {} ", ident_sql(&n)))
+                    .unwrap_or_default();
                 if cx.env.system_variable("foreign_key_checks") == Some(Value::Int(0)) {
                     deferred.push(format!(
                         "ALTER TABLE {} ADD {named}FOREIGN KEY ({}) {rest}",
@@ -2002,10 +2416,19 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
                 }
             }
             "CHECK" => {
-                let named = constraint_name.map(|n| format!("CONSTRAINT {} ", ident_sql(&n))).unwrap_or_default();
-                defs.push(format!("{named}{}", render(&rewrite_expr(part[p..].to_vec(), cx)?)?));
+                let named = constraint_name
+                    .map(|n| format!("CONSTRAINT {} ", ident_sql(&n)))
+                    .unwrap_or_default();
+                defs.push(format!(
+                    "{named}{}",
+                    render(&rewrite_expr(part[p..].to_vec(), cx)?)?
+                ));
             }
-            _ => return Err(MyError::syntax(format!("unexpected '{head}' in CREATE TABLE"))),
+            _ => {
+                return Err(MyError::syntax(format!(
+                    "unexpected '{head}' in CREATE TABLE"
+                )));
+            }
         }
     }
     let mut statements = vec![format!(
@@ -2032,7 +2455,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
         i += 1;
     }
     i += 1; // TABLE
-    let (table, after) = table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("ALTER TABLE needs a name"))?;
+    let (table, after) =
+        table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("ALTER TABLE needs a name"))?;
     let t = ident_sql(&table);
     let database = cx.env.database().clone();
     let mut statements = Vec::new();
@@ -2045,7 +2469,10 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                 let mut constraint_name: Option<String> = None;
                 if kw(&spec, k, "CONSTRAINT") {
                     if let Some(n) = spec.get(k + 1).and_then(|t| t.ident()) {
-                        if !["PRIMARY", "UNIQUE", "FOREIGN", "CHECK"].iter().any(|w| n.eq_ignore_ascii_case(w)) {
+                        if !["PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+                            .iter()
+                            .any(|w| n.eq_ignore_ascii_case(w))
+                        {
                             constraint_name = Some(n.to_lowercase());
                             k += 2;
                         } else {
@@ -2055,24 +2482,50 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                 }
                 let what = spec.get(k).and_then(|t| t.upper()).unwrap_or_default();
                 match what.as_str() {
-                    "INDEX" | "KEY" | "UNIQUE" | "PRIMARY" | "FULLTEXT" | "SPATIAL" | "FOREIGN" | "CHECK" => {
-                        let paren = spec.iter().position(|t| t.is_op("(")).ok_or_else(|| MyError::syntax("a key needs a column list"))?;
-                        let pclose = matching_paren(&spec, paren).ok_or_else(|| MyError::syntax("unbalanced key"))?;
+                    "INDEX" | "KEY" | "UNIQUE" | "PRIMARY" | "FULLTEXT" | "SPATIAL" | "FOREIGN"
+                    | "CHECK" => {
+                        let paren = spec
+                            .iter()
+                            .position(|t| t.is_op("("))
+                            .ok_or_else(|| MyError::syntax("a key needs a column list"))?;
+                        let pclose = matching_paren(&spec, paren)
+                            .ok_or_else(|| MyError::syntax("unbalanced key"))?;
                         match what.as_str() {
                             "INDEX" | "KEY" => {
-                                let name = if k + 1 < paren { spec[k + 1].ident().map(|s| s.to_lowercase()) } else { None };
+                                let name = if k + 1 < paren {
+                                    spec[k + 1].ident().map(|s| s.to_lowercase())
+                                } else {
+                                    None
+                                };
                                 let cols = index_columns(&spec[paren + 1..pclose])?;
-                                let name = name.unwrap_or_else(|| cols[0].trim_matches('"').split(' ').next().unwrap_or("idx").to_string());
-                                statements.push(format!("CREATE INDEX {} ON {t} ({})", ident_sql(&index_name(&table, &name)), cols.join(", ")));
+                                let name = name.unwrap_or_else(|| {
+                                    cols[0]
+                                        .trim_matches('"')
+                                        .split(' ')
+                                        .next()
+                                        .unwrap_or("idx")
+                                        .to_string()
+                                });
+                                statements.push(format!(
+                                    "CREATE INDEX {} ON {t} ({})",
+                                    ident_sql(&index_name(&table, &name)),
+                                    cols.join(", ")
+                                ));
                             }
                             "UNIQUE" => {
                                 let mut q = k + 1;
                                 if kw(&spec, q, "KEY") || kw(&spec, q, "INDEX") {
                                     q += 1;
                                 }
-                                let name = if q < paren { spec[q].ident().map(|s| s.to_lowercase()) } else { None }.or(constraint_name);
+                                let name = if q < paren {
+                                    spec[q].ident().map(|s| s.to_lowercase())
+                                } else {
+                                    None
+                                }
+                                .or(constraint_name);
                                 let cols = index_columns(&spec[paren + 1..pclose])?;
-                                let name = name.unwrap_or_else(|| cols[0].trim_matches('"').to_string());
+                                let name =
+                                    name.unwrap_or_else(|| cols[0].trim_matches('"').to_string());
                                 statements.push(format!(
                                     "ALTER TABLE {t} ADD CONSTRAINT {} UNIQUE ({})",
                                     ident_sql(&index_name(&table, &name)),
@@ -2080,17 +2533,30 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                                 ));
                             }
                             "PRIMARY" => {
-                                statements.push(format!("ALTER TABLE {t} ADD PRIMARY KEY ({})", index_columns(&spec[paren + 1..pclose])?.join(", ")));
+                                statements.push(format!(
+                                    "ALTER TABLE {t} ADD PRIMARY KEY ({})",
+                                    index_columns(&spec[paren + 1..pclose])?.join(", ")
+                                ));
                             }
                             "FOREIGN" => {
                                 let cols = index_columns(&spec[paren + 1..pclose])?;
                                 let rest = render(&rewrite_expr(spec[pclose + 1..].to_vec(), cx)?)?;
-                                let named = constraint_name.map(|n| format!("CONSTRAINT {} ", ident_sql(&n))).unwrap_or_default();
-                                statements.push(format!("ALTER TABLE {t} ADD {named}FOREIGN KEY ({}) {rest}", cols.join(", ")));
+                                let named = constraint_name
+                                    .map(|n| format!("CONSTRAINT {} ", ident_sql(&n)))
+                                    .unwrap_or_default();
+                                statements.push(format!(
+                                    "ALTER TABLE {t} ADD {named}FOREIGN KEY ({}) {rest}",
+                                    cols.join(", ")
+                                ));
                             }
                             "CHECK" => {
-                                let named = constraint_name.map(|n| format!("CONSTRAINT {} ", ident_sql(&n))).unwrap_or_default();
-                                statements.push(format!("ALTER TABLE {t} ADD {named}{}", render(&rewrite_expr(spec[k..].to_vec(), cx)?)?));
+                                let named = constraint_name
+                                    .map(|n| format!("CONSTRAINT {} ", ident_sql(&n)))
+                                    .unwrap_or_default();
+                                statements.push(format!(
+                                    "ALTER TABLE {t} ADD {named}{}",
+                                    render(&rewrite_expr(spec[k..].to_vec(), cx)?)?
+                                ));
                             }
                             other => return Err(MyError::unsupported(format!("{other} indexes"))),
                         }
@@ -2103,7 +2569,8 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                         }
                         let mut defs: Vec<Vec<Token>> = Vec::new();
                         if spec.get(k).is_some_and(|t| t.is_op("(")) {
-                            let close = matching_paren(&spec, k).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
+                            let close = matching_paren(&spec, k)
+                                .ok_or_else(|| MyError::syntax("unbalanced column list"))?;
                             defs.extend(split_commas(&spec[k + 1..close]));
                         } else {
                             let mut def = spec[k..].to_vec();
@@ -2124,18 +2591,31 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                 let what = spec.get(1).and_then(|t| t.upper()).unwrap_or_default();
                 match what.as_str() {
                     "INDEX" | "KEY" => {
-                        let name = spec.get(2).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("DROP INDEX needs a name"))?.to_lowercase();
+                        let name = spec
+                            .get(2)
+                            .and_then(|t| t.ident())
+                            .ok_or_else(|| MyError::syntax("DROP INDEX needs a name"))?
+                            .to_lowercase();
                         statements.push(drop_index_statement(&database, &table, &name));
                     }
                     "FOREIGN" | "CONSTRAINT" | "CHECK" => {
                         let at = if what == "FOREIGN" { 3 } else { 2 };
-                        let name = spec.get(at).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a constraint name was expected"))?;
-                        statements.push(format!("ALTER TABLE {t} DROP CONSTRAINT {}", ident_sql(name)));
+                        let name = spec
+                            .get(at)
+                            .and_then(|t| t.ident())
+                            .ok_or_else(|| MyError::syntax("a constraint name was expected"))?;
+                        statements.push(format!(
+                            "ALTER TABLE {t} DROP CONSTRAINT {}",
+                            ident_sql(name)
+                        ));
                     }
                     "PRIMARY" => return Err(MyError::unsupported("DROP PRIMARY KEY")),
                     _ => {
                         let at = if what == "COLUMN" { 2 } else { 1 };
-                        let name = spec.get(at).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+                        let name = spec
+                            .get(at)
+                            .and_then(|t| t.ident())
+                            .ok_or_else(|| MyError::syntax("a column name was expected"))?;
                         statements.push(format!("ALTER TABLE {t} DROP COLUMN {}", ident_sql(name)));
                     }
                 }
@@ -2145,29 +2625,60 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                 if kw(&spec, k, "COLUMN") {
                     k += 1;
                 }
-                let old = spec.get(k).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?.to_lowercase();
+                let old = spec
+                    .get(k)
+                    .and_then(|t| t.ident())
+                    .ok_or_else(|| MyError::syntax("a column name was expected"))?
+                    .to_lowercase();
                 if head == "CHANGE" {
                     k += 1;
                 }
                 let mut def = spec[k..].to_vec();
                 strip_position(&mut def);
-                let new = def.first().and_then(|t| t.ident()).unwrap_or(&old).to_lowercase();
+                let new = def
+                    .first()
+                    .and_then(|t| t.ident())
+                    .unwrap_or(&old)
+                    .to_lowercase();
                 if new != old {
-                    statements.push(format!("ALTER TABLE {t} RENAME COLUMN {} TO {}", ident_sql(&old), ident_sql(&new)));
+                    statements.push(format!(
+                        "ALTER TABLE {t} RENAME COLUMN {} TO {}",
+                        ident_sql(&old),
+                        ident_sql(&new)
+                    ));
                 }
                 let (column, checks) = column_definition(&def, cx)?;
                 // `name type attrs…` → TYPE, then NULL-ness and default.
                 let without_name = column.splitn(2, ' ').nth(1).unwrap_or("").to_string();
                 let (pg_type, attrs) = split_type_attrs(&without_name);
-                statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} TYPE {pg_type}", ident_sql(&new)));
+                statements.push(format!(
+                    "ALTER TABLE {t} ALTER COLUMN {} TYPE {pg_type}",
+                    ident_sql(&new)
+                ));
                 if attrs.contains("NOT NULL") {
-                    statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} SET NOT NULL", ident_sql(&new)));
+                    statements.push(format!(
+                        "ALTER TABLE {t} ALTER COLUMN {} SET NOT NULL",
+                        ident_sql(&new)
+                    ));
                 } else {
-                    statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} DROP NOT NULL", ident_sql(&new)));
+                    statements.push(format!(
+                        "ALTER TABLE {t} ALTER COLUMN {} DROP NOT NULL",
+                        ident_sql(&new)
+                    ));
                 }
                 if let Some(at) = attrs.find("DEFAULT ") {
-                    let value = attrs[at + 8..].split(" NOT NULL").next().unwrap_or("").split(" NULL").next().unwrap_or("");
-                    statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} SET DEFAULT {}", ident_sql(&new), value.trim()));
+                    let value = attrs[at + 8..]
+                        .split(" NOT NULL")
+                        .next()
+                        .unwrap_or("")
+                        .split(" NULL")
+                        .next()
+                        .unwrap_or("");
+                    statements.push(format!(
+                        "ALTER TABLE {t} ALTER COLUMN {} SET DEFAULT {}",
+                        ident_sql(&new),
+                        value.trim()
+                    ));
                 }
                 for c in checks {
                     statements.push(format!("ALTER TABLE {t} ADD {c}"));
@@ -2178,15 +2689,31 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                 if kw(&spec, k, "COLUMN") {
                     k += 1;
                 }
-                let name = spec.get(k).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
+                let name = spec
+                    .get(k)
+                    .and_then(|t| t.ident())
+                    .ok_or_else(|| MyError::syntax("a column name was expected"))?;
                 let rest = render(&rewrite_expr(spec[k + 1..].to_vec(), cx)?)?;
-                statements.push(format!("ALTER TABLE {t} ALTER COLUMN {} {rest}", ident_sql(name)));
+                statements.push(format!(
+                    "ALTER TABLE {t} ALTER COLUMN {} {rest}",
+                    ident_sql(name)
+                ));
             }
             "RENAME" => {
                 if kw(&spec, 1, "COLUMN") {
-                    let a = spec.get(2).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
-                    let b = spec.get(4).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a column name was expected"))?;
-                    statements.push(format!("ALTER TABLE {t} RENAME COLUMN {} TO {}", ident_sql(a), ident_sql(b)));
+                    let a = spec
+                        .get(2)
+                        .and_then(|t| t.ident())
+                        .ok_or_else(|| MyError::syntax("a column name was expected"))?;
+                    let b = spec
+                        .get(4)
+                        .and_then(|t| t.ident())
+                        .ok_or_else(|| MyError::syntax("a column name was expected"))?;
+                    statements.push(format!(
+                        "ALTER TABLE {t} RENAME COLUMN {} TO {}",
+                        ident_sql(a),
+                        ident_sql(b)
+                    ));
                 } else if kw(&spec, 1, "INDEX") || kw(&spec, 1, "KEY") {
                     return Err(MyError::unsupported("RENAME INDEX"));
                 } else {
@@ -2194,15 +2721,17 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                     if kw(&spec, k, "TO") || kw(&spec, k, "AS") {
                         k += 1;
                     }
-                    let (new, _) = table_name_at(&spec, k).ok_or_else(|| MyError::syntax("a table name was expected"))?;
+                    let (new, _) = table_name_at(&spec, k)
+                        .ok_or_else(|| MyError::syntax("a table name was expected"))?;
                     statements.push(format!("ALTER TABLE {t} RENAME TO {}", ident_sql(&new)));
                 }
             }
             // Storage options: the engine chooses its own. DISABLE/ENABLE
             // KEYS (mysqldump) defers index maintenance in MySQL; indexes
             // here are always maintained.
-            "DISABLE" | "ENABLE" | "ENGINE" | "DEFAULT" | "CHARACTER" | "CHARSET" | "COLLATE" | "CONVERT" | "AUTO_INCREMENT" | "COMMENT"
-            | "ROW_FORMAT" | "ALGORITHM" | "LOCK" | "FORCE" | "KEY_BLOCK_SIZE" | "STATS_PERSISTENT" => {}
+            "DISABLE" | "ENABLE" | "ENGINE" | "DEFAULT" | "CHARACTER" | "CHARSET" | "COLLATE"
+            | "CONVERT" | "AUTO_INCREMENT" | "COMMENT" | "ROW_FORMAT" | "ALGORITHM" | "LOCK"
+            | "FORCE" | "KEY_BLOCK_SIZE" | "STATS_PERSISTENT" => {}
             other => return Err(MyError::unsupported(format!("ALTER TABLE … {other}"))),
         }
     }
@@ -2230,13 +2759,29 @@ fn strip_position(def: &mut Vec<Token>) {
 }
 
 fn split_type_attrs(text: &str) -> (String, String) {
-    for marker in [" NOT NULL", " NULL", " DEFAULT ", " PRIMARY KEY", " UNIQUE", " CHECK", " REFERENCES"] {
+    for marker in [
+        " NOT NULL",
+        " NULL",
+        " DEFAULT ",
+        " PRIMARY KEY",
+        " UNIQUE",
+        " CHECK",
+        " REFERENCES",
+    ] {
         if let Some(at) = text.find(marker) {
             let (ty, attrs) = text.split_at(at);
             let mut first = ty.to_string();
             let mut rest = attrs.to_string();
             // The earliest marker wins.
-            for m in [" NOT NULL", " NULL", " DEFAULT ", " PRIMARY KEY", " UNIQUE", " CHECK", " REFERENCES"] {
+            for m in [
+                " NOT NULL",
+                " NULL",
+                " DEFAULT ",
+                " PRIMARY KEY",
+                " UNIQUE",
+                " CHECK",
+                " REFERENCES",
+            ] {
                 if let Some(a) = text.find(m) {
                     if a < first.len() {
                         first = text[..a].to_string();
@@ -2258,7 +2803,11 @@ fn drop_index_statement(database: &Database, table: &str, name: &str) -> String 
         let schema = view.schema();
         for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
             if key.name == mangled || key.name == name {
-                return format!("ALTER TABLE {} DROP CONSTRAINT {}", ident_sql(table), ident_sql(&key.name));
+                return format!(
+                    "ALTER TABLE {} DROP CONSTRAINT {}",
+                    ident_sql(table),
+                    ident_sql(&key.name)
+                );
             }
         }
         for index in schema.secondary_indexes.iter().filter(|x| !x.is_deleted) {
@@ -2286,11 +2835,20 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         if_not_exists = true;
         i += 3;
     }
-    let name = tokens.get(i).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("CREATE INDEX needs a name"))?.to_lowercase();
-    let on = find_top(&tokens, i, &["ON"]).ok_or_else(|| MyError::syntax("CREATE INDEX needs ON"))?;
-    let (table, after) = table_name_at(&tokens, on + 1).ok_or_else(|| MyError::syntax("CREATE INDEX needs a table"))?;
-    let paren = (after..tokens.len()).find(|&k| tokens[k].is_op("(")).ok_or_else(|| MyError::syntax("CREATE INDEX needs columns"))?;
-    let close = matching_paren(&tokens, paren).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
+    let name = tokens
+        .get(i)
+        .and_then(|t| t.ident())
+        .ok_or_else(|| MyError::syntax("CREATE INDEX needs a name"))?
+        .to_lowercase();
+    let on =
+        find_top(&tokens, i, &["ON"]).ok_or_else(|| MyError::syntax("CREATE INDEX needs ON"))?;
+    let (table, after) = table_name_at(&tokens, on + 1)
+        .ok_or_else(|| MyError::syntax("CREATE INDEX needs a table"))?;
+    let paren = (after..tokens.len())
+        .find(|&k| tokens[k].is_op("("))
+        .ok_or_else(|| MyError::syntax("CREATE INDEX needs columns"))?;
+    let close =
+        matching_paren(&tokens, paren).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
     let cols = index_columns(&tokens[paren + 1..close])?;
     let _ = cx;
     let statement = if unique {
@@ -2330,24 +2888,39 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
                 i += 2;
             }
             let mut end = tokens.len();
-            if tokens.last().is_some_and(|t| t.is_word("CASCADE") || t.is_word("RESTRICT")) {
+            if tokens
+                .last()
+                .is_some_and(|t| t.is_word("CASCADE") || t.is_word("RESTRICT"))
+            {
                 end -= 1;
             }
             let mut names = Vec::new();
             for part in split_commas(&tokens[i..end]) {
-                let (name, _) = table_name_at(&part, 0).ok_or_else(|| MyError::syntax("a table name was expected"))?;
+                let (name, _) = table_name_at(&part, 0)
+                    .ok_or_else(|| MyError::syntax("a table name was expected"))?;
                 names.push(ident_sql(&name));
             }
             names
                 .into_iter()
-                .map(|n| format!("DROP TABLE {}{n}", if if_exists { "IF EXISTS " } else { "" }))
+                .map(|n| {
+                    format!(
+                        "DROP TABLE {}{n}",
+                        if if_exists { "IF EXISTS " } else { "" }
+                    )
+                })
                 .collect()
         }
         "INDEX" => {
             // DROP INDEX name ON t
-            let name = tokens.get(2).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("DROP INDEX needs a name"))?.to_lowercase();
-            let on = find_top(&tokens, 3, &["ON"]).ok_or_else(|| MyError::syntax("DROP INDEX needs ON table"))?;
-            let (table, _) = table_name_at(&tokens, on + 1).ok_or_else(|| MyError::syntax("a table name was expected"))?;
+            let name = tokens
+                .get(2)
+                .and_then(|t| t.ident())
+                .ok_or_else(|| MyError::syntax("DROP INDEX needs a name"))?
+                .to_lowercase();
+            let on = find_top(&tokens, 3, &["ON"])
+                .ok_or_else(|| MyError::syntax("DROP INDEX needs ON table"))?;
+            let (table, _) = table_name_at(&tokens, on + 1)
+                .ok_or_else(|| MyError::syntax("a table name was expected"))?;
             vec![drop_index_statement(&database, &table, &name)]
         }
         "DATABASE" | "SCHEMA" => {
@@ -2357,8 +2930,15 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
                 if_exists = true;
                 i += 2;
             }
-            let name = tokens.get(i).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a database name was expected"))?;
-            vec![format!("DROP DATABASE {}{}", if if_exists { "IF EXISTS " } else { "" }, ident_sql(name))]
+            let name = tokens
+                .get(i)
+                .and_then(|t| t.ident())
+                .ok_or_else(|| MyError::syntax("a database name was expected"))?;
+            vec![format!(
+                "DROP DATABASE {}{}",
+                if if_exists { "IF EXISTS " } else { "" },
+                ident_sql(name)
+            )]
         }
         "VIEW" => vec![render(&rewrite_expr(tokens, cx)?)?],
         other => return Err(MyError::unsupported(format!("DROP {other}"))),
@@ -2378,12 +2958,20 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
 
 /// Translates one statement (already split) for the engine. Session
 /// statements (SET, SHOW, USE, transaction control) are not handled here.
-pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placeholders: bool) -> Result<Forward, MyError> {
+pub(crate) fn translate(
+    sql: &[u8],
+    tokens: Vec<Token>,
+    env: &dyn Env,
+    placeholders: bool,
+) -> Result<Forward, MyError> {
     let mut cx = Cx::new(env, placeholders);
     // MySQL's information_schema calls a database a schema: TABLE_SCHEMA
     // holds the database's name, which the engine's views keep in
     // table_catalog (their table_schema is the namespace, `public`).
-    let tokens = if tokens.iter().any(|t| t.ident().is_some_and(|i| i.eq_ignore_ascii_case("information_schema"))) {
+    let tokens = if tokens.iter().any(|t| {
+        t.ident()
+            .is_some_and(|i| i.eq_ignore_ascii_case("information_schema"))
+    }) {
         tokens
             .into_iter()
             .map(|t| match t.ident() {
@@ -2397,7 +2985,10 @@ pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placehold
     } else {
         tokens
     };
-    let params = tokens.iter().filter(|t| matches!(t.tok, Tok::Param(_))).count();
+    let params = tokens
+        .iter()
+        .filter(|t| matches!(t.tok, Tok::Param(_)))
+        .count();
     let head = tokens.first().and_then(|t| t.upper()).unwrap_or_default();
     let mut forward = match head.as_str() {
         _ if tokens.first().is_some_and(|t| t.is_op("(")) => select_forward(sql, tokens, &mut cx)?,
@@ -2417,15 +3008,23 @@ pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placehold
             let second = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
             match second.as_str() {
                 "TABLE" | "TEMPORARY" => rewrite_create_table(tokens, &mut cx)?,
-                "INDEX" | "UNIQUE" | "FULLTEXT" | "SPATIAL" => rewrite_create_index(tokens, &mut cx)?,
+                "INDEX" | "UNIQUE" | "FULLTEXT" | "SPATIAL" => {
+                    rewrite_create_index(tokens, &mut cx)?
+                }
                 "DATABASE" | "SCHEMA" => {
                     let mut i = 2;
                     let mut if_not_exists = false;
-                    if kw(&tokens, i, "IF") && kw(&tokens, i + 1, "NOT") && kw(&tokens, i + 2, "EXISTS") {
+                    if kw(&tokens, i, "IF")
+                        && kw(&tokens, i + 1, "NOT")
+                        && kw(&tokens, i + 2, "EXISTS")
+                    {
                         if_not_exists = true;
                         i += 3;
                     }
-                    let name = tokens.get(i).and_then(|t| t.ident()).ok_or_else(|| MyError::syntax("a database name was expected"))?;
+                    let name = tokens
+                        .get(i)
+                        .and_then(|t| t.ident())
+                        .ok_or_else(|| MyError::syntax("a database name was expected"))?;
                     Forward {
                         statements: vec![format!(
                             "CREATE DATABASE {}{}",
@@ -2440,11 +3039,18 @@ pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placehold
                 }
                 "VIEW" | "OR" => {
                     cx.ddl = true;
-                    let at = find_top(&tokens, 2, &["AS"]).ok_or_else(|| MyError::syntax("CREATE VIEW needs AS"))?;
+                    let at = find_top(&tokens, 2, &["AS"])
+                        .ok_or_else(|| MyError::syntax("CREATE VIEW needs AS"))?;
                     let mut out = rewrite_expr(tokens[..=at].to_vec(), &mut cx)?;
                     cx.ddl = false;
                     let mut found = false;
-                    out.extend(rewrite_select(sql, tokens[at + 1..].to_vec(), &mut cx, false, &mut found)?);
+                    out.extend(rewrite_select(
+                        sql,
+                        tokens[at + 1..].to_vec(),
+                        &mut cx,
+                        false,
+                        &mut found,
+                    )?);
                     Forward {
                         statements: vec![render(&out)?],
                         kind: Kind::Ddl,
@@ -2467,7 +3073,8 @@ pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placehold
         "DROP" => rewrite_drop(tokens, &mut cx)?,
         "TRUNCATE" => {
             let i = if kw(&tokens, 1, "TABLE") { 2 } else { 1 };
-            let (table, _) = table_name_at(&tokens, i).ok_or_else(|| MyError::syntax("TRUNCATE needs a table"))?;
+            let (table, _) = table_name_at(&tokens, i)
+                .ok_or_else(|| MyError::syntax("TRUNCATE needs a table"))?;
             Forward {
                 statements: vec![format!("TRUNCATE TABLE {}", ident_sql(&table))],
                 kind: Kind::Ddl,
@@ -2480,10 +3087,19 @@ pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placehold
             // RENAME TABLE a TO b, c TO d
             let mut statements = Vec::new();
             for part in split_commas(&tokens[2..]) {
-                let to = part.iter().position(|t| t.is_word("TO")).ok_or_else(|| MyError::syntax("RENAME TABLE needs TO"))?;
-                let (a, _) = table_name_at(&part, 0).ok_or_else(|| MyError::syntax("a table name was expected"))?;
-                let (b, _) = table_name_at(&part, to + 1).ok_or_else(|| MyError::syntax("a table name was expected"))?;
-                statements.push(format!("ALTER TABLE {} RENAME TO {}", ident_sql(&a), ident_sql(&b)));
+                let to = part
+                    .iter()
+                    .position(|t| t.is_word("TO"))
+                    .ok_or_else(|| MyError::syntax("RENAME TABLE needs TO"))?;
+                let (a, _) = table_name_at(&part, 0)
+                    .ok_or_else(|| MyError::syntax("a table name was expected"))?;
+                let (b, _) = table_name_at(&part, to + 1)
+                    .ok_or_else(|| MyError::syntax("a table name was expected"))?;
+                statements.push(format!(
+                    "ALTER TABLE {} RENAME TO {}",
+                    ident_sql(&a),
+                    ident_sql(&b)
+                ));
             }
             Forward {
                 statements,
@@ -2496,7 +3112,9 @@ pub(crate) fn translate(sql: &[u8], tokens: Vec<Token>, env: &dyn Env, placehold
         "EXPLAIN" | "DESCRIBE" | "DESC" => {
             let mut out = vec![Token::word("EXPLAIN")];
             let mut rest = tokens[1..].to_vec();
-            while rest.first().is_some_and(|t| t.is_word("FORMAT") || t.is_word("EXTENDED") || t.is_word("PARTITIONS")) {
+            while rest.first().is_some_and(|t| {
+                t.is_word("FORMAT") || t.is_word("EXTENDED") || t.is_word("PARTITIONS")
+            }) {
                 if rest.first().is_some_and(|t| t.is_word("FORMAT")) {
                     rest.drain(..3.min(rest.len()));
                 } else {
@@ -2543,7 +3161,10 @@ fn select_forward(sql: &[u8], tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward
         stripped.retain(|t| !t.is_word("SQL_CALC_FOUND_ROWS"));
         let mut ignored = false;
         let inner = rewrite_select(sql, stripped, cx, false, &mut ignored)?;
-        Some(format!("SELECT count(*) FROM ({}) AS found_rows", render(&inner)?))
+        Some(format!(
+            "SELECT count(*) FROM ({}) AS found_rows",
+            render(&inner)?
+        ))
     } else {
         None
     };
@@ -2607,14 +3228,21 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(crate::core::database::catalog::DatabaseCatalog::open(None, "app"))
+            .block_on(crate::core::database::catalog::DatabaseCatalog::open(
+                None, "app",
+            ))
             .unwrap();
-        TestEnv { database: catalog.get("app").unwrap() }
+        TestEnv {
+            database: catalog.get("app").unwrap(),
+        }
     }
 
     fn tr(env: &TestEnv, sql: &str) -> String {
         let tokens = lex(sql.as_bytes(), Mode::default()).unwrap();
-        translate(sql.as_bytes(), tokens, env, true).unwrap().statements.join("; ")
+        translate(sql.as_bytes(), tokens, env, true)
+            .unwrap()
+            .statements
+            .join("; ")
     }
 
     fn err(env: &TestEnv, sql: &str) -> MyError {
@@ -2625,41 +3253,92 @@ mod tests {
     #[test]
     fn select_names_and_dialect() {
         let e = env();
-        assert_eq!(tr(&e, "SELECT `UserId`, name FROM `Users`"), r#"SELECT userid AS "UserId", name FROM users"#);
-        assert_eq!(tr(&e, "SELECT COUNT(*) FROM t"), r#"SELECT COUNT(*) AS "COUNT(*)" FROM t"#);
-        assert_eq!(tr(&e, "SELECT a AS Total FROM t ORDER BY total"), r#"SELECT a AS "Total" FROM t ORDER BY "Total""#);
-        assert_eq!(tr(&e, "SELECT * FROM t LIMIT 5, 10"), "SELECT * FROM t LIMIT 10 OFFSET 5");
-        assert_eq!(tr(&e, "SELECT IFNULL(a, 'x') v FROM t"), r#"SELECT coalesce(a, 'x') AS "v" FROM t"#);
-        assert_eq!(tr(&e, "SELECT @@version_comment LIMIT 1"), r#"SELECT 'RasterizedDB' AS "@@version_comment" LIMIT 1"#);
+        assert_eq!(
+            tr(&e, "SELECT `UserId`, name FROM `Users`"),
+            r#"SELECT userid AS "UserId", name FROM users"#
+        );
+        assert_eq!(
+            tr(&e, "SELECT COUNT(*) FROM t"),
+            r#"SELECT COUNT(*) AS "COUNT(*)" FROM t"#
+        );
+        assert_eq!(
+            tr(&e, "SELECT a AS Total FROM t ORDER BY total"),
+            r#"SELECT a AS "Total" FROM t ORDER BY "Total""#
+        );
+        assert_eq!(
+            tr(&e, "SELECT * FROM t LIMIT 5, 10"),
+            "SELECT * FROM t LIMIT 10 OFFSET 5"
+        );
+        assert_eq!(
+            tr(&e, "SELECT IFNULL(a, 'x') v FROM t"),
+            r#"SELECT coalesce(a, 'x') AS "v" FROM t"#
+        );
+        assert_eq!(
+            tr(&e, "SELECT @@version_comment LIMIT 1"),
+            r#"SELECT 'RasterizedDB' AS "@@version_comment" LIMIT 1"#
+        );
         assert_eq!(tr(&e, "SELECT 7 / 2 AS q"), r#"SELECT 7 * 1.0 / 2 AS "q""#);
-        assert_eq!(tr(&e, "SELECT a FROM t WHERE b <=> NULL && c"), "SELECT a FROM t WHERE b IS NOT DISTINCT FROM NULL AND c");
-        assert_eq!(tr(&e, "SELECT a FROM t WHERE ok = TRUE"), "SELECT a FROM t WHERE ok = 1");
-        assert_eq!(tr(&e, "SELECT a FROM t WHERE x = ? AND y = ?"), "SELECT a FROM t WHERE x = $1 AND y = $2");
-        assert_eq!(tr(&e, "SELECT LAST_INSERT_ID() AS id"), r#"SELECT (42::bigint) AS "id""#);
+        assert_eq!(
+            tr(&e, "SELECT a FROM t WHERE b <=> NULL && c"),
+            "SELECT a FROM t WHERE b IS NOT DISTINCT FROM NULL AND c"
+        );
+        assert_eq!(
+            tr(&e, "SELECT a FROM t WHERE ok = TRUE"),
+            "SELECT a FROM t WHERE ok = 1"
+        );
+        assert_eq!(
+            tr(&e, "SELECT a FROM t WHERE x = ? AND y = ?"),
+            "SELECT a FROM t WHERE x = $1 AND y = $2"
+        );
+        assert_eq!(
+            tr(&e, "SELECT LAST_INSERT_ID() AS id"),
+            r#"SELECT (42::bigint) AS "id""#
+        );
         assert_eq!(tr(&e, "SELECT 1 FROM DUAL"), r#"SELECT 1 AS "1""#);
         assert_eq!(
             tr(&e, "SELECT IF(a > 1, 'y', 'n') AS r FROM t"),
             r#"SELECT (CASE WHEN a > 1 THEN 'y' ELSE 'n' END) AS "r" FROM t"#
         );
         assert_eq!(
-            tr(&e, "SELECT GROUP_CONCAT(DISTINCT name ORDER BY name SEPARATOR '; ') AS g FROM t"),
+            tr(
+                &e,
+                "SELECT GROUP_CONCAT(DISTINCT name ORDER BY name SEPARATOR '; ') AS g FROM t"
+            ),
             r#"SELECT string_agg(DISTINCT (name)::text, '; ' ORDER BY name) AS "g" FROM t"#
         );
         assert_eq!(
             tr(&e, "SELECT * FROM t WHERE d > NOW() - INTERVAL 1 DAY"),
             "SELECT * FROM t WHERE d > now() - interval '1 days'"
         );
-        assert_eq!(tr(&e, "SELECT doc->>'$.a.b' AS v FROM t"), r#"SELECT ((doc) -> 'a' ->> 'b') AS "v" FROM t"#);
-        assert_eq!(tr(&e, "SELECT 7 DIV 2 AS q"), r#"SELECT (div(7, 2)::bigint) AS "q""#);
-        assert_eq!(tr(&e, "SELECT CAST(a AS SIGNED) x FROM t"), r#"SELECT CAST(a AS bigint) AS "x" FROM t"#);
+        assert_eq!(
+            tr(&e, "SELECT doc->>'$.a.b' AS v FROM t"),
+            r#"SELECT ((doc) -> 'a' ->> 'b') AS "v" FROM t"#
+        );
+        assert_eq!(
+            tr(&e, "SELECT 7 DIV 2 AS q"),
+            r#"SELECT (div(7, 2)::bigint) AS "q""#
+        );
+        assert_eq!(
+            tr(&e, "SELECT CAST(a AS SIGNED) x FROM t"),
+            r#"SELECT CAST(a AS bigint) AS "x" FROM t"#
+        );
         assert_eq!(
             tr(&e, "SELECT DATE_FORMAT(d, '%Y-%m-%d %H:%i') f FROM t"),
             r#"SELECT to_char((d)::timestamp, 'YYYY-MM-DD HH24:MI') AS "f" FROM t"#
         );
-        assert_eq!(tr(&e, "SELECT * FROM t USE INDEX (i) WHERE a = 1"), "SELECT * FROM t WHERE a = 1");
-        assert_eq!(tr(&e, "SELECT * FROM t LOCK IN SHARE MODE"), "SELECT * FROM t FOR SHARE");
         assert_eq!(
-            tr(&e, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'app'"),
+            tr(&e, "SELECT * FROM t USE INDEX (i) WHERE a = 1"),
+            "SELECT * FROM t WHERE a = 1"
+        );
+        assert_eq!(
+            tr(&e, "SELECT * FROM t LOCK IN SHARE MODE"),
+            "SELECT * FROM t FOR SHARE"
+        );
+        assert_eq!(
+            tr(
+                &e,
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'app'"
+            ),
             "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'app'"
         );
     }
@@ -2667,38 +3346,75 @@ mod tests {
     #[test]
     fn found_rows_query() {
         let e = env();
-        let tokens = lex(b"SELECT SQL_CALC_FOUND_ROWS * FROM t WHERE a = 1 ORDER BY a LIMIT 10", Mode::default()).unwrap();
+        let tokens = lex(
+            b"SELECT SQL_CALC_FOUND_ROWS * FROM t WHERE a = 1 ORDER BY a LIMIT 10",
+            Mode::default(),
+        )
+        .unwrap();
         let f = translate(b"", tokens, &e, false).unwrap();
-        assert_eq!(f.statements[0], "SELECT * FROM t WHERE a = 1 ORDER BY a LIMIT 10");
-        assert_eq!(f.found_rows.as_deref(), Some("SELECT count(*) FROM (SELECT * FROM t WHERE a = 1) AS found_rows"));
+        assert_eq!(
+            f.statements[0],
+            "SELECT * FROM t WHERE a = 1 ORDER BY a LIMIT 10"
+        );
+        assert_eq!(
+            f.found_rows.as_deref(),
+            Some("SELECT count(*) FROM (SELECT * FROM t WHERE a = 1) AS found_rows")
+        );
     }
 
     #[test]
     fn inserts() {
         let e = env();
-        assert_eq!(tr(&e, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"), "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')");
-        assert_eq!(tr(&e, "INSERT t SET a = 1, b = 'x'"), "INSERT INTO t (a, b) VALUES (1, 'x')");
-        assert_eq!(tr(&e, "INSERT IGNORE INTO t (a) VALUES (1)"), "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING");
         assert_eq!(
-            tr(&e, "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b), c = c + 1"),
+            tr(&e, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"),
+            "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')"
+        );
+        assert_eq!(
+            tr(&e, "INSERT t SET a = 1, b = 'x'"),
+            "INSERT INTO t (a, b) VALUES (1, 'x')"
+        );
+        assert_eq!(
+            tr(&e, "INSERT IGNORE INTO t (a) VALUES (1)"),
+            "INSERT INTO t (a) VALUES (1) ON CONFLICT DO NOTHING"
+        );
+        assert_eq!(
+            tr(
+                &e,
+                "INSERT INTO t (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE b = VALUES(b), c = c + 1"
+            ),
             "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT DO UPDATE SET b = excluded.b, c = c + 1"
         );
         assert_eq!(
-            tr(&e, "INSERT INTO t (a, b) VALUES (1, 2) AS new ON DUPLICATE KEY UPDATE b = new.b"),
+            tr(
+                &e,
+                "INSERT INTO t (a, b) VALUES (1, 2) AS new ON DUPLICATE KEY UPDATE b = new.b"
+            ),
             "INSERT INTO t (a, b) VALUES (1, 2) ON CONFLICT DO UPDATE SET b = excluded.b"
         );
-        assert_eq!(tr(&e, "INSERT INTO t (a) VALUES (x'00ff')"), r"INSERT INTO t (a) VALUES ('\x00ff'::bytea)");
+        assert_eq!(
+            tr(&e, "INSERT INTO t (a) VALUES (x'00ff')"),
+            r"INSERT INTO t (a) VALUES ('\x00ff'::bytea)"
+        );
     }
 
     #[test]
     fn updates_and_deletes() {
         let e = env();
-        assert_eq!(tr(&e, "UPDATE t SET a = 1 WHERE b = 2"), "UPDATE t SET a = 1 WHERE (b = 2)");
         assert_eq!(
-            tr(&e, "UPDATE a JOIN b ON a.id = b.id SET a.x = b.y WHERE b.z = 1"),
+            tr(&e, "UPDATE t SET a = 1 WHERE b = 2"),
+            "UPDATE t SET a = 1 WHERE (b = 2)"
+        );
+        assert_eq!(
+            tr(
+                &e,
+                "UPDATE a JOIN b ON a.id = b.id SET a.x = b.y WHERE b.z = 1"
+            ),
             "UPDATE a SET x = b.y FROM b WHERE (a.id = b.id) AND (b.z = 1)"
         );
-        assert_eq!(tr(&e, "DELETE FROM t WHERE a = 1"), "DELETE FROM t WHERE a = 1");
+        assert_eq!(
+            tr(&e, "DELETE FROM t WHERE a = 1"),
+            "DELETE FROM t WHERE a = 1"
+        );
         assert_eq!(
             tr(&e, "DELETE a FROM a JOIN b ON a.id = b.id WHERE b.z = 1"),
             "DELETE FROM a USING b WHERE (a.id = b.id) AND (b.z = 1)"
@@ -2728,15 +3444,28 @@ mod tests {
              CONSTRAINT users__users_email_unique UNIQUE (email)); \
              CREATE INDEX IF NOT EXISTS users__idx_created ON users (created_at)"
         );
-        assert_eq!(err(&e, "CREATE TABLE t (a INT, FULLTEXT KEY f (a))").code, 1235);
-        assert_eq!(err(&e, "CREATE TABLE t (a TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)").code, 1235);
+        assert_eq!(
+            err(&e, "CREATE TABLE t (a INT, FULLTEXT KEY f (a))").code,
+            1235
+        );
+        assert_eq!(
+            err(
+                &e,
+                "CREATE TABLE t (a TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)"
+            )
+            .code,
+            1235
+        );
     }
 
     #[test]
     fn alter_table() {
         let e = env();
         assert_eq!(
-            tr(&e, "ALTER TABLE t ADD COLUMN c INT NOT NULL DEFAULT 0 AFTER b, ADD INDEX ic (c), ENGINE=InnoDB"),
+            tr(
+                &e,
+                "ALTER TABLE t ADD COLUMN c INT NOT NULL DEFAULT 0 AFTER b, ADD INDEX ic (c), ENGINE=InnoDB"
+            ),
             "ALTER TABLE t ADD COLUMN c integer NOT NULL DEFAULT 0; CREATE INDEX t__ic ON t (c)"
         );
         assert_eq!(
@@ -2744,6 +3473,9 @@ mod tests {
             "ALTER TABLE t ALTER COLUMN c TYPE bigint; ALTER TABLE t ALTER COLUMN c DROP NOT NULL"
         );
         assert_eq!(tr(&e, "RENAME TABLE a TO b"), "ALTER TABLE a RENAME TO b");
-        assert_eq!(tr(&e, "DROP TABLE IF EXISTS a, `b`"), "DROP TABLE IF EXISTS a; DROP TABLE IF EXISTS b");
+        assert_eq!(
+            tr(&e, "DROP TABLE IF EXISTS a, `b`"),
+            "DROP TABLE IF EXISTS a; DROP TABLE IF EXISTS b"
+        );
     }
 }

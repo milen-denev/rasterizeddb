@@ -73,7 +73,11 @@ impl Shim {
         }
     }
 
-    fn poll_base_read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_base_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.pending_pos < self.pending.len() {
             let n = (self.pending.len() - self.pending_pos).min(buf.remaining());
             buf.put_slice(&self.pending[self.pending_pos..self.pending_pos + n]);
@@ -117,7 +121,10 @@ impl Shim {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
                     if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed during TLS")));
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "closed during TLS",
+                        )));
                     }
                     got.extend_from_slice(rb.filled());
                 }
@@ -139,7 +146,11 @@ impl Shim {
 }
 
 impl AsyncRead for Shim {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.passthrough {
             return this.poll_base_read(cx, buf);
@@ -169,7 +180,10 @@ impl AsyncRead for Shim {
             };
             let len = u16::from_be_bytes([header[2], header[3]]) as usize;
             if len < 8 {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "bad TDS packet during TLS")));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad TDS packet during TLS",
+                )));
             }
             this.payload_left = len - 8;
         }
@@ -180,7 +194,10 @@ impl AsyncRead for Shim {
             Poll::Ready(Ok(())) => {
                 let n = rb.filled().len();
                 if n == 0 {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed during TLS")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "closed during TLS",
+                    )));
                 }
                 this.payload_left -= n;
                 buf.put_slice(rb.filled());
@@ -192,7 +209,11 @@ impl AsyncRead for Shim {
 }
 
 impl AsyncWrite for Shim {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if this.passthrough && this.out_sent == this.out.len() {
             return this.poll_base_write(cx, data);
@@ -223,7 +244,12 @@ impl AsyncWrite for Shim {
             let r = this.poll_base_write(cx, &out[this.out_sent..]);
             this.out = out;
             match r {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero"))),
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => this.out_sent += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -300,13 +326,21 @@ macro_rules! each {
 }
 
 impl AsyncRead for TdsStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         each!(self, s => Pin::new(s).poll_read(cx, buf))
     }
 }
 
 impl AsyncWrite for TdsStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         each!(self, s => Pin::new(s).poll_write(cx, buf))
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -393,7 +427,10 @@ impl Wire {
             match self.stream.read(&mut self.rbuf[have..]).await {
                 Ok(0) => {
                     self.rbuf.truncate(have);
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client closed the connection"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "client closed the connection",
+                    ));
                 }
                 Ok(n) => self.rbuf.truncate(have + n),
                 Err(e) => {
@@ -430,12 +467,18 @@ impl Wire {
             let status = h[1];
             let len = u16::from_be_bytes([h[2], h[3]]) as usize;
             if len < 8 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "TDS packet shorter than its header"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TDS packet shorter than its header",
+                ));
             }
             self.rpos += 8;
             self.fill(len - 8).await?;
             if payload.len() + len - 8 > self.max_message {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "TDS message too large"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "TDS message too large",
+                ));
             }
             payload.extend_from_slice(&self.rbuf[self.rpos..self.rpos + len - 8]);
             self.rpos += len - 8;
@@ -451,7 +494,11 @@ impl Wire {
             self.rpos = 0;
         }
         let (kind, status) = first.unwrap();
-        Ok(Message { kind, status, payload })
+        Ok(Message {
+            kind,
+            status,
+            payload,
+        })
     }
 
     /// Whether a complete attention packet is already buffered.
@@ -475,11 +522,15 @@ impl Wire {
         let body = self.packet_size - 8;
         let mut start = 0usize;
         let reply = std::mem::take(&mut self.reply);
-        while reply.len() - start > body || (last && start < reply.len()) || (last && reply.is_empty() && start == 0) {
+        while reply.len() - start > body
+            || (last && start < reply.len())
+            || (last && reply.is_empty() && start == 0)
+        {
             let end = (start + body).min(reply.len());
             let eom = last && end == reply.len();
             let len = (end - start + 8) as u16;
-            self.out.extend_from_slice(&[kind, if eom { ST_EOM } else { 0 }]);
+            self.out
+                .extend_from_slice(&[kind, if eom { ST_EOM } else { 0 }]);
             self.out.extend_from_slice(&len.to_be_bytes());
             self.out.extend_from_slice(&self.spid.to_be_bytes());
             self.out.push(self.packet_id);
@@ -537,7 +588,6 @@ impl Wire {
         }
         self.stream.flush().await
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +600,10 @@ pub(crate) struct Reader<'a> {
 }
 
 pub(crate) fn short() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "TDS message shorter than its contents")
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "TDS message shorter than its contents",
+    )
 }
 
 impl<'a> Reader<'a> {
@@ -591,7 +644,10 @@ impl<'a> Reader<'a> {
 }
 
 pub(crate) fn utf16_text(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     String::from_utf16_lossy(&units)
 }
 
@@ -600,7 +656,10 @@ pub(crate) fn all_headers(r: &mut Reader<'_>) -> io::Result<Option<u64>> {
     let start = r.pos;
     let total = r.u32()? as usize;
     if total < 4 || start + total > r.buf.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad ALL_HEADERS"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad ALL_HEADERS",
+        ));
     }
     let mut descriptor = None;
     while r.pos < start + total {
@@ -696,8 +755,10 @@ pub(crate) fn parse_login7(p: &[u8]) -> io::Result<Login> {
     let _tz = r.u32()?;
     let _lcid = r.u32()?;
     let field = |at: usize| -> io::Result<(usize, usize)> {
-        let off = u16::from_le_bytes(p.get(at..at + 2).ok_or_else(short)?.try_into().unwrap()) as usize;
-        let len = u16::from_le_bytes(p.get(at + 2..at + 4).ok_or_else(short)?.try_into().unwrap()) as usize;
+        let off =
+            u16::from_le_bytes(p.get(at..at + 2).ok_or_else(short)?.try_into().unwrap()) as usize;
+        let len = u16::from_le_bytes(p.get(at + 2..at + 4).ok_or_else(short)?.try_into().unwrap())
+            as usize;
         Ok((off, len))
     };
     let text = |at: usize| -> io::Result<String> {
@@ -791,7 +852,16 @@ pub(crate) fn login_ack(out: &mut Vec<u8>) {
 }
 
 /// An ERROR (0xAA) or INFO (0xAB) token.
-pub(crate) fn message(out: &mut Vec<u8>, error: bool, number: i32, state: u8, class: u8, text: &str, server: &str, line: i32) {
+pub(crate) fn message(
+    out: &mut Vec<u8>,
+    error: bool,
+    number: i32,
+    state: u8,
+    class: u8,
+    text: &str,
+    server: &str,
+    line: i32,
+) {
     let mut body = Vec::new();
     body.extend_from_slice(&number.to_le_bytes());
     body.push(state);
@@ -851,7 +921,10 @@ pub(crate) enum ColType {
     Bit,
     Int(u8),
     Float(u8),
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     /// NVARCHAR(n) with n in characters, or MAX.
     NVarChar(Option<u16>),
     VarBinaryMax,
@@ -893,7 +966,9 @@ pub(crate) fn column_type(oid: u32, typmod: i32) -> Option<ColType> {
         1083 | 1266 => ColType::Time,
         17 => ColType::VarBinaryMax,
         2950 => ColType::Guid,
-        1043 | 1042 if typmod > 4 && typmod - 4 <= 4000 => ColType::NVarChar(Some((typmod - 4) as u16)),
+        1043 | 1042 if typmod > 4 && typmod - 4 <= 4000 => {
+            ColType::NVarChar(Some((typmod - 4) as u16))
+        }
         _ => ColType::NVarChar(None),
     })
 }
@@ -916,7 +991,9 @@ pub(crate) fn type_info(out: &mut Vec<u8>, ty: &ColType) {
         ColType::Bit => out.extend_from_slice(&[0x68, 1]),
         ColType::Int(n) => out.extend_from_slice(&[0x26, *n]),
         ColType::Float(n) => out.extend_from_slice(&[0x6d, *n]),
-        ColType::Decimal { precision, scale } => out.extend_from_slice(&[0x6a, 17, *precision, *scale]),
+        ColType::Decimal { precision, scale } => {
+            out.extend_from_slice(&[0x6a, 17, *precision, *scale])
+        }
         ColType::NVarChar(n) => {
             out.push(0xe7);
             match n {
@@ -986,14 +1063,24 @@ fn parse_time_micros(s: &str) -> Option<u64> {
     let rest = parts.next()?;
     let (sec, frac) = rest.split_once('.').unwrap_or((rest, ""));
     let sec: u64 = sec.parse().ok()?;
-    let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).take(6).collect();
-    let micros: u64 = if digits.is_empty() { 0 } else { format!("{:0<6}", digits).parse().ok()? };
+    let digits: String = frac
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .take(6)
+        .collect();
+    let micros: u64 = if digits.is_empty() {
+        0
+    } else {
+        format!("{:0<6}", digits).parse().ok()?
+    };
     Some(((h * 60 + m) * 60 + sec) * 1_000_000 + micros)
 }
 
 /// A time zone suffix (`+02`, `-05:30`) split off a time.
 fn split_offset(s: &str) -> (&str, i32) {
-    let Some(colon) = s.find(':') else { return (s, 0) };
+    let Some(colon) = s.find(':') else {
+        return (s, 0);
+    };
     if let Some(at) = s[colon..].rfind(['+', '-']) {
         let at = colon + at;
         let sign = if s.as_bytes()[at] == b'-' { -1 } else { 1 };
@@ -1067,21 +1154,35 @@ fn decode_bytea_text(value: &[u8]) -> Vec<u8> {
         b'A'..=b'F' => b - b'A' + 10,
         _ => 0,
     };
-    hex.chunks(2).filter(|p| p.len() == 2).map(|p| digit(p[0]) << 4 | digit(p[1])).collect()
+    hex.chunks(2)
+        .filter(|p| p.len() == 2)
+        .map(|p| digit(p[0]) << 4 | digit(p[1]))
+        .collect()
 }
 
 /// One value of a ROW, from the engine's text.
-pub(crate) fn put_value(out: &mut Vec<u8>, ty: &ColType, value: Option<&[u8]>) -> Result<(), String> {
+pub(crate) fn put_value(
+    out: &mut Vec<u8>,
+    ty: &ColType,
+    value: Option<&[u8]>,
+) -> Result<(), String> {
     let Some(value) = value else {
         match ty {
             ColType::NVarChar(Some(_)) => out.extend_from_slice(&0xffffu16.to_le_bytes()),
-            ColType::NVarChar(None) | ColType::VarBinaryMax => out.extend_from_slice(&u64::MAX.to_le_bytes()),
+            ColType::NVarChar(None) | ColType::VarBinaryMax => {
+                out.extend_from_slice(&u64::MAX.to_le_bytes())
+            }
             _ => out.push(0),
         }
         return Ok(());
     };
     let text = || std::str::from_utf8(value).map_err(|_| "a value is not text".to_string());
-    let bad = |what: &str| format!("{what} {:?} cannot be sent as a SQL Server value", String::from_utf8_lossy(value));
+    let bad = |what: &str| {
+        format!(
+            "{what} {:?} cannot be sent as a SQL Server value",
+            String::from_utf8_lossy(value)
+        )
+    };
     match ty {
         ColType::Bit => {
             out.push(1);
@@ -1181,7 +1282,9 @@ pub(crate) fn put_value(out: &mut Vec<u8>, ty: &ColType, value: Option<&[u8]>) -
             if hex.len() != 32 {
                 return Err(bad("the uuid"));
             }
-            let b: Vec<u8> = (0..16).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
+            let b: Vec<u8> = (0..16)
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0))
+                .collect();
             out.push(16);
             // The first three groups are little-endian.
             out.extend_from_slice(&[b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6]]);
@@ -1236,11 +1339,19 @@ fn format_decimal(neg: bool, units: u128, scale: u8) -> String {
     let text = if s == 0 {
         digits
     } else if digits.len() > s {
-        format!("{}.{}", &digits[..digits.len() - s], &digits[digits.len() - s..])
+        format!(
+            "{}.{}",
+            &digits[..digits.len() - s],
+            &digits[digits.len() - s..]
+        )
     } else {
         format!("0.{}{}", "0".repeat(s - digits.len()), digits)
     };
-    if neg && units != 0 { format!("-{text}") } else { text }
+    if neg && units != 0 {
+        format!("-{text}")
+    } else {
+        text
+    }
 }
 
 fn time_text(units: u64, scale: u8) -> String {
@@ -1276,17 +1387,31 @@ fn le_uint(b: &[u8]) -> u64 {
 /// Reads one TYPE_INFO and its value.
 pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u32)> {
     let ty = r.u8()?;
-    let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("unsupported parameter type {ty:#04x}"));
+    let bad = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported parameter type {ty:#04x}"),
+        )
+    };
     Ok(match ty {
         // Fixed-length types.
         0x1f => (ParamValue::Null, 0),
         0x30 => (ParamValue::Text(r.u8()?.to_string()), 21),
-        0x32 => (ParamValue::Text(if r.u8()? != 0 { "true" } else { "false" }.into()), 16),
+        0x32 => (
+            ParamValue::Text(if r.u8()? != 0 { "true" } else { "false" }.into()),
+            16,
+        ),
         0x34 => (ParamValue::Text((r.u16()? as i16).to_string()), 21),
         0x38 => (ParamValue::Text((r.u32()? as i32).to_string()), 23),
         0x7f => (ParamValue::Text((r.u64()? as i64).to_string()), 20),
-        0x3b => (ParamValue::Text(f32::from_le_bytes(r.bytes(4)?.try_into().unwrap()).to_string()), 700),
-        0x3e => (ParamValue::Text(f64::from_le_bytes(r.bytes(8)?.try_into().unwrap()).to_string()), 701),
+        0x3b => (
+            ParamValue::Text(f32::from_le_bytes(r.bytes(4)?.try_into().unwrap()).to_string()),
+            700,
+        ),
+        0x3e => (
+            ParamValue::Text(f64::from_le_bytes(r.bytes(8)?.try_into().unwrap()).to_string()),
+            701,
+        ),
         0x3c | 0x7a => {
             let v = if ty == 0x7a {
                 r.u32()? as i32 as i64
@@ -1295,7 +1420,10 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
                 let lo = r.u32()? as i64;
                 (hi << 32) | lo
             };
-            (ParamValue::Text(format_decimal(v < 0, v.unsigned_abs() as u128, 4)), 1700)
+            (
+                ParamValue::Text(format_decimal(v < 0, v.unsigned_abs() as u128, 4)),
+                1700,
+            )
         }
         0x3d | 0x3a => {
             let (days, ticks) = if ty == 0x3a {
@@ -1305,7 +1433,10 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
             };
             let micros = ticks * 10_000 / 3;
             let days = days + tds_days(1900, 1, 1);
-            (ParamValue::Text(format!("{} {}", date_text(days), time_text(micros, 6))), 1114)
+            (
+                ParamValue::Text(format!("{} {}", date_text(days), time_text(micros, 6))),
+                1114,
+            )
         }
         // Nullable variable-length types: a byte of length.
         0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x24 => {
@@ -1323,11 +1454,21 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
                         4 => i32::from_le_bytes(b.try_into().unwrap()) as i64,
                         _ => i64::from_le_bytes(b.try_into().map_err(|_| bad())?),
                     };
-                    (ParamValue::Text(v.to_string()), if len == 8 { 20 } else { 23 })
+                    (
+                        ParamValue::Text(v.to_string()),
+                        if len == 8 { 20 } else { 23 },
+                    )
                 }
-                0x68 => (ParamValue::Text(if b[0] != 0 { "true" } else { "false" }.into()), 16),
+                0x68 => (
+                    ParamValue::Text(if b[0] != 0 { "true" } else { "false" }.into()),
+                    16,
+                ),
                 0x6d => {
-                    let v = if len == 4 { f32::from_le_bytes(b.try_into().unwrap()) as f64 } else { f64::from_le_bytes(b.try_into().map_err(|_| bad())?) };
+                    let v = if len == 4 {
+                        f32::from_le_bytes(b.try_into().unwrap()) as f64
+                    } else {
+                        f64::from_le_bytes(b.try_into().map_err(|_| bad())?)
+                    };
                     (ParamValue::Text(v.to_string()), 701)
                 }
                 0x6e => {
@@ -1338,24 +1479,48 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
                         let lo = u32::from_le_bytes(b[4..8].try_into().unwrap()) as i64;
                         (hi << 32) | lo
                     };
-                    (ParamValue::Text(format_decimal(v < 0, v.unsigned_abs() as u128, 4)), 1700)
+                    (
+                        ParamValue::Text(format_decimal(v < 0, v.unsigned_abs() as u128, 4)),
+                        1700,
+                    )
                 }
                 0x6f => {
                     let (days, ticks) = if len == 4 {
-                        (u16::from_le_bytes([b[0], b[1]]) as i64, u16::from_le_bytes([b[2], b[3]]) as u64 * 60 * 300)
+                        (
+                            u16::from_le_bytes([b[0], b[1]]) as i64,
+                            u16::from_le_bytes([b[2], b[3]]) as u64 * 60 * 300,
+                        )
                     } else {
-                        (i32::from_le_bytes(b[0..4].try_into().unwrap()) as i64, u32::from_le_bytes(b[4..8].try_into().unwrap()) as u64)
+                        (
+                            i32::from_le_bytes(b[0..4].try_into().unwrap()) as i64,
+                            u32::from_le_bytes(b[4..8].try_into().unwrap()) as u64,
+                        )
                     };
                     let micros = ticks * 10_000 / 3;
                     let days = days + tds_days(1900, 1, 1);
-                    (ParamValue::Text(format!("{} {}", date_text(days), time_text(micros, 6))), 1114)
+                    (
+                        ParamValue::Text(format!("{} {}", date_text(days), time_text(micros, 6))),
+                        1114,
+                    )
                 }
                 _ => {
                     // GUID: the first three groups little-endian.
                     let g = format!(
                         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{}",
-                        b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9],
-                        b[10..16].iter().map(|x| format!("{x:02x}")).collect::<String>()
+                        b[3],
+                        b[2],
+                        b[1],
+                        b[0],
+                        b[5],
+                        b[4],
+                        b[7],
+                        b[6],
+                        b[8],
+                        b[9],
+                        b[10..16]
+                            .iter()
+                            .map(|x| format!("{x:02x}"))
+                            .collect::<String>()
                     );
                     (ParamValue::Text(g), 2950)
                 }
@@ -1373,7 +1538,10 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
             let mut m = [0u8; 16];
             let b = r.bytes(len - 1)?;
             m[..b.len()].copy_from_slice(b);
-            (ParamValue::Text(format_decimal(sign == 0, u128::from_le_bytes(m), scale)), 1700)
+            (
+                ParamValue::Text(format_decimal(sign == 0, u128::from_le_bytes(m), scale)),
+                1700,
+            )
         }
         0x28 => {
             let len = r.u8()? as usize;
@@ -1396,7 +1564,10 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
                 0x29 => (ParamValue::Text(time), 1083),
                 0x2a => {
                     let days = le_uint(r.bytes(3)?) as i64;
-                    (ParamValue::Text(format!("{} {time}", date_text(days))), 1114)
+                    (
+                        ParamValue::Text(format!("{} {time}", date_text(days))),
+                        1114,
+                    )
                 }
                 _ => {
                     let days = le_uint(r.bytes(3)?) as i64;
@@ -1405,7 +1576,10 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
                     let o = offset.unsigned_abs();
                     // The value is UTC; the offset only says how it was written.
                     let _ = (sign, o);
-                    (ParamValue::Text(format!("{} {time}+00", date_text(days))), 1184)
+                    (
+                        ParamValue::Text(format!("{} {time}+00", date_text(days))),
+                        1184,
+                    )
                 }
             }
         }
@@ -1420,14 +1594,21 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
                 read_plp(r)?
             } else {
                 let len = r.u16()?;
-                if len == 0xffff { None } else { Some(r.bytes(len as usize)?.to_vec()) }
+                if len == 0xffff {
+                    None
+                } else {
+                    Some(r.bytes(len as usize)?.to_vec())
+                }
             };
             let Some(data) = data else {
                 return Ok((ParamValue::Null, if text { 0 } else { 17 }));
             };
             match ty {
                 0xe7 | 0xef => (ParamValue::Text(utf16_text(&data)), 0),
-                0xa7 | 0xaf => (ParamValue::Text(String::from_utf8_lossy(&data).into_owned()), 0),
+                0xa7 | 0xaf => (
+                    ParamValue::Text(String::from_utf8_lossy(&data).into_owned()),
+                    0,
+                ),
                 _ => (ParamValue::Bytes(data), 17),
             }
         }
@@ -1444,7 +1625,10 @@ pub(crate) fn read_typed_value(r: &mut Reader<'_>) -> io::Result<(ParamValue, u3
             let data = r.bytes(len as usize)?.to_vec();
             match ty {
                 0x63 => (ParamValue::Text(utf16_text(&data)), 0),
-                0x23 => (ParamValue::Text(String::from_utf8_lossy(&data).into_owned()), 0),
+                0x23 => (
+                    ParamValue::Text(String::from_utf8_lossy(&data).into_owned()),
+                    0,
+                ),
                 _ => (ParamValue::Bytes(data), 17),
             }
         }
@@ -1509,7 +1693,11 @@ mod tests {
     fn login_password_is_unscrambled() {
         // "ab" scrambled: swap nibbles then XOR 0xA5, per UTF-16 byte.
         let scramble = |b: u8| b.rotate_left(4) ^ 0xa5;
-        let password: Vec<u8> = "ab".encode_utf16().flat_map(|u| u.to_le_bytes()).map(scramble).collect();
+        let password: Vec<u8> = "ab"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .map(scramble)
+            .collect();
         let mut p = vec![0u8; 94];
         p.extend_from_slice(&password);
         p[44..46].copy_from_slice(&94u16.to_le_bytes());
@@ -1524,10 +1712,26 @@ mod tests {
         put_value(&mut out, &ColType::Int(4), Some(b"-2")).unwrap();
         assert_eq!(out, vec![4, 0xfe, 0xff, 0xff, 0xff]);
         let mut out = Vec::new();
-        put_value(&mut out, &ColType::Decimal { precision: 10, scale: 2 }, Some(b"19.99")).unwrap();
+        put_value(
+            &mut out,
+            &ColType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            Some(b"19.99"),
+        )
+        .unwrap();
         assert_eq!(out, vec![9, 1, 0xcf, 0x07, 0, 0, 0, 0, 0, 0]);
         let mut out = Vec::new();
-        put_value(&mut out, &ColType::Guid, Some(b"00112233-4455-6677-8899-aabbccddeeff")).unwrap();
-        assert_eq!(out[..9], [16, 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66]);
+        put_value(
+            &mut out,
+            &ColType::Guid,
+            Some(b"00112233-4455-6677-8899-aabbccddeeff"),
+        )
+        .unwrap();
+        assert_eq!(
+            out[..9],
+            [16, 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66]
+        );
     }
 }
