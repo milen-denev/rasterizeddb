@@ -1048,14 +1048,16 @@ pub fn multi_exists_predicate(
 /// second relation reads as `Unknown` rather than `Inner`, and the correlation
 /// is never found.
 fn inner_names(relation_text: &str) -> Vec<String> {
+    use crate::core::rql::join::find_keyword;
+    // Split at `JOIN` and cut each piece at its `ON`, both only outside
+    // parentheses: a derived table's own body has keywords of its own.
     let mut pieces: Vec<&str> = Vec::new();
     let mut rest = relation_text;
     loop {
-        let upper = rest.to_ascii_uppercase();
-        match upper.find(" JOIN ") {
+        match find_keyword(rest, "JOIN", 0) {
             Some(at) => {
                 pieces.push(&rest[..at]);
-                rest = &rest[at + " JOIN ".len()..];
+                rest = &rest[at + "JOIN".len()..];
             }
             None => {
                 pieces.push(rest);
@@ -1067,15 +1069,35 @@ fn inner_names(relation_text: &str) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for piece in pieces {
         // An `ON` clause belongs to the join, not to the relation it follows.
-        let upper = piece.to_ascii_uppercase();
-        let body = match upper.find(" ON ") {
+        let body = match find_keyword(piece, "ON", 0) {
             Some(at) => &piece[..at],
             None => piece,
         };
+        let mut body = body.trim();
+        if body.len() > 7 && body.as_bytes()[..7].eq_ignore_ascii_case(b"LATERAL") && !body.as_bytes()[7].is_ascii_alphanumeric() {
+            body = body[7..].trim_start();
+        }
+        // A derived table or `(VALUES …)` is named by the alias after its
+        // closing parenthesis, and only by that: read as words, `(SELECT id
+        // FROM mt) AS t` named `id`, so `t.id` counted as an outer column and
+        // `t.id = s.id` was refused as a comparison that is not `=`.
+        if body.starts_with('(') {
+            if let Some(close) = crate::core::sql_scan::matching_close(body, 0) {
+                let mut after = body[close + 1..].trim_start();
+                if after.len() > 2 && after.as_bytes()[..2].eq_ignore_ascii_case(b"AS") && after.as_bytes()[2].is_ascii_whitespace() {
+                    after = after[2..].trim_start();
+                }
+                let alias: &str = after.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+                if !alias.is_empty() {
+                    names.push(alias.trim_matches('"').to_string());
+                }
+            }
+            continue;
+        }
         let mut tokens = body.split_whitespace().filter(|t| {
             !matches!(
                 t.to_ascii_uppercase().as_str(),
-                "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "FULL" | "AS"
+                "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "FULL" | "AS" | "NATURAL"
             )
         });
         // An aliased relation is named by its alias alone, as SQL scopes it:

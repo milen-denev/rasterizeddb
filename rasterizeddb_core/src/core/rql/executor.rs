@@ -541,6 +541,36 @@ async fn run_subquery_scaled(
     need: SubqueryNeed,
     normalize: bool,
 ) -> Result<(Vec<crate::core::row::row::Row>, Option<Vec<u32>>), String> {
+    // A derived table in the subquery's own `FROM` — `(SELECT …) t`,
+    // `(VALUES …) t(x)` — or a correlated scalar subquery in it, is
+    // materialised here as the top level materialises
+    // its own (`cte::materialize_derived`), and dropped once the rows are
+    // read. Without it `EXISTS (SELECT 1 FROM (SELECT id FROM mt) t WHERE
+    // t.id = s.id)` — and an uncorrelated `IN (SELECT … FROM (SELECT …) t)`
+    // — failed as "Table not found": nothing below reads `FROM (SELECT`.
+    if crate::core::rql::cte::next_derived_table(sql).is_some()
+        || crate::core::rql::table_functions::next_item(sql).is_some()
+        || crate::core::rql::subquery::find_correlated_scalar_subquery(sql).is_some()
+    {
+        if let Some(materialized) = Box::pin(crate::core::rql::cte::materialize_derived(sql, database, tx)).await? {
+            let result =
+                Box::pin(run_subquery_scaled_body(&materialized.rewritten, database, tx, need, normalize)).await;
+            crate::core::rql::cte::drop_temps(database, &materialized.temps, tx).await;
+            return result;
+        }
+    }
+    Box::pin(run_subquery_scaled_body(sql, database, tx, need, normalize)).await
+}
+
+/// [`run_subquery_scaled`] over a statement whose derived tables are
+/// relations by now.
+async fn run_subquery_scaled_body(
+    sql: &str,
+    database: &Arc<Database>,
+    tx: TxId,
+    need: SubqueryNeed,
+    normalize: bool,
+) -> Result<(Vec<crate::core::row::row::Row>, Option<Vec<u32>>), String> {
     // The inner query is executed exactly once, with no outer row in scope. A
     // correlated subquery would reference an outer column, which the inner
     // table's schema does not have, so it fails here by name rather than being
@@ -572,6 +602,18 @@ async fn run_subquery_scaled(
     } else {
         sql
     };
+    // A correlated scalar subquery left here has no per-row evaluator: the
+    // substitution above leaves it in place, and its text would reach the
+    // select-list parser as an expression over this query's own rows — a
+    // wrong value for every row, not an error. The bodies that can hold one
+    // are rewritten to `LATERAL` before they get here
+    // (`cte::materialize_derived`); any other is refused.
+    if let Some(found) = crate::core::rql::subquery::find_correlated_scalar_subquery(sql) {
+        return Err(format!(
+            "a correlated scalar subquery is not supported here yet: ({}); write it as a join",
+            found.inner_sql.trim()
+        ));
+    }
 
     // A subquery with no FROM — `(SELECT 7)`, `(SELECT now())` — is its one
     // row, evaluated as the top level evaluates it (`rql::no_from`).

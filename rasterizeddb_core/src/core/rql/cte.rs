@@ -2754,6 +2754,18 @@ async fn materialize_derived_inner(
     let mut current = sql.to_string();
     let mut found_any = false;
 
+    // A correlated scalar subquery, as the `LATERAL` join it means
+    // (`rql::correlated`), materialised with the other `LATERAL` items below.
+    // The top level rewrites its own before it gets here, but a derived
+    // table's or a CTE's body never passed there: its subquery's text reached
+    // the select-list parser, which read it as an expression over the outer
+    // row and answered `'t'` — or `max(ms.id)` under an aggregate — for
+    // every row, without an error.
+    if let Some(rewritten) = crate::core::rql::correlated::rewrite_select(&current) {
+        current = rewritten?;
+        found_any = true;
+    }
+
     // `SELECT generate_series(1, 3)`: the `FROM` form it means.
     if let Some(form) = crate::core::rql::table_functions::select_list_form(&current) {
         current = form;

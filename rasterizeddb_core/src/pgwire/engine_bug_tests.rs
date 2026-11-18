@@ -590,3 +590,67 @@ async fn an_optional_filter_after_the_first_conjunct_compiles() {
         assert_eq!(one(&db, &mut s, &sql).await, vec![r(&[Some(expected)])], "{sql}");
     }
 }
+
+/// A correlated scalar subquery inside a derived table or a CTE body is
+/// evaluated per outer row, as at the top level. Its text reached the
+/// select-list parser instead, which read it as an expression over the
+/// outer row: `'t'` for every row, `max(ms.id)` under an aggregate, the
+/// outer ids under `string_agg` — no error. Found by the SQL Server front
+/// end. Each expected value is PostgreSQL 17's for these rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_subquery_inside_a_derived_table_reads_each_row() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE mt (id int PRIMARY KEY, v text)").await;
+    ok(&db, &mut s, "INSERT INTO mt VALUES (1,'A'),(2,'gone')").await;
+    ok(&db, &mut s, "CREATE TABLE ms (id int, v text)").await;
+    ok(&db, &mut s, "INSERT INTO ms VALUES (1,'A'),(3,'C')").await;
+    let cases: [(&str, Rows); 9] = [
+        (
+            "SELECT j FROM (SELECT (SELECT max(mt.v) FROM mt WHERE mt.id = ms.id) AS j FROM ms) AS z ORDER BY j",
+            vec![r(&[Some("A")]), r(&[None])],
+        ),
+        (
+            "SELECT j FROM (SELECT max((SELECT max(mt.v) FROM mt WHERE mt.id = ms.id)) AS j FROM ms) AS z",
+            vec![r(&[Some("A")])],
+        ),
+        (
+            "SELECT j FROM (SELECT string_agg('{' || (SELECT string_agg(mt.v, ',') FROM mt WHERE mt.id = ms.id) || '}', ',') AS j FROM ms) AS z",
+            vec![r(&[Some("{A}")])],
+        ),
+        (
+            "WITH z AS (SELECT (SELECT max(mt.v) FROM mt WHERE mt.id = ms.id) AS j FROM ms) SELECT j FROM z ORDER BY j",
+            vec![r(&[Some("A")]), r(&[None])],
+        ),
+        (
+            "SELECT z.id, z.j FROM (SELECT ms.id, (SELECT count(*) FROM mt WHERE mt.id = ms.id) AS j FROM ms) z ORDER BY z.id",
+            vec![r(&[Some("1"), Some("1")]), r(&[Some("3"), Some("0")])],
+        ),
+        (
+            "SELECT * FROM (SELECT * FROM (SELECT ms.id, (SELECT max(mt.v) FROM mt WHERE mt.id = ms.id) AS j FROM ms) a) b ORDER BY id",
+            vec![r(&[Some("1"), Some("A")]), r(&[Some("3"), None])],
+        ),
+        // A derived table inside EXISTS or IN: refused as a comparison that
+        // was not `=`, or "Table not found", before.
+        (
+            "SELECT ms.id FROM ms WHERE EXISTS (SELECT 1 FROM (SELECT id FROM mt) AS t WHERE t.id = ms.id)",
+            vec![r(&[Some("1")])],
+        ),
+        (
+            "SELECT ms.id FROM ms WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1),(2)) AS t(id) WHERE t.id = ms.id)",
+            vec![r(&[Some("3")])],
+        ),
+        (
+            "SELECT ms.id FROM ms WHERE ms.id IN (SELECT t.id FROM (SELECT id FROM mt) AS t)",
+            vec![r(&[Some("1")])],
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(one(&db, &mut s, sql).await, expected, "{sql}");
+    }
+    // Still refused, not guessed: the join would change the grouping.
+    let e = rows(&db, &mut s, "SELECT j FROM (SELECT (SELECT max(mt.v) FROM mt WHERE mt.id = ms.id) AS j FROM ms GROUP BY ms.id) z")
+        .await
+        .expect_err("refused");
+    assert_eq!(sqlstate_of(&e), "0A000", "{e}");
+}
