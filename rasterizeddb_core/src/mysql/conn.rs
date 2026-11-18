@@ -93,6 +93,11 @@ fn fast_auth_cache() -> &'static parking_lot::Mutex<HashMap<(String, String), (S
     CACHE.get_or_init(Default::default)
 }
 
+/// Equality that takes as long whichever byte differs.
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
     for p in parts {
@@ -216,6 +221,9 @@ pub(crate) async fn serve_connection(
     });
     super::registry().lock().insert(conn_id, registered.clone());
 
+    // Logged in: packets up to max_allowed_packet, and read ahead.
+    io.max_packet = super::packet::MAX_ALLOWED_PACKET;
+    io.exact = false;
     let tls = io.stream.is_secure();
     let port = shared.config.tcp.as_ref().map(|t| t.1).unwrap_or(0);
     let mut session = Session {
@@ -453,7 +461,7 @@ async fn authenticate(
                 for i in 0..32 {
                     h1[i] = response[i] ^ k[i];
                 }
-                if sha256(&[&h1]) == h2 {
+                if constant_time_eq(&sha256(&[&h1]), &h2) {
                     io.packet(&[0x01, 0x03]);
                     return Ok(Some(login));
                 }

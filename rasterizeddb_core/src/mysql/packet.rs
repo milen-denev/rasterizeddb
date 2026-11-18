@@ -114,7 +114,13 @@ pub(crate) struct Packets {
     /// Read exactly a packet at a time, never ahead: during the handshake,
     /// where TLS bytes may follow an SSL request in the same segment.
     pub(crate) exact: bool,
+    /// The largest packet accepted: small until the client has logged in, so
+    /// an unauthenticated one cannot make the server hold megabytes.
+    pub(crate) max_packet: usize,
 }
+
+/// What a client may send before it has authenticated.
+pub(crate) const MAX_LOGIN_PACKET: usize = 64 * 1024;
 
 impl Packets {
     pub(crate) fn new(stream: MyStream) -> Self {
@@ -125,6 +131,7 @@ impl Packets {
             out: Vec::with_capacity(1024),
             seq: 0,
             exact: true,
+            max_packet: MAX_LOGIN_PACKET,
         }
     }
 
@@ -163,7 +170,7 @@ impl Packets {
             let len = h[0] as usize | (h[1] as usize) << 8 | (h[2] as usize) << 16;
             self.seq = h[3].wrapping_add(1);
             self.rpos += 4;
-            if payload.len() + len > MAX_ALLOWED_PACKET {
+            if payload.len() + len > self.max_packet {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "packet larger than max_allowed_packet"));
             }
             self.fill(len).await?;

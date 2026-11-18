@@ -185,6 +185,7 @@ pub(crate) async fn serve_connection(base: tds::Base, peer: String, shared: StdA
             tds::done(out, tds::TOKEN_DONE, 0, 0, 0);
             session.wire.send(tds::PT_REPLY).await?;
             session.wire.packet_size = packet_size;
+            session.wire.max_message = tds::MAX_MESSAGE;
         }
         Err(e) => {
             let out = session.wire.reply();

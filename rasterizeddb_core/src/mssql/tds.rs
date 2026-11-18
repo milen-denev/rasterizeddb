@@ -341,7 +341,12 @@ pub(crate) struct Wire {
     pub(crate) spid: u16,
     /// Reply bytes already cut into packets, for [`Wire::mark`].
     sent: usize,
+    /// The largest message accepted: small until the client has logged in.
+    pub(crate) max_message: usize,
 }
+
+/// What a client may send before it has logged in (PRELOGIN, LOGIN7).
+pub(crate) const MAX_LOGIN_MESSAGE: usize = 64 * 1024;
 
 impl Wire {
     pub(crate) fn new(stream: TdsStream) -> Self {
@@ -355,6 +360,7 @@ impl Wire {
             packet_id: 1,
             spid: 0,
             sent: 0,
+            max_message: MAX_LOGIN_MESSAGE,
         }
     }
 
@@ -428,7 +434,7 @@ impl Wire {
             }
             self.rpos += 8;
             self.fill(len - 8).await?;
-            if payload.len() + len - 8 > MAX_MESSAGE {
+            if payload.len() + len - 8 > self.max_message {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "TDS message too large"));
             }
             payload.extend_from_slice(&self.rbuf[self.rpos..self.rpos + len - 8]);

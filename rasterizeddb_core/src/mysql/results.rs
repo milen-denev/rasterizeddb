@@ -353,8 +353,9 @@ pub(crate) fn write_binary_row(io: &mut Packets, columns: &[MyColumn], cells: &[
             Some(v) => {
                 let column = columns.get(k).cloned().unwrap_or_else(|| MyColumn::text(""));
                 if let Err(e) = put_binary_value(out, &column, v) {
-                    out.truncate(at + 4);
-                    io.end(at);
+                    // The row is not sent at all: the error that follows
+                    // ends the result.
+                    out.truncate(at);
                     return Err(e);
                 }
             }
