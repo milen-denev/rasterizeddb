@@ -491,3 +491,77 @@ async fn a_folded_subquery_keeps_its_type_and_current_date_is_a_date() {
         assert_eq!(one(&db, &mut s, sql).await, vec![r(&[Some(want)])], "{sql}");
     }
 }
+
+/// A constant NULL test or a comparison with NULL anywhere in a WHERE
+/// clause answers as PostgreSQL does. The optional-filter pattern `($1 IS
+/// NULL OR col = $1)`, once a parameter is inlined, was refused for a NULL
+/// value (0A000 "NULL literals are not supported yet") and a syntax error at
+/// `IS` for any other. Found by the MySQL/SQL Server front ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn null_constants_in_a_where_clause_answer_as_postgresql_does() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE pn (id INT PRIMARY KEY, customer TEXT, n INT)").await;
+    ok(&db, &mut s, "INSERT INTO pn VALUES (1,'a',1),(2,NULL,NULL),(3,'b',3)").await;
+    // Each count checked against PostgreSQL 17's answer for these rows.
+    for (condition, expected) in [
+        ("(customer = NULL OR (NULL IS NULL))", "3"),
+        ("NULL IS NULL", "3"),
+        ("NULL IS NOT NULL", "0"),
+        ("('a' IS NULL OR customer = 'a')", "1"),
+        ("('a' IS NOT NULL AND customer = 'a')", "1"),
+        ("(5 IS NULL OR n = 5)", "0"),
+        ("(NULL IS NULL OR n = NULL)", "3"),
+        ("(NULL::text IS NULL OR customer = NULL::text)", "3"),
+        ("(NULL::int4 IS NULL OR n = NULL::int4)", "3"),
+        ("('a'::text IS NOT NULL AND customer = 'a'::text)", "1"),
+        ("customer IS NULL OR NULL IS NOT NULL", "1"),
+        ("NOT (NULL IS NULL)", "0"),
+        ("NOT NULL IS NULL", "0"),
+        ("id = 1 AND NOT ('a' IS NULL)", "1"),
+        ("(NULL IS NULL) IS TRUE", "3"),
+        // Comparisons with NULL are unknown, whichever side and operator.
+        ("NULL = customer", "0"),
+        ("NULL = NULL", "0"),
+        ("n > NULL", "0"),
+        ("n >= NULL OR id = 1", "1"),
+        ("customer = NULL::text", "0"),
+        ("NOT (NULL = customer)", "0"),
+        ("NOT (customer = NULL::text)", "0"),
+        ("(customer = NULL) IS UNKNOWN", "3"),
+        ("NULL", "0"),
+        // NULL as a value, not a condition, is left to what reads it.
+        ("customer IN (NULL)", "0"),
+        ("customer IS NOT NULL", "2"),
+        ("coalesce(customer, NULL) = 'a'", "1"),
+        ("customer = 'x NULL IS NULL'", "0"),
+    ] {
+        let sql = format!("SELECT count(*) FROM pn WHERE {condition}");
+        assert_eq!(one(&db, &mut s, &sql).await, vec![r(&[Some(expected)])], "{sql}");
+    }
+    // The same through UPDATE and DELETE.
+    ok(&db, &mut s, "UPDATE pn SET n = 9 WHERE (NULL IS NULL OR customer = NULL) AND id = 3").await;
+    assert_eq!(one(&db, &mut s, "SELECT n FROM pn WHERE id = 3").await, vec![r(&[Some("9")])]);
+    ok(&db, &mut s, "DELETE FROM pn WHERE NULL::text IS NOT NULL OR id = 99").await;
+    assert_eq!(one(&db, &mut s, "SELECT count(*) FROM pn").await, vec![r(&[Some("3")])]);
+}
+
+/// An unknown column under an alias is 42703 naming the column, as without
+/// one: `nope AS "Nope"` was 42601 naming `nope AS "Nope"`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_column_under_an_alias_is_undefined_column() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE ua (id INT PRIMARY KEY)").await;
+    for (sql, name) in [
+        ("SELECT nope AS \"Nope\" FROM ua", "'nope'"),
+        ("SELECT id, nope AS x FROM ua", "'nope'"),
+        ("SELECT nope x FROM ua", "'nope'"),
+        ("SELECT ua.nope AS x FROM ua", "'ua.nope'"),
+        ("SELECT nope FROM ua", "'nope'"),
+    ] {
+        let e = rows(&db, &mut s, sql).await.expect_err(sql);
+        assert_eq!(sqlstate_of(&e), "42703", "{sql}: {e}");
+        assert!(e.contains(name) && !e.contains(" AS ") && !e.contains("nope x"), "{sql}: {e}");
+    }
+}

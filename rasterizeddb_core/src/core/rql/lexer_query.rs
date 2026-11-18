@@ -816,13 +816,20 @@ fn parse_select_items(
         }
 
         let name = expr.rsplit('.').next().unwrap_or(expr).trim_matches('"');
+        // The name that is missing, not the item with its alias: `nope AS
+        // "Nope"` was reported as column 'nope AS "Nope"', which no client
+        // reads as a name, and which pgwire then sent as a syntax error
+        // (42601) rather than an undefined column (42703). Only a single
+        // name is reported bare; anything else stays whole, as text the
+        // parser could not read.
+        let missing = if alias.is_some() && is_one_name(expr) { expr } else { item };
         if crate::core::rql::nullable::is_hidden(name) {
-            return Err(format!("Column '{}' not found in schema", item));
+            return Err(format!("Column '{}' not found in schema", missing));
         }
         let field = schema
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
-            .ok_or_else(|| format!("Column '{}' not found in schema", item))?;
+            .ok_or_else(|| format!("Column '{}' not found in schema", missing))?;
         out.push(SelectItem::Column {
             label: alias.unwrap_or_else(|| field.name.clone()),
             field: field.clone(),
@@ -3572,4 +3579,20 @@ mod distinct_on_detection {
         assert!(!starts_with_distinct_on("on, id"));
         assert!(!starts_with_distinct_on("on"));
     }
+}
+
+/// Whether `text` is one name, `x`, `t.x` or `"X"`: what an unknown-column
+/// message may report bare.
+fn is_one_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.split('.').all(|part| {
+            let bare = part.strip_prefix('"').and_then(|p| p.strip_suffix('"'));
+            match bare {
+                Some(quoted) => !quoted.is_empty() && !quoted.contains('"'),
+                None => {
+                    part.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                        && part.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                }
+            }
+        })
 }

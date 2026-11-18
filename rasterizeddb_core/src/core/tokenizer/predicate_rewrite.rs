@@ -2349,6 +2349,356 @@ pub(crate) fn expand_row_value_comparisons(clause: &str) -> Result<String, Strin
     Err("too many row comparisons in one clause".to_string())
 }
 
+/// What a [`NullSpan`] is, for the constant-NULL folds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NullSpanKind {
+    /// A quoted string literal.
+    Str,
+    /// A number.
+    Num,
+    /// A name, keyword or `"quoted"` identifier.
+    Word,
+    /// `::`.
+    Cast,
+    /// A run of `<`, `>`, `=`, `!`.
+    Op,
+    LPar,
+    RPar,
+    /// An operand already lifted for the evaluator; never looked into.
+    Opaque,
+    /// Any other character.
+    Other,
+}
+
+/// One token of a clause, as byte offsets into it.
+#[derive(Clone, Copy, Debug)]
+struct NullSpan {
+    kind: NullSpanKind,
+    start: usize,
+    end: usize,
+}
+
+/// Splits `clause` into the spans the constant-NULL folds match on. Strings,
+/// quoted identifiers and lifted operands are single spans, so nothing inside
+/// one is ever matched.
+fn null_spans(clause: &str) -> Vec<NullSpan> {
+    let bytes = clause.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let start = i;
+        let kind = match b {
+            _ if b.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            b'\'' | b'"' => {
+                i += 1;
+                loop {
+                    match bytes.get(i) {
+                        None => break,
+                        Some(&c) if c == b => {
+                            // A doubled quote is one quote inside the literal.
+                            if bytes.get(i + 1) == Some(&b) {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                if b == b'\'' { NullSpanKind::Str } else { NullSpanKind::Word }
+            }
+            LIFTED_OPEN => {
+                i = clause[i..].find(LIFTED_CLOSE as char).map_or(bytes.len(), |k| i + k + 1);
+                NullSpanKind::Opaque
+            }
+            b'0'..=b'9' => {
+                i += 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    let exponent_sign = matches!(c, b'+' | b'-') && matches!(bytes[i - 1], b'e' | b'E');
+                    if c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E') || exponent_sign {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                NullSpanKind::Num
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                i += 2;
+                NullSpanKind::Cast
+            }
+            b'(' => {
+                i += 1;
+                NullSpanKind::LPar
+            }
+            b')' => {
+                i += 1;
+                NullSpanKind::RPar
+            }
+            b'<' | b'>' | b'=' | b'!' => {
+                while i < bytes.len() && matches!(bytes[i], b'<' | b'>' | b'=' | b'!') {
+                    i += 1;
+                }
+                NullSpanKind::Op
+            }
+            _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'$' | b'.') || c >= 0x80 {
+                        i += 1;
+                    } else if c == b'"' {
+                        // `t."Col"`: the quoted part belongs to the name.
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'"' {
+                            i += 1;
+                        }
+                        i = (i + 1).min(bytes.len());
+                    } else {
+                        break;
+                    }
+                }
+                NullSpanKind::Word
+            }
+            _ => {
+                i += clause[i..].chars().next().map_or(1, char::len_utf8);
+                NullSpanKind::Other
+            }
+        };
+        out.push(NullSpan { kind, start, end: i });
+    }
+    out
+}
+
+/// A constant operand starting at span `at`: `NULL`, `TRUE`, `FALSE`, a string
+/// or a number, with any `::type` casts after it (`NULL::text`,
+/// `'x'::varchar(10)`, `$1`'s inlined `NULL::int4`). The span just past it,
+/// and whether it is NULL.
+fn constant_operand(clause: &str, spans: &[NullSpan], at: usize) -> Option<(usize, bool)> {
+    let first = spans.get(at)?;
+    let text = &clause[first.start..first.end];
+    let is_null = match first.kind {
+        NullSpanKind::Word if text.eq_ignore_ascii_case("null") => true,
+        NullSpanKind::Word if text.eq_ignore_ascii_case("true") || text.eq_ignore_ascii_case("false") => false,
+        NullSpanKind::Str | NullSpanKind::Num => false,
+        _ => return None,
+    };
+    let mut k = at + 1;
+    while spans.get(k).is_some_and(|s| s.kind == NullSpanKind::Cast) {
+        // The type: one or more words (`double precision`, `character
+        // varying`), then an optional `(n[, m])`, then an optional `[]`.
+        let mut words = 0;
+        while spans.get(k + 1 + words).is_some_and(|s| {
+            s.kind == NullSpanKind::Word && !is_boolean_keyword(&clause[s.start..s.end])
+        }) {
+            words += 1;
+        }
+        if words == 0 {
+            return None;
+        }
+        k += 1 + words;
+        if spans.get(k).is_some_and(|s| s.kind == NullSpanKind::LPar) {
+            let mut j = k + 1;
+            while spans.get(j).is_some_and(|s| {
+                s.kind == NullSpanKind::Num || (s.kind == NullSpanKind::Other && &clause[s.start..s.end] == ",")
+            }) {
+                j += 1;
+            }
+            if !spans.get(j).is_some_and(|s| s.kind == NullSpanKind::RPar) {
+                return None;
+            }
+            k = j + 1;
+        }
+        if spans.get(k).is_some_and(|s| s.kind == NullSpanKind::Other && &clause[s.start..s.end] == "[")
+            && spans.get(k + 1).is_some_and(|s| s.kind == NullSpanKind::Other && &clause[s.start..s.end] == "]")
+        {
+            k += 2;
+        }
+    }
+    Some((k, is_null))
+}
+
+fn is_boolean_keyword(word: &str) -> bool {
+    ["and", "or", "not", "is"].iter().any(|k| word.eq_ignore_ascii_case(k))
+}
+
+/// Where the conditions of a clause begin and end, over its [`NullSpan`]s.
+///
+/// A condition begins at the clause's start, after a prefix `NOT`, after an
+/// `AND` or `OR` joining conditions, and inside a `(` that groups conditions.
+/// Not inside `IN (`, `f(` or `= (`: the `NULL` in `x IN (NULL)` is a value,
+/// not a condition. Not after the `NOT` of `IS NOT` or `NOT LIKE`, nor after
+/// the `AND` of `BETWEEN 1 AND …`.
+struct NullTerms {
+    /// `starts[k]`: a condition may begin at span `k`.
+    starts: Vec<bool>,
+    /// `ends[k]`: span `k` (`)`, a joining `AND`/`OR`, `;`) ends a condition.
+    ends: Vec<bool>,
+}
+
+impl NullTerms {
+    fn new(clause: &str, spans: &[NullSpan]) -> Self {
+        let n = spans.len();
+        let mut starts = vec![false; n + 1];
+        let mut ends = vec![false; n];
+        starts[0] = true;
+        // Per open paren: whether it groups conditions, and whether a
+        // `BETWEEN` in it waits for its `AND`. The bottom entry is the clause.
+        let mut parens: Vec<(bool, bool)> = vec![(true, false)];
+        for (k, s) in spans.iter().enumerate() {
+            let text = &clause[s.start..s.end];
+            match s.kind {
+                NullSpanKind::LPar => {
+                    let group = starts[k];
+                    parens.push((group, false));
+                    starts[k + 1] = group;
+                }
+                NullSpanKind::RPar => {
+                    ends[k] = true;
+                    if parens.len() > 1 {
+                        parens.pop();
+                    }
+                }
+                NullSpanKind::Word => {
+                    let top = parens.last_mut().expect("the clause's entry");
+                    if text.eq_ignore_ascii_case("between") {
+                        top.1 = true;
+                    } else if text.eq_ignore_ascii_case("and") && top.1 {
+                        top.1 = false;
+                    } else if (text.eq_ignore_ascii_case("and") || text.eq_ignore_ascii_case("or")) && top.0 {
+                        ends[k] = true;
+                        starts[k + 1] = true;
+                    } else if text.eq_ignore_ascii_case("not") && starts[k] {
+                        starts[k + 1] = true;
+                    }
+                }
+                NullSpanKind::Other if text == ";" => ends[k] = true,
+                _ => {}
+            }
+        }
+        NullTerms { starts, ends }
+    }
+
+    fn starts(&self, k: usize) -> bool {
+        self.starts.get(k).copied().unwrap_or(false)
+    }
+
+    /// Whether a condition may end just before span `k`.
+    fn ends_before(&self, k: usize) -> bool {
+        self.ends.get(k).copied().unwrap_or(true)
+    }
+}
+
+/// Folds `<constant> IS [NOT] NULL` to a predicate that always or never
+/// holds: `NULL IS NULL`, `'a' IS NULL`, `NULL::text IS NOT NULL`, `5 IS NULL`.
+///
+/// The optional-filter pattern `($1 IS NULL OR col = $1)` reaches the WHERE
+/// clause this way once a bound parameter is inlined, and neither half was
+/// read: a NULL operand was refused ("NULL literals are not supported yet"),
+/// any other a syntax error at `IS`. The test is two-valued — true or false,
+/// never unknown — so it is folded before `NOT` is pushed down and before the
+/// truth tests are expanded, which then see only `1 = 1` or `1 = 0`.
+fn fold_constant_null_tests(clause: &str) -> String {
+    let spans = null_spans(clause);
+    let terms = NullTerms::new(clause, &spans);
+    let word = |k: usize, w: &str| {
+        spans.get(k).is_some_and(|s| s.kind == NullSpanKind::Word && clause[s.start..s.end].eq_ignore_ascii_case(w))
+    };
+    let mut out = String::with_capacity(clause.len());
+    let mut cursor = 0usize;
+    let mut k = 0usize;
+    while k < spans.len() {
+        if terms.starts(k)
+            && let Some((after, is_null)) = constant_operand(clause, &spans, k)
+            && word(after, "is")
+        {
+            let negated = word(after + 1, "not");
+            let null_at = after + 1 + usize::from(negated);
+            if word(null_at, "null") && terms.ends_before(null_at + 1) {
+                let holds = is_null != negated;
+                out.push_str(&clause[cursor..spans[k].start]);
+                out.push_str(if holds { "1 = 1" } else { "1 = 0" });
+                cursor = spans[null_at].end;
+                k = null_at + 1;
+                continue;
+            }
+        }
+        k += 1;
+    }
+    out.push_str(&clause[cursor..]);
+    out
+}
+
+/// Folds the comparisons with NULL that [`fold_null_comparisons`] does not
+/// see, and a bare NULL condition, to a predicate that never holds:
+/// `NULL = col` (NULL on the left), `n > NULL` and the other orderings,
+/// `col = NULL::text` (a typed NULL, as an inlined parameter arrives), and
+/// `WHERE NULL`. Each is unknown for every row, and WHERE keeps no row for
+/// which it is unknown. A prefix `NOT` before one goes with it: `NOT` of
+/// unknown is unknown.
+///
+/// Runs where the `=`/`<>` fold does, after `NOT` is pushed down, for the same
+/// reason: `NOT (NULL = col)` is unknown too, and folding before the push-down
+/// would have made it `NOT (1 = 0)`, which holds.
+fn fold_null_operand_comparisons(clause: &str) -> String {
+    let spans = null_spans(clause);
+    let terms = NullTerms::new(clause, &spans);
+    let null_operand = |k: usize| constant_operand(clause, &spans, k).filter(|(_, is_null)| *is_null).map(|(end, _)| end);
+    let is_comparison = |k: usize| {
+        spans.get(k).is_some_and(|s| {
+            s.kind == NullSpanKind::Op && matches!(&clause[s.start..s.end], "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
+        })
+    };
+    let is_not = |k: usize| {
+        spans.get(k).is_some_and(|s| s.kind == NullSpanKind::Word && clause[s.start..s.end].eq_ignore_ascii_case("not"))
+    };
+    let mut out = String::with_capacity(clause.len());
+    let mut cursor = 0usize;
+    let mut k = 0usize;
+    while k < spans.len() {
+        if !terms.starts(k) || is_not(k) || spans[k].kind == NullSpanKind::LPar {
+            k += 1;
+            continue;
+        }
+        // The condition from `k`: up to the first `)`, joining `AND`/`OR` or
+        // `;` at its own depth, with the first comparison at that depth.
+        let mut end = k;
+        let mut depth = 0usize;
+        let mut comparison: Option<usize> = None;
+        while end < spans.len() {
+            match spans[end].kind {
+                NullSpanKind::LPar => depth += 1,
+                NullSpanKind::RPar if depth == 0 => break,
+                NullSpanKind::RPar => depth -= 1,
+                _ if depth == 0 && terms.ends_before(end) => break,
+                _ if depth == 0 && comparison.is_none() && is_comparison(end) => comparison = Some(end),
+                _ => {}
+            }
+            end += 1;
+        }
+        let folds = match comparison {
+            Some(op) => null_operand(k) == Some(op) || (op + 1 < end && null_operand(op + 1) == Some(end)),
+            None => null_operand(k) == Some(end),
+        };
+        if folds {
+            let from = if k > 0 && is_not(k - 1) && terms.starts(k - 1) { k - 1 } else { k };
+            out.push_str(&clause[cursor..spans[from].start]);
+            out.push_str("1 = 0");
+            cursor = spans[end - 1].end;
+            k = end;
+            continue;
+        }
+        k += 1;
+    }
+    out.push_str(&clause[cursor..]);
+    out
+}
+
 fn fold_null_comparisons(clause: &str) -> String {
     let upper = clause.to_ascii_uppercase();
     let bytes = clause.as_bytes();
@@ -5472,6 +5822,9 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     // `rewrite_scan_where` has done it).
     let clause = &crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
     let clause = &crate::core::rql::check::lower_text_match(clause);
+    // `<constant> IS [NOT] NULL`, as an inlined parameter makes it, is true
+    // or false outright. See `fold_constant_null_tests`.
+    let clause = &fold_constant_null_tests(clause);
     // Row-value comparisons become their boolean form first, so everything
     // downstream — the NULL fold, the guards, the tokenizer — sees only shapes
     // it already understands.
@@ -5493,6 +5846,7 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     // comparison never reaches the tokenizer, where an untyped NULL against a
     // typed column is a compile error rather than a row that does not match.
     let clause = &fold_null_comparisons(clause);
+    let clause = &fold_null_operand_comparisons(clause);
 
     let toks = floats_for_the_scan(lex(clause)?, schema, scan)?;
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
@@ -7339,12 +7693,14 @@ mod tests {
         assert!(err("country = NULLX").contains("column \"NULLX\" does not exist"));
         // Too short to be `NULL` at all.
         assert!(err("country = NU").contains("column \"NU\" does not exist"));
-        // A tab or newline after `NULL` was never accepted either — only a
-        // literal space was — and the statement is refused rather than folded.
-        // Preserved deliberately: this is behaviour, not an accident of how the
-        // check was written.
-        assert!(err("country = NULL\tAND id = 1").contains("NULL literals"));
-        assert!(err("country = NULL\nAND id = 1").contains("NULL literals"));
+        // A tab or newline after `NULL` is not accepted by this fold — only a
+        // literal space is — but `fold_null_operand_comparisons`, which splits
+        // on any whitespace, folds it after. It used to be refused ("NULL
+        // literals are not supported yet").
+        for clause in ["country = NULL\tAND id = 1", "country = NULL\nAND id = 1"] {
+            let folded = rw(clause);
+            assert!(folded.starts_with("1 = 0") && folded.ends_with("id = 1"), "{clause:?}: {folded:?}");
+        }
     }
 }
 
@@ -7751,5 +8107,3 @@ mod lifted_operand_tests {
         assert!(e.contains("nested more than"), "{e}");
     }
 }
-
-
