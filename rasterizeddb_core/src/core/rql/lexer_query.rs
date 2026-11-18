@@ -275,7 +275,13 @@ fn aggregate_argument(
                 .map_err(|_| format!("Column '{}' not found in schema", arg_text))?
         }
     };
-    let db_type = crate::core::rql::expr::static_type(&parsed);
+    // A `json` value travels as the text it is stored as; the field says
+    // it is `json`, so `json_agg` writes it as JSON rather than quoting it.
+    let db_type = if crate::core::rql::expr::yields_json_text(&parsed) {
+        crate::core::db_type::DbType::JSONTEXT
+    } else {
+        crate::core::rql::expr::static_type(&parsed)
+    };
     let reads = expr_reads(&parsed, schema);
     let field = SchemaField::new(arg_text.to_string(), db_type.clone(), db_type.get_size(), 0, u64::MAX, false);
     Ok((field, Some(crate::core::rql::aggregate::ArgExpression { expr: parsed, schema: reads })))
