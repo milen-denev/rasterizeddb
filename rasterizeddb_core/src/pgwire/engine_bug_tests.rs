@@ -317,3 +317,61 @@ async fn a_duplicate_of_the_blocks_own_key_inside_a_savepoint_is_23505() {
         vec![r(&[Some("1"), Some("70")]), r(&[Some("2"), Some("2")])]
     );
 }
+
+/// `ROLLBACK TO` or `RELEASE` of a savepoint that does not exist fails the
+/// block (3B001), as in PostgreSQL; it was answered and the block went on, so
+/// its COMMIT committed. In a failed block `SAVEPOINT` and `RELEASE` are
+/// refused (25P02): a RELEASE run there merged away the savepoint a ROLLBACK
+/// TO would have revived the block from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_savepoint_fails_the_block() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE b5 (id BIGINT PRIMARY KEY)").await;
+
+    for unknown in [
+        "ROLLBACK TO nosuch",
+        "RELEASE nosuch",
+        "RELEASE SAVEPOINT nosuch",
+    ] {
+        ok(&db, &mut s, "BEGIN").await;
+        ok(&db, &mut s, "INSERT INTO b5 VALUES (1)").await;
+        let e = rows(&db, &mut s, unknown).await.expect_err(unknown);
+        assert_eq!(sqlstate_of(&e), "3B001", "{unknown}: {e}");
+        let e = rows(&db, &mut s, "SELECT 1")
+            .await
+            .expect_err("a failed block");
+        assert_eq!(sqlstate_of(&e), "25P02", "{unknown}: {e}");
+        ok(&db, &mut s, "COMMIT").await;
+        assert_eq!(
+            one(&db, &mut s, "SELECT count(*) FROM b5").await,
+            vec![r(&[Some("0")])],
+            "{unknown}"
+        );
+    }
+
+    // Under a savepoint, ROLLBACK TO it revives the block.
+    ok(&db, &mut s, "BEGIN").await;
+    ok(&db, &mut s, "INSERT INTO b5 VALUES (1)").await;
+    ok(&db, &mut s, "SAVEPOINT a").await;
+    ok(&db, &mut s, "INSERT INTO b5 VALUES (2)").await;
+    rows(&db, &mut s, "RELEASE nosuch")
+        .await
+        .expect_err("unknown");
+    for refused in ["RELEASE a", "SAVEPOINT b"] {
+        let e = rows(&db, &mut s, refused).await.expect_err(refused);
+        assert_eq!(sqlstate_of(&e), "25P02", "{refused}: {e}");
+    }
+    ok(&db, &mut s, "ROLLBACK TO a").await;
+    ok(&db, &mut s, "COMMIT").await;
+    assert_eq!(
+        one(&db, &mut s, "SELECT id FROM b5").await,
+        vec![r(&[Some("1")])]
+    );
+
+    // Outside a block, each is 25P01.
+    for sql in ["SAVEPOINT a", "ROLLBACK TO a", "RELEASE a"] {
+        let e = rows(&db, &mut s, sql).await.expect_err(sql);
+        assert_eq!(sqlstate_of(&e), "25P01", "{sql}: {e}");
+    }
+}

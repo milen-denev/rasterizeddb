@@ -475,10 +475,14 @@ async fn savepoints_roll_back_part_of_a_block() {
         assert_eq!(code(&m).as_deref(), Some("25P02"), "{m}");
         ok(&mut tx, "ROLLBACK TO b").await;
         ok(&mut tx, "INSERT INTO t (id, v) VALUES (13, 0)").await;
+        // An unknown savepoint fails the block, as in PostgreSQL; ROLLBACK
+        // TO the one still open revives it (and undoes what came after it).
         let m = fails(&mut tx, "RELEASE nosuch").await;
         assert_eq!(code(&m).as_deref(), Some("3B001"), "{m}");
-        // pgwire does not fail the block for that one (see the scripts
-        // below), so it commits.
+        let m = fails(&mut tx, "SELECT id FROM t").await;
+        assert_eq!(code(&m).as_deref(), Some("25P02"), "{m}");
+        ok(&mut tx, "ROLLBACK TO b").await;
+        ok(&mut tx, "INSERT INTO t (id, v) VALUES (13, 0)").await;
         ok(&mut tx, "COMMIT").await;
 
         let ids = match ok(&mut other, "SELECT id FROM t ORDER BY id").await {
@@ -924,12 +928,11 @@ async fn the_native_listener_answers_a_script_as_pgwire_does() {
                     (0, "ROLLBACK"),
                 ],
                 vec![
-                    // pgwire answers a ROLLBACK TO an unknown savepoint
-                    // (3B001) without failing the block, so the COMMIT
-                    // after it commits; PostgreSQL would fail the block.
-                    // Native matches pgwire.
+                    // A ROLLBACK TO an unknown savepoint (3B001) fails the
+                    // block, as in PostgreSQL, so the COMMIT after it rolls
+                    // back.
                     "ok", "23505", "25P02", "25P02", "ok", "ok", "ok", "23505", "ok", "ok", "ok",
-                    "3B001", "ok", "25P01", "25P01", "ok", "25006", "ok", "ok", "ok", "ok",
+                    "3B001", "rolled back", "25P01", "25P01", "ok", "25006", "ok", "ok", "ok", "ok",
                     "25001", "ok",
                 ],
             ),
@@ -955,11 +958,10 @@ async fn the_native_listener_answers_a_script_as_pgwire_does() {
                 ],
             ),
             (
-                // A key the block itself wrote, written again: PostgreSQL
-                // says 23505; this engine says 40001 ("being written by
-                // another transaction") under a savepoint and after
-                // ROLLBACK TO it, on both listeners. Pinned so native keeps
-                // matching pgwire.
+                // A key the block itself wrote, written again under a
+                // savepoint and after ROLLBACK TO it: 23505, as in
+                // PostgreSQL, on both listeners (it was 40001, "being
+                // written by another transaction").
                 "own key under a savepoint",
                 vec![
                     (0, "BEGIN"),
@@ -970,7 +972,7 @@ async fn the_native_listener_answers_a_script_as_pgwire_does() {
                     (0, "INSERT INTO {t} (id, v) VALUES (10, 0)"),
                     (0, "ROLLBACK"),
                 ],
-                vec!["ok", "ok", "ok", "40001", "ok", "40001", "ok"],
+                vec!["ok", "ok", "ok", "23505", "ok", "23505", "ok"],
             ),
             (
                 "lock timeout",

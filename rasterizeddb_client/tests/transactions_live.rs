@@ -410,8 +410,18 @@ async fn savepoints() {
             .await
             .unwrap();
 
+        // An unknown savepoint fails the block, as in PostgreSQL; rolling
+        // back to the one still open revives it, undoing what came after it.
         let e = tx.rollback_to("nosuch").await.unwrap_err();
         assert_eq!(e.sqlstate(), Some("3B001"), "{e}");
+        assert_eq!(
+            tx.run("SELECT id FROM t").await.unwrap_err().sqlstate(),
+            Some("25P02")
+        );
+        tx.rollback_to("b").await.unwrap();
+        tx.run("INSERT INTO t (id, v) VALUES (13, 0)")
+            .await
+            .unwrap();
         assert!(matches!(
             tx.savepoint("not a name").await,
             Err(Error::Param(_))

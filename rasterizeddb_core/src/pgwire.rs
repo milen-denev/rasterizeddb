@@ -9722,6 +9722,18 @@ where
             send_error_response(stream, "42601", "SAVEPOINT requires a name").await?;
             return Ok(true);
         };
+        // In a failed block only ROLLBACK, ROLLBACK TO and COMMIT are
+        // answered, as in PostgreSQL (25P02). Run here, a RELEASE merged away
+        // the savepoint a ROLLBACK TO would have revived the block from.
+        if state.transaction.as_ref().is_some_and(|t| t.failed) {
+            send_error_response(
+                stream,
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )
+            .await?;
+            return Ok(true);
+        }
         // Read before the borrow below, which takes `state` mutably.
         let established_with = state.synchronous_commit;
         match state.transaction.as_mut() {
@@ -9732,7 +9744,7 @@ where
                 send_error_response(
                     stream,
                     "25P01",
-                    "SAVEPOINT can only be used in a transaction block",
+                    "SAVEPOINT can only be used in transaction blocks",
                 )
                 .await?;
             }
@@ -9758,15 +9770,22 @@ where
         .or_else(|| strip_keyword(&lower, "rollback to"))
     {
         let Some(name) = savepoint_name(rest) else {
-            send_error_response(stream, "42601", "ROLLBACK TO requires a savepoint name").await?;
+            fail_statement(state, stream, "42601", "ROLLBACK TO requires a savepoint name").await?;
             return Ok(true);
         };
+        // An unknown savepoint fails the block, as in PostgreSQL: answered
+        // with 3B001 and nothing more, the block went on, and a client that
+        // had lost track of its savepoints committed writes it meant to undo.
+        if state.transaction.as_ref().is_some_and(|t| !t.savepoints.iter().any(|sp| sp.name == name)) {
+            fail_statement(state, stream, "3B001", &format!("savepoint \"{}\" does not exist", name)).await?;
+            return Ok(true);
+        }
         // Set inside the borrow below and applied after it, since restoring it
         // writes to `state` while the block is still borrowed from it.
         let mut restore_sync: Option<Option<bool>> = None;
         match state.transaction.as_mut() {
             None => {
-                send_error_response(stream, "25P01", "there is no transaction in progress").await?;
+                send_error_response(stream, "25P01", "ROLLBACK TO SAVEPOINT can only be used in transaction blocks").await?;
             }
             Some(t) => {
                 // Innermost match wins, so a shadowed name resolves to the
@@ -9828,12 +9847,29 @@ where
         strip_keyword(&lower, "release savepoint").or_else(|| strip_keyword(&lower, "release"))
     {
         let Some(name) = savepoint_name(rest) else {
-            send_error_response(stream, "42601", "RELEASE requires a savepoint name").await?;
+            fail_statement(state, stream, "42601", "RELEASE requires a savepoint name").await?;
             return Ok(true);
         };
+        // In a failed block only ROLLBACK, ROLLBACK TO and COMMIT are
+        // answered, as in PostgreSQL (25P02). Run here, a RELEASE merged away
+        // the savepoint a ROLLBACK TO would have revived the block from.
+        if state.transaction.as_ref().is_some_and(|t| t.failed) {
+            send_error_response(
+                stream,
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )
+            .await?;
+            return Ok(true);
+        }
+        // As `ROLLBACK TO`: an unknown savepoint fails the block.
+        if state.transaction.as_ref().is_some_and(|t| !t.savepoints.iter().any(|sp| sp.name == name)) {
+            fail_statement(state, stream, "3B001", &format!("savepoint \"{}\" does not exist", name)).await?;
+            return Ok(true);
+        }
         match state.transaction.as_mut() {
             None => {
-                send_error_response(stream, "25P01", "there is no transaction in progress").await?;
+                send_error_response(stream, "25P01", "RELEASE SAVEPOINT can only be used in transaction blocks").await?;
             }
             Some(t) => match t.savepoints.iter().rposition(|sp| sp.name == name) {
                 None => {
