@@ -16345,6 +16345,27 @@ async fn execute_alter_table_action(
             // whole words outside quotes: as substrings, a constraint named
             // `user_preferences_pkey` (pg_dump's spelling) or `"prefs_x_key"`
             // was read as a foreign key and failed to parse as one.
+            //
+            // `IF NOT EXISTS` is taken out first, in front or after
+            // `CONSTRAINT` (`unique_key::strip_if_not_exists`), for every
+            // kind. Taken out only for UNIQUE, below the foreign-key branch,
+            // `ADD CONSTRAINT IF NOT EXISTS fk FOREIGN KEY …` reached
+            // `add_foreign_key` with it in place, which read `IF` as the
+            // name: a live key called "if", and the second run failed as a
+            // duplicate of it. A named constraint that is already there is
+            // success, whichever kind it is, as `CREATE UNIQUE INDEX IF NOT
+            // EXISTS` (rewritten into this statement) has always had it.
+            let (description, tolerate_existing) = crate::core::rql::unique_key::strip_if_not_exists(&description);
+            if tolerate_existing
+                && let Ok((Some(name), _)) = crate::core::rql::unique_key::split_constraint_name(&description)
+                && constraint_name_taken(&schema, &plan.table_name, &name)
+            {
+                info!(
+                    "Constraint '{}' already exists on '{}'; IF NOT EXISTS makes that success",
+                    name, plan.table_name
+                );
+                return ddl_ok(0);
+            }
             let keyword = |word: &str| crate::core::rql::join::find_keyword(&description, word, 0).is_some();
             if keyword("FOREIGN") || keyword("REFERENCES") {
                 return Box::pin(add_foreign_key(database, &plan.table_name, &schema, &description, tx)).await;
@@ -16354,12 +16375,6 @@ async fn execute_alter_table_action(
             // is stored rather than noted — and validated against the rows
             // already there, since a constraint the existing data breaks was
             // never true of this table.
-            // `CREATE UNIQUE INDEX IF NOT EXISTS` becomes this statement, and
-            // the tolerance has to survive the rewrite: with it, a constraint
-            // that is already there is success rather than an error.
-            // Taken out in front or after `CONSTRAINT`, where the rewrite
-            // puts it (`unique_key::strip_if_not_exists`).
-            let (description, tolerate_existing) = crate::core::rql::unique_key::strip_if_not_exists(&description);
 
             match crate::core::rql::unique_key::parse_clause(&description, &plan.table_name) {
                 Err(e) => return ddl_error(&e),

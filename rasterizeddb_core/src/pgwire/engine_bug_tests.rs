@@ -203,3 +203,60 @@ async fn a_literal_through_an_expression_is_read_as_the_column_type() {
         vec![r(&[Some("\\x0909"), Some("1")])]
     );
 }
+
+/// `ADD CONSTRAINT IF NOT EXISTS name FOREIGN KEY …` adds the key under its
+/// own name, and a second run is a no-op. `IF NOT EXISTS` was taken out only
+/// for UNIQUE: a foreign key read `IF` as its name, so a live key called "if"
+/// was stored and the second run failed as a duplicate of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_constraint_if_not_exists_names_a_foreign_key_and_a_check_properly() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE p3 (id BIGINT PRIMARY KEY)").await;
+    ok(
+        &db,
+        &mut s,
+        "CREATE TABLE c3 (id BIGINT PRIMARY KEY, p BIGINT, v BIGINT)",
+    )
+    .await;
+    ok(&db, &mut s, "INSERT INTO p3 VALUES (1)").await;
+    for _ in 0..2 {
+        ok(&db, &mut s, "ALTER TABLE c3 ADD CONSTRAINT IF NOT EXISTS c3_p_fk FOREIGN KEY (p) REFERENCES p3 (id)").await;
+        ok(
+            &db,
+            &mut s,
+            "ALTER TABLE c3 ADD CONSTRAINT IF NOT EXISTS c3_v_chk CHECK (v > 0)",
+        )
+        .await;
+    }
+    // Without IF NOT EXISTS, the name is taken.
+    let e = rows(
+        &db,
+        &mut s,
+        "ALTER TABLE c3 ADD CONSTRAINT c3_p_fk FOREIGN KEY (p) REFERENCES p3 (id)",
+    )
+    .await
+    .expect_err("a second key under the name");
+    assert_eq!(sqlstate_of(&e), "42710", "{e}");
+
+    let e = rows(&db, &mut s, "INSERT INTO c3 VALUES (1, 99, 1)")
+        .await
+        .expect_err("an orphan");
+    assert_eq!(sqlstate_of(&e), "23503", "{e}");
+    assert!(e.contains("\"c3_p_fk\""), "{e}");
+    let e = rows(&db, &mut s, "INSERT INTO c3 VALUES (2, 1, -1)")
+        .await
+        .expect_err("a failed check");
+    assert_eq!(sqlstate_of(&e), "23514", "{e}");
+    assert!(e.contains("\"c3_v_chk\""), "{e}");
+    ok(&db, &mut s, "INSERT INTO c3 VALUES (3, 1, 1)").await;
+
+    // There is no constraint called "if", and each one drops by its name.
+    let e = rows(&db, &mut s, "ALTER TABLE c3 DROP CONSTRAINT \"if\"")
+        .await
+        .expect_err("no such constraint");
+    assert_eq!(sqlstate_of(&e), "42704", "{e}");
+    ok(&db, &mut s, "ALTER TABLE c3 DROP CONSTRAINT c3_p_fk").await;
+    ok(&db, &mut s, "ALTER TABLE c3 DROP CONSTRAINT c3_v_chk").await;
+    ok(&db, &mut s, "INSERT INTO c3 VALUES (4, 99, -1)").await;
+}
