@@ -565,3 +565,28 @@ async fn an_unknown_column_under_an_alias_is_undefined_column() {
         assert!(e.contains(name) && !e.contains(" AS ") && !e.contains("nope x"), "{sql}: {e}");
     }
 }
+
+/// An optional filter with a NULL parameter, after the first conjunct:
+/// `x AND (col = NULL OR …)` failed to compile ("unexpected RPar after the
+/// end of the expression", 42601). SqlClient's `GetSchema("Tables")` sends
+/// exactly this shape with its NULL restrictions.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_optional_filter_after_the_first_conjunct_compiles() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE nt (a TEXT, b TEXT)").await;
+    ok(&db, &mut s, "INSERT INTO nt VALUES ('x', 'p'), ('y', NULL)").await;
+    for (condition, expected) in [
+        ("a = 'x' and (a = NULL or a = 'x')", "1"),
+        ("(a = NULL or (1 = 1)) and (a = NULL or (1 = 1))", "2"),
+        ("(a = NULL or (NULL is null)) and (a = NULL or (NULL is null))", "2"),
+        ("(a = NULL or a = 'x') and a = 'x'", "1"),
+        ("(a = NULL or a = 'x') and (a = NULL or a = 'x')", "1"),
+        ("(a = 'x' or (NULL is null)) and (a = 'x' or (NULL is null))", "2"),
+        ("(a = NULL or (NULL is null)) and (b = NULL or (NULL is null)) and (a = 'y' or ('y' is null))", "1"),
+        ("(a = 'x' or ('x' is null)) and (b = NULL or (NULL is null))", "1"),
+    ] {
+        let sql = format!("SELECT count(*) FROM nt WHERE {condition}");
+        assert_eq!(one(&db, &mut s, &sql).await, vec![r(&[Some(expected)])], "{sql}");
+    }
+}

@@ -2731,16 +2731,20 @@ fn fold_null_comparisons(clause: &str) -> String {
             continue;
         }
         // A boolean separator ends the term the replacement would cover.
-        for keyword in [" AND ", " OR ", "(", ")"] {
-            if upper[i..].starts_with(keyword) {
-                out.push_str(&clause[i..i + keyword.len()]);
-                i += keyword.len();
-                term_start = out.len();
-                break;
-            }
-        }
-        if i >= bytes.len() {
-            break;
+        //
+        // Then the loop starts over, so the next separator is seen too. It
+        // fell through instead: the `(` of `x AND (a = NULL OR …)` was copied
+        // as a plain character with the term still starting before it, and
+        // the fold replaced it along with `a = NULL`, leaving its `)` to fail
+        // the plan ("unexpected RPar"). Every optional filter `(col = @p OR
+        // @p IS NULL) AND (…)` with a NULL parameter hit it once
+        // `fold_constant_null_tests` let `@p IS NULL` through. A quote right
+        // after a separator was likewise copied without opening the quote.
+        if let Some(keyword) = [" AND ", " OR ", "(", ")"].into_iter().find(|k| upper[i..].starts_with(k)) {
+            out.push_str(&clause[i..i + keyword.len()]);
+            i += keyword.len();
+            term_start = out.len();
+            continue;
         }
 
         let is_eq =
@@ -7677,6 +7681,22 @@ mod tests {
     /// what this did — made the rewrite quadratic in the number of comparisons,
     /// so these pin the shapes the cheap test has to keep accepting, and the
     /// near-misses it must keep refusing.
+    #[test]
+    fn the_null_fold_keeps_a_paren_that_follows_a_separator() {
+        // The `(` after `AND`/`OR` opens a group the fold must not replace:
+        // it did, leaving the group's `)` unmatched.
+        assert_eq!(rw("id = 1 and (country = NULL or name = 'x')"), "id = 1 AND ( 1 = 0 OR name = 'x' )");
+        assert_eq!(rw("id = 1 OR (country = NULL)"), "id = 1 OR ( 1 = 0 )");
+        assert_eq!(
+            rw("(country = NULL or (1 = 1)) and (name = NULL or (1 = 1))"),
+            "( 1 = 0 OR ( 1 = 1 ) ) AND ( 1 = 0 OR ( 1 = 1 ) )"
+        );
+        assert_eq!(rw("id = 1 and ((country = NULL))"), "id = 1 AND ( ( 1 = 0 ) )");
+        // A quote right after a separator opens a quote: the `=` in it is not
+        // a comparison.
+        assert_eq!(rw("id = 1 and 'a = NULL' = name"), "id = 1 AND 'a = NULL' = name");
+    }
+
     #[test]
     fn the_null_fold_accepts_exactly_end_space_and_close_paren() {
         // `NULL` at the end of the clause, before a space, before a `)`.
