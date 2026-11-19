@@ -1208,7 +1208,7 @@ impl ConcurrentProcessor {
                             // refuse is left out here as it is there.
                             if let Some(gather) = gather.as_mut() {
                                 if likely(pointer.check_column_range().is_ok()) {
-                                    gather.note(pointer.position);
+                                    gather.note(pointer.position, pointer.length as u64);
                                 }
                                 continue;
                             }
@@ -1455,7 +1455,7 @@ impl ConcurrentProcessor {
                                 // read with the rest of the batch's.
                                 if let Some(gather) = gather.as_mut() {
                                     if likely(pointer.check_column_range().is_ok()) {
-                                        gather.note(pointer.position);
+                                        gather.note(pointer.position, pointer.length as u64);
                                     }
                                     continue;
                                 }
@@ -2310,7 +2310,7 @@ impl ConcurrentProcessor {
                         unreadable = true;
                         break;
                     }
-                    gather.note(pointer.position);
+                    gather.note(pointer.position, pointer.length as u64);
                     if gather.pending() >= column_scan::CACHED_READ_ROWS && gather.flush(&*io_rows).await.is_err() {
                         unreadable = true;
                         break;

@@ -796,6 +796,47 @@ fn string_position(row_position: u64, header: &[u8]) -> std::io::Result<u64> {
     })
 }
 
+/// A string column's cell in a row: where its bytes start, as an offset from
+/// the row's start (eight bytes), and how many there are (four).
+pub(crate) const STRING_HEADER_BYTES: usize = 12;
+
+/// Where a string's bytes are and how many, from its header in a row of
+/// `row_length` bytes at `row_position`. Refused when the size is absurd or
+/// the bytes do not lie inside the row, which is a misread header. An empty
+/// string has no bytes to place and is not range-checked.
+///
+/// The checks [`RowPointer::fetch_row_reuse_async`] makes of a string, for a
+/// reader of cells (`processor::column_scan`) to make alike.
+#[inline]
+pub(crate) fn string_extent(row_position: u64, row_length: u64, header: &[u8]) -> std::io::Result<(u64, usize)> {
+    const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
+    let string_row_position = string_position(row_position, header)?;
+    let string_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    if string_size == 0 {
+        return Ok((string_row_position, 0));
+    }
+    if string_size > MAX_REASONABLE_STRING_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid string size {} (too large)", string_size),
+        ));
+    }
+    let row_end = row_position.saturating_add(row_length);
+    if string_row_position < row_position
+        || string_row_position > row_end
+        || string_row_position.saturating_add(string_size as u64) > row_end
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
+                string_row_position, string_size, row_position, row_end
+            ),
+        ));
+    }
+    Ok((string_row_position, string_size))
+}
+
 #[derive(Debug, Clone)]
 pub struct RowPointer {
     #[cfg(feature = "enable_long_row")]
@@ -2134,17 +2175,12 @@ impl RowPointer {
 
         if !string_col_indices.is_empty() {
             let mut second_pass_reads: SmallVec<[(u64, &mut [u8]); 8]> = SmallVec::new();
-            let row_start = self.position;
-            let row_len = self.length as u64;
-            let row_end = row_start.saturating_add(row_len);
-            const MAX_REASONABLE_STRING_BYTES: usize = 64 * 1024 * 1024;
 
             for (chunk, &col_idx) in string_headers_buffer
                 .chunks_exact(12)
                 .zip(string_col_indices.iter())
             {
-                let string_row_position = string_position(self.position, chunk)?;
-                let string_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap()) as usize;
+                let (string_row_position, string_size) = string_extent(self.position, self.length as u64, chunk)?;
 
                 let col = &mut columns[col_idx];
 
@@ -2153,26 +2189,6 @@ impl RowPointer {
                     col.schema_id = crate::core::row::row::schema_id_of(row_fetch.columns_fetching_data[col_idx].schema_id);
                     col.column_type = DbType::STRING;
                     continue;
-                }
-
-                if string_size > MAX_REASONABLE_STRING_BYTES {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Invalid string size {} (too large)", string_size),
-                    ));
-                }
-
-                if string_row_position < row_start
-                    || string_row_position > row_end
-                    || string_row_position.saturating_add(string_size as u64) > row_end
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "Invalid string range: pos={} size={} row_start={} row_end={} (likely misread header)",
-                            string_row_position, string_size, row_start, row_end
-                        ),
-                    ));
                 }
 
                 if col.data.into_slice().len() != string_size {

@@ -22,23 +22,27 @@
 //!
 //! **Which bytes.** For a column that is not a `STRING`, `fetch_row` reads
 //! `size` bytes at `row position + column offset`; so does this, from the
-//! same `RowFetch` entry. A `STRING` is a header pointing elsewhere in the
-//! row, which this does not follow: a fetch naming one has no layout here
-//! ([`CellLayout::of`] returns `None`) and takes the ordinary scan.
+//! same `RowFetch` entry. A `STRING`'s cell is a header saying where in the
+//! row its bytes are and how many: `fetch_row` reads the headers with the
+//! fixed cells, checks each (`row_pointer::string_extent`) and reads the
+//! bytes in a second pass. So does this, a batch of rows at a time, with the
+//! same check: every row's value of the column lies one after another in
+//! the chunk, with where each ends beside it.
 //!
-//! **A row that cannot be read.** The row scan logs a matched row whose
-//! fetch fails and leaves it out. So does this: when a batch's read fails,
-//! its rows are read again one at a time, and only the rows that still
-//! cannot be read are logged and left out ([`Gather::flush_readable`]). The
-//! two scans therefore answer alike even then. (Whether a visible row that
-//! cannot be read should instead fail the statement is a question for both
-//! scans, not for this one alone.)
+//! **A row that cannot be read.** The row scan leaves out a matched row
+//! whose fetch fails, a string header that does not check among the reasons.
+//! So does this: when a batch's read fails, its rows are read again one at a
+//! time, and only the rows that still cannot be read are logged and left out
+//! ([`Gather::flush_readable`]). The two scans therefore answer alike even
+//! then. (Whether a visible row that cannot be read should instead fail the
+//! statement is a question for both scans, not for this one alone.)
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::core::db_type::DbType;
 use crate::core::row::row::RowFetch;
+use crate::core::row::row_pointer::{string_extent, STRING_HEADER_BYTES};
 use crate::core::storage_providers::traits::StorageIO;
 
 /// 0 = not read yet, 1 = on, 2 = off.
@@ -77,15 +81,19 @@ pub(crate) fn note_fold_from_cells() {
     let _ = FOLDS_FROM_CELLS.try_with(|n| n.set(n.get() + 1));
 }
 
-/// One fixed-width column of a scan's rows.
+/// One column of a scan's rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellColumn {
     /// The column's `write_order`.
     pub schema_id: u64,
-    /// Where it sits in a row.
+    /// Where its cell sits in a row.
     pub offset: u32,
-    /// How many bytes it is, in every row.
+    /// How many bytes the cell is, in every row: the value itself, or for
+    /// a string the header saying where the value is.
     pub width: u32,
+    /// A `STRING`: the cell is a header and the value lies elsewhere in the
+    /// row, as long as the header says.
+    pub text: bool,
 }
 
 /// The columns a cell scan reads, in the order its chunks hold them.
@@ -95,20 +103,23 @@ pub struct CellLayout {
 }
 
 impl CellLayout {
-    /// The layout of `fetch`'s columns, or `None` when one of them is not a
-    /// fixed run of bytes inside the row: a `STRING`, or a column of no
-    /// width. An empty fetch has a layout of no columns, whose chunks only
-    /// count rows.
+    /// The layout of `fetch`'s columns, or `None` when one of them is a
+    /// fixed-width column of no width. An empty fetch has a layout of no
+    /// columns, whose chunks only count rows.
     pub fn of(fetch: &RowFetch) -> Option<CellLayout> {
         let mut columns = Vec::with_capacity(fetch.columns_fetching_data.len());
         for c in fetch.columns_fetching_data.iter() {
-            if c.column_type == DbType::STRING || c.size == 0 {
+            // What `fetch_row` asks of a column, and all it asks: a `STRING`
+            // is read through its header, anything else as `size` bytes.
+            let text = c.column_type == DbType::STRING;
+            if !text && c.size == 0 {
                 return None;
             }
             columns.push(CellColumn {
                 schema_id: c.schema_id,
                 offset: c.column_offset,
-                width: c.size,
+                width: if text { STRING_HEADER_BYTES as u32 } else { c.size },
+                text,
             });
         }
         Some(CellLayout { columns })
@@ -121,19 +132,31 @@ impl CellLayout {
     }
 }
 
-/// The cells of some rows of one scan: `cols[c]` holds column `c` of the
-/// layout for every row, `width` bytes each, row after row.
+/// The cells of some rows of one scan, a buffer per column of the layout.
 #[derive(Debug, Default)]
 pub struct ColumnChunk {
     pub rows: usize,
+    /// A fixed-width column's cells, `width` bytes each, row after row; a
+    /// string column's values, one after another.
     pub cols: Vec<Vec<u8>>,
+    /// For a string column, where each row's value ends in its buffer (the
+    /// next row's starts there). Empty for a fixed-width column.
+    pub ends: Vec<Vec<usize>>,
 }
 
 impl ColumnChunk {
-    /// Row `row`'s cell of column `col`, `width` bytes wide.
+    /// Row `row`'s cell of the fixed-width column `col`, `width` bytes wide.
     #[inline(always)]
     pub fn cell(&self, col: usize, width: usize, row: usize) -> &[u8] {
         &self.cols[col][row * width..(row + 1) * width]
+    }
+
+    /// Row `row`'s value of the string column `col`.
+    #[inline(always)]
+    pub fn text(&self, col: usize, row: usize) -> &[u8] {
+        let ends = &self.ends[col];
+        let start = if row == 0 { 0 } else { ends[row - 1] };
+        &self.cols[col][start..ends[row]]
     }
 }
 
@@ -153,24 +176,31 @@ pub(crate) struct CellSink {
 /// everything read so far.
 pub(crate) struct Gather<'l> {
     layout: &'l CellLayout,
-    /// Where each noted row starts.
-    noted: Vec<u64>,
+    /// Where each noted row starts, and how long it is.
+    noted: Vec<(u64, u64)>,
     chunk: ColumnChunk,
+    /// The string columns' headers of the rows being read, a buffer per
+    /// column of the layout (empty for a fixed-width one). Kept for its
+    /// allocation.
+    headers: Vec<Vec<u8>>,
 }
 
 impl<'l> Gather<'l> {
     pub(crate) fn new(layout: &'l CellLayout) -> Self {
+        let n = layout.columns.len();
         Gather {
             layout,
             noted: Vec::new(),
-            chunk: ColumnChunk { rows: 0, cols: vec![Vec::new(); layout.columns.len()] },
+            chunk: ColumnChunk { rows: 0, cols: vec![Vec::new(); n], ends: vec![Vec::new(); n] },
+            headers: vec![Vec::new(); n],
         }
     }
 
-    /// A row the scan would have emitted, by where it starts.
+    /// A row the scan would have emitted: where it starts and its length,
+    /// as its pointer has them.
     #[inline(always)]
-    pub(crate) fn note(&mut self, position: u64) {
-        self.noted.push(position);
+    pub(crate) fn note(&mut self, position: u64, length: u64) {
+        self.noted.push((position, length));
     }
 
     /// How many rows are noted and not yet read.
@@ -198,9 +228,9 @@ impl<'l> Gather<'l> {
         let noted = std::mem::take(&mut self.noted);
         if let Err(e) = self.read(io, &noted).await {
             log::error!("Failed to read the cells of {} rows together: {}", noted.len(), e);
-            for position in &noted {
-                if let Err(e) = self.read(io, std::slice::from_ref(position)).await {
-                    log::error!("Failed to read the cells of the row at {}: {}", position, e);
+            for row in &noted {
+                if let Err(e) = self.read(io, std::slice::from_ref(row)).await {
+                    log::error!("Failed to read the cells of the row at {}: {}", row.0, e);
                 }
             }
         }
@@ -208,54 +238,115 @@ impl<'l> Gather<'l> {
         self.noted.clear();
     }
 
-    /// Appends the cells of the rows starting at `positions`, or nothing.
-    async fn read<S: StorageIO>(&mut self, io: &S, positions: &[u64]) -> std::io::Result<()> {
-        let n = positions.len();
-        if n == 0 {
+    /// Appends the cells of `rows` (start and length each), or nothing.
+    async fn read<S: StorageIO>(&mut self, io: &S, rows: &[(u64, u64)]) -> std::io::Result<()> {
+        if rows.is_empty() {
             return Ok(());
         }
-        let before: Vec<usize> = self.chunk.cols.iter().map(Vec::len).collect();
-        let read = {
+        let cols_before: Vec<usize> = self.chunk.cols.iter().map(Vec::len).collect();
+        let ends_before: Vec<usize> = self.chunk.ends.iter().map(Vec::len).collect();
+        let read = self.read_onto(io, rows).await;
+        match read {
+            Ok(()) => self.chunk.rows += rows.len(),
+            Err(_) => {
+                for (buf, len) in self.chunk.cols.iter_mut().zip(cols_before) {
+                    buf.truncate(len);
+                }
+                for (ends, len) in self.chunk.ends.iter_mut().zip(ends_before) {
+                    ends.truncate(len);
+                }
+            }
+        }
+        read
+    }
+
+    /// [`Self::read`] without its undoing: on an error the chunk's buffers
+    /// hold part of `rows`.
+    async fn read_onto<S: StorageIO>(&mut self, io: &S, rows: &[(u64, u64)]) -> std::io::Result<()> {
+        let n = rows.len();
+        let layout = self.layout;
+        {
             // One read per cell, a row's cells together: they are within one
-            // row of each other, so the copy walks the file once.
+            // row of each other, so the copy walks the file once. A fixed
+            // cell goes where it stays; a string's header to the side.
             let mut cells: Vec<std::slice::ChunksExactMut<'_, u8>> = self
                 .chunk
                 .cols
                 .iter_mut()
-                .zip(self.layout.columns.iter())
-                .map(|(buf, col)| {
+                .zip(self.headers.iter_mut())
+                .zip(layout.columns.iter())
+                .map(|((buf, headers), col)| {
                     let width = col.width as usize;
-                    let at = buf.len();
-                    buf.resize(at + n * width, 0);
-                    buf[at..].chunks_exact_mut(width)
+                    if col.text {
+                        headers.clear();
+                        headers.resize(n * width, 0);
+                        headers.chunks_exact_mut(width)
+                    } else {
+                        let at = buf.len();
+                        buf.resize(at + n * width, 0);
+                        buf[at..].chunks_exact_mut(width)
+                    }
                 })
                 .collect();
             let mut reads: Vec<(u64, &mut [u8])> = Vec::with_capacity(n * cells.len());
-            for &position in positions {
-                for (cell, col) in cells.iter_mut().zip(self.layout.columns.iter()) {
+            for &(position, _) in rows {
+                for (cell, col) in cells.iter_mut().zip(layout.columns.iter()) {
                     // `n` cells were added to every column just above.
                     let Some(cell) = cell.next() else { unreachable!("a cell per row") };
                     reads.push((position + col.offset as u64, cell));
                 }
             }
-            if reads.is_empty() || io.try_read_vectored_sync(&mut reads) {
-                Ok(())
-            } else {
-                io.read_vectored(&mut reads).await
-            }
-        };
-        match read {
-            Ok(()) => {
-                self.chunk.rows += n;
-                Ok(())
-            }
-            Err(e) => {
-                for (buf, len) in self.chunk.cols.iter_mut().zip(before) {
-                    buf.truncate(len);
-                }
-                Err(e)
+            if !reads.is_empty() && !io.try_read_vectored_sync(&mut reads) {
+                io.read_vectored(&mut reads).await?;
             }
         }
+        if !layout.columns.iter().any(|c| c.text) {
+            return Ok(());
+        }
+        // The strings: every header checked as `fetch_row` checks it, then
+        // every value read to where it stays, in one read.
+        let mut extents: Vec<(u64, usize)> = Vec::new();
+        let mut reads: Vec<(u64, &mut [u8])> = Vec::new();
+        let mut string_columns = 0;
+        for (((buf, ends), headers), col) in self
+            .chunk
+            .cols
+            .iter_mut()
+            .zip(self.chunk.ends.iter_mut())
+            .zip(self.headers.iter())
+            .zip(layout.columns.iter())
+        {
+            if !col.text {
+                continue;
+            }
+            string_columns += 1;
+            extents.clear();
+            let at = buf.len();
+            let mut end = at;
+            for (header, &(position, length)) in headers.chunks_exact(STRING_HEADER_BYTES).zip(rows) {
+                let extent = string_extent(position, length, header)?;
+                end += extent.1;
+                ends.push(end);
+                extents.push(extent);
+            }
+            buf.resize(end, 0);
+            let mut rest = &mut buf[at..];
+            for &(from, size) in &extents {
+                let (value, after) = rest.split_at_mut(size);
+                rest = after;
+                if size != 0 {
+                    reads.push((from, value));
+                }
+            }
+        }
+        if string_columns > 1 {
+            // Column by column above; by where they lie for the read.
+            reads.sort_unstable_by_key(|read| read.0);
+        }
+        if !reads.is_empty() && !io.try_read_vectored_sync(&mut reads) {
+            io.read_vectored(&mut reads).await?;
+        }
+        Ok(())
     }
 
     /// Everything read. Rows noted and not flushed are not in it.

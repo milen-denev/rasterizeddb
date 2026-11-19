@@ -288,6 +288,9 @@ fn query_for(workload: &str, i: u64, rows: usize) -> String {
         // cheaper than `topn`; on the live node it was only ~9 % cheaper, which
         // is what sent this profiling run looking at the pass instead.
         "topn_narrow" => "SELECT name FROM bench ORDER BY name LIMIT 200".to_string(),
+        // Any statement, for a shape that has no name here yet:
+        // `--workload "sql:SELECT …"`.
+        other if other.starts_with("sql:") => other["sql:".len()..].to_string(),
         other => {
             eprintln!("unknown workload: {other}");
             std::process::exit(2)

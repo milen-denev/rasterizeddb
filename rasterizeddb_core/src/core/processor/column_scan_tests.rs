@@ -94,8 +94,8 @@ impl Rng {
 
 const COLUMNS: &str = "id BIGINT NOT NULL, i8c TINYINT, u8c UTINYINT, i16c SMALLINT, \
     u16c USMALLINT, i32c INTEGER, u32c UINT, i64c BIGINT, u64c UBIGINT, r REAL, \
-    f DOUBLE PRECISION, flag BOOLEAN, ts TIMESTAMPTZ, s TEXT, n NUMERIC(10,2), k INTEGER NOT NULL";
-const COLUMN_NAMES: &str = "id, i8c, u8c, i16c, u16c, i32c, u32c, i64c, u64c, r, f, flag, ts, s, n, k";
+    f DOUBLE PRECISION, flag BOOLEAN, ts TIMESTAMPTZ, s TEXT, n NUMERIC(10,2), k INTEGER NOT NULL, s2 TEXT";
+const COLUMN_NAMES: &str = "id, i8c, u8c, i16c, u16c, i32c, u32c, i64c, u64c, r, f, flag, ts, s, n, k, s2";
 
 /// One row's values. Mostly a narrow range, so groups have members; sometimes
 /// a type's extreme; about one in eight NULL. The floats are quarters and
@@ -128,6 +128,16 @@ fn row(rng: &mut Rng, id: u64) -> String {
         cell(rng, |r| format!("'x{}'", r.next() % 10), &["''"]),
         cell(rng, |r| format!("{:.2}", small(r) as f64 / 8.0), &["99999999.99", "-99999999.99"]),
         (rng.next() % 7).to_string(),
+        // Lengths from nothing to a few hundred bytes, some of them not
+        // ASCII: forty values, so groups have members.
+        cell(
+            rng,
+            |r| {
+                let v = r.next() % 40;
+                format!("'{}{}'", "wörd-".repeat((v % 9) as usize * (v % 5) as usize), v)
+            },
+            &["''"],
+        ),
     ];
     format!("({id}, {})", v.join(", "))
 }
@@ -179,13 +189,23 @@ const FROM_CELLS: &[&str] = &[
     "SELECT i8c, COUNT(*) FROM t GROUP BY i8c HAVING SUM(i32c) > 0 AND COUNT(u8c) > 2 ORDER BY i8c",
     "SELECT u8c, COUNT(*), SUM(k) FROM t GROUP BY u8c ORDER BY u8c LIMIT 5 OFFSET 3",
     "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY COUNT(*) DESC, k LIMIT 3",
+    // Strings, read through their headers: as a key (with its NULL group
+    // and its empty string), as an argument, beside fixed columns, and two
+    // of them in one row.
+    "SELECT s, COUNT(*), SUM(i8c) FROM t GROUP BY s ORDER BY s",
+    "SELECT MAX(s), MIN(s), COUNT(s), COUNT(DISTINCT s), MIN(i32c) FROM t",
+    "SELECT s, k, COUNT(*), MAX(n) FROM t WHERE i32c > 0 GROUP BY s, k ORDER BY s, k",
+    "SELECT k, MIN(s), MAX(s), COUNT(s) FROM t GROUP BY k ORDER BY k",
+    "SELECT s, COUNT(*) FROM t WHERE s <> 'x5' GROUP BY s HAVING MAX(s2) > 'w' ORDER BY s",
+    "SELECT s2, COUNT(*), MIN(s), COUNT(DISTINCT s) FROM t GROUP BY s2 ORDER BY s2 LIMIT 30",
+    "SELECT COUNT(s2), MAX(s2), MIN(s2) FROM t WHERE k > 1000",
 ];
 
-/// Aggregates that read more of a row than cells, or a string, and so fold
-/// from rows whatever the switch says.
+/// Aggregates that read more of a row than cells, and so fold from rows
+/// whatever the switch says.
 const FROM_ROWS: &[&str] = &[
-    "SELECT s, COUNT(*), SUM(i8c) FROM t GROUP BY s ORDER BY s",
-    "SELECT MAX(s), MIN(i32c) FROM t",
+    "SELECT upper(s) AS g, COUNT(*) FROM t GROUP BY upper(s) ORDER BY g",
+    "SELECT MAX(s || 'z'), MIN(i32c) FROM t",
     "SELECT COUNT(*) FILTER (WHERE i32c > 0), SUM(i8c) FROM t",
     "SELECT SUM(i8c + 1), COUNT(*) FROM t",
     "SELECT COUNT(*) + 1, MAX(i8c) FROM t",
@@ -233,6 +253,10 @@ async fn differential(in_memory: bool) {
             "UPDATE t SET i32c = NULL, n = NULL WHERE i8c = 3",
             "UPDATE t SET i64c = -7, flag = true, k = 6 WHERE i32c = 11 AND u16c < 30",
             "INSERT INTO t (id, i32c, i64c, f, k) VALUES (900001, 12, -1, 0.25, 3), (900002, NULL, 5, 0, 4)",
+            // Strings that grow and shrink: the new version's header points
+            // somewhere else in a row of another length.
+            "UPDATE t SET s = 'a much longer value than any the table began with', s2 = 'x' WHERE u8c BETWEEN 60 AND 70",
+            "UPDATE t SET s2 = NULL, s = '' WHERE i8c = 4",
         ] {
             must(&db, change).await;
         }
@@ -450,6 +474,8 @@ async fn cache_child() {
     for sql in [
         // Every row: more than one read of the entry's cells.
         "SELECT COUNT(*), SUM(i16c), MAX(k) FROM t",
+        // Strings, whose read needs each cached row's length.
+        "SELECT s, COUNT(*), MAX(s2) FROM t WHERE i32c > 10 GROUP BY s ORDER BY s",
         "SELECT COUNT(*), SUM(i64c), MAX(u8c) FROM t WHERE i32c > 10",
         "SELECT k, COUNT(*), SUM(i8c) FROM t WHERE s = 'x5' GROUP BY k ORDER BY k",
         "SELECT COUNT(*), MIN(f) FROM t WHERE k > 1000",
@@ -539,9 +565,9 @@ async fn a_row_that_cannot_be_read_is_the_only_one_left_out() {
     io.append_data(&data, true).await;
     let layout = CellLayout {
         columns: vec![
-            CellColumn { schema_id: 5, offset: 8, width: 1 },
-            CellColumn { schema_id: 2, offset: 0, width: 8 },
-            CellColumn { schema_id: 9, offset: 11, width: 1 },
+            CellColumn { schema_id: 5, offset: 8, width: 1, text: false },
+            CellColumn { schema_id: 2, offset: 0, width: 8, text: false },
+            CellColumn { schema_id: 9, offset: 11, width: 1, text: false },
         ],
     };
     assert_eq!(layout.position(2), Some(1));
@@ -549,17 +575,17 @@ async fn a_row_that_cannot_be_read_is_the_only_one_left_out() {
 
     let mut gather = Gather::new(&layout);
     for position in [24u64, 0] {
-        gather.note(position);
+        gather.note(position, 12);
     }
     gather.flush(&io).await.expect("two rows inside the file");
     // A row past the end among good ones: the strict read takes none of them.
     for position in [12u64, 4000, 36] {
-        gather.note(position);
+        gather.note(position, 12);
     }
     assert!(gather.flush(&io).await.is_err(), "a read past the end succeeded");
     // The same rows for a scan: the two that can be read, in order.
     for position in [12u64, 4000, 36] {
-        gather.note(position);
+        gather.note(position, 12);
     }
     gather.flush_readable(&io).await;
     // Nothing is left noted: a second flush reads nothing.
@@ -577,7 +603,7 @@ async fn a_row_that_cannot_be_read_is_the_only_one_left_out() {
 
 /// A fetch has a cell layout exactly when none of its columns is a string.
 #[test]
-fn a_fetch_naming_a_string_has_no_layout() {
+fn a_layout_reads_what_the_fetch_reads() {
     use crate::core::db_type::DbType;
     use crate::core::row::row::{ColumnFetchingData, RowFetch};
     use column_scan::CellLayout;
@@ -593,13 +619,212 @@ fn a_fetch_naming_a_string_has_no_layout() {
     };
     let layout = CellLayout::of(&fixed).expect("fixed columns");
     assert_eq!(
-        layout.columns.iter().map(|c| (c.schema_id, c.offset, c.width)).collect::<Vec<_>>(),
-        [(1, 16, 8), (4, 64, 1)]
+        layout.columns.iter().map(|c| (c.schema_id, c.offset, c.width, c.text)).collect::<Vec<_>>(),
+        [(1, 16, 8, false), (4, 64, 1, false)]
     );
+    // A string's cell is its twelve-byte header, whatever size the fetch
+    // gives the column; nothing else is a string.
     let with_string = RowFetch {
-        columns_fetching_data: [column(DbType::I64, 8, 1), column(DbType::STRING, 12, 2)].into_iter().collect(),
+        columns_fetching_data: [column(DbType::I64, 8, 1), column(DbType::STRING, 4, 2), column(DbType::CHAR, 3, 3)]
+            .into_iter()
+            .collect(),
     };
-    assert!(CellLayout::of(&with_string).is_none());
+    let layout = CellLayout::of(&with_string).expect("a string has a layout");
+    assert_eq!(
+        layout.columns.iter().map(|c| (c.schema_id, c.offset, c.width, c.text)).collect::<Vec<_>>(),
+        [(1, 16, 8, false), (2, 32, 12, true), (3, 48, 3, false)]
+    );
+    // A fixed-width column of no width is not a run of bytes to read.
+    let no_width = RowFetch { columns_fetching_data: [column(DbType::I64, 0, 1)].into_iter().collect() };
+    assert!(CellLayout::of(&no_width).is_none());
     let empty = RowFetch { columns_fetching_data: Default::default() };
     assert!(CellLayout::of(&empty).is_some_and(|l| l.columns.is_empty()));
+}
+
+/// A string is read through its header, and a row whose header does not
+/// check (its bytes would lie outside the row, or it claims an absurd size)
+/// is left out as the row's fetch would have failed: alone, with every
+/// column of its row, and without disturbing the rows around it.
+#[tokio::test]
+async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
+    use crate::core::storage_providers::memory::MemoryStorageProvider;
+    use crate::core::storage_providers::traits::StorageIO;
+    use column_scan::{CellColumn, CellLayout, Gather};
+
+    // A row: an eight-byte id, two string headers (offset from the row's
+    // start, then length), and the two values wherever the headers say.
+    let io = MemoryStorageProvider::new("column_scan_gather_text");
+    let mut data = Vec::new();
+    let mut rows: Vec<(u64, u64)> = Vec::new();
+    let mut row = |id: u64, a: &[u8], b: &[u8], spoil: Option<(u64, u32)>| {
+        let start = data.len() as u64;
+        data.extend_from_slice(&id.to_le_bytes());
+        // `b` is stored first, so the headers do not point in column order.
+        let (b_at, a_at) = (32u64, 32 + b.len() as u64);
+        let (a_at, a_len) = spoil.unwrap_or((a_at, a.len() as u32));
+        data.extend_from_slice(&a_at.to_le_bytes());
+        data.extend_from_slice(&a_len.to_le_bytes());
+        data.extend_from_slice(&b_at.to_le_bytes());
+        data.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        data.extend_from_slice(b);
+        data.extend_from_slice(a);
+        rows.push((start, data.len() as u64 - start));
+    };
+    row(1, b"alpha", b"one", None);
+    row(2, b"", b"", None);
+    row(3, "wörd".as_bytes(), &[0xFF; 300], None);
+    // The first string's header points past its row's end ...
+    row(4, b"lost", b"four", Some((1 << 20, 4)));
+    // ... claims more bytes than the row has left ...
+    row(5, b"lost", b"five", Some((36, 4000)));
+    // ... and claims an absurd size.
+    row(6, b"lost", b"six", Some((35, u32::MAX)));
+    row(7, b"omega", b"", None);
+    // And two megabytes after the rows, so the bytes a bad header names are
+    // there to be read: only the check refuses them, not the end of the file.
+    data.resize(data.len() + (2 << 20), 0x5A);
+    io.append_data(&data, true).await;
+
+    let layout = CellLayout {
+        columns: vec![
+            CellColumn { schema_id: 2, offset: 8, width: 12, text: true },
+            CellColumn { schema_id: 1, offset: 0, width: 8, text: false },
+            CellColumn { schema_id: 3, offset: 20, width: 12, text: true },
+        ],
+    };
+    let good = [0usize, 1, 2, 6];
+
+    // The strict read: the good rows, and nothing of a batch with a bad one.
+    let mut gather = Gather::new(&layout);
+    for &r in &good[..2] {
+        gather.note(rows[r].0, rows[r].1);
+    }
+    gather.flush(&io).await.expect("two good rows");
+    for bad in [3usize, 4, 5] {
+        for r in [2, bad, 6] {
+            gather.note(rows[r].0, rows[r].1);
+        }
+        assert!(gather.flush(&io).await.is_err(), "row {bad}'s header was accepted");
+    }
+    // A scan's read: every row offered, the good ones kept, in order.
+    for r in 2..7 {
+        gather.note(rows[r].0, rows[r].1);
+    }
+    gather.flush_readable(&io).await;
+    let chunk = gather.finish();
+    assert_eq!(chunk.rows, 4);
+    let ids: Vec<u64> = (0..4).map(|r| u64::from_le_bytes(chunk.cell(1, 8, r).try_into().expect("eight bytes"))).collect();
+    assert_eq!(ids, [1, 2, 3, 7]);
+    let a: Vec<&[u8]> = (0..4).map(|r| chunk.text(0, r)).collect();
+    assert_eq!(a, [&b"alpha"[..], b"", "wörd".as_bytes(), b"omega"]);
+    let b: Vec<&[u8]> = (0..4).map(|r| chunk.text(2, r)).collect();
+    assert_eq!(b, [&b"one"[..], b"", &[0xFF; 300], b""]);
+    // Nothing of a refused row stayed behind in any buffer.
+    assert_eq!(chunk.cols[0].len(), 5 + 5 + 5);
+    assert_eq!(chunk.cols[2].len(), 3 + 300);
+    assert_eq!(chunk.ends[0].len(), 4);
+    assert!(chunk.ends[1].is_empty());
+}
+
+/// The check a string's header has to pass, for the row scan and the cell
+/// scan alike: its bytes lie inside its row and are not absurdly many.
+#[test]
+fn a_string_header_is_checked_against_its_row() {
+    use crate::core::row::row_pointer::string_extent;
+    let header = |offset: u64, size: u32| {
+        let mut h = offset.to_le_bytes().to_vec();
+        h.extend_from_slice(&size.to_le_bytes());
+        h
+    };
+    // Inside the row, up to its last byte.
+    assert_eq!(string_extent(1000, 100, &header(20, 80)).ok(), Some((1020, 80)));
+    assert_eq!(string_extent(1000, 100, &header(100, 0)).ok(), Some((1100, 0)));
+    // One byte past the row's end, starting inside it and starting at its end.
+    assert!(string_extent(1000, 100, &header(20, 81)).is_err());
+    assert!(string_extent(1000, 100, &header(100, 1)).is_err());
+    // Starting past the row's end, and an offset no position can take.
+    assert!(string_extent(1000, 100, &header(101, 1)).is_err());
+    assert!(string_extent(1000, 100, &header(u64::MAX, 1)).is_err());
+    assert!(string_extent(1000, 100, &header(u64::MAX, 0)).is_err());
+    // An empty string is nowhere: its offset is not checked against the row.
+    assert_eq!(string_extent(1000, 100, &header(5000, 0)).ok(), Some((6000, 0)));
+    // Sixty-four megabytes is the most a string is believed to be, even in
+    // a row long enough to hold more.
+    let most = 64u32 * 1024 * 1024;
+    assert_eq!(string_extent(0, 1 << 30, &header(12, most)).ok(), Some((12, most as usize)));
+    assert!(string_extent(0, 1 << 30, &header(12, most + 1)).is_err());
+}
+
+/// The same answer from cells and from rows for every kind of stored value:
+/// the ones a row holds as a header and bytes elsewhere (text of any
+/// declared length, documents, bytes, arrays) and the fixed-width ones the
+/// other tests' table lacks. One batch, so an unordered `GROUP BY` shows
+/// its groups in the rows' order either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_stored_type_folds_the_same_from_cells() {
+    let _g = SWITCH.lock().await;
+    let (dir, _cleanup) = scratch("types");
+    let db = Arc::new(Database::new_with_backend(&dir, false).await);
+    must(
+        &db,
+        "CREATE TABLE ty (id BIGINT NOT NULL, n NUMERIC, v VARCHAR(10), c CHAR(3), d DATE, tm TIME, \
+         iv INTERVAL, u UUID, j JSONB, b BYTEA, a INT[], ta TEXT[], k INTEGER NOT NULL)",
+    )
+    .await;
+    let mut rng = Rng(0x7E57_7E57);
+    let mut values = Vec::new();
+    for id in 0..600u64 {
+        let mut pick = |options: &[&str]| -> String {
+            if rng.next() % 7 == 0 { "NULL".to_string() } else { rng.pick(options).to_string() }
+        };
+        values.push(format!(
+            "({id}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            pick(&["1.5", "1.50", "-3", "12345678901234567890.123456789", "0"]),
+            pick(&["'abc'", "''", "'ten chars!'", "'wörd'"]),
+            pick(&["'abc'", "'a'", "'zz '"]),
+            pick(&["'2024-01-02'", "'1999-12-31'", "'2024-02-29'"]),
+            pick(&["'12:00:00'", "'23:59:59.5'", "'00:00:00'"]),
+            pick(&["'1 day'", "'2 hours'", "'1 mon 3 days'"]),
+            pick(&["'0a0b0c0d-0102-0304-0506-0708090a0b0c'", "'ffffffff-ffff-ffff-ffff-ffffffffffff'"]),
+            pick(&["'{\"a\": 1}'", "'{\"a\": 1.0}'", "'[1, 2, 3]'", "'\"text\"'", "'null'", "'{\"b\": {\"c\": [true, null]}}'"]),
+            pick(&["'\\x00ab10ff'", "'\\x'", "'\\x41'"]),
+            pick(&["'{1,2,3}'", "'{}'", "'{-7}'"]),
+            pick(&["'{a,b}'", "'{}'", "'{\"x y\",NULL}'"]),
+            id % 5,
+        ));
+    }
+    must(&db, &format!("INSERT INTO ty (id, n, v, c, d, tm, iv, u, j, b, a, ta, k) VALUES {}", values.join(", "))).await;
+    must(&db, "UPDATE ty SET v = 'changed', j = '{\"a\": [1, 2]}', b = '\\xdeadbeef' WHERE k = 3 AND id < 300").await;
+    must(&db, "DELETE FROM ty WHERE id BETWEEN 100 AND 140").await;
+
+    let mut from_cells = Vec::new();
+    let mut from_rows = Vec::new();
+    for column in ["n", "v", "c", "d", "tm", "iv", "u", "j", "b", "a", "ta"] {
+        for sql in [
+            format!("SELECT {column}, COUNT(*), MAX(id) FROM ty GROUP BY {column}"),
+            format!("SELECT k, COUNT({column}), COUNT(DISTINCT {column}) FROM ty GROUP BY k ORDER BY k"),
+            format!("SELECT MIN({column}), MAX({column}) FROM ty WHERE id > 50"),
+        ] {
+            column_scan::set_enabled(false);
+            let (rows, folds) = run_in(&db, None, &sql).await;
+            assert_eq!(folds, 0, "{sql}: folded from cells while that is off");
+            column_scan::set_enabled(true);
+            let (cells, folds) = run_in(&db, None, &sql).await;
+            assert!(
+                cells == rows,
+                "{sql}: folded from cells {:?}, from rows {:?}",
+                String::from_utf8_lossy(&cells),
+                String::from_utf8_lossy(&rows)
+            );
+            if folds > 0 { &mut from_cells } else { &mut from_rows }.push((sql, cells.first() == Some(&3)));
+        }
+    }
+    // Which statements took which path is the engine's to say; that most
+    // took the cells and answered is what makes the comparison one.
+    let answered = from_cells.iter().filter(|(_, error)| !error).count();
+    assert!(
+        answered >= 20,
+        "{answered} statements answered from cells; from cells {from_cells:?}, from rows {from_rows:?}"
+    );
+    column_scan::set_enabled(true);
 }
