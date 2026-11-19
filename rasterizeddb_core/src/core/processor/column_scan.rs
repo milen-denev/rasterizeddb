@@ -68,6 +68,30 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
 }
 
+/// 0 = not read yet, 1 = on, 2 = off.
+static WHOLE_COLUMNS: AtomicU8 = AtomicU8::new(0);
+
+/// Whether an ungrouped aggregate folded from cells takes each column at
+/// once (`aggregate::Acc::accumulate_cells`). On unless
+/// `RDB_FOLD_COLUMNS=0`, which feeds the cells a row at a time, for A/B
+/// measurement and for the tests that hold the two to the same answers.
+pub fn whole_columns() -> bool {
+    match WHOLE_COLUMNS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RDB_FOLD_COLUMNS").is_none_or(|v| v != "0");
+            WHOLE_COLUMNS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Turns the whole-column fold on or off for the whole process.
+pub fn set_whole_columns(on: bool) {
+    WHOLE_COLUMNS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 tokio::task_local! {
     /// How many folds from cells the statement running on this task made.
@@ -79,6 +103,21 @@ tokio::task_local! {
 #[cfg(test)]
 pub(crate) fn note_fold_from_cells() {
     let _ = FOLDS_FROM_CELLS.try_with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// How many batches of cells the storage copied in one call for the
+    /// statement running on this task ([`ColumnChunk::together`], summed).
+    pub(crate) static BATCHES_TOGETHER: std::cell::Cell<usize>;
+}
+
+/// Counts the batches behind `chunks` that were copied in one call, for the
+/// test whose statement this is.
+#[cfg(test)]
+pub(crate) fn note_batches_together(chunks: &[ColumnChunk]) {
+    let together: usize = chunks.iter().map(|c| c.together).sum();
+    let _ = BATCHES_TOGETHER.try_with(|n| n.set(n.get() + together));
 }
 
 /// One column of a scan's rows.
@@ -142,6 +181,10 @@ pub struct ColumnChunk {
     /// For a string column, where each row's value ends in its buffer (the
     /// next row's starts there). Empty for a fixed-width column.
     pub ends: Vec<Vec<usize>>,
+    /// How many of the reads behind these rows the storage served as one
+    /// batch of cells (`StorageIO::try_read_cells_sync`), for the tests that
+    /// have to know the path they compared was the path taken.
+    pub together: usize,
 }
 
 impl ColumnChunk {
@@ -183,6 +226,8 @@ pub(crate) struct Gather<'l> {
     /// column of the layout (empty for a fixed-width one). Kept for its
     /// allocation.
     headers: Vec<Vec<u8>>,
+    /// Each layout column's cell: its offset in a row and its width.
+    cells: Vec<(u32, u32)>,
 }
 
 impl<'l> Gather<'l> {
@@ -191,8 +236,9 @@ impl<'l> Gather<'l> {
         Gather {
             layout,
             noted: Vec::new(),
-            chunk: ColumnChunk { rows: 0, cols: vec![Vec::new(); n], ends: vec![Vec::new(); n] },
+            chunk: ColumnChunk { rows: 0, cols: vec![Vec::new(); n], ends: vec![Vec::new(); n], together: 0 },
             headers: vec![Vec::new(); n],
+            cells: layout.columns.iter().map(|c| (c.offset, c.width)).collect(),
         }
     }
 
@@ -247,7 +293,10 @@ impl<'l> Gather<'l> {
         let ends_before: Vec<usize> = self.chunk.ends.iter().map(Vec::len).collect();
         let read = self.read_onto(io, rows).await;
         match read {
-            Ok(()) => self.chunk.rows += rows.len(),
+            Ok(together) => {
+                self.chunk.rows += rows.len();
+                self.chunk.together += usize::from(together);
+            }
             Err(_) => {
                 for (buf, len) in self.chunk.cols.iter_mut().zip(cols_before) {
                     buf.truncate(len);
@@ -257,18 +306,39 @@ impl<'l> Gather<'l> {
                 }
             }
         }
-        read
+        read.map(|_| ())
     }
 
     /// [`Self::read`] without its undoing: on an error the chunk's buffers
-    /// hold part of `rows`.
-    async fn read_onto<S: StorageIO>(&mut self, io: &S, rows: &[(u64, u64)]) -> std::io::Result<()> {
+    /// hold part of `rows`. `true` when the storage copied the batch's cells
+    /// in one call.
+    async fn read_onto<S: StorageIO>(&mut self, io: &S, rows: &[(u64, u64)]) -> std::io::Result<bool> {
         let n = rows.len();
         let layout = self.layout;
-        {
+        // Every column's cells of the batch in one call, where the storage
+        // can copy them straight from its mapping: a fixed cell to where it
+        // stays, a string's header to the side.
+        let together = {
+            let mut out: Vec<&mut Vec<u8>> = self
+                .chunk
+                .cols
+                .iter_mut()
+                .zip(self.headers.iter_mut())
+                .zip(layout.columns.iter())
+                .map(|((buf, headers), col)| {
+                    if col.text {
+                        headers.clear();
+                        headers
+                    } else {
+                        buf
+                    }
+                })
+                .collect();
+            io.try_read_cells_sync(rows, &self.cells, &mut out)
+        };
+        if !together {
             // One read per cell, a row's cells together: they are within one
-            // row of each other, so the copy walks the file once. A fixed
-            // cell goes where it stays; a string's header to the side.
+            // row of each other, so the copy walks the file once.
             let mut cells: Vec<std::slice::ChunksExactMut<'_, u8>> = self
                 .chunk
                 .cols
@@ -301,7 +371,7 @@ impl<'l> Gather<'l> {
             }
         }
         if !layout.columns.iter().any(|c| c.text) {
-            return Ok(());
+            return Ok(together);
         }
         // The strings: every header checked as `fetch_row` checks it, then
         // every value read to where it stays, in one read.
@@ -346,7 +416,7 @@ impl<'l> Gather<'l> {
         if !reads.is_empty() && !io.try_read_vectored_sync(&mut reads) {
             io.read_vectored(&mut reads).await?;
         }
-        Ok(())
+        Ok(together)
     }
 
     /// Everything read. Rows noted and not flushed are not in it.

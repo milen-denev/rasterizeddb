@@ -254,6 +254,18 @@ impl StorageIO for DbStorageProvider {
         }
     }
 
+    #[inline(always)]
+    fn try_read_cells_sync(&self, rows: &[(u64, u64)], cells: &[(u32, u32)], out: &mut [&mut Vec<u8>]) -> bool {
+        match self {
+            Self::File(p) => p.try_read_cells_sync(rows, cells, out),
+            Self::Memory(p) => p.try_read_cells_sync(rows, cells, out),
+            #[cfg(feature = "kv_storage")]
+            Self::KeyValue(p) => p.try_read_cells_sync(rows, cells, out),
+            #[cfg(feature = "storage_pools")]
+            Self::Mirror(p) => p.try_read_cells_sync(rows, cells, out),
+        }
+    }
+
     async fn append_data(&self, buffer: &[u8], immediate: bool) {
         match self {
             Self::File(p) => p.append_data(buffer, immediate).await,

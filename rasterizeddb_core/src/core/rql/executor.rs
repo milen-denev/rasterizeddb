@@ -22913,6 +22913,8 @@ async fn execute_query_rows_body(
                     .await
                 {
                     Ok(chunks) => {
+                        #[cfg(test)]
+                        crate::core::processor::column_scan::note_batches_together(&chunks);
                         let mut result = vec![2u8];
                         fold_cells(&plan, &sources, &chunks, &mut result).map(|()| result)
                     }

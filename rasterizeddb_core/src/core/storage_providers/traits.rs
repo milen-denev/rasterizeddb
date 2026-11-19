@@ -119,6 +119,22 @@ pub trait StorageIO: Clone + Sync + Send + 'static {
         false
     }
 
+    /// [`Self::try_read_vectored_sync`] for a batch of rows' fixed-width
+    /// cells. `rows` is each row's start (and its length, which this does
+    /// not read); `cells` is each cell's offset within a row and its width.
+    /// Cell `c` of every row, in `rows`' order, is appended to `out[c]`.
+    ///
+    /// `true` when every cell was copied without blocking. `false` when this
+    /// storage has no such path or could not serve some cell that way; the
+    /// buffers of `out` are then as long as they were, and the caller reads
+    /// the cells another way. A scan for cells reads four cells of each of a
+    /// few thousand rows at a time, and one position, one slice and one
+    /// `memmove` per cell was most of what the read cost.
+    #[inline(always)]
+    fn try_read_cells_sync(&self, _rows: &[(u64, u64)], _cells: &[(u32, u32)], _out: &mut [&mut Vec<u8>]) -> bool {
+        false
+    }
+
     fn append_data(&self, buffer: &[u8], immediate: bool)
     -> impl Future<Output = ()> + Send + Sync;
 
