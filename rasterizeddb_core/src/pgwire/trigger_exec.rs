@@ -1239,6 +1239,13 @@ where
 /// a renamed table's follow it.
 pub(super) async fn after_table_ddl(database: &Arc<Database>, tx: Option<TxId>, ddl: &crate::core::rql::views::TableDdl) {
     use crate::core::rql::views::TableDdl;
+    // A renamed table keeps its owner and grants.
+    if let TableDdl::Alter { name, rename_to: Some(to) } = ddl
+        && database.has_table(to)
+        && !database.has_table(name)
+    {
+        let _ = crate::core::rql::privileges::rename(database, name, to, tx).await;
+    }
     if !database.has_table(triggers::TRIGGER_TABLE) {
         return;
     }

@@ -454,6 +454,11 @@ where
             fail_statement(state, stream, sqlstate_for(&e), &e).await?;
             return Ok(Err(()));
         }
+        let filter = format!("relation = {}", crate::auth::quote(&view.name));
+        if let Err(e) = crate::core::rql::privileges::delete_where(database, &filter, tx).await {
+            fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+            return Ok(Err(()));
+        }
         if view.kind == ViewKind::Materialized {
             let sql = format!("DROP TABLE {}", views::quote_ident(&view.name));
             if let Err(e) = run_internal_ddl(database, state, &sql).await? {
@@ -603,6 +608,9 @@ where
         }
     }
     if let Err(e) = views::rename(database, from, to, tx).await {
+        return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+    }
+    if let Err(e) = crate::core::rql::privileges::rename(database, from, to, tx).await {
         return fail_statement(state, stream, sqlstate_for(&e), &e).await;
     }
     send_command_complete(stream, verb).await

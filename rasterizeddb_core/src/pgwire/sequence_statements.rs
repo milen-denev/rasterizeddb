@@ -146,6 +146,10 @@ where
                     return fail_statement(state, stream, sqlstate_for(&e), &e).await;
                 }
                 sequence::forget_explicit(database.id, name);
+                let filter = format!("relation = {}", crate::auth::quote(name));
+                if let Err(e) = crate::core::rql::privileges::delete_where(database, &filter, tx).await {
+                    return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+                }
             }
             send_command_complete(stream, verb).await
         }

@@ -42,6 +42,7 @@ mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
 mod temp_tables;
+mod privilege_statements;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -6968,6 +6969,11 @@ where
     let Some(ddl) = crate::core::rql::views::table_ddl(stmt) else {
         return Ok(false);
     };
+    // A table's DDL is its owner's (`rql::privileges`).
+    if let Some((code, message)) = privilege_statements::check(database, state, stmt).await {
+        fail_statement(state, stream, code, &message).await?;
+        return Ok(true);
+    }
     if database.has_table(crate::core::rql::sequence_catalog::SEQUENCE_TABLE)
         && sequence_statements::guard_table_ddl(database, state, stream, stmt, &ddl).await?
     {
@@ -6977,6 +6983,19 @@ where
         && view_statements::guard_table_ddl(database, state, stream, stmt, ddl.clone()).await?
     {
         return Ok(true);
+    }
+    // A dropped relation's owner and grants go with it, in its transaction:
+    // kept, a table created later under the name took them over.
+    if database.has_table(crate::core::rql::privileges::ACL_TABLE)
+        && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
+    {
+        for name in names {
+            let filter = format!("relation = {}", crate::auth::quote(name));
+            if let Err(e) = crate::core::rql::privileges::delete_where(database, &filter, state.current_tx()).await {
+                fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+                return Ok(true);
+            }
+        }
     }
     if database.has_table(crate::core::rql::triggers::TRIGGER_TABLE)
         && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
@@ -7005,6 +7024,12 @@ async fn execute_single_statement<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // A relation this statement creates is owned by its creator.
+    let creating = if state.view_internal {
+        None
+    } else {
+        privilege_statements::about_to_create(database, state, stmt).await
+    };
     let scope = crate::core::rql::sequence::session::Scope {
         database: database.id,
         values: state.sequence_values.clone(),
@@ -7017,6 +7042,12 @@ where
     crate::core::rql::sequence_catalog::flush(database).await;
     if !state.view_internal {
         temp_tables::end_of_transaction(database, state).await;
+    }
+    if let Some(name) = creating
+        && ran.is_ok()
+        && !state.statement_failed
+    {
+        privilege_statements::record_owner(database, state, &name).await;
     }
     if ran.is_ok() && !state.statement_failed && let Some(ddl) = crate::core::rql::views::table_ddl(stmt) {
         trigger_exec::after_table_ddl(database, state.current_tx(), &ddl).await;
@@ -7093,6 +7124,9 @@ where
     if let Some(parsed) = crate::core::rql::triggers::parse_trigger_statement(stmt) {
         return trigger_exec::handle_trigger_statement(database, state, stream, parsed).await;
     }
+    if let Some(parsed) = crate::core::rql::privileges::parse_privilege_statement(stmt) {
+        return privilege_statements::handle_privilege_statement(database, state, stream, parsed).await;
+    }
     if let Some(parsed) = crate::core::rql::merge::parse_merge(stmt) {
         return match parsed {
             Ok(merge) => merge_exec::run_merge(database, state, stream, merge, result_formats, omit_description).await,
@@ -7140,6 +7174,14 @@ where
             return Ok(());
         }
     };
+    // A non-superuser's privileges on what the statement names, views as
+    // views (`rql::privileges`).
+    if crate::core::rql::views::table_ddl(stmt).is_none()
+        && let Some((code, message)) = privilege_statements::check(database, state, stmt).await
+    {
+        fail_statement(state, stream, code, &message).await?;
+        return Ok(());
+    }
     let expanded_views;
     let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
         let options = crate::core::rql::views::ExpandOptions {

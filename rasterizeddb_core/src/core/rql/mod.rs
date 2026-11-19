@@ -86,6 +86,7 @@ pub mod sequence_catalog;
 pub mod functions;
 pub mod triggers;
 pub mod merge;
+pub mod privileges;
 
 #[cfg(test)]
 mod rename_column_tests;
