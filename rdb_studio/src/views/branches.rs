@@ -175,17 +175,19 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
         .into();
     }
     let layout = super::GridLayout::new(studio, "branches");
+    // The actions second, beside the name: at the far right they fell off
+    // any window narrower than the whole grid.
     let columns = vec![
-        super::GridColumn::new("branch", "BRANCH", 150.0),
-        super::GridColumn::new("parent", "PARENT", 130.0),
-        super::GridColumn::new("point", "POINT", 150.0),
-        super::GridColumn::new("method", "METHOD", 80.0),
-        super::GridColumn::new("created", "CREATED", 170.0),
-        super::GridColumn::new("merged", "MERGED", 170.0),
-        super::GridColumn::new("size", "SIZE", 90.0).right(),
-        super::GridColumn::new("base", "BASE", 90.0).right(),
-        super::GridColumn::new("sessions", "SESSIONS", 80.0).right(),
+        super::GridColumn::new("branch", "BRANCH", 140.0),
         super::GridColumn::new("actions", "", 330.0).unsortable(),
+        super::GridColumn::new("parent", "PARENT", 110.0),
+        super::GridColumn::new("point", "POINT", 140.0),
+        super::GridColumn::new("method", "METHOD", 70.0),
+        super::GridColumn::new("created", "CREATED", 160.0),
+        super::GridColumn::new("merged", "MERGED", 160.0),
+        super::GridColumn::new("size", "SIZE", 80.0).right(),
+        super::GridColumn::new("base", "BASE", 80.0).right(),
+        super::GridColumn::new("sessions", "SESSIONS", 70.0).right(),
     ];
     let widths = super::column_widths(&layout, &columns);
     let total = super::grid_total(&widths);
@@ -202,6 +204,7 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
         _ => super::SortKey::text(&b.name),
     });
 
+    let rows = list.len();
     let mut body = column![].spacing(0);
     for (index, b) in list.into_iter().enumerate() {
         let selected = studio
@@ -245,6 +248,7 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
                         theme::TEXT
                     },
                 ),
+                container(actions).padding([2, 6]).into(),
                 super::grid_cell(
                     if b.parent_exists {
                         b.parent.clone()
@@ -285,7 +289,6 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
                     },
                 ),
                 super::grid_cell(count(b.sessions), true, theme::TEXT_DIM),
-                container(actions).padding([2, 6]).into(),
             ],
         );
         body = body.push(super::grid_stripe(
@@ -296,12 +299,16 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
     container(
         column![
             section_label("BRANCHES"),
-            super::grid_frame(
+            // Sized to its rows: a `Fill` grid inside the page's scrollable
+            // is squeezed to a row and a half, and the button rows are
+            // taller than text ones.
+            container(super::grid_frame(
                 &layout,
                 &widths,
                 super::grid_header(&layout, &columns, &widths),
                 body.into(),
-            ),
+            ))
+            .height(Length::Fixed(44.0 + rows as f32 * 38.0)),
         ]
         .spacing(2),
     )
