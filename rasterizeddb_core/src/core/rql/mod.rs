@@ -42,6 +42,8 @@ pub mod cte;
 pub(crate) mod ctas;
 pub(crate) mod distinct_on;
 pub(crate) mod join_on;
+pub(crate) mod join_using;
+pub(crate) mod grouping_sets;
 pub(crate) mod lateral;
 pub(crate) mod correlated;
 pub mod truncate;

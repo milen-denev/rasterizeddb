@@ -2173,6 +2173,9 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         DbType::DATETIME if yields_timestamp(&args[0]) => "timestamp without time zone",
                         DbType::DATETIME => "timestamp with time zone",
                         DbType::TIMESTAMP => "timestamp without time zone",
+                        // PostgreSQL's full names, as `format_type` gives them.
+                        DbType::TIME => "time without time zone",
+                        DbType::TIMETZ => "time with time zone",
                         DbType::STRING => "text",
                         DbType::ARRAY => "text[]",
                         DbType::JSONB => "jsonb",
@@ -2296,9 +2299,11 @@ fn keyword_constant(text: &str) -> Option<Expr> {
             Box::new(Expr::Scalar(crate::core::rql::aggregate::ScalarFunc::CurrentDate)),
             DbType::DATE,
         )),
-        // `CURRENT_TIME` and `LOCALTIME` are deliberately absent: there is no
-        // constant that encodes a bare time of day here, and a wrong instant is
-        // worse than an honest "not supported". They still fail by name.
+        // The transaction's instant's time of day, with its zone (UTC here)
+        // and without: `timetz` and `time`, cast from the instant as
+        // `localtimestamp` is.
+        "CURRENT_TIME" => Some(Expr::Cast(Box::new(Expr::Scalar(now)), DbType::TIMETZ)),
+        "LOCALTIME" => Some(Expr::Cast(Box::new(Expr::Scalar(now)), DbType::TIME)),
         _ => None,
     }
 }
@@ -3706,6 +3711,12 @@ pub fn static_type(expr: &Expr) -> DbType {
                     _ => DbType::DATE,
                 };
             }
+            // A time of day moved by an interval is a time of day; two of them
+            // differ by an interval (`time_pl_interval`, `time_mi_time`).
+            let time = |e: &Expr| matches!(ty(e), DbType::TIME);
+            if time(lhs) || time(rhs) {
+                return if time(lhs) && time(rhs) { DbType::INTERVAL } else { DbType::TIME };
+            }
             if timestamp(lhs) && timestamp(rhs) && matches!(op, ArithOp::Sub) {
                 // The difference of two instants is a span, not a bigint. It
                 // was described as `int8` before the type existed, and a client
@@ -3872,6 +3883,40 @@ pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> 
 
     if matches!(a.db_type(), Some(DbType::DATE)) || matches!(b.db_type(), Some(DbType::DATE)) {
         return date_arith(a, op, b);
+    }
+
+    // A time of day ± an interval wraps around midnight, an interval's months
+    // and days being whole days that leave the clock where it was; two times
+    // differ by an interval. As PostgreSQL's `time_pl_interval` and
+    // `time_mi_time`; it was "'+' needs numeric operands".
+    let time_of = |v: &Value| match v {
+        Value::Data { bytes, db_type: DbType::TIME } => bytes.get(..8).and_then(|b| b.try_into().ok()).map(i64::from_be_bytes),
+        _ => None,
+    };
+    if time_of(a).is_some() || time_of(b).is_some() {
+        const DAY: i64 = 86_400_000_000;
+        let span = |v: &Value| match v {
+            Value::Data { bytes, db_type: DbType::INTERVAL } => crate::core::pg_types::decode_interval(bytes).map(|i| i.micros),
+            other => as_i64(other),
+        };
+        let clock = |micros: i64| Value::Data { bytes: micros.rem_euclid(DAY).to_be_bytes().to_vec(), db_type: DbType::TIME };
+        return match (time_of(a), time_of(b), op) {
+            (Some(x), Some(y), ArithOp::Sub) => Ok(Value::Data {
+                bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::Interval { months: 0, days: 0, micros: x - y }),
+                db_type: DbType::INTERVAL,
+            }),
+            (Some(x), None, ArithOp::Add | ArithOp::Sub) if is_interval(b) => {
+                let d = span(b).ok_or("an interval could not be read")?;
+                Ok(clock(if matches!(op, ArithOp::Add) { x.wrapping_add(d) } else { x.wrapping_sub(d) }))
+            }
+            (None, Some(y), ArithOp::Add) if is_interval(a) => Ok(clock(y.wrapping_add(span(a).ok_or("an interval could not be read")?))),
+            _ => Err(format!(
+                "operator does not exist: {} {} {}",
+                if time_of(a).is_some() { "time without time zone" } else { "number" },
+                op.symbol(),
+                if time_of(b).is_some() { "time without time zone" } else { "number" }
+            )),
+        };
     }
 
     // Interval ± interval is an interval, with the three fields kept apart —

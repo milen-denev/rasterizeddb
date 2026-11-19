@@ -4947,6 +4947,16 @@ pub(crate) async fn describe_query(
     let stmt = typed_literals.as_deref().unwrap_or(stmt);
     let quantified = crate::core::sql_scan::quantified_subqueries(stmt).ok().flatten();
     let stmt = quantified.as_deref().unwrap_or(stmt);
+    let join_using = match crate::core::rql::join_using::rewrite_statement(stmt, &|name| relation_column_names(database, name)) {
+        Some(Ok(text)) => Some(text),
+        _ => None,
+    };
+    let stmt = join_using.as_deref().unwrap_or(stmt);
+    let grouping_sets = match crate::core::rql::grouping_sets::rewrite_statement(stmt) {
+        Some(Ok(text)) => Some(text),
+        _ => None,
+    };
+    let stmt = grouping_sets.as_deref().unwrap_or(stmt);
     let window_join = crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name));
     let stmt = window_join.as_deref().unwrap_or(stmt);
     let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name));
@@ -7048,6 +7058,10 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `ARRAY(SELECT …)` as the aggregate it is (`sql_scan::array_subqueries`).
+    if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
+        stmt = Cow::Owned(text);
+    }
     // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
     // before anything reads one: a CTE or derived table is materialised from
     // this text, and `jb.id AS ID` beside `ja.id` must be the second `id`
@@ -7070,6 +7084,21 @@ pub(crate) fn rewrite_statement_text<'a>(
     // A window function over a join: the same statement over a derived
     // table of the join's columns (`core::rql::window_join`). First, so a
     // DISTINCT over it is then a single-table one for `distinct_on`.
+    // `JOIN … USING` and `NATURAL JOIN` as the ON joins they mean, with their
+    // merged columns (`core::rql::join_using`). First: every join pass below
+    // reads ON conditions.
+    match crate::core::rql::join_using::rewrite_statement(&stmt, &|name| relation_column_names(database, name)) {
+        Some(Ok(text)) => take(&mut stmt, Some(text)),
+        Some(Err(refusal)) => return Err(refusal),
+        None => {}
+    }
+    // ROLLUP, CUBE and GROUPING SETS as the UNION ALL of their grouping
+    // sets' queries (`core::rql::grouping_sets`).
+    match crate::core::rql::grouping_sets::rewrite_statement(&stmt) {
+        Some(Ok(text)) => take(&mut stmt, Some(text)),
+        Some(Err(refusal)) => return Err(refusal),
+        None => {}
+    }
     let window_join =
         crate::core::rql::window_join::rewrite_statement(&stmt, &|name| relation_column_names(database, name));
     take(&mut stmt, window_join);

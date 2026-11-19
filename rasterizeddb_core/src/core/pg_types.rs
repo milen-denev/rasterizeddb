@@ -194,7 +194,18 @@ pub fn parse_interval(text: &str) -> Option<Interval> {
 /// thirty days for this purpose alone.
 fn apply_unit(out: &mut Interval, value: f64, unit: &str) -> Option<()> {
     let unit = unit.trim().to_ascii_lowercase();
-    let unit = unit.trim_end_matches('s');
+    // The unit as written first, then its plural with one `s` taken off.
+    // Every trailing `s` was taken off, so `ms` read as `m` (`'5 ms'` was
+    // five minutes, not five milliseconds) and `s` and `us` as nothing.
+    let unit = match unit.as_str() {
+        "s" | "ms" | "us" | "msec" | "msecs" | "usec" | "usecs" => unit.as_str(),
+        u => u.strip_suffix('s').filter(|t| !t.is_empty()).unwrap_or(u),
+    };
+    let unit = match unit {
+        "msecs" => "msec",
+        "usecs" => "usec",
+        u => u,
+    };
     let (months_per, days_per, micros_per) = match unit {
         "millennium" | "millennia" | "millenium" => (12_000.0, 0.0, 0.0),
         "century" | "centurie" => (1_200.0, 0.0, 0.0),
@@ -1513,4 +1524,27 @@ pub fn range_bounds_key(db_type: &DbType, bytes: &[u8]) -> Option<(i128, i128, b
         None => i128::MAX,
     };
     Some((lower, upper, range.lower_inclusive, range.upper_inclusive))
+}
+
+#[cfg(test)]
+mod interval_unit_tests {
+    use super::parse_interval;
+
+    /// Each unit as PostgreSQL reads it: `ms` is milliseconds (it was read
+    /// as minutes), `s` and `us` are units (they were refused).
+    #[test]
+    fn short_and_plural_units_read_as_postgresql_reads_them() {
+        let micros = |t: &str| parse_interval(t).map(|i| (i.months, i.days, i.micros));
+        assert_eq!(micros("5 ms"), Some((0, 0, 5_000)));
+        assert_eq!(micros("5ms"), Some((0, 0, 5_000)));
+        assert_eq!(micros("3 us"), Some((0, 0, 3)));
+        assert_eq!(micros("0 s"), Some((0, 0, 0)));
+        assert_eq!(micros("90 s"), Some((0, 0, 90_000_000)));
+        assert_eq!(micros("2 hrs"), Some((0, 0, 7_200_000_000)));
+        assert_eq!(micros("1 secs"), Some((0, 0, 1_000_000)));
+        assert_eq!(micros("2 msecs"), Some((0, 0, 2_000)));
+        assert_eq!(micros("1 m"), Some((0, 0, 60_000_000)));
+        assert_eq!(micros("3 mons 2 days"), Some((3, 2, 0)));
+        assert_eq!(micros("1 centuries"), Some((1_200, 0, 0)));
+    }
 }

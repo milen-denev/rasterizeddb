@@ -214,6 +214,87 @@ fn matching_paren_at(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// `ARRAY(SELECT x FROM … [ORDER BY o])`, the array constructor over a
+/// subquery, as `COALESCE((SELECT array_agg(x ORDER BY o) FROM …), '{}')`:
+/// the same elements in the same order, and the empty array (not NULL) for
+/// no rows. A subquery with its own `LIMIT`, `OFFSET`, `DISTINCT`, grouping
+/// or set operation is aggregated over as a derived table instead. As a
+/// scalar subquery it is correlated where it reads the outer row, which the
+/// correlated pass then joins. It was "a subquery used as a value returned 2
+/// rows".
+pub fn array_subqueries(sql: &str) -> Cow<'_, str> {
+    if !contains_ignore_ascii_case(sql, b"array") {
+        return Cow::Borrowed(sql);
+    }
+    let mut text = sql.to_string();
+    let mut changed = false;
+    // Innermost first is not needed: each pass rewrites the first one and
+    // the result is scanned again, an inner one included.
+    for _ in 0..32 {
+        let Some(next) = rewrite_first_array_subquery(&text) else { break };
+        text = next;
+        changed = true;
+    }
+    if changed { Cow::Owned(text) } else { Cow::Borrowed(sql) }
+}
+
+fn rewrite_first_array_subquery(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let bytes = sql.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let word_start = i == 0 || !(ident(bytes[i - 1]) || bytes[i - 1] == b'.');
+        if word_start && bytes.len() - i >= 5 && bytes[i..i + 5].eq_ignore_ascii_case(b"ARRAY") && !bytes.get(i + 5).is_some_and(|&b| ident(b)) {
+            let after = &sql[i + 5..];
+            let open = i + 5 + (after.len() - after.trim_start().len());
+            if bytes.get(open) == Some(&b'(') && let Some(close) = matching_paren_at(bytes, open) {
+                let inner = sql[open + 1..close].trim();
+                if inner.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+                    let replacement = array_aggregate(inner)?;
+                    return Some(format!("{}{}{}", &sql[..i], replacement, &sql[close + 1..]));
+                }
+            }
+        }
+        i += 1;
+    }
+    let _ = find_keyword;
+    None
+}
+
+/// The aggregate an `ARRAY(…)` subquery is.
+fn array_aggregate(query: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let from = find_keyword(query, "FROM", 0)?;
+    let list = query[6..from].trim();
+    let items = split_top_level(list, b',');
+    if items.len() != 1 || list.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT")) {
+        return None;
+    }
+    let (expr, _) = crate::core::rql::lexer_query::split_alias(items[0].trim());
+    let complex = ["LIMIT", "OFFSET", "FETCH", "GROUP", "HAVING", "UNION", "INTERSECT", "EXCEPT", "DISTINCT", "WINDOW"]
+        .iter()
+        .any(|k| find_keyword(query, k, 0).is_some());
+    if complex {
+        let aliased = format!("SELECT {} AS __arr_v {}", expr.trim(), &query[from..]);
+        return Some(format!("COALESCE((SELECT array_agg(__arr_v) FROM ({aliased}) __arr), '{{}}')"));
+    }
+    let body = &query[from..];
+    let (rest, order) = match find_keyword(body, "ORDER BY", 0) {
+        Some(o) => (&body[..o], Some(body[o + "ORDER BY".len()..].trim())),
+        None => (body, None),
+    };
+    let aggregate = match order {
+        Some(o) => format!("array_agg({} ORDER BY {o})", expr.trim()),
+        None => format!("array_agg({})", expr.trim()),
+    };
+    Some(format!("COALESCE((SELECT {aggregate} {}), '{{}}')", rest.trim()))
+}
+
 /// `sql` with every tab, line break, vertical tab and form feed outside
 /// quotes made a space: whitespace to PostgreSQL, and one kind of it to the
 /// parsers downstream, many of which test for a keyword followed by a space
@@ -2019,6 +2100,21 @@ mod tests {
         // A column named like the qualifier's tail is not a qualifier.
         assert_eq!(catalog_syntax("SELECT my_pg_catalog.x FROM t"), "SELECT my_pg_catalog.x FROM t");
         assert!(matches!(catalog_syntax("SELECT 1"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn array_subqueries_become_aggregates() {
+        use super::array_subqueries;
+        assert_eq!(
+            array_subqueries("SELECT id, ARRAY(SELECT w FROM sb WHERE sb.id <= sa.id ORDER BY w) FROM sa"),
+            "SELECT id, COALESCE((SELECT array_agg(w ORDER BY w) FROM sb WHERE sb.id <= sa.id), '{}') FROM sa"
+        );
+        assert_eq!(
+            array_subqueries("SELECT ARRAY(SELECT w FROM sb LIMIT 2)"),
+            "SELECT COALESCE((SELECT array_agg(__arr_v) FROM (SELECT w AS __arr_v FROM sb LIMIT 2) __arr), '{}')"
+        );
+        // The constructor over elements, and a column named like it: untouched.
+        assert_eq!(array_subqueries("SELECT ARRAY[1, 2], my_array(x), 'ARRAY(SELECT 1)'"), "SELECT ARRAY[1, 2], my_array(x), 'ARRAY(SELECT 1)'");
     }
 
     #[test]

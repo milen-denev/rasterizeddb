@@ -1231,8 +1231,15 @@ fn parse_items(list: &str, schema: &[SchemaField]) -> Result<Vec<ReturningItem>,
             }
         }
 
-        // Anything else is an expression over the affected row.
-        match crate::core::rql::expr::parse(expr_text, schema) {
+        // Anything else is an expression over the affected row: a value, or
+        // a comparison read as the boolean it is (`k > 5`, `v IS NULL`),
+        // which the expression grammar alone refused ("RETURNING column 'k >
+        // 5' not found in schema").
+        let parsed = match crate::core::rql::expr::parse(expr_text, schema) {
+            Ok(expr) => Ok(expr),
+            Err(e) => crate::core::rql::join::comparison_value(expr_text, schema).ok().flatten().ok_or(e),
+        };
+        match parsed {
             Ok(expr) => {
                 // The expression path must not become a way to address what
                 // the column path refuses: a `__null_` companion is engine
