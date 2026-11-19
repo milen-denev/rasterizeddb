@@ -957,11 +957,19 @@ where
     drop(o.barrier.take());
     BUILT_TOTAL.fetch_add(1, Ordering::Relaxed);
     match rebuild().await {
-        Ok(n) if o.indexes.set_ready_at(proof, o.epoch) => {
+        Ok(n) => {
+            // Recorded before the indexes read as ready, and taken back if
+            // they never do: whoever waits for ready then reads how they came
+            // to be. Stored after, a reader in between found them ready and
+            // the origin still Pending.
             o.origin.store(if fell_back { 3 } else { 2 }, Ordering::Release);
-            log::info!("Built {} index(es) on {} over {} rows", o.indexes.len(), o.name, n);
+            if o.indexes.set_ready_at(proof, o.epoch) {
+                log::info!("Built {} index(es) on {} over {} rows", o.indexes.len(), o.name, n);
+            } else {
+                o.origin.store(0, Ordering::Release);
+                log::info!("Index build on {} overlapped a compaction; its result is not used", o.name);
+            }
         }
-        Ok(_) => log::info!("Index build on {} overlapped a compaction; its result is not used", o.name),
         Err(e) => log::error!("Index build on {} failed; queries scan instead: {}", o.name, e),
     }
 }

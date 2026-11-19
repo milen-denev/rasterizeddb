@@ -50,7 +50,19 @@ async fn assert_nothing_running(server: &TestServer, what: &str) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(server.database().row_locks.len(), 0, "{}: locks left behind", what);
+    // A session's block ends its transaction first and gives its locks back
+    // just after (its owner's release), so a read right at `quiescent` can
+    // still see them: wait for them under the same deadline.
+    while server.database().row_locks.len() != 0 || server.database().row_locks.referenced_len() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{}: locks left behind ({} row, {} key-share)",
+            what,
+            server.database().row_locks.len(),
+            server.database().row_locks.referenced_len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn values(from: i32, to: i32, dup_at: Option<i32>) -> String {
