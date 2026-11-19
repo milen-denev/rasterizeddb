@@ -971,7 +971,7 @@ impl DatabaseCatalog {
             }) {
                 forget_directory(&e.path());
                 released(&e.path()).await;
-                remove_quietly(&e.path());
+                super::remove_eventually(&e.path());
             }
         }
     }
@@ -1511,7 +1511,7 @@ impl DatabaseCatalog {
         match self.attach(name).await {
             Ok(_) => {
                 released(&retiring).await;
-                remove_quietly(&retiring);
+                super::remove_eventually(&retiring);
                 // The old base generation goes with what it described.
                 if let Some((_, (_, open))) = self.bases.remove(name) {
                     drop(open);
@@ -1519,7 +1519,7 @@ impl DatabaseCatalog {
                 if let Some(old) = self.base_path(name, meta.base_generation) {
                     forget_directory(&old);
                     released(&old).await;
-                    remove_quietly(&old);
+                    super::remove_eventually(&old);
                 }
                 info!("Reset branch \"{}\" from \"{}\"", name, meta.parent);
                 Ok(fresh)
@@ -1699,7 +1699,7 @@ impl DatabaseCatalog {
         if let Some(old) = self.base_path(name, old) {
             forget_directory(&old);
             released(&old).await;
-            remove_quietly(&old);
+            super::remove_eventually(&old);
         }
         Ok(())
     }
@@ -1709,7 +1709,7 @@ impl DatabaseCatalog {
         if let Some(next) = self.base_path(name, generation) {
             forget_directory(&next);
             released(&next).await;
-            remove_quietly(&next);
+            super::remove_eventually(&next);
         }
     }
 
