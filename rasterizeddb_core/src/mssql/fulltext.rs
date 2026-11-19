@@ -90,9 +90,9 @@ fn quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', "''"))
 }
 
-/// A word for an `english` query: bare, so `to_tsquery` stems it (the
-/// engine takes a quoted one as an already-made lexeme). A word with an
-/// apostrophe in it is quoted, unstemmed, as it cannot go bare.
+/// A word for an `english` query: bare, which `to_tsquery` stems. A word
+/// with an apostrophe in it is quoted, as it cannot go bare; `to_tsquery`
+/// normalises a quoted operand the same way.
 fn stemmable(word: &str) -> String {
     if word.contains('\'') { quoted(word) } else { word.to_string() }
 }
