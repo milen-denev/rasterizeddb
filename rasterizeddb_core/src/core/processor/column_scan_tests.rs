@@ -170,7 +170,14 @@ const FROM_CELLS: &[&str] = &[
     "SELECT COUNT(*), AVG(i8c) FROM t WHERE s = 'x5'",
     "SELECT COUNT(*), MIN(n) FROM t WHERE s = 'x5' AND i32c > 0",
     "SELECT COUNT(*), MAX(f) FROM t WHERE i32c IS NULL",
-    "SELECT COUNT(*), SUM(i8c) FROM t WHERE i32c + 1 > 10 AND i32c < 1000",
+    // Arithmetic no row can overflow. `i32c + 1 > 10 AND i32c < 1000` stood
+    // here, and answered or failed with "integer out of range" by whether
+    // the prefilter had dropped the row holding the greatest integer before
+    // the sum was tried: a prefilter that passes nearly every row turns
+    // itself off mid-statement, for all workers at once, so which batches
+    // it ran for is a matter of timing (`prefilter`, "When it turns itself
+    // off"). The two folds are not what differed.
+    "SELECT COUNT(*), SUM(i8c) FROM t WHERE i8c + 1 > 10 AND i32c < 1000",
     "SELECT COUNT(u8c), SUM(k) FROM t WHERE n > 1.5",
     // Nothing matches: one row of a zero and NULLs, or no group at all.
     "SELECT COUNT(*), SUM(i32c), MAX(f) FROM t WHERE k > 1000",
