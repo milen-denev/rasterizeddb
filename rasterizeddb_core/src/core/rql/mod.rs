@@ -42,6 +42,8 @@ pub mod cte;
 pub(crate) mod ctas;
 pub(crate) mod distinct_on;
 pub(crate) mod join_on;
+pub(crate) mod join_using;
+pub(crate) mod grouping_sets;
 pub(crate) mod lateral;
 pub(crate) mod correlated;
 pub mod truncate;
@@ -60,6 +62,7 @@ pub mod path_index;
 pub mod prepared;
 pub mod replicated_values;
 
+pub mod catalog_model;
 pub mod catalog_views;
 pub mod check;
 pub mod collation;
@@ -82,6 +85,12 @@ pub mod type_modifier;
 /// Table-level and composite `UNIQUE` constraints.
 pub mod unique_key;
 pub mod window;
+pub mod views;
+pub mod sequence_catalog;
+pub mod functions;
+pub mod triggers;
+pub mod merge;
+pub mod privileges;
 
 #[cfg(test)]
 mod rename_column_tests;

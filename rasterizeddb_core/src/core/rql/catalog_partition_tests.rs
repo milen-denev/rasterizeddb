@@ -176,7 +176,7 @@ async fn stats(db: &Arc<Database>, table: &str) -> Vec<(String, String)> {
 /// A catalogue view's rows, each as `column -> text`, built as pgwire builds
 /// it and read back through a SELECT of its temporary relation.
 async fn view(db: &Arc<Database>, name: &str) -> Vec<Vec<(String, String)>> {
-    let temp = super::build(name, db, FROZEN_TX, None).await.unwrap();
+    let temp = super::build_alone(name, db, FROZEN_TX, None).await.unwrap();
     let out = exec(db, &format!("SELECT * FROM {temp}")).await;
     assert_eq!(out.first(), Some(&2u8), "{name}: {}", String::from_utf8_lossy(&out));
     let fields = db.table_for_tests(&temp).unwrap().schema.fields.clone();
@@ -193,8 +193,13 @@ async fn view(db: &Arc<Database>, name: &str) -> Vec<Vec<(String, String)>> {
                     let text = match f.db_type {
                         DbType::STRING => String::from_utf8(bytes.to_vec()).unwrap(),
                         DbType::I64 => i64::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+                        DbType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()).to_string(),
+                        DbType::I16 => i16::from_le_bytes(bytes.try_into().unwrap()).to_string(),
                         DbType::BOOL => (bytes[0] != 0).to_string(),
-                        ref other => panic!("no rendering for {other:?}"),
+                        // An array, a NULL or a value the view carries for
+                        // completeness: its bytes, which compare the same
+                        // between the twins.
+                        _ => format!("{bytes:?}"),
                     };
                     (f.name.clone(), text)
                 })
@@ -537,7 +542,7 @@ async fn a_broken_partitioned_table_refuses_rather_than_vanishing() {
             assert!(e.contains("cannot be opened"), "{gone}: {what} erred without the reason: {e}");
         };
         for v in ["pg_class", "pg_stat_user_tables", "pg_indexes", "pg_index"] {
-            refused(v, super::build(v, &db, FROZEN_TX, None).await);
+            refused(v, super::build_alone(v, &db, FROZEN_TX, None).await);
         }
         for statement in ["SHOW TABLES", "SHOW DATABASE STATS", "SHOW TABLE STATS pt", "SHOW PARTITIONS pt"] {
             refused(statement, show(&db, statement).await.map(|_| String::new()));
@@ -548,7 +553,7 @@ async fn a_broken_partitioned_table_refuses_rather_than_vanishing() {
             assert!(!twin_rows(&view(&db, "columns").await, "table_name", "pt", &[]).is_empty());
             show(&db, "SHOW SCHEMA MAP").await.unwrap();
         } else {
-            refused("columns", super::build("columns", &db, FROZEN_TX, None).await);
+            refused("columns", super::build_alone("columns", &db, FROZEN_TX, None).await);
             refused("SHOW COLUMNS", show(&db, "SHOW COLUMNS FROM pt").await.map(|_| String::new()));
             // Its edges are unknown; a map drawn without them is wrong.
             refused("SHOW SCHEMA MAP", show(&db, "SHOW SCHEMA MAP").await.map(|_| String::new()));

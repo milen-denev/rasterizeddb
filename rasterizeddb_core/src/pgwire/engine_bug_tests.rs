@@ -766,3 +766,45 @@ async fn a_correlated_subquery_in_a_grouped_select_answers_as_postgresql_does() 
     .expect_err("refused");
     assert_eq!(sqlstate_of(&e), "0A000", "{e}");
 }
+
+/// `x [NOT] BETWEEN … AND …` with a constant NULL bound, and `BETWEEN
+/// SYMMETRIC`, answer as PostgreSQL 17 does. A NULL bound reached the planner
+/// as a column named NULL (42703 "unknown identifier 'NULL'") and SYMMETRIC
+/// was a syntax error; `WHERE NOT NULL` was refused. Each expansion keeps
+/// three-valued logic: `v NOT BETWEEN 5 AND NULL` holds where `v < 5`.
+#[tokio::test(flavor = "multi_thread")]
+async fn between_with_a_null_bound_or_symmetric_answers_as_postgresql_does() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE bt (id INT PRIMARY KEY, v INT)").await;
+    ok(&db, &mut s, "INSERT INTO bt VALUES (1, 1), (2, 2), (3, NULL), (4, 7)").await;
+    // The ids each keeps, PostgreSQL 17's answer for these rows.
+    for (condition, expected) in [
+        ("v BETWEEN 1 AND NULL", ""),
+        ("v BETWEEN NULL AND 5", ""),
+        ("v NOT BETWEEN 5 AND NULL", "1,2"),
+        ("v NOT BETWEEN NULL AND 1", "2,4"),
+        ("NOT (v BETWEEN 2 AND NULL)", "1"),
+        ("NOT (v NOT BETWEEN 2 AND NULL)", ""),
+        ("id = 4 OR v BETWEEN 1 AND NULL::int", "4"),
+        ("v + 1 BETWEEN 2 AND NULL OR id BETWEEN 3 AND 4", "3,4"),
+        ("v BETWEEN SYMMETRIC 2 AND 1", "1,2"),
+        ("v NOT BETWEEN SYMMETRIC 7 AND 2", "1"),
+        ("NOT (v BETWEEN SYMMETRIC 7 AND 2)", "1"),
+        ("v BETWEEN 1 AND 2", "1,2"),
+        ("NOT NULL", ""),
+        ("NOT NULL OR id = 2", "2"),
+    ] {
+        let sql = format!("SELECT string_agg(id::text, ',' ORDER BY id) FROM bt WHERE {condition}");
+        let want = if expected.is_empty() { None } else { Some(expected) };
+        assert_eq!(one(&db, &mut s, &sql).await, vec![r(&[want])], "{sql}");
+    }
+    // The same through UPDATE and DELETE.
+    ok(&db, &mut s, "UPDATE bt SET v = 0 WHERE v NOT BETWEEN 5 AND NULL").await;
+    assert_eq!(
+        one(&db, &mut s, "SELECT string_agg(id::text, ',' ORDER BY id) FROM bt WHERE v = 0").await,
+        vec![r(&[Some("1,2")])]
+    );
+    ok(&db, &mut s, "DELETE FROM bt WHERE v BETWEEN NULL AND 100 OR id = 4").await;
+    assert_eq!(one(&db, &mut s, "SELECT count(*) FROM bt").await, vec![r(&[Some("3")])]);
+}

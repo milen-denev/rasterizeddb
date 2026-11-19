@@ -758,7 +758,7 @@ async fn a_failed_update_on_a_mirrored_table_leaves_nothing_pending_or_diverged(
     let in_place = table.in_place_column_updates();
 
     let e = exec(&db, "UPDATE mq SET m = 7, n = 5000 WHERE id < 10").await.expect_err("n repeats");
-    assert!(e.contains("duplicate value"), "{e}");
+    assert!(e.contains("violates unique constraint"), "{e}");
     assert_eq!(table.in_place_column_updates(), in_place, "a mirrored table overwrote in place");
     assert_eq!(wal.pending_transactions(), 0, "the failed UPDATE's transaction is still pending in the log");
     assert!(wal.checkpoint().unwrap(), "a checkpoint declined after the failed UPDATE");

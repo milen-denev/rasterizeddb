@@ -138,6 +138,46 @@ pub enum PgFunc {
     JsonbSet,
     /// `jsonb_strip_nulls(doc)`.
     JsonbStripNulls,
+    /// `nextval(regclass)`, `currval(regclass)`, `setval(regclass, n[,
+    /// is_called])`, `lastval()`: a sequence's values (`rql::sequence`), for
+    /// the database and session a statement's scope names.
+    NextVal,
+    CurrVal,
+    SetVal,
+    LastVal,
+    /// The catalogue read by oid (`catalog_model`), as `psql` and drivers
+    /// call it: `pg_get_userbyid`, `format_type`, `pg_get_indexdef`,
+    /// `pg_get_constraintdef`, `pg_get_function_result`,
+    /// `pg_get_function_arguments`, `pg_get_expr`, `pg_encoding_to_char`.
+    PgGetUserById,
+    FormatType,
+    PgGetIndexDef,
+    PgGetConstraintDef,
+    PgGetFunctionResult,
+    PgGetFunctionArguments,
+    PgGetExpr,
+    PgEncodingToChar,
+    /// `obj_description`, `col_description`, `shobj_description`: no object
+    /// here has a comment, so NULL.
+    Description,
+    /// `pg_relation_is_publishable`: nothing is published here.
+    RelationIsPublishable,
+    /// `pg_column_is_updatable`: a table's column is, a view's is not (views
+    /// here are read-only); answered for the relation the oid names.
+    ColumnIsUpdatable,
+    /// `oid::regclass` read as text: the relation's name.
+    RegclassName,
+    /// `sha224`, `sha256`, `sha384`, `sha512` of a `bytea` (or text's bytes):
+    /// the digest as `bytea`.
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+    /// `convert_to(text, encoding)` and `convert_from(bytea, encoding)`, for
+    /// UTF8 (and SQL_ASCII, its subset); another encoding is refused rather
+    /// than written in the wrong one.
+    ConvertTo,
+    ConvertFrom,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -150,7 +190,12 @@ pub const NAMES: &[&str] = &[
     "TO_TIMESTAMP", "TO_DATE", "TO_CHAR", "AGE", "ENCODE", "DECODE", "JSON_BUILD_OBJECT", "JSONB_BUILD_OBJECT",
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
-    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS",
+    "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
+    "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF",
+    "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
+    "PG_ENCODING_TO_CHAR", "OBJ_DESCRIPTION", "COL_DESCRIPTION", "SHOBJ_DESCRIPTION", "PG_RELATION_IS_PUBLISHABLE",
+    "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
+    "PG_GET_RULEDEF", "SHA224", "SHA256", "SHA384", "SHA512", "CONVERT_TO", "CONVERT_FROM",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -270,6 +315,33 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "ARRAY_CAT" => (ArrayCat, &[2]),
         "JSONB_SET" => (JsonbSet, &[3, 4]),
         "JSONB_STRIP_NULLS" => (JsonbStripNulls, &[1]),
+        "NEXTVAL" => (NextVal, &[1]),
+        "CURRVAL" => (CurrVal, &[1]),
+        "SETVAL" => (SetVal, &[2, 3]),
+        "LASTVAL" => (LastVal, &[0]),
+        "PG_GET_USERBYID" => (PgGetUserById, &[1]),
+        "FORMAT_TYPE" => (FormatType, &[2]),
+        "PG_GET_INDEXDEF" => (PgGetIndexDef, &[1, 3]),
+        "PG_GET_CONSTRAINTDEF" => (PgGetConstraintDef, &[1, 2]),
+        "PG_GET_FUNCTION_RESULT" => (PgGetFunctionResult, &[1]),
+        "PG_GET_FUNCTION_ARGUMENTS" | "PG_GET_FUNCTION_IDENTITY_ARGUMENTS" => (PgGetFunctionArguments, &[1]),
+        "PG_GET_EXPR" => (PgGetExpr, &[2, 3]),
+        "PG_ENCODING_TO_CHAR" => (PgEncodingToChar, &[1]),
+        "OBJ_DESCRIPTION" => (Description, &[1, 2]),
+        "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => (Description, &[2]),
+        // No extended statistics, triggers' text or rules exist here.
+        "PG_GET_STATISTICSOBJDEF_COLUMNS" => (Description, &[1]),
+        "PG_GET_TRIGGERDEF" => (Description, &[1, 2]),
+        "PG_GET_RULEDEF" => (Description, &[1, 2]),
+        "SHA224" => (Sha224, &[1]),
+        "SHA256" => (Sha256, &[1]),
+        "SHA384" => (Sha384, &[1]),
+        "SHA512" => (Sha512, &[1]),
+        "CONVERT_TO" => (ConvertTo, &[2]),
+        "CONVERT_FROM" => (ConvertFrom, &[2]),
+        "PG_RELATION_IS_PUBLISHABLE" => (RelationIsPublishable, &[1]),
+        "PG_COLUMN_IS_UPDATABLE" => (ColumnIsUpdatable, &[3]),
+        "__REGCLASS_NAME" => (RegclassName, &[1]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -314,6 +386,12 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
             DbType::DECIMAL
         }
         Power | Cbrt | Exp | Ln | Log | Log10 | Pi | Degrees | Radians | Random => DbType::F64,
+        NextVal | CurrVal | SetVal | LastVal => DbType::I64,
+        PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetFunctionResult
+        | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName => DbType::STRING,
+        RelationIsPublishable | ColumnIsUpdatable => DbType::BOOL,
+        Sha224 | Sha256 | Sha384 | Sha512 | ConvertTo => DbType::BYTEA,
+        ConvertFrom => DbType::STRING,
         Div => DbType::DECIMAL,
         Gcd | Lcm => match first() {
             DbType::I64 => DbType::I64,
@@ -1652,6 +1730,95 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             data(crate::core::jsonb::set_path(&jsonb_of(&args[0])?, &path, &jsonb_of(&args[2])?, create)?, DbType::JSONB)
         }
         JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
+        PgGetUserById => text_value(crate::core::rql::catalog_model::user_by_id(int_of(&args[0], "the role's oid")?)),
+        FormatType => {
+            let typmod = int_of(&args[1], "the type modifier").ok();
+            match crate::core::rql::catalog_model::format_type(int_of(&args[0], "the type's oid")?, typmod) {
+                Some(name) => text_value(name),
+                None => text_value("???".to_string()),
+            }
+        }
+        PgGetIndexDef => {
+            let column = match args.get(1) {
+                Some(v) => int_of(v, "the column number")?,
+                None => 0,
+            };
+            match crate::core::rql::catalog_model::index_definition(int_of(&args[0], "the index's oid")?, column) {
+                Some(text) => text_value(text),
+                None => Value::Null,
+            }
+        }
+        PgGetConstraintDef => match crate::core::rql::catalog_model::constraint_definition(int_of(&args[0], "the constraint's oid")?) {
+            Some(text) => text_value(text),
+            None => Value::Null,
+        },
+        PgGetFunctionResult | PgGetFunctionArguments => {
+            let what = if func == PgGetFunctionResult { "result" } else { "arguments" };
+            match crate::core::rql::catalog_model::function_text(int_of(&args[0], "the function's oid")?, what) {
+                Some(text) => text_value(text),
+                None => Value::Null,
+            }
+        }
+        // `pg_get_expr(adbin, relid)`: a stored expression is its text here.
+        PgGetExpr => text_value(s(0)),
+        PgEncodingToChar => text_value(if int_of(&args[0], "the encoding")? == 6 { "UTF8" } else { "" }.to_string()),
+        Description => Value::Null,
+        RelationIsPublishable => data(vec![0], DbType::BOOL),
+        ColumnIsUpdatable => data(vec![1], DbType::BOOL),
+        Sha224 | Sha256 | Sha384 | Sha512 => {
+            use sha2::Digest;
+            let input = match &args[0] {
+                Value::Data { bytes, db_type: DbType::BYTEA } => bytes.clone(),
+                other => text_of(other).into_bytes(),
+            };
+            let digest = match func {
+                Sha224 => sha2::Sha224::digest(&input).to_vec(),
+                Sha256 => sha2::Sha256::digest(&input).to_vec(),
+                Sha384 => sha2::Sha384::digest(&input).to_vec(),
+                _ => sha2::Sha512::digest(&input).to_vec(),
+            };
+            data(digest, DbType::BYTEA)
+        }
+        ConvertTo | ConvertFrom => {
+            let encoding = s(1).to_ascii_uppercase().replace(['-', '_'], "");
+            let ascii = encoding == "SQLASCII";
+            if encoding != "UTF8" && !ascii {
+                return Err(format!("conversion to or from encoding \"{}\" is not supported here", s(1)));
+            }
+            if func == ConvertTo {
+                let text = s(0);
+                if ascii && !text.is_ascii() {
+                    return Err(format!("character not representable in encoding \"SQL_ASCII\": {text}"));
+                }
+                data(text.into_bytes(), DbType::BYTEA)
+            } else {
+                let bytes = match &args[0] {
+                    Value::Data { bytes, .. } => bytes.clone(),
+                    other => text_of(other).into_bytes(),
+                };
+                text_value(String::from_utf8(bytes).map_err(|_| "invalid byte sequence for encoding \"UTF8\"".to_string())?)
+            }
+        }
+        RegclassName => text_value(crate::core::rql::catalog_model::regclass_name(int_of(&args[0], "the relation's oid")?)),
+        NextVal | CurrVal | SetVal | LastVal => {
+            use crate::core::rql::sequence;
+            let database = sequence::session::database()
+                .ok_or_else(|| "sequence functions are not available in this context".to_string())?;
+            let value = match func {
+                NextVal => sequence::next_checked(database, &sequence::sequence_name_of(&s(0)))?,
+                CurrVal => sequence::session::current(&sequence::sequence_name_of(&s(0)))?,
+                LastVal => sequence::session::last()?,
+                _ => {
+                    let is_called = match args.get(2) {
+                        Some(Value::Data { bytes, db_type: DbType::BOOL }) => bytes.first().is_some_and(|b| *b != 0),
+                        Some(other) => text_of(other).eq_ignore_ascii_case("true") || text_of(other) == "t",
+                        None => true,
+                    };
+                    sequence::set_value(database, &sequence::sequence_name_of(&s(0)), int_of(&args[1], "the value")?, is_called)?
+                }
+            };
+            data(value.to_le_bytes().to_vec(), DbType::I64)
+        }
         TimezoneToLocal | TimezoneToUtc => {
             let Value::Data { bytes, .. } = &args[1] else {
                 return Ok(Value::Null);

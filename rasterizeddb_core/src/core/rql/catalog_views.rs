@@ -45,7 +45,40 @@ const VIEWS: &[&str] = &[
     "pg_tables",
     "columns",
     "tables",
+    "views",
+    "pg_views",
+    "pg_matviews",
+    "sequences",
+    "pg_sequences",
+    // Built from one model of the database (`catalog_model`).
+    "pg_type",
+    "pg_proc",
+    "pg_range",
+    "pg_enum",
+    "pg_attribute",
+    "pg_attrdef",
+    "pg_constraint",
+    "pg_am",
+    "pg_roles",
+    "pg_user",
+    "pg_collation",
+    "pg_description",
+    "pg_tablespace",
+    "pg_policy",
+    "pg_statistic_ext",
+    "pg_publication",
+    "pg_publication_rel",
+    "pg_publication_namespace",
+    "pg_trigger",
+    "pg_rewrite",
+    "pg_depend",
+    "pg_extension",
 ];
+
+/// The relations built from [`crate::core::rql::catalog_model::Model`].
+fn from_model(view: &str) -> bool {
+    matches!(view, "pg_class" | "pg_index" | "pg_namespace") || crate::core::rql::catalog_model::NEW_VIEWS.contains(&view)
+}
 
 /// The columns each view is built with, in order.
 ///
@@ -68,6 +101,9 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
     #[cfg(feature = "query_stats")]
     use DbType::F64;
     use DbType::{BOOL, I64, STRING};
+    if from_model(view) {
+        return crate::core::rql::catalog_model::columns_of(view);
+    }
     Some(match view {
         // `pg_stat_statements`, as its extension defines it, minus the columns
         // this engine has no counterpart for. The block counters are the ones
@@ -99,20 +135,11 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("materialised", I64),
             ("materialised_ms", F64),
         ],
-        "pg_namespace" => &[("oid", I64), ("nspname", STRING)],
         // `pg_tables`' two columns a client asks "does this table exist" by.
         // The rest (`tableowner`, `tablespace`, `hasindexes`, `hasrules`,
         // `hastriggers`, `rowsecurity`) are omitted, as `tables` omits the
         // standard's, rather than filled with plausible constants.
         "pg_tables" => &[("schemaname", STRING), ("tablename", STRING)],
-        "pg_class" => &[
-            ("oid", I64),
-            ("relname", STRING),
-            ("relnamespace", I64),
-            ("relkind", STRING),
-            ("relsize", I64),
-            ("reltuples", I64),
-        ],
         "columns" => &[
             ("table_catalog", STRING),
             ("table_schema", STRING),
@@ -127,6 +154,25 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("numeric_scale", I64),
             ("datetime_precision", I64),
             ("udt_name", STRING),
+            ("column_default", STRING),
+            ("is_identity", STRING),
+            ("identity_generation", STRING),
+            ("is_generated", STRING),
+            ("generation_expression", STRING),
+            ("is_updatable", STRING),
+            ("udt_catalog", STRING),
+            ("udt_schema", STRING),
+            ("character_octet_length", I64),
+            ("character_set_catalog", STRING),
+            ("character_set_schema", STRING),
+            ("character_set_name", STRING),
+            ("collation_catalog", STRING),
+            ("collation_schema", STRING),
+            ("collation_name", STRING),
+            ("domain_catalog", STRING),
+            ("domain_schema", STRING),
+            ("domain_name", STRING),
+            ("dtd_identifier", STRING),
         ],
         "pg_stat_user_tables" => &[
             ("relid", I64),
@@ -149,18 +195,6 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("restart_lsn", I64),
             ("confirmed_flush_lsn", I64),
         ],
-        "pg_index" => &[
-            ("indexrelid", I64),
-            ("indrelid", I64),
-            ("indnatts", I64),
-            ("indisunique", BOOL),
-            ("indisprimary", BOOL),
-            ("indisvalid", BOOL),
-            ("indisready", BOOL),
-            ("indislive", BOOL),
-            ("indpred", STRING),
-            ("indexprs", STRING),
-        ],
         "pg_indexes" => &[
             ("schemaname", STRING),
             ("tablename", STRING),
@@ -178,6 +212,12 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("datistemplate", BOOL),
             ("datallowconn", BOOL),
             ("datconnlimit", I64),
+            ("datlocprovider", STRING),
+            ("datlocale", STRING),
+            ("daticulocale", STRING),
+            ("daticurules", STRING),
+            ("datacl", DbType::ARRAY),
+            ("dattablespace", I64),
         ],
         "tables" => &[
             ("table_catalog", STRING),
@@ -185,9 +225,59 @@ pub fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]> {
             ("table_name", STRING),
             ("table_type", STRING),
         ],
-        "pg_inherits" => &[("inhrelid", I64), ("inhparent", I64), ("inhseqno", I64)],
+        "pg_inherits" => &[("inhrelid", I64), ("inhparent", I64), ("inhseqno", I64), ("inhdetachpending", BOOL)],
+        // `information_schema.views`: views here are not updatable and take
+        // no check option.
+        "views" => &[
+            ("table_catalog", STRING),
+            ("table_schema", STRING),
+            ("table_name", STRING),
+            ("view_definition", STRING),
+            ("check_option", STRING),
+            ("is_updatable", STRING),
+            ("is_insertable_into", STRING),
+        ],
+        "pg_views" => &[("schemaname", STRING), ("viewname", STRING), ("viewowner", STRING), ("definition", STRING)],
+        "pg_matviews" => &[
+            ("schemaname", STRING),
+            ("matviewname", STRING),
+            ("matviewowner", STRING),
+            ("ispopulated", BOOL),
+            ("definition", STRING),
+        ],
+        "sequences" => &[
+            ("sequence_catalog", STRING),
+            ("sequence_schema", STRING),
+            ("sequence_name", STRING),
+            ("data_type", STRING),
+            ("start_value", STRING),
+            ("minimum_value", STRING),
+            ("maximum_value", STRING),
+            ("increment", STRING),
+            ("cycle_option", STRING),
+        ],
+        "pg_sequences" => &[
+            ("schemaname", STRING),
+            ("sequencename", STRING),
+            ("data_type", STRING),
+            ("start_value", I64),
+            ("min_value", I64),
+            ("max_value", I64),
+            ("increment_by", I64),
+            ("cycle", BOOL),
+            ("cache_size", I64),
+            ("last_value", I64),
+        ],
         _ => return None,
     })
+}
+
+/// Every catalogue view a statement reads.
+pub fn views_named(sql: &str) -> Vec<&'static str> {
+    if !may_name_a_view(sql) {
+        return Vec::new();
+    }
+    VIEWS.iter().copied().filter(|view| names_relation(sql, view)).collect()
 }
 
 /// The catalogue view a statement reads, if it reads one.
@@ -247,7 +337,7 @@ const SCHEMA: &str = "public";
 /// COLUMNS FROM "rdb_roles"` became `SHOW __cat_columns_… FROM "rdb_roles"`,
 /// which returned one empty column and left every client that asks a table for
 /// its columns believing it had none.
-const QUALIFIED_ONLY: [&str; 2] = ["columns", "tables"];
+const QUALIFIED_ONLY: [&str; 4] = ["columns", "tables", "views", "sequences"];
 
 /// Whether `view` may only be matched with its schema in front of it.
 fn needs_qualifier(view: &str) -> bool {
@@ -286,6 +376,8 @@ pub async fn materialize(
     if !may_name_a_view(sql) {
         return Ok(None);
     }
+    let shortcut = empty_answer(sql);
+    let sql = shortcut.as_deref().unwrap_or(sql);
     let mut wanted: Vec<String> = Vec::new();
     for view in VIEWS.iter().copied() {
         if names_relation(sql, view) {
@@ -322,12 +414,20 @@ pub async fn materialize(
     // for the partial index covering one value — correctly matches nothing.
     // Left alone the whole statement failed instead, which reads as "the index
     // could not be checked" rather than "there is no such index".
-    if wanted.iter().any(|v| v == "pg_index") {
-        rewritten = rewrite_get_expr(&rewritten);
-    }
+    rewritten = rewrite_reg_casts(&rewritten);
 
+    // One model for every relation of the statement built from it, and for
+    // the functions that read the catalogue by oid while it runs
+    // (`catalog_model::publish`).
+    let model = if wanted.iter().any(|v| from_model(v)) {
+        let model = std::sync::Arc::new(model_for(database, tx).await?);
+        crate::core::rql::catalog_model::publish(database.id, model.clone());
+        Some(model)
+    } else {
+        None
+    };
     for view in &wanted {
-        match build(view, database, tx, catalog).await {
+        match build(view, database, tx, catalog, model.as_deref()).await {
             Ok(temp) => {
                 rewritten = replace_relation(&rewritten, view, &temp);
                 temps.push(temp);
@@ -342,6 +442,285 @@ pub async fn materialize(
     }
 
     Ok(Some(Materialized { rewritten, temps }))
+}
+
+/// The `regclass` and `regtype` casts of a catalogue statement, as this
+/// engine reads them: a name's cast (`'items'::regclass`, how an ORM asks for
+/// a table's columns) as the oid it names, a number's as that number, and a
+/// column's (`conrelid::regclass`, which `psql` prints) as the relation's
+/// name, `__regclass_name(conrelid)`; `x::regtype` as `format_type(x, NULL)`.
+/// `psql`'s `(SELECT pg_partition_ancestors(r) UNION ALL VALUES (r))`, the
+/// relation and the ancestors it was partitioned from, is `(r)`: nothing
+/// here is a partition of another relation.
+fn rewrite_reg_casts(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("::reg") && !lower.contains("pg_partition_ancestors") {
+        return sql.to_string();
+    }
+    let sql = match regex::Regex::new(
+        r"(?i)\(\s*SELECT\s+pg_partition_ancestors\s*\(([^()]*)\)\s+UNION\s+ALL\s+VALUES\s*\(([^()]*)\)\s*\)",
+    ) {
+        Ok(re) => re.replace_all(sql, "($2)").into_owned(),
+        Err(_) => sql.to_string(),
+    };
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            out.push_str(&sql[i..end]);
+            i = end.max(i + 1);
+            continue;
+        }
+        let rest = &sql[i..];
+        let cast = ["::regclass", "::regtype", "::regnamespace", "::regrole"].iter().find(|c| {
+            rest.len() >= c.len()
+                && rest[..c.len()].eq_ignore_ascii_case(c)
+                && !rest[c.len()..].starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_')
+        });
+        let Some(cast) = cast else {
+            let ch = rest.chars().next().expect("in bounds");
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+        let class = *cast == "::regclass";
+        let trimmed = out.trim_end().len();
+        if matches!(*cast, "::regnamespace" | "::regrole") {
+            // A column's: the schema's or the role's name.
+            let ob = out[..trimmed].as_bytes();
+            let start = ob
+                .iter()
+                .rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'"'))
+                .map_or(0, |p| p + 1);
+            let operand = out[start..trimmed].to_string();
+            out.truncate(start);
+            if *cast == "::regrole" {
+                out.push_str(&format!("pg_get_userbyid({operand})"));
+            } else {
+                out.push_str(&format!(
+                    "CASE {operand} WHEN {} THEN 'pg_catalog' WHEN {} THEN 'public' WHEN {} THEN 'information_schema' END",
+                    crate::core::rql::catalog_model::NS_CATALOG,
+                    crate::core::rql::catalog_model::NS_PUBLIC,
+                    crate::core::rql::catalog_model::NS_INFORMATION_SCHEMA
+                ));
+            }
+            i += cast.len();
+            continue;
+        }
+        out.truncate(trimmed);
+        let ob = out.as_bytes();
+        if ob.last() == Some(&b'\'') {
+            // The literal's opening quote, past doubled ones.
+            let mut k = ob.len() - 1;
+            let start = loop {
+                match ob[..k].iter().rposition(|&b| b == b'\'') {
+                    Some(q) if q > 0 && ob[q - 1] == b'\'' => k = q - 1,
+                    Some(q) => break Some(q),
+                    None => break None,
+                }
+            };
+            if let Some(start) = start {
+                let text = out[start + 1..out.len() - 1].replace("''", "'");
+                let oid = match text.trim().parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) if class => {
+                        let name = text.rsplit('.').next().unwrap_or(&text);
+                        let name =
+                            if name.starts_with('"') { name.trim_matches('"').to_string() } else { name.to_ascii_lowercase() };
+                        crate::core::rql::catalog_model::oid_of(&name)
+                    }
+                    Err(_) => crate::core::rql::catalog_model::type_oid_by_name(&text),
+                };
+                out.truncate(start);
+                out.push_str(&oid.to_string());
+                i += cast.len();
+                continue;
+            }
+        }
+        let start = ob
+            .iter()
+            .rposition(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'"'))
+            .map_or(0, |p| p + 1);
+        let operand = out[start..].to_string();
+        if operand.is_empty() || operand.as_bytes()[0].is_ascii_digit() {
+            // A number is its own oid; anything else is left as written.
+            if !operand.is_empty() {
+                i += cast.len();
+            } else {
+                out.push_str(cast);
+                i += cast.len();
+            }
+            continue;
+        }
+        out.truncate(start);
+        if class {
+            out.push_str(&format!("__regclass_name({operand})"));
+        } else {
+            out.push_str(&format!("format_type({operand}, NULL)"));
+        }
+        i += cast.len();
+    }
+    out
+}
+
+/// The catalogue relations that hold no rows here, ever: no row-security
+/// policy, extended statistics, publication, rewrite rule, dependency,
+/// extension, comment or enum exists in this engine.
+const ALWAYS_EMPTY: &[&str] = &[
+    "pg_inherits",
+    "pg_trigger",
+    "pg_policy",
+    "pg_statistic_ext",
+    "pg_publication",
+    "pg_publication_rel",
+    "pg_publication_namespace",
+    "pg_rewrite",
+    "pg_depend",
+    "pg_extension",
+    "pg_description",
+    "pg_enum",
+];
+
+/// A SELECT whose every branch is driven by an [`ALWAYS_EMPTY`] relation,
+/// reached only by inner, `LEFT` or comma joins and with no aggregate, as
+/// the empty answer it is: its columns, by name, as NULLs, over that relation
+/// `WHERE FALSE`. `psql`'s `\d` asks for a table's policies with a
+/// correlated `array(SELECT …)` and for its publications with a correlated
+/// subquery under UNION, neither of which this engine reads; with no policy
+/// and no publication either answer has no rows whatever its select list
+/// computes.
+fn empty_answer(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    if !sql.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        return None;
+    }
+    let branches: Vec<String> = match crate::core::rql::join::split_union(sql) {
+        Some(Ok(parts)) => parts.branches,
+        Some(Err(_)) => return None,
+        None => vec![sql.to_string()],
+    };
+    // Only where it is needed: a select list computing a subquery or an
+    // `array(…)`, or a UNION. Anything else is answered as written, with its
+    // columns' own types.
+    let needed = branches.len() > 1
+        || crate::core::sql_scan::contains_ignore_ascii_case(sql, b"(select")
+        || crate::core::sql_scan::contains_ignore_ascii_case(sql, b"array(");
+    // Or a relation joined to one that is always empty: its ORDER BY or
+    // select list may compute what this engine's join does not read
+    // (`psql`'s child tables, ordered by `pg_get_expr(…) = 'DEFAULT'`).
+    let mut joined_empty = false;
+    let aggregates: [&[u8]; 12] = [
+        b"count(", b"sum(", b"avg(", b"min(", b"max(", b"array_agg(", b"string_agg(", b"json_agg(", b"jsonb_agg(",
+        b"bool_and(", b"bool_or(", b"every(",
+    ];
+    let mut first: Option<(String, Vec<String>)> = None;
+    for branch in &branches {
+        let branch = branch.trim();
+        let branch = branch.strip_prefix('(').and_then(|b| b.strip_suffix(')')).unwrap_or(branch).trim();
+        let from = find_keyword(branch, "FROM", 0)?;
+        let list = &branch[6..from];
+        let list = list.trim_start();
+        let list = if list.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT")) { &list[8..] } else { list };
+        // An aggregate of the branch's own (one inside a subquery aggregates
+        // that subquery's rows, and leaves the branch's empty).
+        let own = outside_subqueries(list);
+        if aggregates.iter().any(|a| crate::core::sql_scan::contains_ignore_ascii_case(&own, a)) || own.contains('*') {
+            return None;
+        }
+        let rest = &branch[from + 4..];
+        let end = ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET"]
+            .iter()
+            .filter_map(|k| find_keyword(rest, k, 0))
+            .min()
+            .unwrap_or(rest.len());
+        let from_list = &rest[..end];
+        if find_keyword(from_list, "RIGHT", 0).is_some() || find_keyword(from_list, "FULL", 0).is_some() {
+            return None;
+        }
+        // The driving relation; or, when every join is inner, any relation.
+        let words: Vec<String> = from_list
+            .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')')
+            .filter(|w| !w.is_empty())
+            .map(|w| w.trim_matches('"').to_ascii_lowercase())
+            .collect();
+        let inner_only = find_keyword(from_list, "LEFT", 0).is_none();
+        joined_empty |= words.iter().skip(1).any(|w| ALWAYS_EMPTY.contains(&w.as_str()));
+        let relation = if inner_only {
+            words.iter().find(|w| ALWAYS_EMPTY.contains(&w.as_str())).cloned()
+        } else {
+            words.first().filter(|w| ALWAYS_EMPTY.contains(&w.as_str())).cloned()
+        };
+        let Some(relation) = relation else {
+            return None;
+        };
+        if first.is_none() {
+            let names = crate::core::sql_scan::split_top_level(list, b',')
+                .into_iter()
+                .map(|item| {
+                    let (expr, alias) = crate::core::rql::lexer_query::split_alias(item.trim());
+                    alias
+                        .map(|a| a.trim_matches('"').to_string())
+                        .unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr))
+                })
+                .collect();
+            first = Some((relation, names));
+        }
+    }
+    if !needed && !joined_empty {
+        return None;
+    }
+    let (relation, names) = first?;
+    let columns = names
+        .iter()
+        .map(|n| format!("NULL AS {}", crate::core::rql::views::quote_ident(n)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // No rows to filter: the relation is empty.
+    Some(format!("SELECT {columns} FROM {relation}"))
+}
+
+/// `text` with every parenthesised `SELECT` blanked, past quotes.
+fn outside_subqueries(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            out.push_str(&text[i..end]);
+            i = end.max(i + 1);
+            continue;
+        }
+        if bytes[i] == b'(' && text[i + 1..].trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+            let mut depth = 0i32;
+            let mut j = i;
+            while j < bytes.len() {
+                if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, j) {
+                    j = end.max(j + 1);
+                    continue;
+                }
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            out.push_str("(NULL)");
+            i = (j + 1).min(bytes.len());
+            continue;
+        }
+        let ch = text[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Whether `sql` uses `view` as a relation, rather than merely containing the
@@ -485,91 +864,6 @@ fn rewrite_size_calls(sql: &str) -> String {
 ///
 /// `pg_current_wal_lsn()` becomes the engine's commit LSN — a real, monotonic
 /// position, not a placeholder — and `pg_wal_lsn_diff(a, b)` becomes `(a - b)`.
-/// Replaces every `pg_get_expr(...)` call with the empty string.
-///
-/// Empty rather than `NULL`: the row evaluator rejects a `NULL` literal in a
-/// `WHERE`, and the two behave the same under the `LIKE`/`ILIKE` these calls
-/// are almost always compared with — neither matches a pattern with anything
-/// in it. Arguments are skipped by balancing parentheses, so a nested call
-/// does not end the span early.
-fn rewrite_get_expr(sql: &str) -> String {
-    const NAME: &str = "pg_get_expr";
-    let mut out = sql.to_string();
-    let mut from = 0usize;
-
-    loop {
-        let lower = out.to_ascii_lowercase();
-        let Some(at) = lower[from..].find(NAME).map(|i| i + from) else {
-            break;
-        };
-
-        // Only a call, and only a whole word: `my_pg_get_expr` is a column.
-        let before_ok = at == 0 || !is_ident_byte(out.as_bytes()[at - 1]);
-        let after = &out[at + NAME.len()..];
-        let open_rel = after.find('(').filter(|o| after[..*o].trim().is_empty());
-
-        let (Some(open_rel), true) = (open_rel, before_ok) else {
-            from = at + NAME.len();
-            continue;
-        };
-
-        let start = at + NAME.len() + open_rel;
-        let Some(end) = matching_paren(&out, start) else {
-            from = at + NAME.len();
-            continue;
-        };
-
-        out = format!("{}''{}", &out[..at], &out[end + 1..]);
-        from = at + 2;
-    }
-
-    out
-}
-
-/// The index of the `)` closing the `(` at `open`, or `None` if unbalanced.
-///
-/// String literals are skipped so a parenthesis inside one cannot close the
-/// call.
-fn matching_paren(sql: &str, open: usize) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    let mut depth = 0usize;
-    let mut i = open;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    None
-}
-
-/// A byte that can appear inside an identifier.
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 fn rewrite_wal_calls(sql: &str, database: &Arc<Database>) -> String {
     let lsn = database
         .location
@@ -852,10 +1146,24 @@ fn column_info(field: &crate::core::row::schema::SchemaField, schema: &crate::co
     }
 }
 
+/// `character_octet_length`: four bytes a character for a bounded text
+/// column, PostgreSQL's 1 GB bound for `text`, NULL for anything else.
+fn octet_length(info: &ColumnInfo) -> String {
+    match (info.character_maximum_length, info.udt_name) {
+        (Some(n), _) => (u64::from(n) * 4).to_string(),
+        (None, "text" | "varchar" | "bpchar") => "1073741824".to_string(),
+        _ => "NULL".to_string(),
+    }
+}
+
 /// `value` as a literal: the number, or `NULL`.
 fn number_or_null(value: Option<u32>) -> String {
     value.map_or_else(|| "NULL".to_string(), |v| v.to_string())
 }
+
+/// The prefix of every relation [`temp_name`] makes: statement-scoped, so
+/// memory-backed and never in the catalogue (`database::is_statement_scoped`).
+pub(crate) const TEMP_PREFIX: &str = "__cat_";
 
 /// A temporary table name for one view, unique to this statement.
 fn temp_name(view: &str, database: &Arc<Database>) -> String {
@@ -869,12 +1177,56 @@ fn temp_name(view: &str, database: &Arc<Database>) -> String {
     )
 }
 
+/// The model of `database` as `tx` sees it: its tables, views, materialized
+/// views and sequences, with every table's figures read here, where the
+/// storage layer is reachable.
+async fn model_for(
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+) -> Result<crate::core::rql::catalog_model::Model, String> {
+    let view_tx = (tx != crate::core::mvcc::transaction::FROZEN_TX).then_some(tx);
+    let views = crate::core::rql::views::load(database, None, view_tx).await?;
+    let materialized: Vec<String> = views
+        .iter()
+        .filter(|v| v.kind == crate::core::rql::views::ViewKind::Materialized)
+        .map(|v| v.name.clone())
+        .collect();
+    let tables: Vec<String> = database
+        .relation_names()
+        .into_iter()
+        .filter(|name| !is_internal(name) && !materialized.contains(name))
+        .collect();
+    let mut sizes = std::collections::HashMap::new();
+    for name in tables.iter().chain(materialized.iter()) {
+        let (bytes, tuples) = relation_size(database, name).await?;
+        sizes.insert(name.clone(), (bytes as i64, tuples));
+    }
+    let sequences = sequence_rows(database, view_tx).await?.into_iter().map(|s| s.name).collect();
+    let gathered = crate::core::rql::catalog_model::Gathered { tables, views, sequences };
+    let ready_of = |relation: &Relation| index_set(relation).ok().flatten().is_none_or(|(_, ready)| ready);
+    Ok(crate::core::rql::catalog_model::build_model(database, view_tx, gathered, &shared_declarations, &ready_of, &sizes).await)
+}
+
+/// [`build`], with the model made first when the relation needs one, as
+/// [`materialize`] makes it.
+#[cfg(test)]
+async fn build_alone(
+    view: &str,
+    database: &Arc<Database>,
+    tx: crate::core::mvcc::transaction::TxId,
+    catalog: Option<&Arc<crate::core::database::catalog::DatabaseCatalog>>,
+) -> Result<String, String> {
+    let model = if from_model(view) { Some(model_for(database, tx).await?) } else { None };
+    build(view, database, tx, catalog, model.as_ref()).await
+}
+
 /// Builds one catalogue relation as a temporary table and returns its name.
 async fn build(
     view: &str,
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
     catalog: Option<&Arc<crate::core::database::catalog::DatabaseCatalog>>,
+    model: Option<&crate::core::rql::catalog_model::Model>,
 ) -> Result<String, String> {
     let temp = temp_name(view, database);
 
@@ -882,11 +1234,27 @@ async fn build(
     // partitioned table whose schema could not be read has no shell in
     // `tables`; it is listed too, so a view that needs its data or schema
     // refuses rather than answering without it.
+    // The views this statement's transaction sees (`rql::views`). A
+    // materialized view is a table underneath, listed as what it is.
+    let view_tx = (tx != crate::core::mvcc::transaction::FROZEN_TX).then_some(tx);
+    let view_defs = crate::core::rql::views::load(database, None, view_tx).await?;
+    let is_view_of = |name: &str, kind: crate::core::rql::views::ViewKind| {
+        view_defs.iter().any(|v| v.kind == kind && v.name == name)
+    };
     let tables: Vec<String> = database
         .relation_names()
         .into_iter()
         .filter(|name| !is_internal(name))
+        .filter(|name| !is_view_of(name, crate::core::rql::views::ViewKind::Materialized))
         .collect();
+    // Every sequence: those `CREATE SEQUENCE` made, and those a column's
+    // default reads (a `SERIAL`'s, an identity column's), as PostgreSQL
+    // lists both.
+    let sequences: Vec<SequenceRow> = if matches!(view, "sequences" | "pg_sequences" | "pg_class") {
+        sequence_rows(database, view_tx).await?
+    } else {
+        Vec::new()
+    };
 
     let (create, inserts) = match view {
         "pg_tables" => (
@@ -903,42 +1271,13 @@ async fn build(
                 })
                 .collect(),
         ),
-        "pg_namespace" => (
-            format!("CREATE TABLE {} (oid BIGINT, nspname TEXT)", temp),
-            vec![format!(
-                "INSERT INTO {} (oid, nspname) VALUES ({}, '{}')",
-                temp,
-                oid_of(SCHEMA),
-                SCHEMA
-            )],
-        ),
-        "pg_class" => {
-            let mut rows = Vec::with_capacity(tables.len());
-            for name in &tables {
-                // The size is read here, where the storage layer is reachable.
-                // `pg_total_relation_size(c.oid)` is rewritten into a reference
-                // to this column, so the figure comes from a `stat` rather than
-                // from a function the row evaluator could not answer.
-                let (bytes, tuples) = relation_size(database, name).await?;
-                rows.push(format!(
-                    "INSERT INTO {} (oid, relname, relnamespace, relkind, relsize, reltuples) \
-                     VALUES ({}, '{}', {}, 'r', {}, {})",
-                    temp,
-                    oid_of(name),
-                    escape(name),
-                    oid_of(SCHEMA),
-                    bytes,
-                    tuples
-                ));
-            }
-            (
-                format!(
-                    "CREATE TABLE {} (oid BIGINT, relname TEXT, relnamespace BIGINT, \
-                     relkind TEXT, relsize BIGINT, reltuples BIGINT)",
-                    temp
-                ),
-                rows,
-            )
+        // Built from the statement's model (`catalog_model`), which
+        // `materialize` makes once for every relation of it that needs one.
+        v if from_model(v) => {
+            let model = model.ok_or_else(|| format!("{v} was asked for without the catalogue's model"))?;
+            let columns = crate::core::rql::catalog_model::columns_of(v).expect("a model relation has columns");
+            let rows = crate::core::rql::catalog_model::rows_of(v, model).expect("a model relation has rows");
+            crate::core::rql::catalog_model::table_sql(&temp, columns, &rows)
         }
         // `information_schema.columns`, which is how an application asks
         // whether a column exists before using it. Named `columns` here because
@@ -970,12 +1309,27 @@ async fn build(
                             )
                     });
                     let info = column_info(field, table.schema());
+                    let identity = crate::core::rql::column_default::identity_of(&field.name, &table.schema().defaults).map(|k| {
+                        match k {
+                            crate::core::rql::column_default::IdentityKind::Always => "ALWAYS",
+                            _ => "BY DEFAULT",
+                        }
+                    });
+                    let generated = crate::core::rql::generated::expression_for(&field.name, &table.schema().generated);
+                    let default_sql = match (identity, generated) {
+                        (None, None) => crate::core::rql::column_default::expression_for(&field.name, &table.schema().defaults)
+                            .map_or("NULL".to_string(), |d| format!("'{}'", escape(d))),
+                        _ => "NULL".to_string(),
+                    };
                     rows.push(format!(
                         "INSERT INTO {} (table_catalog, table_schema, table_name, column_name, \
                          ordinal_position, is_nullable, data_type, character_maximum_length, \
                          numeric_precision, numeric_precision_radix, numeric_scale, \
-                         datetime_precision, udt_name) \
-                         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}', {}, {}, {}, {}, {}, '{}')",
+                         datetime_precision, udt_name, column_default, is_identity, identity_generation, \
+                         is_generated, generation_expression, is_updatable, udt_catalog, udt_schema, \
+                         character_octet_length, dtd_identifier) \
+                         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}', {}, {}, {}, {}, {}, '{}', {}, '{}', {}, '{}', {}, \
+                         'YES', '{}', 'pg_catalog', {}, '{}')",
                         temp,
                         // The catalog is the database, as `current_database()`
                         // names it; it said the schema.
@@ -992,6 +1346,58 @@ async fn build(
                         number_or_null(info.numeric_scale),
                         number_or_null(info.datetime_precision),
                         info.udt_name,
+                        default_sql,
+                        if identity.is_some() { "YES" } else { "NO" },
+                        identity.map_or("NULL".to_string(), |k| format!("'{k}'")),
+                        if generated.is_some() { "ALWAYS" } else { "NEVER" },
+                        generated.map_or("NULL".to_string(), |g| format!("'{}'", escape(g))),
+                        escape(&database.name),
+                        octet_length(&info),
+                        position + 1,
+                    ));
+                }
+            }
+            // A view's columns and their types, as its query describes them.
+            for view in view_defs.iter().filter(|v| v.kind == crate::core::rql::views::ViewKind::View) {
+                let select = format!("SELECT * FROM {}", crate::core::rql::views::quote_ident(&view.name));
+                let Ok(Some((fields, true))) = Box::pin(crate::pgwire::describe_query(database, &select)).await else {
+                    continue;
+                };
+                for (position, (column, db_type)) in fields.iter().enumerate() {
+                    let field = crate::core::row::schema::SchemaField::new(
+                        column.clone(),
+                        db_type.clone(),
+                        db_type.get_size(),
+                        0,
+                        position as u64,
+                        false,
+                    );
+                    let info = column_info(&field, &crate::core::row::schema::TableSchema::new(view.name.clone(), false));
+                    rows.push(format!(
+                        "INSERT INTO {} (table_catalog, table_schema, table_name, column_name, \
+                         ordinal_position, is_nullable, data_type, character_maximum_length, \
+                         numeric_precision, numeric_precision_radix, numeric_scale, \
+                         datetime_precision, udt_name, column_default, is_identity, identity_generation, \
+                         is_generated, generation_expression, is_updatable, udt_catalog, udt_schema, \
+                         character_octet_length, dtd_identifier) \
+                         VALUES ('{}', '{}', '{}', '{}', {}, 'YES', '{}', {}, {}, {}, {}, {}, '{}', NULL, 'NO', NULL, \
+                         'NEVER', NULL, 'NO', '{}', 'pg_catalog', {}, '{}')",
+                        temp,
+                        escape(&database.name),
+                        SCHEMA,
+                        escape(&view.name),
+                        escape(column),
+                        position + 1,
+                        info.data_type,
+                        number_or_null(info.character_maximum_length),
+                        number_or_null(info.numeric_precision),
+                        number_or_null(info.numeric_precision_radix),
+                        number_or_null(info.numeric_scale),
+                        number_or_null(info.datetime_precision),
+                        info.udt_name,
+                        escape(&database.name),
+                        octet_length(&info),
+                        position + 1,
                     ));
                 }
             }
@@ -1001,11 +1407,120 @@ async fn build(
                      column_name TEXT, ordinal_position BIGINT, is_nullable TEXT, data_type TEXT, \
                      character_maximum_length BIGINT, numeric_precision BIGINT, \
                      numeric_precision_radix BIGINT, numeric_scale BIGINT, \
-                     datetime_precision BIGINT, udt_name TEXT)",
+                     datetime_precision BIGINT, udt_name TEXT, column_default TEXT, is_identity TEXT, \
+                     identity_generation TEXT, is_generated TEXT, generation_expression TEXT, \
+                     is_updatable TEXT, udt_catalog TEXT, udt_schema TEXT, character_octet_length BIGINT, \
+                     character_set_catalog TEXT, character_set_schema TEXT, character_set_name TEXT, \
+                     collation_catalog TEXT, collation_schema TEXT, collation_name TEXT, \
+                     domain_catalog TEXT, domain_schema TEXT, domain_name TEXT, dtd_identifier TEXT)",
                     temp
                 ),
                 rows,
             )
+        }
+        "sequences" | "pg_sequences" => {
+            let mut rows = Vec::new();
+            for seq in &sequences {
+                rows.push(match view {
+                    "sequences" => format!(
+                        "INSERT INTO {} (sequence_catalog, sequence_schema, sequence_name, data_type, start_value, \
+                         minimum_value, maximum_value, increment, cycle_option) VALUES ('{}', '{}', '{}', '{}', '{}', \
+                         '{}', '{}', '{}', '{}')",
+                        temp,
+                        escape(&database.name),
+                        SCHEMA,
+                        escape(&seq.name),
+                        seq.data_type,
+                        seq.start,
+                        seq.min,
+                        seq.max,
+                        seq.increment,
+                        if seq.cycle { "YES" } else { "NO" }
+                    ),
+                    _ => format!(
+                        "INSERT INTO {} (schemaname, sequencename, data_type, start_value, min_value, max_value, \
+                         increment_by, cycle, cache_size, last_value) VALUES ('{}', '{}', '{}', {}, {}, {}, {}, {}, \
+                         {}, {})",
+                        temp,
+                        SCHEMA,
+                        escape(&seq.name),
+                        seq.data_type,
+                        seq.start,
+                        seq.min,
+                        seq.max,
+                        seq.increment,
+                        if seq.cycle { "TRUE" } else { "FALSE" },
+                        seq.cache,
+                        seq.last.map_or("NULL".to_string(), |v| v.to_string())
+                    ),
+                });
+            }
+            let create = match view {
+                "sequences" => format!(
+                    "CREATE TABLE {} (sequence_catalog TEXT, sequence_schema TEXT, sequence_name TEXT, data_type TEXT, \
+                     start_value TEXT, minimum_value TEXT, maximum_value TEXT, increment TEXT, cycle_option TEXT)",
+                    temp
+                ),
+                _ => format!(
+                    "CREATE TABLE {} (schemaname TEXT, sequencename TEXT, data_type TEXT, start_value BIGINT, \
+                     min_value BIGINT, max_value BIGINT, increment_by BIGINT, cycle BOOLEAN, cache_size BIGINT, \
+                     last_value BIGINT)",
+                    temp
+                ),
+            };
+            (create, rows)
+        }
+        "views" | "pg_views" | "pg_matviews" => {
+            use crate::core::rql::views::ViewKind;
+            let wanted = if view == "pg_matviews" { ViewKind::Materialized } else { ViewKind::View };
+            let mut rows = Vec::new();
+            for def in view_defs.iter().filter(|v| v.kind == wanted) {
+                rows.push(match view {
+                    "views" => format!(
+                        "INSERT INTO {} (table_catalog, table_schema, table_name, view_definition, check_option, \
+                         is_updatable, is_insertable_into) VALUES ('{}', '{}', '{}', '{}', 'NONE', 'NO', 'NO')",
+                        temp,
+                        escape(&database.name),
+                        SCHEMA,
+                        escape(&def.name),
+                        escape(&def.definition)
+                    ),
+                    "pg_views" => format!(
+                        "INSERT INTO {} (schemaname, viewname, viewowner, definition) VALUES ('{}', '{}', '{}', '{}')",
+                        temp,
+                        SCHEMA,
+                        escape(&def.name),
+                        escape(&database.name),
+                        escape(&def.definition)
+                    ),
+                    _ => format!(
+                        "INSERT INTO {} (schemaname, matviewname, matviewowner, ispopulated, definition) \
+                         VALUES ('{}', '{}', '{}', TRUE, '{}')",
+                        temp,
+                        SCHEMA,
+                        escape(&def.name),
+                        escape(&database.name),
+                        escape(&def.definition)
+                    ),
+                });
+            }
+            let create = match view {
+                "views" => format!(
+                    "CREATE TABLE {} (table_catalog TEXT, table_schema TEXT, table_name TEXT, view_definition TEXT, \
+                     check_option TEXT, is_updatable TEXT, is_insertable_into TEXT)",
+                    temp
+                ),
+                "pg_views" => format!(
+                    "CREATE TABLE {} (schemaname TEXT, viewname TEXT, viewowner TEXT, definition TEXT)",
+                    temp
+                ),
+                _ => format!(
+                    "CREATE TABLE {} (schemaname TEXT, matviewname TEXT, matviewowner TEXT, ispopulated BOOLEAN, \
+                     definition TEXT)",
+                    temp
+                ),
+            };
+            (create, rows)
         }
         // The four columns schema introspection actually reads —
         // `sea-orm-cli`, Diesel's `print-schema` and JDBC's `getTables` all
@@ -1016,15 +1531,22 @@ async fn build(
         // answer.
         "tables" => {
             let mut rows = Vec::with_capacity(tables.len());
-            for name in &tables {
+            let listed = tables.iter().map(|n| (n.as_str(), "BASE TABLE")).chain(
+                view_defs
+                    .iter()
+                    .filter(|v| v.kind == crate::core::rql::views::ViewKind::View)
+                    .map(|v| (v.name.as_str(), "VIEW")),
+            );
+            for (name, kind) in listed {
                 rows.push(format!(
                     "INSERT INTO {} (table_catalog, table_schema, table_name, table_type) \
-                     VALUES ('{}', '{}', '{}', 'BASE TABLE')",
+                     VALUES ('{}', '{}', '{}', '{}')",
                     temp,
                     // The database, as in `columns`.
                     escape(&database.name),
                     SCHEMA,
-                    escape(name)
+                    escape(name),
+                    kind
                 ));
             }
             (
@@ -1128,112 +1650,6 @@ async fn build(
         // access paths and has no user-visible indexes, so the only entries are
         // the ones a client can reason about: what is unique, and what is the
         // key.
-        "pg_index" => {
-            let mut rows = Vec::new();
-            for name in &tables {
-                let Some(relation) = database.relation(name) else {
-                    continue;
-                };
-                let schema = relation.schema();
-                let relid = oid_of(name);
-
-                let mut keys: Vec<(String, bool, bool)> = Vec::new();
-                if let Some(primary) = schema.primary_key.as_deref() {
-                    keys.push((primary.to_string(), true, true));
-                }
-                for field in schema.fields.iter() {
-                    if field.is_unique
-                        && !field.is_deleted
-                        && !keys
-                            .iter()
-                            .any(|(n, _, _)| n.eq_ignore_ascii_case(&field.name))
-                    {
-                        keys.push((field.name.clone(), true, false));
-                    }
-                }
-                // A partial key is unique only under its predicate, and this
-                // view lists each column as unique outright, so it is left out
-                // rather than reported as a guarantee it does not give.
-                for key in schema.unique_keys.iter().filter(|k| !k.is_deleted && k.predicate.is_none()) {
-                    if key.columns.len() == 1
-                        && !keys
-                            .iter()
-                            .any(|(n, _, _)| n.eq_ignore_ascii_case(&key.columns[0]))
-                    {
-                        keys.push((key.columns[0].clone(), true, false));
-                    }
-                }
-
-                // Indexes `CREATE INDEX` declared, each with its own
-                // identity and its column count. Never "no indexes" for a
-                // table whose indexes cannot be read: a migration tool would
-                // re-issue every CREATE INDEX.
-                if let Some((owned, ready)) = index_set(&relation)? {
-                    let indexes = owned.view();
-                    let mut declared: Vec<(String, usize)> = indexes
-                        .list()
-                        .iter()
-                        .filter(|i| !i.implicit)
-                        .map(|i| (i.decl.name.clone(), i.columns.len()))
-                        .chain(indexes.gin().iter().map(|g| (g.decl.name.clone(), 1)))
-                        .collect();
-                    // A `CREATE INDEX` sharing another's columns shares its
-                    // index; listed by its own name all the same.
-                    for (index_name, unique, columns, _) in shared_declarations(&schema) {
-                        if !unique
-                            && !declared.iter().any(|(n, _)| n.eq_ignore_ascii_case(&index_name))
-                            && indexes.list().iter().any(|i| i.path.is_none() && i.decl.columns == columns)
-                        {
-                            declared.push((index_name, columns.len()));
-                        }
-                    }
-                    for (index_name, columns) in declared {
-                        rows.push(format!(
-                            "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
-                             indisprimary, indisvalid, indisready, indislive, \
-                             indpred, indexprs) \
-                             VALUES ({}, {}, {}, 'f', 'f', 't', '{}', 't', '', '')",
-                            temp,
-                            oid_of(&format!("{}.{}", name, index_name)),
-                            relid,
-                            columns,
-                            if ready { "t" } else { "f" },
-                        ));
-                    }
-                }
-
-                for (column, unique, primary) in keys {
-                    // The index has an identity of its own, distinct from the
-                    // table's, so a client joining `pg_index` to `pg_class`
-                    // does not find the table where it expects the index.
-                    let indexrelid = oid_of(&format!("{}.{}", name, column));
-                    rows.push(format!(
-                        "INSERT INTO {} (indexrelid, indrelid, indnatts, indisunique, \
-                         indisprimary, indisvalid, indisready, indislive, \
-                         indpred, indexprs) \
-                         VALUES ({}, {}, 1, {}, {}, 't', 't', 't', '', '')",
-                        temp,
-                        indexrelid,
-                        relid,
-                        if unique { "'t'" } else { "'f'" },
-                        if primary { "'t'" } else { "'f'" },
-                    ));
-                }
-            }
-            (
-                format!(
-                    // `indpred` and `indexprs` are always empty: every index
-                    // here is one plain column, never partial and never over an
-                    // expression. They exist so a client that reads them finds
-                    // the answer rather than an error.
-                    "CREATE TABLE {} (indexrelid BIGINT, indrelid BIGINT, indnatts BIGINT, \
-                     indisunique BOOL, indisprimary BOOL, indisvalid BOOL, indisready BOOL, \
-                     indislive BOOL, indpred TEXT, indexprs TEXT)",
-                    temp
-                ),
-                rows,
-            )
-        }
         // One row per index a table has: the implicit ones its `PRIMARY KEY`
         // and `UNIQUE` constraints bring, and the ones `CREATE INDEX`
         // declared, with the statement that would recreate each. This is the
@@ -1399,8 +1815,10 @@ async fn build(
                 .map(|name| {
                     format!(
                         "INSERT INTO {} (oid, datname, datdba, encoding, datcollate, \
-                         datctype, datistemplate, datallowconn, datconnlimit) \
-                         VALUES ({}, '{}', 10, 6, 'en_US.UTF-8', 'en_US.UTF-8', 'f', 't', -1)",
+                         datctype, datistemplate, datallowconn, datconnlimit, datlocprovider, \
+                         datlocale, daticulocale, daticurules, datacl, dattablespace) \
+                         VALUES ({}, '{}', 10, 6, 'en_US.UTF-8', 'en_US.UTF-8', 'f', 't', -1, 'c', \
+                         NULL, NULL, NULL, NULL, 1663)",
                         temp,
                         oid_of(name),
                         escape(name)
@@ -1411,7 +1829,9 @@ async fn build(
                 format!(
                     "CREATE TABLE {} (oid BIGINT, datname TEXT, datdba BIGINT, \
                      encoding BIGINT, datcollate TEXT, datctype TEXT, \
-                     datistemplate BOOL, datallowconn BOOL, datconnlimit BIGINT)",
+                     datistemplate BOOL, datallowconn BOOL, datconnlimit BIGINT, \
+                     datlocprovider TEXT, datlocale TEXT, daticulocale TEXT, daticurules TEXT, datacl TEXT[], \
+                     dattablespace BIGINT)",
                     temp
                 ),
                 rows,
@@ -1424,7 +1844,7 @@ async fn build(
         // partitions, then gets the right answer.
         "pg_inherits" => (
             format!(
-                "CREATE TABLE {} (inhrelid BIGINT, inhparent BIGINT, inhseqno BIGINT)",
+                "CREATE TABLE {} (inhrelid BIGINT, inhparent BIGINT, inhseqno BIGINT, inhdetachpending BOOL)",
                 temp
             ),
             Vec::new(),
@@ -1668,14 +2088,82 @@ fn index_set(relation: &Relation) -> Result<Option<(std::sync::Arc<crate::core::
 /// restarts — a client that reads an oid from one query and joins on it in the
 /// next gets the relation it asked for.
 fn oid_of(name: &str) -> i64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in name.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    crate::core::rql::catalog_model::oid_of(name)
+}
+
+/// One sequence as the catalogue relations list it.
+struct SequenceRow {
+    name: String,
+    data_type: String,
+    start: i64,
+    min: i64,
+    max: i64,
+    increment: i64,
+    cycle: bool,
+    cache: i64,
+    last: Option<i64>,
+}
+
+/// Every sequence of `database` as `tx` sees it: each explicit one with its
+/// counter as it stands, and each implicit one a column default reads.
+async fn sequence_rows(
+    database: &Arc<Database>,
+    tx: Option<crate::core::mvcc::transaction::TxId>,
+) -> Result<Vec<SequenceRow>, String> {
+    use crate::core::rql::{sequence, sequence_catalog};
+    let mut out: Vec<SequenceRow> = Vec::new();
+    for def in sequence_catalog::load(database, None, tx).await? {
+        let live = sequence::explicit(database.id, &def.name);
+        let last = match &live {
+            Some(s) if s.called.load(std::sync::atomic::Ordering::SeqCst) => Some(s.last.load(std::sync::atomic::Ordering::SeqCst)),
+            Some(_) => None,
+            None => def.is_called.then_some(def.last_value),
+        };
+        out.push(SequenceRow {
+            name: def.name,
+            data_type: def.data_type,
+            start: def.start,
+            min: def.min,
+            max: def.max,
+            increment: def.increment,
+            cycle: def.cycle,
+            cache: def.cache,
+            last,
+        });
     }
-    // Kept positive and inside i32 range: `oid` is a 32-bit unsigned type in
-    // PostgreSQL and a client may decode it as one.
-    ((hash % 2_000_000_000) + 16_384) as i64
+    for (name, table, column) in sequence_catalog::implicit_sequences(database) {
+        if out.iter().any(|s| s.name == name) {
+            continue;
+        }
+        let data_type = database
+            .schema_view(&table)
+            .and_then(|v| {
+                v.schema().fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&column)).map(|f| f.db_type.clone())
+            })
+            .map_or("bigint", |t| match t {
+                crate::core::db_type::DbType::I16 => "smallint",
+                crate::core::db_type::DbType::I32 => "integer",
+                _ => "bigint",
+            });
+        let max = match data_type {
+            "smallint" => i16::MAX as i64,
+            "integer" => i32::MAX as i64,
+            _ => i64::MAX,
+        };
+        out.push(SequenceRow {
+            name: name.clone(),
+            data_type: data_type.to_string(),
+            start: 1,
+            min: 1,
+            max,
+            increment: 1,
+            cycle: false,
+            cache: 1,
+            last: sequence::current(database.id, &name).filter(|v| *v > 0),
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 /// Tables the engine keeps for itself, which PostgreSQL's catalogue would not
@@ -1706,44 +2194,6 @@ mod catalog_partition_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The call is replaced wherever it appears, arguments and all, so a
-    /// client filtering on a partial-index predicate gets "no such index"
-    /// rather than a failed statement.
-    #[test]
-    fn pg_get_expr_becomes_an_empty_predicate() {
-        assert_eq!(
-            rewrite_get_expr("SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i"),
-            "SELECT '' FROM pg_index i"
-        );
-        // The shape the application actually sends.
-        assert_eq!(
-            rewrite_get_expr(
-                "SELECT 1 FROM pg_index i \
-                 WHERE pg_get_expr(i.indpred, i.indrelid) ILIKE '%4806fcdf%'"
-            ),
-            "SELECT 1 FROM pg_index i WHERE '' ILIKE '%4806fcdf%'"
-        );
-    }
-
-    /// A nested call must not end the span at the inner `)`, and a column that
-    /// merely contains the name is not a call at all.
-    #[test]
-    fn the_rewrite_reads_the_whole_call_and_only_a_call() {
-        assert_eq!(
-            rewrite_get_expr("SELECT pg_get_expr(coalesce(a, b), c) FROM t"),
-            "SELECT '' FROM t"
-        );
-        assert_eq!(
-            rewrite_get_expr("SELECT my_pg_get_expr FROM t"),
-            "SELECT my_pg_get_expr FROM t"
-        );
-        // Two of them, so the scan continues past the first.
-        assert_eq!(
-            rewrite_get_expr("SELECT pg_get_expr(a, b), pg_get_expr(c, d) FROM t"),
-            "SELECT '', '' FROM t"
-        );
-    }
 
     #[test]
     fn only_a_statement_naming_a_view_is_recognised() {

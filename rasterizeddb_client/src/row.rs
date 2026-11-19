@@ -370,10 +370,10 @@ impl<'a> Row<'a> {
         self.get(i)
     }
 
-    /// A `NUMERIC` as exact decimal text. Reads one that carries its scale, an
-    /// integer, or a column selected as `col::text`; a `NUMERIC(p, s)` column
-    /// read directly is an error, because the native protocol does not send
-    /// its scale.
+    /// A `NUMERIC` as exact decimal text. Reads one that carries its scale
+    /// (what the server sends), an integer, or a column selected as
+    /// `col::text`; a scaled `NUMERIC` with no scale, from a server that
+    /// predates sending it, is an error rather than a guess.
     pub fn get_numeric(&self, i: usize) -> Result<crate::Numeric> {
         self.get(i)
     }

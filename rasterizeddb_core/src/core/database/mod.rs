@@ -1056,16 +1056,19 @@ fn seed_fell_back(_pool: &StoragePool, _seed: &DbStorageProvider, _table_name: &
 /// bought. Everything else about the relation is unchanged: it is a real table
 /// with a real schema, created and dropped through the ordinary paths.
 /// Whether `table_name` is a statement's own relation: a CTE's or a derived
-/// table's (`cte::TEMP_TABLE_PREFIX`), created in memory and dropped before
-/// the statement ends.
+/// table's (`cte::TEMP_TABLE_PREFIX`), or a catalogue view's
+/// (`catalog_views::TEMP_PREFIX`), created in memory and dropped before the
+/// statement ends. The catalogue's were on disk: five files made, synced and
+/// removed, and a catalogue row written and tombstoned, for every relation of
+/// every statement naming `pg_type` or `pg_class` (a driver's connect read
+/// eight, 23 s on a debug build, past Npgsql's connect timeout).
 fn is_statement_scoped(table_name: &str) -> bool {
     table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+        || table_name.starts_with(crate::core::rql::catalog_views::TEMP_PREFIX)
 }
 
 fn temp_seed(table_name: &str) -> Option<Arc<DbStorageProvider>> {
-    table_name
-        .starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
-        .then(|| Arc::new(DbStorageProvider::new_memory(table_name)))
+    is_statement_scoped(table_name).then(|| Arc::new(DbStorageProvider::new_memory(table_name)))
 }
 
 #[cfg(feature = "storage_pools")]
@@ -1248,7 +1251,7 @@ fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
 /// 192.168.1.7, forever.
 #[cfg(feature = "storage_pools")]
 fn pool_forget_statement_relations(pool: &StoragePool) {
-    let removed = pool.forget_where(|table| table.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX));
+    let removed = pool.forget_where(|table| is_statement_scoped(table));
     if removed > 0 {
         info!("forgot {} placement(s) of statement-scoped relations left by an older build", removed);
     }
@@ -1341,6 +1344,12 @@ fn pool_has_placement(_pool: &StoragePool, _table_name: &str) -> bool {
 }
 
 pub struct Database {
+    /// The names of the views this database may hold (`rql::views`).
+    pub(crate) views: crate::core::rql::views::ViewRegistry,
+    /// The names of the routines this database may hold (`rql::functions`).
+    pub(crate) functions: crate::core::rql::functions::FunctionRegistry,
+    /// The tables that may have triggers (`rql::triggers`).
+    pub(crate) triggers: crate::core::rql::triggers::TriggerRegistry,
     /// Each table's slot by name (a partitioned table's shell included).
     /// Private, and named only in `slots.rs`: metadata readers use
     /// [`Database::schema_view`], execution the escape hatches listed there.
@@ -1793,7 +1802,7 @@ impl Database {
             // now answers with memory-backed storage for these names, which
             // would discard nothing. These leftovers predate that and are real
             // files in the database's own directory.
-            if table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+            if is_statement_scoped(&table_name) {
                 // Kept files keep their row too, so the next start tries again.
                 if !discard_files(&io_pointers, &storage, Some(location), &table_name).await {
                     continue;
@@ -1891,6 +1900,9 @@ impl Database {
         let database = Database {
             #[cfg(test)]
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
+            views: crate::core::rql::views::ViewRegistry::default(),
+            functions: crate::core::rql::functions::FunctionRegistry::default(),
+            triggers: crate::core::rql::triggers::TriggerRegistry::default(),
             id,
             name: name.to_string(),
             table_slots,
@@ -3698,7 +3710,7 @@ impl Database {
         // disk, and it is created often enough that a pass over the map each
         // time would show. Two of them cannot share a file either: each name
         // ends in a lower-case hex tag, and no suffix stem does.
-        if name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+        if is_statement_scoped(name) {
             return None;
         }
         // Every live table, every partitioned table (whose shell may be
@@ -6057,14 +6069,14 @@ async fn process_native_request(
     // through pgwire's path, in a session made for this statement alone
     // (`NativeSession::run_alone`).
     if let Some(session) = session
-        && crate::core::rql::correlated::rewrite_select(&query).is_some()
+        && session.needs_session_path(&query).await
     {
         return session.run_alone(&query).await;
     }
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query(&query, context.database).await
+        run_native_query_in(&query, context.database, session).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -6073,11 +6085,11 @@ async fn process_native_request(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query(&query, context.database).await;
+            return run_native_query_in(&query, context.database, session).await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response = run_native_query(&query, context.database).await;
+            let response = run_native_query_in(&query, context.database, session).await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -6151,6 +6163,26 @@ pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Databa
 /// a session: a transaction block, a CTE's or derived table's statement
 /// transaction. Those are refused by name rather than reaching the parser as
 /// text it cannot read.
+/// [`run_native_query`], with the connection's sequence values in reach of
+/// the statement (a column's `DEFAULT nextval(…)` records its value for the
+/// connection's `currval` and `lastval`), and a sequence's reservation
+/// written ahead after it, as pgwire's `execute_single_statement` does.
+async fn run_native_query_in(
+    query: &str,
+    database: Arc<Database>,
+    session: Option<&crate::pgwire::NativeSession>,
+) -> Vec<u8> {
+    let response = match session {
+        Some(session) => {
+            crate::core::rql::sequence::session::scoped(session.sequence_scope(), run_native_query(query, database.clone()))
+                .await
+        }
+        None => run_native_query(query, database.clone()).await,
+    };
+    crate::core::rql::sequence_catalog::flush(&database).await;
+    response
+}
+
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
     // An autocommit statement is its own transaction: `now()` is its start,
     // one instant for every call and row of it, as pgwire's
@@ -6171,6 +6203,22 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
         Err((_, message)) => return error_response(&message),
     };
     let stmt = rewritten.as_ref();
+
+    // Views (`rql::views`) are read as derived tables and kept in a catalogue
+    // written in a session's transaction; neither is open to a native
+    // statement yet.
+    if crate::core::rql::views::parse_view_statement(stmt).is_some() {
+        return error_response(
+            "view statements are not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
+    if crate::core::rql::views::names_a_known_view(&database, stmt) {
+        return error_response(
+            "reading a view is not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
 
     // A unique index is a constraint here, as on pgwire.
     let unique;
@@ -6324,9 +6372,20 @@ async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
         };
     };
     info!("Recognized query purpose: {:?}", query_purpose);
+    let read = matches!(query_purpose, crate::core::rql::lexer_s1::QueryPurpose::QueryRows(_));
     // A named owner for the native protocol's statements (§7 Owner;
     // finding L3): never `FROZEN_TX`, and one per statement.
-    execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database).await
+    let response = execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database.clone()).await;
+    // The rows typed by their columns (`pgwire::native_retag`), from the
+    // statement's description, read only when a cell may need it.
+    if read
+        && crate::pgwire::native_answer_needs_retag(&response, &database, query)
+        && let Some(purpose) = recognize_query_purpose(query)
+    {
+        let (fields, scales) = crate::pgwire::result_description(&database, &purpose).unwrap_or((None, None));
+        return crate::pgwire::native_retag(response, fields.as_deref(), scales.as_deref());
+    }
+    response
 }
 
 /// Rows a native-protocol response reports: the count a write carries, or the
@@ -6370,8 +6429,7 @@ impl<'a> SchemaChanged<'a> {
         generation: &'a CacheGuard<std::sync::atomic::AtomicU64>,
         table_name: &str,
     ) -> Option<Self> {
-        let internal = table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
-            || crate::core::rql::json_map::is_shadow_table(table_name);
+        let internal = is_statement_scoped(table_name) || crate::core::rql::json_map::is_shadow_table(table_name);
         (!internal).then(|| SchemaChanged(generation))
     }
 }

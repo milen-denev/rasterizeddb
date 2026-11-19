@@ -373,6 +373,16 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
     } else {
         (remainder, None)
     };
+    // `GENERATED … AS IDENTITY` on an added column would have to number the
+    // rows already there; until it does, it is refused rather than read as
+    // no clause (a plain nullable column, NULL in every row).
+    if remainder.trim_start().to_ascii_uppercase().starts_with("ADD")
+        && crate::core::rql::sequence::split_identity_clause(&remainder)?.1.is_some()
+    {
+        return Err("ALTER TABLE ... ADD COLUMN ... GENERATED AS IDENTITY is not supported yet; \
+                    create the table with the identity column instead"
+            .to_string());
+    }
     let (remainder, default) = crate::core::rql::column_default::split_clause(&remainder);
     let rest: Vec<&str> = remainder.split_whitespace().collect();
     if rest.is_empty() {
@@ -439,6 +449,15 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             // constraint, as at CREATE (`lexer_ct::column_type_span`).
             let (phrase, written, used) =
                 crate::core::rql::lexer_ct::column_type_span(&type_tokens)?.ok_or("ADD COLUMN names no type")?;
+            // A SERIAL added here got no sequence: every row, old and new,
+            // read NULL in a column PostgreSQL makes NOT NULL and numbers.
+            if crate::core::rql::sequence::serial_type(&phrase).is_some() {
+                return Err(format!(
+                    "ALTER TABLE ... ADD COLUMN ... {} is not supported yet; create the table with the serial column \
+                     instead",
+                    phrase.split_whitespace().next().unwrap_or("SERIAL").to_ascii_uppercase()
+                ));
+            }
             let db_type = if json {
                 DbType::UUID
             } else {

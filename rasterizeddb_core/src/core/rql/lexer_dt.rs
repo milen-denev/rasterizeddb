@@ -38,7 +38,9 @@ pub fn drop_table_from_query_purpose(qp: &QueryPurpose) -> Option<DropTable> {
         if let Some(semi_idx) = table_name.find(';') {
             table_name = &table_name[..semi_idx];
         }
-        let table_name = table_name.trim_matches('"').to_string();
+        let table_name = crate::core::sql_scan::last_name_segment(table_name)
+            .trim_matches('"')
+            .to_string();
         if table_name.is_empty() {
             return None;
         }

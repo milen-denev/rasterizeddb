@@ -34,6 +34,7 @@ async fn add_default(old: Arc<Table<DbStorageProvider>>) -> Result<(), String> {
         column: "n".to_string(),
         expression: "7".to_string(),
         is_deleted: false,
+        identity: None,
     };
     crate::core::rql::column_default::append(old.io_schema.clone(), &entry)
         .await

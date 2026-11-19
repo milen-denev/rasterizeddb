@@ -2501,6 +2501,98 @@ fn split_relation_alias(text: &str) -> Result<(String, String), String> {
     Ok((table, label))
 }
 
+/// Each `ON` clause with its bare column names qualified by the one relation
+/// in its scope that has the column (the relations joined so far and the one
+/// being joined, as PostgreSQL scopes it), and split again into its key and
+/// filter terms. `a JOIN b ON id = aid` was refused ("'id' is neither a column
+/// nor a value"), though it is the key `a.id = b.aid`; a name two relations
+/// in scope have stays bare, and is refused as ambiguous as before.
+fn qualify_on_clauses(mut relations: Vec<RelationRef>, schemas: &[SmallVec<[SchemaField; 20]>]) -> Vec<RelationRef> {
+    for i in 0..relations.len() {
+        let Some(raw) = relations[i].join.as_ref() else { continue };
+        if raw.kind == JoinKind::Cross {
+            continue;
+        }
+        let mut terms: Vec<String> = Vec::new();
+        if !raw.left_qualified.is_empty() {
+            terms.push(format!("{} = {}", raw.left_qualified, raw.right_qualified));
+        }
+        terms.extend(raw.extra.iter().cloned());
+        let qualified: Vec<String> = terms.iter().map(|t| qualify_bare(t, &relations[..=i], &schemas[..=i])).collect();
+        if qualified == terms {
+            continue;
+        }
+        // Term by term, so an `OR` inside one keeps its grouping.
+        let mut key: Option<(String, String)> = None;
+        let mut extra: Vec<String> = Vec::new();
+        for term in qualified {
+            match split_on_condition(&term) {
+                Ok((l, r, _)) if !l.is_empty() && key.is_none() => key = Some((l, r)),
+                _ => extra.push(term),
+            }
+        }
+        let raw = relations[i].join.as_mut().expect("checked above");
+        let (l, r) = key.unwrap_or_default();
+        raw.left_qualified = l;
+        raw.right_qualified = r;
+        raw.extra = extra;
+    }
+    relations
+}
+
+/// Whether the text before a word ends in the keyword `AS`: the word is then
+/// a type (`CAST(x AS text)`) or an alias, never a column.
+fn follows_as(before: &str) -> bool {
+    let t = before.trim_end();
+    t.len() >= 2
+        && t[t.len() - 2..].eq_ignore_ascii_case("AS")
+        && !t[..t.len() - 2].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A bare name in an `ON` clause that more than one relation in its scope
+/// has: PostgreSQL's 42702, where it was reported as no column at all.
+fn ambiguous_on(relations: &[RelationRef], schemas: &[SmallVec<[SchemaField; 20]>]) -> Option<String> {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for (i, r) in relations.iter().enumerate() {
+        let Some(raw) = r.join.as_ref() else { continue };
+        let key = format!("{} {}", raw.left_qualified, raw.right_qualified);
+        for term in std::iter::once(key.as_str()).chain(raw.extra.iter().map(String::as_str)) {
+            let bytes = term.as_bytes();
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let c = bytes[at];
+                if c == b'\'' || c == b'"' {
+                    at = crate::core::sql_scan::quoted_end(bytes, at, c).min(bytes.len()).max(at + 1);
+                    continue;
+                }
+                if !is_word(c) {
+                    at += 1;
+                    continue;
+                }
+                let start = at;
+                while at < bytes.len() && is_word(bytes[at]) {
+                    at += 1;
+                }
+                let word = &term[start..at];
+                let qualified = start > 0 && bytes[start - 1] == b'.';
+                let qualifier = bytes.get(at) == Some(&b'.');
+                let call = term[at..].trim_start().starts_with('(');
+                if qualified || qualifier || call || c.is_ascii_digit() || follows_as(&term[..start]) {
+                    continue;
+                }
+                let owners = schemas[..=i]
+                    .iter()
+                    .filter(|s| s.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(word)))
+                    .count();
+                if owners > 1 {
+                    return Some(word.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Splits `a.x = b.y` into its two qualified sides.
 /// Splits an `ON` clause into the join equality and any extra filter terms.
 ///
@@ -3221,6 +3313,10 @@ pub fn plan(
             schema_of(&r.table).ok_or_else(|| format!("relation '{}' does not exist", r.table))
         })
         .collect::<Result<_, _>>()?;
+    let relations = qualify_on_clauses(relations, &schemas);
+    if let Some(name) = ambiguous_on(&relations, &schemas) {
+        return Err(format!("column reference \"{}\" is ambiguous", name));
+    }
 
     // A column with a nondeterministic collation compared anywhere here is
     // refused (`collation::refuse_in_join`).
@@ -5932,7 +6028,7 @@ fn qualify_bare(conjunct: &str, relations: &[RelationRef], schemas: &[SmallVec<[
             }
             let word = &conjunct[start..i];
             let next = conjunct[i..].trim_start();
-            let after_cast = conjunct[..start].trim_end().ends_with("::");
+            let after_cast = conjunct[..start].trim_end().ends_with("::") || follows_as(&conjunct[..start]);
             let qualified_next = bytes.get(i) == Some(&b'.');
             let owners: Vec<usize> = (0..relations.len())
                 .filter(|&r| schemas[r].iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(word)))

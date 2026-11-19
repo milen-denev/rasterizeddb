@@ -991,6 +991,11 @@ fn negate_atom(toks: &[Tok], schema: &SmallVec<[SchemaField; 20]>) -> Result<Str
         if w.eq_ignore_ascii_case("false") {
             return Ok(CONSTANT_TRUE.to_string());
         }
+        // `NOT NULL` is NULL, which keeps no row: left as the bare NULL
+        // condition `fold_null_operand_comparisons` folds.
+        if w.eq_ignore_ascii_case("null") {
+            return Ok("NULL".to_string());
+        }
         // A boolean column standing alone.
         let col = resolve_column(w, schema)
             .filter(|c| {
@@ -2629,6 +2634,101 @@ fn fold_constant_null_tests(clause: &str) -> String {
             }
         }
         k += 1;
+    }
+    out.push_str(&clause[cursor..]);
+    out
+}
+
+/// `x [NOT] BETWEEN [SYMMETRIC] lo AND hi` written as its comparisons, where
+/// a bound is the constant NULL or the form is `SYMMETRIC`: `(x >= lo AND x
+/// <= hi)`, `(x < lo OR x > hi)` negated, and both orders for `SYMMETRIC`.
+///
+/// A NULL bound reached the planner as a column named `NULL` ("unknown
+/// identifier 'NULL'", 42703), and `SYMMETRIC` as a syntax error. Expanded,
+/// the comparison with NULL is folded by `fold_null_operand_comparisons`
+/// after `NOT` is pushed down, so each half keeps its three-valued meaning:
+/// `x NOT BETWEEN 5 AND NULL` holds where `x < 5`, as in PostgreSQL. Any
+/// other BETWEEN is left to the tokenizer's own expansion.
+fn expand_null_between(clause: &str) -> String {
+    let spans = null_spans(clause);
+    let terms = NullTerms::new(clause, &spans);
+    let word = |k: usize, w: &str| {
+        spans.get(k).is_some_and(|s| s.kind == NullSpanKind::Word && clause[s.start..s.end].eq_ignore_ascii_case(w))
+    };
+    if !spans.iter().any(|s| s.kind == NullSpanKind::Word && clause[s.start..s.end].eq_ignore_ascii_case("between")) {
+        return clause.to_string();
+    }
+    let text = |from: usize, to: usize| -> &str {
+        if from >= to {
+            ""
+        } else {
+            &clause[spans[from].start..spans[to - 1].end]
+        }
+    };
+    let mut out = String::with_capacity(clause.len() + 32);
+    let mut cursor = 0usize;
+    let mut k = 0usize;
+    while k < spans.len() {
+        if !terms.starts(k) || word(k, "not") || spans[k].kind == NullSpanKind::LPar {
+            k += 1;
+            continue;
+        }
+        // The condition from `k`, as `fold_null_operand_comparisons` reads
+        // one, with its top-level BETWEEN and that BETWEEN's AND.
+        let mut end = k;
+        let mut depth = 0usize;
+        let mut between: Option<usize> = None;
+        let mut and_at: Option<usize> = None;
+        while end < spans.len() {
+            match spans[end].kind {
+                NullSpanKind::LPar => depth += 1,
+                NullSpanKind::RPar if depth == 0 => break,
+                NullSpanKind::RPar => depth -= 1,
+                _ if depth == 0 && terms.ends_before(end) => break,
+                _ if depth == 0 && between.is_none() && word(end, "between") => between = Some(end),
+                _ if depth == 0 && between.is_some() && and_at.is_none() && word(end, "and") => and_at = Some(end),
+                _ => {}
+            }
+            end += 1;
+        }
+        let (Some(between), Some(and_at)) = (between, and_at) else {
+            k = end.max(k + 1);
+            continue;
+        };
+        let negated = between > k && word(between - 1, "not");
+        let operand_end = if negated { between - 1 } else { between };
+        let symmetric = word(between + 1, "symmetric");
+        let lo_at = between + 1 + usize::from(symmetric);
+        let null_bound = |from: usize, to: usize| constant_operand(clause, &spans, from) == Some((to, true));
+        if operand_end <= k || lo_at >= and_at || and_at + 1 >= end {
+            k = end;
+            continue;
+        }
+        if !(symmetric || null_bound(lo_at, and_at) || null_bound(and_at + 1, end)) {
+            k = end;
+            continue;
+        }
+        let x = text(k, operand_end);
+        let lo = text(lo_at, and_at);
+        let hi = text(and_at + 1, end);
+        let range = |lo: &str, hi: &str| {
+            if negated {
+                format!("({x} < {lo} OR {x} > {hi})")
+            } else {
+                format!("({x} >= {lo} AND {x} <= {hi})")
+            }
+        };
+        let expanded = if !symmetric {
+            range(lo, hi)
+        } else if negated {
+            format!("({} AND {})", range(lo, hi), range(hi, lo))
+        } else {
+            format!("({} OR {})", range(lo, hi), range(hi, lo))
+        };
+        out.push_str(&clause[cursor..spans[k].start]);
+        out.push_str(&expanded);
+        cursor = spans[end - 1].end;
+        k = end;
     }
     out.push_str(&clause[cursor..]);
     out
@@ -5835,6 +5935,9 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     // `<constant> IS [NOT] NULL`, as an inlined parameter makes it, is true
     // or false outright. See `fold_constant_null_tests`.
     let clause = &fold_constant_null_tests(clause);
+    // `x BETWEEN 1 AND NULL` and `BETWEEN SYMMETRIC` as the comparisons they
+    // are, before `NOT` is pushed down. See `expand_null_between`.
+    let clause = &expand_null_between(clause);
     // Row-value comparisons become their boolean form first, so everything
     // downstream — the NULL fold, the guards, the tokenizer — sees only shapes
     // it already understands.

@@ -106,8 +106,8 @@ database. A few things it does not carry, which this client accounts for:
   [transactions](crate::guide::transactions). `BEGIN`, `COMMIT` and the rest
   written as statements are refused.
 * **No column names or types in answers.** Columns are read by position, and
-  each cell carries a type tag; see [types](crate::guide::types) for what that
-  means for `jsonb`, arrays and `NUMERIC(p, s)`.
+  each cell carries a type tag, its column's declared type; see
+  [types](crate::guide::types) for `jsonb`, arrays and `NUMERIC(p, s)`.
 * **No bound parameters.** `$1`…`$n` are rendered into literals on this
   side, under the server's lexer's rules, so a value can never become syntax;
   see [`render`](crate::render).

@@ -147,6 +147,17 @@ pub fn is_seeded(database: u64, name: &str) -> bool {
 /// from the other table's rows, it could sit below this table's, and the
 /// next values would repeat keys this table holds.
 pub fn seed(database: u64, name: &str, last: i64) -> bool {
+    // An explicit sequence a `DEFAULT nextval('…')` reads: raised above the
+    // rows the table holds, as an implicit one is, when it counts upward.
+    if let Some(sequence) = explicit(database, name) {
+        if sequence.increment > 0 && sequence.called.load(Ordering::SeqCst) {
+            sequence.last.fetch_max(last.min(sequence.max), Ordering::SeqCst);
+        } else if sequence.increment > 0 && last >= sequence.last.load(Ordering::SeqCst) {
+            sequence.last.store(last.min(sequence.max), Ordering::SeqCst);
+            sequence.called.store(true, Ordering::SeqCst);
+        }
+        return false;
+    }
     let mut seeded = false;
     SEQUENCES
         .entry(key(database, name))
@@ -408,6 +419,8 @@ pub fn follow_rename(
                 column: d.column.clone(),
                 expression: format!("nextval('{}')", to),
                 is_deleted: false,
+                // An identity column stays one under its table's new name.
+                identity: d.identity,
             };
             Some((rewritten, from, to))
         })
@@ -471,6 +484,383 @@ pub fn max_of_column(
         }
     }
     max
+}
+
+// ---------------------------------------------------------------------------
+// Sequences created by CREATE SEQUENCE
+// ---------------------------------------------------------------------------
+
+/// A sequence `CREATE SEQUENCE` made: its parameters and its counter. Kept
+/// apart from the implicit counters above, which a `SERIAL` seeds from its
+/// column; one of these counts from its own `START` and keeps to its bounds.
+///
+/// Values are not transactional, as PostgreSQL's are not: one taken by a
+/// transaction that rolls back is gone. The counter is persisted ahead of
+/// itself (`reserved`), in the system table `sequence_catalog` keeps, so a
+/// crash leaves a gap and never hands a value out twice.
+#[derive(Debug)]
+pub struct ExplicitSequence {
+    pub data_type: String,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub start: i64,
+    pub cache: i64,
+    pub cycle: bool,
+    /// The last value handed out, or `start - increment` before any.
+    pub last: AtomicI64,
+    /// Whether `last` has been handed out (`setval(…, false)` clears it).
+    pub called: std::sync::atomic::AtomicBool,
+    /// The value up to which the persisted row covers: a value past it must
+    /// be written ahead before the process could lose it.
+    pub reserved: AtomicI64,
+}
+
+/// Every explicit sequence of every database, by [`key`].
+static EXPLICIT: std::sync::LazyLock<DashMap<String, std::sync::Arc<ExplicitSequence>>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+/// How many values past the last one handed out a persisted reservation
+/// covers.
+pub const RESERVE_AHEAD: i64 = 32;
+
+/// Registers (or replaces) `database`'s explicit sequence `name`.
+pub fn register_explicit(database: u64, name: &str, sequence: ExplicitSequence) {
+    EXPLICIT.insert(key(database, name), std::sync::Arc::new(sequence));
+}
+
+/// Forgets `database`'s explicit sequence `name`.
+pub fn forget_explicit(database: u64, name: &str) {
+    EXPLICIT.remove(&key(database, name));
+}
+
+/// `database`'s explicit sequence `name`, if there is one.
+pub fn explicit(database: u64, name: &str) -> Option<std::sync::Arc<ExplicitSequence>> {
+    EXPLICIT.get(&key(database, name)).map(|e| e.value().clone())
+}
+
+/// Every explicit sequence of `database`, by name.
+pub fn explicit_all(database: u64) -> Vec<(String, std::sync::Arc<ExplicitSequence>)> {
+    let prefix = key(database, "");
+    EXPLICIT
+        .iter()
+        .filter_map(|e| e.key().strip_prefix(&prefix).map(|name| (name.to_string(), e.value().clone())))
+        .collect()
+}
+
+/// The explicit sequences of `database` whose reservation a value has
+/// passed: what `sequence_catalog::flush` writes ahead.
+pub fn explicit_needing_reserve(database: u64) -> Vec<(String, i64)> {
+    explicit_all(database)
+        .into_iter()
+        .filter_map(|(name, s)| {
+            let last = s.last.load(Ordering::SeqCst);
+            let reserved = s.reserved.load(Ordering::SeqCst);
+            let ahead = s.increment.saturating_mul(RESERVE_AHEAD / 2);
+            let short = if s.increment > 0 { last.saturating_add(ahead) > reserved } else { last.saturating_add(ahead) < reserved };
+            short.then(|| (name, reserve_target(&s, last)))
+        })
+        .collect()
+}
+
+/// Where a reservation from `last` reaches: `RESERVE_AHEAD` steps on,
+/// clamped to the sequence's bounds.
+pub fn reserve_target(sequence: &ExplicitSequence, last: i64) -> i64 {
+    last.saturating_add(sequence.increment.saturating_mul(RESERVE_AHEAD)).clamp(sequence.min.min(sequence.max), sequence.max.max(sequence.min))
+}
+
+/// The next value of an explicit sequence, as PostgreSQL's `nextval`:
+/// `last + increment`, wrapping to the other bound when it cycles, and an
+/// error at a bound when it does not (2200H).
+fn next_explicit(name: &str, sequence: &ExplicitSequence) -> Result<i64, String> {
+    loop {
+        let called = sequence.called.load(Ordering::SeqCst);
+        let last = sequence.last.load(Ordering::SeqCst);
+        let candidate = if !called {
+            last
+        } else {
+            match last.checked_add(sequence.increment) {
+                Some(v) if v >= sequence.min && v <= sequence.max => v,
+                _ if sequence.cycle => {
+                    if sequence.increment > 0 { sequence.min } else { sequence.max }
+                }
+                _ => {
+                    let (which, bound) =
+                        if sequence.increment > 0 { ("maximum", sequence.max) } else { ("minimum", sequence.min) };
+                    return Err(format!("nextval: reached {which} value of sequence \"{name}\" ({bound})"));
+                }
+            }
+        };
+        if !called {
+            if sequence.called.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Ok(candidate);
+            }
+            continue;
+        }
+        if sequence.last.compare_exchange(last, candidate, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            return Ok(candidate);
+        }
+    }
+}
+
+/// `nextval(name)` for `database`: an explicit sequence's next value, or an
+/// implicit (`SERIAL`, identity) counter's. Records the value as this
+/// session's `currval`/`lastval` when a session is in scope.
+pub fn next_checked(database: u64, name: &str) -> Result<i64, String> {
+    let value = match explicit(database, name) {
+        Some(sequence) => next_explicit(name, &sequence)?,
+        None => next(database, name),
+    };
+    session::record(name, value);
+    Ok(value)
+}
+
+/// `setval(name, value, is_called)`. An explicit sequence's bounds hold
+/// (22003); an implicit counter is set as it stands.
+pub fn set_value(database: u64, name: &str, value: i64, is_called: bool) -> Result<i64, String> {
+    match explicit(database, name) {
+        Some(sequence) => {
+            if value < sequence.min || value > sequence.max {
+                return Err(format!(
+                    "setval: value {value} is out of bounds for sequence \"{name}\" ({}..{})",
+                    sequence.min, sequence.max
+                ));
+            }
+            sequence.last.store(value, Ordering::SeqCst);
+            sequence.called.store(is_called, Ordering::SeqCst);
+            // Past the reservation: written ahead at the statement's end.
+            if (sequence.increment > 0 && value > sequence.reserved.load(Ordering::SeqCst))
+                || (sequence.increment < 0 && value < sequence.reserved.load(Ordering::SeqCst))
+            {
+                sequence.reserved.store(value, Ordering::SeqCst);
+            }
+        }
+        None => {
+            let last = if is_called { value } else { value - 1 };
+            SEQUENCES.insert(key(database, name), AtomicI64::new(last));
+        }
+    }
+    if is_called {
+        session::record(name, value);
+    }
+    Ok(value)
+}
+
+/// `currval`/`lastval`: what this session's last `nextval` took, per
+/// sequence, in a task-local the PostgreSQL listener scopes around each
+/// statement (its map lives on the session).
+pub mod session {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// One session's `nextval` results.
+    #[derive(Debug, Default)]
+    pub struct SessionSequences {
+        pub by_name: HashMap<String, i64>,
+        pub last: Option<i64>,
+    }
+
+    /// What a statement's expressions need of a sequence: the database's id
+    /// and the session's values.
+    #[derive(Debug, Clone)]
+    pub struct Scope {
+        pub database: u64,
+        pub values: Arc<Mutex<SessionSequences>>,
+    }
+
+    tokio::task_local! {
+        static SCOPE: Scope;
+    }
+
+    /// Runs `fut` with `scope` in reach of its expressions.
+    pub async fn scoped<F: std::future::Future>(scope: Scope, fut: F) -> F::Output {
+        SCOPE.scope(scope, fut).await
+    }
+
+    /// The scope's database, when a statement set one.
+    pub fn database() -> Option<u64> {
+        SCOPE.try_with(|s| s.database).ok()
+    }
+
+    pub(super) fn record(name: &str, value: i64) {
+        let _ = SCOPE.try_with(|s| {
+            if let Ok(mut values) = s.values.lock() {
+                values.by_name.insert(name.to_string(), value);
+                values.last = Some(value);
+            }
+        });
+    }
+
+    /// `currval(name)`: 55000 before this session took a value from it.
+    pub fn current(name: &str) -> Result<i64, String> {
+        SCOPE
+            .try_with(|s| s.values.lock().ok().and_then(|v| v.by_name.get(name).copied()))
+            .ok()
+            .flatten()
+            .ok_or_else(|| format!("currval of sequence \"{name}\" is not yet defined in this session"))
+    }
+
+    /// `lastval()`: 55000 before this session took any value.
+    pub fn last() -> Result<i64, String> {
+        SCOPE
+            .try_with(|s| s.values.lock().ok().and_then(|v| v.last))
+            .ok()
+            .flatten()
+            .ok_or_else(|| "lastval is not yet defined in this session".to_string())
+    }
+}
+
+/// The sequence a `nextval`/`currval`/`setval` argument names, as PostgreSQL
+/// reads a `regclass` from text: a `::regclass` cast dropped, a schema
+/// qualifier dropped, a quoted name kept as written and an unquoted one
+/// lowercased.
+pub fn sequence_name_of(argument: &str) -> String {
+    let text = argument.trim();
+    let text = text.split("::").next().unwrap_or(text).trim();
+    let last = crate::core::sql_scan::last_name_segment(text);
+    if last.starts_with('"') && last.ends_with('"') && last.len() >= 2 {
+        last[1..last.len() - 1].replace("\"\"", "\"")
+    } else {
+        last.to_ascii_lowercase()
+    }
+}
+
+/// Reads a `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( options ) ]`
+/// clause out of a column definition: the definition without it, and the
+/// kind. `Ok((definition, None))` when the definition has none.
+///
+/// An identity column is built as a `SERIAL` is: `NOT NULL`, defaulting to
+/// `nextval` of the sequence `<table>_<column>_seq`. The sequence options
+/// PostgreSQL defaults to are accepted as written; any other is refused by
+/// name, as the counter here always starts above the column's largest value
+/// and steps by one.
+pub fn split_identity_clause(
+    definition: &str,
+) -> Result<(String, Option<crate::core::rql::column_default::IdentityKind>), String> {
+    use crate::core::rql::column_default::IdentityKind;
+    use crate::core::rql::join::find_keyword;
+    let Some(at) = find_keyword(definition, "GENERATED", 0) else {
+        return Ok((definition.to_string(), None));
+    };
+    let mut words = WordReader { text: definition, at: at + "GENERATED".len() };
+    let kind = if words.eat("ALWAYS") {
+        IdentityKind::Always
+    } else if words.eat("BY") {
+        if !words.eat("DEFAULT") {
+            return Ok((definition.to_string(), None));
+        }
+        IdentityKind::ByDefault
+    } else {
+        return Ok((definition.to_string(), None));
+    };
+    if !words.eat("AS") || !words.eat("IDENTITY") {
+        // `GENERATED ALWAYS AS (…) STORED`, which `generated::split_clause`
+        // reads.
+        return Ok((definition.to_string(), None));
+    }
+    let mut end = words.at;
+    let rest = &definition[end..];
+    let skipped = rest.len() - rest.trim_start().len();
+    if rest.trim_start().starts_with('(') {
+        let open = end + skipped;
+        let close = crate::core::sql_scan::matching_close(definition, open)
+            .ok_or_else(|| "syntax error in the identity options".to_string())?;
+        identity_options(&definition[open + 1..close])?;
+        end = close + 1;
+    }
+    let mut out = String::with_capacity(definition.len());
+    out.push_str(definition[..at].trim_end());
+    out.push(' ');
+    out.push_str(definition[end..].trim_start());
+    Ok((out.trim_end().to_string(), Some(kind)))
+}
+
+/// Checks the options of an identity column's sequence: those that restate
+/// what this sequence does are accepted, any other is refused by name.
+fn identity_options(options: &str) -> Result<(), String> {
+    let words: Vec<String> = options.split_whitespace().map(|w| w.to_ascii_uppercase()).collect();
+    let refuse = |what: &str| -> Result<(), String> {
+        Err(format!(
+            "identity option {what} is not supported: an identity column here starts at 1 (above the \
+             column's largest value) and increments by 1"
+        ))
+    };
+    let number = |w: Option<&String>| -> Option<i64> { w.and_then(|w| w.parse::<i64>().ok()) };
+    let mut i = 0;
+    while i < words.len() {
+        match words[i].as_str() {
+            "START" => {
+                i += 1;
+                if words.get(i).map(String::as_str) == Some("WITH") {
+                    i += 1;
+                }
+                if number(words.get(i)) != Some(1) {
+                    return refuse(&format!("START WITH {}", words.get(i).map(String::as_str).unwrap_or("")));
+                }
+                i += 1;
+            }
+            "INCREMENT" => {
+                i += 1;
+                if words.get(i).map(String::as_str) == Some("BY") {
+                    i += 1;
+                }
+                if number(words.get(i)) != Some(1) {
+                    return refuse(&format!("INCREMENT BY {}", words.get(i).map(String::as_str).unwrap_or("")));
+                }
+                i += 1;
+            }
+            "MINVALUE" => {
+                if number(words.get(i + 1)) != Some(1) {
+                    return refuse(&format!("MINVALUE {}", words.get(i + 1).map(String::as_str).unwrap_or("")));
+                }
+                i += 2;
+            }
+            "NO" => match words.get(i + 1).map(String::as_str) {
+                Some("MINVALUE" | "MAXVALUE" | "CYCLE") => i += 2,
+                other => return refuse(&format!("NO {}", other.unwrap_or(""))),
+            },
+            // Values are handed out one at a time from memory; a cache is
+            // only how many PostgreSQL reserves at once.
+            "CACHE" if number(words.get(i + 1)).is_some_and(|n| n >= 1) => i += 2,
+            "MAXVALUE" if number(words.get(i + 1)).is_some() => i += 2,
+            other => return refuse(other),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a column type can be an identity column's: PostgreSQL allows the
+/// three integer widths only.
+pub fn identity_type_ok(db_type: &crate::core::db_type::DbType) -> bool {
+    use crate::core::db_type::DbType;
+    matches!(db_type, DbType::I16 | DbType::I32 | DbType::I64)
+}
+
+/// Reads keywords one after another, skipping whitespace.
+struct WordReader<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl WordReader<'_> {
+    fn eat(&mut self, word: &str) -> bool {
+        let rest = &self.text[self.at..];
+        let start = self.at + (rest.len() - rest.trim_start().len());
+        let tail = &self.text[start..];
+        let end = start + word.len();
+        let fits = tail.len() >= word.len() && tail.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes());
+        let bounded = self
+            .text
+            .as_bytes()
+            .get(end)
+            .is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if fits && bounded {
+            self.at = end;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +1083,7 @@ mod tests {
             column: column.to_string(),
             expression: expression.to_string(),
             is_deleted: false,
+            identity: None,
         }
     }
 

@@ -492,11 +492,20 @@ pub(super) fn encode_cell_binary(
             let Ok(raw) = <[u8; 16]>::try_from(bytes) else {
                 return false;
             };
-            crate::core::value_codec::encode_pg_numeric_scaled_into(
-                i128::from_le_bytes(raw),
-                scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
-                out,
-            );
+            match scale {
+                // A declared scale is the display scale, as the text form
+                // shows it: `12.50` from a `NUMERIC(10,2)`, which went out
+                // as `12.5` and read back so in a binary client.
+                Some(scale) => out.extend_from_slice(&crate::core::value_codec::encode_pg_numeric_with_dscale(
+                    i128::from_le_bytes(raw),
+                    scale,
+                )),
+                None => crate::core::value_codec::encode_pg_numeric_scaled_into(
+                    i128::from_le_bytes(raw),
+                    crate::core::value_codec::DECIMAL_SCALE,
+                    out,
+                ),
+            }
             true
         }
         DbType::DATETIME | DbType::TIMESTAMP => {

@@ -36,6 +36,16 @@ use crate::core::{
 use crate::pg_params::{BoundParam, inline_params};
 
 mod param_infer;
+mod view_statements;
+mod sequence_statements;
+mod routine_statements;
+mod trigger_exec;
+mod merge_exec;
+mod copy;
+mod notify;
+mod explain;
+mod temp_tables;
+mod privilege_statements;
 #[cfg(test)]
 mod prepared_partition_tests;
 mod statement_intern;
@@ -1555,6 +1565,37 @@ tokio::task_local! {
 /// scoped to exactly the statement and outside its owner's scope.
 type ReplyHold = crate::core::cancel::HeldReply;
 
+tokio::task_local! {
+    /// Set while a statement runs for another one, its reply going to a
+    /// buffer rather than the client (see [`hold_reply`]).
+    static INTERNAL_RUN: ();
+}
+
+tokio::task_local! {
+    /// The SELECT whose `RowDescription` is being sent, and its database:
+    /// where [`send_row_description`] reads each column's table, number,
+    /// type and modifier (`catalog_model::column_origins`). Every column was
+    /// "no table, no column", and `varchar(20)` was `text` with no length,
+    /// so a driver could not say which table a column came from, whether it
+    /// was a key or nullable, or how long it could be.
+    static DESCRIBED: (Arc<Database>, StdArc<str>);
+}
+
+/// Runs `fut` with `sql` as the statement [`send_row_description`] reads
+/// column origins from, when it is a SELECT.
+async fn describing<F: std::future::Future>(database: &Arc<Database>, sql: &str, fut: F) -> F::Output {
+    if sql.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        DESCRIBED.scope((database.clone(), StdArc::from(sql)), fut).await
+    } else {
+        fut.await
+    }
+}
+
+/// Runs `fut`, a statement run for another, outside the reply hold.
+pub(super) async fn internal_run<F: std::future::Future>(fut: F) -> F::Output {
+    INTERNAL_RUN.scope((), fut).await
+}
+
 /// Whether `tag` ends a statement's reply (see [`ReplyHold`]).
 fn ends_reply(tag: u8) -> bool {
     matches!(tag, b'C' | b'E' | b'I' | b's')
@@ -1563,6 +1604,13 @@ fn ends_reply(tag: u8) -> bool {
 /// Keeps a message for the statement's [`ReplyHold`] when one is open and
 /// holding (or `tag` begins holding); `false` when it should be written now.
 fn hold_reply(tag: u8, header: &[u8], payload: &[u8]) -> bool {
+    // A statement run for another (`run_internal`) writes its whole reply
+    // to the buffer it was given: its `CommandComplete` is not the end of
+    // the client's reply, and held, it started holding everything after it,
+    // which then reached the client behind the real reply.
+    if INTERNAL_RUN.try_with(|_| ()).is_ok() {
+        return false;
+    }
     crate::core::cancel::STATEMENT_CANCEL
         .try_with(|cancel| {
             let Some(hold) = cancel.held_reply() else {
@@ -2053,6 +2101,7 @@ where
                 context.limits,
                 stream,
                 startup_timeout,
+                registration.pid,
             ),
         )
         .await
@@ -2315,11 +2364,14 @@ async fn run_message_loop<S>(
     // `statement_timeout` and `lock_timeout` from the StartupMessage.
     // And `rdb.shape_change` (Q2), when the StartupMessage named one.
     startup_timeouts: (Option<u64>, Option<u64>, Option<ShapeChangeMode>),
+    // The process id `BackendKeyData` gave the session.
+    backend_pid: i32,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = SessionState::new(catalog, database.name.clone(), auth, principal, limits);
+    state.backend_pid = backend_pid;
     // Applied before the first statement, so a driver that set it at connection
     // time is protected by it from the very first query rather than from
     // whenever it happens to issue a `SET`.
@@ -2371,6 +2423,8 @@ where
         t.abort_unless_aborted(database);
         t.owner.release();
     }
+    // The session's temporary tables go with it.
+    temp_tables::drop_all(database, &mut state).await;
     result
 }
 
@@ -2443,12 +2497,45 @@ where
                 // completed has consumed nothing, so a message arriving as the timer
                 // fires is not torn.
                 let idle = if ready { state.idle_limit() } else { None };
-                let read = match idle {
-                    None => stream.read_exact(&mut tag).await,
-                    Some((limit, kind)) => {
-                        match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
-                            Ok(read) => read,
-                            Err(_) => return terminate_idle_session(database, state, stream, kind).await,
+                let deadline = idle.map(|(limit, kind)| (tokio::time::Instant::now() + limit, kind));
+                // A listening session is sent its notifications while it waits
+                // (`notify`), as drivers' listen loops wait for them; the read
+                // goes on after each.
+                enum Woke {
+                    Read(io::Result<usize>),
+                    Note(Option<notify::Note>),
+                    Idle,
+                }
+                let read = loop {
+                    let woke = {
+                        let read_next = stream.read_exact(&mut tag);
+                        let listener = state.listener.as_mut();
+                        tokio::select! {
+                            read = read_next => Woke::Read(read),
+                            note = async {
+                                match listener {
+                                    Some(l) => l.rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Woke::Note(note),
+                            _ = async {
+                                match deadline {
+                                    Some((at, _)) => tokio::time::sleep_until(at).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Woke::Idle,
+                        }
+                    };
+                    match woke {
+                        Woke::Read(read) => break read,
+                        Woke::Note(Some(note)) => {
+                            notify::send_note(stream, &note).await?;
+                            stream.flush().await?;
+                        }
+                        Woke::Note(None) => {}
+                        Woke::Idle => {
+                            let (_, kind) = deadline.expect("woken by its deadline");
+                            return terminate_idle_session(database, state, stream, kind).await;
                         }
                     }
                 };
@@ -2507,6 +2594,7 @@ where
                 state.message_us = crate::core::statement_clock::wall_us();
                 let query = read_cstring(&payload);
                 handle_simple_query(database, state, stream, query).await?;
+                state.copy_in_ran = false;
                 // And it closes its own window: it has already answered with
                 // `ReadyForQuery`. A failure inside it (`fail_statement` sets
                 // the flag) otherwise left the window open, so the *next*
@@ -2549,6 +2637,11 @@ where
                     open_implicit_block(database, state);
                 }
                 handle_execute(database, state, stream, &payload).await?;
+                if std::mem::take(&mut state.copy_in_ran)
+                    && let Some(at) = pending.iter().position(|(tag, _)| *tag == b'S')
+                {
+                    pending.remove(at);
+                }
             }
             b'C' => {
                 handle_close(state, stream, &payload).await?;
@@ -2767,6 +2860,40 @@ struct SessionState {
     /// own transaction state) leaves the journal with a statement and no
     /// reason.
     statement_error: Option<String>,
+    /// A statement this session runs for a view statement of its own (a
+    /// materialized view's table DDL, a rename's): the view guards on table
+    /// DDL let it through (`rql::views`).
+    view_internal: bool,
+    /// The materialized view a `REFRESH` is filling: the one write to a
+    /// materialized view expansion lets through.
+    refreshing_materialized: Option<String>,
+    /// This session's `nextval` results, for `currval` and `lastval`
+    /// (`rql::sequence::session`).
+    sequence_values: StdArc<std::sync::Mutex<crate::core::rql::sequence::session::SessionSequences>>,
+    /// The tables whose triggers are held off while this session writes the
+    /// rows they were run for (`trigger_exec`).
+    triggers_suppressed: Vec<String>,
+    /// Set when a statement run for this one (`run_internal_ddl`) made DDL
+    /// the block undoes: the statement's table locks are then the block's,
+    /// kept to its end, as for the block's own DDL.
+    kept_ddl_locks: bool,
+    /// This session's temporary tables (`temp_tables`).
+    temp_tables: Vec<temp_tables::TempTable>,
+    /// What this session's temporary tables' real names are made unique by.
+    temp_session: u64,
+    /// A `COPY … FROM STDIN` ran: the `Sync` an extended-query client sent
+    /// behind its `Execute`, which PostgreSQL ignores during the copy, was
+    /// read ahead before it and is dropped once (the client's next `Sync`,
+    /// after its `CopyDone`, is the one answered). Answered too, it was a
+    /// second `ReadyForQuery` the client did not expect, and the connection
+    /// broke on its next statement.
+    copy_in_ran: bool,
+    /// The channels this session listens on and its notifications' queue
+    /// (`notify`), from its first `LISTEN`.
+    listener: Option<notify::Listener>,
+    /// The process id the session was given in `BackendKeyData`, which a
+    /// notification it raises carries.
+    backend_pid: i32,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -2993,6 +3120,9 @@ struct Savepoint {
 /// An open `BEGIN` block.
 struct SessionTransaction {
     id: TxId,
+    /// `NOTIFY`s raised in the block, sent when it commits (`notify`) and
+    /// dropped with it when it does not.
+    notifies: Vec<(String, String)>,
     /// What to put `SessionState::synchronous_commit` back to when this block
     /// ends, if a `SET LOCAL` inside it changed the value.
     ///
@@ -3137,6 +3267,16 @@ impl SessionState {
             error_in_batch: false,
             message_us: crate::core::statement_clock::wall_us(),
             statement_error: None,
+            view_internal: false,
+            refreshing_materialized: None,
+            sequence_values: StdArc::default(),
+            triggers_suppressed: Vec::new(),
+            kept_ddl_locks: false,
+            temp_tables: Vec::new(),
+            temp_session: fastrand::u64(..),
+            copy_in_ran: false,
+            listener: None,
+            backend_pid: 0,
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -3753,6 +3893,27 @@ where
         }
     }
 
+    // A binary value with no type (node-postgres binds a `Buffer` so): the
+    // type its place gives it, as PostgreSQL reads one, rather than "unsupported
+    // binary parameter type OID 0". The statement's inferred types if a
+    // Describe made them, else where each parameter stands.
+    if params.iter().any(|p| p.oid == 0 && p.format == 1 && p.value.is_some())
+        && let Some(info) = state.statements.get(&stmt)
+    {
+        let placed: Vec<Option<i32>> = match &info.inferred_oids {
+            Some(oids) => oids.iter().map(|o| (*o != 0).then_some(*o)).collect(),
+            None => param_infer::infer_where_placed(database, &info.sql, &[]),
+        };
+        for (idx, p) in params.iter_mut().enumerate() {
+            if p.oid == 0
+                && p.format == 1
+                && let Some(Some(oid)) = placed.get(idx)
+            {
+                p.oid = *oid;
+            }
+        }
+    }
+
     let (res_fmt_count, mut i) = read_i16_be_from(payload, i)?;
     let mut result_formats = Vec::with_capacity(res_fmt_count as usize);
     for _ in 0..res_fmt_count {
@@ -3896,7 +4057,7 @@ where
             });
             info.shape_refused = false;
         }
-        send_row_description(stream, &fields, &result_formats).await?;
+        describing(database, &sql, send_row_description(stream, &fields, &result_formats)).await?;
         return Ok(());
     }
 
@@ -3947,9 +4108,13 @@ async fn description_now(
         Some(fields) => Some((fields, true)),
         // Nothing to describe: the reply is `NoData` whatever the tables hold.
         None if value_free == Some(ValueFreeShape::NoRows) => None,
-        None => describe_for_wire(database, query)
-            .await?
-            .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select)),
+        None => {
+            // A temporary table is described under its real name, as it runs.
+            let temp_rewritten = temp_tables::rewrite(&state.temp_tables, query);
+            describe_for_wire(database, temp_rewritten.as_deref().unwrap_or(query))
+                .await?
+                .map(|(fields, is_select)| (statement_intern::fields(&fields), is_select))
+        }
     };
 
     if let Some((fields, true)) = &description {
@@ -4736,6 +4901,31 @@ pub(crate) async fn describe_query(
     // Folded as it runs (`execute_single_statement`).
     let folded = crate::core::sql_scan::fold_core_statement(stmt);
     let stmt = folded.as_ref();
+    // A view read as the derived table it stands for, as the execute path
+    // reads it (`rql::views`), so the description is of the same statement.
+    // A `MERGE … RETURNING`: its list, as a query over its source.
+    if let Some(Ok(merge)) = crate::core::rql::merge::parse_merge(stmt) {
+        return match merge_exec::describe_text(database, &merge) {
+            Some(text) => Box::pin(describe_query(database, &text)).await,
+            None => Ok(None),
+        };
+    }
+    let inlined_calls;
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, None).await {
+        Ok(Some(text)) => {
+            inlined_calls = text;
+            inlined_calls.as_str()
+        }
+        _ => stmt,
+    };
+    let expanded_views;
+    let stmt = match crate::core::rql::views::expand(database, stmt, None, Default::default()).await {
+        Ok(Some(text)) => {
+            expanded_views = text;
+            expanded_views.as_str()
+        }
+        _ => stmt,
+    };
     // And a correlated scalar subquery as the `LATERAL` join it runs as.
     let correlated;
     let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
@@ -4773,6 +4963,16 @@ pub(crate) async fn describe_query(
     let stmt = typed_literals.as_deref().unwrap_or(stmt);
     let quantified = crate::core::sql_scan::quantified_subqueries(stmt).ok().flatten();
     let stmt = quantified.as_deref().unwrap_or(stmt);
+    let join_using = match crate::core::rql::join_using::rewrite_statement(stmt, &|name| relation_column_names(database, name)) {
+        Some(Ok(text)) => Some(text),
+        _ => None,
+    };
+    let stmt = join_using.as_deref().unwrap_or(stmt);
+    let grouping_sets = match crate::core::rql::grouping_sets::rewrite_statement(stmt) {
+        Some(Ok(text)) => Some(text),
+        _ => None,
+    };
+    let stmt = grouping_sets.as_deref().unwrap_or(stmt);
     let window_join = crate::core::rql::window_join::rewrite_statement(stmt, &|name| relation_column_names(database, name));
     let stmt = window_join.as_deref().unwrap_or(stmt);
     let join_on = crate::core::rql::join_on::rewrite_statement(stmt, &|name| relation_column_names(database, name));
@@ -5005,6 +5205,14 @@ async fn cte_relations(
 /// the first stand-in that resolves it. Nothing is run.
 async fn param_scratch_relations(database: &Arc<Database>, sql: &str) -> Vec<(String, Vec<(String, i32)>)> {
     let mut found: Vec<(String, Vec<(String, i32)>)> = Vec::new();
+    // The catalogue relations it names, by their columns: `pg_type t …
+    // WHERE t.oid = $1` is a bigint, not the text a parameter with no
+    // relation to read was taken for.
+    for view in crate::core::rql::catalog_views::views_named(sql) {
+        if let Some(columns) = crate::core::rql::catalog_views::columns_of(view) {
+            found.push((view.to_string(), columns.iter().map(|(n, t)| (n.to_string(), t.pg_oid() as i32)).collect()));
+        }
+    }
     let with = crate::core::rql::cte::split_with(sql).ok().flatten();
     if with.is_none() && crate::core::rql::cte::next_derived_table(sql).is_none() {
         return found;
@@ -5336,6 +5544,16 @@ async fn describe_resolved(
         )));
     }
 
+    // `EXPLAIN` answers one text column; `pg_notify`'s void is one too.
+    if let Some(Ok(_)) = explain::parse_explain(stmt) {
+        return Ok(Some((vec![("QUERY PLAN".to_string(), DbType::STRING)], true)));
+    }
+    if stmt.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT"))
+        && let Some(Ok(_)) = notify::parse_notify_statement(stmt)
+    {
+        return Ok(Some((vec![("pg_notify".to_string(), DbType::STRING)], true)));
+    }
+
     let purpose = match recognize_query_purpose(stmt) {
         Some(p) => p,
         None => return Ok(None),
@@ -5369,6 +5587,27 @@ async fn describe_resolved(
                     }
                 }
             }
+        }
+    }
+    // A statement over more than one catalogue relation, or over one in a
+    // join or a derived table (a driver's, as it connects or describes a
+    // table): described over the relations built as `Execute` builds them,
+    // and dropped again before the answer. Left to the arms below it was
+    // `NoData`, and the rows that followed broke the connection ("Received
+    // unexpected backend message DataRow").
+    if crate::core::rql::catalog_views::view_of_statement(stmt).is_some()
+        && let Ok(Some(built)) = crate::core::rql::catalog_views::materialize(
+            stmt,
+            database,
+            crate::core::mvcc::transaction::FROZEN_TX,
+            None,
+        )
+        .await
+    {
+        let described = Box::pin(describe_query(database, &built.rewritten)).await;
+        crate::core::rql::cte::drop_temps(database, &built.temps, crate::core::mvcc::transaction::FROZEN_TX).await;
+        if let Ok(Some(described)) = described {
+            return Ok(Some(described));
         }
     }
 
@@ -6308,6 +6547,16 @@ where
                             let read_only = state.transaction.as_ref().is_some_and(|t| t.read_only);
                             // A DROP TABLE runs at the block's commit, so a
                             // ROLLBACK keeps the table (`deferred_drops`).
+                            if ddl.is_some() && !read_only && !state.view_internal {
+                                // Views, sequences and triggers first: a
+                                // deferred DROP never reaches the statement
+                                // path's guards (`catalog_guards`).
+                                match Box::pin(catalog_guards(database, state, stream, stmt)).await {
+                                    Ok(true) => return Ok(()),
+                                    Ok(false) => {}
+                                    Err(e) => return Err(e),
+                                }
+                            }
                             if ddl.is_some() && !read_only {
                                 match deferred_drops(database, root, stmt) {
                                     Some(Err((code, message))) => return fail_statement(state, stream, code, &message).await,
@@ -6363,6 +6612,11 @@ where
                             .await;
                             if let Some(t) = state.transaction.as_mut() {
                                 t.ddl_mark = None;
+                            }
+                            // DDL a statement ran for this one is the block's
+                            // too (`run_internal_ddl`).
+                            if std::mem::take(&mut state.kept_ddl_locks) {
+                                transactional = true;
                             }
                             result
                         }),
@@ -7013,6 +7267,24 @@ pub(crate) fn rewrite_statement_text<'a>(
     } else {
         Cow::Borrowed(stmt)
     };
+    // Line breaks and tabs outside quotes made spaces, once, here
+    // (`sql_scan::flatten_whitespace`): parsers downstream test for a keyword
+    // followed by a space, and a statement laid out over lines (every
+    // driver's catalogue query, most ORMs') failed where its one-line form
+    // ran.
+    if let Cow::Owned(flat) = crate::core::sql_scan::flatten_whitespace(&stmt) {
+        stmt = Cow::Owned(flat);
+    }
+    // `pg_catalog.` qualifiers, `OPERATOR(pg_catalog.~)`, a byte-order
+    // `COLLATE` and the visibility tests, as `psql` and drivers write them
+    // (`sql_scan::catalog_syntax`).
+    if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `ARRAY(SELECT …)` as the aggregate it is (`sql_scan::array_subqueries`).
+    if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
+        stmt = Cow::Owned(text);
+    }
     // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
     // before anything reads one: a CTE or derived table is materialised from
     // this text, and `jb.id AS ID` beside `ja.id` must be the second `id`
@@ -7035,6 +7307,21 @@ pub(crate) fn rewrite_statement_text<'a>(
     // A window function over a join: the same statement over a derived
     // table of the join's columns (`core::rql::window_join`). First, so a
     // DISTINCT over it is then a single-table one for `distinct_on`.
+    // `JOIN … USING` and `NATURAL JOIN` as the ON joins they mean, with their
+    // merged columns (`core::rql::join_using`). First: every join pass below
+    // reads ON conditions.
+    match crate::core::rql::join_using::rewrite_statement(&stmt, &|name| relation_column_names(database, name)) {
+        Some(Ok(text)) => take(&mut stmt, Some(text)),
+        Some(Err(refusal)) => return Err(refusal),
+        None => {}
+    }
+    // ROLLUP, CUBE and GROUPING SETS as the UNION ALL of their grouping
+    // sets' queries (`core::rql::grouping_sets`).
+    match crate::core::rql::grouping_sets::rewrite_statement(&stmt) {
+        Some(Ok(text)) => take(&mut stmt, Some(text)),
+        Some(Err(refusal)) => return Err(refusal),
+        None => {}
+    }
     let window_join =
         crate::core::rql::window_join::rewrite_statement(&stmt, &|name| relation_column_names(database, name));
     take(&mut stmt, window_join);
@@ -7076,7 +7363,114 @@ pub(crate) fn rewrite_statement_text<'a>(
 /// not transactional here, so a statement that fails part-way would otherwise
 /// leave tables behind to collide with the next run, and the body returns early
 /// in a dozen places.
+/// `CREATE`, `DROP` and `ALTER TABLE` checked against the catalogue objects
+/// kept above the engine: a table may not take a view's or a sequence's
+/// name, `DROP TABLE` of a view is refused, a table views read is not
+/// dropped from under them (or they go first with `CASCADE`), and a dropped
+/// table's triggers and `OWNED BY` sequences go with it, in the DROP's own
+/// transaction. `Ok(true)` when the statement was answered here.
+///
+/// Called on every path a table DDL statement takes: the statement path,
+/// and a block's, which defers a `DROP TABLE` to its commit before the
+/// statement path would see it.
+async fn catalog_guards<S>(database: &Arc<Database>, state: &mut SessionState, stream: &mut S, stmt: &str) -> io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(ddl) = crate::core::rql::views::table_ddl(stmt) else {
+        return Ok(false);
+    };
+    // A table's DDL is its owner's (`rql::privileges`).
+    if let Some((code, message)) = privilege_statements::check(database, state, stmt).await {
+        fail_statement(state, stream, code, &message).await?;
+        return Ok(true);
+    }
+    if database.has_table(crate::core::rql::sequence_catalog::SEQUENCE_TABLE)
+        && sequence_statements::guard_table_ddl(database, state, stream, stmt, &ddl).await?
+    {
+        return Ok(true);
+    }
+    if database.has_table(crate::core::rql::views::VIEW_TABLE)
+        && view_statements::guard_table_ddl(database, state, stream, stmt, ddl.clone()).await?
+    {
+        return Ok(true);
+    }
+    // A dropped relation's owner and grants go with it, in its transaction:
+    // kept, a table created later under the name took them over.
+    if database.has_table(crate::core::rql::privileges::ACL_TABLE)
+        && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
+    {
+        for name in names {
+            let filter = format!("relation = {}", crate::auth::quote(name));
+            if let Err(e) = crate::core::rql::privileges::delete_where(database, &filter, state.current_tx()).await {
+                fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+                return Ok(true);
+            }
+        }
+    }
+    if database.has_table(crate::core::rql::triggers::TRIGGER_TABLE)
+        && let crate::core::rql::views::TableDdl::Drop { names, .. } = &ddl
+    {
+        for name in names {
+            if let Err(e) = crate::core::rql::triggers::remove_table(database, name, state.current_tx()).await {
+                fail_statement(state, stream, sqlstate_for(&e), &e).await?;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// [`execute_single_statement_unscoped`], with this session's sequence values
+/// in reach of the statement's expressions (`nextval`, `currval`, a `DEFAULT
+/// nextval(…)`), and a sequence's reservation written ahead after it.
 async fn execute_single_statement<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // A relation this statement creates is owned by its creator.
+    let creating = if state.view_internal {
+        None
+    } else {
+        privilege_statements::about_to_create(database, state, stmt).await
+    };
+    let scope = crate::core::rql::sequence::session::Scope {
+        database: database.id,
+        values: state.sequence_values.clone(),
+    };
+    let ran = crate::core::rql::sequence::session::scoped(
+        scope,
+        describing(
+            database,
+            stmt,
+            Box::pin(execute_single_statement_unscoped(database, state, stream, stmt, result_formats, omit_description)),
+        ),
+    )
+    .await;
+    crate::core::rql::sequence_catalog::flush(database).await;
+    if !state.view_internal {
+        temp_tables::end_of_transaction(database, state).await;
+    }
+    if let Some(name) = creating
+        && ran.is_ok()
+        && !state.statement_failed
+    {
+        privilege_statements::record_owner(database, state, &name).await;
+    }
+    if ran.is_ok() && !state.statement_failed && let Some(ddl) = crate::core::rql::views::table_ddl(stmt) {
+        trigger_exec::after_table_ddl(database, state.current_tx(), &ddl).await;
+    }
+    ran
+}
+
+async fn execute_single_statement_unscoped<S>(
     database: &Arc<Database>,
     state: &mut SessionState,
     stream: &mut S,
@@ -7100,6 +7494,166 @@ where
         }
     };
     let stmt = rewritten.as_ref();
+
+    // Temporary tables (`temp_tables`): created here, and every reference to
+    // one written as its real name before anything else reads the text.
+    if temp_tables::handle_create(database, state, stream, stmt).await? {
+        return Ok(());
+    }
+    {
+        let lower = stmt.trim().trim_end_matches(';').to_ascii_lowercase();
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        match words.as_slice() {
+            ["discard", "all"] if state.transaction.is_none() => {
+                temp_tables::drop_all(database, state).await;
+                *state.sequence_values.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+            }
+            ["discard", "temp" | "temporary"] => temp_tables::drop_all(database, state).await,
+            ["discard", "sequences"] => {
+                *state.sequence_values.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+            }
+            _ => {}
+        }
+    }
+    let temp_rewritten;
+    let stmt = match temp_tables::rewrite(&state.temp_tables, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            temp_rewritten = text;
+            temp_rewritten.as_str()
+        }
+        None => stmt,
+    };
+    // Views (`core::rql::views`): their own statements are answered here,
+    // table DDL is checked against them, and a statement reading one is
+    // given its query as a derived table, before anything else plans it.
+    if let Some(parsed) = crate::core::rql::views::parse_view_statement(stmt) {
+        return view_statements::handle_view_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
+        return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::functions::parse_routine_statement(stmt) {
+        return routine_statements::handle_routine_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::triggers::parse_trigger_statement(stmt) {
+        return trigger_exec::handle_trigger_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::privileges::parse_privilege_statement(stmt) {
+        return privilege_statements::handle_privilege_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::merge::parse_merge(stmt) {
+        return match parsed {
+            Ok(merge) => merge_exec::run_merge(database, state, stream, merge, result_formats, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // `EXPLAIN [ANALYZE] …` (`explain`).
+    if let Some(parsed) = explain::parse_explain(stmt) {
+        return match parsed {
+            Ok(statement) => explain::run_explain(database, state, stream, statement, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // `LISTEN`, `UNLISTEN`, `NOTIFY`, `SELECT pg_notify(…)` (`notify`).
+    if let Some(parsed) = notify::parse_notify_statement(stmt) {
+        let function_form = stmt.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT"));
+        return match parsed {
+            Ok(statement) => notify::run(database, state, stream, statement, function_form, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // `COPY … FROM STDIN` / `TO STDOUT` (`copy`).
+    if let Some(parsed) = copy::parse_copy(stmt) {
+        return match parsed {
+            Ok(statement) => copy::run_copy(database, state, stream, statement).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // Table DDL checked against views, sequences and triggers
+    // (`catalog_guards`).
+    if !state.view_internal && catalog_guards(database, state, stream, stmt).await? {
+        return Ok(());
+    }
+    let prepared_sequences;
+    let stmt = match sequence_statements::prepare_statement(database, state.current_tx(), stmt).await {
+        Ok(None) => stmt,
+        Ok(Some(text)) => {
+            crate::core::rql::prepared::note_rewritten();
+            prepared_sequences = text;
+            prepared_sequences.as_str()
+        }
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    // A call of a `CREATE FUNCTION` function, as its body
+    // (`rql::functions`), before views are expanded: a body may read one.
+    let inlined_calls;
+    let stmt = match crate::core::rql::functions::inline_calls(database, stmt, state.current_tx()).await {
+        Ok(None) => stmt,
+        Ok(Some(text)) => {
+            crate::core::rql::prepared::note_rewritten();
+            match rewrite_statement_text(database, &text) {
+                Ok(again) => {
+                    inlined_calls = again.into_owned();
+                    inlined_calls.as_str()
+                }
+                Err((code, message)) => {
+                    fail_statement(state, stream, code, &message).await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    // A non-superuser's privileges on what the statement names, views as
+    // views (`rql::privileges`).
+    if crate::core::rql::views::table_ddl(stmt).is_none()
+        && let Some((code, message)) = privilege_statements::check(database, state, stmt).await
+    {
+        fail_statement(state, stream, code, &message).await?;
+        return Ok(());
+    }
+    let expanded_views;
+    let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
+        let options = crate::core::rql::views::ExpandOptions {
+            writing_materialized: state.refreshing_materialized.as_deref(),
+        };
+        match crate::core::rql::views::expand(database, stmt, state.current_tx(), options).await {
+            Ok(None) => stmt,
+            Ok(Some(text)) => {
+                crate::core::rql::prepared::note_rewritten();
+                // Through the rewrites again: the derived tables are new text.
+                match rewrite_statement_text(database, &text) {
+                    Ok(again) => {
+                        expanded_views = again.into_owned();
+                        expanded_views.as_str()
+                    }
+                    Err((code, message)) => {
+                        fail_statement(state, stream, code, &message).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err((code, message)) => {
+                fail_statement(state, stream, code, &message).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        stmt
+    };
+    // A write to a table with triggers runs a row at a time
+    // (`trigger_exec`).
+    if let Some((event, table)) = trigger_exec::triggered_write(database, state, stmt).await {
+        return trigger_exec::run_triggered_write(database, state, stream, stmt, event, &table, result_formats, omit_description)
+            .await;
+    }
 
     // A data-modifying CTE and the statement it feeds are one statement, so
     // they need one transaction. Outside an explicit block there is none yet —
@@ -7267,6 +7821,28 @@ where
     }
     let stmt = folded_where.as_str();
 
+    // A statement naming `pg_class` or `pg_type` gets them built now and
+    // pointed at temporary tables. Before the CTE and derived-table passes,
+    // whose bodies run first: a driver's catalogue query reads `pg_type` from
+    // a derived table (Npgsql's, as it connects), which ran before the
+    // relation existed ("Table not found"). Nothing is built for a statement
+    // that names none, which is every ordinary one.
+    let catalog = match crate::core::rql::catalog_views::materialize(
+        stmt,
+        database,
+        effective_tx,
+        Some(&state.catalog),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
+            return Ok(());
+        }
+    };
+    let stmt = catalog.as_ref().map(|c| c.rewritten.as_str()).unwrap_or(stmt);
+
     // A correlated scalar subquery (`(SELECT max(v) FROM u WHERE u.k =
     // t.k)`), as the `LATERAL` join it means (`rql::correlated`), before the
     // passes that materialise such joins.
@@ -7278,6 +7854,9 @@ where
             correlated.as_str()
         }
         Some(Err(e)) => {
+            if let Some(c) = &catalog {
+                crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+            }
             let code = if e.contains("only one column") {
                 "42601"
             } else if e.contains("uses ungrouped column") {
@@ -7291,6 +7870,7 @@ where
         None => stmt,
     };
 
+
     // A statement with CTE bodies or derived tables runs parts of itself
     // before the engine sees its outer statement, so its whole known table
     // set is taken here, at once and in name order, before any part runs
@@ -7298,6 +7878,9 @@ where
     // plain statement's set is taken at the engine's entry.
     if crate::core::rql::cte::has_with_clause(stmt) || crate::core::rql::lock_set::names_a_subquery(stmt) {
         if let Err(e) = crate::core::rql::executor::lock_statement_set(database, stmt).await {
+            if let Some(c) = &catalog {
+                crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+            }
             fail_statement(state, stream, sqlstate_in(&e, stmt), &e).await?;
             return Ok(());
         }
@@ -7307,6 +7890,9 @@ where
     {
         Ok(m) => m,
         Err(e) => {
+            if let Some(c) = &catalog {
+                crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+            }
             // 0A000 is `feature_not_supported`, which is what an unsupported
             // CTE shape is; a body that ran and failed keeps its own class.
             fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
@@ -7329,6 +7915,9 @@ where
                 if let Some(m) = &materialized {
                     crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
                 }
+                if let Some(c) = &catalog {
+                    crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+                }
                 fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
                 return Ok(());
             }
@@ -7338,33 +7927,7 @@ where
         .map(|d| d.rewritten.as_str())
         .unwrap_or(after_cte);
 
-    // A statement naming `pg_class` or `pg_stat_user_tables` gets them built
-    // now and pointed at temporary tables. Nothing is built for a statement
-    // that names none, which is every ordinary one.
-    let catalog = match crate::core::rql::catalog_views::materialize(
-        after_derived,
-        database,
-        effective_tx,
-        Some(&state.catalog),
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            if let Some(d) = &derived {
-                crate::core::rql::cte::drop_temps(database, &d.temps, effective_tx).await;
-            }
-            if let Some(m) = &materialized {
-                crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
-            }
-            fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
-            return Ok(());
-        }
-    };
-    let effective = catalog
-        .as_ref()
-        .map(|c| c.rewritten.as_str())
-        .unwrap_or(after_derived);
+    let effective = after_derived;
     // Materialised relations are per execution, so a parse of the rewritten
     // text names relations the next execution will not have.
     if materialized.is_some() || derived.is_some() || catalog.is_some() {
@@ -7790,7 +8353,8 @@ where
                         for row in &rows {
                             row.extend_serialized(&mut answer);
                         }
-                        state.native_result = Some(answer);
+                        let described: Vec<(String, DbType)> = columns.iter().map(|(n, t)| (n.to_string(), t.clone())).collect();
+                        state.native_result = Some(native_retag(answer, Some(&described), Some(&scales)));
                         return send_command_complete(stream, &tag).await;
                     }
                     return send_query_result(
@@ -7958,7 +8522,7 @@ where
 /// `describe-and-payload-share-one-source`). Read from the tables' schemas
 /// with no lock. `Err((sqlstate, message))` when the statement cannot be
 /// described as it would run.
-fn result_description(
+pub(crate) fn result_description(
     database: &Arc<Database>,
     purpose: &QueryPurpose,
 ) -> Result<(Option<Vec<(String, DbType)>>, Option<Vec<u32>>), (&'static str, String)> {
@@ -8211,6 +8775,146 @@ fn result_description(
     Ok((select_fields, select_scales))
 }
 
+/// A native answer's rows (`2` and the serialized rows) with each cell
+/// typed as its column is declared, not as it is stored: a `jsonb` document
+/// as its JSON text (tag `JSON`), a `json` column's text as `JSONTEXT`, a
+/// `bytea` as `BYTEA`, an array as `ARRAY`, a `timestamp` as `TIMESTAMP`,
+/// and a sixteen-byte `NUMERIC` carrying its scale (`decimal_cell_with_scale`):
+/// the column's, from `scales`, or the engine's own trimmed of trailing
+/// zeros, as the PostgreSQL listener's text shows it. Each went out under its
+/// storage type: a document as engine bytes a client refused, an array or a
+/// `bytea` as text, a NUMERIC with no point.
+pub(crate) fn native_retag(answer: Vec<u8>, fields: Option<&[(String, DbType)]>, scales: Option<&[u32]>) -> Vec<u8> {
+    if answer.first() != Some(&2) {
+        return answer;
+    }
+    // Read from the first row: a column's cells share its type, and an
+    // answer nothing retypes is left as it is, unparsed.
+    let applies = |stored: &DbType, declared: Option<&DbType>| {
+        matches!(
+            (stored, declared),
+            (DbType::DECIMAL, _)
+                | (DbType::STRING | DbType::JSONB, Some(DbType::JSONB))
+                | (DbType::STRING, Some(DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_)))
+                | (DbType::DATETIME, Some(DbType::TIMESTAMP))
+        )
+    };
+    let first = crate::core::row::row::serialized_rows(&answer[1..])
+        .next()
+        .and_then(|r| r.ok())
+        .and_then(|r| crate::core::row::row::Row::decode(r).ok());
+    let Some(first) = first else {
+        return answer;
+    };
+    if !first
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(at, c)| applies(&c.column_type, fields.and_then(|f| f.get(at)).map(|(_, t)| t)))
+    {
+        return answer;
+    }
+    drop(first);
+    let Ok(mut rows) = crate::core::row::row::vec_into_rows(&answer[1..]) else {
+        return answer;
+    };
+    let mut changed = false;
+    let block = |bytes: &[u8]| {
+        let mut b = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+        b.into_slice_mut().copy_from_slice(bytes);
+        b
+    };
+    for row in rows.iter_mut() {
+        for (at, cell) in row.columns.iter_mut().enumerate() {
+            let declared = fields.and_then(|f| f.get(at)).map(|(_, t)| t);
+            match (&cell.column_type, declared) {
+                (DbType::DECIMAL, _) if cell.data.into_slice().len() == 16 => {
+                    let mut mantissa = i128::from_le_bytes(cell.data.into_slice().try_into().expect("sixteen bytes"));
+                    let scale = match scales.and_then(|s| s.get(at)).copied() {
+                        Some(scale) => scale,
+                        None => {
+                            let mut scale = crate::core::value_codec::DECIMAL_SCALE;
+                            while scale > 0 && mantissa % 10 == 0 {
+                                mantissa /= 10;
+                                scale -= 1;
+                            }
+                            scale
+                        }
+                    };
+                    cell.data = block(&crate::core::value_codec::decimal_cell_with_scale(mantissa, scale));
+                    changed = true;
+                }
+                (DbType::STRING | DbType::JSONB, Some(DbType::JSONB)) => {
+                    let mut text = Vec::new();
+                    if crate::core::jsonb::render_text_into(cell.data.into_slice(), &mut text).is_ok() {
+                        cell.data = block(&text);
+                        cell.column_type = DbType::JSON;
+                        changed = true;
+                    }
+                }
+                (DbType::STRING, Some(DbType::JSONTEXT)) => {
+                    cell.column_type = DbType::JSONTEXT;
+                    changed = true;
+                }
+                (DbType::STRING, Some(DbType::BYTEA)) => {
+                    cell.column_type = DbType::BYTEA;
+                    changed = true;
+                }
+                (DbType::STRING, Some(DbType::ARRAY | DbType::ARRAYOF(_))) => {
+                    cell.column_type = DbType::ARRAY;
+                    changed = true;
+                }
+                (DbType::DATETIME, Some(DbType::TIMESTAMP)) => {
+                    cell.column_type = DbType::TIMESTAMP;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if !changed {
+        return answer;
+    }
+    let mut out = vec![2u8];
+    for row in &rows {
+        row.extend_serialized(&mut out);
+    }
+    out
+}
+
+/// Whether a native answer to `query` holds a cell [`native_retag`] may
+/// retype, read from its first row alone: a NUMERIC, a document or a
+/// timestamp, or a text cell when a table `query` names declares a column
+/// stored as text but typed otherwise (`jsonb`, `json`, `bytea`, an array).
+/// The check that keeps a second parse of the statement and of its rows off
+/// every other answer.
+pub(crate) fn native_answer_needs_retag(answer: &[u8], database: &Database, query: &str) -> bool {
+    if answer.first() != Some(&2) {
+        return false;
+    }
+    let Some(Ok(first)) = crate::core::row::row::serialized_rows(&answer[1..]).next() else {
+        return false;
+    };
+    let Ok(row) = crate::core::row::row::Row::decode(first) else {
+        return false;
+    };
+    let mut text = false;
+    for c in &row.columns {
+        match c.column_type {
+            DbType::DECIMAL | DbType::DATETIME | DbType::JSONB => return true,
+            DbType::STRING => text = true,
+            _ => {}
+        }
+    }
+    text && crate::core::rql::lock_set::relation_references(query).iter().any(|r| {
+        database.schema_view(&r.name).is_some_and(|t| {
+            t.schema().fields.iter().any(|f| {
+                matches!(f.db_type, DbType::JSONB | DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_))
+            })
+        })
+    })
+}
+
 /// Turns the engine's answer to a statement into the wire messages that
 /// answer the client.
 #[allow(clippy::too_many_arguments)]
@@ -8248,7 +8952,7 @@ where
             };
             #[cfg(feature = "query_stats")]
             crate::core::query_stats::note_rows(rows as u64);
-            state.native_result = Some(resp);
+            state.native_result = Some(native_retag(resp, select_fields.as_deref(), select_scales.as_deref()));
             return send_command_complete(stream, &format!("SELECT {}", rows)).await;
         }
         state.native_result = Some(resp.clone());
@@ -9132,6 +9836,19 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
         // PostgreSQL's own codes for a generation expression it refuses:
         // a subquery is a missing feature, the rest a bad definition.
         "0A000"
+    } else if has("nextval: reached maximum value") || has("nextval: reached minimum value") {
+        // A sequence at its bound with no CYCLE.
+        "2200H"
+    } else if has("is not yet defined in this session") {
+        // `currval`/`lastval` before any `nextval`.
+        "55000"
+    } else if has("setval: value") && has("is out of bounds for sequence") {
+        "22003"
+    } else if has("both default and identity specified") || has("drop identity instead") {
+        // PostgreSQL's codes for an identity declaration it refuses.
+        "42601"
+    } else if has("identity column type must be") {
+        "22023"
     } else if has("both default and generation expression") {
         // PostgreSQL reports the two clauses together as a syntax error.
         "42601"
@@ -9329,6 +10046,12 @@ pub(crate) fn split_statements(query: &str) -> Vec<String> {
                 quote = Some(c);
                 i += 1;
             }
+            // `$$ … $$` and `$tag$ … $tag$`, a function's body: a `;` inside
+            // ends no statement. Split there, `CREATE FUNCTION … AS $$ BEGIN
+            // RETURN 1; END $$` reached the parser as two broken halves.
+            b'$' if crate::core::sql_scan::dollar_tag_len(bytes, i).is_some() => {
+                i = crate::core::sql_scan::dollar_quote_end(bytes, i).unwrap_or(bytes.len());
+            }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -9417,6 +10140,7 @@ fn open_block(
     }
     state.transaction = Some(SessionTransaction {
         id,
+        notifies: Vec::new(),
         // A chained block starts fresh: `SET LOCAL` belongs to the block that
         // ran it, and `COMMIT AND CHAIN` carries the characteristics over, not
         // the settings.
@@ -9491,6 +10215,22 @@ fn opens_an_implicit_block(sql: &str) -> bool {
 /// to report is returned: a commit whose rows or outcome could not be made
 /// durable is not a commit.
 async fn commit_block(
+    database: &Arc<Database>,
+    state: &SessionState,
+    mut t: SessionTransaction,
+) -> Result<(), (&'static str, String)> {
+    // The block's notifications, sent once it has committed (`notify`).
+    let notifies = std::mem::take(&mut t.notifies);
+    let committed = Box::pin(commit_block_inner(database, state, t)).await;
+    if committed.is_ok() {
+        for (channel, payload) in &notifies {
+            notify::publish(database.id, state.backend_pid, channel, payload);
+        }
+    }
+    committed
+}
+
+async fn commit_block_inner(
     database: &Arc<Database>,
     state: &SessionState,
     t: SessionTransaction,
@@ -12117,10 +12857,14 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 // a power of ten. The text renderer beside this one was
                 // already given the scale, which is why the same query
                 // answered differently over the two protocols.
-                Some(crate::core::value_codec::encode_pg_numeric_scaled(
-                    i128::from_le_bytes(arr),
-                    scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
-                ))
+                // Shown at it, as the text form shows it (`12.50`).
+                Some(match scale {
+                    Some(scale) => crate::core::value_codec::encode_pg_numeric_with_dscale(i128::from_le_bytes(arr), scale),
+                    None => crate::core::value_codec::encode_pg_numeric_scaled(
+                        i128::from_le_bytes(arr),
+                        crate::core::value_codec::DECIMAL_SCALE,
+                    ),
+                })
             } else {
                 None
             }
@@ -13104,6 +13848,13 @@ where
     send_message(stream, b'N', &payload).await
 }
 
+/// The name in an error's `constraint "name"`, its first.
+fn quoted_constraint(message: &str) -> Option<&str> {
+    let at = message.find("constraint \"")? + "constraint \"".len();
+    let end = message[at..].find('"')?;
+    Some(&message[at..at + end]).filter(|n| !n.is_empty())
+}
+
 async fn send_error_response<S>(stream: &mut S, sqlstate: &str, message: &str) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -13123,6 +13874,17 @@ where
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
+
+    // The constraint an integrity error names, as its own field: what an ORM
+    // maps the error to a key or a check by (node-postgres's `constraint`,
+    // Npgsql's `ConstraintName`).
+    if sqlstate.starts_with("23")
+        && let Some(name) = quoted_constraint(message)
+    {
+        payload.push(b'n');
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+    }
 
     // PostgreSQL's routine for the one error a driver dispatches on by it
     // (see `CACHED_PLAN_ROUTINE`).
@@ -13193,28 +13955,49 @@ where
     // number of fields
     payload.extend_from_slice(&(fields.len() as i16).to_be_bytes());
 
+    // Each column's table, number and declared type, when the statement's
+    // items are columns of its tables (`DESCRIBED`). Taken only where they
+    // line up with the fields described.
+    let origins = DESCRIBED
+        .try_with(|(database, sql)| {
+            let flat = crate::core::sql_scan::flatten_whitespace(sql);
+            crate::core::rql::catalog_model::column_origins(database, &flat)
+        })
+        .ok()
+        .flatten()
+        .filter(|o| o.len() == fields.len());
+
     for (i, (name, db_type)) in fields.iter().enumerate() {
         // field name
         payload.extend_from_slice(name.as_ref().as_bytes());
         payload.push(0);
 
+        let oid = db_type.pg_oid();
+        let origin = origins.as_ref().and_then(|o| o[i]);
+        // The declared type where it is the one described or its narrowing:
+        // a `varchar(n)` described as `text` is `varchar` with its length.
+        let (type_oid, typmod) = match origin {
+            Some(o) if o.type_oid as u32 == oid => (oid as i32, o.typmod),
+            Some(o) if oid == 25 && matches!(o.type_oid, 1043) => (o.type_oid, o.typmod),
+            _ => (oid as i32, db_type.pg_typmod()),
+        };
+
         // table_oid
-        payload.extend_from_slice(&0i32.to_be_bytes());
+        payload.extend_from_slice(&origin.map_or(0, |o| o.table_oid).to_be_bytes());
 
         // column_attr
-        payload.extend_from_slice(&0i16.to_be_bytes());
+        payload.extend_from_slice(&origin.map_or(0, |o| o.attnum).to_be_bytes());
 
         // type_oid
-        let oid = db_type.pg_oid();
-        payload.extend_from_slice(&(oid as i32).to_be_bytes());
+        payload.extend_from_slice(&type_oid.to_be_bytes());
 
         // type_size
         let size = db_type.pg_type_size();
         payload.extend_from_slice(&(size as i16).to_be_bytes());
 
-        // type_modifier: a `character(n)`'s length plus four, as
-        // PostgreSQL reports it; -1 for every other type.
-        payload.extend_from_slice(&db_type.pg_typmod().to_be_bytes());
+        // type_modifier: a declared length, precision and scale or
+        // fractional digits as PostgreSQL reports them; -1 for none.
+        payload.extend_from_slice(&typmod.to_be_bytes());
 
         // format_code
         let format_code = if result_formats.is_empty() {

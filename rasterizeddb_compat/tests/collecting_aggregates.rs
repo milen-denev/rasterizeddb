@@ -152,3 +152,43 @@ async fn drivers_read_them_by_type() {
     assert_eq!(row.get::<serde_json::Value, _>(2), serde_json::json!([1, 2]));
     assert_eq!(row.get::<Vec<String>, _>(3), ["a", "b"]);
 }
+
+/// `json_agg` of `json` values: an object built by `json_build_object`, a
+/// `to_json`, a `::json` cast, a `json` path. Each was quoted as a string, so
+/// `json_agg(json_build_object('id', id))` came back as `["{\"id\" : 1}"]`,
+/// an array of strings, with no error. `json_agg` is `json` (OID 114), its
+/// elements' text kept as written, as PostgreSQL 17's is; `jsonb_agg` stays
+/// `jsonb`. Expected answers are PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread")]
+async fn json_agg_keeps_json_values_as_json() {
+    let server = TestServer::start().await.expect("server");
+    let (c, conn) = tokio_postgres::connect(&server.url(), tokio_postgres::NoTls).await.expect("connect");
+    tokio::spawn(conn);
+    for sql in [
+        "CREATE TABLE ms (id INT PRIMARY KEY, name TEXT, j JSONB, tz TIMESTAMPTZ)",
+        "INSERT INTO ms VALUES (1, 'a', '{\"k\": [1, 2]}', '2026-01-02 03:04:05.25+00'), (2, 'b\"q', NULL, NULL)",
+    ] {
+        c.simple_query(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "SELECT json_agg(json_build_object('id', id, 'n', name) ORDER BY id) FROM ms",
+            &[r#"[{"id" : 1, "n" : "a"}, {"id" : 2, "n" : "b\"q"}]"#],
+        ),
+        ("SELECT json_agg(json_build_array(id, name) ORDER BY id) FROM ms", &[r#"[[1, "a"], [2, "b\"q"]]"#]),
+        ("SELECT json_agg(to_json(name) ORDER BY id) FROM ms", &[r#"["a", "b\"q"]"#]),
+        ("SELECT json_agg(CAST('{\"a\" : 1}' AS json)) FROM ms", &[r#"[{"a" : 1}, {"a" : 1}]"#]),
+        ("SELECT json_agg(j->'k' ORDER BY id), json_agg(j->>'k' ORDER BY id) FROM ms", &[r#"[[1, 2], null]|["[1, 2]", null]"#]),
+        ("SELECT jsonb_agg(json_build_object('id', id) ORDER BY id) FROM ms", &[r#"[{"id": 1}, {"id": 2}]"#]),
+        ("SELECT json_agg(tz ORDER BY id), jsonb_agg(tz ORDER BY id) FROM ms",
+         &[r#"["2026-01-02T03:04:05.25+00:00", null]|["2026-01-02T03:04:05.25+00:00", null]"#]),
+        ("SELECT pg_typeof(json_agg(id)), pg_typeof(jsonb_agg(id)) FROM ms", &["json|jsonb"]),
+        ("SELECT json_agg(id ORDER BY id DESC) -> 0 FROM ms", &["2"]),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(rows(&c, sql).await, *expected, "{sql}");
+    }
+    let described = c.prepare("SELECT json_agg(id), jsonb_agg(id) FROM ms").await.expect("prepare");
+    let types: Vec<_> = described.columns().iter().map(|col| col.type_().clone()).collect();
+    assert_eq!(types, [tokio_postgres::types::Type::JSON, tokio_postgres::types::Type::JSONB]);
+}

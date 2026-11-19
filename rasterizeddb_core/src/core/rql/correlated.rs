@@ -28,7 +28,11 @@
 //! value is added to the `GROUP BY` without changing any group, and a
 //! `HAVING` term testing it alone moves into the `WHERE` (`group_by_values`).
 //!
-//! Refused rather than guessed (0A000): a set operation; in a grouped SELECT,
+//! In a set operation each branch is rewritten on its own and read as a
+//! derived table (`set_operation`); the whole's `ORDER BY` and `LIMIT` stay
+//! outside the last branch.
+//!
+//! Refused rather than guessed (0A000): in a grouped SELECT,
 //! a `GROUP BY` over expressions, the value inside a larger select-list
 //! expression, in the `ORDER BY`, or compared with an aggregate in one
 //! `HAVING` term (what a grouped join cannot take); a subquery returning
@@ -73,7 +77,10 @@ fn from_list_end(sql: &str, from: usize) -> usize {
 /// `sql`, a SELECT holding correlated scalar subqueries, as the `LATERAL`
 /// joins they mean; `None` when it holds none (or is not a SELECT).
 pub(crate) fn rewrite_select(sql: &str) -> Option<Result<String, String>> {
-    if !starts_with_word(sql, "SELECT") {
+    // A set operation may open with a parenthesised branch.
+    let set_operation =
+        || sql.trim_start().starts_with('(') && ["UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| find_keyword(sql, kw, 0).is_some());
+    if !starts_with_word(sql, "SELECT") && !set_operation() {
         return None;
     }
     outside_from(sql)?;
@@ -105,10 +112,8 @@ fn rewrite_select_inner(sql: &str) -> Result<String, String> {
             "a correlated scalar subquery in a SELECT with {what} is not supported yet; write it as a join"
         ))
     };
-    for kw in ["UNION", "INTERSECT", "EXCEPT"] {
-        if find_keyword(sql, kw, 0).is_some() {
-            return refuse(kw);
-        }
+    if ["UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| find_keyword(sql, kw, 0).is_some()) {
+        return set_operation(sql);
     }
     let mut current = sql.trim().trim_end_matches(';').trim_end().to_string();
     // Every subquery replaced first, its join kept to append after: an
@@ -381,6 +386,71 @@ fn alone_in_item(before: &str, after: &str) -> bool {
         rest = rest[name_len..].trim_start();
     }
     starts_item && (rest.starts_with(',') || starts_with_word(rest, "FROM"))
+}
+
+/// A set operation whose branches hold correlated scalar subqueries: each
+/// branch rewritten on its own, the operators and a trailing `ORDER BY` or
+/// `LIMIT` (which belong to the whole) left where they were. A branch's
+/// subquery reads only that branch's relations, so its lateral join is that
+/// branch's. It was refused ("… in a SELECT with UNION is not supported").
+fn set_operation(sql: &str) -> Result<String, String> {
+    let text = sql.trim().trim_end_matches(';').trim_end();
+    // Every top-level operator, with an `ALL` or `DISTINCT` after it.
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    loop {
+        let next = ["UNION", "INTERSECT", "EXCEPT"]
+            .iter()
+            .filter_map(|kw| find_keyword(text, kw, at).map(|p| (p, kw.len())))
+            .min_by_key(|(p, _)| *p);
+        let Some((p, len)) = next else { break };
+        let mut end = p + len;
+        let rest = &text[end..];
+        for word in ["ALL", "DISTINCT"] {
+            if starts_with_word(rest, word) {
+                end += (rest.len() - rest.trim_start().len()) + word.len();
+                break;
+            }
+        }
+        cuts.push((p, end));
+        at = end;
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut start = 0usize;
+    let last = cuts.len();
+    for (i, piece_end) in cuts.iter().map(|(p, _)| *p).chain(std::iter::once(text.len())).enumerate() {
+        let mut piece = text[start..piece_end].trim();
+        // The last branch carries the whole's `ORDER BY` and `LIMIT`, which
+        // stay outside it.
+        let mut tail = "";
+        if i == last && !piece.starts_with('(') {
+            if let Some(at) = ["ORDER", "LIMIT", "OFFSET", "FETCH"].iter().filter_map(|k| find_keyword(piece, k, 0)).min() {
+                tail = &piece[at..];
+                piece = piece[..at].trim_end();
+            }
+        }
+        let (open, inner, close) = if piece.starts_with('(') && piece.ends_with(')') {
+            ("(", &piece[1..piece.len() - 1], ")")
+        } else {
+            ("", piece, "")
+        };
+        // A branch with a correlated subquery as a derived table of its own:
+        // its lateral join then reads that branch's relations alone. Joined
+        // in place, a second branch's read the first's FROM ("missing
+        // FROM-clause entry for table \"sb\"").
+        let rewritten = if outside_from(inner).is_some() {
+            // As written: the derived table's own pass rewrites it there.
+            format!("SELECT * FROM ({inner}) {ALIAS_PREFIX}u{i}")
+        } else {
+            inner.to_string()
+        };
+        out.push_str(&format!(" {open}{rewritten}{close} {tail}"));
+        if let Some((p, end)) = cuts.get(i) {
+            out.push_str(&text[*p..*end]);
+            start = *end;
+        }
+    }
+    Ok(out.trim().to_string())
 }
 
 /// Whether `text` ends with the word `word`.

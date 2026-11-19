@@ -1265,7 +1265,7 @@ async fn ext_cov_table_level_unique_constraints() {
 
     // The pair repeats: refused.
     let res = exec(&database, &insert(4, 1, 100, "owner")).await;
-    assert_error_contains(&res, "UNIQUE", "duplicate (org_id, user_id) pair");
+    assert_error_contains(&res, "violates unique constraint", "duplicate (org_id, user_id) pair");
 
     let res = exec(&database, "SELECT id FROM memberships WHERE id >= 1").await;
     assert_eq!(assert_rows(&res, "rows after composite checks").len(), 3);
@@ -1277,7 +1277,7 @@ async fn ext_cov_table_level_unique_constraints() {
         "UPDATE memberships SET user_id = 100 WHERE id = 2",
     )
     .await;
-    assert_error_contains(&res, "UNIQUE", "UPDATE into a duplicate pair");
+    assert_error_contains(&res, "violates unique constraint", "UPDATE into a duplicate pair");
 
     // Deleting the row that held the pair frees it. Under MVCC a deleted row
     // keeps its `deleted` flag clear until reclamation runs, so without the
@@ -1326,7 +1326,7 @@ async fn ext_cov_table_level_unique_constraints() {
 
     // And it is enforced from here on, without a restart.
     let res = exec(&database, &add_account(4, "a@x.com", 1)).await;
-    assert_error_contains(&res, "UNIQUE", "duplicate after ALTER ADD CONSTRAINT");
+    assert_error_contains(&res, "violates unique constraint", "duplicate after ALTER ADD CONSTRAINT");
 
     // A pair that is still new is accepted.
     let res = exec(&database, &add_account(5, "c@x.com", 1)).await;
@@ -1412,7 +1412,7 @@ async fn ext_cov_unique_treats_nulls_as_distinct() {
         r##"INSERT INTO invites (id, code, claimed_by) VALUES (5, 'SHARED', 'ann');"##,
     )
     .await;
-    assert_error_contains(&res, "UNIQUE", "duplicate fully-specified tuple");
+    assert_error_contains(&res, "violates unique constraint", "duplicate fully-specified tuple");
 }
 
 /// The anti-join, checked against an oracle computed outside the engine.

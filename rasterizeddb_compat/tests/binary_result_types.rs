@@ -146,7 +146,7 @@ fn cases() -> Vec<Case> {
         Case { column: "DOUBLE PRECISION", literal: "-2.25", ty: Type::FLOAT8, expect: Native(native::<f64>) },
         Case { column: "BOOLEAN", literal: "true", ty: Type::BOOL, expect: Bytes(vec![1]) },
         Case { column: "TEXT", literal: "héllo, wörld", ty: Type::TEXT, expect: Native(native::<String>) },
-        Case { column: "VARCHAR(20)", literal: "abc", ty: Type::TEXT, expect: Native(native::<String>) },
+        Case { column: "VARCHAR(20)", literal: "abc", ty: Type::VARCHAR, expect: Native(native::<String>) },
         Case { column: "BYTEA", literal: "\\x00ab10ff", ty: Type::BYTEA, expect: Bytes(vec![0x00, 0xab, 0x10, 0xff]) },
         Case {
             column: "UUID",

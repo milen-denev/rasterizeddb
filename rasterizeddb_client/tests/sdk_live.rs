@@ -200,21 +200,19 @@ async fn every_type_round_trips() {
             )
         );
 
-        // NUMERIC(10,2) and JSONB and arrays need ::text; read directly they
-        // are errors that say so, never wrong values.
+        // NUMERIC(10,2) and JSONB read directly: the column's scale and the
+        // document's JSON text (`pgwire::native_retag`). Both were refused
+        // before, a NUMERIC with no scale and a document as engine bytes.
         let rows = c.run("SELECT n, nu, j FROM ty WHERE id = 1").await.unwrap();
         let r = rows.get(0).unwrap();
-        let e = r.get::<Numeric>(0).unwrap_err().to_string();
-        assert!(e.contains("::text"), "{e}");
+        assert_eq!(r.get::<Numeric>(0).unwrap(), n, "NUMERIC(10,2) carries its scale");
         assert_eq!(
             r.get::<Numeric>(1).unwrap(),
             nu,
             "unconstrained NUMERIC carries its scale"
         );
-        assert!(
-            r.get::<Json>(2).is_err(),
-            "a stored JSONB document is not JSON text"
-        );
+        let direct_json = r.get::<Json>(2).expect("a JSONB document read as its JSON text");
+        assert!(direct_json.as_str().contains("it's"), "{:?}", direct_json);
 
         let row: (Numeric, Numeric, Json, Vec<Option<i64>>, Vec<String>) = c
             .fetch_one(
@@ -234,6 +232,11 @@ async fn every_type_round_trips() {
             .await
             .unwrap();
         assert_eq!(direct, ints);
+        let direct_texts: Vec<String> = c
+            .fetch_scalar("SELECT ta FROM ty WHERE id = 1", params![])
+            .await
+            .unwrap();
+        assert_eq!(direct_texts, texts);
 
         assert!(
             c.fetch_scalar::<f64>("SELECT f8 FROM ty WHERE id = 2", params![])
@@ -270,17 +273,18 @@ async fn every_type_round_trips() {
             .unwrap();
         assert_eq!(ids, vec![(1,), (3,)]);
 
-        // Aggregates: AVG carries its scale; SUM over BIGINT does not.
+        // Aggregates: AVG and SUM over BIGINT (a NUMERIC, as in PostgreSQL)
+        // carry their scales.
         let avg: Numeric = c
             .fetch_scalar("SELECT AVG(id) FROM ty", params![])
             .await
             .unwrap();
         assert!(avg.as_str().starts_with("2"), "{avg:?}");
-        assert!(
-            c.fetch_scalar::<Numeric>("SELECT SUM(id) FROM ty", params![])
-                .await
-                .is_err()
-        );
+        let sum: Numeric = c
+            .fetch_scalar("SELECT SUM(id) FROM ty", params![])
+            .await
+            .unwrap();
+        assert_eq!(sum.to_string(), "6");
         assert_eq!(
             c.fetch_scalar::<i64>("SELECT SUM(id)::bigint FROM ty", params![])
                 .await

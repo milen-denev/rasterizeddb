@@ -114,7 +114,7 @@ async fn no_shape_produces_a_malformed_frame() {
     println!("probes: {}, errored: {}", probes.len() * 2, errors.len());
     let unexpected: Vec<&String> = errors
         .iter()
-        .filter(|e| !e.contains("duplicate value for UNIQUE"))
+        .filter(|e| !e.contains("duplicate key value violates unique constraint"))
         .collect();
     assert!(unexpected.is_empty(), "shapes that failed:\n{:#?}", unexpected);
 }

@@ -127,10 +127,10 @@ let posts: Vec<Post> = Post::query().with(Post::author).all(db).await?;
 # let _ = (users, posts); Ok(()) }
 ```
 
-A per-relation `limit` is applied **per parent, on this side**: the native
-protocol refuses the derived table a per-parent `LIMIT` needs in SQL (a
-window over a subquery), so every matching related row is read and each
-parent keeps its first `n`. Filter and order apply in the statement.
+A per-relation `limit` is applied **per parent, on this side**: a per-parent
+`LIMIT` in SQL needs a window over a derived table, which servers before
+derived tables ran over the native protocol refused, so every matching
+related row is read and each parent keeps its first `n`. Filter and order apply in the statement.
 
 ## Lazy loading
 

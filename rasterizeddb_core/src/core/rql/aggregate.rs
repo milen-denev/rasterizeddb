@@ -228,8 +228,11 @@ impl AggFunc {
             // One array type here, described as `text[]`; its text is
             // PostgreSQL's whatever the element type.
             AggFunc::ArrayAgg => DbType::ARRAY,
-            // `json_agg`'s text is `jsonb`'s for every value it builds.
-            AggFunc::JsonAgg | AggFunc::JsonbAgg => DbType::JSONB,
+            // `json_agg` is `json`, its elements' text kept as each one's
+            // own (a `json` value verbatim), as PostgreSQL's is; `jsonb_agg`
+            // is `jsonb`.
+            AggFunc::JsonAgg => DbType::JSONTEXT,
+            AggFunc::JsonbAgg => DbType::JSONB,
             AggFunc::BoolAnd | AggFunc::BoolOr | AggFunc::Every => DbType::BOOL,
         }
     }
@@ -1861,15 +1864,26 @@ impl Acc {
                                         text.push_str(&json_string(&rendered))
                                     }
                                 }
-                                DbType::BOOL | DbType::JSONB => text.push_str(&rendered),
+                                // A `json` value is JSON already: written as
+                                // it is, never quoted as a string (which made
+                                // `json_agg(json_build_object(…))` an array
+                                // of strings).
+                                DbType::BOOL | DbType::JSONB | DbType::JSONTEXT => text.push_str(&rendered),
                                 // `to_json` writes a timestamp in ISO 8601.
                                 DbType::TIMESTAMP => text.push_str(&json_string(&rendered.replacen(' ', "T", 1))),
+                                // And a `timestamptz` with its offset in full
+                                // (`+00:00`), as PostgreSQL's JSON form has it.
+                                DbType::DATETIME => text.push_str(&json_string(&json_timestamptz(&rendered))),
                                 _ => text.push_str(&json_string(&rendered)),
                             }
                         }
                     }
                 }
                 text.push(']');
+                if matches!(func, AggFunc::JsonAgg) {
+                    // `json` is stored as its text.
+                    return Ok(Some(text.into_bytes()));
+                }
                 crate::core::jsonb::encode_text(&text).map(Some)
             }
             _ => Ok(None),
@@ -3259,6 +3273,19 @@ fn array_element_text(text: &str) -> String {
         out.push(c);
     }
     out.push('"');
+    out
+}
+
+/// A `timestamptz` as PostgreSQL's JSON writes it: `T` between the date and
+/// the time, and the offset as `±HH:MM` (`2026-01-02T03:04:05+00:00`) where
+/// the text form has `+00`.
+fn json_timestamptz(rendered: &str) -> String {
+    let mut out = rendered.replacen(' ', "T", 1);
+    let bytes = out.as_bytes();
+    let n = bytes.len();
+    if n >= 3 && matches!(bytes[n - 3], b'+' | b'-') && bytes[n - 2].is_ascii_digit() && bytes[n - 1].is_ascii_digit() {
+        out.push_str(":00");
+    }
     out
 }
 

@@ -3354,6 +3354,17 @@ impl<S: StorageIO> Table<S> {
         }
     }
 
+    /// The constraint a column's own UNIQUE is, as PostgreSQL names it: the
+    /// table's `_pkey` when it is the primary key, its `_<column>_key`
+    /// otherwise.
+    fn column_constraint_name(&self, column: &str) -> String {
+        if self.schema.primary_key.as_deref().is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
+            crate::core::rql::unique_key::pkey_name(&self.schema.name)
+        } else {
+            crate::core::rql::unique_key::implicit_key_name(&self.schema.name, column)
+        }
+    }
+
     async fn check_unique(
         &self,
         row_write: &RowWrite,
@@ -3449,8 +3460,9 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     vec![field.name.clone()],
                     format!(
-                        "duplicate value for UNIQUE column {:?} (row {} already holds it)",
-                        field.name, existing
+                        "duplicate key value violates unique constraint \"{}\" (row {} already holds it)",
+                        self.column_constraint_name(&field.name),
+                        existing
                     ),
                 );
                 continue;
@@ -3461,8 +3473,8 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     vec![field.name.clone()],
                     format!(
-                        "duplicate value for UNIQUE column {:?} (an earlier row of this statement holds it)",
-                        field.name
+                        "duplicate key value violates unique constraint \"{}\" (an earlier row of this statement holds it)",
+                        self.column_constraint_name(&field.name)
                     ),
                 );
             }
@@ -3578,8 +3590,8 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     key.columns.clone(),
                     format!(
-                        "duplicate value for UNIQUE constraint {} (row {} already holds it): {}{}",
-                        key.describe(),
+                        "duplicate key value violates unique constraint \"{}\" (row {} already holds it): {}{}",
+                        key.name,
                         existing,
                         shown.join(", "),
                         updated
@@ -3593,8 +3605,8 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     key.columns.clone(),
                     format!(
-                        "duplicate value for UNIQUE constraint {} (an earlier row of this statement holds it)",
-                        key.describe()
+                        "duplicate key value violates unique constraint \"{}\" (an earlier row of this statement holds it)",
+                        key.name
                     ),
                 );
             }
@@ -5919,6 +5931,46 @@ impl<S: StorageIO> Table<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The row `RETURNING` reports for a version an `UPDATE` wrote: `row`
+    /// (the fetched pre-image) with each column an expression assigns
+    /// holding what `row_write` stores, NULL where the write set its
+    /// companion. A column the fetch did not carry is left out, as it is
+    /// from the pre-image.
+    fn returning_image(
+        &self,
+        row: &Row,
+        row_write: &RowWrite,
+        expressions: &[(u32, crate::core::rql::expr::Expr)],
+    ) -> Row {
+        let mut image = row.clone();
+        for (write_order, _) in expressions {
+            let Some(payload) = row_write.columns_writing_data.iter().find(|c| c.write_order == *write_order) else {
+                continue;
+            };
+            let flag = self
+                .schema
+                .fields
+                .iter()
+                .find(|f| !f.is_deleted && f.write_order as u32 == *write_order)
+                .and_then(|f| {
+                    let flag_name = crate::core::rql::nullable::flag_column_name(&f.name);
+                    self.schema.fields.iter().find(|g| !g.is_deleted && g.name.eq_ignore_ascii_case(&flag_name))
+                })
+                .and_then(|flag| row_write.columns_writing_data.iter().find(|c| c.write_order == flag.write_order as u32));
+            let is_null = flag.is_some_and(|c| crate::core::rql::nullable::flag_is_set(c.data.into_slice()));
+            if let Some(cell) = image.columns.iter_mut().find(|c| u64::from(c.schema_id) == u64::from(*write_order)) {
+                cell.data = payload.data.clone();
+                cell.column_type = if is_null { crate::core::db_type::DbType::NULL } else { payload.column_type.clone() };
+            }
+            if let Some(flag) = flag
+                && let Some(cell) = image.columns.iter_mut().find(|c| u64::from(c.schema_id) == u64::from(flag.write_order))
+            {
+                cell.data = flag.data.clone();
+            }
+        }
+        image
+    }
+
     async fn update_rows_body(
         &self,
         where_clause: &str,
@@ -6434,6 +6486,12 @@ impl<S: StorageIO> Table<S> {
 
             // Refused as an expression that fails to evaluate is refused: the
             // statement's writes so far are abandoned with it.
+            // What `RETURNING` reports for this version, when it is asked:
+            // the pre-image with each computed assignment as written. Taken
+            // from the write, never computed again: a second evaluation of
+            // `SET id = nextval('s')` or `SET token = gen_random_uuid()`
+            // reported a value the row does not hold.
+            let returned_image = collect.is_some().then(|| self.returning_image(&row, &row_write, expressions));
             if !row_checks.is_empty() {
                 if let Err(e) = row_checks.hold(
                     &self.schema.name,
@@ -6471,7 +6529,7 @@ impl<S: StorageIO> Table<S> {
                     }
                     updated_count = updated_count.saturating_add(1);
                     if let Some(collect) = collect.as_deref_mut() {
-                        collect.push(row.clone());
+                        collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
                     }
                     moves.push(row_write);
                     continue;
@@ -6597,7 +6655,7 @@ impl<S: StorageIO> Table<S> {
                     own_keys.updated.insert(row_id);
                 }
                 if let Some(collect) = collect.as_deref_mut() {
-                    collect.push(row.clone());
+                    collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
                 }
                 continue;
             }
@@ -6657,7 +6715,7 @@ impl<S: StorageIO> Table<S> {
                     own_keys.updated.insert(row_id);
                 }
                 if let Some(collect) = collect.as_deref_mut() {
-                    collect.push(row.clone());
+                    collect.push(returned_image.clone().unwrap_or_else(|| row.clone()));
                 }
             }
 

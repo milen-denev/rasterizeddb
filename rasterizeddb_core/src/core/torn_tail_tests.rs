@@ -1025,7 +1025,7 @@ impl Sidecar {
                 unique_key::append(io, &key).await
             }
             Sidecar::Def => {
-                column_default::append(io, &column_default::ColumnDefault { column: name, expression: format!("{i}"), is_deleted: false })
+                column_default::append(io, &column_default::ColumnDefault { column: name, expression: format!("{i}"), is_deleted: false, identity: None })
                     .await
             }
             Sidecar::Idx => {
@@ -1096,7 +1096,7 @@ impl Sidecar {
             Sidecar::Def => column_default::stage(
                 io,
                 writes,
-                &column_default::ColumnDefault { column: name, expression: format!("{i}"), is_deleted: false },
+                &column_default::ColumnDefault { column: name, expression: format!("{i}"), is_deleted: false, identity: None },
             ),
             Sidecar::Idx => crate::core::index::decl::stage(
                 io,
