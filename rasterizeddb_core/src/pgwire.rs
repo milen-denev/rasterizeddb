@@ -59,6 +59,10 @@ mod engine_bug_tests;
 mod shape_repair_tests;
 mod fixed_rows;
 mod native_session;
+#[cfg(feature = "db_branching")]
+mod branch_merge;
+#[cfg(all(test, feature = "db_branching"))]
+mod branch_tests;
 #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
 pub(crate) mod proxied;
 mod wire_out;
@@ -2249,6 +2253,18 @@ pub(crate) fn privileged_statement(stmt: &str) -> Option<&'static str> {
         ("DROP", "ROLE") | ("DROP", "USER") => Some("DROP ROLE"),
         ("CREATE", "DATABASE") => Some("CREATE DATABASE"),
         ("DROP", "DATABASE") => Some("DROP DATABASE"),
+        // Branches are databases: making, replacing, swapping and merging
+        // one is administering the catalogue. `SHOW BRANCHES` only reads.
+        ("CREATE", "BRANCH") => Some("CREATE BRANCH"),
+        ("DROP", "BRANCH") => Some("DROP BRANCH"),
+        ("RESET", "BRANCH") => Some("RESET BRANCH"),
+        ("PROMOTE", "BRANCH") => Some("PROMOTE BRANCH"),
+        // Not T-SQL's `MERGE branch USING …`, a table's MERGE.
+        ("MERGE", "BRANCH") if !upper.split_whitespace().any(|w| w == "USING") => Some("MERGE BRANCH"),
+        // Not a read of state like the other `SHOW` forms: a diff reads the
+        // rows of the branch, its base and its parent — databases whose
+        // accounts this session may not hold — and names their keys.
+        ("SHOW", "BRANCH") => Some("SHOW BRANCH DIFF"),
         ("IMPORT", "DATABASE") => Some("IMPORT DATABASE"),
         ("SET", "CONFIG") => Some("SET CONFIG"),
         ("SET", "FILTER") | ("RESET", "FILTER") => Some("SET FILTER"),
@@ -5288,6 +5304,22 @@ async fn describe_resolved(
         }
     }
 
+    #[cfg(feature = "db_branching")]
+    match parse_database_statement(stmt) {
+        Some(Ok(DatabaseStatement::ListBranches)) => {
+            return Ok(Some((
+                branch_merge::BRANCH_COLUMNS.iter().map(|(n, t)| (n.to_string(), t.clone())).collect(),
+                true,
+            )));
+        }
+        Some(Ok(DatabaseStatement::DiffBranch { .. } | DatabaseStatement::MergeBranch { .. })) => {
+            return Ok(Some((
+                branch_merge::DIFF_COLUMNS.iter().map(|(n, t)| (n.to_string(), t.clone())).collect(),
+                true,
+            )));
+        }
+        _ => {}
+    }
     if let Some(Ok(DatabaseStatement::List)) = parse_database_statement(stmt) {
         return Ok(Some((
             [
@@ -5975,7 +6007,188 @@ where
                 Err(e) => fail_statement(state, stream, "55006", &e).await,
             }
         }
+        #[cfg(feature = "db_branching")]
+        branch => handle_branch_statement(state, stream, branch, omit_description).await,
     }
+}
+
+/// `CREATE BRANCH` and the rest (`docs/branching.md`): the catalogue's
+/// side of branching, and the merge's.
+#[cfg(feature = "db_branching")]
+async fn handle_branch_statement<S>(
+    state: &mut SessionState,
+    stream: &mut S,
+    statement: DatabaseStatement,
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let current = state.database_name.clone();
+    let not_branch_code = |e: &str| if e.contains("is not a branch") { "42704" } else { "55006" };
+    match statement {
+        DatabaseStatement::CreateBranch {
+            name,
+            from,
+            options,
+            template,
+        } => {
+            let tag = if template { "CREATE DATABASE" } else { "CREATE BRANCH" };
+            let source = from.unwrap_or_else(|| current.clone());
+            match state.catalog.create_branch(&name, &source, &options).await {
+                Ok((database, meta)) => {
+                    if state.catalog.all().iter().any(|d| d.replication.is_active()) {
+                        crate::core::notice::push(
+                            "WARNING",
+                            "01000",
+                            format!("not replicated: branch \"{name}\" is this node's alone"),
+                        );
+                    }
+                    crate::core::notice::push(
+                        "NOTICE",
+                        "00000",
+                        format!(
+                            "branch \"{name}\" of \"{}\" made by {} at LSN {}{}",
+                            meta.parent,
+                            meta.method,
+                            meta.parent_lsn,
+                            if meta.has_base { ", with a merge base" } else { "" }
+                        ),
+                    );
+                    // Its roles came with its data; the bootstrap account is
+                    // made only where the parent had none.
+                    if let Err(e) = seed_roles(&database, &state.auth).await {
+                        crate::core::notice::push(
+                            "WARNING",
+                            "01000",
+                            format!("branch \"{name}\" was made but its accounts could not be checked: {e}"),
+                        );
+                    }
+                    send_command_complete(stream, tag).await
+                }
+                Err(e) => {
+                    let exists = state.catalog.get(&name).is_some();
+                    let code = if exists {
+                        "42P04"
+                    } else if crate::core::database::catalog::validate_name(&name).is_err() {
+                        "42602"
+                    } else if state.catalog.get(&source).is_none() {
+                        "3D000"
+                    } else if e.contains("not enough space") {
+                        "53100"
+                    } else {
+                        "58000"
+                    };
+                    fail_statement(state, stream, code, &e).await
+                }
+            }
+        }
+        DatabaseStatement::DropBranch { name, if_exists } => {
+            if if_exists && state.catalog.get(&name).is_none() {
+                return send_command_complete(stream, "DROP BRANCH").await;
+            }
+            match state.catalog.drop_branch(&name, &current).await {
+                Ok(()) => send_command_complete(stream, "DROP BRANCH").await,
+                Err(e) => fail_statement(state, stream, not_branch_code(&e), &e).await,
+            }
+        }
+        DatabaseStatement::ResetBranch { name } => match state.catalog.reset_branch(&name, &current).await {
+            Ok(_) => send_command_complete(stream, "RESET BRANCH").await,
+            Err(e) => fail_statement(state, stream, not_branch_code(&e), &e).await,
+        },
+        DatabaseStatement::PromoteBranch { name } => match state.catalog.promote_branch(&name, &current).await {
+            Ok(parent) => {
+                crate::core::notice::push(
+                    "NOTICE",
+                    "00000",
+                    format!(
+                        "\"{name}\" is now \"{parent}\"; the previous \"{parent}\" is kept as branch \"{name}\""
+                    ),
+                );
+                send_command_complete(stream, "PROMOTE BRANCH").await
+            }
+            Err(e) => fail_statement(state, stream, not_branch_code(&e), &e).await,
+        },
+        DatabaseStatement::ListBranches => {
+            let fields: Vec<(String, DbType)> = branch_merge::BRANCH_COLUMNS
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.clone()))
+                .collect();
+            let rfc = |t: u64| crate::core::backup::timeutil::format_rfc3339(t);
+            let rows: Vec<Row> = state
+                .catalog
+                .branches()
+                .iter()
+                .map(|b| {
+                    catalog_row(&[
+                        CatalogCell::Text(b.name.clone()),
+                        CatalogCell::Text(b.meta.parent.clone()),
+                        CatalogCell::Flag(b.parent_exists),
+                        CatalogCell::Text(b.meta.point.clone()),
+                        CatalogCell::Number(b.meta.parent_lsn),
+                        CatalogCell::Text(b.meta.method.clone()),
+                        CatalogCell::Text(rfc(b.meta.created_at)),
+                        CatalogCell::Text(b.meta.merged_at.map(rfc).unwrap_or_default()),
+                        CatalogCell::Number(b.meta.bytes),
+                        CatalogCell::Number(b.base_bytes.unwrap_or(0)),
+                        CatalogCell::Number(b.sessions),
+                    ])
+                })
+                .collect();
+            let tag = format!("SELECT {}", rows.len());
+            send_query_result(stream, Some(&fields), None, &rows, &[], &tag, omit_description).await
+        }
+        DatabaseStatement::DiffBranch { name, into } => {
+            let catalog = state.catalog.clone();
+            match branch_merge::run(&catalog, &name, into.as_deref(), None).await {
+                Ok(diff) => send_diff(stream, &diff, omit_description).await,
+                Err((code, e)) => fail_statement(state, stream, code, &e).await,
+            }
+        }
+        DatabaseStatement::MergeBranch {
+            name,
+            into,
+            policy,
+            allow_drop,
+        } => {
+            let catalog = state.catalog.clone();
+            match branch_merge::run(&catalog, &name, into.as_deref(), Some((policy, allow_drop))).await {
+                Ok(diff) => send_diff(stream, &diff, omit_description).await,
+                Err((code, e)) => fail_statement(state, stream, code, &e).await,
+            }
+        }
+        DatabaseStatement::Create { .. } | DatabaseStatement::Drop { .. } | DatabaseStatement::List => {
+            unreachable!("answered by handle_database_statement")
+        }
+    }
+}
+
+/// The rows of `SHOW BRANCH DIFF` and `MERGE BRANCH`.
+#[cfg(feature = "db_branching")]
+async fn send_diff<S>(stream: &mut S, diff: &[branch_merge::DiffRow], omit_description: bool) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let fields: Vec<(String, DbType)> = branch_merge::DIFF_COLUMNS
+        .iter()
+        .map(|(n, t)| (n.to_string(), t.clone()))
+        .collect();
+    let rows: Vec<Row> = diff
+        .iter()
+        .map(|d| {
+            catalog_row(&[
+                CatalogCell::Text(d.table.clone()),
+                CatalogCell::Text(d.change.to_string()),
+                CatalogCell::Number(d.inserts),
+                CatalogCell::Number(d.updates),
+                CatalogCell::Number(d.deletes),
+                CatalogCell::Number(d.conflicts),
+                CatalogCell::Text(d.detail.clone()),
+            ])
+        })
+        .collect();
+    let tag = format!("SELECT {}", rows.len());
+    send_query_result(stream, Some(&fields), None, &rows, &[], &tag, omit_description).await
 }
 
 /// Runs one statement and records what it cost.
@@ -6212,6 +6425,16 @@ where
                 stream.flush().await?;
             }
         }
+    }
+    // A branch records the schema changes it makes, for a merge to replay
+    // (`branch::note_ddl`). Inside a block, kept until the block commits.
+    #[cfg(feature = "db_branching")]
+    if result.is_ok()
+        && !state.statement_failed
+        && let Some(dir) = &database.location
+        && crate::core::database::catalog::branch::is_recorded_ddl(stmt)
+    {
+        crate::core::database::catalog::branch::note_ddl(dir, state.transaction.as_ref().map(|t| t.id), stmt);
     }
     result
 }
@@ -7381,6 +7604,11 @@ where
                     | "CREATE DATABASE"
                     | "DROP DATABASE"
                     | "IMPORT DATABASE"
+                    | "CREATE BRANCH"
+                    | "DROP BRANCH"
+                    | "RESET BRANCH"
+                    | "PROMOTE BRANCH"
+                    | "MERGE BRANCH"
             )
         });
         if let Some(verb) = verb {
@@ -7435,6 +7663,17 @@ where
         let verb = match &parsed {
             Ok(DatabaseStatement::Create { .. }) => Some("CREATE DATABASE"),
             Ok(DatabaseStatement::Drop { .. }) => Some("DROP DATABASE"),
+            // A branch is a database too; a merge commits on its own.
+            #[cfg(feature = "db_branching")]
+            Ok(DatabaseStatement::CreateBranch { .. }) => Some("CREATE BRANCH"),
+            #[cfg(feature = "db_branching")]
+            Ok(DatabaseStatement::DropBranch { .. }) => Some("DROP BRANCH"),
+            #[cfg(feature = "db_branching")]
+            Ok(DatabaseStatement::ResetBranch { .. }) => Some("RESET BRANCH"),
+            #[cfg(feature = "db_branching")]
+            Ok(DatabaseStatement::PromoteBranch { .. }) => Some("PROMOTE BRANCH"),
+            #[cfg(feature = "db_branching")]
+            Ok(DatabaseStatement::MergeBranch { .. }) => Some("MERGE BRANCH"),
             _ => None,
         };
         if let Some(verb) = verb

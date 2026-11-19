@@ -158,6 +158,15 @@ pub struct Studio {
     /// The benchmark page's own state; see [`crate::views::bench`].
     pub bench: views::bench::Page,
 
+    // --- branches
+    /// Everything the branches page reads, or `None` before the first load.
+    pub branches: Option<BranchesSnapshot>,
+    pub branch_form: BranchForm,
+    /// The branch whose diff is shown, and the diff: `None` while it loads.
+    pub branch_diff: Option<(String, Option<Result<Vec<BranchDiffRow>, String>>)>,
+    pub merge_policy: MergePolicy,
+    pub merge_allow_drop: bool,
+
     // --- replication
     pub replication: Option<ReplicationSnapshot>,
     pub peer_name: String,
@@ -210,6 +219,7 @@ pub enum Tab {
     Activity,
     Bench,
     Backup,
+    Branches,
     Storage,
     Replication,
     Migrate,
@@ -217,7 +227,7 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 13] = [
+    pub const ALL: [Tab; 14] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -233,6 +243,9 @@ impl Tab {
         // one thing again.
         Tab::Bench,
         Tab::Backup,
+        // Next to BACKUP: both are copies of the data, one kept for a bad
+        // day and one to work on.
+        Tab::Branches,
         // Next to BACKUP rather than next to CONFIG: both pages are about where
         // the bytes are and what happens when a disk goes, and an operator
         // opening one usually wants the other.
@@ -253,6 +266,7 @@ impl Tab {
             Tab::Activity => "ACTIVITY",
             Tab::Bench => "BENCH",
             Tab::Backup => "BACKUP",
+            Tab::Branches => "BRANCHES",
             Tab::Storage => "STORAGE",
             Tab::Replication => "REPLICATION",
             Tab::Migrate => "MIGRATE",
@@ -575,6 +589,9 @@ pub enum Refresh {
     Replication,
     Storage,
     Activity,
+    /// A branch was made, reset, swapped, merged or dropped: the branch list,
+    /// and the databases, which branches are.
+    Branches,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +689,22 @@ pub enum Message {
 
     // --- benchmark
     Bench(views::bench::BenchMessage),
+
+    // --- branches
+    ReloadBranches,
+    BranchesLoaded(Box<BranchesSnapshot>),
+    BranchField(views::branches::BranchField, String),
+    BranchPoint(BranchPointKind),
+    BranchKeepBase(bool),
+    CreateBranch,
+    DiffBranch(String),
+    BranchDiffLoaded(String, Result<Vec<BranchDiffRow>, String>),
+    MergePolicyChosen(MergePolicy),
+    MergeAllowDrop(bool),
+    MergeBranch(String),
+    ResetBranch(String),
+    PromoteBranch(String),
+    DropBranch(String),
 
     // --- replication
     ReloadReplication,
@@ -1032,6 +1065,11 @@ impl Studio {
             import_report: Vec::new(),
             activity: None,
             bench: views::bench::Page::default(),
+            branches: None,
+            branch_form: BranchForm::default(),
+            branch_diff: None,
+            merge_policy: MergePolicy::Fail,
+            merge_allow_drop: false,
             replication: None,
             peer_name: String::new(),
             peer_address: String::new(),
@@ -1322,6 +1360,8 @@ impl Studio {
                     // And again: free space is the figure this page exists to
                     // report, and a cached one is worse than useless.
                     Tab::Storage => self.load_storage(),
+                    // A list of databases, which other consoles make and drop.
+                    Tab::Branches => self.load_branches(),
                     _ => Task::none(),
                 }
             }
@@ -1783,6 +1823,127 @@ impl Studio {
             }
 
             // ---- replication --------------------------------------------------
+            Message::ReloadBranches => self.load_branches(),
+            Message::BranchesLoaded(snapshot) => {
+                self.branches = Some(*snapshot);
+                Task::none()
+            }
+            Message::BranchField(field, value) => {
+                let form = &mut self.branch_form;
+                match field {
+                    views::branches::BranchField::Name => form.name = value,
+                    views::branches::BranchField::Source => form.source = value,
+                    views::branches::BranchField::Value => form.value = value,
+                }
+                Task::none()
+            }
+            Message::BranchPoint(kind) => {
+                if self.branch_form.point != kind {
+                    self.branch_form.value.clear();
+                }
+                self.branch_form.point = kind;
+                Task::none()
+            }
+            Message::BranchKeepBase(keep) => {
+                self.branch_form.keep_base = keep;
+                Task::none()
+            }
+            Message::CreateBranch => match dialect::create_branch_sql(&self.branch_form) {
+                Ok(sql) => {
+                    self.branch_form = BranchForm::default();
+                    self.statement(sql, Refresh::Branches)
+                }
+                Err(e) => {
+                    self.status = Status::Failed(e);
+                    Task::none()
+                }
+            },
+            Message::DiffBranch(name) => {
+                self.branch_diff = Some((name.clone(), None));
+                let Some(session) = self.session.clone() else { return Task::none() };
+                let sql = dialect::branch_diff_sql(&name);
+                Task::perform(
+                    async move { session.query(&sql).await.map(|g| dialect::parse_branch_diff(&g)) },
+                    move |result| Message::BranchDiffLoaded(name.clone(), result),
+                )
+            }
+            Message::BranchDiffLoaded(name, result) => {
+                // Only for the branch still shown: a slow answer for another
+                // must not land under this one.
+                if let Some((shown, diff)) = &mut self.branch_diff
+                    && *shown == name
+                {
+                    *diff = Some(result);
+                }
+                Task::none()
+            }
+            Message::MergePolicyChosen(policy) => {
+                self.merge_policy = policy;
+                Task::none()
+            }
+            Message::MergeAllowDrop(allow) => {
+                self.merge_allow_drop = allow;
+                Task::none()
+            }
+            Message::MergeBranch(name) => {
+                let parent = self
+                    .branches
+                    .as_ref()
+                    .and_then(|s| s.branches.iter().find(|b| b.name == name))
+                    .map(|b| b.parent.clone())
+                    .unwrap_or_else(|| "its parent".to_string());
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Merge {name} into {parent}"),
+                    body: format!(
+                        "Everything {name} changed since its base is written to {parent} in one \
+                         transaction: its schema changes first, then its rows. With FAIL, a row \
+                         both sides changed stops the whole merge and nothing is written. Run DIFF \
+                         first to see what this will do."
+                    ),
+                    statement: dialect::merge_branch_sql(&name, self.merge_policy, self.merge_allow_drop),
+                    refresh: Refresh::Branches,
+                });
+                Task::none()
+            }
+            Message::ResetBranch(name) => {
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Reset {name}"),
+                    body: format!(
+                        "{name} is copied from its parent again, as the parent is now. Everything \
+                         written on {name} since it was made is discarded. Nobody may be connected \
+                         to it."
+                    ),
+                    statement: dialect::reset_branch_sql(&name),
+                    refresh: Refresh::Branches,
+                });
+                Task::none()
+            }
+            Message::PromoteBranch(name) => {
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Promote {name}"),
+                    body: format!(
+                        "{name} takes its parent's name, and the parent as it is now is kept as \
+                         branch {name}. Clients connecting by the parent's name get the branch's \
+                         data from then on. Nobody may be connected to either."
+                    ),
+                    statement: dialect::promote_branch_sql(&name),
+                    refresh: Refresh::Branches,
+                });
+                Task::none()
+            }
+            Message::DropBranch(name) => {
+                self.modal = Some(Modal::Confirm {
+                    title: format!("Drop {name}"),
+                    body: format!(
+                        "Branch {name} and its merge base are deleted, with everything written on \
+                         it. Its parent is not touched."
+                    ),
+                    statement: dialect::drop_branch_sql(&name),
+                    refresh: Refresh::Branches,
+                });
+                Task::none()
+            }
+
             Message::ReloadReplication => self.load_replication(),
             Message::ReplicationLoaded(snapshot) => {
                 self.replication = Some(*snapshot);
@@ -2483,6 +2644,11 @@ impl Studio {
                     Refresh::Replication => self.load_replication(),
                     Refresh::Storage => self.load_storage(),
                     Refresh::Activity => self.load_activity(),
+                    Refresh::Branches => {
+                        // A merge changed what a diff would say.
+                        self.branch_diff = None;
+                        Task::batch([self.load_branches(), self.load_databases()])
+                    }
                 }
             }
             Message::StatementFinished(_, sql, elapsed, Err(e)) => {
@@ -2657,6 +2823,29 @@ impl Studio {
     /// check as the backup page — an older build answers an unknown `SHOW x`
     /// with an empty column named after it rather than refusing it, and that
     /// parses into a status result that says nothing while looking like one.
+    /// Reads the branch list. A server without branches refuses `SHOW
+    /// BRANCHES`, which the page says rather than showing an empty list.
+    fn load_branches(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                match session.query(dialect::BRANCHES_SQL).await {
+                    Ok(grid) if grid.column_index("branch").is_some() => Box::new(BranchesSnapshot {
+                        supported: true,
+                        branches: dialect::parse_branches(&grid),
+                    }),
+                    _ => Box::new(BranchesSnapshot::default()),
+                }
+            },
+            Message::BranchesLoaded,
+        )
+    }
+
+    /// The database this console is connected to.
+    pub fn current_database(&self) -> String {
+        self.session.as_ref().map(|s| s.database.clone()).unwrap_or_default()
+    }
+
     fn load_replication(&self) -> Task<Message> {
         let Some(session) = self.session.clone() else { return Task::none() };
         let flavor = session.flavor;

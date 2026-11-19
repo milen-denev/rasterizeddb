@@ -1983,3 +1983,128 @@ impl Metrics {
         self.samples = 0;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Branches
+// ---------------------------------------------------------------------------
+
+/// One row of `SHOW BRANCHES`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub parent: String,
+    /// Whether the parent still exists under its name: a branch outlives it.
+    pub parent_exists: bool,
+    /// `now`, or the past point it was restored to.
+    pub point: String,
+    pub parent_lsn: u64,
+    /// `reflink`, `copy`, `mixed`, `restore` or `promote`.
+    pub method: String,
+    pub created_at: String,
+    /// Empty when it has never been merged.
+    pub merged_at: String,
+    pub size: u64,
+    /// 0 when it keeps no merge base, and so cannot be merged.
+    pub base: u64,
+    pub sessions: u64,
+}
+
+impl BranchInfo {
+    pub fn mergeable(&self) -> bool {
+        self.base > 0 && self.parent_exists
+    }
+}
+
+/// One row of `SHOW BRANCH DIFF` (and of a `MERGE BRANCH`'s answer).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchDiffRow {
+    pub table: String,
+    /// `schema` or `data`.
+    pub change: String,
+    pub inserts: u64,
+    pub updates: u64,
+    pub deletes: u64,
+    pub conflicts: u64,
+    pub detail: String,
+}
+
+/// Everything the branches page reads.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BranchesSnapshot {
+    /// Whether the server understood `SHOW BRANCHES` at all.
+    pub supported: bool,
+    pub branches: Vec<BranchInfo>,
+}
+
+/// Where a new branch is taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BranchPointKind {
+    #[default]
+    Now,
+    Timestamp,
+    Lsn,
+    Snapshot,
+}
+
+impl BranchPointKind {
+    pub const ALL: [BranchPointKind; 4] = [
+        BranchPointKind::Now,
+        BranchPointKind::Timestamp,
+        BranchPointKind::Lsn,
+        BranchPointKind::Snapshot,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BranchPointKind::Now => "NOW",
+            BranchPointKind::Timestamp => "TIMESTAMP",
+            BranchPointKind::Lsn => "LSN",
+            BranchPointKind::Snapshot => "SNAPSHOT",
+        }
+    }
+}
+
+/// What a merge does with a row both sides changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergePolicy {
+    #[default]
+    Fail,
+    BranchWins,
+    ParentWins,
+}
+
+impl MergePolicy {
+    pub const ALL: [MergePolicy; 3] = [MergePolicy::Fail, MergePolicy::BranchWins, MergePolicy::ParentWins];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MergePolicy::Fail => "FAIL",
+            MergePolicy::BranchWins => "BRANCH WINS",
+            MergePolicy::ParentWins => "PARENT WINS",
+        }
+    }
+}
+
+/// The new-branch form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchForm {
+    pub name: String,
+    /// Empty: the database this console is connected to.
+    pub source: String,
+    pub point: BranchPointKind,
+    /// The timestamp, LSN or snapshot id the point needs.
+    pub value: String,
+    pub keep_base: bool,
+}
+
+impl Default for BranchForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            source: String::new(),
+            point: BranchPointKind::Now,
+            value: String::new(),
+            keep_base: true,
+        }
+    }
+}

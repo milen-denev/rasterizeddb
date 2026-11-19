@@ -54,6 +54,11 @@ use rclite::Arc;
 use crate::core::database::DEFAULT_DATABASE_NAME;
 use crate::core::database::Database;
 
+/// Database branches (`CREATE BRANCH`, `MERGE BRANCH`, …): `docs/branching.md`.
+#[cfg(feature = "db_branching")]
+#[path = "branch.rs"]
+pub mod branch;
+
 /// The file every database has, used to tell a database directory apart from
 /// whatever else an operator has left in the root.
 const DATABASE_MARKER_FILE: &str = "db_data_schema.db";
@@ -103,6 +108,9 @@ pub struct DatabaseCatalog {
     /// The database a connection that names none is given, and the one that
     /// lives at the root rather than in a subdirectory.
     default_name: String,
+    /// Each branch's merge base, once opened: `(generation, database)`.
+    #[cfg(feature = "db_branching")]
+    bases: DashMap<String, (u64, Arc<Database>), ahash::RandomState>,
 }
 
 /// Keeps a database attached for as long as a session is using it.
@@ -176,7 +184,11 @@ impl DatabaseCatalog {
             databases,
             root: root.map(str::to_string),
             default_name: default_name.to_string(),
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
         });
+        #[cfg(feature = "db_branching")]
+        catalogue.sweep_branch_leftovers();
 
         info!(
             "Database catalogue open with {}: {}",
@@ -208,6 +220,8 @@ impl DatabaseCatalog {
             databases,
             root: None,
             default_name: name,
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
         })
     }
 
@@ -225,6 +239,8 @@ impl DatabaseCatalog {
             databases: StdArc::new(databases),
             root: None,
             default_name: name,
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
         })
     }
 
@@ -444,6 +460,10 @@ impl DatabaseCatalog {
             }
         }
 
+        // A branch's merge bases go with it.
+        #[cfg(feature = "db_branching")]
+        self.remove_bases(name);
+
         info!("Dropped database \"{}\"", name);
         Ok(())
     }
@@ -548,6 +568,35 @@ pub enum DatabaseStatement {
     /// rest of the introspection surface because the executor is handed one
     /// database and the catalogue is above it.
     List,
+    /// `CREATE BRANCH name [FROM db] [AS OF …] [WITHOUT BASE]`, and
+    /// `CREATE DATABASE name TEMPLATE db` (`from` set, default options).
+    #[cfg(feature = "db_branching")]
+    CreateBranch {
+        name: String,
+        /// `None`: the session's own database.
+        from: Option<String>,
+        options: branch::BranchOptions,
+        /// Written as `CREATE DATABASE … TEMPLATE`, and so answered as one.
+        template: bool,
+    },
+    #[cfg(feature = "db_branching")]
+    DropBranch { name: String, if_exists: bool },
+    #[cfg(feature = "db_branching")]
+    ResetBranch { name: String },
+    #[cfg(feature = "db_branching")]
+    PromoteBranch { name: String },
+    #[cfg(feature = "db_branching")]
+    ListBranches,
+    /// `SHOW BRANCH DIFF name [INTO db]`.
+    #[cfg(feature = "db_branching")]
+    DiffBranch { name: String, into: Option<String> },
+    #[cfg(feature = "db_branching")]
+    MergeBranch {
+        name: String,
+        into: Option<String>,
+        policy: branch::ConflictPolicy,
+        allow_drop: bool,
+    },
 }
 
 /// One database, as `SHOW DATABASES` reports it.
@@ -570,6 +619,18 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
     // it is (uppercasing moves no whitespace), so the statements that are not
     // one, which is every other statement the server runs, skip the copy.
     let noun = trimmed.split_whitespace().nth(1)?;
+    if noun.eq_ignore_ascii_case("BRANCH") || noun.eq_ignore_ascii_case("BRANCHES") {
+        let verb = trimmed.split_whitespace().next()?.to_ascii_uppercase();
+        if !matches!(verb.as_str(), "CREATE" | "DROP" | "RESET" | "PROMOTE" | "MERGE" | "SHOW") {
+            return None;
+        }
+        #[cfg(feature = "db_branching")]
+        return branch::parse(trimmed, &trimmed.to_ascii_uppercase());
+        #[cfg(not(feature = "db_branching"))]
+        return Some(Err(
+            "database branching is not built into this server (feature db_branching)".to_string(),
+        ));
+    }
     if !noun.eq_ignore_ascii_case("DATABASE") && !noun.eq_ignore_ascii_case("DATABASES") {
         return None;
     }
@@ -615,7 +676,34 @@ pub fn parse_database_statement(sql: &str) -> Option<Result<DatabaseStatement, S
             let Some(name) = tokens.get(index).map(|t| fold(t)) else {
                 return Some(Err("CREATE DATABASE names no database".to_string()));
             };
-            // `WITH OWNER`, `TEMPLATE`, `ENCODING` and the rest are silently
+            // `TEMPLATE db` is a copy: a branch of `db`. `template0` and
+            // `template1` are PostgreSQL's empty templates, a plain create.
+            #[cfg(feature = "db_branching")]
+            {
+                let words: Vec<&str> = upper.split_whitespace().collect();
+                if let Some(template) = branch::template_of(
+                    words.get(index + 1..).unwrap_or(&[]),
+                    tokens.get(index + 1..).unwrap_or(&[]),
+                ) {
+                    return Some(match template {
+                        Err(e) => Err(e),
+                        Ok(None) => Ok(DatabaseStatement::Create {
+                            name,
+                            if_not_exists,
+                        }),
+                        Ok(Some(from)) if !if_not_exists => Ok(DatabaseStatement::CreateBranch {
+                            name,
+                            from: Some(from),
+                            options: branch::BranchOptions::default(),
+                            template: true,
+                        }),
+                        Ok(Some(_)) => Err(
+                            "CREATE DATABASE IF NOT EXISTS … TEMPLATE is not supported; use CREATE BRANCH".to_string(),
+                        ),
+                    });
+                }
+            }
+            // `WITH OWNER`, `ENCODING` and the rest are silently
             // accepted by nothing here; saying so beats creating a database
             // that ignores half of what was asked for.
             if tokens.len() > index + 1 {

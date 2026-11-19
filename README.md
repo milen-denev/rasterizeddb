@@ -27,6 +27,7 @@ through a bit-sliced SIMD filter index rather than a B-tree.
 | **JSON** | Documents stored as binary values, with path indexing |
 | **Replication** | Multi-primary, statement-shipping, HLC-ordered, over TLS 1.3 |
 | **Backup** | Snapshot and point-in-time recovery to any S3-compatible store |
+| **Branches** | A database copied live (or from a past point), then reset, promoted, diffed and three-way merged back |
 | **Storage pools** | One database across several directories, with a placement policy and mirrored backups |
 | **Key/value storage** | A database kept in an object store instead of files, per table, alongside file and in-memory tables |
 | **PostgreSQL import** | One-shot migration of a live PostgreSQL database |
@@ -66,6 +67,7 @@ default = ["memory_pool_reuse", "replication_compression", "s3_backup",
 | `mysql_wire` | on | The MySQL / MariaDB client protocol on `--mysql-port` / `--mysql-socket` |
 | `mssql_wire` | on | The SQL Server (TDS) client protocol on `--mssql-port` / `--mssql-socket` |
 | `query_stats` | on | `SHOW QUERIES`, `SHOW QUERY STATS` and `pg_stat_statements` |
+| `db_branching` | on | `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`, `SHOW BRANCH DIFF`, `MERGE BRANCH`; `AS OF` also needs `s3_backup` |
 | `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
 | `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
 | `enable_long_row` | off | Rows above the standard width cap |
@@ -826,6 +828,30 @@ rasterizeddb_core --location /var/lib/rasterized \
 `--restore-replace` renames the existing directory aside rather than deleting
 it. See [docs/s3-backup.md](docs/s3-backup.md) for the design, the full flag
 list, and what it costs in API requests.
+
+### Database branches
+
+A branch is a database made as a consistent copy of another while it keeps
+taking writes, which then diverges from it:
+
+```sql
+CREATE BRANCH dev FROM prod;                 -- or CREATE DATABASE dev TEMPLATE prod
+CREATE BRANCH yesterday FROM prod AS OF TIMESTAMP '2026-11-18 09:00+00';  -- from the S3 backup
+SHOW BRANCHES;
+SHOW BRANCH DIFF dev;                        -- what a merge would do, per table
+MERGE BRANCH dev;                            -- ON CONFLICT FAIL | BRANCH WINS | PARENT WINS, ALLOW DROP
+RESET BRANCH dev;                            -- copy the parent again
+PROMOTE BRANCH dev;                          -- swap it in under the parent's name
+DROP BRANCH dev;
+```
+
+Clients connect to a branch by name. Files are cloned where the filesystem
+shares blocks (btrfs, XFS) and copied in full elsewhere; each branch also keeps
+a merge base, a copy of itself as made, unless created `WITHOUT BASE`. A merge
+replays the schema changes the branch recorded, then compares rows three ways
+and writes them to the parent in one transaction; any conflict fails it whole
+by default. rdb_studio has a BRANCHES tab for all of it. See
+[docs/branching.md](docs/branching.md).
 
 ### Importing a PostgreSQL database
 

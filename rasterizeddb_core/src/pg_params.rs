@@ -468,7 +468,7 @@ fn push_param_literal(out: &mut String, p: &BoundParam) -> Result<(), String> {
 
 /// Text-format parameters arrive already in their SQL rendering; only quoting
 /// needs deciding, and that follows from the declared type.
-fn text_param_literal(oid: i32, text: &str) -> String {
+pub(crate) fn text_param_literal(oid: i32, text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     push_text_param_literal(&mut out, oid, text);
     out

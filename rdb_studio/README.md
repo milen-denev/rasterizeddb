@@ -21,6 +21,7 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 | **Activity** | What the *server* has been running, what each cost, how many rows it had to read to answer, and how much of the time went on relations it had to build first |
 | **Bench** | How fast one statement runs: queries per second and end-to-end latency (mean, median, p90/p95/p99/p99.9, min, max) over N connections of its own, with warm-up, simple or prepared protocol, and runs kept side by side to compare |
 | **Backup** | What is stored in S3, whether archiving is healthy, and restoring from it |
+| **Branches** | Each branch of a database, making one (now or at a past point), and per branch what a merge would do, then merge, reset, promote or drop |
 | **Storage** | Which directories the database writes into, how full each is, and which one holds each table |
 | **Replication** | Whether it is on, who it is talking to, and how far behind they are |
 | **Migrate** | Importing a live PostgreSQL database into this one |

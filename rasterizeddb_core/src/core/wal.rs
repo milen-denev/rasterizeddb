@@ -358,6 +358,18 @@ fn discarded_tail(total: u64, valid: u64) -> u64 {
     total.saturating_sub(valid)
 }
 
+/// Returned by [`Wal::hold_checkpoints`]; checkpoints resume when the last
+/// one is dropped.
+pub struct CheckpointHold {
+    wal: Arc<Wal>,
+}
+
+impl Drop for CheckpointHold {
+    fn drop(&mut self) {
+        self.wal.checkpoint_holds.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The log.
 ///
 /// The atomics here are deliberately **not** cache-line padded, and that is a
@@ -412,6 +424,11 @@ pub struct Wal {
     /// Set while a checkpoint runs, so a burst of writers past the threshold
     /// produces one checkpoint rather than one each.
     checkpointing: AtomicBool,
+    /// Outstanding [`CheckpointHold`]s. While any is held every checkpoint
+    /// declines, so the log keeps every record since the last truncation —
+    /// what a copy taken while writes run replays to become consistent
+    /// (database branching).
+    checkpoint_holds: AtomicU64,
     /// Set when a flush has failed. Durability can no longer be promised, so
     /// every later commit reports an error rather than lying about it.
     poisoned: AtomicBool,
@@ -659,6 +676,7 @@ impl Wal {
             commit_lsn: AtomicU64::new(resume_lsn),
             bytes_since_checkpoint: AtomicU64::new(end),
             checkpointing: AtomicBool::new(false),
+            checkpoint_holds: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             poison_reason: OnceLock::new(),
             checkpoints_declined: AtomicU64::new(0),
@@ -1456,6 +1474,50 @@ impl Wal {
         self.commit_lsn.load(Ordering::Acquire)
     }
 
+    /// Keeps every checkpoint from discarding the log until the returned
+    /// hold is dropped, after waiting out one already running.
+    ///
+    /// For a copy of the database taken while writes run (`CREATE BRANCH`):
+    /// a record logged after the copy read its file is only in the log, and a
+    /// checkpoint would discard it. With the hold, the log at the end of the
+    /// copy holds every record since the last truncation, which is everything
+    /// the copied files may lack. Commits carry on meanwhile; the log only
+    /// grows. Blocking (it may wait for a checkpoint's flushes): call it off
+    /// the async runtime.
+    pub fn hold_checkpoints(self: &Arc<Self>) -> CheckpointHold {
+        self.checkpoint_holds.fetch_add(1, Ordering::SeqCst);
+        while self.checkpointing.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        CheckpointHold { wal: self.clone() }
+    }
+
+    /// Copies the log as it stands into `to`, whole records only, and returns
+    /// the commit sequence it reaches.
+    ///
+    /// The extent is read under the writer lock, so every record before it
+    /// is complete in the file; the copy itself runs with the lock released,
+    /// and anything appended meanwhile is cut off. Only meaningful under a
+    /// [`CheckpointHold`]: a checkpoint replacing the file mid-copy would
+    /// hand back a different log.
+    pub fn copy_log_to(&self, to: &Path) -> io::Result<u64> {
+        let (end, lsn) = {
+            let mut file = self.writer.lock();
+            file.flush()?;
+            (
+                self.write_pos.load(Ordering::Acquire),
+                self.commit_lsn.load(Ordering::Acquire),
+            )
+        };
+        std::fs::copy(&self.path, to)?;
+        let copied = File::options().write(true).open(to)?;
+        if copied.metadata()?.len() > end {
+            copied.set_len(end)?;
+        }
+        copied.sync_data()?;
+        Ok(lsn)
+    }
+
     /// Writes `bufs` at the append point, which the caller holds the writer
     /// lock for, and leaves the file exactly as it was if that fails.
     ///
@@ -2108,7 +2170,11 @@ impl Wal {
         }
 
         // One checkpoint at a time; the rest carry on writing.
-        if self.checkpointing.swap(true, Ordering::AcqRel) {
+        //
+        // `SeqCst`, paired with `hold_checkpoints`: either this sees the
+        // hold and declines, or the hold sees this checkpoint running and
+        // waits for it to end. Never both missing each other.
+        if self.checkpointing.swap(true, Ordering::SeqCst) {
             return Ok(false);
         }
         struct Reset<'a>(&'a AtomicBool);
@@ -2118,6 +2184,9 @@ impl Wal {
             }
         }
         let _reset = Reset(&self.checkpointing);
+        if self.checkpoint_holds.load(Ordering::SeqCst) != 0 {
+            return Ok(false);
+        }
 
         // What the sync pass below will cover: every record issued by now had
         // its data written before it was logged. Read together, under the lock
@@ -5077,6 +5146,46 @@ mod tests {
 
         // With nothing outstanding, a checkpoint now proceeds.
         wal.checkpoint().unwrap();
+        assert_eq!(wal.bytes_since_checkpoint(), 0);
+    }
+
+    /// A hold keeps every checkpoint from discarding the log, and the log a
+    /// held `copy_log_to` hands back replays a copy taken before a write into
+    /// the state after it: what `CREATE BRANCH` rests on.
+    #[test]
+    fn a_checkpoint_hold_keeps_the_log_a_copy_needs() {
+        let dir = temp_dir();
+        let wal_path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("table.db");
+        std::fs::write(&data, b"AAAA").unwrap();
+
+        let wal = Arc::new(Wal::open(&wal_path).unwrap());
+        let id = file_id_for_name("table.db");
+        wal.register_file(id, &data).unwrap();
+
+        let hold = wal.hold_checkpoints();
+        // The copy reads the file before the write lands.
+        let copy_dir = temp_dir();
+        let copied = copy_dir.path().join("table.db");
+        std::fs::copy(&data, &copied).unwrap();
+
+        wal.log_and_commit(id, 0, b"BB").unwrap();
+        std::fs::write(&data, b"BBAA").unwrap();
+        assert!(!wal.checkpoint().unwrap(), "a held log was checkpointed");
+        assert!(wal.bytes_since_checkpoint() > 0);
+
+        let log_copy = copy_dir.path().join("replay.wal");
+        let lsn = wal.copy_log_to(&log_copy).unwrap();
+        assert_eq!(lsn, wal.commit_lsn());
+        drop(hold);
+
+        let target = copied.clone();
+        let stats = Wal::recover(&log_copy, move |f| (f == id).then(|| target.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(read_file(&copied), b"BBAA");
+
+        // Released, the next checkpoint proceeds.
+        assert!(wal.checkpoint().unwrap());
         assert_eq!(wal.bytes_since_checkpoint(), 0);
     }
 

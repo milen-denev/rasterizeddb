@@ -159,6 +159,9 @@ const EXCLUDED: &[&str] = &[
     // resumed one would delete from the store the live server still uses.
     "db_kv_erase.pending",
     "db_kv_erase.pending.tmp",
+    // Branches' merge bases: closed copies of databases the snapshot already
+    // holds, needed only by a merge on this host.
+    ".rdb_branch_bases",
 ];
 
 /// Whether a file is left out of every snapshot: [`EXCLUDED`], and the
@@ -342,6 +345,42 @@ fn relocation_gate() -> &'static RwLock<()> {
 /// [`RELOCATION_GATE`].
 pub async fn relocation_permit() -> tokio::sync::RwLockReadGuard<'static, ()> {
     relocation_gate().read().await
+}
+
+/// The three gates as a snapshot's copy holds them, for any other copy of a
+/// live database's files (`CREATE BRANCH`). Taken in the snapshot's order —
+/// relocation, compaction, deletion — so the two can never deadlock.
+///
+/// The deletion gate is held only until the copy's starting point is fixed
+/// ([`CopyGates::release_deletion`]), for the reason [`DELETION_GATE`] gives;
+/// the other two for the whole copy.
+pub(crate) struct CopyGates {
+    _relocation: tokio::sync::RwLockWriteGuard<'static, ()>,
+    _compaction: tokio::sync::RwLockWriteGuard<'static, ()>,
+    deletion: Option<tokio::sync::RwLockWriteGuard<'static, ()>>,
+}
+
+impl CopyGates {
+    pub(crate) async fn hold() -> CopyGates {
+        let relocation = relocation_gate().write().await;
+        let compaction = compaction_gate().write().await;
+        let deletion = deletion_gate().write().await;
+        CopyGates {
+            _relocation: relocation,
+            _compaction: compaction,
+            deletion: Some(deletion),
+        }
+    }
+
+    pub(crate) fn release_deletion(&mut self) {
+        self.deletion = None;
+    }
+}
+
+/// Whether a file is left out of a copy of a database's files: everything a
+/// snapshot leaves out, and the staged log segments.
+pub(crate) fn excluded_from_copy(name: &str) -> bool {
+    excluded_file(name) || name.ends_with(crate::core::wal::SEGMENT_SUFFIX)
 }
 
 /// The deletion gate as a snapshot holds it while it fixes where its copy

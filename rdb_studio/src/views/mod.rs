@@ -9,6 +9,7 @@
 pub mod activity;
 pub mod backup;
 pub mod bench;
+pub mod branches;
 pub mod config;
 pub mod dashboard;
 pub mod connect;
@@ -165,6 +166,7 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Bench => bench::view(studio),
         Tab::Backup => backup::view(studio),
         Tab::Storage => storage::view(studio),
+        Tab::Branches => branches::view(studio),
         Tab::Replication => replication::view(studio),
         Tab::Migrate => migrate::view(studio),
         Tab::Config => config::view(studio),

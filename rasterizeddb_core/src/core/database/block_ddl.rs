@@ -795,6 +795,10 @@ impl Database {
 
     /// Block `root` committed durably: its intents go, then its copies.
     pub(crate) async fn block_ddl_commit(&self, root: TxId) {
+        #[cfg(feature = "db_branching")]
+        if let Some(dir) = &self.location {
+            crate::core::database::catalog::branch::block_ended(dir, u64::from(root), true);
+        }
         let Some((_, steps)) = self.block_ddl.remove(&root) else { return };
         for step in steps {
             if let Some(path) = &step.intent {
@@ -826,6 +830,10 @@ impl Database {
     /// locks it still holds. A step that fails keeps its intent, so the next
     /// open finishes it.
     pub(crate) async fn block_ddl_abort(&self, root: TxId) {
+        #[cfg(feature = "db_branching")]
+        if let Some(dir) = &self.location {
+            crate::core::database::catalog::branch::block_ended(dir, u64::from(root), false);
+        }
         let Some((_, steps)) = self.block_ddl.remove(&root) else { return };
         let _ = self.undo_steps(root, steps).await;
     }

@@ -306,8 +306,8 @@ impl Drop for NativeSession {
 
 /// Where the statement's PostgreSQL messages go, to be read back.
 #[derive(Default)]
-struct NativeSink {
-    out: Vec<u8>,
+pub(super) struct NativeSink {
+    pub(super) out: Vec<u8>,
 }
 
 impl AsyncRead for NativeSink {
@@ -347,13 +347,15 @@ impl AsyncWrite for NativeSink {
 }
 
 /// What one statement's PostgreSQL messages said.
-#[derive(Default)]
-struct Said {
-    error: Option<(String, String)>,
-    tag: Option<String>,
+#[derive(Default, Debug)]
+pub(super) struct Said {
+    pub(super) error: Option<(String, String)>,
+    pub(super) tag: Option<String>,
     /// Each column's type OID, when the statement described rows.
-    columns: Option<Vec<i32>>,
-    rows: Vec<Vec<Option<Vec<u8>>>>,
+    pub(super) columns: Option<Vec<i32>>,
+    /// Each column's name, alongside `columns`.
+    pub(super) names: Vec<String>,
+    pub(super) rows: Vec<Vec<Option<Vec<u8>>>>,
 }
 
 fn cstring(bytes: &[u8], at: &mut usize) -> Option<String> {
@@ -377,7 +379,7 @@ fn be_i32(bytes: &[u8], at: &mut usize) -> Option<i32> {
 
 /// Reads the messages back. `None` when they do not parse, which is this
 /// module's bug, not the client's.
-fn read_messages(out: &[u8]) -> Option<Said> {
+pub(super) fn read_messages(out: &[u8]) -> Option<Said> {
     let mut said = Said::default();
     let mut at = 0usize;
     while at < out.len() {
@@ -409,8 +411,9 @@ fn read_messages(out: &[u8]) -> Option<Said> {
                 let mut p = 0usize;
                 let count = be_i16(body, &mut p)?;
                 let mut columns = Vec::with_capacity(count.max(0) as usize);
+                said.names.clear();
                 for _ in 0..count {
-                    cstring(body, &mut p)?;
+                    said.names.push(cstring(body, &mut p)?);
                     be_i32(body, &mut p)?; // table
                     be_i16(body, &mut p)?; // attribute
                     columns.push(be_i32(body, &mut p)?);

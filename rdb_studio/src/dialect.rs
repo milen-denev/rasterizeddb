@@ -33,7 +33,7 @@
 //! come back empty rather than zero.
 
 use crate::model::{
-    BackupEntry, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner,
+    BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, MergePolicy, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner,
     PartitionInfo, PeerStatus, Relationship, RestoreReport, RestoreTarget, Stat, StatementRecord,
     StatementShape, StorageLocation, TableInfo, TablePlacement,
 };
@@ -2725,5 +2725,174 @@ mod tests {
             page_sql("events", None, Some(("at", true)), 50, 0),
             "SELECT * FROM \"events\" ORDER BY \"at\" DESC LIMIT 50 OFFSET 0"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Branches (RasterizedDB)
+// ---------------------------------------------------------------------------
+
+pub const BRANCHES_SQL: &str = "SHOW BRANCHES";
+
+/// `CREATE BRANCH …` from the form, or why it cannot be sent yet.
+pub fn create_branch_sql(form: &BranchForm) -> Result<String, String> {
+    let name = form.name.trim();
+    if name.is_empty() {
+        return Err("a branch needs a name".to_string());
+    }
+    let mut sql = format!("CREATE BRANCH {}", quote_ident(name));
+    if !form.source.trim().is_empty() {
+        sql.push_str(&format!(" FROM {}", quote_ident(form.source.trim())));
+    }
+    let value = form.value.trim();
+    match form.point {
+        BranchPointKind::Now => {}
+        BranchPointKind::Timestamp => {
+            if value.is_empty() {
+                return Err("a timestamp, as in 2026-11-19 10:00:00+00".to_string());
+            }
+            sql.push_str(&format!(" AS OF TIMESTAMP {}", quote_literal(value)));
+        }
+        BranchPointKind::Lsn => {
+            let lsn: u64 = value
+                .parse()
+                .map_err(|_| "an LSN is a whole number, as SHOW BACKUPS reports it".to_string())?;
+            sql.push_str(&format!(" AS OF LSN {lsn}"));
+        }
+        BranchPointKind::Snapshot => {
+            if value.is_empty() {
+                return Err("a snapshot id, as SHOW BACKUPS lists it".to_string());
+            }
+            sql.push_str(&format!(" AS OF SNAPSHOT {}", quote_literal(value)));
+        }
+    }
+    if !form.keep_base {
+        sql.push_str(" WITHOUT BASE");
+    }
+    Ok(sql)
+}
+
+pub fn branch_diff_sql(name: &str) -> String {
+    format!("SHOW BRANCH DIFF {}", quote_ident(name))
+}
+
+pub fn reset_branch_sql(name: &str) -> String {
+    format!("RESET BRANCH {}", quote_ident(name))
+}
+
+pub fn promote_branch_sql(name: &str) -> String {
+    format!("PROMOTE BRANCH {}", quote_ident(name))
+}
+
+pub fn drop_branch_sql(name: &str) -> String {
+    format!("DROP BRANCH {}", quote_ident(name))
+}
+
+pub fn merge_branch_sql(name: &str, policy: MergePolicy, allow_drop: bool) -> String {
+    let mut sql = format!("MERGE BRANCH {}", quote_ident(name));
+    match policy {
+        MergePolicy::Fail => {}
+        MergePolicy::BranchWins => sql.push_str(" ON CONFLICT BRANCH WINS"),
+        MergePolicy::ParentWins => sql.push_str(" ON CONFLICT PARENT WINS"),
+    }
+    if allow_drop {
+        sql.push_str(" ALLOW DROP");
+    }
+    sql
+}
+
+pub fn parse_branches(grid: &Grid) -> Vec<BranchInfo> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let text = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            let number = |c: &str| grid.number(i, c).unwrap_or(0);
+            BranchInfo {
+                name: text("branch"),
+                parent: text("parent"),
+                parent_exists: matches!(grid.value(i, "parent_exists"), Some("t" | "true" | "1")),
+                point: text("point"),
+                parent_lsn: number("parent_lsn"),
+                method: text("method"),
+                created_at: text("created_at"),
+                merged_at: text("merged_at"),
+                size: number("size_bytes"),
+                base: number("base_bytes"),
+                sessions: number("sessions"),
+            }
+        })
+        .collect()
+}
+
+pub fn parse_branch_diff(grid: &Grid) -> Vec<BranchDiffRow> {
+    (0..grid.rows.len())
+        .map(|i| {
+            let text = |c: &str| grid.value(i, c).unwrap_or("").to_string();
+            let number = |c: &str| grid.number(i, c).unwrap_or(0);
+            BranchDiffRow {
+                table: text("table_name"),
+                change: text("change"),
+                inserts: number("inserts"),
+                updates: number("updates"),
+                deletes: number("deletes"),
+                conflicts: number("conflicts"),
+                detail: text("detail"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod branch_sql_tests {
+    use super::*;
+
+    #[test]
+    fn the_form_writes_the_statement_the_server_parses() {
+        let mut form = BranchForm { name: "dev".into(), ..BranchForm::default() };
+        assert_eq!(create_branch_sql(&form).unwrap(), "CREATE BRANCH \"dev\"");
+        form.source = "prod".into();
+        form.keep_base = false;
+        assert_eq!(create_branch_sql(&form).unwrap(), "CREATE BRANCH \"dev\" FROM \"prod\" WITHOUT BASE");
+        form.point = BranchPointKind::Timestamp;
+        assert!(create_branch_sql(&form).is_err());
+        form.value = "2026-11-19 10:00:00+00".into();
+        assert_eq!(
+            create_branch_sql(&form).unwrap(),
+            "CREATE BRANCH \"dev\" FROM \"prod\" AS OF TIMESTAMP '2026-11-19 10:00:00+00' WITHOUT BASE"
+        );
+        form.point = BranchPointKind::Lsn;
+        assert!(create_branch_sql(&form).is_err());
+        form.value = "42".into();
+        assert!(create_branch_sql(&form).unwrap().contains("AS OF LSN 42"));
+        assert!(create_branch_sql(&BranchForm::default()).is_err());
+    }
+
+    #[test]
+    fn merge_options_are_spelled_out() {
+        assert_eq!(merge_branch_sql("dev", MergePolicy::Fail, false), "MERGE BRANCH \"dev\"");
+        assert_eq!(
+            merge_branch_sql("dev", MergePolicy::BranchWins, true),
+            "MERGE BRANCH \"dev\" ON CONFLICT BRANCH WINS ALLOW DROP"
+        );
+    }
+
+    #[test]
+    fn rows_parse_by_column_name() {
+        let grid = Grid {
+            columns: ["branch", "parent", "parent_exists", "point", "parent_lsn", "method", "created_at", "merged_at", "size_bytes", "base_bytes", "sessions"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            rows: vec![
+                ["dev", "prod", "t", "now", "7", "copy", "2026-11-19T10:00:00Z", "", "1024", "1024", "2"]
+                    .iter()
+                    .map(|s| Some(s.to_string()))
+                    .collect(),
+            ],
+            tag: "SELECT 1".into(),
+        };
+        let parsed = parse_branches(&grid);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].parent_exists && parsed[0].mergeable());
+        assert_eq!((parsed[0].parent_lsn, parsed[0].sessions), (7, 2));
     }
 }
