@@ -3780,7 +3780,7 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
 /// be RETURNED, so each row's are put back by position: the engine returns
 /// an INSERT's rows in the order of its VALUES.
 /// `CREATE | DROP | ALTER FULLTEXT CATALOG | INDEX …` ([`super::fulltext`]).
-fn fulltext_ddl(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
+fn fulltext_ddl(tokens: Vec<Token>, _cx: &mut Cx) -> Result<Forward, TsqlError> {
     let verb = tokens[0].upper().unwrap_or_default();
     let nothing = || Forward {
         statements: vec![String::new()],

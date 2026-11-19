@@ -98,8 +98,10 @@ const FIELDS_HOLDING_A_TOKEN: [(&str, &str); 2] = [("FamilyShard", "held"), ("Re
 const GUARDED: [&str; 4] = ["LiveIndex", "GinIndex", "TableIndexes", "TableFilters"];
 
 /// Fns that build a new structure, which nothing else can reach yet.
-const CONSTRUCTORS: [(&str, &str); 16] = [
+const CONSTRUCTORS: [(&str, &str); 17] = [
     ("GinIndex", "new_in"),
+    // A full-text index (`gin (to_tsvector(…))`), at construction.
+    ("GinIndex", "new_text_in"),
     ("GinIndex", "new_paged"),
     ("GinIndex", "build"),
     ("LiveIndex", "new"),

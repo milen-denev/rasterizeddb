@@ -3760,8 +3760,15 @@ mod tests {
              CONSTRAINT users__users_email_unique UNIQUE (email)); \
              CREATE INDEX IF NOT EXISTS users__idx_created ON users (created_at)"
         );
+        // A FULLTEXT key is the engine's full-text index (`fulltext`); a
+        // parser plugin is refused.
         assert_eq!(
-            err(&e, "CREATE TABLE t (a INT, FULLTEXT KEY f (a))").code,
+            tr(&e, "CREATE TABLE t (a TEXT, FULLTEXT KEY f (a))"),
+            "CREATE TABLE t (a text); \
+             CREATE INDEX t__f ON t USING gin (to_tsvector('simple', coalesce(a, '')))"
+        );
+        assert_eq!(
+            err(&e, "CREATE TABLE t (a TEXT, FULLTEXT KEY f (a) WITH PARSER ngram)").code,
             1235
         );
         // ON UPDATE CURRENT_TIMESTAMP: the column, and its record.
