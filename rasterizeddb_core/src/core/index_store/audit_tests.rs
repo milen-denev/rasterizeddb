@@ -652,6 +652,13 @@ async fn checks_under_concurrent_writes_never_report_a_mismatch() {
     let t = table(&db, "cw");
     settled(&t).await;
     assert_eq!(t.index_origin(), Origin::Loaded);
+    // The load's own audit (rate 1) first: while it runs it holds the
+    // table's one check, so every check below would be "another check of
+    // this table is running", and under a loaded suite it ran through all
+    // thirty seconds of writes (seen in disk residency).
+    let _after_load = outcome_after(d, 0).await;
+    // The checks below are counted after it.
+    let seen = hooks::outcomes(d).len();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let checker = {
         let (db, stop) = (db.clone(), stop.clone());
@@ -671,7 +678,7 @@ async fn checks_under_concurrent_writes_never_report_a_mismatch() {
     // seconds is (seen as "no check completed" with every check abandoned,
     // never as a mismatch, known-flaky-tests). The mismatch assertion is the
     // point; the wait only keeps the liveness one from depending on load.
-    let clean = || hooks::outcomes(d).iter().any(|(_, o)| matches!(o, Outcome::Clean(_)));
+    let clean = || hooks::outcomes(d)[seen..].iter().any(|(_, o)| matches!(o, Outcome::Clean(_)));
     while started.elapsed() < Duration::from_secs(4) || (!clean() && started.elapsed() < Duration::from_secs(30)) {
         burst += 1;
         insert(&db, "cw", &mut model, next..next + 40).await;
@@ -695,7 +702,7 @@ async fn checks_under_concurrent_writes_never_report_a_mismatch() {
     }
     stop.store(true, AtomicOrdering::Relaxed);
     checker.await.unwrap();
-    let outcomes = hooks::outcomes(d);
+    let outcomes = hooks::outcomes(d).split_off(seen);
     let count = |f: fn(&Outcome) -> bool| outcomes.iter().filter(|(_, o)| f(o)).count();
     let mismatched: Vec<_> = outcomes.iter().filter(|(_, o)| matches!(o, Outcome::Mismatch { .. })).collect();
     assert!(mismatched.is_empty(), "a check reported a mismatch under concurrent writes: {mismatched:?}");
