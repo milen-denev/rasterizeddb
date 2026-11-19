@@ -34,6 +34,7 @@
 //! | Enter | a new line at the same indentation, one deeper after `(` |
 //! | Tab / Shift+Tab | indent / unindent — the selected lines, if any |
 //! | Ctrl+/ | comments the lines out, or back in |
+//! | Ctrl+Space | completes the table, column or keyword being typed |
 //! | Ctrl+Shift+F | formats |
 //! | Ctrl+S | saves to a `.sql` file |
 
@@ -41,10 +42,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use iced::widget::text_editor::{Action, Binding, Edit};
-use iced::widget::{Space, button, column, container, row, rule, scrollable, text, text_editor};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, rule, scrollable, text, text_editor,
+};
 use iced::{Center, Element, Fill, Length};
 
-use crate::app::{Message, Studio, Template};
+use crate::app::{Message, RowLimit, Studio, Template};
 use crate::export::Format;
 use crate::model::{Flavor, Outcome, age, duration};
 use crate::sqlhl;
@@ -78,6 +81,9 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
         container(editor).width(Fill),
     ]
     .spacing(8);
+    if !studio.completions.is_empty() {
+        panel = panel.push(completion_list(studio));
+    }
     if !diagnostics.is_empty() {
         panel = panel.push(problems(&diagnostics));
     }
@@ -131,6 +137,12 @@ fn key_binding(press: text_editor::KeyPress) -> Option<Binding<Message>> {
     // Running works wherever the focus is on this screen. A bare Enter has to
     // stay a newline: this is an editor for statements that span lines, and a
     // console that ran on Enter would fire half a statement every time.
+    if let Key::Named(Named::Space) = press.key.as_ref()
+        && command
+        && matches!(press.status, text_editor::Status::Focused { .. })
+    {
+        return Some(Binding::Custom(Message::Complete));
+    }
     if let Key::Named(Named::Enter) = press.key.as_ref() {
         if command && shift {
             return Some(Binding::Custom(Message::RunStatement));
@@ -161,6 +173,28 @@ fn key_binding(press: text_editor::KeyPress) -> Option<Binding<Message>> {
         }
         _ => Binding::from_key_press(press),
     }
+}
+
+/// What Ctrl+Space found for the word before the cursor, one click each.
+fn completion_list(studio: &Studio) -> Element<'_, Message> {
+    const SHOWN: usize = 40;
+    let mut list = row![text("complete").size(10).color(theme::TEXT_FAINT)]
+        .spacing(4)
+        .align_y(Center);
+    for choice in studio.completions.iter().take(SHOWN) {
+        list = list.push(small_button(choice.clone(), Some(Message::ApplyCompletion(choice.clone()))));
+    }
+    if studio.completions.len() > SHOWN {
+        list = list.push(
+            text(format!("+{} more — type more of the name", studio.completions.len() - SHOWN))
+                .size(10)
+                .color(theme::TEXT_FAINT),
+        );
+    }
+    scrollable(list)
+        .direction(scrollable::Direction::Horizontal(scrollable::Scrollbar::default()))
+        .style(theme::scroller)
+        .into()
 }
 
 /// What the linter found, one clickable line each.
@@ -206,6 +240,9 @@ fn problems<'a>(diagnostics: &[Diagnostic]) -> Element<'a, Message> {
 
 fn toolbar(studio: &Studio) -> Element<'_, Message> {
     let has_table = studio.selected_table.is_some();
+    // One run at a time: the editor's connection takes one, and a second
+    // would have no way to be cancelled.
+    let idle = studio.query_cancel.is_none();
 
     let mut templates = row![
         text("insert a statement for")
@@ -229,13 +266,22 @@ fn toolbar(studio: &Studio) -> Element<'_, Message> {
     container(
         column![
             row![
-                super::primary_button("RUN   CTRL+ENTER", Some(Message::RunQuery)),
-                small_button("RUN STATEMENT", Some(Message::RunStatement)),
-                small_button("RUN SELECTION", Some(Message::RunSelection)),
+                super::primary_button("RUN   CTRL+ENTER", idle.then_some(Message::RunQuery)),
+                small_button("RUN STATEMENT", idle.then_some(Message::RunStatement)),
+                small_button("RUN SELECTION", idle.then_some(Message::RunSelection)),
+                small_button(
+                    if studio.cancel_sent { "CANCELLING…" } else { "CANCEL" },
+                    (!idle && !studio.cancel_sent).then_some(Message::CancelQuery),
+                ),
                 small_button("FORMAT", Some(Message::FormatSql)),
                 small_button("COMMENT", Some(Message::ToggleComment)),
                 small_button("CLEAR", Some(Message::ClearEditor)),
+                transaction_pill(studio),
                 Space::new().width(Fill),
+                text("keep").size(10).color(theme::TEXT_FAINT),
+                pick_list(&RowLimit::ALL[..], Some(studio.row_limit), Message::SetRowLimit)
+                    .text_size(11)
+                    .padding([2, 6]),
                 small_button(
                     if studio.editor_tall { "SHORTER" } else { "TALLER" },
                     Some(Message::ToggleEditorSize),
@@ -253,6 +299,21 @@ fn toolbar(studio: &Studio) -> Element<'_, Message> {
     .width(Fill)
     .style(theme::header)
     .into()
+}
+
+/// Where the editor's own transaction stands, when it is in one: a block left
+/// open is easy to forget, and everything run after it is inside it.
+fn transaction_pill<'a>(studio: &Studio) -> Element<'a, Message> {
+    use rasterizeddb_client::TransactionStatus;
+    let (label, colour) = match studio.editor_transaction {
+        Some(TransactionStatus::InBlock) => ("IN TRANSACTION", theme::WARN),
+        Some(TransactionStatus::Failed) => ("TRANSACTION FAILED — ROLLBACK", theme::BAD),
+        _ => return Space::new().width(0).into(),
+    };
+    container(text(label).size(10).font(theme::MONO).color(colour))
+        .padding([2, 6])
+        .style(theme::panel)
+        .into()
 }
 
 fn footer<'a>(studio: &'a Studio, diagnostics: &[Diagnostic]) -> Element<'a, Message> {
@@ -286,7 +347,7 @@ fn footer<'a>(studio: &'a Studio, diagnostics: &[Diagnostic]) -> Element<'a, Mes
                 .color(if errors > 0 { theme::BAD } else { theme::WARN })
         },
         Space::new().width(Fill),
-        text("Ctrl+/ comment · Tab indent · Ctrl+Shift+F format")
+        text("Ctrl+Space complete · Ctrl+/ comment · Tab indent · Ctrl+Shift+F format")
             .size(10)
             .color(theme::TEXT_FAINT),
         match studio.last_elapsed {
@@ -306,7 +367,40 @@ fn footer<'a>(studio: &'a Studio, diagnostics: &[Diagnostic]) -> Element<'a, Mes
 // Results
 // ---------------------------------------------------------------------------
 
+/// What the last run's statements raised as notices, if any did.
+fn notices(studio: &Studio) -> Option<Element<'_, Message>> {
+    if studio.query_notices.is_empty() {
+        return None;
+    }
+    let mut list = column![].spacing(2);
+    for notice in &studio.query_notices {
+        list = list.push(
+            row![
+                text("NOTICE").size(10).font(theme::MONO).color(theme::WARN),
+                text(notice.clone()).size(11).font(theme::MONO).color(theme::TEXT),
+            ]
+            .spacing(8),
+        );
+    }
+    Some(
+        container(scrollable(list).style(theme::scroller))
+            .max_height(110.0)
+            .width(Fill)
+            .padding(6)
+            .style(theme::panel)
+            .into(),
+    )
+}
+
 fn results(studio: &Studio) -> Element<'_, Message> {
+    let body = results_body(studio);
+    match notices(studio) {
+        Some(notices) => column![notices, body].spacing(8).into(),
+        None => body,
+    }
+}
+
+fn results_body(studio: &Studio) -> Element<'_, Message> {
     if let Some(error) = &studio.query_error {
         let mut panel = column![text(error.clone()).size(12).font(theme::MONO)].spacing(4);
         if let Some(elapsed) = studio.last_elapsed {
@@ -409,12 +503,23 @@ fn results(studio: &Studio) -> Element<'_, Message> {
                     None,
                 );
 
+                let heading = match grid.total {
+                    // The row limit kept the first ones; saying only "1,000
+                    // rows" would read as the whole answer.
+                    Some(total) => text(format!(
+                        "statement {} — the first {} of {} rows (the row limit); copies and \
+                         exports hold these only",
+                        index + 1,
+                        crate::model::count(grid.rows.len() as u64),
+                        crate::model::count(total),
+                    ))
+                    .color(theme::WARN),
+                    None => text(format!("statement {} — {}", index + 1, grid.tag))
+                        .color(theme::TEXT_FAINT),
+                };
                 column![
                     row![
-                        text(format!("statement {} — {}", index + 1, grid.tag))
-                            .size(11)
-                            .font(theme::MONO)
-                            .color(theme::TEXT_FAINT),
+                        heading.size(11).font(theme::MONO),
                         Space::new().width(Fill),
                         copies,
                     ]

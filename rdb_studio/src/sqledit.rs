@@ -138,6 +138,79 @@ pub fn place_cursor(content: &mut Content, line: usize, column: usize) {
     });
 }
 
+/// The name being typed: the word characters right before the cursor.
+pub fn word_before_cursor(content: &Content) -> String {
+    let cursor = content.cursor().position;
+    let line = line_text(content, cursor.line);
+    let before = &line[..floor_boundary(&line, cursor.column)];
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+        .last()
+        .map_or(before.len(), |(i, _)| i);
+    before[start..].to_string()
+}
+
+/// What `prefix` may complete to: the names (tables, columns) that start
+/// with it, then the keywords, each once, ignoring ASCII case. A keyword
+/// takes the case the prefix was typed in.
+pub fn completions(prefix: &str, names: &[String], keywords: &[&str]) -> Vec<String> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let lower = prefix.to_lowercase();
+    let starts = |candidate: &str| {
+        candidate.to_lowercase().starts_with(&lower) && candidate.len() > prefix.len()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut names: Vec<&String> = names.iter().filter(|n| starts(n)).collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    for name in names {
+        if seen.insert(name.to_lowercase()) {
+            out.push(name.clone());
+        }
+    }
+    let lower_case = prefix.chars().all(|c| !c.is_uppercase());
+    for keyword in keywords.iter().filter(|k| starts(k)) {
+        if seen.insert(keyword.to_lowercase()) {
+            out.push(if lower_case { keyword.to_lowercase() } else { keyword.to_string() });
+        }
+    }
+    out
+}
+
+/// What every completion of `prefix` has in common, past the prefix: what a
+/// completion with several candidates can still type.
+pub fn common_completion(prefix: &str, candidates: &[String]) -> Option<String> {
+    let first = candidates.first()?;
+    let mut end = first.len();
+    for other in &candidates[1..] {
+        end = first
+            .char_indices()
+            .zip(other.chars())
+            .find(|((_, a), b)| !a.eq_ignore_ascii_case(b))
+            .map_or(end.min(other.len()), |((i, _), _)| i)
+            .min(end);
+    }
+    (end > prefix.len()).then(|| first[..end].to_string())
+}
+
+/// Replaces the name before the cursor with `choice`.
+pub fn complete(content: &mut Content, choice: &str) {
+    let prefix = word_before_cursor(content);
+    let cursor = content.cursor().position;
+    if content.cursor().selection.is_some() {
+        content.perform(Action::Move(Motion::Right));
+    }
+    content.move_to(Cursor {
+        position: cursor,
+        selection: Some(Position { line: cursor.line, column: cursor.column - prefix.len() }),
+    });
+    content.perform(Action::Edit(Edit::Paste(Arc::new(choice.to_string()))));
+}
+
 fn line_text(content: &Content, line: usize) -> String {
     content.line(line).map(|line| line.text.into_owned()).unwrap_or_default()
 }
@@ -225,5 +298,41 @@ mod tests {
         place_cursor(&mut content, 9, 9);
         assert_eq!(content.cursor().position, Position { line: 1, column: 1 });
         assert_eq!(content.cursor().selection, None);
+    }
+
+    #[test]
+    fn a_word_is_completed_from_names_then_keywords() {
+        let names = vec!["seed_users".to_string(), "Seed_Orders".to_string(), "email".to_string()];
+        assert_eq!(
+            completions("se", &names, &["SELECT", "SERIAL", "SET"]),
+            ["Seed_Orders", "seed_users", "select", "serial", "set"]
+        );
+        assert_eq!(completions("SEL", &names, &["SELECT"]), ["SELECT"]);
+        // A word already whole is not offered again.
+        assert!(completions("email", &names, &[]).is_empty());
+        assert!(completions("", &names, &["SELECT"]).is_empty());
+        assert_eq!(
+            common_completion("se", &["seed_users".into(), "Seed_Orders".into()]),
+            Some("seed_".to_string())
+        );
+        assert_eq!(common_completion("sel", &["select".into()]), Some("select".to_string()));
+        assert_eq!(common_completion("se", &["select".into(), "set".into()]), None);
+    }
+
+    #[test]
+    fn a_completion_replaces_the_word_before_the_cursor() {
+        let mut content = Content::with_text("SELECT * FROM se WHERE");
+        at(&mut content, 0, 16);
+        assert_eq!(word_before_cursor(&content), "se");
+        complete(&mut content, "seed_users");
+        assert_eq!(content.text(), "SELECT * FROM seed_users WHERE");
+        assert_eq!(content.cursor().position, Position { line: 0, column: 24 });
+
+        let mut content = Content::with_text("x.é");
+        at(&mut content, 0, 4);
+        assert_eq!(word_before_cursor(&content), "é");
+        let mut content = Content::with_text("a + ");
+        at(&mut content, 0, 4);
+        assert_eq!(word_before_cursor(&content), "");
     }
 }

@@ -14,10 +14,12 @@ pub mod config;
 pub mod dashboard;
 pub mod connect;
 pub mod data;
+pub mod keys;
 pub mod overview;
 pub mod migrate;
 pub mod query;
 pub mod replication;
+pub mod roles;
 pub mod schema;
 pub mod storage;
 pub mod tables;
@@ -80,8 +82,19 @@ fn titlebar(studio: &Studio) -> Element<'_, Message> {
                 text("·").size(13).color(theme::TEXT_FAINT),
                 text(&session.server).size(13).font(theme::MONO).color(theme::TEXT_DIM),
                 pill(
-                    if session.encrypted { "TLS" } else { "PLAIN" },
-                    if session.encrypted { theme::OK } else { theme::WARN },
+                    match session.transport {
+                        crate::model::Transport::Native => "NATIVE",
+                        crate::model::Transport::Wire => "PG WIRE",
+                    },
+                    theme::TEXT_DIM,
+                ),
+                pill(
+                    session.link(),
+                    if session.link() == "PLAIN" {
+                        theme::WARN
+                    } else {
+                        theme::OK
+                    },
                 ),
             ]
             .spacing(10)
@@ -169,6 +182,8 @@ fn pane(studio: &Studio) -> Element<'_, Message> {
         Tab::Branches => branches::view(studio),
         Tab::Replication => replication::view(studio),
         Tab::Migrate => migrate::view(studio),
+        Tab::Keys => keys::view(studio),
+        Tab::Roles => roles::view(studio),
         Tab::Config => config::view(studio),
     };
     container(inner).width(Fill).height(Fill).padding(12).into()
@@ -351,6 +366,53 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
         // names a point in the past, to the commits after it — so it gets the
         // destructive button, and the body it was built with rather than a
         // generic "are you sure".
+        Modal::ConfirmCsv { table, file, rows, columns, scripts } => column![
+            dialog_title(format!("Import into {}", table)),
+            text(format!(
+                "{} row{} from {}\ninto the column{} {}.",
+                crate::model::count(*rows as u64),
+                if *rows == 1 { "" } else { "s" },
+                file,
+                if columns.len() == 1 { "" } else { "s" },
+                columns.join(", ")
+            ))
+            .size(12)
+            .font(theme::MONO),
+            text(if scripts.len() == 1 {
+                "One request: the file goes in whole, or not at all.".to_string()
+            } else {
+                format!(
+                    "{} requests of up to {} rows; each goes in whole or not at all, and a \
+                     refused one stops the import with the rows before it kept.",
+                    scripts.len(),
+                    crate::model::count(
+                        (crate::import::ROWS_PER_INSERT * crate::import::INSERTS_PER_SCRIPT) as u64
+                    )
+                )
+            })
+            .size(11)
+            .color(theme::TEXT_DIM),
+            text("An empty unquoted field is NULL; \"\" is the empty string.")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            Space::new().height(4),
+            row![
+                Space::new().width(Fill),
+                button(text("CANCEL").size(12).font(theme::MONO))
+                    .padding([7, 14])
+                    .style(theme::secondary)
+                    .on_press(Message::ModalCancel),
+                button(text("IMPORT").size(12).font(theme::MONO))
+                    .padding([7, 14])
+                    .style(theme::primary)
+                    .on_press(Message::ModalSubmit),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .width(600)
+        .into(),
+
         Modal::ConfirmImport { body, .. } => column![
             dialog_title("Import database"),
             container(text(body.clone()).size(12).font(theme::MONO))
@@ -442,6 +504,85 @@ fn modal_view<'a>(modal: &'a Modal, studio: &'a Studio) -> Element<'a, Message> 
                 .color(theme::TEXT_FAINT),
             error_line(error),
             dialog_actions("ADD COLUMN", pending),
+        ]
+        .spacing(12)
+        .width(560)
+        .into(),
+
+        Modal::CreateRole { name, password, login, superuser, error } => column![
+            dialog_title("New role"),
+            field("Name", name, |v| Message::ModalField(crate::app::ModalField::Name, v)),
+            secret_field("Password", password, |v| Message::ModalField(
+                crate::app::ModalField::Password,
+                v
+            )),
+            row![
+                toggle("Can log in", *login, |v| Message::ModalToggle(
+                    crate::app::ModalField::Login,
+                    v
+                )),
+                toggle("Superuser", *superuser, |v| Message::ModalToggle(
+                    crate::app::ModalField::Superuser,
+                    v
+                )),
+            ]
+            .spacing(16),
+            text("The password is sent once, kept by the server as a SCRAM verifier, and left \
+                  out of this console's history.")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("CREATE ROLE", pending),
+        ]
+        .spacing(12)
+        .width(480)
+        .into(),
+
+        Modal::RolePassword { role, password, error } => column![
+            dialog_title(format!("Password for {}", role)),
+            secret_field("New password", password, |v| Message::ModalField(
+                crate::app::ModalField::Password,
+                v
+            )),
+            text("Connections already open keep working; the next login needs the new one.")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("SET PASSWORD", pending),
+        ]
+        .spacing(12)
+        .width(440)
+        .into(),
+
+        Modal::EditColumn { table, edit, error } => column![
+            dialog_title(format!("Change {}.{}", table, edit.original)),
+            field("Name", &edit.name, |v| Message::ModalField(
+                crate::app::ModalField::Name,
+                v
+            )),
+            field("Type", &edit.data_type, |v| Message::ModalField(
+                crate::app::ModalField::DataType,
+                v
+            )),
+            toggle("Nullable", edit.nullable, |v| Message::ModalToggle(
+                crate::app::ModalField::Nullable,
+                v
+            )),
+            text(match edit.statements(table) {
+                Ok(sql) => format!("Will run:\n{}", sql),
+                Err(why) => why,
+            })
+            .size(11)
+            .font(theme::MONO)
+            .color(theme::TEXT_FAINT),
+            text(
+                "A type change rewrites every row, and is refused if a value does not convert. \
+                 Setting NOT NULL is refused while a row holds NULL."
+            )
+            .size(11)
+            .color(theme::TEXT_DIM),
+            error_line(error),
+            dialog_actions("APPLY", pending),
         ]
         .spacing(12)
         .width(560)
@@ -890,6 +1031,26 @@ pub fn field<'a>(
         text(label.into()).size(11).font(theme::MONO).color(theme::TEXT_DIM),
         text_input("", value)
             .on_input(on_input)
+            .padding([6, 8])
+            .size(13)
+            .font(theme::MONO)
+            .style(theme::input),
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// [`field`], with what is typed hidden.
+pub fn secret_field<'a>(
+    label: impl Into<String>,
+    value: &str,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    column![
+        text(label.into()).size(11).font(theme::MONO).color(theme::TEXT_DIM),
+        text_input("", value)
+            .on_input(on_input)
+            .secure(true)
             .padding([6, 8])
             .size(13)
             .font(theme::MONO)
@@ -1374,6 +1535,7 @@ pub fn in_sorted_order<'a>(
     match order_by(sort, grid) {
         None => std::borrow::Cow::Borrowed(grid),
         Some(order) => std::borrow::Cow::Owned(Grid {
+            total: None,
             columns: grid.columns.clone(),
             rows: order.into_iter().map(|index| grid.rows[index].clone()).collect(),
             tag: grid.tag.clone(),
@@ -2006,6 +2168,7 @@ mod tests {
 
     fn grid() -> Grid {
         Grid {
+            total: None,
             columns: vec!["id".into(), "name".into()],
             rows: vec![
                 vec![Some("10".into()), Some("carol".into())],

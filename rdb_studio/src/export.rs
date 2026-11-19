@@ -179,6 +179,7 @@ mod tests {
 
     fn grid() -> Grid {
         Grid {
+            total: None,
             columns: vec!["id".into(), "note".into()],
             rows: vec![
                 vec![Some("1".into()), Some("plain".into())],
@@ -247,7 +248,7 @@ mod tests {
 
     #[test]
     fn an_empty_grid_still_renders_its_header() {
-        let empty = Grid { columns: vec!["a".into()], rows: vec![], tag: String::new() };
+        let empty = Grid { total: None, columns: vec!["a".into()], rows: vec![], tag: String::new() };
         assert_eq!(to_csv(&empty), "a\n");
         assert_eq!(to_json(&empty), "[]");
         assert!(to_markdown(&empty).starts_with("| a |"));

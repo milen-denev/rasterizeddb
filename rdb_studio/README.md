@@ -1,7 +1,7 @@
 # rdb_studio
 
-A database console for RasterizedDB — and, over the same wire protocol, for
-PostgreSQL.
+A database console for RasterizedDB — over its native protocol by default —
+and, over the PostgreSQL wire protocol, for PostgreSQL.
 
 ```sh
 cargo run -p rdb_studio                # pick a connection
@@ -16,8 +16,8 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 | **Overview** | Every statistic the server reports, grouped, with the six that matter as tiles |
 | **Tables** | Every table with its sizes and what is holding it — memory, files, S3 — and one table's columns, indexes, partitions and statistics |
 | **Schema** | The foreign keys as a layered map, each line anchored at the column it joins |
-| **Data** | A page of rows, editable in place, with insert and delete |
-| **Query** | Several statements at a time, each reporting separately, with timings and a history you can prune |
+| **Data** | A page of rows, editable in place, with insert and delete, a `WHERE` filter, and CSV import |
+| **Query** | Several statements at a time, each reporting separately, with timings, a row limit, cancel, notices, completion and a history you can prune |
 | **Activity** | What the *server* has been running, what each cost, how many rows it had to read to answer, and how much of the time went on relations it had to build first |
 | **Bench** | How fast one statement runs: queries per second and end-to-end latency (mean, median, p90/p95/p99/p99.9, min, max) over N connections of its own, with warm-up, simple or prepared protocol, and runs kept side by side to compare |
 | **Backup** | What is stored in S3, whether archiving is healthy, and restoring from it |
@@ -25,10 +25,14 @@ cargo run -p rdb_studio -- studio-demo # open a saved profile straight away
 | **Storage** | Which directories the database writes into, how full each is, and which one holds each table |
 | **Replication** | Whether it is on, who it is talking to, and how far behind they are |
 | **Migrate** | Importing a live PostgreSQL database into this one |
+| **Keys** | RasterizedDB's key/value store: keys scanned a page at a time by pattern, each value read by its type, with its expiry |
+| **Roles** | Who may log in: create a role, set its password, drop it (password hashes are never read) |
 | **Config** | Every runtime knob: the ones a running server can change applied live, restart-only ones saved for the next start where the server can save them, fixed choices as dropdowns |
 
-Databases and tables are created and dropped from the sidebar; columns are added
-from the table detail pane.
+Databases and tables are created and dropped from the sidebar; columns are
+added, renamed, retyped, made (non-)nullable and dropped from the table detail
+pane. A column change is sent as one script — the type and nullability under
+the old name, then the rename — so a refused type change leaves the name alone.
 
 ## Indexes and partitions
 
@@ -64,10 +68,38 @@ for a partitioned table) and **STATISTICS**.
 Dialogs stay open until the server answers, and show its refusal where the
 form still is.
 
+## Two protocols
+
+A new RasterizedDB profile connects with the server's **native protocol**
+(rastcp, port 61170 or a `--rdb-socket` file) through `rasterizeddb_client`.
+The **PostgreSQL wire protocol** (`tokio-postgres`, port 5432) is the other
+choice, and the only one for a PostgreSQL server. A profile saved before the
+choice existed keeps the wire protocol: it was saved with a pgwire port.
+
+Every screen works over either, because the native session asks for the
+*simple-query form*: the server runs the text through its PostgreSQL path and
+answers with the messages pgwire would have sent — column names, each cell as
+PostgreSQL's text, command tags, SQLSTATEs, several statements as one implicit
+transaction, `WITH` and derived tables. The engine's plain native answer has no
+column names and tags a `jsonb` document as text, so a console cannot be built
+on it. The form needs a server that has it; an older one refuses it without
+running anything, and the connection screen says so and names the way back.
+
+What differs over native:
+
+| | native | wire |
+|---|---|---|
+| Databases | one per listener: the session takes its name from the server, and switching is refused rather than reconnecting to the same one under another name | any; switching reconnects |
+| Login | chosen: password (SCRAM-SHA-256), peer (unix socket), or trust | negotiated |
+| Link | TLS over TCP, always, the certificate verified when the profile asks (`--rdb-cert`); none on a socket | per the TLS setting |
+| Transaction blocks | the editor's own connection keeps one open across runs; the panels' shared one does not see into it | may span runs (and the panels share the editor's connection) |
+| Long statements | cut off at the server's `--rdb-request-timeout` (30 s by default) | no limit |
+| BENCH | `native` (the engine's binary answer, what applications send) and `simple` | `simple` and `prepared` |
+
 ## The two dialects
 
-Both servers speak the PostgreSQL v3 wire protocol, so one transport serves
-both. What differs is *how you ask a database about itself*, and that is the
+Whichever protocol carries it, a result reaches the screens in the same shape
+(see above). What differs is *how you ask a database about itself*, and that is the
 whole of [`src/dialect.rs`](src/dialect.rs):
 
 - **RasterizedDB** answers a statement family added for this:
@@ -115,6 +147,17 @@ Beyond running SQL:
 - **Open and save `.sql` files** through the desktop's own file chooser, and
   **copy or export results** as CSV, JSON, Markdown or `INSERT` statements.
 - **Export the session history** as a runnable script.
+- **A row limit** (1,000 / 10,000 / 100,000 / none; 10,000 by default) on each
+  result. Rows past it are counted, not kept — the server drops them over
+  native, the console streams past them over the wire — and the result says
+  "the first 10,000 of 52,341 rows", so a capped answer never reads as whole.
+- **Cancel** stops the running statement: over the wire with PostgreSQL's
+  CancelRequest, over native with a CANCEL of the token the run was sent with.
+  The statement ends with SQLSTATE 57014.
+- **Notices** the statements raised are listed above their results.
+- **A transaction pill** says when the editor is inside a block, or a failed
+  one, over native. An open block is kept alive while you think: the server
+  closes a connection idle for its request timeout, which would roll it back.
 
 ### The editor
 
@@ -145,6 +188,7 @@ statement from running — the server is the authority.
 | Enter | a new line at the same indentation, one deeper after `(` |
 | Tab / Shift+Tab | indent / unindent — the selected lines, if any |
 | Ctrl+/ | comments the lines out, or back in |
+| Ctrl+Space | completes the table, column or keyword before the cursor; several candidates are listed under the editor |
 | Ctrl+Shift+F | formats |
 | Ctrl+S | saves to a `.sql` file |
 
@@ -180,7 +224,9 @@ one exchange and get one figure between them rather than a fabricated split.
 ### History
 
 Everything the session sent — typed, or issued by a dialog, a backup action or a
-config change — with its duration, its outcome and how long ago. Clicking an
+config change — with its duration, its outcome and how long ago. A string after
+`PASSWORD` is kept as `'********'`, so a `CREATE ROLE` or `ALTER ROLE` never
+leaves its password in the history or its export. Clicking an
 entry **loads it into the editor and does not run it**: the list holds the
 session's `DROP` and `DELETE` statements as readily as its `SELECT`s. Running is
 a separate button. Entries can be copied, deleted one at a time, or cleared.
@@ -301,6 +347,18 @@ clicked, reports success, and is undetectable afterwards.
 
 Columns are dragged to width from the divider in the header, remembered per
 table, and double-clicked back to the default.
+
+The **filter** box above the grid takes a condition as written after `WHERE`.
+It must be one condition — no `;`, balanced parentheses — so the browser's own
+`ORDER BY` and `LIMIT` still apply to it; a `--` comment in it ends before them.
+The footer then counts the matching rows.
+
+**Import CSV** reads a file with a header row into the selected table, matching
+the header to the columns by name. An unquoted empty field is `NULL` and `""`
+the empty string, as the export writes them. Up to 20,000 rows go in one
+request, which is one transaction: a file that size imports whole or not at
+all; a bigger one goes request by request and a refusal stops it with the
+rows before it kept, and the report says which records.
 
 For the same reason a page is always ordered by that key. Without an `ORDER BY`
 neither engine promises the same order twice, so page 2 can repeat a row from
@@ -430,12 +488,34 @@ column removed in a newer PostgreSQL, a cast that needs quoting, an engine that
 refuses a string literal against an integer key. It writes only to a table it
 creates and drops.
 
+Over native, set `RDB_STUDIO_TEST_RDB` to `rdb://user:pw@127.0.0.1:61170` or
+`rdb://user@/tmp/rdb.sock?login=trust` (`login` is `password`, `peer` or
+`trust`) and the same suite runs over the native protocol.
+
+With `RDB_STUDIO_TEST_RDB` on the wire protocol and `RDB_STUDIO_TEST_RDB_NATIVE`
+on the native one, two more run: the transports must answer identically, and
+the editor's row limit, cancel, notices and cross-run block are checked on
+both. `RDB_STUDIO_TEST_TLS_CA` (the CA that signed the server's `--pg-cert` and
+`--rdb-cert`) and `RDB_STUDIO_TEST_TLS_OTHER_CA` (one that did not) check
+certificate verification. The tests take turns: several create and drop tables
+while another lists them all.
+
 ## Connections on disk
 
 `~/.config/rdb_studio/connections.json`, owner-readable only. A password is
 written only when the profile asks for it.
 
 ## What TLS does here
+
+Over the native protocol, TCP is always TLS and a unix socket never is.
+
+**Verify the server's certificate** (per profile, either protocol) believes
+only a certificate signed by the profile's CA file — or, with none, a public
+authority — that names the host, and never falls back to cleartext. It needs a
+server given a real certificate: `--pg-cert`/`--pg-key` for the wire protocol,
+`--rdb-cert`/`--rdb-key` for the native one. The status bar then says
+`TLS VERIFIED`. Without it:
+
 
 `require` encrypts and **does not authenticate the server**: RasterizedDB
 generates a self-signed certificate when none is configured, and verifying it

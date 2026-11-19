@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use iced::futures::{SinkExt, Stream, channel::mpsc};
 use tokio::sync::watch;
-use tokio_postgres::{Client, SimpleQueryMessage};
+use tokio_postgres::SimpleQueryMessage;
 
 use crate::conn;
 use crate::model::Connection;
@@ -59,21 +59,25 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Protocol {
     /// Text in, text out, parsed every time — what this console itself uses,
-    /// and what `psql` sends.
+    /// and what `psql` sends. Over a native session, the simple-query form.
     #[default]
     Simple,
     /// Parsed once per connection, then executed by name: what an application
-    /// using a driver with prepared statements sends.
+    /// using a driver with prepared statements sends. The wire protocol only.
     Prepared,
+    /// The native protocol's own request: the statement's text, answered with
+    /// the engine's binary rows — what an application using
+    /// `rasterizeddb_client` sends. A native session only.
+    Native,
 }
-
 impl Protocol {
-    pub const ALL: [Protocol; 2] = [Protocol::Simple, Protocol::Prepared];
+    pub const ALL: [Protocol; 3] = [Protocol::Simple, Protocol::Prepared, Protocol::Native];
 
     pub fn label(&self) -> &'static str {
         match self {
             Protocol::Simple => "simple",
             Protocol::Prepared => "prepared",
+            Protocol::Native => "native",
         }
     }
 }
@@ -489,24 +493,42 @@ impl Drop for Workers {
 enum Statement {
     Simple(String),
     Prepared(tokio_postgres::Statement),
+    NativeSimple(String),
+    Native(String),
 }
 
 impl Statement {
-    async fn prepare(client: &Client, sql: &str, protocol: Protocol) -> Result<Self, String> {
-        match protocol {
-            Protocol::Simple => Ok(Statement::Simple(sql.to_string())),
-            Protocol::Prepared => client
+    async fn prepare(
+        session: &conn::Session,
+        sql: &str,
+        protocol: Protocol,
+    ) -> Result<Self, String> {
+        match (session.client(), protocol) {
+            (Some(_), Protocol::Simple) => Ok(Statement::Simple(sql.to_string())),
+            (Some(client), Protocol::Prepared) => client
                 .prepare(sql)
                 .await
                 .map(Statement::Prepared)
                 .map_err(|e| conn::sql_error(&e)),
+            (Some(_), Protocol::Native) => Err(
+                "the native protocol needs a profile that connects with it; this one speaks the \
+                 PostgreSQL wire protocol"
+                    .to_string(),
+            ),
+            (None, Protocol::Simple) => Ok(Statement::NativeSimple(sql.to_string())),
+            (None, Protocol::Native) => Ok(Statement::Native(sql.to_string())),
+            (None, Protocol::Prepared) => Err(
+                "prepared statements are the PostgreSQL wire protocol's; this profile connects with \
+                 the native protocol, which sends a statement's text each time"
+                    .to_string(),
+            ),
         }
     }
 
     /// Runs it and counts the rows that came back.
-    async fn run(&self, client: &Client) -> Result<u64, String> {
-        match self {
-            Statement::Simple(sql) => client
+    async fn run(&self, session: &conn::Session) -> Result<u64, String> {
+        match (self, session.client(), session.native()) {
+            (Statement::Simple(sql), Some(client), _) => client
                 .simple_query(sql)
                 .await
                 .map(|messages| {
@@ -516,12 +538,40 @@ impl Statement {
                         .count() as u64
                 })
                 .map_err(|e| conn::sql_error(&e)),
-            Statement::Prepared(statement) => client
+            (Statement::Prepared(statement), Some(client), _) => client
                 .query(statement, &[])
                 .await
                 .map(|rows| rows.len() as u64)
                 .map_err(|e| conn::sql_error(&e)),
+            (Statement::NativeSimple(sql), _, Some(client)) => client
+                .simple_query(sql)
+                .await
+                .map(|answer| {
+                    answer
+                        .results
+                        .iter()
+                        .map(|r| match r {
+                            rasterizeddb_client::SimpleResult::Rows { rows, .. } => {
+                                rows.len() as u64
+                            }
+                            _ => 0,
+                        })
+                        .sum()
+                })
+                .map_err(|e| conn::native_error(&e)),
+            (Statement::Native(sql), _, Some(client)) => client
+                .run(sql)
+                .await
+                .map(|rows| rows.len() as u64)
+                .map_err(|e| conn::native_error(&e)),
+            _ => Err("internal error: a statement prepared for another session".to_string()),
         }
+    }
+
+    /// Whether the session's connection is known to be gone. A native client
+    /// reopens a closed connection on its next statement, so it never is.
+    fn is_closed(session: &conn::Session) -> bool {
+        session.client().is_some_and(|client| client.is_closed())
     }
 }
 
@@ -578,8 +628,8 @@ async fn execute(
 
     // The statement once, alone: a mistake is one clear error, not a run of
     // them.
-    let first = Statement::prepare(sessions[0].client(), &plan.sql, plan.protocol).await?;
-    first.run(sessions[0].client()).await?;
+    let first = Statement::prepare(&sessions[0], &plan.sql, plan.protocol).await?;
+    first.run(&sessions[0]).await?;
 
     let now = Instant::now();
     let measure_from = now + plan.warmup;
@@ -594,8 +644,7 @@ async fn execute(
         let mut stop = stop.clone();
         workers.0.push(tokio::spawn(async move {
             let mut tally = Tally::default();
-            let client = session.client();
-            let statement = match Statement::prepare(client, &sql, protocol).await {
+            let statement = match Statement::prepare(&session, &sql, protocol).await {
                 Ok(statement) => statement,
                 Err(e) => {
                     tally.errors += 1;
@@ -605,7 +654,7 @@ async fn execute(
                 }
             };
             loop {
-                if *stop.borrow() || client.is_closed() {
+                if *stop.borrow() || Statement::is_closed(&session) {
                     break;
                 }
                 let started = Instant::now();
@@ -613,7 +662,7 @@ async fn execute(
                     break;
                 }
                 let result = tokio::select! {
-                    result = statement.run(client) => result,
+                    result = statement.run(&session) => result,
                     _ = stop.wait_for(|stopped| *stopped) => break,
                 };
                 let ended = Instant::now();

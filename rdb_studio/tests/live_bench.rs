@@ -7,6 +7,9 @@
 //!   cargo test -p rdb_studio --test live_bench -- --nocapture
 //! ```
 //!
+//! Or over the native protocol: `rdb://user:pw@127.0.0.1:61170`, or
+//! `rdb://user@/tmp/rdb.sock?login=trust`.
+//!
 //! Every run here is a second or two of `SELECT`s, and the stop test is
 //! bounded by its own timeout, so a broken runner fails rather than hangs.
 
@@ -18,6 +21,34 @@ use rdb_studio::model::{Connection, Flavor, TlsMode};
 
 fn profile() -> Option<Connection> {
     let url = std::env::var("RDB_STUDIO_TEST_BENCH").ok()?;
+    if let Some(rest) = url.strip_prefix("rdb://") {
+        let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (credentials, place) = rest.rsplit_once('@').unwrap_or(("", rest));
+        let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+        let (host, port) = if place.starts_with('/') {
+            (place.to_string(), 61170)
+        } else {
+            let (host, port) = place.split_once(':').unwrap_or((place, "61170"));
+            (
+                host.to_string(),
+                port.trim_end_matches('/').parse().unwrap_or(61170),
+            )
+        };
+        return Some(Connection {
+            name: "bench".to_string(),
+            host,
+            port,
+            user: user.to_string(),
+            password: password.to_string(),
+            transport: rdb_studio::model::Transport::Native,
+            login: match query.split('&').find_map(|kv| kv.strip_prefix("login=")) {
+                Some("trust") => rdb_studio::model::NativeLogin::Trust,
+                Some("peer") => rdb_studio::model::NativeLogin::Peer,
+                _ => rdb_studio::model::NativeLogin::Password,
+            },
+            ..Connection::default()
+        });
+    }
     let rest = url
         .trim_start_matches("postgresql://")
         .trim_start_matches("postgres://");
@@ -36,6 +67,10 @@ fn profile() -> Option<Connection> {
         password: password.to_string(),
         save_password: false,
         tls: TlsMode::Disable,
+        transport: rdb_studio::model::Transport::Wire,
+        login: rdb_studio::model::NativeLogin::Password,
+        verify_server: false,
+        ca_file: String::new(),
     })
 }
 
@@ -73,7 +108,7 @@ async fn drive(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_reports_consistent_figures() {
     let Some(profile) = profile() else { return };
-    for protocol in Protocol::ALL {
+    for protocol in protocols(&profile) {
         let (_stop, stopped) = tokio::sync::watch::channel(false);
         let (phases, result) = drive(plan(profile.clone(), "SELECT 1", protocol), stopped).await;
         let report = result.unwrap_or_else(|e| panic!("{} run failed: {}", protocol, e));
@@ -111,6 +146,30 @@ async fn a_run_reports_consistent_figures() {
         let ceiling = 3.0 / l.mean.as_secs_f64();
         assert!(report.qps() <= ceiling * 1.05, "{} q/s over {}", report.qps(), ceiling);
     }
+}
+
+/// The protocols a profile's transport can run; the others are refused.
+fn protocols(profile: &Connection) -> [Protocol; 2] {
+    match profile.effective_transport() {
+        rdb_studio::model::Transport::Native => [Protocol::Simple, Protocol::Native],
+        rdb_studio::model::Transport::Wire => [Protocol::Simple, Protocol::Prepared],
+    }
+}
+
+/// A protocol the profile's transport does not speak is refused before
+/// anything is measured, with the reason, never run as something else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_protocol_of_the_other_transport_is_refused_up_front() {
+    let Some(profile) = profile() else { return };
+    let other = match profile.effective_transport() {
+        rdb_studio::model::Transport::Native => Protocol::Prepared,
+        rdb_studio::model::Transport::Wire => Protocol::Native,
+    };
+    let (_stop, stopped) = tokio::sync::watch::channel(false);
+    let (phases, result) = drive(plan(profile, "SELECT 1", other), stopped).await;
+    let error = result.expect_err("the run must be refused");
+    assert!(error.contains("protocol"), "{error}");
+    assert!(!phases.contains(&Phase::Measuring), "{:?}", phases);
 }
 
 /// A typing mistake is one error, before any connection is benchmarked.

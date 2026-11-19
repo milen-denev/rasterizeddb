@@ -156,6 +156,7 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
         super::GridColumn::new("type", "TYPE", 140.0),
         super::GridColumn::new("flags", "", 170.0).unsortable(),
         super::GridColumn::new("default", "DEFAULT", 160.0),
+        super::GridColumn::new("actions", "", 110.0).unsortable(),
     ];
     let widths = super::column_widths(&layout, &specs);
 
@@ -200,6 +201,31 @@ fn detail(studio: &Studio) -> Element<'_, Message> {
                 super::grid_cell(info.data_type.clone(), false, theme::TEXT_DIM),
                 container(flags).padding([3, 6]).into(),
                 super::grid_cell(info.default.clone(), false, theme::TEXT_FAINT),
+                container(
+                    row![
+                        small_button("EDIT", Some(Message::EditColumn(info.name.clone()))),
+                        iced::widget::button(text("DROP").size(10).font(theme::MONO))
+                            .padding([2, 6])
+                            .style(theme::destructive)
+                            .on_press(confirm(
+                                "Drop column",
+                                format!(
+                                    "This permanently removes column `{}` from `{}`, and its value \
+                                     in every row.",
+                                    info.name, name
+                                ),
+                                format!(
+                                    "ALTER TABLE {} DROP COLUMN {}",
+                                    crate::dialect::quote_ident(&name),
+                                    crate::dialect::quote_ident(&info.name)
+                                ),
+                                Refresh::CurrentTable,
+                            )),
+                    ]
+                    .spacing(4),
+                )
+                .padding([2, 6])
+                .into(),
             ],
         );
         column_rows = column_rows.push(super::grid_stripe(

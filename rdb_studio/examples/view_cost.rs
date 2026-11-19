@@ -25,6 +25,7 @@ fn rss_kib() -> u64 {
 
 fn grid(rows: usize, columns: usize) -> Grid {
     Grid {
+        total: None,
         columns: (0..columns).map(|c| format!("column_{c}")).collect(),
         rows: (0..rows)
             .map(|r| {
@@ -70,6 +71,10 @@ async fn main() {
         password: password.into(),
         save_password: false,
         tls: TlsMode::Disable,
+        transport: rdb_studio::model::Transport::Wire,
+        login: rdb_studio::model::NativeLogin::Password,
+        verify_server: false,
+        ca_file: String::new(),
     })
     .await
     .expect("could not connect");
