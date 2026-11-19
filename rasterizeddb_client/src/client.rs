@@ -50,6 +50,14 @@ pub struct Options {
     /// quiet spell and no traffic while idle. A connection with a statement in
     /// flight is never reopened under it.
     pub idle_reconnect: Option<Duration>,
+    /// Whether a TCP connection believes the server it reached (a unix
+    /// socket has no TLS, and needs none). The default,
+    /// [`Trust::AcceptAny`](crate::Trust::AcceptAny), encrypts without
+    /// authenticating the server, which suits the self-signed certificate a
+    /// server makes for itself; [`load_ca`](crate::load_ca) reads a private
+    /// CA's certificate for [`Trust::RootCa`](crate::Trust::RootCa), and
+    /// [`Trust::WebPki`](crate::Trust::WebPki) uses the public roots.
+    pub trust: crate::Trust,
 }
 
 impl Default for Options {
@@ -62,7 +70,20 @@ impl Default for Options {
             migrations: None,
             auto_migrate: crate::orm::AutoMigrate::Apply,
             idle_reconnect: Some(DEFAULT_IDLE_RECONNECT),
+            trust: crate::Trust::AcceptAny,
         }
+    }
+}
+
+/// `builder` believing the server as `trust` says. Accepting anything is
+/// left unsaid: rastcp refuses a unix socket that names any trust at all,
+/// since a socket carries no TLS to check, and "accept anything" asks for
+/// nothing there.
+pub(crate) fn with_trust(builder: TcpClientBuilder, trust: &crate::Trust) -> TcpClientBuilder {
+    if trust.authenticates() {
+        builder.trust(trust.clone())
+    } else {
+        builder.verify_certificate(false)
     }
 }
 
@@ -156,18 +177,19 @@ impl Client {
     /// that fails, when [`Options::migrations`] is set and
     /// [`Options::auto_migrate`] applies or verifies it.
     ///
-    /// Over TCP the transport is TLS, and the server's certificate is not
-    /// verified: use a unix socket, or a network you trust, until certificate
-    /// options are added here. [`Login::Password`](crate::Login::Password)
-    /// still holds there: its exchange is bound to the connection, and the
-    /// server must prove it holds the password's verifier.
+    /// Over TCP the transport is TLS, and the server's certificate is
+    /// checked as [`Options::trust`] says: by default it is not, so use a
+    /// unix socket, a network you trust, or a [`Trust`](crate::Trust) that
+    /// authenticates. [`Login::Password`](crate::Login::Password) holds
+    /// either way: its exchange is bound to the connection, and the server
+    /// must prove it holds the password's verifier.
     pub async fn connect(addr: &str, options: Options) -> Result<Self> {
         let authenticator = options.login.authenticator()?;
         let mut connections = Vec::with_capacity(options.connections.max(1));
         for _ in 0..options.connections.max(1) {
-            let mut builder = TcpClientBuilder::new(addr)
-                .verify_certificate(false)
-                .max_message_size(options.max_message_size);
+            let mut builder =
+                with_trust(TcpClientBuilder::new(addr), &options.trust)
+                    .max_message_size(options.max_message_size);
             builder = match options.timeout {
                 Some(timeout) => builder.timeout(timeout),
                 None => builder.no_timeout(),
@@ -194,6 +216,7 @@ impl Client {
                 timeout: options.timeout,
                 max_message_size: options.max_message_size,
                 authenticator,
+                trust: options.trust.clone(),
             }),
         };
         if let Some(migrator) = &options.migrations {
@@ -224,6 +247,7 @@ impl Client {
                 timeout: None,
                 max_message_size: 0,
                 authenticator: None,
+                trust: crate::Trust::AcceptAny,
             }),
         }
     }
@@ -321,8 +345,80 @@ impl Client {
         self.send(sql).await
     }
 
+    /// Runs `sql` as a PostgreSQL client's simple query runs, and answers as
+    /// pgwire would: each result's column names and type OIDs, every cell as
+    /// PostgreSQL's text, each statement's command tag, and the notices. See
+    /// [`simple`](crate::simple).
+    ///
+    /// For code that shows results it did not write the statement for (a
+    /// console, an export). `sql` may hold several statements, which run as one
+    /// implicit transaction, and `WITH` and derived tables work. Nothing is
+    /// rendered: `$1` is sent as written. A `BEGIN` must be ended in the same
+    /// call, because the client's connections are shared; one left open is
+    /// rolled back and reported as an error.
+    ///
+    /// A failed statement is [`Error::Server`] with its SQLSTATE; a server
+    /// too old for this form refuses it without running anything, as
+    /// [`Error::Unsupported`].
+    pub async fn simple_query(&self, sql: &str) -> Result<crate::simple::SimpleAnswer> {
+        self.simple_query_with(sql, &crate::SimpleOptions::default())
+            .await
+    }
+
+    /// [`simple_query`](Self::simple_query), with a [`CancelToken`](crate::CancelToken)
+    /// that [`cancel`](Self::cancel) stops it by, or a cap on the rows sent
+    /// of each result (see [`SimpleOptions`](crate::SimpleOptions)).
+    ///
+    /// ```no_run
+    /// # async fn demo(client: std::sync::Arc<rasterizeddb_client::Client>) -> rasterizeddb_client::Result<()> {
+    /// use rasterizeddb_client::{CancelToken, SimpleOptions};
+    ///
+    /// let token = CancelToken::new();
+    /// let options = SimpleOptions { cancel: Some(token.clone()), max_rows: Some(1000) };
+    /// let running = {
+    ///     let client = client.clone();
+    ///     tokio::spawn(async move { client.simple_query_with("SELECT * FROM big", &options).await })
+    /// };
+    /// // Later, from anywhere holding the client:
+    /// client.cancel(&token).await?;
+    /// let stopped = running.await.unwrap(); // Err(Server("… (SQLSTATE 57014)"))
+    /// # let _ = stopped; Ok(()) }
+    /// ```
+    pub async fn simple_query_with(
+        &self,
+        sql: &str,
+        options: &crate::SimpleOptions,
+    ) -> Result<crate::simple::SimpleAnswer> {
+        let request = crate::simple::request(sql, options)?;
+        crate::simple::decode(self.send_bytes(&request).await?)
+    }
+
+    /// Stops the statement a simple query sent with `token` (by this client,
+    /// a [`SimpleSession`](crate::SimpleSession), or any connection of the same
+    /// user) is running; it fails with SQLSTATE 57014. Returns whether one
+    /// was running: `false` when the query has ended, has not started, or is
+    /// between two of its statements. Nothing is reported to the query's
+    /// caller beyond its error.
+    pub async fn cancel(&self, token: &crate::CancelToken) -> Result<bool> {
+        crate::simple::decode_cancel(
+            self.send_bytes(&crate::simple::cancel_request(token))
+                .await?,
+        )
+    }
+
+    /// Opens a connection of its own for simple queries, where a transaction
+    /// block lasts from one call to the next. See
+    /// [`SimpleSession`](crate::SimpleSession).
+    pub async fn simple_session(&self) -> Result<crate::SimpleSession> {
+        crate::SimpleSession::open(self.transactions.clone(), self.idle_reconnect).await
+    }
+
     /// Sends text already checked (by [`check_statement`], or by rendering).
     pub(crate) async fn send(&self, sql: &str) -> Result<Rows> {
+        decode_response(self.send_bytes(sql.as_bytes()).await?)
+    }
+
+    async fn send_bytes(&self, request: &[u8]) -> Result<Vec<u8>> {
         let connection = self.pick();
         if let Some(limit) = self.idle_reconnect {
             connection.reopen_if_idle(limit, self.epoch).await;
@@ -334,8 +430,7 @@ impl Client {
             connection,
             epoch: self.epoch,
         };
-        let response = connection.mux.send(sql.as_bytes()).await?;
-        decode_response(response)
+        Ok(connection.mux.send(request).await?)
     }
 
     /// Runs `sql` with `$1`…`$n` replaced by `params` (see [`render`]) and

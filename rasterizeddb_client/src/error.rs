@@ -97,6 +97,13 @@ impl Error {
         )
     }
 
+    /// Whether the server abandoned the statement at its request timeout
+    /// (`--rdb-request-timeout`, 30 s by default). Whether a write had taken
+    /// effect is unknown, as for any [`Error::Transport`].
+    pub fn is_server_timeout(&self) -> bool {
+        matches!(self, Error::Transport(RastcpError::HandlerTimeout))
+    }
+
     /// The SQLSTATE the server gave, when it gave one.
     ///
     /// Statements run inside a transaction are answered by the server's

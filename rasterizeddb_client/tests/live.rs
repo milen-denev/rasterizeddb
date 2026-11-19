@@ -449,3 +449,85 @@ async fn an_answer_over_the_message_limit_fails_whole() {
     })
     .await;
 }
+
+/// The simple-query form end to end: a session whose block outlives a call,
+/// a row cap that still counts every row, and a cancel from the shared
+/// client that stops a statement waiting for a lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_simple_session_keeps_its_block_and_is_cancellable() {
+    use rasterizeddb_client::{CancelToken, SimpleOptions, SimpleResult, TransactionStatus};
+    bounded(async {
+        let Some(server) = server("simple_session", "trust").await else { return };
+        let client = std::sync::Arc::new(connect(&server, 1).await);
+        client
+            .simple_query(
+                "CREATE TABLE simple_t (id BIGINT, label TEXT); \
+                 INSERT INTO simple_t (id, label) VALUES (1,'a'),(2,'b'),(3,'c')",
+            )
+            .await
+            .unwrap();
+
+        let capped = client
+            .simple_query_with(
+                "SELECT id FROM simple_t ORDER BY id",
+                &SimpleOptions { cancel: None, max_rows: Some(2) },
+            )
+            .await
+            .unwrap();
+        let SimpleResult::Rows { rows, .. } = &capped.results[0] else { panic!("{capped:?}") };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(capped.results[0].row_count(), Some(3));
+
+        let session = client.simple_session().await.unwrap();
+        session.query("BEGIN; INSERT INTO simple_t (id, label) VALUES (4, 'd')").await.unwrap();
+        assert_eq!(session.transaction(), TransactionStatus::InBlock);
+        session.ping().await.unwrap();
+        let count = |answer: &rasterizeddb_client::SimpleAnswer| match &answer.results[0] {
+            SimpleResult::Rows { rows, .. } => rows[0][0].clone().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let inside = session.query("SELECT count(*) FROM simple_t").await.unwrap();
+        assert_eq!(count(&inside), "4");
+        let outside = client.simple_query("SELECT count(*) FROM simple_t").await.unwrap();
+        assert_eq!(count(&outside), "3", "the shared connection saw into the block");
+
+        // A failed statement leaves the block failed, and the session says so.
+        assert!(session.query("SELECT * FROM no_such_table").await.is_err());
+        assert_eq!(session.transaction(), TransactionStatus::Failed);
+        session.query("ROLLBACK").await.unwrap();
+        assert_eq!(session.transaction(), TransactionStatus::Idle);
+
+        // The session takes the table; the client's read waits until its
+        // cancel stops it.
+        session
+            .query("BEGIN; LOCK TABLE simple_t IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let token = CancelToken::new();
+        let waiting = {
+            let (client, token) = (client.clone(), token.clone());
+            tokio::spawn(async move {
+                client
+                    .simple_query_with(
+                        "SELECT id FROM simple_t",
+                        &SimpleOptions { cancel: Some(token), max_rows: None },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!waiting.is_finished(), "the read did not wait for the lock");
+        assert!(client.cancel(&token).await.unwrap());
+        let stopped = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the cancelled read kept waiting")
+            .unwrap();
+        match stopped {
+            Err(Error::Server(message)) => assert!(message.contains("57014"), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!client.cancel(&token).await.unwrap(), "a finished query was cancelled");
+        session.query("ROLLBACK").await.unwrap();
+    })
+    .await;
+}

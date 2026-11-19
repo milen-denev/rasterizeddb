@@ -89,6 +89,14 @@
 //! of the statement's select list (or `RETURNING` list), so read rows by the
 //! position your SQL put each value in. The ORM writes its select lists itself,
 //! so its models read correctly by construction.
+//!
+//! A program that shows results it did not write the statement for (a console,
+//! an export) uses [`Client::simple_query`] instead: the answer pgwire would
+//! give, with column names and every cell as PostgreSQL's text, and several
+//! statements per call. See [`simple`]. A console's editor, where a `BEGIN`
+//! has to outlast the call that sent it, uses a [`SimpleSession`]
+//! ([`Client::simple_session`]); a long statement is stopped with
+//! [`Client::cancel`] and the [`CancelToken`] it was sent with.
 
 // The derive macros name this crate by its path; this lets its own tests use
 // them.
@@ -102,6 +110,7 @@ mod login;
 mod params;
 mod row;
 mod scram;
+mod simple_session;
 mod to_sql;
 mod transaction;
 mod types;
@@ -110,6 +119,7 @@ mod value;
 pub mod admin;
 pub mod kv;
 pub mod orm;
+pub mod simple;
 
 /// The guide: how to use this crate, chapter by chapter. Documentation only;
 /// every example in it is compiled by `cargo test`.
@@ -143,6 +153,19 @@ pub use params::{
     ArrayRef, Param, check_statement, quote_bytes, quote_ident, quote_text, render, render_dyn,
 };
 pub use row::{FromRow, Row, Rows, tag};
+pub use simple::{
+    CancelToken, SimpleAnswer, SimpleColumn, SimpleOptions, SimpleResult, TransactionStatus,
+};
+pub use simple_session::SimpleSession;
+/// How a TCP connection decides whether to believe the server
+/// ([`Options::trust`]).
+pub use rastcp::tls::Trust;
+
+/// A private certificate authority's certificate(s), read from a PEM file,
+/// as the [`Trust`] that believes what it signed.
+pub fn load_ca(path: &str) -> Result<Trust> {
+    Ok(Trust::RootCa(rastcp::tls::load_certificates(path)?))
+}
 pub use to_sql::ToSql;
 pub use transaction::{
     DEFAULT_TRANSACTION_RETRIES, Isolation, SERVER_IDLE_CLOSE, Transaction, TransactionFuture,
