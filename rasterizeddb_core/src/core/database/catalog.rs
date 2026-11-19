@@ -431,6 +431,39 @@ impl DatabaseCatalog {
         // never read them, so this only releases them.
         crate::core::rql::sequence::forget_database(database_id);
 
+        // Branches made from it move to its parent (docs/branching.md §8).
+        #[cfg(feature = "db_branching")]
+        {
+            let moved = self.reparent_children(name);
+            let (reparented, orphaned): (Vec<_>, Vec<_>) =
+                moved.into_iter().partition(|(_, to)| to.is_some());
+            if let Some((_, Some(to))) = reparented.first() {
+                crate::core::notice::push(
+                    "NOTICE",
+                    "00000",
+                    format!(
+                        "{} now branch{} from \"{to}\"; {} merge base{} still the copy taken from \"{name}\"",
+                        reparented.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", "),
+                        if reparented.len() == 1 { "es" } else { "" },
+                        if reparented.len() == 1 { "its" } else { "their" },
+                        if reparented.len() == 1 { " is" } else { "s are" },
+                    ),
+                );
+            }
+            if !orphaned.is_empty() {
+                crate::core::notice::push(
+                    "WARNING",
+                    "01000",
+                    format!(
+                        "{} {} made from \"{name}\", which was not a branch, so {} no parent to merge into now",
+                        orphaned.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", "),
+                        if orphaned.len() == 1 { "was" } else { "were" },
+                        if orphaned.len() == 1 { "it has" } else { "they have" },
+                    ),
+                );
+            }
+        }
+
         if let Some(root) = &self.root {
             let path = std::path::Path::new(root).join(name);
 

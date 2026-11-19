@@ -97,6 +97,12 @@ pub struct BranchMeta {
     /// committed.
     #[serde(default)]
     pub base_generation: u64,
+    /// Branches it was re-parented through, oldest first: each a branch it
+    /// was made from (directly or through another) that was dropped, so its
+    /// parent became that branch's parent. Its base is still the copy taken
+    /// from the first of them.
+    #[serde(default)]
+    pub via: Vec<String>,
 }
 
 impl BranchMeta {
@@ -155,6 +161,13 @@ pub struct BranchListing {
     pub sessions: u64,
     /// Bytes the base holds, when there is one.
     pub base_bytes: Option<u64>,
+    /// Branches between it and the first ancestor that is not a branch (or
+    /// no longer exists): 1 for a branch of an ordinary database.
+    pub depth: u64,
+    /// Its ancestry, root first, ending with its own name: `prod/dev/x`.
+    pub path: String,
+    /// Branches made from it.
+    pub children: u64,
 }
 
 /// What a copy did, for the branch's metadata and the operator.
@@ -807,29 +820,98 @@ impl DatabaseCatalog {
         }
     }
 
-    /// Every branch, ordered by name.
+    /// Every branch, in tree order: each after its parent, siblings by name
+    /// (ordered by [`BranchListing::path`]).
     pub fn branches(&self) -> Vec<BranchListing> {
-        let mut out = Vec::new();
+        let mut metas: HashMap<String, BranchMeta> = HashMap::new();
+        let mut sessions: HashMap<String, u64> = HashMap::new();
         for entry in self.databases.iter() {
             let Some(dir) = self.directory_of(entry.key()) else {
                 continue;
             };
-            let Some(meta) = BranchMeta::read(&dir) else {
-                continue;
-            };
+            if let Some(meta) = BranchMeta::read(&dir) {
+                sessions.insert(
+                    entry.key().clone(),
+                    entry.sessions.load(Ordering::Acquire) as u64,
+                );
+                metas.insert(entry.key().clone(), meta);
+            }
+        }
+        let mut out = Vec::new();
+        for (name, meta) in &metas {
             let base_bytes = self
-                .base_path(entry.key(), meta.base_generation)
+                .base_path(name, meta.base_generation)
                 .filter(|d| meta.has_base && d.is_dir())
                 .map(|d| dir_bytes(&d));
+            let (ancestors, _) = ancestry(name, &metas);
+            let mut path: Vec<String> = ancestors.iter().rev().cloned().collect();
+            path.push(name.clone());
             out.push(BranchListing {
-                name: entry.key().clone(),
+                name: name.clone(),
                 parent_exists: self.databases.contains_key(&meta.parent),
-                meta,
-                sessions: entry.sessions.load(Ordering::Acquire) as u64,
+                sessions: sessions.get(name).copied().unwrap_or(0),
                 base_bytes,
+                depth: ancestors
+                    .iter()
+                    .filter(|a| metas.contains_key(*a))
+                    .count() as u64
+                    + 1,
+                path: path.join("/"),
+                children: metas.values().filter(|m| &m.parent == name).count() as u64,
+                meta: meta.clone(),
             });
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// `dropped` is going: each branch made from it is re-parented to
+    /// `dropped`'s own parent, when `dropped` was a branch, keeping its base
+    /// (docs/branching.md §8). Returns `(child, new parent)` per child; a
+    /// child of a database that was not a branch keeps naming it, and can no
+    /// longer be merged. Run while `dropped`'s directory still exists.
+    pub(super) fn reparent_children(&self, dropped: &str) -> Vec<(String, Option<String>)> {
+        let Some(dropped_dir) = self.directory_of(dropped) else {
+            return Vec::new();
+        };
+        let grandparent = BranchMeta::read(&dropped_dir).map(|m| m.parent);
+        let mut out = Vec::new();
+        for entry in self.databases.iter() {
+            if entry.key() == dropped {
+                continue;
+            }
+            let Some(dir) = self.directory_of(entry.key()) else {
+                continue;
+            };
+            let Some(mut meta) = BranchMeta::read(&dir) else {
+                continue;
+            };
+            if meta.parent != dropped {
+                continue;
+            }
+            if let Some(grandparent) = &grandparent {
+                meta.via.push(dropped.to_string());
+                meta.parent = grandparent.clone();
+                if let Err(e) = meta.write(&dir) {
+                    warn!(
+                        "branch \"{}\" could not be re-parented from \"{}\" to \"{}\": {}",
+                        entry.key(),
+                        dropped,
+                        grandparent,
+                        e
+                    );
+                    continue;
+                }
+                info!(
+                    "Branch \"{}\" re-parented from \"{}\" to \"{}\"",
+                    entry.key(),
+                    dropped,
+                    grandparent
+                );
+            }
+            out.push((entry.key().clone(), grandparent.clone()));
+        }
+        out.sort();
         out
     }
 
@@ -1027,6 +1109,7 @@ impl DatabaseCatalog {
             bytes,
             merged_at: None,
             base_generation,
+            via: Vec::new(),
         };
         if options.with_base {
             self.write_base(name, staging, final_dir, base_generation)
@@ -1356,6 +1439,7 @@ impl DatabaseCatalog {
                 bytes: dir_bytes(&parent_dir),
                 merged_at: None,
                 base_generation: 0,
+                via: Vec::new(),
             },
         };
         let swapped = intent
@@ -1508,6 +1592,47 @@ impl DatabaseCatalog {
             .map(|dir| read_ddl(&dir))
             .unwrap_or_default()
     }
+}
+
+/// `name`'s ancestors, nearest first, through the branches in `metas`: each
+/// branch's parent, until one that is not a branch (included, it is the
+/// tree's root) — and whether the walk stopped at a cycle, which only a
+/// damaged metadata file can make.
+fn ancestry(name: &str, metas: &HashMap<String, BranchMeta>) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    let mut at = name;
+    while let Some(meta) = metas.get(at) {
+        if meta.parent == name || out.contains(&meta.parent) {
+            return (out, true);
+        }
+        out.push(meta.parent.clone());
+        at = &meta.parent;
+    }
+    (out, false)
+}
+
+/// Every branch directory under `root` whose metadata names `from` as its
+/// parent, other than those in `except`, now names `to`: what a `PROMOTE`
+/// does for the promoted branch's own branches, which follow its data to
+/// its new name. Idempotent, so a promote finished after a crash runs it
+/// again safely.
+fn repoint_children(root: &Path, from: &str, to: &str, except: &[&Path]) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let dir = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            || entry.file_name().to_string_lossy().starts_with('.')
+            || except.iter().any(|e| *e == dir.as_path())
+        {
+            continue;
+        }
+        if let Some(mut meta) = BranchMeta::read(&dir)
+            && meta.parent == from
+        {
+            meta.parent = to.to_string();
+            meta.write(&dir)?;
+        }
+    }
+    Ok(())
 }
 
 // ---- the DDL a branch records -------------------------------------------------
@@ -1729,6 +1854,9 @@ fn finish_promote(root: &Path, intent: &mut PromoteIntent) -> io::Result<()> {
         },
     }
     intent.branch_meta.write(&branch_dir)?;
+    // The promoted branch's own branches were copied from what is now the
+    // parent's name, and follow it there.
+    repoint_children(root, &intent.branch, &intent.parent, &[&parent_dir, &branch_dir])?;
     let _ = std::fs::remove_file(branch_dir.join(DDL_FILE));
     let _ = std::fs::remove_file(parent_dir.join(DDL_FILE));
     std::fs::remove_file(root.join(PROMOTE_INTENT))?;

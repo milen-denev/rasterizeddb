@@ -861,6 +861,9 @@ pub(super) struct Said {
     /// Each column's name, alongside `columns`.
     pub(super) names: Vec<String>,
     pub(super) rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// Notices and warnings, by message. Not sent on the native protocol;
+    /// read by pgwire's own sessions and tests.
+    pub(super) notices: Vec<String>,
 }
 
 fn cstring(bytes: &[u8], at: &mut usize) -> Option<String> {
@@ -944,7 +947,19 @@ pub(super) fn read_messages(out: &[u8]) -> Option<Said> {
                 said.rows.push(row);
             }
             // Notices (a warning, `there is no transaction in progress`):
-            // the native protocol has nowhere to put them.
+            // the native protocol has nowhere to put them, but its reader
+            // keeps them for the callers that do.
+            b'N' => {
+                let mut p = 0usize;
+                while p < body.len() && body[p] != 0 {
+                    let field = body[p];
+                    p += 1;
+                    let value = cstring(body, &mut p)?;
+                    if field == b'M' {
+                        said.notices.push(value);
+                    }
+                }
+            }
             _ => {}
         }
     }

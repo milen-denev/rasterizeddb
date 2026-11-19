@@ -6380,6 +6380,10 @@ where
                         CatalogCell::Number(b.meta.bytes),
                         CatalogCell::Number(b.base_bytes.unwrap_or(0)),
                         CatalogCell::Number(b.sessions),
+                        CatalogCell::Number(b.depth),
+                        CatalogCell::Text(b.path.clone()),
+                        CatalogCell::Number(b.children),
+                        CatalogCell::Text(b.meta.via.join(", ")),
                     ])
                 })
                 .collect();

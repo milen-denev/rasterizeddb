@@ -161,6 +161,7 @@ fn an_interrupted_promote_is_finished_from_any_point() {
         bytes: 0,
         merged_at: None,
         base_generation: 0,
+        via: Vec::new(),
     };
     // (renames done before the crash, step recorded)
     for (done, recorded) in [(0u8, 0u8), (1, 0), (1, 1), (2, 1), (2, 2), (3, 2), (3, 3)] {

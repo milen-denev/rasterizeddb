@@ -36,7 +36,9 @@ use super::*;
 use crate::core::database::catalog::branch::ConflictPolicy;
 
 /// `SHOW BRANCHES`.
-pub(super) const BRANCH_COLUMNS: [(&str, DbType); 11] = [
+/// The tree columns come last, so a client reading the first eleven by
+/// position reads what it always did.
+pub(super) const BRANCH_COLUMNS: [(&str, DbType); 15] = [
     ("branch", DbType::STRING),
     ("parent", DbType::STRING),
     ("parent_exists", DbType::BOOL),
@@ -48,6 +50,10 @@ pub(super) const BRANCH_COLUMNS: [(&str, DbType); 11] = [
     ("size_bytes", DbType::I64),
     ("base_bytes", DbType::I64),
     ("sessions", DbType::I64),
+    ("depth", DbType::I64),
+    ("path", DbType::STRING),
+    ("children", DbType::I64),
+    ("via", DbType::STRING),
 ];
 
 /// `SHOW BRANCH DIFF` and `MERGE BRANCH`: one row per table with a change.
@@ -379,6 +385,10 @@ struct TablePlan {
     writes: Vec<String>,
     /// Deletes, run children-first.
     deletes_sql: Vec<String>,
+    /// Columns the branch wrote that the parent does not have (it dropped
+    /// them, or never had them: a branch re-parented past the branch that
+    /// added them), left out of what is written.
+    left_out: BTreeSet<String>,
 }
 
 struct TableInput<'a> {
@@ -406,12 +416,13 @@ fn condition(columns: &[String], oids: &[i32], positions: &[usize], row: &[Cell]
         .join(" AND ")
 }
 
-fn insert_statements(input: &TableInput<'_>, rows: &[Vec<Cell>]) -> Vec<String> {
+fn insert_statements(input: &TableInput<'_>, skip: &[bool], rows: &[Vec<Cell>]) -> Vec<String> {
     let writable: Vec<usize> = (0..input.columns.len())
         .filter(|&i| {
-            !input
-                .generated
-                .contains(&input.columns[i].to_ascii_lowercase())
+            !skip[i]
+                && !input
+                    .generated
+                    .contains(&input.columns[i].to_ascii_lowercase())
         })
         .collect();
     let names = writable
@@ -466,6 +477,10 @@ fn plan_table(input: TableInput<'_>) -> TablePlan {
         .as_ref()
         .map(|p| p.has.clone())
         .unwrap_or_else(|| vec![true; n]);
+    // Columns the base had and the parent has not: nothing the parent can
+    // hold, so never written there. (A column only the branch has is one it
+    // added, which a merge's replayed DDL gives the parent first.)
+    let skip: Vec<bool> = (0..n).map(|i| base_has[i] && !parent_has[i]).collect();
 
     // A key repeated on any side (NULLs in a unique key) does not identify
     // rows: compared as whole rows instead.
@@ -481,7 +496,7 @@ fn plan_table(input: TableInput<'_>) -> TablePlan {
     });
 
     match key {
-        Some(key) => plan_keyed(&input, &key, &base_has, &parent_has, &mut plan),
+        Some(key) => plan_keyed(&input, &key, &base_has, &parent_has, &skip, &mut plan),
         None => {
             if base_has.iter().any(|h| !h) {
                 plan.conflicts.push(
@@ -490,7 +505,7 @@ fn plan_table(input: TableInput<'_>) -> TablePlan {
                         .to_string(),
                 );
             } else {
-                plan_keyless(&input, &mut plan);
+                plan_keyless(&input, &skip, &mut plan);
             }
         }
     }
@@ -502,6 +517,7 @@ fn plan_keyed(
     key: &[usize],
     base_has: &[bool],
     parent_has: &[bool],
+    skip: &[bool],
     plan: &mut TablePlan,
 ) {
     let key_of = |r: &Vec<Cell>| key.iter().map(|&i| r[i].clone()).collect::<Vec<Cell>>();
@@ -615,6 +631,7 @@ fn plan_keyed(
         match (r, p) {
             (Some(r), None) => {
                 plan.inserts += 1;
+                note_left_out(input, skip, r, plan);
                 inserts.push(r.clone());
             }
             (Some(r), Some(p)) => {
@@ -626,7 +643,15 @@ fn plan_keyed(
                             .generated
                             .contains(&input.columns[i].to_ascii_lowercase())
                     })
-                    .filter(|&i| r[i] != ep[i] || !parent_has[i])
+                    .filter(|&i| {
+                        if skip[i] {
+                            if r[i] != ep[i] {
+                                plan.left_out.insert(input.columns[i].clone());
+                            }
+                            return false;
+                        }
+                        r[i] != ep[i] || !parent_has[i]
+                    })
                     .map(|i| {
                         format!(
                             "{} = {}",
@@ -656,10 +681,20 @@ fn plan_keyed(
             (None, None) => {}
         }
     }
-    plan.writes.extend(insert_statements(input, &inserts));
+    plan.writes.extend(insert_statements(input, skip, &inserts));
 }
 
-fn plan_keyless(input: &TableInput<'_>, plan: &mut TablePlan) {
+/// Records the columns of `row` an insert leaves out for want of them on the
+/// parent, when it holds anything there.
+fn note_left_out(input: &TableInput<'_>, skip: &[bool], row: &[Cell], plan: &mut TablePlan) {
+    for (i, cell) in row.iter().enumerate() {
+        if skip[i] && cell.is_some() {
+            plan.left_out.insert(input.columns[i].clone());
+        }
+    }
+}
+
+fn plan_keyless(input: &TableInput<'_>, skip: &[bool], plan: &mut TablePlan) {
     let count = |rows: &[Vec<Cell>]| -> BTreeMap<Vec<Cell>, u64> {
         let mut m = BTreeMap::new();
         for r in rows {
@@ -671,7 +706,8 @@ fn plan_keyless(input: &TableInput<'_>, plan: &mut TablePlan) {
     let cb = count(input.base.as_ref().map_or(&empty, |b| &b.rows));
     let cr = count(&input.branch.rows);
     let cp = count(input.parent.as_ref().map_or(&empty, |p| &p.rows));
-    let all: Vec<usize> = (0..input.columns.len()).collect();
+    // A row is found on the parent by the columns it has.
+    let all: Vec<usize> = (0..input.columns.len()).filter(|&i| !skip[i]).collect();
     let mut inserts: Vec<Vec<Cell>> = Vec::new();
     let mut tuples: Vec<&Vec<Cell>> = cb.keys().chain(cr.keys()).collect();
     tuples.sort();
@@ -694,6 +730,7 @@ fn plan_keyless(input: &TableInput<'_>, plan: &mut TablePlan) {
                 continue;
             }
         }
+        note_left_out(input, skip, t, plan);
         if r > p {
             plan.inserts += r - p;
             for _ in 0..(r - p) {
@@ -713,7 +750,7 @@ fn plan_keyless(input: &TableInput<'_>, plan: &mut TablePlan) {
             }
         }
     }
-    let statements = insert_statements(input, &inserts);
+    let statements = insert_statements(input, skip, &inserts);
     // Written back after the delete that made room for them.
     plan.deletes_sql.extend(statements);
 }
@@ -1090,7 +1127,10 @@ async fn merge_with(
 
     let mut conflicts: Vec<String> = schema_conflicts.clone();
     for (table, plan) in &plans {
-        if plan.inserts + plan.updates + plan.deletes == 0 && plan.conflicts.is_empty() {
+        if plan.inserts + plan.updates + plan.deletes == 0
+            && plan.conflicts.is_empty()
+            && plan.left_out.is_empty()
+        {
             continue;
         }
         conflicts.extend(plan.conflicts.iter().map(|c| format!("{table}: {c}")));
@@ -1101,7 +1141,14 @@ async fn merge_with(
             updates: plan.updates,
             deletes: plan.deletes,
             conflicts: plan.conflicts.len() as u64,
-            detail: plan.conflicts.first().cloned().unwrap_or_default(),
+            detail: match (plan.conflicts.first(), plan.left_out.is_empty()) {
+                (Some(c), _) => c.clone(),
+                (None, false) => format!(
+                    "the parent has no column {}; the branch's values in it are left out",
+                    plan.left_out.iter().cloned().collect::<Vec<_>>().join(", ")
+                ),
+                (None, true) => String::new(),
+            },
         });
     }
 
