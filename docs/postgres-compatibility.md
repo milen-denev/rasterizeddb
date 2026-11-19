@@ -1352,17 +1352,22 @@ longer gaps. What is still missing:
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: a row compared with a subquery (`(a, b) IN (SELECT …)`),
-  `TABLESAMPLE`, the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
+- **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
+  WHERE u.k = t.k)`; an uncorrelated one works), a correlated `EXISTS` over a
+  derived table that names its columns (`FROM (SELECT …) s(c1, c2)`) or reads
+  an outer column unqualified (`WHERE s.x = a`; `t.a` works), `TABLESAMPLE`,
+  the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
   on a table with no unique column, and a `WINDOW` clause inside a subquery
   (the outermost one works).
 - **Functions**: the ordered-set aggregates (`percentile_cont`,
   `percentile_disc`, `mode`), `json_object_agg`/`jsonb_object_agg`,
   `regexp_matches` and `regexp_split_to_table` in a select list, the
-  `jsonb_path_*` functions, `jsonb_insert`, `jsonb_pretty`, `row_to_json`,
-  `to_number`, `date_bin`, `overlay(… placing …)`, the XML functions, and
+  `jsonb_path_*` functions, `row_to_json`, `to_number`, `date_bin`, the XML
+  functions, and
   the `json_*` (not `jsonb_*`) table functions.
-- **Operators**: `^@`, the prefix `|/` and `@`, and `OVERLAPS`.
+- **Operators**: `^@`, the prefix `|/` and `@`, and `OVERLAPS`. In a `WHERE`, a
+  `jsonb` operator over a function's result (`jsonb_set(doc, '{d}', '1') ? 'd'`)
+  is refused (0A000); over a column, and in a select list, it works.
 - **Table functions**: a `jsonb_array_elements` item's alias names the item,
   not its column, so `SELECT x FROM t, jsonb_array_elements_text(t.tags) x`
   fails (write `x.value`). A lateral `jsonb_each(t.j)` runs for every row of
@@ -1375,21 +1380,23 @@ longer gaps. What is still missing:
 A statement sent over the native protocol (`rasterizeddb_client`)
 gets the same preparation as an autocommit statement over pgwire: comments,
 typed literals (`DATE '…'`), `CREATE UNIQUE INDEX` as a unique constraint,
-constant folding, `IN`/`EXISTS`/scalar subqueries, a `SELECT` with no `FROM`
-(`SELECT 1`, `SELECT now()`), and the catalogue views (`pg_tables`,
-`pg_indexes`, `information_schema.*`). The statements that administer the
-server (`BACKUP`, `RESTORE`, `STORAGE`, `REPLICATION`, `SET CONFIG`,
-`KV FLUSHALL`, databases, roles) need a superuser when the listener requires
-authentication, as on pgwire.
+constant folding, `IN`/`EXISTS`/scalar subqueries, `WITH` and derived tables
+(`FROM (SELECT …)`), views, sequences and the other schema objects, a
+`SELECT` with no `FROM` (`SELECT 1`, `SELECT now()`), and the catalogue views
+(`pg_tables`, `pg_indexes`, `information_schema.*`). A cell arrives typed by
+its column: `jsonb`, arrays, `bytea` and a NUMERIC's scale are kept. The
+statements that administer the server (`BACKUP`, `RESTORE`, `STORAGE`,
+`REPLICATION`, `SET CONFIG`, `KV FLUSHALL`, databases, roles) need a
+superuser when the listener requires authentication, as on pgwire.
 
-What needs a session it does not have is refused by name rather than run in
-part:
+A transaction block (`BEGIN` … `COMMIT`, `SAVEPOINT`, `LOCK TABLE`) runs on a
+`rastcp/1` connection, which holds one session, as a pgwire connection does;
+the client gives each transaction a connection of its own. A multiplexed
+`rastcp/2` connection carries requests from unrelated callers at once, so it
+refuses transaction control (0A000).
+
+Refused by name rather than run in part:
 
 - **One statement per request.** `INSERT …; INSERT …` is refused whole. Before
   2026-11-16 the first statement ran and the second was dropped with a success
   reply.
-- **No transaction block.** `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and
-  `LOCK TABLE` are refused; each statement commits on its own.
-- **No `WITH` or `FROM (SELECT …)`.** A CTE or a derived table runs its parts
-  and the outer statement in one statement transaction that only the pgwire
-  listener sets up. Use pgwire for those.

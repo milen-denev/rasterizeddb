@@ -1638,6 +1638,118 @@ pub fn quantified_predicate(
     })
 }
 
+/// When `found`'s `IN` reads a row, `(e1, e2, …) [NOT] IN (SELECT …)`: where
+/// that row's `(` opens and how many values it holds. `None` for a single
+/// operand, a parenthesised one (`(a) IN`) and a call (`lower(a, b) IN`).
+pub fn row_in_operand(sql: &str, found: &InSubquery) -> Option<(usize, usize)> {
+    let head = match found.negated_start {
+        Some(not) => sql[..not].trim_end(),
+        None => {
+            let head = sql[..found.start].trim_end();
+            let cut = head.len().checked_sub(2)?;
+            if !head.get(cut..)?.eq_ignore_ascii_case("IN") {
+                return None;
+            }
+            head[..cut].trim_end()
+        }
+    };
+    if !head.ends_with(')') {
+        return None;
+    }
+    let close = head.len() - 1;
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut open = None;
+    for i in (0..=close).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open?;
+    // A quote holding a parenthesis misleads the count above: the pair has
+    // to be one by the quote-aware matcher too.
+    if crate::core::sql_scan::matching_close(sql, open) != Some(close) {
+        return None;
+    }
+    let before = sql[..open].trim_end();
+    if before.bytes().last().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'"') {
+        let word_start = before.bytes().rposition(|b| !(b.is_ascii_alphanumeric() || b == b'_')).map_or(0, |p| p + 1);
+        let word = &before[word_start..];
+        // `WHERE (a, b) IN`, `AND (a, b) IN`: a keyword, not a function's name.
+        if !["WHERE", "AND", "OR", "NOT", "ON", "HAVING", "SELECT", "WHEN", "THEN", "ELSE", "IS"]
+            .iter()
+            .any(|k| word.eq_ignore_ascii_case(k))
+        {
+            return None;
+        }
+    }
+    let arity = crate::core::sql_scan::split_top_level(&sql[open + 1..close], b',').len();
+    (arity >= 2).then_some((open, arity))
+}
+
+/// The rows of a subquery as a row list for `(e1, e2, …) IN (…)`, each row
+/// typed as [`rows_to_value_list`] types one value and a NULL written as
+/// `NULL`, which the row comparison reads three-valued as PostgreSQL does.
+/// `None` when there are no rows: `IN ()` is no SQL, and the caller writes
+/// the predicate's constant instead.
+pub fn rows_to_row_list(rows: &[Row], arity: usize, document: &[bool], exact_text: &[bool]) -> Result<Option<String>, String> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(2 + rows.len() * 8 * arity);
+    out.push('(');
+    let mut seen: ahash::HashSet<Vec<u8>> = ahash::HashSet::with_capacity_and_hasher(rows.len(), Default::default());
+    let mut first = true;
+    for row in rows {
+        match row.columns.len().cmp(&arity) {
+            std::cmp::Ordering::Greater => return Err("subquery has too many columns".to_string()),
+            std::cmp::Ordering::Less => return Err("subquery has too few columns".to_string()),
+            std::cmp::Ordering::Equal => {}
+        }
+        let mut key = Vec::new();
+        let mut literals: Vec<String> = Vec::with_capacity(arity);
+        for (at, column) in row.columns.iter().enumerate() {
+            if column.column_type == DbType::NULL {
+                key.push(0);
+                literals.push("NULL".to_string());
+                continue;
+            }
+            let bytes = column.data.into_slice();
+            let db_type = if document.get(at).copied().unwrap_or(false) && column.column_type == DbType::STRING {
+                DbType::JSONB
+            } else {
+                column.column_type.clone()
+            };
+            let literal = subquery_literal(&db_type, bytes, exact_text.get(at).copied().unwrap_or(true))
+                .ok_or_else(|| format!("subquery returned a {db_type} value that cannot be compared"))?;
+            key.push(1);
+            key.extend_from_slice(&(literal.len() as u32).to_le_bytes());
+            key.extend_from_slice(literal.as_bytes());
+            literals.push(literal);
+        }
+        if !seen.insert(key) {
+            continue;
+        }
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push('(');
+        out.push_str(&literals.join(", "));
+        out.push(')');
+    }
+    out.push(')');
+    Ok(Some(out))
+}
+
 pub fn rows_to_value_list(rows: &[Row], document: bool, exact_text: bool) -> Result<(String, bool), String> {
     rows_to_value_list_as(rows, document, exact_text, false)
 }
@@ -1730,6 +1842,20 @@ pub fn rows_to_value_list_as(
 #[cfg(test)]
 mod correlation_tests {
     use super::*;
+
+    #[test]
+    fn a_row_operand_is_told_from_a_single_one() {
+        let row = |sql: &str| row_in_operand(sql, &find_in_subquery(sql).unwrap()).map(|(open, n)| (sql[open..open + 1].to_string(), open, n));
+        assert_eq!(row("SELECT 1 FROM t WHERE (a, b) IN (SELECT x, y FROM u)"), Some(("(".to_string(), 22, 2)));
+        assert_eq!(row("SELECT 1 FROM t WHERE (a, (b), c) NOT IN (SELECT x, y, z FROM u)"), Some(("(".to_string(), 22, 3)));
+        assert_eq!(row("SELECT 1 FROM t WHERE NOT (a,b) IN (SELECT x, y FROM u)"), Some(("(".to_string(), 26, 2)));
+        assert_eq!(row("SELECT (a, b) IN (SELECT x, y FROM u) FROM t"), Some(("(".to_string(), 7, 2)));
+        assert_eq!(row("SELECT 1 FROM t WHERE a IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE (a) IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE coalesce(a, b) IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE a NOT IN (SELECT x FROM u)"), None);
+        assert_eq!(row("SELECT 1 FROM t WHERE f(')') = 1 AND g(a, b) IN (SELECT x FROM u)"), None);
+    }
 
     #[test]
     fn a_null_goes_back_into_the_list() {

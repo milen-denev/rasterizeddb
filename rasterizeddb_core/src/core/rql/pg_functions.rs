@@ -208,6 +208,9 @@ pub enum PgFunc {
     Scale,
     MinScale,
     TrimScale,
+    Overlay,
+    JsonbPretty,
+    JsonbInsert,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -229,7 +232,7 @@ pub const NAMES: &[&str] = &[
     "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
     "ISFINITE", "GET_BYTE", "REGEXP_COUNT", "REGEXP_SUBSTR", "REGEXP_SPLIT_TO_ARRAY", "ARRAY_POSITION",
     "ARRAY_REMOVE", "ARRAY_REPLACE", "ARRAY_UPPER", "ARRAY_LOWER", "ARRAY_DIMS", "TRIM_ARRAY", "ARRAY_FILL",
-    "SCALE", "MIN_SCALE", "TRIM_SCALE",
+    "SCALE", "MIN_SCALE", "TRIM_SCALE", "OVERLAY", "JSONB_PRETTY", "JSONB_INSERT",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -338,6 +341,9 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "SCALE" => (Scale, &[1]),
         "MIN_SCALE" => (MinScale, &[1]),
         "TRIM_SCALE" => (TrimScale, &[1]),
+        "OVERLAY" => (Overlay, &[3, 4]),
+        "JSONB_PRETTY" => (JsonbPretty, &[1]),
+        "JSONB_INSERT" => (JsonbInsert, &[3, 4]),
         "EXP" => (Exp, &[1]),
         "LN" => (Ln, &[1]),
         "LOG" => (Log, &[1, 2]),
@@ -472,7 +478,8 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         MakeTimestamp | ToTimestamp | TimezoneToLocal | TimezoneToUtc => DbType::DATETIME,
         Age | JustifyHours | JustifyDays | JustifyInterval => DbType::INTERVAL,
         Decode => DbType::BYTEA,
-        JsonBuildObject | JsonBuildArray | ToJson | JsonbSet | JsonbStripNulls => DbType::JSONB,
+        JsonBuildObject | JsonBuildArray | ToJson | JsonbSet | JsonbStripNulls | JsonbInsert => DbType::JSONB,
+        Overlay if first() == DbType::BYTEA => DbType::BYTEA,
         JsonBuildObjectText | JsonBuildArrayText | ToJsonText => DbType::JSONTEXT,
         StringToArray | ArrayCtor | ArraySlice | ArrayCast | ArrayAppend | ArrayPrepend | ArrayCat => DbType::ARRAY,
         BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | BitNot => bitwise_type(func, args),
@@ -493,6 +500,59 @@ pub fn yields_json_text(func: PgFunc) -> bool {
 /// offset: `make_timestamp`. (`to_timestamp` is a `timestamptz`.)
 pub fn yields_timestamp(func: PgFunc) -> bool {
     matches!(func, PgFunc::MakeTimestamp | PgFunc::TimezoneToLocal)
+}
+
+/// `overlay(s PLACING r FROM from FOR len)`, PostgreSQL's definition:
+/// `substring(s, 1, from - 1) || r || substring(s, from + len)`, over
+/// characters or bytes. A start before the first unit leaves a negative
+/// length for the first part, which is refused as `substring` refuses it.
+fn overlay_units<T: Clone>(s: &[T], placing: &[T], from: i64, len: i64) -> Result<Vec<T>, String> {
+    if from < 1 {
+        return Err("negative substring length not allowed".to_string());
+    }
+    let resume = i32::try_from(from)
+        .ok()
+        .zip(i32::try_from(len).ok())
+        .and_then(|(f, l)| f.checked_add(l))
+        .ok_or("integer out of range")? as i64;
+    let head = ((from - 1) as usize).min(s.len());
+    let tail = ((resume.max(1) - 1) as usize).min(s.len());
+    let mut out = Vec::with_capacity(head + placing.len() + s.len() - tail);
+    out.extend_from_slice(&s[..head]);
+    out.extend_from_slice(placing);
+    out.extend_from_slice(&s[tail..]);
+    Ok(out)
+}
+
+/// A boolean argument (`create_missing`, `insert_after`): a boolean as it
+/// is stored, or text PostgreSQL reads as one (`'yes'`, `'t'`, `'on'`).
+fn bool_argument(v: &Value) -> Result<bool, String> {
+    match v {
+        Value::Data { bytes, db_type: DbType::BOOL } => Ok(bytes.first() == Some(&1)),
+        other => {
+            let text = text_of(other);
+            match text.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "y" | "yes" | "on" | "1" => Ok(true),
+                "f" | "false" | "n" | "no" | "off" | "0" => Ok(false),
+                _ => Err(format!("invalid input syntax for type boolean: \"{text}\"")),
+            }
+        }
+    }
+}
+
+/// A `text[]` path argument (`'{a,0}'`, `ARRAY['a','0']`), each element
+/// present: a NULL one is refused with PostgreSQL's words.
+fn json_path_of(v: &Value) -> Result<Vec<String>, String> {
+    match v {
+        Value::Data { bytes, db_type: DbType::ARRAY } => {
+            array_elements(&crate::core::value_codec::format_array(bytes).ok_or("could not read the path")?)?
+        }
+        other => array_elements(&text_of(other))?,
+    }
+    .into_iter()
+    .enumerate()
+    .map(|(i, e)| e.ok_or_else(|| format!("path element at position {} is null", i + 1)))
+    .collect()
 }
 
 /// A `jsonb` argument as an encoded document: a document as it is stored,
@@ -624,6 +684,17 @@ pub fn standard_syntax(upper: &str, args: &str) -> Option<(String, String)> {
                 Some(p) => ("SUBSTR".to_string(), format!("{value}, {start}, {}", args[p + 3..].trim())),
                 None => ("SUBSTR".to_string(), format!("{value}, {start}")),
             })
+        }
+        "OVERLAY" => {
+            let placing = find_keyword(args, "PLACING", 0)?;
+            let from = find_keyword(args, "FROM", placing)?;
+            let for_ = find_keyword(args, "FOR", from);
+            let start = &args[from + 4..for_.unwrap_or(args.len())];
+            let mut plain = format!("{}, {}, {}", args[..placing].trim(), args[placing + 7..from].trim(), start.trim());
+            if let Some(p) = for_ {
+                plain = format!("{plain}, {}", args[p + 3..].trim());
+            }
+            Some(("OVERLAY".to_string(), plain))
         }
         "POSITION" => {
             let at = find_keyword(args, "IN", 0)?;
@@ -1872,22 +1943,32 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         Cardinality => int_value(array_elements(&s(0))?.len() as i64),
         JsonbSet => {
-            let path: Vec<String> = match &args[1] {
-                Value::Data { bytes, db_type: DbType::ARRAY } => {
-                    array_elements(&crate::core::value_codec::format_array(bytes).ok_or("could not read the path")?)?
+            let create = args.get(3).map_or(Ok(true), bool_argument)?;
+            data(crate::core::jsonb::set_path(&jsonb_of(&args[0])?, &json_path_of(&args[1])?, &jsonb_of(&args[2])?, create)?, DbType::JSONB)
+        }
+        JsonbInsert => {
+            let after = args.get(3).map_or(Ok(false), bool_argument)?;
+            data(crate::core::jsonb::insert_path(&jsonb_of(&args[0])?, &json_path_of(&args[1])?, &jsonb_of(&args[2])?, after)?, DbType::JSONB)
+        }
+        JsonbPretty => text_value(crate::core::jsonb::pretty(&jsonb_of(&args[0])?)?),
+        Overlay => {
+            let from = int_of(&args[2], "the start")?;
+            match (&args[0], &args[1]) {
+                (Value::Data { bytes, db_type: DbType::BYTEA }, placing) => {
+                    let placing = match placing {
+                        Value::Data { bytes, db_type: DbType::BYTEA } => bytes.clone(),
+                        other => crate::core::value_codec::parse_bytea_literal(&text_of(other))
+                            .ok_or("invalid input syntax for type bytea")?,
+                    };
+                    let len = args.get(3).map_or(Ok(placing.len() as i64), |l| int_of(l, "the length"))?;
+                    data(overlay_units(bytes, &placing, from, len)?, DbType::BYTEA)
                 }
-                other => array_elements(&text_of(other))?,
+                _ => {
+                    let (text, placing): (Vec<char>, Vec<char>) = (s(0).chars().collect(), s(1).chars().collect());
+                    let len = args.get(3).map_or(Ok(placing.len() as i64), |l| int_of(l, "the length"))?;
+                    text_value(overlay_units(&text, &placing, from, len)?.into_iter().collect())
+                }
             }
-            .into_iter()
-            .enumerate()
-            .map(|(i, e)| e.ok_or_else(|| format!("path element at position {} is null", i + 1)))
-            .collect::<Result<_, _>>()?;
-            let create = match args.get(3) {
-                None => true,
-                Some(Value::Data { bytes, db_type: DbType::BOOL }) => bytes.first() == Some(&1),
-                Some(other) => matches!(text_of(other).to_ascii_lowercase().as_str(), "t" | "true"),
-            };
-            data(crate::core::jsonb::set_path(&jsonb_of(&args[0])?, &path, &jsonb_of(&args[2])?, create)?, DbType::JSONB)
         }
         JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
         PgGetUserById => text_value(crate::core::rql::catalog_model::user_by_id(int_of(&args[0], "the role's oid")?)),
@@ -2879,6 +2960,74 @@ mod tests {
     }
     fn shown(v: Value) -> String {
         text_of(&v)
+    }
+
+    #[test]
+    fn overlay_is_postgresql_s() {
+        assert_eq!(
+            standard_syntax("OVERLAY", "'Txxxxas' placing 'hom' from 2 for 4"),
+            Some(("OVERLAY".into(), "'Txxxxas', 'hom', 2, 4".into()))
+        );
+        assert_eq!(standard_syntax("OVERLAY", "s PLACING r FROM 2"), Some(("OVERLAY".into(), "s, r, 2".into())));
+        assert_eq!(standard_syntax("OVERLAY", "s, r, 2"), None);
+        let o = |s: &str, r: &str, from: i64, len: Option<i64>| {
+            let mut args = vec![t(s), t(r), i(from)];
+            args.extend(len.map(i));
+            call(PgFunc::Overlay, &args).map(shown)
+        };
+        // What PostgreSQL 17 answers.
+        assert_eq!(o("Txxxxas", "hom", 2, Some(4)).unwrap(), "Thomas");
+        assert_eq!(o("abc", "XY", 2, None).unwrap(), "aXY");
+        assert_eq!(o("abc", "XY", 5, None).unwrap(), "abcXY");
+        assert_eq!(o("abc", "XY", 2, Some(0)).unwrap(), "aXYbc");
+        assert_eq!(o("abc", "XY", 2, Some(10)).unwrap(), "aXY");
+        assert_eq!(o("abc", "XY", 1, Some(-1)).unwrap(), "XYabc");
+        assert_eq!(o("ñandú", "Ü", 2, Some(1)).unwrap(), "ñÜndú");
+        assert_eq!(o("abc", "XY", 0, None).unwrap_err(), "negative substring length not allowed");
+        let bytes = call(
+            PgFunc::Overlay,
+            &[Value::Data { bytes: vec![1, 2, 3], db_type: DbType::BYTEA }, t("\\xff"), i(2)],
+        )
+        .unwrap();
+        assert!(matches!(bytes, Value::Data { ref bytes, db_type: DbType::BYTEA } if bytes == &[1, 0xff, 3]));
+    }
+
+    #[test]
+    fn jsonb_insert_and_pretty_are_postgresql_s() {
+        let j = |s: &str| Value::Data { bytes: crate::core::jsonb::encode_text(s).unwrap(), db_type: DbType::JSONB };
+        let ins = |doc: &str, path: &str, v: &str, after: Option<bool>| {
+            let mut args = vec![j(doc), t(path), j(v)];
+            args.extend(after.map(|a| t(if a { "true" } else { "false" })));
+            call(PgFunc::JsonbInsert, &args).map(shown)
+        };
+        // What PostgreSQL 17 answers.
+        assert_eq!(ins(r#"{"a":[0,1,2]}"#, "{a,1}", r#""new""#, None).unwrap(), r#"{"a": [0, "new", 1, 2]}"#);
+        assert_eq!(ins(r#"{"a":[0,1,2]}"#, "{a,1}", r#""new""#, Some(true)).unwrap(), r#"{"a": [0, 1, "new", 2]}"#);
+        assert_eq!(ins(r#"{"a":[0,1,2]}"#, "{a,-1}", "9", None).unwrap(), r#"{"a": [0, 1, 9, 2]}"#);
+        assert_eq!(ins(r#"{"a":[0,1,2]}"#, "{a,10}", "9", None).unwrap(), r#"{"a": [0, 1, 2, 9]}"#);
+        assert_eq!(ins(r#"{"a":[0,1,2]}"#, "{a,-10}", "9", None).unwrap(), r#"{"a": [9, 0, 1, 2]}"#);
+        assert_eq!(ins("[1,2]", "{-10}", "9", Some(true)).unwrap(), "[9, 1, 2]");
+        assert_eq!(ins("[1,2]", "{-1}", "9", Some(true)).unwrap(), "[1, 2, 9]");
+        assert_eq!(ins("[]", "{0}", "9", None).unwrap(), "[9]");
+        assert_eq!(ins(r#"{"a":{"x":1}}"#, "{a,y}", "2", None).unwrap(), r#"{"a": {"x": 1, "y": 2}}"#);
+        assert_eq!(ins(r#"{"a":1}"#, "{z,y}", "2", None).unwrap(), r#"{"a": 1}"#);
+        assert_eq!(ins(r#"{"a":1}"#, "{a,0}", "2", None).unwrap(), r#"{"a": 1}"#);
+        assert_eq!(ins("[1]", "{}", "2", None).unwrap(), "[1]");
+        assert_eq!(ins(r#"{"a":1}"#, "{a}", "2", None).unwrap_err(), "cannot replace existing key");
+        assert_eq!(ins("5", "{0}", "2", None).unwrap_err(), "cannot set path in scalar");
+        assert_eq!(ins("[1]", "{x}", "2", None).unwrap_err(), "path element at position 1 is not an integer: \"x\"");
+        assert_eq!(ins("[1]", "{NULL}", "2", None).unwrap_err(), "path element at position 1 is null");
+
+        let pretty = |doc: &str| shown(call(PgFunc::JsonbPretty, &[j(doc)]).unwrap());
+        assert_eq!(
+            pretty(r#"{"a":1,"bb":[1,{"c":null},[]],"d":{}}"#),
+            "{\n    \"a\": 1,\n    \"d\": {\n    },\n    \"bb\": [\n        1,\n        {\n            \"c\": null\n        },\n        [\n        ]\n    ]\n}"
+        );
+        assert_eq!(pretty("[]"), "[\n]");
+        assert_eq!(pretty("{}"), "{\n}");
+        assert_eq!(pretty("5"), "5");
+        assert_eq!(pretty(r#""x""#), r#""x""#);
+        assert_eq!(pretty(r#"{"s":"a\"b, [c]","n":1.50,"e":""}"#), "{\n    \"e\": \"\",\n    \"n\": 1.50,\n    \"s\": \"a\\\"b, [c]\"\n}");
     }
 
     #[test]

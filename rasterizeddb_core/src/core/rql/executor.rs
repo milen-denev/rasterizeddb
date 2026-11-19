@@ -1381,6 +1381,27 @@ pub async fn substitute_in_subqueries(
             }
             Err(e) => return Err(e),
         };
+        // `(a, b) IN (SELECT x, y …)`: the rows as a row list, which the row
+        // comparison reads three-valued (a NULL in either is UNKNOWN, `NOT
+        // IN` included). No rows is no list: the predicate is its constant,
+        // false for `IN` and true for `NOT IN`, whatever the operand holds.
+        if let Some((open, arity)) = subquery::row_in_operand(&current, &found) {
+            let documents = crate::core::rql::cte::document_columns(&found.inner_sql, database);
+            let exact: Vec<bool> = crate::core::rql::cte::blank_padded_columns(&found.inner_sql, database)
+                .into_iter()
+                .map(|padded| !padded)
+                .collect();
+            current = match subquery::rows_to_row_list(&rows, arity, &documents, &exact)? {
+                Some(list) => format!("{}{}{}", &current[..found.start], list, &current[found.end..]),
+                None => format!(
+                    "{}{}{}",
+                    &current[..open],
+                    if found.negated_start.is_some() { "(1 = 1)" } else { "(1 = 0)" },
+                    &current[found.end..]
+                ),
+            };
+            continue;
+        }
         let document = crate::core::rql::cte::document_columns(&found.inner_sql, database)
             .first()
             .copied()
