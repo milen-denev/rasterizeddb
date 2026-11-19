@@ -1345,14 +1345,9 @@ impl Acc {
                             }
                         }
                     }
-                    // An integer summed as a float, as `decode_float` reads it.
-                    _ => {
-                        let Some(int) = IntCell::of(ty, cells.width) else { return false };
-                        int.for_each(cells, |_, v| {
-                            *total += v as f64;
-                            *n += 1;
-                        });
-                    }
+                    // A float total is made for a float argument only
+                    // (`Acc::for_call`); anything else is not this loop's.
+                    _ => return false,
                 }
                 true
             }
@@ -2622,6 +2617,21 @@ pub(crate) struct FixedCells<'c> {
 }
 
 impl FixedCells<'_> {
+    /// Whether row `row` has no value.
+    #[inline(always)]
+    fn is_null(&self, row: usize) -> bool {
+        match self.flags {
+            None => false,
+            Some((flags, width)) => crate::core::rql::nullable::flag_is_set(&flags[row * width..(row + 1) * width]),
+        }
+    }
+
+    /// Row `row`'s cell.
+    #[inline(always)]
+    fn cell(&self, row: usize) -> &[u8] {
+        &self.values[row * self.width..(row + 1) * self.width]
+    }
+
     /// How many rows have a value.
     fn values(&self) -> usize {
         let rows = self.values.len() / self.width;
@@ -2804,6 +2814,20 @@ pub struct Folder<'p> {
     plain: Vec<u8>,
     /// `stride` accumulators per group, group after group.
     accs: Vec<Acc>,
+    /// The group of each row of the chunk being folded (`push_chunk`), kept
+    /// for its allocation.
+    gids: Vec<u32>,
+    /// For a plan grouped by one fixed-width column of at most eight bytes:
+    /// the group of each cell seen, by the cell's own bytes, and of NULL
+    /// (`u32::MAX` until one is seen). Only a memory of what
+    /// [`Self::group_for_key`] answered: two cells of one group (`-0` and
+    /// `0`) are two entries naming it.
+    memo: hashbrown::HashMap<u64, u32, ahash::RandomState>,
+    memo_null: u32,
+    /// The memo has met [`MEMO_CELLS`] different cells and is given up: with
+    /// about a group a row it is a second table as large as the first, a
+    /// miss and an insert for nearly every row.
+    memo_full: bool,
     index: hashbrown::HashTable<u32>,
     /// ahash rather than SipHash: randomly seeded, so a client choosing key
     /// values still cannot aim collisions at it.
@@ -2972,6 +2996,10 @@ impl<'p> Folder<'p> {
             shown,
             plain: Vec::new(),
             accs: Vec::new(),
+            gids: Vec::new(),
+            memo: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+            memo_null: u32::MAX,
+            memo_full: false,
             index: hashbrown::HashTable::new(),
             state: ahash::RandomState::new(),
         }
@@ -3194,47 +3222,12 @@ impl<'p> Folder<'p> {
             }
             return Ok(());
         }
+        if crate::core::processor::column_scan::whole_columns() {
+            return self.push_chunk_by_groups(sources, chunk);
+        }
         for r in 0..chunk.rows {
+            let at = self.group_of_cells(sources, chunk, r)?;
             let cell = |slot: usize| sources.cell(chunk, slot, r);
-            let byte_cell = self.byte_slot.and_then(|slot| match cell(slot) {
-                None => Some(256),
-                Some([b]) => Some(*b as usize),
-                Some(_) => None,
-            });
-            let known = byte_cell
-                .map(|cell| self.byte_groups[cell])
-                .filter(|g| *g != u32::MAX);
-            let at = match known {
-                Some(at) => at as usize,
-                None => {
-                    self.key.clear();
-                    self.plain.clear();
-                    let mut plain = self.shown.is_some().then_some(&mut self.plain);
-                    for (((source, document), legacy_char), float) in self
-                        .key_sources
-                        .iter()
-                        .zip(&self.document_keys)
-                        .zip(&self.legacy_char_keys)
-                        .zip(&self.float_keys)
-                    {
-                        match source {
-                            // `cell_sources` accepts no such plan.
-                            KeySource::Computed(_) => {
-                                return Err("a computed grouping key cannot be folded from cells".to_string());
-                            }
-                            KeySource::Column(slot) => push_column_key_part(
-                                &mut self.key,
-                                plain.as_deref_mut(),
-                                cell(*slot),
-                                *document,
-                                *legacy_char,
-                                float.as_ref(),
-                            ),
-                        }
-                    }
-                    self.group_for_key(byte_cell)
-                }
-            };
             let run = &mut self.accs[at * self.stride..(at + 1) * self.stride];
             // `accumulate_aggregate` for an aggregate with no FILTER and no
             // computed argument, which is all `cell_sources` lets through:
@@ -3261,6 +3254,134 @@ impl<'p> Folder<'p> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// The group row `r` of `chunk` belongs to, made if it is the first of
+    /// it: the key [`Folder::push`] builds from the row, from its cells.
+    fn group_of_cells(
+        &mut self,
+        sources: &CellSources,
+        chunk: &crate::core::processor::column_scan::ColumnChunk,
+        r: usize,
+    ) -> Result<usize, String> {
+        let cell = |slot: usize| sources.cell(chunk, slot, r);
+        let byte_cell = self.byte_slot.and_then(|slot| match cell(slot) {
+            None => Some(256),
+            Some([b]) => Some(*b as usize),
+            Some(_) => None,
+        });
+        let known = byte_cell
+            .map(|cell| self.byte_groups[cell])
+            .filter(|g| *g != u32::MAX);
+        if let Some(at) = known {
+            return Ok(at as usize);
+        }
+        self.key.clear();
+        self.plain.clear();
+        let mut plain = self.shown.is_some().then_some(&mut self.plain);
+        for (((source, document), legacy_char), float) in self
+            .key_sources
+            .iter()
+            .zip(&self.document_keys)
+            .zip(&self.legacy_char_keys)
+            .zip(&self.float_keys)
+        {
+            match source {
+                // `cell_sources` accepts no such plan.
+                KeySource::Computed(_) => {
+                    return Err("a computed grouping key cannot be folded from cells".to_string());
+                }
+                KeySource::Column(slot) => push_column_key_part(
+                    &mut self.key,
+                    plain.as_deref_mut(),
+                    cell(*slot),
+                    *document,
+                    *legacy_char,
+                    float.as_ref(),
+                ),
+            }
+        }
+        Ok(self.group_for_key(byte_cell))
+    }
+
+    /// A grouped chunk in two passes: each row's group, then each aggregate
+    /// over its whole column with the groups beside it.
+    ///
+    /// The groups are found as [`Self::group_of_cells`] finds them, in row
+    /// order, so they are made in the order the rows meet them. Where the
+    /// plan groups by one fixed-width column of at most eight bytes, a
+    /// cell seen before is answered from [`Self::memo`] without building
+    /// its key again. Each accumulator then meets its rows in the order it
+    /// did a row at a time, so a float sum has the same bits.
+    fn push_chunk_by_groups(
+        &mut self,
+        sources: &CellSources,
+        chunk: &crate::core::processor::column_scan::ColumnChunk,
+    ) -> Result<(), String> {
+        let plan = self.plan;
+        let mut gids = std::mem::take(&mut self.gids);
+        gids.clear();
+        gids.reserve(chunk.rows);
+        let remembered = match (self.byte_slot, self.key_sources.as_slice()) {
+            (None, [KeySource::Column(slot)]) if !self.memo_full => {
+                sources.fixed(chunk, *slot).filter(|cells| cells.width <= 8)
+            }
+            _ => None,
+        };
+        match remembered {
+            Some(cells) => {
+                for r in 0..chunk.rows {
+                    let at = if cells.is_null(r) {
+                        if self.memo_null == u32::MAX {
+                            self.memo_null = self.group_of_cells(sources, chunk, r)? as u32;
+                        }
+                        self.memo_null
+                    } else {
+                        let mut raw = [0u8; 8];
+                        raw[..cells.width].copy_from_slice(cells.cell(r));
+                        let raw = u64::from_le_bytes(raw);
+                        match self.memo.get(&raw) {
+                            Some(at) => *at,
+                            None => {
+                                let at = self.group_of_cells(sources, chunk, r)? as u32;
+                                if self.memo.len() < MEMO_CELLS {
+                                    self.memo.insert(raw, at);
+                                } else {
+                                    // Too many keys for remembering them to
+                                    // pay: the rest of this chunk still asks
+                                    // what is here, later chunks do not.
+                                    self.memo_full = true;
+                                }
+                                at
+                            }
+                        }
+                    };
+                    gids.push(at);
+                }
+            }
+            None => {
+                for r in 0..chunk.rows {
+                    gids.push(self.group_of_cells(sources, chunk, r)? as u32);
+                }
+            }
+        }
+        for (i, item) in plan.items.iter().enumerate() {
+            if let SelectItem::Aggregate { arg, .. } = item {
+                fold_by_groups(&mut self.accs, self.stride, i, &gids, arg, self.item_slots[i], sources, chunk);
+            }
+        }
+        if let Some(h) = plan.having.as_ref() {
+            for (j, item) in h.aggregates.iter().enumerate() {
+                let SelectItem::Aggregate { arg, .. } = item else { continue };
+                if self.n_items + j >= self.stride {
+                    continue;
+                }
+                let slot = self.having_slots.get(j).copied().flatten();
+                fold_by_groups(&mut self.accs, self.stride, self.n_items + j, &gids, arg, slot, sources, chunk);
+            }
+        }
+        self.gids = gids;
         Ok(())
     }
 
@@ -3374,6 +3495,101 @@ impl<'p> Folder<'p> {
         }
 
         Ok(out)
+    }
+}
+
+/// How many different key cells [`Folder::memo`] remembers before it is given
+/// up. Measured over a million rows: fifty groups fold about 1.5 times as
+/// fast with it, a group per row no faster and with a second table to fill.
+const MEMO_CELLS: usize = 1 << 16;
+
+/// One aggregate of a grouped chunk: accumulator `at` of each row's group
+/// (`gids`, a row's group; `stride` accumulators a group) fed that row's
+/// value, the rows in order.
+///
+/// A count, or a sum over a column of plain integers or of floats, reads the
+/// column in a loop that knows its type; any other accumulator or type is
+/// fed a row at a time, NULLs included, exactly as before. The loops skip a
+/// NULL without a call, which is what those three accumulators do with one.
+#[allow(clippy::too_many_arguments)]
+fn fold_by_groups(
+    accs: &mut [Acc],
+    stride: usize,
+    at: usize,
+    gids: &[u32],
+    arg: &Option<SchemaField>,
+    slot: Option<usize>,
+    sources: &CellSources,
+    chunk: &crate::core::processor::column_scan::ColumnChunk,
+) {
+    let Some(field) = arg else {
+        // `COUNT(*)`: neither bytes nor a type.
+        for gid in gids {
+            match &mut accs[*gid as usize * stride + at] {
+                Acc::Count(n) => *n += 1,
+                other => other.accumulate(None, None),
+            }
+        }
+        return;
+    };
+    let ty = &field.db_type;
+    let a_row_at_a_time = |accs: &mut [Acc]| {
+        for (r, gid) in gids.iter().enumerate() {
+            accs[*gid as usize * stride + at].accumulate(slot.and_then(|slot| sources.cell(chunk, slot, r)), Some(ty));
+        }
+    };
+    let (Some(cells), Some(first)) = (slot.and_then(|slot| sources.fixed(chunk, slot)), gids.first()) else {
+        return a_row_at_a_time(accs);
+    };
+    let int = IntCell::of(ty, cells.width);
+    // Every group's accumulator for one aggregate is of one kind; the first
+    // row's says which loop this is, and a loop that met another kind would
+    // hand that row to the accumulator itself.
+    match (&accs[*first as usize * stride + at], int) {
+        (Acc::Count(_), _) => {
+            for (r, gid) in gids.iter().enumerate() {
+                if cells.is_null(r) {
+                    continue;
+                }
+                match &mut accs[*gid as usize * stride + at] {
+                    Acc::Count(n) => *n += 1,
+                    other => other.accumulate(Some(cells.cell(r)), Some(ty)),
+                }
+            }
+        }
+        (Acc::ExactSum { track_dscale: false, own_scale: false, .. }, Some(int)) => {
+            int.for_each(&cells, |r, v| match &mut accs[gids[r] as usize * stride + at] {
+                Acc::ExactSum { total, n, overflow, track_dscale: false, own_scale: false, .. } => {
+                    match total.checked_add(v) {
+                        Some(sum) => *total = sum,
+                        None => *overflow = true,
+                    }
+                    *n += 1;
+                }
+                other => other.accumulate(Some(cells.cell(r)), Some(ty)),
+            });
+        }
+        (Acc::FloatSum { .. }, _) if matches!((ty, cells.width), (DbType::F64, 8) | (DbType::F32, 4)) => {
+            let double = cells.width == 8;
+            for (r, gid) in gids.iter().enumerate() {
+                if cells.is_null(r) {
+                    continue;
+                }
+                let value = cells.cell(r);
+                match &mut accs[*gid as usize * stride + at] {
+                    Acc::FloatSum { total, n } => {
+                        *total += if double {
+                            f64::from_le_bytes(value.try_into().expect("eight bytes"))
+                        } else {
+                            f32::from_le_bytes(value.try_into().expect("four bytes")) as f64
+                        };
+                        *n += 1;
+                    }
+                    other => other.accumulate(Some(value), Some(ty)),
+                }
+            }
+        }
+        _ => a_row_at_a_time(accs),
     }
 }
 

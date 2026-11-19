@@ -72,9 +72,10 @@ async fn same_both_ways(db: &Arc<Database>, tx: Option<crate::core::mvcc::TxId>,
         "{note}{sql}: {}",
         if cells { "was not folded from cells, so nothing was compared" } else { "was folded from cells" }
     );
-    // An ungrouped aggregate takes each column at once; the same cells fed
-    // a row at a time are the third way to the one answer.
-    if cells && !sql.contains("GROUP BY") {
+    // A fold from cells takes each aggregate's column at once (and, grouped,
+    // remembers the group of a key it has seen); the same cells fed a row at
+    // a time are the third way to the one answer.
+    if cells {
         column_scan::set_whole_columns(false);
         let (a_row_at_a_time, _) = run_in(db, tx, sql).await;
         column_scan::set_whole_columns(true);
@@ -228,6 +229,15 @@ const FROM_CELLS: &[&str] = &[
     "SELECT i8c, COUNT(*) FROM t GROUP BY i8c HAVING SUM(i32c) > 0 AND COUNT(u8c) > 2 ORDER BY i8c",
     "SELECT u8c, COUNT(*), SUM(k) FROM t GROUP BY u8c ORDER BY u8c LIMIT 5 OFFSET 3",
     "SELECT k, COUNT(*) FROM t GROUP BY k ORDER BY COUNT(*) DESC, k LIMIT 3",
+    // One key of two, four and eight bytes, with its NULL group, and every
+    // kind of sum and count beside it: integers of each width, both floats,
+    // the aggregates no loop takes, and a HAVING's own.
+    "SELECT i16c, COUNT(*), SUM(u16c), SUM(i64c), COUNT(i32c) FROM t GROUP BY i16c ORDER BY i16c",
+    "SELECT u32c, COUNT(u8c), SUM(i8c), AVG(i16c), SUM(u32c) FROM t GROUP BY u32c ORDER BY u32c",
+    "SELECT i64c, COUNT(*), SUM(f), SUM(r), AVG(f), COUNT(f) FROM t GROUP BY i64c ORDER BY i64c",
+    "SELECT k, SUM(f), SUM(r), AVG(u64c), SUM(i32c), MIN(i16c), MAX(u8c), COUNT(DISTINCT i8c) FROM t GROUP BY k ORDER BY k",
+    "SELECT f, COUNT(*), SUM(i8c), AVG(n) FROM t GROUP BY f ORDER BY f",
+    "SELECT i32c, COUNT(*), SUM(k) FROM t GROUP BY i32c HAVING SUM(u8c) > 100 AND COUNT(i16c) > 1 ORDER BY i32c",
     // Strings, read through their headers: as a key (with its NULL group
     // and its empty string), as an argument, beside fixed columns, and two
     // of them in one row.
@@ -360,14 +370,17 @@ async fn a_large_input_folds_in_parts_to_the_same_answer() {
     let _g = SWITCH.lock().await;
     let (dir, _cleanup) = scratch("large");
     let db = Arc::new(Database::new_named(&dir, false, "columnscanlarge").await);
-    must(&db, "CREATE TABLE w (id BIGINT NOT NULL, g INTEGER NOT NULL, v INTEGER, h SMALLINT)").await;
+    must(&db, "CREATE TABLE w (id BIGINT NOT NULL, g INTEGER NOT NULL, v INTEGER, h SMALLINT, d INTEGER NOT NULL)").await;
     must(
         &db,
-        "CREATE TABLE wp (id BIGINT NOT NULL, g INTEGER NOT NULL, v INTEGER, h SMALLINT) \
+        "CREATE TABLE wp (id BIGINT NOT NULL, g INTEGER NOT NULL, v INTEGER, h SMALLINT, d INTEGER NOT NULL) \
          PARTITION BY HASH (id) PARTITIONS 16",
     )
     .await;
-    let rows = 130_000u64;
+    // `d` is a key two rows share, a row and the next: seventy thousand of
+    // them, which is more than a fold remembers the groups of, so the later
+    // ones are found the long way both times they are met.
+    let rows = 140_000u64;
     let mut rng = Rng(0xB16_F01D);
     let mut id = 0;
     while id < rows {
@@ -377,11 +390,11 @@ async fn a_large_input_folds_in_parts_to_the_same_answer() {
                     0 => "NULL".to_string(),
                     n => ((rng.next() % 2001) as i64 - 1000 + n as i64).to_string(),
                 };
-                format!("({i}, {}, {v}, {})", rng.next() % 12, rng.next() % 300)
+                format!("({i}, {}, {v}, {}, {})", rng.next() % 12, rng.next() % 300, i / 2)
             })
             .collect();
         for table in ["w", "wp"] {
-            must(&db, &format!("INSERT INTO {table} (id, g, v, h) VALUES {}", chunk.join(", "))).await;
+            must(&db, &format!("INSERT INTO {table} (id, g, v, h, d) VALUES {}", chunk.join(", "))).await;
         }
         id += 2_000;
     }
@@ -395,6 +408,9 @@ async fn a_large_input_folds_in_parts_to_the_same_answer() {
             "SELECT g, h, COUNT(*), SUM(v) FROM {t} WHERE v > -500 GROUP BY g, h ORDER BY g, h",
             // A group per row: the first chunk says so and the rest fold serially.
             "SELECT id, COUNT(*), SUM(v) FROM {t} GROUP BY id ORDER BY id LIMIT 40 OFFSET 99000",
+            // More keys than are remembered, each met twice: the last of
+            // them come after the memory is given up.
+            "SELECT d, COUNT(*), SUM(v), MIN(id), MAX(id) FROM {t} GROUP BY d ORDER BY d LIMIT 60 OFFSET 69900",
         ] {
             let sql = sql.replace("{t}", table);
             let reply = same_both_ways(&db, None, &sql, true, "").await;
