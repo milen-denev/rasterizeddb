@@ -1,9 +1,22 @@
-//! An inverted index over a document column, PostgreSQL's GIN for `jsonb`.
+//! An inverted index over a document column, PostgreSQL's GIN for `jsonb`,
+//! and over text for full-text search.
 //!
 //! ```sql
 //! CREATE INDEX docs_gin ON docs USING gin (doc);                 -- jsonb_ops
 //! CREATE INDEX docs_gin ON docs USING gin (doc jsonb_path_ops);  -- path ops
+//! CREATE INDEX docs_fts ON docs USING gin (to_tsvector('english', title || ' ' || body));
 //! ```
+//!
+//! # Full text
+//!
+//! A full-text index ([`TextSource`]) keys each row by the lexemes of
+//! `to_tsvector(<configuration>, <column>)` for each column it reads
+//! (`jsonb::gin_lexeme_item`). Its declaration only joins columns with
+//! separators that end a word (`ddl::tsvector_expression`), so those lexemes
+//! are exactly the document's. A `to_tsvector` of the same configuration
+//! over any of the columns, matched `@@` against a query, is answered from
+//! `text_search::index_terms`: a lexeme's list, intersected under `&` and a
+//! phrase, united under `|`, and nothing for a negation or a prefix.
 //!
 //! Each document is reduced to a set of 64-bit *items* (`jsonb::gin_items`):
 //! its keys and scalars under `jsonb_ops`, its leaf paths under
@@ -80,9 +93,14 @@ pub const GIN_HASHER_ID: u32 = 2;
 
 pub struct GinIndex {
     pub decl: IndexDecl,
-    /// The document column's `write_order`.
+    /// The document column's `write_order`; a full-text index's first
+    /// column.
     pub column: u32,
+    /// A `jsonb` index's operator class. A full-text index has none, and
+    /// carries `Ops`, which nothing reads for it.
     pub opclass: GinOpclass,
+    /// What a full-text index keys a row by; `None` for a `jsonb` index.
+    pub text: Option<TextSource>,
     /// Item to the slots holding it, each list sorted and distinct. Unused,
     /// and empty, when the index is paged.
     shards: Box<[RwLock<HashMap<u64, Vec<u64>, RandomState>>]>,
@@ -118,9 +136,58 @@ pub enum GinQuery {
     Any(Vec<u64>),
 }
 
+/// What a full-text index reduces a row to: the lexemes of
+/// `to_tsvector(<configuration>, <column>)` for each of `columns`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSource {
+    /// The `simple` configuration; `false` for every other, which is
+    /// `english` here (`text_search::same_configuration`).
+    pub simple: bool,
+    /// The text columns, by `write_order`.
+    pub columns: Vec<u32>,
+}
+
+impl TextSource {
+    fn configuration(&self) -> &'static str {
+        if self.simple { "simple" } else { "english" }
+    }
+
+    /// The items of a row, or `None` when a column could not be read (or is
+    /// not UTF-8), which makes the row a candidate for every lookup.
+    pub fn items<'a>(&self, get: &dyn Fn(u32) -> Option<&'a [u8]>) -> Option<Vec<u64>> {
+        let mut items = Vec::new();
+        for &column in &self.columns {
+            let text = std::str::from_utf8(get(column)?).ok()?;
+            for lexeme in crate::core::text_search::lexemes(self.configuration(), text) {
+                items.push(jsonb::gin_lexeme_item(&lexeme.text));
+            }
+        }
+        Some(items)
+    }
+
+    /// Whether a `to_tsvector` of this configuration over `columns` is
+    /// answered by this index: the same configuration, and columns it keys.
+    pub fn covers(&self, simple: bool, columns: &[u32]) -> bool {
+        self.simple == simple && columns.iter().all(|c| self.columns.contains(c))
+    }
+}
+
 impl GinIndex {
     pub fn new(decl: IndexDecl, column: u32, opclass: GinOpclass) -> GinIndex {
         Self::new_in(decl, column, opclass, None)
+    }
+
+    /// A full-text index over `source`, paged as [`Self::new_in`] decides.
+    pub fn new_text_in(
+        decl: IndexDecl,
+        source: TextSource,
+        placement: Option<&super::paged::Placement>,
+    ) -> GinIndex {
+        let budgets = placement
+            .filter(|_| super::paged::residency() != super::paged::Residency::Memory)
+            .map(|p| (p, super::paged::Budgets::current()));
+        let column = source.columns.first().copied().unwrap_or(0);
+        Self::build(decl, column, GinOpclass::Ops, Some(source), budgets)
     }
 
     /// [`Self::new`], paged under `placement` when the residency is `hybrid`
@@ -134,7 +201,7 @@ impl GinIndex {
         let budgets = placement
             .filter(|_| super::paged::residency() != super::paged::Residency::Memory)
             .map(|p| (p, super::paged::Budgets::current()));
-        Self::build(decl, column, opclass, budgets)
+        Self::build(decl, column, opclass, None, budgets)
     }
 
     /// A paged gin index with budgets of its own, for tests.
@@ -146,7 +213,7 @@ impl GinIndex {
         placement: &super::paged::Placement,
         budgets: super::paged::Budgets,
     ) -> GinIndex {
-        let g = Self::build(decl, column, opclass, Some((placement, budgets)));
+        let g = Self::build(decl, column, opclass, None, Some((placement, budgets)));
         assert!(g.paged.is_some(), "the store must open");
         g
     }
@@ -155,6 +222,7 @@ impl GinIndex {
         decl: IndexDecl,
         column: u32,
         opclass: GinOpclass,
+        text: Option<TextSource>,
         paged: Option<(&super::paged::Placement, super::paged::Budgets)>,
     ) -> GinIndex {
         let present = std::sync::Arc::new(RwLock::new(Vec::new()));
@@ -167,6 +235,7 @@ impl GinIndex {
             decl,
             column,
             opclass,
+            text,
             shards: (0..SHARDS).map(|_| RwLock::new(HashMap::with_hasher(RandomState::new()))).collect(),
             paged,
             present,
@@ -181,11 +250,12 @@ impl GinIndex {
     /// What decides this index's entries, for `TableIndexes::shape_hash`.
     /// Destructured whole, so a new field does not compile until it is placed
     /// on one side or the other; the rest is the entries themselves.
-    pub(super) fn shape(&self) -> (&IndexDecl, u32, GinOpclass) {
+    pub(super) fn shape(&self) -> (&IndexDecl, u32, GinOpclass, Option<&TextSource>) {
         let GinIndex {
             decl,
             column,
             opclass,
+            text,
             shards: _,
             paged: _,
             present: _,
@@ -195,7 +265,7 @@ impl GinIndex {
             forgotten_slots: _,
             live: _,
         } = self;
-        (decl, *column, *opclass)
+        (decl, *column, *opclass, text.as_ref())
     }
 
     #[inline]
@@ -258,14 +328,39 @@ impl GinIndex {
         }
     }
 
-    /// Indexes the document a version holds (its bytes; empty for `NULL`).
-    pub fn insert(&self, _proof: Proof<'_>, slot: u64, document: Option<&[u8]>) {
-        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "GinIndex::insert");
+    /// Indexes a version, reading the columns this index keys from `get`:
+    /// a `jsonb` index's document column, a full-text index's text columns.
+    pub fn insert_from<'a>(&self, proof: Proof<'_>, slot: u64, get: &dyn Fn(u32) -> Option<&'a [u8]>) {
+        match &self.text {
+            None => self.insert(proof, slot, get(self.column)),
+            Some(source) => self.insert_items(proof, slot, source.items(get)),
+        }
+    }
+
+    /// Indexes the document a version holds (its bytes; empty for `NULL`),
+    /// or, given `None`, makes it a candidate for every lookup. A full-text
+    /// index takes its columns through [`Self::insert_from`]; handed one
+    /// document it can only make the row such a candidate.
+    pub fn insert(&self, proof: Proof<'_>, slot: u64, document: Option<&[u8]>) {
+        if self.text.is_some() {
+            return self.insert_items(proof, slot, None);
+        }
         let mut items = Vec::new();
-        match document.map(|d| jsonb::gin_items(d, self.opclass, &mut items)) {
-            Some(Some(())) => {}
+        let items = match document.map(|d| jsonb::gin_items(d, self.opclass, &mut items)) {
+            Some(Some(())) => Some(items),
+            _ => None,
+        };
+        self.insert_items(proof, slot, items)
+    }
+
+    /// Indexes a version under `items`; `None` (unreadable) makes it a
+    /// candidate for every lookup, never a missed row.
+    fn insert_items(&self, _proof: Proof<'_>, slot: u64, items: Option<Vec<u64>>) {
+        crate::core::index_store::census::mutation(_proof, self as *const Self as usize, "GinIndex::insert");
+        let mut items = match items {
+            Some(items) => items,
             // Unreadable: a candidate for every lookup, never a missed row.
-            _ => {
+            None => {
                 let mut unkeyed = self.unkeyed.write();
                 if !unkeyed.contains(&slot) {
                     unkeyed.push(slot);
@@ -274,7 +369,7 @@ impl GinIndex {
                 self.set_present(slot, true);
                 return;
             }
-        }
+        };
         items.sort_unstable();
         items.dedup();
         if let Some(store) = &self.paged {
@@ -937,6 +1032,10 @@ pub enum JsonOp {
     Contains(Vec<u8>),
     /// `?` (one key), `?&` (`all`) or `?|` (`!all`).
     Keys { keys: Vec<String>, all: bool },
+    /// One lexeme a full-text match needs the document to have, where the
+    /// document is `to_tsvector(<simple or english>, <columns>)`
+    /// ([`text_leaf`]). Answered by a full-text index over those columns.
+    Lexeme { simple: bool, columns: Vec<u32>, item: u64 },
 }
 
 /// Reads the inverted-index predicates out of a tokenized `WHERE` clause.
@@ -1022,8 +1121,15 @@ pub fn parse_json_where(tokens: &[Token]) -> Option<JsonExpr> {
     Some(root)
 }
 
-/// One `[jsonb column, operator, literal]` conjunct, or opaque.
+/// One `[jsonb column, operator, literal]` conjunct, a full-text match
+/// ([`text_leaf`]), or opaque.
 fn leaf(toks: &[Token]) -> JsonExpr {
+    if let [Token::Evaluated(operand), Token::Op(eq), truth] = toks
+        && eq == "="
+        && is_true(truth)
+    {
+        return text_leaf(&operand.expr);
+    }
     let [Token::Ident((_, DbType::JSONB, column)), Token::Op(op), Token::StringLit(lit)] = toks else {
         return JsonExpr::Opaque;
     };
@@ -1057,13 +1163,173 @@ fn leaf(toks: &[Token]) -> JsonExpr {
     JsonExpr::Leaf { column, op }
 }
 
+/// The token a lowered `@@` is compared with: `(ts_match_vq(…) = TRUE)`,
+/// whose `TRUE` the tokenizer reads as the number 1.
+fn is_true(token: &Token) -> bool {
+    use crate::core::tokenizer::query_tokenizer::NumericValue as N;
+    match token {
+        Token::Number(n) => matches!(
+            n,
+            N::I8(1) | N::I16(1) | N::I32(1) | N::I64(1) | N::I128(1) | N::U8(1) | N::U16(1) | N::U32(1) | N::U64(1) | N::U128(1)
+        ),
+        Token::Ident((name, _, _)) => name.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// A full-text match as a tree of [`JsonOp::Lexeme`] leaves, or opaque.
+///
+/// `expr` is what `check::lower_text_match` made of `a @@ b`, read as the
+/// evaluator reads it: `ts_match_vq(to_tsvector(c, doc), query)`,
+/// `ts_match_tq(doc, query)` (an `english` vector of `doc`) or
+/// `ts_match_tt(doc, text)` (`plainto_tsquery('english', text)`). The query
+/// is computed here only from literals, by the functions the evaluator
+/// calls; a query read from a column, a parameter the planner never sees, or
+/// anything else is left to the scan.
+pub fn text_leaf(expr: &crate::core::rql::expr::Expr) -> JsonExpr {
+    use crate::core::rql::expr::{Expr, TextFunc};
+    use crate::core::text_search as ts;
+    let Expr::Call(func, args) = expr else {
+        return JsonExpr::Opaque;
+    };
+    let [left, right] = args.as_slice() else {
+        return JsonExpr::Opaque;
+    };
+    let (simple, document) = match func {
+        TextFunc::TsMatchVq => match left {
+            Expr::Call(TextFunc::ToTsVector, a) if a.len() == 2 => match literal_text(&a[0]) {
+                Some(configuration) => (ts::is_simple(&configuration), &a[1]),
+                None => return JsonExpr::Opaque,
+            },
+            _ => return JsonExpr::Opaque,
+        },
+        TextFunc::TsMatchTq | TextFunc::TsMatchTt => (false, left),
+        _ => return JsonExpr::Opaque,
+    };
+    let mut columns = Vec::new();
+    if !document_columns(document, &mut columns) || columns.is_empty() {
+        return JsonExpr::Opaque;
+    }
+    let query = if *func == TextFunc::TsMatchTt {
+        match literal_text(right) {
+            Some(text) => ts::plainto_tsquery("english", &text),
+            None => return JsonExpr::Opaque,
+        }
+    } else {
+        match right {
+            Expr::Call(f, a) if a.len() == 2 => {
+                let (Some(configuration), Some(text)) = (literal_text(&a[0]), literal_text(&a[1])) else {
+                    return JsonExpr::Opaque;
+                };
+                match f {
+                    TextFunc::ToTsQuery => match ts::to_tsquery(&configuration, &text) {
+                        Ok(q) => q,
+                        Err(_) => return JsonExpr::Opaque,
+                    },
+                    TextFunc::PlainToTsQuery => ts::plainto_tsquery(&configuration, &text),
+                    TextFunc::PhraseToTsQuery => ts::phraseto_tsquery(&configuration, &text),
+                    TextFunc::WebsearchToTsQuery => ts::websearch_to_tsquery(&configuration, &text),
+                    _ => return JsonExpr::Opaque,
+                }
+            }
+            // A query written as text is matched as it stands.
+            other => match literal_text(other) {
+                Some(text) => text,
+                None => return JsonExpr::Opaque,
+            },
+        }
+    };
+    fn tree(terms: ts::IndexTerms, simple: bool, columns: &[u32]) -> JsonExpr {
+        match terms {
+            ts::IndexTerms::Lexeme(lexeme) => JsonExpr::Leaf {
+                column: columns[0],
+                op: JsonOp::Lexeme {
+                    simple,
+                    columns: columns.to_vec(),
+                    item: jsonb::gin_lexeme_item(&lexeme),
+                },
+            },
+            ts::IndexTerms::All(c) => JsonExpr::And(c.into_iter().map(|t| tree(t, simple, columns)).collect()),
+            ts::IndexTerms::Any(c) => JsonExpr::Or(c.into_iter().map(|t| tree(t, simple, columns)).collect()),
+            ts::IndexTerms::Opaque => JsonExpr::Opaque,
+        }
+    }
+    tree(ts::index_terms(&query), simple, &columns)
+}
+
+/// A string literal's text, through a cast (`'english'::regconfig`).
+fn literal_text(expr: &crate::core::rql::expr::Expr) -> Option<String> {
+    use crate::core::rql::expr::Expr;
+    match expr {
+        Expr::Literal { bytes, db_type: DbType::STRING } => String::from_utf8(bytes.clone()).ok(),
+        Expr::Cast(inner, _) => literal_text(inner),
+        _ => None,
+    }
+}
+
+/// The text columns a full-text document reads, appended to `out`, when it
+/// is one a full-text index keys the same way: columns joined by `||` with a
+/// separator between each two that holds only word-ending characters, each
+/// bare, cast to text, or in `coalesce(column, <such a literal>)`
+/// (`ddl::tsvector_expression`'s rule, which makes the document's lexemes
+/// the union of each column's own). `false` for anything else.
+fn document_columns(expr: &crate::core::rql::expr::Expr, out: &mut Vec<u32>) -> bool {
+    use crate::core::rql::expr::Expr;
+    fn pieces<'e>(e: &'e Expr, into: &mut Vec<&'e Expr>) {
+        match e {
+            Expr::Concat(a, b) => {
+                pieces(a, into);
+                pieces(b, into);
+            }
+            other => into.push(other),
+        }
+    }
+    let separates = |e: &Expr| {
+        literal_text(e).is_some_and(|t| t.chars().all(|c| !c.is_alphanumeric() && c != '\''))
+    };
+    fn column(e: &Expr) -> Option<u32> {
+        match e {
+            Expr::Column(f) if f.db_type == DbType::STRING && !f.json_text => Some(f.write_order as u32),
+            Expr::Cast(inner, DbType::STRING) => column(inner),
+            _ => None,
+        }
+    }
+    let mut list = Vec::new();
+    pieces(expr, &mut list);
+    let mut after_column = false;
+    for piece in list {
+        if separates(piece) {
+            if literal_text(piece).is_some_and(|t| !t.is_empty()) {
+                after_column = false;
+            }
+            continue;
+        }
+        let found = match piece {
+            Expr::Coalesce(args) if args.len() == 2 && separates(&args[1]) => column(&args[0]),
+            other => column(other),
+        };
+        let Some(c) = found else { return false };
+        if after_column {
+            return false;
+        }
+        if !out.contains(&c) {
+            out.push(c);
+        }
+        after_column = true;
+    }
+    true
+}
+
 impl GinIndex {
     /// Whether this index can answer `op`: `jsonb_path_ops` keeps no key
-    /// items, so it answers containment only.
+    /// items, so it answers containment only; a full-text index answers
+    /// only lexemes, of its configuration over columns it keys.
     pub fn answers(&self, op: &JsonOp) -> bool {
-        match op {
-            JsonOp::Contains(_) => true,
-            JsonOp::Keys { .. } => self.opclass == GinOpclass::Ops,
+        match (op, &self.text) {
+            (JsonOp::Contains(_), None) => true,
+            (JsonOp::Keys { .. }, None) => self.opclass == GinOpclass::Ops,
+            (JsonOp::Lexeme { simple, columns, .. }, Some(source)) => source.covers(*simple, columns),
+            _ => false,
         }
     }
 
@@ -1071,6 +1337,7 @@ impl GinIndex {
         match op {
             JsonOp::Contains(literal) => contains_query(literal, self.opclass),
             JsonOp::Keys { keys, all } => Some(keys_query(keys, *all)),
+            JsonOp::Lexeme { item, .. } => Some(GinQuery::All(vec![*item])),
         }
     }
 }
@@ -1856,5 +2123,116 @@ mod tests {
             let after = (capture(&g), g.live.load(Ordering::Relaxed), g.entries.load(Ordering::Relaxed));
             assert_eq!(after, before, "{parts:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod text_planning {
+    use super::*;
+    use crate::core::db_type::DbType;
+    use crate::core::row::schema::SchemaField;
+
+    fn schema() -> smallvec::SmallVec<[SchemaField; 20]> {
+        let mut s = smallvec::SmallVec::new();
+        s.push(SchemaField::new("id".into(), DbType::I32, 4, 0, 0, false));
+        s.push(SchemaField::new("title".into(), DbType::STRING, 8, 4, 1, false));
+        s.push(SchemaField::new("body".into(), DbType::STRING, 8, 12, 2, false));
+        s
+    }
+
+    /// The tree the planner reads out of a `WHERE`, as the scan's own
+    /// rewrite and tokenizer hand it over.
+    fn plan(clause: &str) -> Option<JsonExpr> {
+        let s = schema();
+        let rewritten = crate::core::tokenizer::predicate_rewrite::rewrite_scan_where(clause, &s).unwrap();
+        let tokens = crate::core::tokenizer::query_tokenizer::try_tokenize(&rewritten, &s).unwrap();
+        parse_json_where(&tokens)
+    }
+
+    fn lexeme(simple: bool, columns: &[u32], word: &str) -> JsonExpr {
+        JsonExpr::Leaf {
+            column: columns[0],
+            op: JsonOp::Lexeme { simple, columns: columns.to_vec(), item: jsonb::gin_lexeme_item(word) },
+        }
+    }
+
+    fn strip(e: JsonExpr) -> JsonExpr {
+        // `( … )` around one leaf parses to the leaf itself or a one-child
+        // node; flatten one-child nodes for comparison.
+        match e {
+            JsonExpr::And(mut v) | JsonExpr::Or(mut v) if v.len() == 1 => strip(v.pop().unwrap()),
+            JsonExpr::And(v) => JsonExpr::And(v.into_iter().map(strip).collect()),
+            JsonExpr::Or(v) => JsonExpr::Or(v.into_iter().map(strip).collect()),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn full_text_matches_become_lexeme_lookups() {
+        let e = strip(plan("to_tsvector('english', body) @@ to_tsquery('english', 'foxes & dogs')").unwrap());
+        assert_eq!(e, JsonExpr::And(vec![lexeme(false, &[2], "fox"), lexeme(false, &[2], "dog")]));
+        let e = strip(plan("to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(body, '')) @@ plainto_tsquery('simple', 'Fox')").unwrap());
+        assert_eq!(e, lexeme(true, &[1, 2], "fox"));
+        // `text @@ text` is `english` both sides, the query plain.
+        let e = strip(plan("body @@ 'running'").unwrap());
+        assert_eq!(e, lexeme(false, &[2], "run"));
+        // `|` needs each side; a negation says nothing.
+        let e = strip(plan("to_tsvector('english', body) @@ to_tsquery('english', 'fox | !dog')").unwrap());
+        assert_eq!(e, JsonExpr::Or(vec![lexeme(false, &[2], "fox"), JsonExpr::Opaque]));
+        // Beside another condition.
+        let e = strip(plan("id > 3 AND to_tsvector('english', body) @@ to_tsquery('english', 'fox')").unwrap());
+        assert!(matches!(&e, JsonExpr::And(v) if v.contains(&lexeme(false, &[2], "fox"))), "{e:?}");
+    }
+
+    #[test]
+    fn documents_an_index_cannot_key_are_opaque() {
+        for clause in [
+            // Joined with no separator: a lexeme spanning both columns.
+            "to_tsvector('english', title || body) @@ to_tsquery('english', 'fox')",
+            // A literal with a word of its own.
+            "to_tsvector('english', title || ' and ' || body) @@ to_tsquery('english', 'fox')",
+            // Not a column.
+            "to_tsvector('english', lower(body)) @@ to_tsquery('english', 'fox')",
+            // A prefix: no hashed item names it.
+            "to_tsvector('english', body) @@ to_tsquery('english', 'fo:*')",
+        ] {
+            let e = plan(clause).map(strip);
+            assert!(e.is_none() || e == Some(JsonExpr::Opaque), "{clause}: {e:?}");
+        }
+    }
+
+    #[test]
+    fn a_text_index_answers_only_its_configuration_and_columns() {
+        let decl = IndexDecl {
+            name: "ft".into(),
+            method: crate::core::index::Method::GinTsvector { simple: false },
+            unique: false,
+            columns: vec![1, 2],
+            is_deleted: false,
+        };
+        let g = GinIndex::new_text_in(decl, TextSource { simple: false, columns: vec![1, 2] }, None);
+        let ask = |simple: bool, columns: &[u32]| JsonOp::Lexeme { simple, columns: columns.to_vec(), item: 1 };
+        assert!(g.answers(&ask(false, &[2])));
+        assert!(g.answers(&ask(false, &[1, 2])));
+        assert!(!g.answers(&ask(true, &[2])), "another configuration's lexemes");
+        assert!(!g.answers(&ask(false, &[0, 2])), "a column it does not key");
+        assert!(!g.answers(&JsonOp::Contains(b"{}".to_vec())), "a jsonb operator");
+        let ticket = crate::core::index_store::gate::test_mint();
+        let proof = crate::core::index_store::gate::Proof::from(&ticket);
+        let rows: [(&[u8], &[u8]); 3] = [(b"The quick fox", b"jumps"), (b"Lazy dogs", b"sleep"), (b"", b"Foxes run")];
+        for (slot, (title, body)) in rows.iter().enumerate() {
+            let get = |c: u32| -> Option<&[u8]> {
+                match c {
+                    1 => Some(*title),
+                    2 => Some(*body),
+                    _ => None,
+                }
+            };
+            g.insert_from(proof, slot as u64, &get);
+        }
+        let fox = GinQuery::All(vec![jsonb::gin_lexeme_item("fox")]);
+        assert_eq!(g.lookup(&fox, usize::MAX), Some(vec![0, 2]));
+        let dog = GinQuery::All(vec![jsonb::gin_lexeme_item("dog")]);
+        assert_eq!(g.lookup(&dog, usize::MAX), Some(vec![1]));
     }
 }

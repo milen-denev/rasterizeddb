@@ -389,6 +389,8 @@ fn key_v1_digest() -> u64 {
             Method::Hash => 2,
             Method::GinOps => 3,
             Method::GinPathOps => 4,
+            Method::GinTsvector { simple: false } => 5,
+            Method::GinTsvector { simple: true } => 6,
         });
         h.u64_le(columns.len() as u64);
         for (t, v) in columns.iter() {

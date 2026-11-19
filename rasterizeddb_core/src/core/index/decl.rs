@@ -27,6 +27,13 @@ pub enum Method {
     /// Inverted, over one `jsonb` column, keeping leaf paths
     /// (`gin (doc jsonb_path_ops)`): answers `@>` only, more selectively.
     GinPathOps,
+    /// Inverted, over the lexemes of `to_tsvector('<configuration>', …)` of
+    /// one or more text columns joined by separators
+    /// (`gin (to_tsvector('english', title || ' ' || body))`): answers `@@`
+    /// against a `to_tsvector` of the same configuration over any of those
+    /// columns. `simple` is the `simple` configuration, `false` every other
+    /// (each of which is `english` here). See [`super::gin`].
+    GinTsvector { simple: bool },
 }
 
 impl Method {
@@ -34,7 +41,7 @@ impl Method {
         match self {
             Method::BTree => "btree",
             Method::Hash => "hash",
-            Method::GinOps | Method::GinPathOps => "gin",
+            Method::GinOps | Method::GinPathOps | Method::GinTsvector { .. } => "gin",
         }
     }
 
@@ -49,7 +56,12 @@ impl Method {
 
     /// Whether this is an inverted index rather than one key per row.
     pub fn is_gin(self) -> bool {
-        self.opclass().is_some()
+        self.opclass().is_some() || self.is_text()
+    }
+
+    /// Whether this is a full-text inverted index ([`Method::GinTsvector`]).
+    pub fn is_text(self) -> bool {
+        matches!(self, Method::GinTsvector { .. })
     }
 
     pub fn parse(text: &str) -> Option<Method> {
@@ -69,6 +81,8 @@ impl Method {
             Method::Hash => 2,
             Method::GinOps => 3,
             Method::GinPathOps => 4,
+            Method::GinTsvector { simple: false } => 5,
+            Method::GinTsvector { simple: true } => 6,
         }
     }
 
@@ -78,6 +92,8 @@ impl Method {
             2 => Some(Method::Hash),
             3 => Some(Method::GinOps),
             4 => Some(Method::GinPathOps),
+            5 => Some(Method::GinTsvector { simple: false }),
+            6 => Some(Method::GinTsvector { simple: true }),
             _ => None,
         }
     }

@@ -276,7 +276,7 @@ impl LiveIndex {
             Method::BTree => Data::BTree(RwLock::new(Ranged::new())),
             // An inverted index is a `gin::GinIndex`, never one of these;
             // `for_schema` routes it there. A hash is the harmless reading.
-            Method::Hash | Method::GinOps | Method::GinPathOps => Data::Hash(
+            Method::Hash | Method::GinOps | Method::GinPathOps | Method::GinTsvector { .. } => Data::Hash(
                 (0..HASH_SHARDS)
                     .map(|_| RwLock::new(HashMap::with_hasher(RandomState::new())))
                     .collect(),
@@ -349,7 +349,9 @@ impl LiveIndex {
             let value = get(*wo)?;
             match self.decl.method {
                 Method::BTree => key::encode_ordered(ty, value, i + 1 == n, &mut out)?,
-                Method::Hash | Method::GinOps | Method::GinPathOps => key::encode_canonical(ty, value, &mut out)?,
+                Method::Hash | Method::GinOps | Method::GinPathOps | Method::GinTsvector { .. } => {
+                    key::encode_canonical(ty, value, &mut out)?
+                }
             }
         }
         Some(KeyBuf::from_vec(out))
@@ -1394,6 +1396,8 @@ impl TableIndexes {
             Method::Hash => 2,
             Method::GinOps => 3,
             Method::GinPathOps => 4,
+            Method::GinTsvector { simple: false } => 5,
+            Method::GinTsvector { simple: true } => 6,
         };
         // `state` is readiness and the renumbering epoch, not what is keyed.
         let TableIndexes { list, gin, state: _ } = self;
@@ -1467,8 +1471,9 @@ impl TableIndexes {
         }
         h.u64_le(gin.len() as u64);
         for g in gin {
-            let (decl, column, opclass) = g.shape();
-            // `decl.columns` is `[column]`.
+            let (decl, column, opclass, text) = g.shape();
+            // `decl.columns` is `[column]`, or a full-text index's columns,
+            // which `text` carries.
             let IndexDecl {
                 name: _,
                 method: m,
@@ -1484,6 +1489,18 @@ impl TableIndexes {
                 GinOpclass::Ops => 1,
                 GinOpclass::PathOps => 2,
             });
+            if let Some(gin::TextSource { simple, columns }) = text {
+                // How a row became lexemes is part of what the entries are:
+                // a stemmer that moved one would leave a persisted index
+                // missing rows, so its version is in the shape.
+                h.u8(3);
+                h.u8(*simple as u8);
+                h.u64_le(crate::core::text_search::INDEX_DERIVE_VERSION as u64);
+                h.u64_le(columns.len() as u64);
+                for c in columns {
+                    h.u64_le(*c as u64);
+                }
+            }
         }
         h.finish()
     }
@@ -1562,7 +1579,10 @@ impl TableIndexes {
                 Some((document, _)) => vec![*document],
                 None => i.columns.iter().map(|c| c.0).collect(),
             })
-            .chain(self.gin.iter().map(|g| g.column))
+            .chain(self.gin.iter().flat_map(|g| match &g.text {
+                Some(source) => source.columns.clone(),
+                None => vec![g.column],
+            }))
             .collect();
         cols.sort_unstable();
         cols.dedup();
@@ -1576,7 +1596,7 @@ impl TableIndexes {
             index.insert(proof, slot, index.key_of_row(row));
         }
         for g in &self.gin {
-            g.insert(proof, slot, document_of(row, g.column));
+            g.insert_from(proof, slot, &|c| document_of(row, c));
         }
     }
 
@@ -1592,7 +1612,7 @@ impl TableIndexes {
             index.insert(proof, slot, index.key_of(get));
         }
         for g in &self.gin {
-            g.insert(proof, slot, get(g.column));
+            g.insert_from(proof, slot, get);
         }
     }
 
@@ -1631,7 +1651,7 @@ impl TableIndexes {
         // The new document's items are added; the old ones stay, a stale
         // candidate rather than a missed row (see `gin`).
         for g in &self.gin {
-            g.insert(proof, slot, document_of(row, g.column));
+            g.insert_from(proof, slot, &|c| document_of(row, c));
         }
     }
 
@@ -1735,7 +1755,8 @@ impl TableIndexes {
         let mut asked: Vec<((usize, usize), &gin::GinIndex, gin::GinQuery)> = self
             .gin
             .iter()
-            .filter(|g| g.column == column && g.answers(op))
+            // A lexeme names its columns itself; `column` is its first.
+            .filter(|g| (g.column == column || matches!(op, gin::JsonOp::Lexeme { .. })) && g.answers(op))
             .filter_map(|g| {
                 let q = g.query_for(op)?;
                 Some((g.estimate_and_cost(&q), g.as_ref(), q))
@@ -2053,6 +2074,28 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
     };
     let mut gins: Vec<Arc<gin::GinIndex>> = Vec::new();
     for decl in &schema.secondary_indexes {
+        if let Method::GinTsvector { simple } = decl.method {
+            // Every column a live text column, or the index is not built: a
+            // dropped or retyped column leaves a declaration this cannot key.
+            let columns: Option<Vec<u32>> = decl
+                .columns
+                .iter()
+                .map(|wo| live(*wo).filter(|f| f.db_type == DbType::STRING && !f.json_text).map(|f| f.write_order as u32))
+                .collect();
+            match columns.filter(|c| !c.is_empty()) {
+                Some(columns) => gins.push(Arc::new(gin::GinIndex::new_text_in(
+                    decl.clone(),
+                    gin::TextSource { simple, columns },
+                    placement,
+                ))),
+                None => log::warn!(
+                    "full-text index {} on {} no longer names text columns; not built",
+                    decl.name,
+                    schema.name
+                ),
+            }
+            continue;
+        }
         if let Some(opclass) = decl.method.opclass() {
             let column = decl.columns.first().copied();
             match column.and_then(live) {
@@ -2144,6 +2187,14 @@ pub fn for_schema_in(schema: &crate::core::row::schema::TableSchema, placement: 
 pub fn choose_method(requested: Option<Method>, types: &[DbType]) -> Result<Method, String> {
     let all = |f: fn(&DbType) -> bool| types.iter().all(f);
     match requested {
+        Some(m @ Method::GinTsvector { .. }) => {
+            if let Some(t) = types.iter().find(|t| **t != DbType::STRING) {
+                return Err(format!(
+                    "a full-text index is not supported over a {t:?} column: to_tsvector reads text columns"
+                ));
+            }
+            Ok(m)
+        }
         Some(m @ (Method::GinOps | Method::GinPathOps)) => {
             if types.len() == 1 && types[0] == DbType::JSONB {
                 Ok(m)

@@ -14,7 +14,9 @@
 //! - a partial index (`WHERE …`) or an expression index (`(lower(email))`) is
 //!   accepted and not built, as all index DDL was before. An index built
 //!   without its predicate or expression would answer different questions
-//!   from the ones it was declared for.
+//!   from the ones it was declared for. The one expression read is a
+//!   full-text one, `USING gin (to_tsvector('<configuration>', <document>))`
+//!   ([`tsvector_expression`]).
 //!
 //! `ASC`/`DESC`, `NULLS`, `COLLATE` and an operator class only shape a
 //! B-tree's scan order or its comparisons in PostgreSQL. This index orders by
@@ -31,6 +33,10 @@ pub struct CreateIndex {
     pub table: String,
     pub method: Option<Method>,
     pub columns: Vec<String>,
+    /// What an unnamed index is named after when it is not its columns:
+    /// `to_tsvector` for a full-text index, as PostgreSQL names an
+    /// expression index after the function.
+    pub label: Option<String>,
 }
 
 impl CreateIndex {
@@ -40,10 +46,8 @@ impl CreateIndex {
             .clone()
             .unwrap_or_else(|| {
                 // Cut as every derived name is cut: the label survives.
-                crate::core::rql::unique_key::name_with_label(
-                    &format!("{}_{}", self.table, self.columns.join("_")),
-                    "_idx",
-                )
+                let what = self.label.clone().unwrap_or_else(|| self.columns.join("_"));
+                crate::core::rql::unique_key::name_with_label(&format!("{}_{}", self.table, what), "_idx")
             })
     }
 }
@@ -198,7 +202,38 @@ pub fn parse_create(sql: &str) -> Option<Result<CreateIndex, String>> {
     }
     let mut columns = Vec::new();
     let mut opclasses = Vec::new();
-    for part in split_top(&after_on[open + 1..close]) {
+    let parts = split_top(&after_on[open + 1..close]);
+    // `USING gin (to_tsvector(…))`: a full-text index, the only expression
+    // read. Without `USING gin` PostgreSQL would build a B-tree over the
+    // vector, which answers nothing a query asks of one.
+    if method == Some(Method::GinOps) && parts.len() == 1 {
+        match tsvector_expression(parts[0]) {
+            Some(Ok((simple, columns))) => {
+                if columns.len() > super::decl::MAX_COLUMNS {
+                    return Some(Err(format!(
+                        "a full-text index may cover at most {} columns",
+                        super::decl::MAX_COLUMNS
+                    )));
+                }
+                if let Some(n) = &name
+                    && n.len() > super::decl::NAME_LEN
+                {
+                    return Some(Err(format!("an index name may be at most {} bytes", super::decl::NAME_LEN)));
+                }
+                return Some(Ok(CreateIndex {
+                    name,
+                    if_not_exists,
+                    table,
+                    method: Some(Method::GinTsvector { simple }),
+                    columns,
+                    label: Some("to_tsvector".to_string()),
+                }));
+            }
+            Some(Err(e)) => return Some(Err(e)),
+            None => {}
+        }
+    }
+    for part in parts {
         match column_of(part) {
             Some((c, opclass)) => {
                 columns.push(c);
@@ -243,7 +278,196 @@ pub fn parse_create(sql: &str) -> Option<Result<CreateIndex, String>> {
         table,
         method,
         columns,
+        label: None,
     }))
+}
+
+/// Strips parentheses that enclose the whole of `text`.
+fn unwrap_parens(mut text: &str) -> &str {
+    loop {
+        let t = text.trim();
+        if t.starts_with('(') && matching_paren(t, 0) == Some(t.len() - 1) {
+            text = &t[1..t.len() - 1];
+        } else {
+            return t;
+        }
+    }
+}
+
+/// The text of a single-quoted literal (`''` read as one quote), or `None`
+/// when `text` is not exactly one.
+fn quoted_literal(text: &str) -> Option<String> {
+    let t = text.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'\'' || crate::core::sql_scan::quoted_end(bytes, 0, b'\'') != bytes.len() {
+        return None;
+    }
+    Some(t[1..t.len() - 1].replace("''", "'"))
+}
+
+/// Whether every character of `text` ends a word for the full-text splitter
+/// (`text_search`'s, which keeps letters, digits and an inner apostrophe): a
+/// separator that adds no lexeme and joins none.
+fn separates_words(text: &str) -> bool {
+    text.chars().all(|c| !c.is_alphanumeric() && c != '\'')
+}
+
+/// A string literal, perhaps cast to a text type (`' '::text`, as
+/// PostgreSQL prints one back).
+fn literal_piece(text: &str) -> Option<String> {
+    let t = unwrap_parens(text);
+    if let Some(at) = t.rfind("::") {
+        let cast = t[at + 2..].trim().to_ascii_lowercase();
+        if matches!(cast.as_str(), "text" | "varchar" | "character varying") {
+            return quoted_literal(unwrap_parens(&t[..at]));
+        }
+    }
+    quoted_literal(t)
+}
+
+/// The operands of a `||` chain, nested parentheses flattened
+/// (`(a || ' ') || b`, as PostgreSQL prints one back).
+fn concat_pieces(text: &str) -> Vec<&str> {
+    let parts = split_concat(unwrap_parens(text));
+    if parts.len() == 1 {
+        return vec![unwrap_parens(parts[0])];
+    }
+    parts.into_iter().flat_map(concat_pieces).collect()
+}
+
+/// Splits on `||` at the top level (outside parentheses and quotes).
+fn split_concat(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let (mut depth, mut start, mut i) = (0i32, 0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, bytes[i]);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'|' if depth == 0 && bytes.get(i + 1) == Some(&b'|') => {
+                parts.push(&text[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// A column named on its own, perhaps qualified, quoted or cast to text.
+fn text_column(piece: &str) -> Option<String> {
+    let mut t = unwrap_parens(piece);
+    if let Some(at) = t.rfind("::") {
+        let cast = t[at + 2..].trim().to_ascii_lowercase();
+        if !matches!(cast.as_str(), "text" | "varchar" | "character varying") {
+            return None;
+        }
+        t = unwrap_parens(&t[..at]);
+    }
+    let last = t.rsplit('.').next().unwrap_or(t).trim();
+    is_plain_identifier(last).then(|| last.trim_matches('"').to_string())
+}
+
+/// A full-text index's expression, `to_tsvector('<configuration>',
+/// <document>)`: whether the configuration is `simple`, and the columns the
+/// document reads. `None` when `part` is not a `to_tsvector` call (the
+/// caller's other readings apply); `Err` when it is one this cannot index.
+///
+/// The document is one column, or columns joined by `||` with a separator
+/// literal between each two, each column bare, cast to text, or inside
+/// `coalesce(column, '')`. A separator must hold only characters that end a
+/// word ([`separates_words`]): then the document's lexemes are exactly the
+/// union of each column's own, which is what the index keys a row by, so a
+/// query over any of the columns is answered from it. `title || body` joins
+/// the last word of one to the first of the other into a lexeme neither
+/// column has, and is refused rather than indexed as something else.
+pub fn tsvector_expression(part: &str) -> Option<Result<(bool, Vec<String>), String>> {
+    let t = unwrap_parens(part);
+    let lower = t.to_ascii_lowercase();
+    let rest = lower.strip_prefix("to_tsvector")?;
+    let open = t.len() - rest.len() + (rest.len() - rest.trim_start().len());
+    if !t[open..].starts_with('(') || matching_paren(t, open) != Some(t.len() - 1) {
+        return None;
+    }
+    let unsupported = |why: &str| {
+        Some(Err(format!(
+            "this full-text index expression is not supported: {why}; index              to_tsvector('<configuration>', column [|| ' ' || column …])"
+        )))
+    };
+    let args = split_top(&t[open + 1..t.len() - 1]);
+    if args.len() == 1 {
+        // PostgreSQL: the one-argument form reads the session's
+        // `default_text_search_config`, so it is not IMMUTABLE (42P17).
+        return Some(Err("functions in index expression must be marked IMMUTABLE".to_string()));
+    }
+    if args.len() != 2 {
+        return unsupported("to_tsvector takes a configuration and a document");
+    }
+    let mut configuration = unwrap_parens(args[0]);
+    if let Some(at) = configuration.rfind("::") {
+        if !configuration[at + 2..].trim().eq_ignore_ascii_case("regconfig") {
+            return unsupported("the configuration is not a literal");
+        }
+        configuration = configuration[..at].trim();
+    }
+    let Some(configuration) = quoted_literal(configuration) else {
+        return unsupported("the configuration is not a literal");
+    };
+    let simple = crate::core::text_search::is_simple(&configuration);
+    let mut columns: Vec<String> = Vec::new();
+    // Whether the last piece was a column, so the next must be a separator.
+    let mut after_column = false;
+    for piece in concat_pieces(args[1]) {
+        if let Some(text) = literal_piece(piece) {
+            if !separates_words(&text) {
+                return unsupported("a literal in the document holds words of its own");
+            }
+            if !text.is_empty() {
+                after_column = false;
+            }
+            continue;
+        }
+        let column = if let Some(c) = text_column(piece) {
+            c
+        } else {
+            // `coalesce(column, '')`.
+            let l = piece.to_ascii_lowercase();
+            let Some(inner) = l.strip_prefix("coalesce").map(str::trim_start).filter(|r| r.starts_with('(')) else {
+                return unsupported("the document is not columns joined by separators");
+            };
+            let at = piece.len() - inner.len();
+            if matching_paren(piece, at) != Some(piece.len() - 1) {
+                return unsupported("the document is not columns joined by separators");
+            }
+            let args = split_top(&piece[at + 1..piece.len() - 1]);
+            match (args.as_slice(), args.get(1).and_then(|d| literal_piece(d))) {
+                ([c, _], Some(default)) if separates_words(&default) => match text_column(c) {
+                    Some(c) => c,
+                    None => return unsupported("coalesce does not read a column"),
+                },
+                _ => return unsupported("coalesce's default holds words of its own"),
+            }
+        };
+        if after_column {
+            return unsupported("two columns are joined with no separator between them");
+        }
+        if !columns.iter().any(|c| c.eq_ignore_ascii_case(&column)) {
+            columns.push(column);
+        }
+        after_column = true;
+    }
+    if columns.is_empty() {
+        return unsupported("the document reads no column");
+    }
+    Some(Ok((simple, columns)))
 }
 
 #[cfg(test)]
@@ -252,6 +476,38 @@ mod tests {
 
     fn ok(sql: &str) -> CreateIndex {
         parse_create(sql).expect("recognised").expect("valid")
+    }
+
+    #[test]
+    fn full_text_indexes() {
+        let c = ok("CREATE INDEX ft_body ON ft USING gin (to_tsvector('english', body))");
+        assert_eq!(c.method, Some(Method::GinTsvector { simple: false }));
+        assert_eq!(c.columns, vec!["body".to_string()]);
+        let c = ok("CREATE INDEX ON ft USING GIN (to_tsvector('simple'::regconfig, coalesce(title, '') || ' ' || coalesce(body, '')))");
+        assert_eq!(c.method, Some(Method::GinTsvector { simple: true }));
+        assert_eq!(c.columns, vec!["title".to_string(), "body".to_string()]);
+        assert_eq!(c.name_or_default(), "ft_to_tsvector_idx");
+        // As PostgreSQL prints one back (pg_dump, pg_indexes).
+        let c = ok("CREATE INDEX x ON public.ft USING gin (to_tsvector('english'::regconfig, \
+                    ((COALESCE(title, ''::text) || ' '::text) || COALESCE(body, ''::text))))");
+        assert_eq!(c.columns, vec!["title".to_string(), "body".to_string()]);
+        let c = ok("CREATE INDEX x ON ft USING gin ((to_tsvector('english', title || ', ' || body::text)))");
+        assert_eq!(c.columns, vec!["title".to_string(), "body".to_string()]);
+        for (sql, why) in [
+            ("CREATE INDEX x ON ft USING gin (to_tsvector(body))", "IMMUTABLE"),
+            ("CREATE INDEX x ON ft USING gin (to_tsvector('english', title || body))", "no separator"),
+            ("CREATE INDEX x ON ft USING gin (to_tsvector('english', title || ' and ' || body))", "words of its own"),
+            ("CREATE INDEX x ON ft USING gin (to_tsvector('english', lower(body)))", "not columns"),
+            ("CREATE INDEX x ON ft USING gin (to_tsvector(cfg, body))", "not a literal"),
+            ("CREATE INDEX x ON ft USING gin (to_tsvector('english', title || '''' || body))", "words of its own"),
+        ] {
+            match parse_create(sql) {
+                Some(Err(e)) => assert!(e.contains(why), "{sql}: {e}"),
+                other => panic!("{sql} should be refused, got {other:?}"),
+            }
+        }
+        // Without USING gin, an expression index is still not this module's.
+        assert!(parse_create("CREATE INDEX x ON ft (to_tsvector('english', body))").is_none());
     }
 
     #[test]

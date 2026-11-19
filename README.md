@@ -218,9 +218,12 @@ The dialect is PostgreSQL's. What is implemented:
   computed from the rows around it. The default frame follows PostgreSQL's, so
   `SUM(x) OVER (ORDER BY t)` is a running total and `SUM(x) OVER ()` is the
   partition total.
-- **Full-text search** — `to_tsvector`, `to_tsquery`, `plainto_tsquery` and
-  `@@`, with PostgreSQL's `english` stop-word list and a Porter stemmer, so a
-  query for `runs` finds a document that said `running`.
+- **Full-text search** — `to_tsvector`, `to_tsquery`, `plainto_tsquery`,
+  `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank` and `@@`, with
+  PostgreSQL's `english` stop-word list and Snowball stemmer, so a query for
+  `runs` finds a document that said `running`. `CREATE INDEX … USING gin
+  (to_tsvector('english', title || ' ' || body))` indexes it: a match over
+  any of those columns in that configuration is answered from the index.
 - **CTEs** — `WITH name AS (SELECT …)`, materialised, which gives PostgreSQL's
   pre-12 semantics: an optimisation fence, evaluated once however many times it
   is referenced.

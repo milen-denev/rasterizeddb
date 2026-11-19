@@ -2270,6 +2270,9 @@ pub enum GinOpclass {
 const ITEM_KEY: u8 = 1;
 const ITEM_VALUE: u8 = 2;
 const ITEM_PATH: u8 = 3;
+/// A full-text lexeme (`gin (to_tsvector(…))`): never in a `jsonb` index,
+/// tagged apart all the same.
+const ITEM_LEXEME: u8 = 4;
 
 /// The seed every item is hashed under. Part of the derivation that
 /// `gin::ITEM_DERIVE_VERSION` versions.
@@ -2327,6 +2330,18 @@ fn hash_scalar(bytes: &[u8], h: &mut crate::core::hash::ItemFeed) -> Option<()> 
         _ => return None,
     }
     Some(())
+}
+
+/// The item a full-text index keys a lexeme by: its text, as
+/// `text_search::lexemes` gives it and `text_search::index_terms` names it.
+/// Under the GIN hasher, so `gin::GIN_HASHER_ID` covers it; what makes the
+/// lexeme is versioned by `text_search::INDEX_DERIVE_VERSION`.
+pub fn gin_lexeme_item(lexeme: &str) -> u64 {
+    let mut h = item_hasher();
+    h.u8(ITEM_LEXEME);
+    h.bytes(lexeme.as_bytes());
+    h.u64_le(lexeme.len() as u64);
+    h.finish()
 }
 
 /// The key item for `key`: an object key, a string array element, or the

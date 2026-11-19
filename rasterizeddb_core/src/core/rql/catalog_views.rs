@@ -1321,6 +1321,30 @@ async fn build(
                     ));
                 }
                 for g in indexes.gin().iter() {
+                    if let Some(source) = &g.text {
+                        // As PostgreSQL prints an expression index: the
+                        // configuration cast to regconfig, each column
+                        // NULL-safe.
+                        let document = source
+                            .columns
+                            .iter()
+                            .filter_map(|wo| column_name(*wo))
+                            .map(|c| format!("COALESCE({c}, ''::text)"))
+                            .collect::<Vec<_>>()
+                            .join(" || ' '::text || ");
+                        defs.push((
+                            g.decl.name.clone(),
+                            format!(
+                                "CREATE INDEX {} ON {}.{} USING gin (to_tsvector('{}'::regconfig, {}))",
+                                g.decl.name,
+                                SCHEMA,
+                                name,
+                                if source.simple { "simple" } else { "english" },
+                                document
+                            ),
+                        ));
+                        continue;
+                    }
                     let class = match g.opclass {
                         crate::core::jsonb::GinOpclass::Ops => "",
                         crate::core::jsonb::GinOpclass::PathOps => " jsonb_path_ops",
@@ -1566,7 +1590,7 @@ fn shared_declarations(schema: &crate::core::row::schema::TableSchema) -> Vec<(S
             .map(|f| f.write_order as u32)
     };
     let mut out = Vec::new();
-    for decl in schema.secondary_indexes.iter().filter(|d| !d.is_deleted && d.method.opclass().is_none()) {
+    for decl in schema.secondary_indexes.iter().filter(|d| !d.is_deleted && !d.method.is_gin()) {
         out.push((decl.name.clone(), false, decl.columns.clone(), None));
     }
     let pk = schema.primary_key.as_deref().and_then(by_name);

@@ -184,6 +184,39 @@ pub struct Lexeme {
 
 /// Reduces a document to its lexemes.
 pub fn to_tsvector(configuration: &str, document: &str) -> String {
+    let lexemes = lexemes(configuration, document);
+    lexemes
+        .iter()
+        .map(|l| {
+            format!(
+                "'{}':{}",
+                l.text.replace('\'', "''"),
+                l.positions
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether two configuration names reduce a document to the same lexemes:
+/// every name but `simple` is read as `english` (see the module docs).
+pub fn same_configuration(a: &str, b: &str) -> bool {
+    stems(a) == stems(b)
+}
+
+/// Whether `configuration` is `simple` rather than `english`.
+pub fn is_simple(configuration: &str) -> bool {
+    !stems(configuration)
+}
+
+/// A document's lexemes, sorted, each with its positions: what
+/// [`to_tsvector`] prints. An inverted index keys a row by these texts, so
+/// they and the printed vector cannot disagree.
+pub fn lexemes(configuration: &str, document: &str) -> Vec<Lexeme> {
     let stem_it = stems(configuration);
     let mut lexemes: Vec<Lexeme> = Vec::new();
     // Where each lexeme sits in `lexemes`; finding it was a linear search per
@@ -218,21 +251,51 @@ pub fn to_tsvector(configuration: &str, document: &str) -> String {
     // PostgreSQL prints a tsvector with its lexemes in sorted order.
     lexemes.sort_by(|a, b| a.text.cmp(&b.text));
     lexemes
-        .iter()
-        .map(|l| {
-            format!(
-                "'{}':{}",
-                l.text.replace('\'', "''"),
-                l.positions
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
+
+/// What an inverted index can use of a query: the lexemes a matching
+/// document must have, as a tree.
+///
+/// The rule the index rests on: when `matches(to_tsvector(c, d), q)` is
+/// true, the document's lexemes satisfy `index_terms(q)` read as a boolean
+/// over "has this lexeme", with [`IndexTerms::Opaque`] read as true. So `&`
+/// and a phrase need every side (a phrase's words are each present), `|`
+/// needs one, and a negation or a prefix (`'qui':*`, which no hashed item
+/// can name) says nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexTerms {
+    Lexeme(String),
+    All(Vec<IndexTerms>),
+    Any(Vec<IndexTerms>),
+    Opaque,
+}
+
+/// The [`IndexTerms`] of a query in its canonical text form (what the
+/// `to_tsquery` family returns). A query that does not parse, or is empty,
+/// is [`IndexTerms::Opaque`]: the index declines it and the scan answers.
+pub fn index_terms(query: &str) -> IndexTerms {
+    fn of(node: &Node) -> IndexTerms {
+        match node {
+            Node::Term(t) => IndexTerms::Lexeme(t.clone()),
+            Node::Prefix(_) | Node::Not(_) => IndexTerms::Opaque,
+            Node::And(a, b) | Node::Followed(a, b, _) => IndexTerms::All(vec![of(a), of(b)]),
+            Node::Or(a, b) => IndexTerms::Any(vec![of(a), of(b)]),
+        }
+    }
+    // Parsed as `matches` parses it (`compiled_query`): the text is already
+    // normalised, so `simple` leaves each term as it stands.
+    match parse_query("simple", query) {
+        Ok(Some(node)) => of(&node),
+        _ => IndexTerms::Opaque,
+    }
+}
+
+/// The version of how a document becomes an inverted index's lexeme items:
+/// the word splitter, stop words, stemmer and [`same_configuration`]. A
+/// persisted `to_tsvector` index is keyed by it (`TableIndexes::shape_hash`)
+/// and rebuilt when it differs. Bump it with any change that moves one
+/// lexeme; `index_lexemes_are_frozen` fails on such a change.
+pub const INDEX_DERIVE_VERSION: u32 = 1;
 
 /// Normalises a boolean query over lexemes, keeping its operators.
 ///
@@ -1249,6 +1312,27 @@ mod porter2 {
 
 #[cfg(test)]
 mod tests {
+    /// What a full-text index keys rows by, frozen: a change here moves
+    /// lexemes a persisted index was built with, so it must come with a bump
+    /// of [`super::INDEX_DERIVE_VERSION`] (and this table's update).
+    #[test]
+    fn index_lexemes_are_frozen() {
+        use super::{INDEX_DERIVE_VERSION, lexemes};
+        let cases: [(&str, &str, &str); 6] = [
+            ("english", "The quick brown foxes were running daily", "brown daili fox quick run"),
+            ("english", "Generously, the dogs' owners ran o'clock e-mail 42nd", "42nd dog e generous mail o'clock owner ran"),
+            ("simple", "The Quick über CAFÉ 42", "42 café quick the über"),
+            ("english", "Organizations organized organizing", "organ"),
+            ("english", "", ""),
+            ("simple", "a-b_c", "a b c"),
+        ];
+        for (configuration, document, want) in cases {
+            let got: Vec<String> = lexemes(configuration, document).into_iter().map(|l| l.text).collect();
+            assert_eq!(got.join(" "), want, "{configuration}: {document}");
+        }
+        assert_eq!(INDEX_DERIVE_VERSION, 1, "bumped: update the table above to the new lexemes");
+    }
+
     use super::*;
 
     #[test]
