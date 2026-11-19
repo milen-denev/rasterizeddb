@@ -130,6 +130,12 @@ pub fn parse_merge(sql: &str) -> Option<Result<Merge, Refusal>> {
     if upper_head != "MERGE" || !text[5..].starts_with(char::is_whitespace) {
         return None;
     }
+    // PostgreSQL's MERGE is `MERGE INTO`; any other word after MERGE is
+    // another statement's (`MERGE BRANCH dev`), which its own handler reads.
+    let next = text[5..].trim_start();
+    if !(next.len() > 4 && next[..4].eq_ignore_ascii_case("INTO") && next.as_bytes()[4].is_ascii_whitespace()) {
+        return None;
+    }
     Some(parse(text))
 }
 
@@ -292,5 +298,7 @@ mod tests {
         assert_eq!((m.target_alias.as_str(), m.source_alias.as_str()), ("t", "s"));
         assert!(parse_merge("MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN DELETE").unwrap().is_err());
         assert!(parse_merge("SELECT 1").is_none());
+        assert!(parse_merge("MERGE BRANCH dev").is_none());
+        assert!(parse_merge("merge branch dev INTO main").is_none());
     }
 }
