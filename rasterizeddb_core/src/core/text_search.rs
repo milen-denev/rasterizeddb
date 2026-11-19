@@ -302,8 +302,16 @@ pub const INDEX_DERIVE_VERSION: u32 = 1;
 /// Returns `Err` for a query PostgreSQL would also refuse — an operator with
 /// nothing to apply to, or unbalanced parentheses — so a typo is reported
 /// rather than quietly matching nothing.
+///
+/// A quoted operand is text, as PostgreSQL's `to_tsquery` takes it: its
+/// words are normalised like any other (`'Running'` is `'run'` under
+/// `english`), and several of them are a phrase (`'supernovae stars'` is
+/// `'supernova' <-> 'star'`). The quotes only let an operand hold spaces and
+/// operator characters. (The query's text form, `'run' & 'cat'`, read back by
+/// [`matches`] and the index, keeps each quoted lexeme as written, as
+/// PostgreSQL's `::tsquery` input does.)
 pub fn to_tsquery(configuration: &str, query: &str) -> Result<String, String> {
-    let node = parse_query(configuration, query)?;
+    let node = parse_query_as(configuration, query, true)?;
     Ok(node.map(|n| render(&n)).unwrap_or_default())
 }
 
@@ -343,15 +351,22 @@ pub fn phraseto_tsquery(configuration: &str, text: &str) -> String {
 /// The phrase over `words` (a stop word `None`), as [`phraseto_tsquery`]
 /// builds it.
 fn phrase_of(words: Vec<Option<String>>) -> Option<Node> {
+    phrase_of_nodes(words.into_iter().map(|w| w.map(Node::Term)))
+}
+
+/// [`phrase_of`] over nodes: a stop word (`None`) in between widens the
+/// distance; one before the first word or after the last is dropped, as
+/// PostgreSQL drops it.
+fn phrase_of_nodes(words: impl IntoIterator<Item = Option<Node>>) -> Option<Node> {
     let mut out: Option<Node> = None;
     let mut gap = 0u16;
     for word in words {
         match word {
             None => gap = gap.saturating_add(1),
-            Some(term) => {
+            Some(node) => {
                 out = Some(match out {
-                    None => Node::Term(term),
-                    Some(left) => Node::Followed(Box::new(left), Box::new(Node::Term(term)), gap + 1),
+                    None => node,
+                    Some(left) => Node::Followed(Box::new(left), Box::new(node), gap + 1),
                 });
                 gap = 0;
             }
@@ -816,15 +831,25 @@ struct Parser<'a> {
     tokens: Vec<String>,
     at: usize,
     configuration: &'a str,
+    /// `to_tsquery`'s reading: a quoted operand is text to normalise. Off,
+    /// it is a lexeme as written (a query's own text form, read back).
+    normalise_quoted: bool,
 }
 
 /// A parsed query with its stop words taken out (`Ok(None)` when nothing is
 /// left), or why it does not parse.
 fn parse_query(configuration: &str, query: &str) -> Result<Option<Node>, String> {
+    parse_query_as(configuration, query, false)
+}
+
+/// [`parse_query`], with `to_tsquery`'s reading of a quoted operand when
+/// `normalise_quoted` (see [`Parser::normalise_quoted`]).
+fn parse_query_as(configuration: &str, query: &str, normalise_quoted: bool) -> Result<Option<Node>, String> {
     let mut parser = Parser {
         tokens: tokenize_query(query),
         at: 0,
         configuration,
+        normalise_quoted,
     };
     let node = parser.parse_or()?;
     if parser.at != parser.tokens.len() {
@@ -1032,6 +1057,16 @@ impl Parser<'_> {
                 let prefix = suffix.contains('*');
                 if suffix.chars().any(|c| c.is_ascii_alphabetic()) {
                     return Err(format!("tsquery weights ('{suffix}') are not supported yet"));
+                }
+                if quoted && self.normalise_quoted {
+                    // Its words, each normalised, as one phrase; nothing left
+                    // (only stop words, or no word at all) is a stop word,
+                    // taken out after the parse as PostgreSQL ignores it.
+                    let words = normalised_words(self.configuration, &raw);
+                    let node = phrase_of_nodes(
+                        words.into_iter().map(|w| w.map(|t| if prefix { Node::Prefix(t) } else { Node::Term(t) })),
+                    );
+                    return Ok(node.unwrap_or_else(|| Node::Term(STOP.to_string())));
                 }
                 let lower = raw.to_lowercase();
                 let text = if quoted {
@@ -1385,6 +1420,39 @@ mod tests {
         let vector = to_tsvector("english", "the package is running late");
         let query = to_tsquery("english", "runs").unwrap();
         assert!(matches(&vector, &query), "vector was {}", vector);
+    }
+
+    #[test]
+    fn a_quoted_operand_is_normalised_as_postgresql_does() {
+        // Each expectation is PostgreSQL 17's `to_tsquery` answer.
+        let q = |cfg: &str, text: &str| to_tsquery(cfg, text).unwrap();
+        assert_eq!(q("english", "'running'"), "'run'");
+        assert_eq!(q("english", "'Running'"), "'run'");
+        assert_eq!(q("english", "'supernovae stars' & !crab"), "'supernova' <-> 'star' & !'crab'");
+        assert_eq!(q("english", "'cat the dog'"), "'cat' <2> 'dog'");
+        assert_eq!(q("english", "'the cat'"), "'cat'");
+        assert_eq!(q("english", "'cat the'"), "'cat'");
+        assert_eq!(q("english", "'cats the' <-> dog"), "'cat' <-> 'dog'");
+        assert_eq!(q("english", "'the'"), "");
+        assert_eq!(q("english", "'the' & cat"), "'cat'");
+        assert_eq!(q("english", "'!!!' & cat"), "'cat'");
+        assert_eq!(q("english", "'running':*"), "'run':*");
+        assert_eq!(q("english", "'supernovae stars':*"), "'supernova':* <-> 'star':*");
+        assert_eq!(q("english", "'running dogs' <-> barked"), "'run' <-> 'dog' <-> 'bark'");
+        assert_eq!(q("english", "'cat dog' & 'fish'"), "'cat' <-> 'dog' & 'fish'");
+        assert_eq!(q("english", "!'cat dog'"), "!( 'cat' <-> 'dog' )");
+        assert_eq!(q("english", "!(cat <-> dog)"), "!( 'cat' <-> 'dog' )");
+        assert_eq!(q("simple", "'Foo Bar'"), "'foo' <-> 'bar'");
+        assert_eq!(q("simple", "'Running'"), "'running'");
+        // And it finds what the unquoted word finds.
+        let vector = to_tsvector("english", "the stars running");
+        assert!(matches(&vector, &q("english", "'running'")));
+        assert!(matches(&vector, &q("english", "'Stars running'")));
+        // The text form read back keeps a quoted lexeme as written (as
+        // PostgreSQL's `'running'::tsquery` does): `simple` would stem
+        // nothing anyway, but a phrase must not be re-split.
+        assert!(!matches(&vector, "'running'"));
+        assert!(matches(&vector, "'run'"));
     }
 
     #[test]
