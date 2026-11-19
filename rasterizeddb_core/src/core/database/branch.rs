@@ -270,6 +270,9 @@ fn excluded(name: &str) -> bool {
         || name.starts_with(".rdb_")
         || name == "RESTORED.json"
         || name == REPLAY_FILE
+        // What ntfs-3g (FUSE) keeps of a file removed while open: the parent's
+        // garbage, never its data.
+        || name.starts_with(".fuse_hidden")
         // A branch never shares its parent's stores: their objects are the
         // parent's, and a table the branch placed there would write among
         // them. Their tables are copied out of them ([`copy_store_tables`]).
@@ -789,6 +792,9 @@ fn copy_tree(from: &Path, to: &Path, stats: &mut CopyStats) -> io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)?.flatten() {
         let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with(".fuse_hidden") {
+            continue;
+        }
         let target = to.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_dir() {
@@ -850,7 +856,7 @@ fn now_unix() -> u64 {
 /// shortly after. Removing them while open works on most filesystems, but on
 /// a FUSE one (ntfs-3g) leaves `.fuse_hidden` files the removal then trips
 /// over.
-async fn released(dir: &Path) {
+pub(super) async fn released(dir: &Path) {
     #[cfg(target_os = "linux")]
     {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -946,7 +952,7 @@ impl DatabaseCatalog {
     }
 
     /// Removes every base generation of `name`, and forgets an open one.
-    pub(super) fn remove_bases(&self, name: &str) {
+    pub(super) async fn remove_bases(&self, name: &str) {
         if let Some((_, (_, open))) = self.bases.remove(name) {
             drop(open);
         }
@@ -964,6 +970,7 @@ impl DatabaseCatalog {
                 !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) || rest == "building"
             }) {
                 forget_directory(&e.path());
+                released(&e.path()).await;
                 remove_quietly(&e.path());
             }
         }
@@ -1202,7 +1209,7 @@ impl DatabaseCatalog {
                 Err(e) => {
                     forget_directory(&final_dir);
                     remove_quietly(&final_dir);
-                    self.remove_bases(name);
+                    self.remove_bases(name).await;
                     return Err(format!(
                         "branch \"{name}\" was copied but would not open: {e}"
                     ));
@@ -1598,7 +1605,7 @@ impl DatabaseCatalog {
         let swapped = intent
             .store(&root)
             .and_then(|_| finish_promote(&root, &mut intent));
-        self.remove_bases(name);
+        self.remove_bases(name).await;
         let reopened = (self.attach(&parent).await, self.attach(name).await);
         if let Err(e) = swapped {
             return Err(format!(

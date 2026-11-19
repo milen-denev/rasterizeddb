@@ -481,6 +481,11 @@ impl DatabaseCatalog {
                 &path.to_string_lossy(),
             );
 
+            // Its files close from its own tasks, just after it is let go:
+            // removing them while open leaves `.fuse_hidden` files on
+            // ntfs-3g, and the directory behind.
+            #[cfg(feature = "db_branching")]
+            branch::released(&path).await;
             if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                 // The database is gone as far as clients are concerned, so this
                 // is a disk-space problem rather than a failed statement.
@@ -495,7 +500,7 @@ impl DatabaseCatalog {
 
         // A branch's merge bases go with it.
         #[cfg(feature = "db_branching")]
-        self.remove_bases(name);
+        self.remove_bases(name).await;
 
         info!("Dropped database \"{}\"", name);
         Ok(())
