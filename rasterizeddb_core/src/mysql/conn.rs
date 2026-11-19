@@ -2088,7 +2088,7 @@ impl Session {
                     .map(|c| {
                         let mut row = vec![Some(c.name), Some(c.mysql_type.clone())];
                         if full {
-                            row.push(c.text.then(|| "utf8mb4_bin".to_string()));
+                            row.push(c.text.then(|| c.collation.to_string()));
                         }
                         row.extend([
                             Some(if c.nullable { "YES" } else { "NO" }.to_string()),
@@ -2545,7 +2545,11 @@ impl Session {
             .unique_keys
             .iter()
             .filter(|k| !k.is_deleted && k.columns.len() == 1)
-            .map(|k| k.columns[0].clone())
+            // A key on a collation's companion is a key on its column.
+            .map(|k| {
+                crate::core::rql::collation::companion_of(&k.columns[0])
+                    .map_or_else(|| k.columns[0].clone(), |(base, _)| base.to_string())
+            })
             .chain(
                 schema
                     .fields
@@ -2565,7 +2569,7 @@ impl Session {
                     .iter()
                     .find(|f| f.write_order as u32 == *w && !f.is_deleted)
             })
-            .map(|f| f.name.clone())
+            .map(|f| crate::core::rql::collation::companion_of(&f.name).map_or_else(|| f.name.clone(), |(b, _)| b.to_string()))
             .chain(
                 schema
                     .unique_keys
@@ -2620,11 +2624,17 @@ impl Session {
             } else {
                 ""
             };
+            let collation = match crate::core::rql::collation::of(&column, &schema.fields) {
+                crate::core::rql::collation::Strength::Binary => "utf8mb4_bin",
+                crate::core::rql::collation::Strength::CaseInsensitive => "utf8mb4_0900_as_ci",
+                crate::core::rql::collation::Strength::CaseAccentInsensitive => "utf8mb4_0900_ai_ci",
+            };
             out.push(Described {
                 nullable: get(5).as_deref() == Some("YES") && !primary.contains(&column),
                 name: column,
                 mysql_type,
                 text,
+                collation,
                 key: key.to_string(),
                 default,
                 extra,
@@ -2679,10 +2689,15 @@ impl Session {
             {
                 continue;
             }
+            let columns: Vec<String> = key
+                .columns
+                .iter()
+                .map(|c| crate::core::rql::collation::companion_of(c).map_or_else(|| c.clone(), |(b, _)| b.to_string()))
+                .collect();
             push(
                 translate::plain_index_name(&name, &key.name),
                 false,
-                &key.columns,
+                &columns,
                 "BTREE",
             );
         }
@@ -2696,7 +2711,10 @@ impl Session {
                         .iter()
                         .find(|f| f.write_order as u32 == *w && !f.is_deleted)
                 })
-                .map(|f| f.name.clone())
+                .map(|f| {
+                    crate::core::rql::collation::companion_of(&f.name)
+                        .map_or_else(|| f.name.clone(), |(b, _)| b.to_string())
+                })
                 .collect();
             // A full-text key, as MySQL lists one (and SHOW CREATE TABLE
             // writes it back, which a dump reloads).
@@ -2718,6 +2736,11 @@ impl Session {
             .iter()
             .map(|c| {
                 let mut line = format!("  `{}` {}", c.name, c.mysql_type);
+                // A case-insensitive column says so, so a dump made from
+                // this loads as the same column.
+                if c.text && c.collation != "utf8mb4_bin" {
+                    line.push_str(&format!(" COLLATE {}", c.collation));
+                }
                 if !c.nullable {
                     line.push_str(" NOT NULL");
                 }
@@ -4868,6 +4891,8 @@ struct Described {
     mysql_type: String,
     /// A text column (has a collation).
     text: bool,
+    /// Its collation's MySQL name.
+    collation: &'static str,
     nullable: bool,
     key: String,
     default: Option<String>,

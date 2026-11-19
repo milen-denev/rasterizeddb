@@ -50,8 +50,16 @@ pub fn flag_column_name(column: &str) -> String {
 }
 
 /// True for a companion column, which must stay out of `SELECT *` and out of
-/// anything else the client can see.
+/// anything else the client can see: a NULL flag ([`is_flag`]) or a
+/// collation key (`collation::is_companion`).
 pub fn is_hidden(name: &str) -> bool {
+    is_flag(name) || crate::core::rql::collation::is_companion(name)
+}
+
+/// True for a NULL flag, `__null_<column>`, the companion whose name ends
+/// in the column it tracks. A caller reading the column out of the name asks
+/// this, not [`is_hidden`].
+pub fn is_flag(name: &str) -> bool {
     name.starts_with(NULL_FLAG_PREFIX)
 }
 

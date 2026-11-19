@@ -407,6 +407,11 @@ pub enum TextFunc {
     /// Lower/upper case.
     Lower,
     Upper,
+    /// A collation key (`core::rql::collation::key`): `__rdb_ci_key(text)`,
+    /// what a case-insensitive column's companion holds and its comparisons
+    /// read; `CiAiKey` for case and accents.
+    CiKey,
+    CiAiKey,
     /// `date_trunc('minute', ts)` — an instant floored to a unit.
     DateTrunc,
     /// `to_tsvector(config, document)` — a document reduced to its lexemes.
@@ -1885,13 +1890,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     blank_pad_text_branches(args.iter_mut());
                     Ok(Expr::Greatest(args))
                 }
-                "QUOTE_IDENT" | "LOWER" | "UPPER" => {
+                "QUOTE_IDENT" | "LOWER" | "UPPER" | "__RDB_CI_KEY" | "__RDB_CI_AI_KEY" => {
                     if args.len() != 1 {
                         return Err(format!("{} takes exactly one argument", upper_name));
                     }
                     let func = match upper_name.as_str() {
                         "QUOTE_IDENT" => TextFunc::QuoteIdent,
                         "LOWER" => TextFunc::Lower,
+                        "__RDB_CI_KEY" => TextFunc::CiKey,
+                        "__RDB_CI_AI_KEY" => TextFunc::CiAiKey,
                         _ => TextFunc::Upper,
                     };
                     Ok(Expr::Call(func, args))
@@ -4278,6 +4285,8 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         func,
         TextFunc::Lower
             | TextFunc::Upper
+            | TextFunc::CiKey
+            | TextFunc::CiAiKey
             | TextFunc::QuoteIdent
             | TextFunc::ToTsVector
             | TextFunc::ToTsQuery
@@ -4500,6 +4509,14 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             }
         }
         TextFunc::Lower => string(as_text(&args[0]).to_lowercase()),
+        TextFunc::CiKey => string(crate::core::rql::collation::key(
+            &as_text(&args[0]),
+            crate::core::rql::collation::Strength::CaseInsensitive,
+        )),
+        TextFunc::CiAiKey => string(crate::core::rql::collation::key(
+            &as_text(&args[0]),
+            crate::core::rql::collation::Strength::CaseAccentInsensitive,
+        )),
         TextFunc::Upper => string(as_text(&args[0]).to_uppercase()),
 
         // Full-text search. Both sides carry their canonical text form — see

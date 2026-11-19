@@ -217,7 +217,7 @@ impl UniqueKey {
             let owner = field
                 .name
                 .get(crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..)
-                .filter(|_| crate::core::rql::nullable::is_hidden(&field.name));
+                .filter(|_| crate::core::rql::nullable::is_flag(&field.name));
             let column = owner.unwrap_or(&field.name);
             for f in fields.iter().filter(|f| !f.is_deleted) {
                 if f.name.eq_ignore_ascii_case(column)

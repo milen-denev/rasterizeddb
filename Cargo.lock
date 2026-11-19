@@ -4657,6 +4657,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls 0.26.6",
+ "unicode-normalization",
  "webpki-roots",
  "xutex",
  "zstd",

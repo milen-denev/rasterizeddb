@@ -939,3 +939,49 @@ async fn mysql_full_text_search() {
         assert_eq!(code(&e).0, Some(1235), "{sql}: {e}");
     }
 }
+
+/// A column's case-insensitive collation is the engine's; a table's default
+/// is not applied (schemas loaded before keep their answers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_column_collations() {
+    let s = start(MyAuth::Password);
+    let mut c = mysql(&s).await;
+    c.execute(
+        "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(100) COLLATE utf8mb4_0900_ai_ci UNIQUE, \
+         login VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, nick VARCHAR(20)) \
+         ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+    )
+    .await
+    .unwrap();
+    c.execute("INSERT INTO users VALUES (1, 'Ann@Example.com', 'Ann', 'Annie'), (2, 'bo@x.org', 'bo', 'Bo')")
+        .await
+        .unwrap();
+    let id: i32 = sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+        .bind("ANN@example.COM")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(id, 1);
+    // Accents too, under ai_ci.
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = 'bó@x.org'").fetch_one(&mut c).await.unwrap();
+    assert_eq!(n, 1);
+    // `_bin` and the table default: the bytes.
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE login = 'ann' OR nick = 'annie'")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+    let e = c.execute("INSERT INTO users VALUES (3, 'BO@X.ORG', 'x', 'y')").await.expect_err("duplicate");
+    assert_eq!(code(&e).0, Some(1062), "{e}");
+    let rows = sqlx::query("SHOW FULL COLUMNS FROM users").fetch_all(&mut c).await.unwrap();
+    let collations: Vec<Option<String>> = rows.iter().map(|r| r.get::<Option<String>, _>(2)).collect();
+    assert_eq!(
+        collations,
+        [None, Some("utf8mb4_0900_ai_ci".into()), Some("utf8mb4_bin".into()), Some("utf8mb4_bin".into())]
+    );
+    let rows = sqlx::query("SHOW CREATE TABLE users").fetch_all(&mut c).await.unwrap();
+    let ddl: String = rows[0].get(1);
+    assert!(ddl.contains("`email` varchar(100) COLLATE utf8mb4_0900_ai_ci"), "{ddl}");
+    assert!(ddl.contains("UNIQUE KEY"), "{ddl}");
+    assert!(!ddl.contains("__ci"), "{ddl}");
+}

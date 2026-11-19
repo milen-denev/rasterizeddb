@@ -608,6 +608,9 @@ pub(crate) struct Cx<'a> {
     /// The FOR XML being rewritten is read back as text with
     /// `.value('.', …)`: its text is unescaped.
     xml_value: bool,
+    /// A CREATE TABLE's column `COLLATE` is honoured ([`engine_collation`]);
+    /// elsewhere it is dropped, as before.
+    collations: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -618,6 +621,7 @@ impl<'a> Cx<'a> {
             window_next: false,
             past_select_list: false,
             xml_value: false,
+            collations: false,
         }
     }
 }
@@ -3350,7 +3354,17 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<String, TsqlError> {
                     k += 1;
                 }
             }
-            "COLLATE" => k += 2,
+            "COLLATE" => {
+                // A case-insensitive collation is the engine's own (the
+                // column gets its key companion); a case-sensitive or binary
+                // one is the bytes, which is what a column compares by.
+                if cx.collations
+                    && let Some(engine) = def.get(k + 1).and_then(|t| t.ident()).and_then(engine_collation)
+                {
+                    attrs.push(format!("COLLATE {engine}"));
+                }
+                k += 2;
+            }
             "ROWGUIDCOL" | "SPARSE" => k += 1,
             "REFERENCES" | "CHECK" | "FOREIGN" => {
                 attrs.push(render_text(&rewrite_expr(def[k..].to_vec(), cx)?));
@@ -3526,7 +3540,22 @@ fn strip_storage(tokens: &[Token]) -> Result<(), TsqlError> {
     Ok(())
 }
 
+/// The engine collation a SQL Server collation means, `None` for the bytes:
+/// `…_CI_AI` ignores case and accents, any other `…_CI…` case only;
+/// `…_CS…` and `…_BIN`/`…_BIN2` compare by the bytes.
+pub(crate) fn engine_collation(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_uppercase();
+    if !n.contains("_CI") {
+        None
+    } else if n.contains("_CI_AI") {
+        Some(crate::core::rql::collation::CIA_NAME)
+    } else {
+        Some(crate::core::rql::collation::CI_NAME)
+    }
+}
+
 fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
+    cx.collations = true;
     let (table, after) =
         table_name_at(&tokens, 2).ok_or_else(|| TsqlError::syntax("CREATE TABLE needs a name"))?;
     let temporary = table.starts_with('#');

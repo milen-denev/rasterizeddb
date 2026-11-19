@@ -2257,6 +2257,10 @@ pub fn row_fetch_from_select_query(
     // needs no special case: it already emits the grouping key for a plain
     // column, so a plan whose items are all keys yields one row per group.
     let is_grouped = has_aggregate || !group_by.is_empty();
+    // Columns with a nondeterministic collation sort by their key; what
+    // would compare them by their bytes is refused (`collation::plan_single`).
+    let order_terms =
+        crate::core::rql::collation::plan_single(columns_part, schema, order_terms, &group_by, is_grouped, distinct)?;
 
     // HAVING with nothing to group by is the whole table as one group, which
     // only means something if there is an aggregate to test.

@@ -33,10 +33,17 @@ already runs, so it cannot drift from PostgreSQL's behaviour.
   folding them to lower case. A result column is named as it was written in
   the select list (`SELECT UserId` returns `UserId`); `SELECT *` returns the
   names in lower case.
-- **Text compares as bytes.** The servers say so (`utf8mb4_bin`,
-  `Latin1_General_BIN2`). MySQL's and SQL Server's default collations ignore
-  case (and MySQL's accents): `WHERE name = 'abc'` does not match `'ABC'`
-  here.
+- **Text compares as bytes unless a column says otherwise.** The servers
+  report `utf8mb4_bin` and `Latin1_General_BIN2` as their defaults, and a
+  table's default collation (`DEFAULT COLLATE=…`, which `mysqldump` writes on
+  every table) is not applied: existing schemas keep the answers they had. A
+  *column's* own case-insensitive collation is the engine's
+  ([collations](collations.md)): MySQL `…_as_ci` is `rdb_ci`, any other
+  `…_ci` (`utf8mb4_0900_ai_ci`, `utf8mb4_general_ci`) is `rdb_ci_ai`; SQL
+  Server `…_CI_AI` is `rdb_ci_ai` and any other `…_CI_…` `rdb_ci`. Such a
+  column compares, sorts, is unique and is indexed without case, and the
+  catalogs report it under its own collation. What the engine refuses for
+  one (`GROUP BY`, `DISTINCT`, joins comparing it, …) is listed there.
 - **Index names** are per table in both databases and per database here; an
   index made through either protocol is stored as `<table>__<name>` and shown
   under its own name.
@@ -261,6 +268,7 @@ and `mssql_protocol.rs` run in the compat suite; the client harnesses are in
 
 ## Not offered
 
-Case-insensitive collations (both databases' default) need the engine: a
-front end that folded case could not make a unique key or an index compare
-the same way.
+Applying a table's or database's default case-insensitive collation to its
+columns (MySQL's and SQL Server's own default behaviour): it would change the
+answers of every schema loaded so far, and the engine still refuses grouping
+and joins over such columns.

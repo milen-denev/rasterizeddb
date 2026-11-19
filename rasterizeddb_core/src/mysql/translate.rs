@@ -295,6 +295,9 @@ pub(crate) struct Cx<'a> {
     /// A `MATCH … AGAINST` here is read as its relevance score: a select-list
     /// item, an `ORDER BY` term, a function's argument.
     relevance: bool,
+    /// A CREATE TABLE's column `COLLATE` is honoured ([`engine_collation`]);
+    /// elsewhere it is dropped, as before.
+    collations: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -307,6 +310,7 @@ impl<'a> Cx<'a> {
             table: None,
             meta: Vec::new(),
             relevance: false,
+            collations: false,
         }
     }
 }
@@ -2290,6 +2294,21 @@ fn index_columns(tokens: &[Token]) -> Result<Vec<String>, MyError> {
     Ok(out)
 }
 
+/// The engine collation a MySQL collation means, `None` for the bytes:
+/// `…_bin`, `…_cs` and `binary` compare by them; `…_as_ci` ignores case;
+/// every other `…_ci` (`utf8mb4_0900_ai_ci`, `utf8mb4_general_ci`,
+/// `utf8mb4_unicode_ci`) ignores case and accents.
+pub(crate) fn engine_collation(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.ends_with("_as_ci") {
+        Some(crate::core::rql::collation::CI_NAME)
+    } else if n.ends_with("_ci") {
+        Some(crate::core::rql::collation::CIA_NAME)
+    } else {
+        None
+    }
+}
+
 /// One column definition: name, then type, then attributes. Returns the
 /// engine's definition and any CHECK an ENUM adds.
 fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>), MyError> {
@@ -2433,7 +2452,18 @@ fn column_definition(def: &[Token], cx: &mut Cx) -> Result<(String, Vec<String>)
             }
             "COMMENT" | "COLUMN_FORMAT" | "STORAGE" | "SRID" => k += 2,
             "CHARACTER" => k += 3,
-            "CHARSET" | "COLLATE" => k += 2,
+            "COLLATE" => {
+                // A case-insensitive collation is the engine's own (the
+                // column gets its key companion); a binary or case-sensitive
+                // one is the bytes, which is what a column compares by.
+                if cx.collations
+                    && let Some(engine) = def.get(k + 1).and_then(|t| t.ident()).and_then(engine_collation)
+                {
+                    attrs.push(format!("COLLATE {engine}"));
+                }
+                k += 2;
+            }
+            "CHARSET" => k += 2,
             "VISIBLE" | "INVISIBLE" => k += 1,
             "ON" if kw(def, k + 1, "UPDATE") => {
                 // ON UPDATE CURRENT_TIMESTAMP[(n)]: recorded, and set by
@@ -2512,6 +2542,7 @@ fn check_table_options(tokens: &[Token]) -> Result<(), MyError> {
 
 fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyError> {
     cx.ddl = true;
+    cx.collations = true;
     let mut i = 1usize;
     let temporary = kw(&tokens, i, "TEMPORARY");
     if temporary {

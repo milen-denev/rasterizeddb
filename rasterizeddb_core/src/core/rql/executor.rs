@@ -3859,7 +3859,7 @@ fn rewrite_payload(
                     mb
                 } else if field.db_type.is_variable_width() {
                     crate::memory_pool::MemoryBlock::default()
-                } else if crate::core::rql::nullable::is_hidden(&field.name) {
+                } else if crate::core::rql::nullable::is_flag(&field.name) {
                     let tracked =
                         &field.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..];
 
@@ -5868,6 +5868,13 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         Some(Err(e)) => return ddl_error(&e),
         None => return ddl_error("not a UNION"),
     };
+    // Rows told apart by a column with a nondeterministic collation are
+    // refused (`collation::refuse_in_set_op`).
+    let compares = parts.ops.iter().any(|op| !(op.all && op.kind == crate::core::rql::join::SetKind::Union));
+    let fields = |table: &str| database.schema_view(table).map(|v| v.schema().fields.to_vec());
+    if let Err(e) = crate::core::rql::collation::refuse_in_set_op(&parts.branches, compares, &fields) {
+        return ddl_error(&e);
+    }
 
     // A document column compares by value, so `{"a":1}` and `{"a":1.0}` are
     // one row. A position is a document column when any branch says so
@@ -8170,8 +8177,15 @@ fn conflict_is_on_arbiter(
     let Some(violation) = crate::core::row::table::UniqueViolation::of(error) else {
         return false;
     };
+    // A key on a collation's companion is a key on its column.
     let normalized = |names: &[String]| -> Vec<String> {
-        let mut names: Vec<String> = names.iter().map(|c| c.trim().trim_matches('"').to_ascii_lowercase()).collect();
+        let mut names: Vec<String> = names
+            .iter()
+            .map(|c| {
+                let c = c.trim().trim_matches('"');
+                crate::core::rql::collation::companion_of(c).map_or(c, |(base, _)| base).to_ascii_lowercase()
+            })
+            .collect();
         names.sort();
         names.dedup();
         names
@@ -11739,7 +11753,11 @@ fn check_conflict_target_infers_a_key(
     wanted.sort();
     wanted.dedup();
     let same = |columns: &[String]| {
-        let mut have: Vec<String> = columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+        // A key on a collation's companion is a key on its column.
+        let mut have: Vec<String> = columns
+            .iter()
+            .map(|c| crate::core::rql::collation::companion_of(c).map_or(c.as_str(), |(base, _)| base).to_ascii_lowercase())
+            .collect();
         have.sort();
         have.dedup();
         have == wanted
@@ -13430,7 +13448,7 @@ impl CompiledCheck {
         let mut out: Vec<crate::core::row::schema::SchemaField> = Vec::new();
         for field in read {
             let field = match field.name.get(crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..) {
-                Some(base) if crate::core::rql::nullable::is_hidden(&field.name) => fields
+                Some(base) if crate::core::rql::nullable::is_flag(&field.name) => fields
                     .iter()
                     .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(base))
                     .cloned()
@@ -14396,6 +14414,12 @@ async fn existing_rows_break_unique(
 async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8> {
     use crate::core::rql::lexer_alter;
 
+    // A column given a nondeterministic collation here would compare by its
+    // bytes: refused until ALTER can make its key companion.
+    if crate::core::rql::collation::declares_nondeterministic(sql) {
+        return ddl_error("ALTER TABLE giving a column a case-insensitive collation is not supported yet; declare it in CREATE TABLE");
+    }
+
     let plans = match lexer_alter::parse_alter_table_actions_tagged(sql) {
         Ok(p) => p,
         Err(e) => {
@@ -14403,6 +14427,21 @@ async fn execute_alter_table(sql: &str, database: &Arc<Database>, tx: TxId) -> V
             return ddl_error(&e);
         }
     };
+
+    // Retyping a column with a nondeterministic collation would rebuild it
+    // without its key companion, comparing by its bytes after: refused.
+    for (plan, _) in &plans {
+        if let lexer_alter::AlterAction::AlterColumn { name, detail } = &plan.action
+            && detail.to_ascii_uppercase().contains("TYPE")
+            && database
+                .schema_view(&plan.table_name)
+                .is_some_and(|v| !crate::core::rql::collation::of(name, &v.schema().fields).is_binary())
+        {
+            return ddl_error(&format!(
+                "ALTER COLUMN {name} TYPE on a column which has a case-insensitive collation, is not supported yet"
+            ));
+        }
+    }
 
     // Before `IF EXISTS`: a partitioned table that could not be opened is
     // absent from `tables` yet exists. Every action is checked before the
@@ -17320,10 +17359,20 @@ async fn execute_create_index(sql: &str, database: &Arc<Database>) -> Vec<u8> {
                         "data type json has no default operator class for access method \"{method}\""
                     ));
                 }
-                Some(f) => {
-                    columns.push(f.write_order as u32);
-                    types.push(f.db_type.clone());
-                }
+                // A column with a nondeterministic collation is keyed by its
+                // companion, so the index finds and orders what the collation
+                // calls equal and ordered (`collation`). Not a full-text
+                // index, whose lexemes have no case.
+                Some(f) => match crate::core::rql::collation::companion(&f.name, &table.schema.fields) {
+                    Some((key, _)) if !statement.method.is_some_and(|m| m.is_gin()) => {
+                        columns.push(key.write_order as u32);
+                        types.push(key.db_type.clone());
+                    }
+                    _ => {
+                        columns.push(f.write_order as u32);
+                        types.push(f.db_type.clone());
+                    }
+                },
                 None => {
                     return ddl_error(&format!(
                         "column '{}' does not exist in '{}'",
@@ -20707,6 +20756,13 @@ pub(crate) async fn execute_with_need(
                 }
                 let mut create_table = create_table;
                 if let Err(e) = resolve_default_referenced_columns(&database, &mut create_table) {
+                    return ddl_error(&e);
+                }
+                // Columns with a nondeterministic collation get their key
+                // companions (`collation::apply_to_create`).
+                if let Err(e) =
+                    crate::core::rql::collation::apply_to_create(&query_sql(&query), &mut create_table, partition.is_some())
+                {
                     return ddl_error(&e);
                 }
                 if let Some(clause) = partition {

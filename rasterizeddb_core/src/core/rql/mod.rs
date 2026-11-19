@@ -62,6 +62,7 @@ pub mod replicated_values;
 
 pub mod catalog_views;
 pub mod check;
+pub mod collation;
 pub mod pg_regex;
 pub mod executor;
 pub mod generated;

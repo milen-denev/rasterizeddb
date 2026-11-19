@@ -1376,7 +1376,7 @@ pub fn combine<'a>(plan: &JoinPlan, scanned: &'a [RowSet]) -> Result<Joined<'a>,
             rel.fetch_columns
                 .iter()
                 .find(|f| {
-                    crate::core::rql::nullable::is_hidden(&f.name)
+                    crate::core::rql::nullable::is_flag(&f.name)
                         && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
                         && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
                             .eq_ignore_ascii_case(name)
@@ -1799,7 +1799,7 @@ impl<'p> Projector<'p> {
                         .fetch_columns
                         .iter()
                         .find(|f| {
-                            crate::core::rql::nullable::is_hidden(&f.name)
+                            crate::core::rql::nullable::is_flag(&f.name)
                                 && f.name.len() > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
                                 && f.name[crate::core::rql::nullable::NULL_FLAG_PREFIX.len()..]
                                     .eq_ignore_ascii_case(&item.field.name)
@@ -3222,6 +3222,26 @@ pub fn plan(
         })
         .collect::<Result<_, _>>()?;
 
+    // A column with a nondeterministic collation compared anywhere here is
+    // refused (`collation::refuse_in_join`).
+    if schemas.iter().any(|s| crate::core::rql::collation::any(s)) {
+        let labelled: Vec<(&str, &[SchemaField])> =
+            relations.iter().zip(&schemas).map(|(r, s)| (r.label.as_str(), &s[..])).collect();
+        let order_text: Vec<String> = order_by.iter().map(|t| t.token.clone()).collect();
+        let mut compared: Vec<&str> = vec![where_clause];
+        compared.extend(group_by_clause);
+        compared.extend(having_clause);
+        compared.extend(order_text.iter().map(String::as_str));
+        for r in &relations {
+            if let Some(j) = &r.join {
+                compared.push(&j.left_qualified);
+                compared.push(&j.right_qualified);
+                compared.extend(j.extra.iter().map(String::as_str));
+            }
+        }
+        crate::core::rql::collation::refuse_in_join(&labelled, select_list, &compared)?;
+    }
+
     // `pg_column_size(c)` names a whole *relation*, not a column, and has to be
     // answered from the row layout before anything reads the select list as
     // expressions — the projection and the aggregate stage each parse it
@@ -4378,7 +4398,7 @@ fn bare_aliases(
     let mut out: Vec<SchemaField> = Vec::new();
     for (i, relation) in relations.iter().enumerate() {
         for (k, field) in relation.fetch_columns.iter().enumerate() {
-            let base = field.name.strip_prefix(prefix).filter(|_| crate::core::rql::nullable::is_hidden(&field.name)).unwrap_or(&field.name);
+            let base = field.name.strip_prefix(prefix).filter(|_| crate::core::rql::nullable::is_flag(&field.name)).unwrap_or(&field.name);
             let elsewhere = schemas
                 .iter()
                 .enumerate()
@@ -4465,7 +4485,7 @@ pub fn combined_layout(relations: &[Relation]) -> CombinedLayout {
             // post-join term, and a NULL cell, which holds its type's zeroes,
             // compared as zero — `a.v <> b.v` kept a row where `b.v` was NULL.
             let prefix = crate::core::rql::nullable::NULL_FLAG_PREFIX;
-            let name = if crate::core::rql::nullable::is_hidden(&field.name) {
+            let name = if crate::core::rql::nullable::is_flag(&field.name) {
                 format!("{}{}__{}", prefix, relation.label, &field.name[prefix.len()..])
             } else {
                 format!("{}__{}", relation.label, field.name)
@@ -4527,7 +4547,7 @@ impl Companions {
                                 .fetch_columns
                                 .iter()
                                 .find(|f| {
-                                    crate::core::rql::nullable::is_hidden(&f.name)
+                                    crate::core::rql::nullable::is_flag(&f.name)
                                         && f.name.len()
                                             > crate::core::rql::nullable::NULL_FLAG_PREFIX.len()
                                         && f.name

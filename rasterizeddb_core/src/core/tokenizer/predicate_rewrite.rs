@@ -1153,7 +1153,7 @@ pub const PG_OPERATORS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+pub(crate) enum Tok {
     /// A bare word: column name, keyword, or unquoted literal.
     Word(String),
     /// A quoted string, carried with its original quoting intact.
@@ -1175,11 +1175,11 @@ enum Tok {
 }
 
 impl Tok {
-    fn is_keyword(&self, kw: &str) -> bool {
+    pub(crate) fn is_keyword(&self, kw: &str) -> bool {
         matches!(self, Tok::Word(w) if w.eq_ignore_ascii_case(kw))
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match self {
             Tok::Word(w) => w.clone(),
             Tok::Str(s) => s.clone(),
@@ -1193,7 +1193,7 @@ impl Tok {
     }
 }
 
-fn lex(clause: &str) -> Result<Vec<Tok>, String> {
+pub(crate) fn lex(clause: &str) -> Result<Vec<Tok>, String> {
     let bytes = clause.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1709,7 +1709,7 @@ fn lex(clause: &str) -> Result<Vec<Tok>, String> {
 ///
 /// `users.name`, `u.name`, `"name"` and `NAME` all resolve to `name`, matching
 /// Postgres' case-insensitive folding of unquoted identifiers.
-fn resolve_column(raw: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<String> {
+pub(crate) fn resolve_column(raw: &str, schema: &SmallVec<[SchemaField; 20]>) -> Option<String> {
     let unquoted = raw.trim_matches('"');
     // Try the whole name first, so a column that genuinely contains a dot wins
     // over a qualifier interpretation.
@@ -2860,6 +2860,9 @@ pub fn rewrite_scan_where(
     // they mean, which the evaluator answers.
     let lowered = crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
     let lowered = crate::core::rql::check::lower_text_match(&lowered);
+    // Before the lift, so an operand folded through the key function is
+    // lifted with the rest (`collate_rewrite`).
+    let lowered = super::collate_rewrite::rewrite(&lowered, schema)?;
     let expanded = expand_row_value_comparisons(&lowered)?;
     let lifted = lift_evaluated_operands(&expanded, schema)?;
     rewrite_where_in(&lifted, schema, true)
@@ -5826,6 +5829,9 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     // `rewrite_scan_where` has done it).
     let clause = &crate::core::rql::check::lower_regex_operators(clause, "regexp_like");
     let clause = &crate::core::rql::check::lower_text_match(clause);
+    // A comparison under a nondeterministic collation reads the column's
+    // key companion (`collate_rewrite`).
+    let clause = &super::collate_rewrite::rewrite(clause, schema)?;
     // `<constant> IS [NOT] NULL`, as an inlined parameter makes it, is true
     // or false outright. See `fold_constant_null_tests`.
     let clause = &fold_constant_null_tests(clause);

@@ -961,3 +961,38 @@ async fn tiberius_full_text_search() {
     let r = batch(&mut c, "SELECT Id FROM Docs WHERE CONTAINS(Body, 'pie') ORDER BY Id").await.unwrap();
     assert_eq!(ids(&r), vec![3]);
 }
+
+/// A column's case-insensitive collation is the engine's.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiberius_column_collations() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE Accounts (Id int PRIMARY KEY, Login nvarchar(50) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL UNIQUE, \
+         City nvarchar(50) COLLATE Latin1_General_CI_AI, Code varchar(10) COLLATE Latin1_General_BIN2);
+         INSERT INTO Accounts VALUES (1, N'Admin', N'Zürich', 'AB'), (2, N'guest', N'Bern', 'cd');",
+    )
+    .await
+    .unwrap();
+    let ids = |r: &Vec<Vec<tiberius::Row>>| r[0].iter().map(|row| row.get::<i32, _>(0).unwrap()).collect::<Vec<_>>();
+    for (condition, want) in [
+        ("Login = N'ADMIN'", vec![1]),
+        ("City = N'zurich'", vec![1]),
+        ("Login LIKE N'G%'", vec![2]),
+        ("Code = 'ab'", vec![]),
+    ] {
+        let r = batch(&mut c, &format!("SELECT Id FROM Accounts WHERE {condition} ORDER BY Id")).await.unwrap();
+        assert_eq!(ids(&r), want, "{condition}");
+    }
+    let r = c
+        .query("SELECT Id FROM Accounts WHERE Login = @P1", &[&"GUEST"])
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), vec![2]);
+    let e = batch(&mut c, "INSERT INTO Accounts VALUES (3, N'admin', NULL, NULL)").await.expect_err("duplicate");
+    assert_eq!(number(&e), Some(2627), "{e}");
+}

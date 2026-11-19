@@ -1688,7 +1688,7 @@ pub fn insert_row_with_defaults(
                     mb.into_slice_mut().fill(0);
                     mb
                 }
-            } else if nullable::is_hidden(&field.name) {
+            } else if nullable::is_flag(&field.name) {
                 // Set when the column it tracks was not supplied and has no
                 // default, or was supplied as NULL.
                 let tracked = &field.name[nullable::NULL_FLAG_PREFIX.len()..];

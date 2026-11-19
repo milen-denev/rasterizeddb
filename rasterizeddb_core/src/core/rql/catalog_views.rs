@@ -1250,12 +1250,17 @@ async fn build(
                 };
                 let indexes = owned.view();
                 let schema = relation.schema();
+                // An index keyed by a collation's companion is an index on
+                // its column, as it was declared.
                 let column_name = |wo: u32| {
                     schema
                         .fields
                         .iter()
                         .find(|f| f.write_order as u32 == wo && !f.is_deleted)
-                        .map(|f| f.name.clone())
+                        .map(|f| match crate::core::rql::collation::companion_of(&f.name) {
+                            Some((base, _)) => base.to_string(),
+                            None => f.name.clone(),
+                        })
                 };
                 let mut defs: Vec<(String, String)> = Vec::new();
                 for index in indexes.list().iter() {

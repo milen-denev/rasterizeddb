@@ -721,10 +721,21 @@ pub(crate) async fn drop_column(
     if live.is_empty() {
         return Err(format!("column '{}' does not exist", name));
     }
-    for i in live
-        .into_iter()
-        .chain(fields.find(&nullable::flag_column_name(name), false))
-    {
+    // A collation's key companion, and its own NULL flag, go too.
+    let companions: Vec<String> = [
+        crate::core::rql::collation::Strength::CaseInsensitive,
+        crate::core::rql::collation::Strength::CaseAccentInsensitive,
+    ]
+    .into_iter()
+    .filter_map(|s| crate::core::rql::collation::companion_name(name, s))
+    .collect();
+    let mut dropped: Vec<usize> = live;
+    dropped.extend(fields.find(&nullable::flag_column_name(name), false));
+    for companion in &companions {
+        dropped.extend(fields.find(companion, false));
+        dropped.extend(fields.find(&nullable::flag_column_name(companion), false));
+    }
+    for i in dropped {
         let mut field = fields.records[i].clone().expect("found");
         field.is_deleted = true;
         fields.put(i, field);
@@ -735,6 +746,10 @@ pub(crate) async fn drop_column(
         .filter(|f| !named(&f.name, name))
         .collect();
     decl.retire_leftovers(table, name, &remaining);
+    // Its generation expression and the unique keys over it.
+    for companion in &companions {
+        decl.retire_leftovers(table, companion, &remaining);
+    }
     // Unreachable through the refusal above, but harmless: a self-reference
     // from the column to itself goes with it.
     retire_parent_side(&mut others, table, name);
@@ -824,6 +839,16 @@ pub(crate) async fn rename_column(
     if to.len() > 128 || (has_flag && nullable::flag_column_name(to).len() > 128) {
         return Err("column names are limited to 128 characters".to_string());
     }
+    // A collation's key companion is renamed with it, and its name (and its
+    // own NULL flag's) has to fit as well.
+    let companion = crate::core::rql::collation::companion(from, &schema.fields).map(|(f, s)| {
+        (f.name.clone(), crate::core::rql::collation::companion_name(to, s).expect("nondeterministic"))
+    });
+    if let Some((_, new_companion)) = &companion
+        && nullable::flag_column_name(new_companion).len() > 128
+    {
+        return Err("column names are limited to 128 characters".to_string());
+    }
     let rewrite = |e: &str| crate::core::rql::executor::rename_column_references(e, table, from, to);
 
     let before = visible(schema);
@@ -858,6 +883,22 @@ pub(crate) async fn rename_column(
         decl.modifiers.move_key(&old, &new);
     }
     decl.json.move_key(from, to);
+    // The companion's generation record and the unique keys over it.
+    if let Some((old, new)) = &companion {
+        decl.generated.move_key(old, new);
+        for i in 0..decl.unique.records.len() {
+            let Some(mut k) = decl.unique.records[i].clone() else { continue };
+            if k.is_deleted || !k.columns.iter().any(|c| named(c, old)) {
+                continue;
+            }
+            for c in k.columns.iter_mut() {
+                if named(c, old) {
+                    *c = new.clone();
+                }
+            }
+            decl.unique.put(i, k);
+        }
+    }
 
     // Everything else that mentions it is rewritten. A partial index's
     // predicate names columns too: left naming `from`, it no longer compiled,
@@ -951,9 +992,13 @@ pub(crate) async fn rename_column(
     // `to` or under a dead name is a leftover, never rewritten to read the
     // renamed column: it would have become generated from itself.
     for g in decl.generated.live_all() {
-        let column_is_live_other = before
-            .iter()
-            .any(|f| named(&f.name, &g.column) && !named(&f.name, from));
+        // A collation's companion is hidden, so not in `before`; its record,
+        // moved above, reads the renamed column and follows it.
+        let own_companion = companion.as_ref().is_some_and(|(_, new)| named(&g.column, new));
+        let column_is_live_other = own_companion
+            || before
+                .iter()
+                .any(|f| named(&f.name, &g.column) && !named(&f.name, from));
         if !column_is_live_other || named(&g.column, to) {
             continue;
         }
@@ -1019,6 +1064,18 @@ pub(crate) async fn rename_column(
         let mut flag = fields.records[flag_at].clone().expect("found");
         flag.name = new_flag;
         fields.put(flag_at, flag);
+    }
+    if let Some((old, new)) = &companion {
+        let (old_flag, new_flag) = (nullable::flag_column_name(old), nullable::flag_column_name(new));
+        fields.retire_dead(new)?;
+        fields.retire_dead(&new_flag)?;
+        for (from_name, to_name) in [(old.clone(), new.clone()), (old_flag, new_flag)] {
+            if let Some(&at) = fields.find(&from_name, false).first() {
+                let mut f = fields.records[at].clone().expect("found");
+                f.name = to_name;
+                fields.put(at, f);
+            }
+        }
     }
 
     let key = match schema.primary_key.as_deref() {

@@ -8849,6 +8849,25 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("is reserved for the temporary tables a statement materialises") {
         return "42939";
     }
+    // Collations (`core::rql::collation`), in PostgreSQL's words and codes.
+    // Early: the message quotes the collation's name.
+    if has_raw("collation \"") && has("does not exist") {
+        return "42704";
+    }
+    if has("could not determine which collation to use") {
+        return "42P22";
+    }
+    if has("collations are not supported by type") || has("collations are not supported by the type") {
+        return "42804";
+    }
+    if has("nondeterministic collations are not supported")
+        || has("is not supported with a case-insensitive collation")
+        || has("over a column with a case-insensitive collation is not supported")
+        || has("which has a case-insensitive collation, is not supported")
+        || has("giving a column a case-insensitive collation is not supported")
+    {
+        return "0A000";
+    }
     // A regular-expression flag PostgreSQL refuses: invalid_parameter_value,
     // also when a CHECK meets it.
     if has("regexp_like() does not support the") || has("invalid regular expression option") {
