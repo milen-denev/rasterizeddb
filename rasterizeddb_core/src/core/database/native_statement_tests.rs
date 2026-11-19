@@ -844,3 +844,73 @@ async fn a_cancel_token_stops_its_own_users_query_only() {
     let said = simple(&context, Some(&holder), "COMMIT").await;
     assert!(said.errors.is_empty(), "{said:?}");
 }
+
+/// `SHOW COLUMNS` names each column's type as it was declared, length,
+/// precision and element type included, in a form `CREATE TABLE` accepts
+/// back: a table declared from the reported names reports the same names.
+/// It read `TEXT` for a `VARCHAR(40)`, `NUMERIC` for a `NUMERIC(10,2)` and
+/// `UNKNOWN` for a `DATE`, so a console editing a column offered a type the
+/// column did not have.
+///
+/// Mutation: report the bare storage name (`TEXT`, `NUMERIC`, `UNKNOWN`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_columns_reports_the_declared_type_with_its_modifiers() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let session =
+        crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let said = simple(
+        &context,
+        Some(&session),
+        "CREATE TABLE typmod_t (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(40), \
+         code CHAR(3), price NUMERIC(10,2), plain NUMERIC, note TEXT, \
+         born DATE, at TIMESTAMP(3), took INTERVAL, tags INTEGER[], \
+         seen TIMESTAMPTZ)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{said:?}");
+
+    async fn types(
+        context: &NativeContext,
+        session: &crate::pgwire::NativeSession,
+        table: &str,
+    ) -> Vec<(String, String)> {
+        let request = format!("\x01SIMPLE;SHOW COLUMNS FROM {table}");
+        let said = marked(context, "svc", Some(session), request.as_bytes()).await;
+        assert!(said.errors.is_empty(), "{said:?}");
+        let (columns, rows, _) = &said.results[0];
+        let name = columns.iter().position(|c| c == "column_name").unwrap();
+        let data_type = columns.iter().position(|c| c == "data_type").unwrap();
+        rows.iter()
+            .map(|r| (r[name].clone().unwrap(), r[data_type].clone().unwrap()))
+            .collect()
+    }
+
+    let reported = types(&context, &session, "typmod_t").await;
+    let expect = [
+        ("id", "BIGINT"),
+        ("name", "VARCHAR(40)"),
+        ("code", "CHAR(3)"),
+        ("price", "NUMERIC(10,2)"),
+        ("plain", "NUMERIC"),
+        ("note", "TEXT"),
+        ("born", "DATE"),
+        ("at", "TIMESTAMP(3)"),
+        ("took", "INTERVAL"),
+        ("tags", "INTEGER[]"),
+        ("seen", "TIMESTAMPTZ"),
+    ];
+    let expect: Vec<(String, String)> =
+        expect.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect();
+    assert_eq!(reported, expect);
+
+    // Declared back from what was reported, the table reports the same.
+    let ddl = reported
+        .iter()
+        .map(|(n, t)| format!("{n} {t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let said = simple(&context, Some(&session), &format!("CREATE TABLE typmod_back ({ddl})")).await;
+    assert!(said.errors.is_empty(), "{ddl}: {said:?}");
+    assert_eq!(types(&context, &session, "typmod_back").await, expect);
+}
