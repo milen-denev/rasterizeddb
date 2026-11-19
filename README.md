@@ -858,9 +858,13 @@ Clients connect to a branch by name. Files are cloned where the filesystem
 shares blocks (btrfs, XFS) and copied in full elsewhere; each branch also keeps
 a merge base, a copy of itself as made, unless created `WITHOUT BASE`. A merge
 replays the schema changes the branch recorded, then compares rows three ways
-and writes them to the parent in one transaction; any conflict fails it whole
-by default. rdb_studio has a BRANCHES tab for all of it. See
-[docs/branching.md](docs/branching.md).
+and writes them to the parent in one transaction, a page at a time; any
+conflict fails it whole by default. Rows the branch inserted under a `SERIAL`
+key take new numbers from the parent's sequence, with their references. A
+branch can be branched again (`CREATE BRANCH feature FROM dev`); dropping a
+middle branch moves its branches to its parent. Tables on a key/value store
+come over as the branch's own. rdb_studio has a BRANCHES tab, with the tree,
+for all of it. See [docs/branching.md](docs/branching.md).
 
 ### Importing a PostgreSQL database
 

@@ -1362,7 +1362,7 @@ impl<'a> GridLayout<'a> {
 
     /// The column this grid is sorted by, and which way, when the grid is the
     /// one doing the sorting.
-    fn client_sort(&self) -> Option<&GridSort> {
+    pub(super) fn client_sort(&self) -> Option<&GridSort> {
         self.sort.filter(|_| !self.sorted_by_server)
     }
 
