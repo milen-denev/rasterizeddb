@@ -68,6 +68,30 @@ pub fn set_enabled(on: bool) {
     ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
 }
 
+/// 0 = not read yet, 1 = on, 2 = off.
+static WHOLE_COLUMNS: AtomicU8 = AtomicU8::new(0);
+
+/// Whether an ungrouped aggregate folded from cells takes each column at
+/// once (`aggregate::Acc::accumulate_cells`). On unless
+/// `RDB_FOLD_COLUMNS=0`, which feeds the cells a row at a time, for A/B
+/// measurement and for the tests that hold the two to the same answers.
+pub fn whole_columns() -> bool {
+    match WHOLE_COLUMNS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RDB_FOLD_COLUMNS").is_none_or(|v| v != "0");
+            WHOLE_COLUMNS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Turns the whole-column fold on or off for the whole process.
+pub fn set_whole_columns(on: bool) {
+    WHOLE_COLUMNS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 tokio::task_local! {
     /// How many folds from cells the statement running on this task made.

@@ -61,6 +61,19 @@ async fn same_both_ways(db: &Arc<Database>, tx: Option<crate::core::mvcc::TxId>,
         "{note}{sql}: {}",
         if cells { "was not folded from cells, so nothing was compared" } else { "was folded from cells" }
     );
+    // An ungrouped aggregate takes each column at once; the same cells fed
+    // a row at a time are the third way to the one answer.
+    if cells && !sql.contains("GROUP BY") {
+        column_scan::set_whole_columns(false);
+        let (a_row_at_a_time, _) = run_in(db, tx, sql).await;
+        column_scan::set_whole_columns(true);
+        assert!(
+            a_row_at_a_time == from_cells,
+            "{note}{sql}: whole columns {:?}, a row at a time {:?}",
+            String::from_utf8_lossy(&from_cells),
+            String::from_utf8_lossy(&a_row_at_a_time)
+        );
+    }
     from_cells
 }
 
@@ -165,6 +178,14 @@ const FROM_CELLS: &[&str] = &[
     "SELECT MIN(ts), MAX(ts), COUNT(ts) FROM t",
     "SELECT stddev(i16c), variance(i8c), var_pop(u8c) FROM t WHERE i16c BETWEEN -50 AND 50",
     "SELECT 1, COUNT(*), MAX(k) FROM t",
+    // Every integer width, signed and not, summed, averaged and compared,
+    // over a column with NULLs and one without; and the floats summed.
+    "SELECT SUM(i8c), MIN(i8c), MAX(i8c), SUM(u8c), MIN(u8c), MAX(u8c), COUNT(i8c), COUNT(u8c) FROM t",
+    "SELECT SUM(i16c), MIN(i16c), MAX(i16c), SUM(u16c), MIN(u16c), MAX(u16c), AVG(u16c) FROM t",
+    "SELECT SUM(u32c), MIN(u32c), MAX(u32c), AVG(u32c), MIN(i64c), MAX(i64c), MIN(u64c), MAX(u64c) FROM t",
+    "SELECT SUM(k), AVG(k), MIN(k), MAX(k), COUNT(k), MIN(id), MAX(id), SUM(id) FROM t WHERE i32c > -10",
+    "SELECT SUM(f), SUM(r), AVG(f), AVG(r), COUNT(f), COUNT(r), bool_and(flag), COUNT(flag) FROM t WHERE u8c < 200",
+    "SELECT COUNT(*), SUM(i16c) FROM t HAVING MAX(u8c) > 3 AND COUNT(i32c) > 1",
     "SELECT MAX(i32c), MIN(u16c) FROM t WHERE i32c > 10",
     "SELECT COUNT(*), SUM(u32c) FROM t WHERE i64c < 0 OR i16c > 30",
     "SELECT COUNT(*), AVG(i8c) FROM t WHERE s = 'x5'",

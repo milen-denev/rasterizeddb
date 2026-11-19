@@ -1294,6 +1294,89 @@ impl Acc {
         }
     }
 
+    /// [`Self::accumulate`] for every row of a fixed-width column at once:
+    /// the state the rows fed one at a time, in order, would leave. `false`
+    /// when this accumulator over this type has no such loop, and nothing
+    /// was done.
+    ///
+    /// What the loops save is deciding, value by value, which accumulator
+    /// this is and how its argument is stored; the arithmetic is the same,
+    /// in the same order, so a float sum has the same bits.
+    pub(crate) fn accumulate_cells(&mut self, cells: &FixedCells<'_>, ty: &DbType) -> bool {
+        match self {
+            // `COUNT(col)`: the rows that have a value.
+            Acc::Count(n) => {
+                *n += cells.values() as i64;
+                true
+            }
+            // Plain integers into the exact total: no scale to carry or learn.
+            Acc::ExactSum { total, n, overflow, track_dscale: false, own_scale: false, .. } => {
+                let Some(int) = IntCell::of(ty, cells.width) else { return false };
+                int.for_each(cells, |_, v| {
+                    match total.checked_add(v) {
+                        Some(sum) => *total = sum,
+                        None => *overflow = true,
+                    }
+                    *n += 1;
+                });
+                true
+            }
+            Acc::FloatSum { total, n } => {
+                match (ty, cells.width) {
+                    (DbType::F64, 8) | (DbType::F32, 4) => {
+                        let double = cells.width == 8;
+                        let mut add = |value: &[u8]| {
+                            *total += if double {
+                                f64::from_le_bytes(value.try_into().expect("eight bytes"))
+                            } else {
+                                f32::from_le_bytes(value.try_into().expect("four bytes")) as f64
+                            };
+                            *n += 1;
+                        };
+                        let values = cells.values.chunks_exact(cells.width);
+                        match cells.flags {
+                            None => values.for_each(&mut add),
+                            Some((flags, width)) => {
+                                for (value, flag) in values.zip(flags.chunks_exact(width)) {
+                                    if !crate::core::rql::nullable::flag_is_set(flag) {
+                                        add(value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // An integer summed as a float, as `decode_float` reads it.
+                    _ => {
+                        let Some(int) = IntCell::of(ty, cells.width) else { return false };
+                        int.for_each(cells, |_, v| {
+                            *total += v as f64;
+                            *n += 1;
+                        });
+                    }
+                }
+                true
+            }
+            // The column's least or greatest integer, then that one value
+            // against what the accumulator holds. Equal integers are the
+            // same bytes, so which of them is kept cannot show.
+            Acc::Extreme { ty: own, want_max, .. } => {
+                let Some(int) = IntCell::of(own, cells.width) else { return false };
+                let want_max = *want_max;
+                let mut best: Option<(usize, i128)> = None;
+                int.for_each(cells, |row, v| {
+                    if best.is_none_or(|(_, b)| if want_max { v > b } else { v < b }) {
+                        best = Some((row, v));
+                    }
+                });
+                if let Some((row, _)) = best {
+                    self.accumulate(Some(&cells.values[row * cells.width..(row + 1) * cells.width]), Some(ty));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn accumulate(&mut self, bytes: Option<&[u8]>, ty: Option<&DbType>) {
         match self {
             // A DISTINCT replay, or a call with no ORDER BY: no keys.
@@ -2510,6 +2593,115 @@ impl CellSources {
     }
 }
 
+impl CellSources {
+    /// Fold column `slot` of every row of `chunk`, when it is of fixed
+    /// width: its cells end to end, and its NULL flags' if it has any.
+    fn fixed<'c>(
+        &self,
+        chunk: &'c crate::core::processor::column_scan::ColumnChunk,
+        slot: usize,
+    ) -> Option<FixedCells<'c>> {
+        let source = &self.slots[slot];
+        if source.text {
+            return None;
+        }
+        Some(FixedCells {
+            values: &chunk.cols[source.col],
+            width: source.width,
+            flags: source.flag.map(|(col, width)| (&chunk.cols[col][..], width)),
+        })
+    }
+}
+
+/// One fixed-width column of a chunk's rows: `width` bytes a row, and the
+/// column's NULL flags, a set one meaning the row has no value.
+pub(crate) struct FixedCells<'c> {
+    values: &'c [u8],
+    width: usize,
+    flags: Option<(&'c [u8], usize)>,
+}
+
+impl FixedCells<'_> {
+    /// How many rows have a value.
+    fn values(&self) -> usize {
+        let rows = self.values.len() / self.width;
+        match self.flags {
+            None => rows,
+            Some((flags, width)) => {
+                rows - flags.chunks_exact(width).filter(|flag| crate::core::rql::nullable::flag_is_set(flag)).count()
+            }
+        }
+    }
+}
+
+/// The integers [`decode_exact`] reads from a cell of their own width, for
+/// a loop that reads a whole column of one of them.
+#[derive(Clone, Copy)]
+enum IntCell {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl IntCell {
+    /// The reader of `ty` in cells `width` bytes wide: `decode_exact`'s arm
+    /// for the type, and `None` where it has none of that width or the
+    /// value needs more than the arm's cast.
+    fn of(ty: &DbType, width: usize) -> Option<IntCell> {
+        Some(match (ty, width) {
+            (DbType::I8, 1) => IntCell::I8,
+            (DbType::I16, 2) => IntCell::I16,
+            (DbType::I32, 4) => IntCell::I32,
+            (DbType::I64 | DbType::DATETIME, 8) => IntCell::I64,
+            (DbType::U8 | DbType::BOOL, 1) => IntCell::U8,
+            (DbType::U16, 2) => IntCell::U16,
+            (DbType::U32, 4) => IntCell::U32,
+            (DbType::U64, 8) => IntCell::U64,
+            _ => return None,
+        })
+    }
+
+    /// Calls `each` with every value of `cells` that is not NULL, in row
+    /// order, and with the row it is in.
+    #[inline(always)]
+    fn for_each(self, cells: &FixedCells<'_>, mut each: impl FnMut(usize, i128)) {
+        macro_rules! read {
+            ($int:ty) => {{
+                let values = cells.values.chunks_exact(cells.width);
+                match cells.flags {
+                    None => {
+                        for (row, value) in values.enumerate() {
+                            each(row, <$int>::from_le_bytes(value.try_into().expect("a cell of the type's width")) as i128);
+                        }
+                    }
+                    Some((flags, width)) => {
+                        for (row, (value, flag)) in values.zip(flags.chunks_exact(width)).enumerate() {
+                            if !crate::core::rql::nullable::flag_is_set(flag) {
+                                each(row, <$int>::from_le_bytes(value.try_into().expect("a cell of the type's width")) as i128);
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+        match self {
+            IntCell::I8 => read!(i8),
+            IntCell::I16 => read!(i16),
+            IntCell::I32 => read!(i32),
+            IntCell::I64 => read!(i64),
+            IntCell::U8 => read!(u8),
+            IntCell::U16 => read!(u16),
+            IntCell::U32 => read!(u32),
+            IntCell::U64 => read!(u64),
+        }
+    }
+}
+
 /// How `plan` folds from the cells of a scan laid out as `layout`, or `None`
 /// when it has to see rows: it reads more of a row than plain columns
 /// ([`reads_only_cells`]), or a column it reads is not in the layout.
@@ -2954,6 +3146,53 @@ impl<'p> Folder<'p> {
         let plan = self.plan;
         if sources.slots.len() != self.positions.wanted.len() {
             return Err("a cell fold was given another plan's columns".to_string());
+        }
+        // No grouping key: every row is the one group, so each aggregate
+        // takes its whole column at once.
+        if self.key_sources.is_empty()
+            && self.byte_slot.is_none()
+            && crate::core::processor::column_scan::whole_columns()
+        {
+            if chunk.rows == 0 {
+                return Ok(());
+            }
+            self.key.clear();
+            self.plain.clear();
+            let at = self.group_for_key(None);
+            let run = &mut self.accs[at * self.stride..(at + 1) * self.stride];
+            let fold = |acc: &mut Acc, arg: &Option<SchemaField>, slot: Option<usize>| {
+                let Some(field) = arg else {
+                    // `COUNT(*)`: neither bytes nor a type, a row at a time
+                    // for anything that is not the count.
+                    match acc {
+                        Acc::Count(n) => *n += chunk.rows as i64,
+                        other => (0..chunk.rows).for_each(|_| other.accumulate(None, None)),
+                    }
+                    return;
+                };
+                let ty = &field.db_type;
+                let at_once = slot
+                    .and_then(|slot| sources.fixed(chunk, slot))
+                    .is_some_and(|cells| acc.accumulate_cells(&cells, ty));
+                if !at_once {
+                    for r in 0..chunk.rows {
+                        acc.accumulate(slot.and_then(|slot| sources.cell(chunk, slot, r)), Some(ty));
+                    }
+                }
+            };
+            for (i, item) in plan.items.iter().enumerate() {
+                if let SelectItem::Aggregate { arg, .. } = item {
+                    fold(&mut run[i], arg, self.item_slots[i]);
+                }
+            }
+            if let Some(h) = plan.having.as_ref() {
+                for (j, item) in h.aggregates.iter().enumerate() {
+                    let SelectItem::Aggregate { arg, .. } = item else { continue };
+                    let Some(acc) = run.get_mut(self.n_items + j) else { continue };
+                    fold(acc, arg, self.having_slots.get(j).copied().flatten());
+                }
+            }
+            return Ok(());
         }
         for r in 0..chunk.rows {
             let cell = |slot: usize| sources.cell(chunk, slot, r);
