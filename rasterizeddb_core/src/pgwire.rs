@@ -4959,6 +4959,9 @@ pub(crate) async fn describe_query(
     }
     let arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
     let mut shorthands = crate::core::sql_scan::statement_shorthands(&arrays).into_owned();
+    if let Ok(Some(text)) = crate::core::sql_scan::tablesample(&shorthands) {
+        shorthands = text;
+    }
     if let Ok(Some(text)) = crate::core::sql_scan::row_assignments(&shorthands) {
         shorthands = text;
     }
@@ -7408,6 +7411,11 @@ pub(crate) fn rewrite_statement_text<'a>(
     }
     // `TABLE t` and `AS [NOT] MATERIALIZED` (`sql_scan::statement_shorthands`).
     if let Cow::Owned(text) = crate::core::sql_scan::statement_shorthands(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `t TABLESAMPLE BERNOULLI (p)` as a sampled derived table
+    // (`sql_scan::tablesample`).
+    if let Some(text) = crate::core::sql_scan::tablesample(&stmt)? {
         stmt = Cow::Owned(text);
     }
     // `UPDATE … SET (a, b) = (…)` as one assignment per column

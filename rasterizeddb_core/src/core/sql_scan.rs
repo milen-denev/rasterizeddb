@@ -1960,6 +1960,93 @@ fn operand_end(sql: &str, from: usize) -> Option<usize> {
     }
 }
 
+/// `FROM t [[AS] x] TABLESAMPLE BERNOULLI (p)` (or `SYSTEM`) as the derived
+/// table `(SELECT * FROM t WHERE random() * 100 < (p)) AS x`: each row kept
+/// with chance `p` percent. It was refused ("TABLESAMPLE is not supported").
+/// `SYSTEM` samples pages in PostgreSQL and rows here; either is a sample of
+/// that size. PostgreSQL's errors: an unknown method (42704), a literal
+/// percentage outside 0..=100 (2202H). `REPEATABLE (seed)` is refused
+/// (0A000): a per-row `random()` cannot draw the same sample twice.
+pub fn tablesample(sql: &str) -> Result<Option<String>, (&'static str, String)> {
+    if !contains_ignore_ascii_case(sql, b"tablesample") {
+        return Ok(None);
+    }
+    let mut text = sql.to_string();
+    let mut changed = false;
+    for _ in 0..32 {
+        let Some(at) = crate::core::rql::join::find_keyword(&text, "TABLESAMPLE", 0) else { break };
+        let (start, end, replacement) = tablesample_at(&text, at)?;
+        text.replace_range(start..end, &replacement);
+        changed = true;
+    }
+    Ok(changed.then_some(text))
+}
+
+fn tablesample_at(sql: &str, at: usize) -> Result<(usize, usize, String), (&'static str, String)> {
+    let syntax = || ("42601", "syntax error at or near \"TABLESAMPLE\"".to_string());
+    let bytes = sql.as_bytes();
+    // The words before the keyword: `t`, `t x`, `t AS x`.
+    let word_before = |end: usize| -> Option<(usize, usize)> {
+        let e = sql[..end].trim_end().len();
+        let s = sql[..e].bytes().rposition(|b| !(is_identifier_byte(b) || b == b'.' || b == b'"')).map_or(0, |p| p + 1);
+        (s < e).then_some((s, e))
+    };
+    let (w1s, w1e) = word_before(at).ok_or_else(syntax)?;
+    let is_kw = |s: usize, e: usize, k: &str| sql[s..e].eq_ignore_ascii_case(k);
+    let opens_list = |s: usize| {
+        let before = sql[..s].trim_end();
+        before.ends_with(',')
+            || ["FROM", "JOIN"].iter().any(|k| {
+                let Some(w) = before.len().checked_sub(k.len()) else { return false };
+                before[w..].eq_ignore_ascii_case(k) && (w == 0 || !is_identifier_byte(before.as_bytes()[w - 1]))
+            })
+    };
+    let (relation, alias, start) = if opens_list(w1s) {
+        (&sql[w1s..w1e], None, w1s)
+    } else {
+        let (w2s, w2e) = word_before(w1s).ok_or_else(syntax)?;
+        if is_kw(w2s, w2e, "AS") {
+            let (rs, re) = word_before(w2s).ok_or_else(syntax)?;
+            (&sql[rs..re], Some(&sql[w1s..w1e]), rs)
+        } else {
+            (&sql[w2s..w2e], Some(&sql[w1s..w1e]), w2s)
+        }
+    };
+    // `METHOD (args) [REPEATABLE (seed)]`.
+    let mut i = at + "TABLESAMPLE".len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let method_end = i + bytes[i..].iter().take_while(|b| is_identifier_byte(**b)).count();
+    let method = &sql[i..method_end];
+    if !(method.eq_ignore_ascii_case("BERNOULLI") || method.eq_ignore_ascii_case("SYSTEM")) {
+        return Err(("42704", format!("tablesample method {} does not exist", method.to_ascii_lowercase())));
+    }
+    let open = method_end + (sql[method_end..].len() - sql[method_end..].trim_start().len());
+    if bytes.get(open) != Some(&b'(') {
+        return Err(syntax());
+    }
+    let close = matching_close(sql, open).ok_or_else(syntax)?;
+    let arg = sql[open + 1..close].trim();
+    if arg.is_empty() || split_top_level(arg, b',').len() != 1 {
+        return Err(("42883", format!("tablesample method {} requires 1 argument, not {}", method.to_ascii_lowercase(), split_top_level(arg, b',').len())));
+    }
+    if let Ok(p) = arg.parse::<f64>()
+        && !(0.0..=100.0).contains(&p)
+    {
+        return Err(("2202H", "sample percentage must be between 0 and 100".to_string()));
+    }
+    let after = sql[close + 1..].trim_start();
+    if after.len() >= 10 && after.as_bytes()[..10].eq_ignore_ascii_case(b"REPEATABLE") {
+        return Err((
+            "0A000",
+            "TABLESAMPLE … REPEATABLE is not supported: the sample is drawn anew on every run".to_string(),
+        ));
+    }
+    let name = alias.map(str::to_string).unwrap_or_else(|| relation.rsplit('.').next().unwrap_or(relation).to_string());
+    Ok((start, close + 1, format!("(SELECT * FROM {relation} WHERE random() * 100 < ({arg})) AS {name}")))
+}
+
 /// Where the operand ending at `end` begins: a column, a constant, a call,
 /// a parenthesised expression, a cast, and arithmetic over them, back to the
 /// keyword, comma, comparison or unmatched `(` before it. `None` when there
@@ -2763,6 +2850,24 @@ mod tests {
             "SELECT n FROM (VALUES ('id', '23'::bigint, -1)) s(n, tp, tpm)"
         );
         assert_eq!(catalog_syntax("SELECT x::pg_catalog.oidvector"), "SELECT x::oidvector");
+    }
+
+    #[test]
+    fn tablesample_is_a_sampled_derived_table() {
+        assert_eq!(
+            tablesample("SELECT count(*) FROM t TABLESAMPLE BERNOULLI (10)").unwrap().as_deref(),
+            Some("SELECT count(*) FROM (SELECT * FROM t WHERE random() * 100 < (10)) AS t")
+        );
+        assert_eq!(
+            tablesample("SELECT x.id FROM public.t AS x TABLESAMPLE system(50) JOIN u y TABLESAMPLE SYSTEM (5) ON x.id = y.id").unwrap().as_deref(),
+            Some(
+                "SELECT x.id FROM (SELECT * FROM public.t WHERE random() * 100 < (50)) AS x JOIN (SELECT * FROM u WHERE random() * 100 < (5)) AS y ON x.id = y.id"
+            )
+        );
+        assert_eq!(tablesample("SELECT 'TABLESAMPLE' FROM t").unwrap(), None);
+        assert_eq!(tablesample("SELECT * FROM t TABLESAMPLE foo (1)").unwrap_err().0, "42704");
+        assert_eq!(tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI (101)").unwrap_err().0, "2202H");
+        assert_eq!(tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI (1) REPEATABLE (7)").unwrap_err().0, "0A000");
     }
 
     #[test]

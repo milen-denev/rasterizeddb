@@ -1408,7 +1408,9 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   WHERE u.k = t.k)`; an uncorrelated one works), an outer column
   named bare where the subquery's relations are not all known (a CTE, a
   function in `FROM`, `SELECT *` in a derived table) or two outer relations
-  have it, `TABLESAMPLE`,
+  have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on
+  every run; `TABLESAMPLE BERNOULLI|SYSTEM (p)` itself works, `SYSTEM`
+  sampling rows rather than pages),
   the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
   on a table with no unique column, and a `WINDOW` clause inside a subquery
   (the outermost one works).
