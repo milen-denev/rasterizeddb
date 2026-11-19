@@ -3097,9 +3097,10 @@ mod unicode_fold_tests {
     }
 
     /// For text, every case-insensitive operator must equal its case-sensitive
-    /// counterpart applied to `to_lowercase` of both sides — what `ILIKE` is in
-    /// PostgreSQL and what `lower()` computes here. ASCII inputs included, so
-    /// the fast path is held to the same definition.
+    /// counterpart applied to `lower()` of both sides (`pg_lower`, one
+    /// character at a time: PostgreSQL 17's `lower('İ')` is `i`, where
+    /// `str::to_lowercase` gives `i̇`) — what `ILIKE` is in PostgreSQL. ASCII
+    /// inputs included, so the fast path is held to the same definition.
     #[test]
     fn every_operator_matches_lowered_comparison() {
         use ComparerOperation::*;
@@ -3121,7 +3122,8 @@ mod unicode_fold_tests {
             };
             let a = make(12);
             let b = make(3);
-            let (la, lb) = (a.to_lowercase(), b.to_lowercase());
+            let lower = crate::core::rql::pg_functions::pg_lower;
+            let (la, lb) = (lower(&a), lower(&b));
             let cases = [
                 (EqualsCaseInsensitive, la == lb),
                 (ContainsCaseInsensitive, la.contains(lb.as_str())),
