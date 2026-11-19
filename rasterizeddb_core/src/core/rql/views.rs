@@ -642,7 +642,7 @@ pub fn query_deps(query: &str) -> Vec<String> {
 
 /// The names the statement's own `WITH` clauses define, lowercased (every
 /// depth, read off the text: a CTE shadows a view of the same name).
-fn cte_names(sql: &str) -> Vec<String> {
+pub(crate) fn cte_names(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(Some((defs, _))) = crate::core::rql::cte::split_with(sql) {
         out.extend(defs.into_iter().map(|d| d.name.to_ascii_lowercase()));

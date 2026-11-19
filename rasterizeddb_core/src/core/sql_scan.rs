@@ -168,7 +168,11 @@ pub fn catalog_syntax(sql: &str) -> Cow<'_, str> {
         }
         if at(i, "::") {
             let rest = &sql[i + 2..];
-            let ty_at = i + 2 + rest.len() - rest.trim_start().len();
+            let mut ty_at = i + 2 + rest.len() - rest.trim_start().len();
+            // `::pg_catalog.oid`, as psql's `\gdesc` writes it.
+            if at(ty_at, "pg_catalog.") && (at(ty_at + 11, "\"char\"") || (at(ty_at + 11, "oid") && !bytes.get(ty_at + 14).is_some_and(|&b| ident(b)))) {
+                ty_at += 11;
+            }
             if at(ty_at, "\"char\"") {
                 out.push_str("::text");
                 i = ty_at + 6;
@@ -873,6 +877,9 @@ pub fn statement_shorthands(sql: &str) -> Cow<'_, str> {
         text = Cow::Owned(t);
     }
     if let Some(t) = derived_column_lists(&text) {
+        text = Cow::Owned(t);
+    }
+    if let Some(t) = text_operators(&text) {
         text = Cow::Owned(t);
     }
     if contains_ignore_ascii_case(&text, b"similar") {
@@ -1746,6 +1753,213 @@ pub fn find_quantified_subquery(sql: &str) -> Option<Result<QuantifiedSubquery, 
     None
 }
 
+/// PostgreSQL's `text ^@ prefix` and `(s1, e1) OVERLAPS (s2, e2)`, written
+/// with what the engine reads: `starts_with(text, prefix)` and the `CASE`
+/// PostgreSQL's `overlaps_timestamp` computes. Both were refused ("column
+/// "'a' ^@ 'b'" does not exist"). `None` when `sql` has neither.
+///
+/// `OVERLAPS` follows PostgreSQL: each pair is ordered first, a pair's end
+/// may be an interval (`(start, INTERVAL '1 day')`, read off the text),
+/// periods sharing their start overlap, and a missing end gives NULL where
+/// the answer depends on it.
+pub fn text_operators(sql: &str) -> Option<String> {
+    if !sql.contains("^@") && !contains_ignore_ascii_case(sql, b"overlaps") {
+        return None;
+    }
+    let mut text = sql.to_string();
+    let mut changed = false;
+    // Each round rewrites the first one found; bounded for a statement that
+    // keeps one we cannot read.
+    for _ in 0..64 {
+        let Some((start, end, replacement)) = next_text_operator(&text) else { break };
+        text.replace_range(start..end, &replacement);
+        changed = true;
+    }
+    changed.then_some(text)
+}
+
+fn next_text_operator(sql: &str) -> Option<(usize, usize, String)> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if bytes[i] == b'^' && bytes.get(i + 1) == Some(&b'@') {
+            if let Some(start) = operand_start(sql, i)
+                && let Some(end) = operand_end(sql, i + 2)
+            {
+                let left = sql[start..i].trim();
+                let right = sql[i + 2..end].trim();
+                // PostgreSQL names an operator's column `?column?`.
+                let name = if whole_select_item(sql, start, end) { " AS \"?column?\"" } else { "" };
+                return Some((start, end, format!("starts_with({left}, {right}){name}")));
+            }
+            i += 2;
+            continue;
+        }
+        let boundary = i == 0 || !is_identifier_byte(bytes[i - 1]);
+        if boundary
+            && bytes.len() >= i + 8
+            && bytes[i..i + 8].eq_ignore_ascii_case(b"OVERLAPS")
+            && bytes.get(i + 8).is_none_or(|b| !is_identifier_byte(*b))
+            && let Some(rewritten) = overlaps_at(sql, i)
+        {
+            return Some(rewritten);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `sql[start..end]` is a whole item of a select list: at depth
+/// zero after the nearest `SELECT`, between it or a comma and a comma,
+/// `FROM` or the end.
+pub(crate) fn whole_select_item(sql: &str, start: usize, end: usize) -> bool {
+    let before = sql[..start].trim_end();
+    let after = sql[end..].trim_start();
+    let after_ok = after.is_empty()
+        || after.starts_with([',', ';'])
+        || (after.len() >= 4 && after.as_bytes()[..4].eq_ignore_ascii_case(b"FROM") && after.as_bytes().get(4).is_none_or(|b| !is_identifier_byte(*b)));
+    if !after_ok || !(before.ends_with(',') || before.to_ascii_uppercase().ends_with("SELECT")) {
+        return false;
+    }
+    let upper = before.to_ascii_uppercase();
+    let Some(select) = upper.rfind("SELECT") else { return false };
+    let between = &before[select + 6..];
+    let mut depth = 0i32;
+    let b = between.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(e) = skip_quoted(b, i) {
+            i = e.max(i + 1);
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return false;
+    }
+    let words = between.to_ascii_uppercase();
+    !["FROM", "WHERE", " BY", "HAVING", "WHEN", "THEN", " ON "].iter().any(|k| words.contains(k))
+}
+
+/// `(a, b) OVERLAPS (c, d)` around the keyword at `at`.
+fn overlaps_at(sql: &str, at: usize) -> Option<(usize, usize, String)> {
+    let before = sql[..at].trim_end();
+    if !before.ends_with(')') {
+        return None;
+    }
+    let start = operand_start(sql, before.len())?;
+    if sql.as_bytes()[start] != b'(' || matching_close(sql, start)? + 1 != before.len() {
+        return None;
+    }
+    let after = at + 8;
+    let open = after + (sql[after..].len() - sql[after..].trim_start().len());
+    if sql.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    let close = matching_close(sql, open)?;
+    let pair = |inner: &str| -> Option<(String, String)> {
+        let parts = split_top_level(inner, b',');
+        let [a, b] = parts.as_slice() else { return None };
+        let (a, b) = (format!("({a})"), b.to_string());
+        let interval = {
+            let t = b.trim_start();
+            (t.len() > 8 && t.as_bytes()[..8].eq_ignore_ascii_case(b"INTERVAL") && !is_identifier_byte(t.as_bytes()[8]))
+                || contains_ignore_ascii_case(&b, b"::interval")
+        };
+        let b = if interval { format!("({a} + ({b}))") } else { format!("({b})") };
+        // Ordered as PostgreSQL orders a pair: the earlier first; a missing
+        // start takes the end's place and leaves the end missing.
+        let s = format!("(CASE WHEN {a} > {b} THEN {b} ELSE coalesce({a}, {b}) END)");
+        let e = format!("(CASE WHEN {a} > {b} THEN {a} WHEN {a} <= {b} THEN {b} END)");
+        Some((s, e))
+    };
+    let (s1, e1) = pair(&sql[start + 1..before.len() - 1])?;
+    let (s2, e2) = pair(&sql[open + 1..close])?;
+    let unknown = format!("{e1} IS NULL OR {e2} IS NULL");
+    let text = format!(
+        "(CASE WHEN {s1} > {s2} THEN (CASE WHEN {s1} < {e2} THEN true WHEN {unknown} THEN NULL ELSE false END) \
+         WHEN {s1} < {s2} THEN (CASE WHEN {s2} < {e1} THEN true WHEN {unknown} THEN NULL ELSE false END) \
+         WHEN {s1} = {s2} THEN (CASE WHEN {unknown} THEN NULL ELSE true END) END)"
+    );
+    let name = if whole_select_item(sql, start, close + 1) { " AS overlaps" } else { "" };
+    Some((start, close + 1, format!("{text}{name}")))
+}
+
+/// Where the operand starting at `from` ends: a constant, a typed literal
+/// (`DATE '…'`), a column, a call or a group, with its casts and
+/// subscripts. `None` when none starts there.
+fn operand_end(sql: &str, from: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip_ws(from);
+    if bytes.get(i) == Some(&b'-') {
+        i = skip_ws(i + 1);
+    }
+    let c = *bytes.get(i)?;
+    i = match c {
+        b'(' => matching_close(sql, i)? + 1,
+        b'\'' => quoted_end(bytes, i, b'\''),
+        b'0'..=b'9' | b'.' => i + bytes[i..].iter().take_while(|b| b.is_ascii_digit() || **b == b'.').count(),
+        b'$' => i + 1 + bytes[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count(),
+        c if c == b'"' || is_identifier_byte(c) => {
+            // A dotted name, then a call's arguments or a typed literal.
+            let mut k = i;
+            loop {
+                k = if bytes.get(k) == Some(&b'"') {
+                    quoted_end(bytes, k, b'"')
+                } else {
+                    k + bytes[k..].iter().take_while(|b| is_identifier_byte(**b)).count()
+                };
+                if bytes.get(k) == Some(&b'.') {
+                    k += 1;
+                    continue;
+                }
+                break;
+            }
+            let next = skip_ws(k);
+            match bytes.get(next) {
+                Some(b'(') if next == k => matching_close(sql, next)? + 1,
+                Some(b'\'') if bytes[i..k].iter().all(|b| b.is_ascii_alphabetic()) => quoted_end(bytes, next, b'\''),
+                _ => k,
+            }
+        }
+        _ => return None,
+    };
+    // `::type`, `::type(n)`, `[i]`.
+    loop {
+        let next = skip_ws(i);
+        if bytes.get(next) == Some(&b':') && bytes.get(next + 1) == Some(&b':') {
+            let mut k = skip_ws(next + 2);
+            k += bytes[k..].iter().take_while(|b| is_identifier_byte(**b) || **b == b'.').count();
+            if bytes.get(k) == Some(&b'(') {
+                k = matching_close(sql, k)? + 1;
+            }
+            while bytes.get(k) == Some(&b'[') && bytes.get(k + 1) == Some(&b']') {
+                k += 2;
+            }
+            i = k;
+        } else if bytes.get(next) == Some(&b'[') && next == i {
+            i = matching_close(sql, next)? + 1;
+        } else {
+            return Some(i);
+        }
+    }
+}
+
 /// Where the operand ending at `end` begins: a column, a constant, a call,
 /// a parenthesised expression, a cast, and arithmetic over them, back to the
 /// keyword, comma, comparison or unmatched `(` before it. `None` when there
@@ -2532,6 +2746,36 @@ fn read_hex(body: &[u8], at: usize, width: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn starts_with_operator_is_the_function() {
+        assert_eq!(
+            text_operators("SELECT 'alphabet' ^@ 'alph', name ^@ 'a' FROM t WHERE t.name::text ^@ lower('A')").as_deref(),
+            Some("SELECT starts_with('alphabet', 'alph') AS \"?column?\", starts_with(name, 'a') AS \"?column?\" FROM t WHERE starts_with(t.name::text, lower('A'))")
+        );
+        assert_eq!(text_operators("SELECT '^@', \"a^@b\" FROM t"), None);
+    }
+
+    #[test]
+    fn a_catalog_qualified_oid_cast_is_bigint() {
+        assert_eq!(
+            catalog_syntax("SELECT n FROM (VALUES ('id', '23'::pg_catalog.oid, -1)) s(n, tp, tpm)"),
+            "SELECT n FROM (VALUES ('id', '23'::bigint, -1)) s(n, tp, tpm)"
+        );
+        assert_eq!(catalog_syntax("SELECT x::pg_catalog.oidvector"), "SELECT x::oidvector");
+    }
+
+    #[test]
+    fn overlaps_is_postgresql_s_case() {
+        let out = text_operators("SELECT (DATE '2001-02-16', DATE '2001-12-21') OVERLAPS (DATE '2001-10-30', DATE '2002-10-30') AS o").unwrap();
+        assert!(out.starts_with("SELECT (CASE WHEN (CASE WHEN (DATE '2001-02-16') > (DATE '2001-12-21')"), "{out}");
+        assert!(out.ends_with(" END) AS o"), "{out}");
+        assert!(!out.contains("OVERLAPS"), "{out}");
+        let interval = text_operators("SELECT 1 WHERE (s, INTERVAL '1 day') OVERLAPS (x, y)").unwrap();
+        assert!(interval.contains("((s) + (INTERVAL '1 day'))"), "{interval}");
+        assert_eq!(text_operators("SELECT overlaps FROM t"), None);
+    }
+
     #[test]
     fn the_last_name_segment_ignores_dots_inside_quotes() {
         use super::last_name_segment as l;

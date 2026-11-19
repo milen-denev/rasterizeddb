@@ -101,8 +101,17 @@ pub(crate) fn qualify(sql: &str, columns_of: &dyn Fn(&str) -> Option<Vec<String>
     Some(out)
 }
 
-/// [`qualify`] over `database`'s tables.
+/// [`qualify`] over `database`'s tables, after their alias column lists
+/// (`FROM t AS x(a, b)`, `rql::table_column_lists`) are written out: both
+/// need the schema, and the derived table a list becomes has the columns
+/// a subquery may name. `None` when neither changes `sql`.
 pub(crate) fn qualify_in(database: &crate::core::database::Database, sql: &str) -> Option<String> {
+    let listed = crate::core::rql::table_column_lists::rewrite_in(database, sql);
+    let sql_now = listed.as_deref().unwrap_or(sql);
+    qualify_columns_in(database, sql_now).or(listed)
+}
+
+fn qualify_columns_in(database: &crate::core::database::Database, sql: &str) -> Option<String> {
     qualify(sql, &|name: &str| {
         database
             .schema_view(name)
@@ -137,6 +146,12 @@ fn folded(name: &str) -> String {
 /// The names a select list gives its columns, `None` when one is not known
 /// (`*`, `t.*`, an expression PostgreSQL would name by a cast).
 fn output_names(list: &str) -> Option<Vec<String>> {
+    Some(select_items(list)?.into_iter().map(|(name, _)| name).collect())
+}
+
+/// Each item of a select list as its output name (as [`output_names`]) and
+/// its expression without the alias; `None` when a name is not known.
+pub(crate) fn select_items(list: &str) -> Option<Vec<(String, String)>> {
     let mut list = list.trim();
     for word in ["DISTINCT", "ALL"] {
         if starts_word(list, word) {
@@ -162,7 +177,7 @@ fn output_names(list: &str) -> Option<Vec<String>> {
             from = p + 2;
         }
         if let Some(p) = alias_at {
-            names.push(folded(&item[p + 2..]));
+            names.push((folded(&item[p + 2..]), item[..p].trim().to_string()));
             continue;
         }
         let chain = item.split('.').all(|seg| {
@@ -172,7 +187,7 @@ fn output_names(list: &str) -> Option<Vec<String>> {
                     || seg.bytes().all(is_identifier_byte) && !seg.as_bytes()[0].is_ascii_digit())
         });
         if chain {
-            names.push(folded(item.rsplit('.').next().unwrap_or(item)));
+            names.push((folded(item.rsplit('.').next().unwrap_or(item)), item.to_string()));
             continue;
         }
         if item.contains("::") {
@@ -182,13 +197,14 @@ fn output_names(list: &str) -> Option<Vec<String>> {
         // `?column?`.
         let word: String = item.bytes().take_while(|b| is_identifier_byte(*b)).map(|b| b as char).collect();
         let rest = item[word.len()..].trim_start();
-        names.push(if !word.is_empty() && rest.starts_with('(') {
+        let name = if !word.is_empty() && rest.starts_with('(') {
             word.to_ascii_lowercase()
         } else if word.eq_ignore_ascii_case("CASE") {
             "case".to_string()
         } else {
             "?column?".to_string()
-        });
+        };
+        names.push((name, item.to_string()));
     }
     Some(names)
 }

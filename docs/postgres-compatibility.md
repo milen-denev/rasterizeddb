@@ -394,16 +394,22 @@ read as the left side's type either way); a derived table's column list,
 `ALTER TYPE … RENAME VALUE 'a' TO 'z'` and `ALTER TYPE … RENAME TO`, in a
 transaction block as well (a type and a table using it in one migration).
 A column of the type, or of an array of it, takes only its labels (22P02
-otherwise, as a cast of a non-label does); `ORDER BY` such a column sorts by
-the labels' declared order; `pg_type` and `pg_enum` list the type and its
-labels. A column holds the label as `text`, kept to the labels by a hidden
+otherwise, as a cast of a non-label does); `pg_type` and `pg_enum` list the
+type and its labels. Enum values order by the labels' declared order, as
+PostgreSQL orders them: `ORDER BY` the column, its output name or position
+(in a `DISTINCT` or grouped query too), `<`, `<=`, `>` and `>=` against a
+label, a parameter or another column of the type, `[NOT] BETWEEN` two
+labels, and `min`/`max`. A parameter that is no label matches nothing,
+where PostgreSQL refuses it (22P02). A column holds the label as `text`, kept to the labels by a hidden
 constraint the type's `ALTER`s replace.
 
 Where it differs from PostgreSQL:
 
-- `<`, `>` and `min`/`max` over enum values compare the labels' text, not
-  their order; only a top-level `ORDER BY` of the column itself follows the
-  declared order.
+- The declared order applies where the column is certain from the text: a
+  comparison with a text expression (`m > note`, `m > $1::text`) compares
+  the labels' text, and so does an enum value inside an
+  expression (`ORDER BY coalesce(m, 'ok')`), a CTE's or a subquery's
+  output, or a column two of the statement's tables have.
 - The 22P02 a column reports does not name the value (`invalid input value
   for enum "Status"`); a cast's does.
 - A row's column is typed `text` on the wire and in `information_schema`.
@@ -1384,7 +1390,8 @@ Checked against PostgreSQL 17 on 2026-11-19 with the differential harness
 `DISTINCT ON`, `UPDATE … FROM`, window functions (with a `WINDOW` clause),
 sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
 `RIGHT`/`FULL`/`CROSS JOIN`, `JOIN … USING`, `NATURAL JOIN`,
-`ROLLUP`/`CUBE`/`GROUPING SETS` and `WITH RECURSIVE` all run now and are no
+`ROLLUP`/`CUBE`/`GROUPING SETS`, `WITH RECURSIVE`, a column list on a table
+alias (`FROM t AS x(a, b)`), `^@` and `OVERLAPS` all run now and are no
 longer gaps. What is still missing:
 
 - **Types**: `CREATE TYPE` for composites and ranges (enums work, see
@@ -1396,8 +1403,7 @@ longer gaps. What is still missing:
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
 - **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
-  WHERE u.k = t.k)`; an uncorrelated one works), a column list on a table
-  alias (`FROM t AS x(a, b)`; on a derived table it works), an outer column
+  WHERE u.k = t.k)`; an uncorrelated one works), an outer column
   named bare where the subquery's relations are not all known (a CTE, a
   function in `FROM`, `SELECT *` in a derived table) or two outer relations
   have it, `TABLESAMPLE`,
@@ -1410,7 +1416,7 @@ longer gaps. What is still missing:
   `jsonb_path_*` functions, `row_to_json`, `to_number`, `date_bin`, the XML
   functions, and
   the `json_*` (not `jsonb_*`) table functions.
-- **Operators**: `^@`, the prefix `|/` and `@`, and `OVERLAPS`. In a `WHERE`, a
+- **Operators**: the prefix `|/` and `@`. In a `WHERE`, a
   `jsonb` operator over a function's result (`jsonb_set(doc, '{d}', '1') ? 'd'`)
   is refused (0A000); over a column, and in a select list, it works.
 - **Table functions**: a `jsonb_array_elements` item's alias names the item,

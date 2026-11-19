@@ -26,9 +26,13 @@
 //! `ORDER BY` of an enum column sorts by the labels' order, as PostgreSQL
 //! does, not by their text.
 //!
-//! Not done (documented in docs/postgres-compatibility.md): `<` and `>`
-//! between enum values compare the labels' text; a row sent to the client
-//! types the column `text`.
+//! `<`, `>`, `min` and `max` over an enum column compare the labels' order
+//! too ([`ordering`]), where the other side is a label or a column of the
+//! same type.
+//!
+//! Not done (documented in docs/postgres-compatibility.md): a comparison
+//! with a parameter or a text expression compares text; a row sent to the
+//! client types the column `text`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -512,7 +516,12 @@ pub async fn rewrite(database: &Arc<Database>, sql: &str, tx: Option<TxId>) -> R
         return Ok(None);
     }
     let mentioned = database.types.mentioned_in(sql);
-    let order_by = crate::core::sql_scan::contains_ignore_ascii_case(sql, b"order");
+    // What needs the enum columns: an ORDER BY, an ordering comparison, a
+    // min or max.
+    let order_by = crate::core::sql_scan::contains_ignore_ascii_case(sql, b"order")
+        || sql.contains(['<', '>'])
+        || crate::core::sql_scan::contains_ignore_ascii_case(sql, b"max(")
+        || crate::core::sql_scan::contains_ignore_ascii_case(sql, b"min(");
     if mentioned.is_empty() && !order_by {
         return Ok(None);
     }
@@ -547,6 +556,9 @@ pub fn rewrite_with(sql: &str, defs: &[EnumType], columns: &[(String, String, St
     casts(sql, defs, &mut edits)?;
     if is("SELECT") || is("WITH") {
         order_by(sql, defs, columns, &mut edits);
+    }
+    if !(is("CREATE") || is("ALTER") || is("DROP")) {
+        ordering(sql, defs, columns, &mut edits)?;
     }
     if edits.is_empty() {
         return Ok(None);
@@ -769,7 +781,14 @@ fn column_types(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, Str
 /// A top-level `ORDER BY` item that is an enum column, by its labels'
 /// order: `array_position(ARRAY['sad', 'ok', 'happy']::text[], m)`. Only
 /// where the column is certain: a name one relation of the statement has as
-/// an enum column and no other has, not hidden by an output name.
+/// an enum column and no other has.
+///
+/// An item naming an output column that is an enum (by position, by its
+/// name or alias, a `max` or `min` of one) is sorted over the query as a
+/// derived table, `SELECT * FROM (…) AS __rdb_o ORDER BY array_position(…,
+/// __rdb_o.m)`: a grouped or `DISTINCT` query sorts only by its select
+/// list, and the position of an output is not an expression. Every item is
+/// then an output reference, or none is wrapped.
 fn order_by(sql: &str, defs: &[EnumType], columns: &[(String, String, String)], edits: &mut Vec<(usize, usize, String)>) {
     use crate::core::rql::join::{find_keyword, find_phrase};
     if columns.is_empty() {
@@ -777,53 +796,392 @@ fn order_by(sql: &str, defs: &[EnumType], columns: &[(String, String, String)], 
     }
     let Some(order) = find_phrase(sql, &["ORDER", "BY"], 0) else { return };
     let by = find_keyword(sql, "BY", order).unwrap_or(order) + 2;
-    let end = ["LIMIT", "OFFSET", "FETCH", "FOR"].iter().filter_map(|k| find_keyword(sql, k, by)).min().unwrap_or(sql.trim_end().trim_end_matches(';').len());
-    // The relations a statement names, as words.
-    let mentions = |table: &str| {
-        let lower = sql.to_ascii_lowercase();
-        let t = table.to_ascii_lowercase();
-        lower.match_indices(&t).any(|(p, _)| {
-            let before = lower.as_bytes().get(p.wrapping_sub(1)).copied();
-            let after = lower.as_bytes().get(p + t.len()).copied();
-            p > 0 && before.is_some_and(|b| !is_identifier_byte(b)) && after.is_none_or(|b| !is_identifier_byte(b))
-        })
-    };
-    let named: Vec<&(String, String, String)> = columns.iter().filter(|(t, _, _)| mentions(t)).collect();
+    let stmt_end = sql.trim_end().trim_end_matches(';').trim_end().len();
+    let end = ["LIMIT", "OFFSET", "FETCH", "FOR"].iter().filter_map(|k| find_keyword(sql, k, by)).min().unwrap_or(stmt_end);
+    let named = named_columns(sql, columns);
     if named.is_empty() {
         return;
     }
+    // The select list of the statement's (first) SELECT.
+    let head = sql.trim_start();
+    let select_at = sql.len() - head.len();
+    let outputs = if head.len() > 6 && head.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT") && !is_identifier_byte(head.as_bytes()[6]) {
+        let list_start = select_at + 6;
+        let list_end = find_keyword(sql, "FROM", list_start).filter(|f| *f < order).unwrap_or(order);
+        crate::core::rql::outer_columns::select_items(&sql[list_start..list_end]).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // The enum an output's expression is: a column, or max/min of one.
+    let output_enum = |expr: &str| -> Option<&EnumType> {
+        let e = expr.trim();
+        let inner = ["max(", "min("]
+            .iter()
+            .find(|f| e.len() > 4 && e.as_bytes()[..4].eq_ignore_ascii_case(f.as_bytes()) && e.ends_with(')'))
+            .map(|_| e[4..e.len() - 1].trim())
+            .unwrap_or(e);
+        let plain = !inner.is_empty() && inner.bytes().all(|b| is_identifier_byte(b) || b == b'.' || b == b'"');
+        if plain { enum_of(sql, &named, defs, inner) } else { None }
+    };
+    struct Item<'s> {
+        at: usize,
+        len: usize,
+        reference: &'s str,
+        tail: &'s str,
+        /// The output it names, by index.
+        output: Option<usize>,
+    }
     let list = &sql[by..end];
+    let mut items: Vec<Item> = Vec::new();
     for item in split_top_level(list, b',') {
         let at = by + (item.as_ptr() as usize - list.as_ptr() as usize);
         let trimmed = item.trim_start();
         let item_at = at + (item.len() - trimmed.len());
         let n = trimmed.bytes().take_while(|b| is_identifier_byte(*b) || *b == b'.' || *b == b'"').count();
         let reference = &trimmed[..n];
-        if reference.is_empty() || reference.as_bytes()[0].is_ascii_digit() {
-            continue;
-        }
-        let tail = trimmed[n..].trim_start();
+        let tail = trimmed[n..].trim();
         let tail_ok = tail.is_empty()
             || ["ASC", "DESC", "NULLS"].iter().any(|k| {
                 tail.len() >= k.len() && tail.as_bytes()[..k.len()].eq_ignore_ascii_case(k.as_bytes()) && tail.as_bytes().get(k.len()).is_none_or(|b| !is_identifier_byte(*b))
             });
-        if !tail_ok {
+        let output = if reference.is_empty() || !tail_ok {
+            None
+        } else if reference.bytes().all(|b| b.is_ascii_digit()) {
+            reference.parse::<usize>().ok().filter(|k| *k >= 1 && *k <= outputs.len()).map(|k| k - 1)
+        } else if !reference.contains('.') {
+            let name = fold(reference);
+            let mut found = outputs.iter().enumerate().filter(|(_, (o, _))| *o == name);
+            match (found.next(), found.next()) {
+                (Some((k, _)), None) => Some(k),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        items.push(Item { at: item_at, len: if tail_ok { n } else { 0 }, reference, tail, output });
+    }
+    let wraps = items.iter().any(|it| it.output.is_some_and(|k| output_enum(&outputs[k].1).is_some()));
+    let unique = |k: usize| outputs.iter().filter(|(o, _)| *o == outputs[k].0).count() == 1;
+    if wraps && select_at < order && items.iter().all(|it| it.output.is_some_and(unique)) {
+        let terms: Vec<String> = items
+            .iter()
+            .map(|it| {
+                let k = it.output.unwrap_or_default();
+                let column = format!("__rdb_o.{}", crate::core::rql::views::quote_ident(&outputs[k].0));
+                let term = match output_enum(&outputs[k].1) {
+                    Some(def) => format!("array_position(ARRAY[{}]::text[], {column})", def.label_list()),
+                    None => column,
+                };
+                if it.tail.is_empty() { term } else { format!("{term} {}", it.tail) }
+            })
+            .collect();
+        let gap = if end < stmt_end { " " } else { "" };
+        edits.push((select_at, select_at, "SELECT * FROM (".to_string()));
+        edits.push((order, end, format!(") AS __rdb_o ORDER BY {}{gap}", terms.join(", "))));
+        return;
+    }
+    for it in &items {
+        if it.len == 0 {
             continue;
         }
-        let column = fold(reference.rsplit('.').next().unwrap_or(reference));
-        // An output name of that name would be what the ORDER BY reads.
-        let alias = format!("AS {reference}");
-        if crate::core::sql_scan::contains_ignore_ascii_case(&sql[..order], alias.as_bytes()) {
+        // An output is what an item of its name or position reads: sorted
+        // in place by the column it is, when it is one (not a max or min,
+        // which only the derived table can sort).
+        let column = match it.output {
+            Some(k) => outputs[k].1.trim(),
+            None if it.reference.as_bytes()[0].is_ascii_digit() => continue,
+            None => it.reference,
+        };
+        if column.contains('(') {
             continue;
         }
-        let holders: Vec<&&(String, String, String)> = named.iter().filter(|(_, c, _)| *c == column).collect();
-        if holders.len() != 1 {
-            continue;
-        }
-        let Some(def) = defs.iter().find(|d| d.name == holders[0].2) else { continue };
-        edits.push((item_at, item_at + n, format!("array_position(ARRAY[{}]::text[], {reference})", def.label_list())));
+        let Some(def) = enum_of(sql, &named, defs, column) else { continue };
+        edits.push((it.at, it.at + it.len, format!("array_position(ARRAY[{}]::text[], {column})", def.label_list())));
     }
 }
+
+/// The enum column `reference` names, by the holder rule of [`order_by`]:
+/// one relation of the statement has it as an enum column and no other.
+/// A qualified reference (`q.m`) only where `q` is that table or its alias.
+fn enum_of<'d>(sql: &str, named: &[&(String, String, String)], defs: &'d [EnumType], reference: &str) -> Option<&'d EnumType> {
+    let column = fold(reference.rsplit('.').next().unwrap_or(reference));
+    let mut holders = named.iter().filter(|(_, c, _)| *c == column);
+    let (table, _, ty) = holders.next()?;
+    if holders.next().is_some() {
+        return None;
+    }
+    if let Some((qualifier, _)) = reference.rsplit_once('.') {
+        let qualifier = fold(qualifier.rsplit('.').next().unwrap_or(qualifier));
+        if qualifier != *table && !aliases(sql, table).contains(&qualifier) {
+            return None;
+        }
+    }
+    defs.iter().find(|d| d.name == *ty)
+}
+
+/// The aliases `sql` gives `table`: the word after `table` or `table AS`.
+fn aliases(sql: &str, table: &str) -> Vec<String> {
+    const NOT_ALIASES: &[&str] = &[
+        "where", "join", "on", "using", "left", "right", "full", "inner", "cross", "natural", "group", "order",
+        "having", "limit", "offset", "union", "intersect", "except", "window", "fetch", "for", "set", "values",
+        "returning", "lateral",
+    ];
+    let lower = sql.to_ascii_lowercase();
+    let t = table.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut out = Vec::new();
+    for (p, _) in lower.match_indices(&t) {
+        let before_ok = p > 0 && !is_identifier_byte(bytes[p - 1]) && bytes[p - 1] != b'.';
+        let end = p + t.len();
+        if !before_ok || bytes.get(end).is_some_and(|b| is_identifier_byte(*b) || *b == b'.') {
+            continue;
+        }
+        let mut rest = lower[end..].trim_start();
+        if rest.starts_with("as") && rest.as_bytes().get(2).is_some_and(|b| b.is_ascii_whitespace()) {
+            rest = rest[2..].trim_start();
+        }
+        let word: String = rest.bytes().take_while(|b| is_identifier_byte(*b)).map(|b| b as char).collect();
+        if !word.is_empty() && !NOT_ALIASES.contains(&word.as_str()) {
+            out.push(word);
+        }
+    }
+    out
+}
+
+/// The tables of `columns` that `sql` names as words.
+fn named_columns<'c>(sql: &str, columns: &'c [(String, String, String)]) -> Vec<&'c (String, String, String)> {
+    let lower = sql.to_ascii_lowercase();
+    columns
+        .iter()
+        .filter(|(table, _, _)| {
+            let t = table.to_ascii_lowercase();
+            lower.match_indices(&t).any(|(p, _)| {
+                let before = lower.as_bytes().get(p.wrapping_sub(1)).copied();
+                let after = lower.as_bytes().get(p + t.len()).copied();
+                p > 0 && before.is_some_and(|b| !is_identifier_byte(b)) && after.is_none_or(|b| !is_identifier_byte(b))
+            })
+        })
+        .collect()
+}
+
+/// An ordering comparison at the front of `text` (`<`, `<=`, `>`, `>=`),
+/// its length; `None` for `<>`, `<@`, `<<` and anything else.
+fn ordering_op(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    match (b.first(), b.get(1)) {
+        (Some(b'<' | b'>'), Some(b'=')) => Some(2),
+        (Some(b'<'), Some(b'>' | b'@' | b'<' | b'-')) | (Some(b'>'), Some(b'>')) => None,
+        (Some(b'<' | b'>'), _) => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether `text` starts with the keyword `word`.
+fn starts_word(text: &str, word: &str) -> bool {
+    let t = text.trim_start();
+    t.len() >= word.len()
+        && t.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+        && t.as_bytes().get(word.len()).is_none_or(|b| !is_identifier_byte(*b))
+}
+
+/// Where a parameter (`$1`) at `at` ends, without a cast after it.
+fn parameter_end(sql: &str, at: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    if bytes.get(at) != Some(&b'$') {
+        return None;
+    }
+    let end = at + 1 + bytes[at + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+    (end > at + 1 && !sql[end..].trim_start().starts_with("::") && bytes.get(end).is_none_or(|b| !is_identifier_byte(*b))).then_some(end)
+}
+
+/// Enum values compared and folded by their labels' order, as PostgreSQL
+/// compares them, not by their text: `m > 'sad'` is
+/// `array_position(ARRAY['sad', 'ok', 'happy']::text[], m) > 1`, `m1 < m2`
+/// compares both positions, and `max(m)` is the label at the greatest
+/// position. Only an enum column certain by the [`order_by`] rule, compared
+/// with a label literal or a column of its own type; anything else (a
+/// parameter, a text column) still compares text. A literal that is no
+/// label is PostgreSQL's 22P02.
+fn ordering(
+    sql: &str,
+    defs: &[EnumType],
+    columns: &[(String, String, String)],
+    edits: &mut Vec<(usize, usize, String)>,
+) -> Result<(), Refusal> {
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let named = named_columns(sql, columns);
+    if named.is_empty() {
+        return Ok(());
+    }
+    let bytes = sql.as_bytes();
+    let reference_at = |s: usize| -> usize {
+        s + bytes[s..].iter().take_while(|b| is_identifier_byte(**b) || **b == b'.' || **b == b'"').count()
+    };
+    // The column a reference ending at `end` begins with, by scanning back.
+    let reference_before = |end: usize| -> Option<(usize, &str)> {
+        let s = sql[..end].bytes().rposition(|b| !(is_identifier_byte(b) || b == b'.' || b == b'"')).map_or(0, |p| p + 1);
+        (s < end && !bytes[s].is_ascii_digit()).then(|| (s, &sql[s..end]))
+    };
+    let label_position = |def: &EnumType, at: usize| -> Result<Option<(usize, String)>, Refusal> {
+        // A literal in parentheses, `('ok')`, as `EXECUTE` binds an argument.
+        if bytes.get(at) == Some(&b'(')
+            && let Some(close) = matching_close(sql, at)
+        {
+            let inner = sql[at + 1..close].trim();
+            let inner_at = at + 1 + (sql[at + 1..close].len() - sql[at + 1..close].trim_start().len());
+            let whole = inner.starts_with('\'') && crate::core::sql_scan::quoted_end(bytes, inner_at, b'\'') == inner_at + inner.len();
+            if !whole {
+                return Ok(None);
+            }
+            let value = inner[1..inner.len() - 1].replace("''", "'");
+            return match def.labels.iter().position(|l| *l == value) {
+                Some(p) if !sql[close + 1..].trim_start().starts_with("::") => Ok(Some((close + 1, (p + 1).to_string()))),
+                Some(_) => Ok(None),
+                None => Err(refusal("22P02", format!("invalid input value for enum {}: \"{value}\"", display_name(&def.name)))),
+            };
+        }
+        if bytes.get(at) != Some(&b'\'') {
+            return Ok(None);
+        }
+        let end = crate::core::sql_scan::quoted_end(bytes, at, b'\'');
+        if sql[end..].trim_start().starts_with("::") {
+            return Ok(None);
+        }
+        let value = sql[at + 1..end - 1].replace("''", "'");
+        match def.labels.iter().position(|l| *l == value) {
+            Some(p) => Ok(Some((end, (p + 1).to_string()))),
+            None => Err(refusal("22P02", format!("invalid input value for enum {}: \"{value}\"", display_name(&def.name)))),
+        }
+    };
+    let positions = |def: &EnumType, reference: &str| format!("array_position(ARRAY[{}]::text[], {reference})", def.label_list());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let c = bytes[i];
+        let boundary = i == 0 || !(is_identifier_byte(bytes[i - 1]) || matches!(bytes[i - 1], b'.' | b'"' | b':' | b'$'));
+        if !(boundary && (c.is_ascii_alphabetic() || c == b'_' || c == b'"')) {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        let e = reference_at(s);
+        i = e.max(s + 1);
+        let reference = &sql[s..e];
+        if bytes.get(e) == Some(&b'(') || reference.ends_with('.') {
+            continue;
+        }
+        let Some(def) = enum_of(sql, &named, defs, reference) else { continue };
+        let after = sql[e..].trim_start();
+        let after_at = e + (sql[e..].len() - after.len());
+        let before = sql[..s].trim_end();
+        // `max(m)`, `min(m)`.
+        if after.starts_with(')') {
+            let call = before.strip_suffix('(').map(str::trim_end);
+            let word = call.and_then(|c| {
+                let w = c.bytes().rposition(|b| !is_identifier_byte(b)).map_or(0, |p| p + 1);
+                (c.len() - w == 3).then(|| (w, &c[w..]))
+            });
+            if let Some((word_at, name)) = word
+                && (name.eq_ignore_ascii_case("max") || name.eq_ignore_ascii_case("min"))
+            {
+                let close = after_at;
+                let folded = format!(
+                    "(ARRAY[{}]::text[])[{name}({})]",
+                    def.label_list(),
+                    positions(def, reference)
+                );
+                let alias = if crate::core::sql_scan::whole_select_item(sql, word_at, close + 1) { format!(" AS {}", name.to_ascii_lowercase()) } else { String::new() };
+                edits.push((word_at, close + 1, format!("{folded}{alias}")));
+                continue;
+            }
+        }
+        // `m [NOT] BETWEEN 'sad' AND 'ok'`.
+        let between_at = if starts_word(after, "NOT") { after_at + 3 + (after[3..].len() - after[3..].trim_start().len()) } else { after_at };
+        if starts_word(&sql[between_at..], "BETWEEN") {
+            let low_at = between_at + 7 + (sql[between_at + 7..].len() - sql[between_at + 7..].trim_start().len());
+            if let Some((low_end, low)) = label_position(def, low_at)?
+                && starts_word(&sql[low_end..], "AND")
+            {
+                let and_at = low_end + (sql[low_end..].len() - sql[low_end..].trim_start().len());
+                let high_at = and_at + 3 + (sql[and_at + 3..].len() - sql[and_at + 3..].trim_start().len());
+                if let Some((high_end, high)) = label_position(def, high_at)? {
+                    edits.push((low_at, low_end, low));
+                    edits.push((high_at, high_end, high));
+                    edits.push((s, e, positions(def, reference)));
+                    continue;
+                }
+            }
+        }
+        // `m > 'sad'`, `m < n`, `m >= $1`.
+        let mut wrap = false;
+        if let Some(n) = ordering_op(after) {
+            let other_at = after_at + n + (sql[after_at + n..].len() - sql[after_at + n..].trim_start().len());
+            if let Some((end, position)) = label_position(def, other_at)? {
+                edits.push((other_at, end, position));
+                wrap = true;
+            } else if let Some(end) = parameter_end(sql, other_at) {
+                edits.push((other_at, end, positions(def, &sql[other_at..end])));
+                wrap = true;
+            } else {
+                let other_end = reference_at(other_at);
+                wrap = other_end > other_at
+                    && bytes.get(other_end) != Some(&b'(')
+                    && enum_of(sql, &named, defs, &sql[other_at..other_end]).is_some_and(|d| d.name == def.name);
+            }
+        }
+        if !wrap {
+            // `'sad' < m`, `n < m`.
+            let op = [">=", "<=", ">", "<"].into_iter().find(|op| before.ends_with(op));
+            let op_ok = op.is_some_and(|op| {
+                let lead = before[..before.len() - op.len()].trim_end();
+                !(lead.ends_with(['<', '>', '=', '!', '-', '@']) || (op.len() == 1 && before.ends_with("<>")))
+            });
+            if op_ok {
+                let lead = before[..before.len() - op.unwrap().len()].trim_end();
+                if lead.ends_with(')')
+                    && let Some(open) = lead.rfind('(')
+                    && let Some((end, position)) = label_position(def, open)?
+                    && end == lead.len()
+                {
+                    edits.push((open, end, position));
+                    wrap = true;
+                } else if lead.ends_with('\'') {
+                    let lit_at = sql[..lead.len() - 1].rfind('\'').unwrap_or(0);
+                    // The literal's start: back over doubled quotes.
+                    let mut start = lit_at;
+                    while start > 0 && bytes[start - 1] == b'\'' {
+                        start = sql[..start - 1].rfind('\'').unwrap_or(0);
+                    }
+                    if let Some((end, position)) = label_position(def, start)?
+                        && end == lead.len()
+                    {
+                        edits.push((start, end, position));
+                        wrap = true;
+                    }
+                } else if let Some(p) = lead.bytes().rposition(|b| !b.is_ascii_digit())
+                    && p + 1 < lead.len()
+                    && bytes[p] == b'$'
+                    && (p == 0 || !is_identifier_byte(bytes[p - 1]))
+                {
+                    edits.push((p, lead.len(), positions(def, &lead[p..])));
+                    wrap = true;
+                } else if let Some((_, other)) = reference_before(lead.len()) {
+                    wrap = enum_of(sql, &named, defs, other).is_some_and(|d| d.name == def.name);
+                }
+            }
+        }
+        if wrap {
+            edits.push((s, e, positions(def, reference)));
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -897,6 +1255,49 @@ mod tests {
     }
 
     #[test]
+    fn enum_comparisons_and_extremes_follow_the_labels() {
+        let d = mood();
+        let cols = vec![("t".to_string(), "m".to_string(), "mood".to_string()), ("t".to_string(), "n".to_string(), "mood".to_string())];
+        let r = |sql: &str| rewrite_with(sql, &d, &cols).unwrap();
+        let p = |c: &str| format!("array_position(ARRAY['sad', 'ok', 'happy']::text[], {c})");
+        assert_eq!(r("SELECT id FROM t WHERE m > 'sad'"), Some(format!("SELECT id FROM t WHERE {} > 1", p("m"))));
+        assert_eq!(r("SELECT id FROM t WHERE 'ok' >= t.m"), Some(format!("SELECT id FROM t WHERE 2 >= {}", p("t.m"))));
+        assert_eq!(r("SELECT id FROM t WHERE m<n"), Some(format!("SELECT id FROM t WHERE {}<{}", p("m"), p("n"))));
+        assert_eq!(
+            r("SELECT max(m), min(m) AS lo, count(*) FROM t"),
+            Some(format!(
+                "SELECT (ARRAY['sad', 'ok', 'happy']::text[])[max({})] AS max, (ARRAY['sad', 'ok', 'happy']::text[])[min({})] AS lo, count(*) FROM t",
+                p("m"),
+                p("m")
+            ))
+        );
+        assert_eq!(
+            r("SELECT coalesce(max(m), 'ok') FROM t"),
+            Some(format!("SELECT coalesce((ARRAY['sad', 'ok', 'happy']::text[])[max({})], 'ok') FROM t", p("m")))
+        );
+        // Equality, a parameter, a text column, another table: text as before.
+        assert_eq!(r("SELECT id FROM t WHERE m = 'sad' AND m <> 'ok'"), None);
+        assert_eq!(r("SELECT id FROM t WHERE m > $1"), Some(format!("SELECT id FROM t WHERE {} > {}", p("m"), p("$1"))));
+        assert_eq!(r("SELECT id FROM t WHERE $2 <= m"), Some(format!("SELECT id FROM t WHERE {} <= {}", p("$2"), p("m"))));
+        assert_eq!(
+            r("SELECT id FROM t WHERE m NOT BETWEEN 'sad' AND 'ok' AND id > 1"),
+            Some(format!("SELECT id FROM t WHERE {} NOT BETWEEN 1 AND 2 AND id > 1", p("m")))
+        );
+        assert_eq!(r("SELECT id FROM t WHERE m > $1::text"), None);
+        // `EXECUTE`'s bound argument.
+        assert_eq!(r("SELECT id FROM t WHERE m >= ('ok')"), Some(format!("SELECT id FROM t WHERE {} >= 2", p("m"))));
+        assert_eq!(r("SELECT id FROM t WHERE ('ok') < m"), Some(format!("SELECT id FROM t WHERE 2 < {}", p("m"))));
+        assert_eq!(r("SELECT id FROM t WHERE m > (x)"), None);
+        assert_eq!(r("SELECT id FROM t WHERE m > note"), None);
+        assert_eq!(r("SELECT id FROM u WHERE m > 'sad'"), None);
+        // A qualified reference that is another table's column.
+        assert_eq!(r("SELECT * FROM t, u WHERE u.m > 'x'"), None);
+        assert_eq!(r("SELECT * FROM t AS a WHERE a.m > 'sad'"), Some(format!("SELECT * FROM t AS a WHERE {} > 1", p("a.m"))));
+        let err = rewrite_with("SELECT id FROM t WHERE m < 'glad'", &d, &cols).unwrap_err();
+        assert_eq!(err, ("22P02", "invalid input value for enum mood: \"glad\"".to_string()));
+    }
+
+    #[test]
     fn an_enum_column_sorts_by_its_labels() {
         let d = mood();
         let cols = vec![("t".to_string(), "m".to_string(), "mood".to_string())];
@@ -911,6 +1312,19 @@ mod tests {
         );
         assert_eq!(r("SELECT id FROM u ORDER BY m"), None);
         assert_eq!(r("SELECT upper(m) AS m FROM t ORDER BY m"), None);
+        // An enum output: the query sorted as a derived table.
+        let a = "ARRAY['sad', 'ok', 'happy']::text[]";
+        assert_eq!(
+            r("SELECT DISTINCT m FROM t ORDER BY m").unwrap(),
+            format!("SELECT * FROM (SELECT DISTINCT m FROM t ) AS __rdb_o ORDER BY array_position({a}, __rdb_o.\"m\")")
+        );
+        assert_eq!(
+            r("SELECT m AS z, count(*) FROM t GROUP BY m ORDER BY 1 DESC, count LIMIT 2;").unwrap(),
+            format!("SELECT * FROM (SELECT m AS z, count(*) FROM t GROUP BY m ) AS __rdb_o ORDER BY array_position({a}, __rdb_o.\"z\") DESC, __rdb_o.\"count\" LIMIT 2;")
+        );
+        // An item that is no output: nothing wrapped, the column sorted in place.
+        assert_eq!(r("SELECT m AS z FROM t ORDER BY z, id").unwrap(), format!("SELECT m AS z FROM t ORDER BY array_position({a}, m), id"));
+        assert_eq!(r("SELECT m FROM t ORDER BY 1, id").unwrap(), format!("SELECT m FROM t ORDER BY array_position({a}, m), id"));
         assert_eq!(r("SELECT id FROM t ORDER BY lower(m)"), None);
     }
 
