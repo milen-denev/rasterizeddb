@@ -451,6 +451,13 @@ async fn a_merge_applies_what_the_branch_did() {
         prod.scalar("SELECT label FROM tags WHERE id = 1").await,
         "fresh"
     );
+    // The table the merge created is the merging role's, not an internal
+    // session's that no role is.
+    assert_eq!(
+        prod.rows("SELECT grantee FROM __rdb_acl WHERE relation = 'tags' AND privilege = 'OWNER'")
+            .await,
+        vec![vec!["tester".to_string()]]
+    );
 
     // Merged once: nothing is offered again.
     let again = admin.rows("SHOW BRANCH DIFF dev").await;

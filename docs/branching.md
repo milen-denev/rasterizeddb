@@ -197,9 +197,12 @@ leftovers).
 7. **After commit** the base moves to the branch side's copy and the replayed
    DDL is trimmed from the log, so a second merge offers only later changes.
 
-The parent's role catalogue (`rdb_roles`), `__rdb_branch_keymap` and internal
-tables are never merged. The `__rdb_*` tables holding views, sequences,
-functions and triggers are merged as data.
+The parent's role catalogue (`rdb_roles`) and internal tables (`__…`) are
+never merged as rows. Views, sequences, functions and triggers travel as the
+DDL that made them; privileges (`GRANT`/`REVOKE`, kept in `__rdb_acl`), roles
+and a sequence's position do not. The parent's side of a merge runs as the
+role that issued `MERGE BRANCH`, so the relations its replayed DDL creates are
+owned by that role.
 
 **Limits.** A table with no key, or one whose key may hold NULLs, is read
 whole into memory, as is a sequence-keyed table whose rows reference each

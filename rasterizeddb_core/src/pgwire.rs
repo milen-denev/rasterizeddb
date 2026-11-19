@@ -6403,7 +6403,7 @@ where
         }
         DatabaseStatement::DiffBranch { name, into } => {
             let catalog = state.catalog.clone();
-            match branch_merge::run(&catalog, &name, into.as_deref(), None).await {
+            match branch_merge::run(&catalog, &name, into.as_deref(), None, &state.principal.name).await {
                 Ok(diff) => send_diff(stream, &diff, omit_description).await,
                 Err((code, e)) => fail_statement(state, stream, code, &e).await,
             }
@@ -6415,7 +6415,7 @@ where
             allow_drop,
         } => {
             let catalog = state.catalog.clone();
-            match branch_merge::run(&catalog, &name, into.as_deref(), Some((policy, allow_drop))).await {
+            match branch_merge::run(&catalog, &name, into.as_deref(), Some((policy, allow_drop)), &state.principal.name).await {
                 Ok(diff) => send_diff(stream, &diff, omit_description).await,
                 Err((code, e)) => fail_statement(state, stream, code, &e).await,
             }

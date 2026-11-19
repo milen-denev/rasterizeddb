@@ -95,13 +95,20 @@ struct Internal {
 
 impl Internal {
     fn new(database: Arc<Database>) -> Self {
+        Self::as_role(database, "rdb_branch_merge")
+    }
+
+    /// A session as `role`: what the parent's side of a merge runs as, so
+    /// the relations its replayed DDL creates are owned by the role that
+    /// merged, as if it had run them.
+    fn as_role(database: Arc<Database>, role: &str) -> Self {
         let catalog = DatabaseCatalog::single_unmanaged(database.clone());
         let state = SessionState::new(
             catalog,
             database.name.clone(),
             AuthConfig::default(),
             Principal {
-                name: "rdb_branch_merge".to_string(),
+                name: role.to_string(),
                 superuser: true,
                 authenticated: true,
             },
@@ -164,17 +171,20 @@ fn literal(oid: i32, cell: &Option<Vec<u8>>) -> String {
     }
 }
 
-/// The tables a merge considers: the database's own, not its internal
-/// shadows (JSON column tables, partition storage), nor its role catalogue,
-/// which a merge never carries. The `__rdb_*` catalogue tables of views,
-/// sequences, functions and triggers are data, merged like any table.
+/// The tables a merge considers: the database's own. Not its internal ones
+/// (`__…`: JSON column tables, partition storage, and the `__rdb_*`
+/// catalogues of views, sequences, functions, triggers and privileges), nor
+/// its role catalogue. Views, functions, triggers and sequences travel as the
+/// DDL that made them; privileges, roles and a sequence's position do not.
+/// (The catalogues are not in `information_schema`, so read as rows they
+/// had no columns: the merge compared empty tuples, and failed on the first
+/// it tried to write.)
 fn user_tables(database: &Database) -> BTreeSet<String> {
     database
         .relation_names()
         .into_iter()
-        .filter(|n| !n.starts_with("__") || n.starts_with("__rdb_"))
+        .filter(|n| !n.starts_with("__"))
         .filter(|n| n != crate::auth::ROLE_TABLE)
-        .filter(|n| n != KEYMAP_TABLE)
         .collect()
 }
 
@@ -1374,6 +1384,7 @@ pub(super) async fn run(
     name: &str,
     into: Option<&str>,
     apply: Option<(ConflictPolicy, bool)>,
+    merger: &str,
 ) -> Result<Vec<DiffRow>, Failure> {
     let meta = catalog
         .branch_meta(name)
@@ -1413,7 +1424,7 @@ pub(super) async fn run(
     };
     let ddl = catalog.branch_ddl(name);
 
-    let outcome = merge_with(&base_db, &branch_db, &parent_db, &ddl, apply, &meta.merge_id(name)).await;
+    let outcome = merge_with(&base_db, &branch_db, &parent_db, &ddl, apply, &meta.merge_id(name), merger).await;
     // The old base is retired once the new one is adopted: let it go first,
     // so its files are closed when its directory is removed.
     drop(base_db);
@@ -1448,11 +1459,12 @@ async fn merge_with(
     ddl: &[String],
     apply: Option<(ConflictPolicy, bool)>,
     branch_id: &str,
+    merger: &str,
 ) -> Result<Vec<DiffRow>, Failure> {
     let internal = |e: String| ("XX000", e);
     let mut base = Internal::new(base_db.clone());
     let mut branch = Internal::new(branch_db.clone());
-    let mut parent = Internal::new(parent_db.clone());
+    let mut parent = Internal::as_role(parent_db.clone(), merger);
 
     let base_tables = user_tables(base_db);
     let branch_tables = user_tables(branch_db);
