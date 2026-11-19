@@ -36,6 +36,17 @@ async fn run(db: &Arc<Database>, sql: &str) -> Vec<u8> {
     run_in(db, None, sql).await.0
 }
 
+/// Runs `sql` and returns its reply with how many batches of cells the
+/// storage copied for it in one call.
+async fn run_counting_batches(db: &Arc<Database>, sql: &str) -> (Vec<u8>, usize) {
+    column_scan::BATCHES_TOGETHER
+        .scope(std::cell::Cell::new(0), async {
+            let reply = run(db, sql).await;
+            (reply, column_scan::BATCHES_TOGETHER.with(std::cell::Cell::get))
+        })
+        .await
+}
+
 async fn must(db: &Arc<Database>, sql: &str) {
     let reply = run(db, sql).await;
     assert!(reply.first() != Some(&3), "{sql}: {}", String::from_utf8_lossy(&reply));
@@ -288,6 +299,42 @@ async fn differential(in_memory: bool) {
         ] {
             must(&db, change).await;
         }
+    }
+    // A table's file is read through its mapping, and a batch's cells are
+    // then copied from it in one call instead of one by one; a database in
+    // memory has no mapping, and reads them one by one. Both were compared
+    // above, and this is what says so.
+    let mut together = 0;
+    for sql in FROM_CELLS {
+        together += usize::from(run_counting_batches(&db, sql).await.1 > 0);
+    }
+    if in_memory {
+        assert_eq!(together, 0, "a database in memory copied cells from a mapping");
+    } else {
+        // All but the statements whose WHERE matches nothing.
+        assert!(together >= FROM_CELLS.len() - 3, "only {together} statements read their cells in batches");
+    }
+    // And the same once the table is opened anew, as any table of an age is.
+    if !in_memory {
+        let before: Vec<Vec<u8>> = {
+            let mut replies = Vec::new();
+            for sql in FROM_CELLS {
+                replies.push(run(&db, sql).await);
+            }
+            replies
+        };
+        drop(db);
+        let db = Arc::new(Database::new_with_backend(&dir, false).await);
+        let mut copied = 0;
+        for (sql, before) in FROM_CELLS.iter().zip(&before) {
+            let reply = same_both_ways(&db, None, sql, true, "reopened, ").await;
+            assert!(&reply == before, "reopened, {sql}: the answer changed across the reopen");
+            let (again, batches) = run_counting_batches(&db, sql).await;
+            assert!(again == reply, "reopened, {sql}: two runs differ");
+            copied += usize::from(batches > 0);
+        }
+        // All but the statements whose WHERE matches nothing.
+        assert!(copied >= FROM_CELLS.len() - 3, "only {copied} statements read their cells in batches from the mapping");
     }
     column_scan::set_enabled(true);
 }
@@ -675,13 +722,12 @@ fn a_layout_reads_what_the_fetch_reads() {
 /// column of its row, and without disturbing the rows around it.
 #[tokio::test]
 async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
+    use crate::core::storage_providers::file_sync::LocalStorageProvider;
     use crate::core::storage_providers::memory::MemoryStorageProvider;
     use crate::core::storage_providers::traits::StorageIO;
-    use column_scan::{CellColumn, CellLayout, Gather};
 
     // A row: an eight-byte id, two string headers (offset from the row's
     // start, then length), and the two values wherever the headers say.
-    let io = MemoryStorageProvider::new("column_scan_gather_text");
     let mut data = Vec::new();
     let mut rows: Vec<(u64, u64)> = Vec::new();
     let mut row = |id: u64, a: &[u8], b: &[u8], spoil: Option<(u64, u32)>| {
@@ -711,7 +757,24 @@ async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
     // And two megabytes after the rows, so the bytes a bad header names are
     // there to be read: only the check refuses them, not the end of the file.
     data.resize(data.len() + (2 << 20), 0x5A);
-    io.append_data(&data, true).await;
+    // From memory, whose cells are read one by one; and from a file opened
+    // anew, which copies each batch's cells and headers from its mapping,
+    // into header buffers the reads before it have used.
+    let memory = MemoryStorageProvider::new("column_scan_gather_text");
+    memory.append_data(&data, true).await;
+    assert_eq!(strings_through_headers(&memory, &rows).await, 0, "memory copied a batch from a mapping");
+
+    let (dir, _cleanup) = scratch("gather_text");
+    std::fs::create_dir_all(&dir).expect("the scratch directory");
+    LocalStorageProvider::new(&dir, Some("text")).await.append_data(&data, true).await;
+    let file = LocalStorageProvider::new(&dir, Some("text")).await;
+    assert!(strings_through_headers(&file, &rows).await >= 2, "the file's batches were not copied from its mapping");
+}
+
+/// The reads of [`a_string_is_read_through_its_header_and_a_bad_header_drops_its_row`]
+/// against one storage; returns how many batches it copied in one call.
+async fn strings_through_headers<S: crate::core::storage_providers::traits::StorageIO>(io: &S, rows: &[(u64, u64)]) -> usize {
+    use column_scan::{CellColumn, CellLayout, Gather};
 
     let layout = CellLayout {
         columns: vec![
@@ -727,18 +790,18 @@ async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
     for &r in &good[..2] {
         gather.note(rows[r].0, rows[r].1);
     }
-    gather.flush(&io).await.expect("two good rows");
+    gather.flush(io).await.expect("two good rows");
     for bad in [3usize, 4, 5] {
         for r in [2, bad, 6] {
             gather.note(rows[r].0, rows[r].1);
         }
-        assert!(gather.flush(&io).await.is_err(), "row {bad}'s header was accepted");
+        assert!(gather.flush(io).await.is_err(), "row {bad}'s header was accepted");
     }
     // A scan's read: every row offered, the good ones kept, in order.
     for r in 2..7 {
         gather.note(rows[r].0, rows[r].1);
     }
-    gather.flush_readable(&io).await;
+    gather.flush_readable(io).await;
     let chunk = gather.finish();
     assert_eq!(chunk.rows, 4);
     let ids: Vec<u64> = (0..4).map(|r| u64::from_le_bytes(chunk.cell(1, 8, r).try_into().expect("eight bytes"))).collect();
@@ -752,6 +815,7 @@ async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
     assert_eq!(chunk.cols[2].len(), 3 + 300);
     assert_eq!(chunk.ends[0].len(), 4);
     assert!(chunk.ends[1].is_empty());
+    chunk.together
 }
 
 /// The check a string's header has to pass, for the row scan and the cell
@@ -855,4 +919,145 @@ async fn every_stored_type_folds_the_same_from_cells() {
         "{answered} statements answered from cells; from cells {from_cells:?}, from rows {from_rows:?}"
     );
     column_scan::set_enabled(true);
+}
+
+/// A file copies a batch of rows' cells a column at a time, each onto the
+/// end of its buffer: the bytes the per-cell read returns, at every width,
+/// or nothing at all when one cell is not there to copy.
+#[tokio::test]
+async fn a_file_copies_a_batch_of_cells_or_none_of_it() {
+    use crate::core::storage_providers::file_sync::LocalStorageProvider;
+    use crate::core::storage_providers::traits::StorageIO;
+
+    let (dir, _cleanup) = scratch("cells");
+    std::fs::create_dir_all(&dir).expect("the scratch directory");
+    // Sixty-four rows of forty bytes, no two bytes of a row alike.
+    const ROW: u64 = 40;
+    let data: Vec<u8> = (0..64 * ROW).map(|i| ((i / ROW) * 7 + (i % ROW) * 3) as u8).collect();
+    {
+        let io = LocalStorageProvider::new(&dir, Some("cells")).await;
+        io.append_data(&data, true).await;
+        // A file is mapped as it stood when it was opened (and again each
+        // time it has grown by megabytes): written this small, it is read
+        // from the mapping only once opened anew.
+        let mut none = vec![Vec::new()];
+        assert!(!io.try_read_cells_sync(&[(0, ROW)], &[(0, 8)], &mut none.iter_mut().collect::<Vec<_>>()));
+        assert!(none[0].is_empty());
+    }
+    let io = LocalStorageProvider::new(&dir, Some("cells")).await;
+
+    // Rows out of order and one of them twice; every width with a loop of
+    // its own, one without, and a column of no width.
+    let rows: Vec<(u64, u64)> = [5u64, 0, 63, 17, 17].iter().map(|r| (r * ROW, ROW)).collect();
+    let cells: [(u32, u32); 8] = [(0, 1), (1, 2), (3, 4), (8, 8), (16, 12), (24, 16), (37, 3), (5, 0)];
+    let mut bufs: Vec<Vec<u8>> = (0..cells.len()).map(|c| vec![0xEE; c]).collect();
+    let copied = {
+        let mut out: Vec<&mut Vec<u8>> = bufs.iter_mut().collect();
+        io.try_read_cells_sync(&rows, &cells, &mut out)
+    };
+    assert!(copied, "a file with every cell in it copied none");
+    for (c, (&(offset, width), buf)) in cells.iter().zip(&bufs).enumerate() {
+        // What was in the buffer stays, and the cells follow it in row order.
+        let mut expect = vec![0xEE; c];
+        for &(row, _) in &rows {
+            let at = (row + offset as u64) as usize;
+            expect.extend_from_slice(&data[at..at + width as usize]);
+        }
+        assert_eq!(buf, &expect, "column {c} (offset {offset}, width {width})");
+        // And they are the bytes the per-cell read returns.
+        let mut one = vec![0u8; width as usize];
+        if width != 0 {
+            let mut reads = vec![(rows[2].0 + offset as u64, &mut one[..])];
+            assert!(io.try_read_vectored_sync(&mut reads));
+            assert_eq!(one, buf[c + 2 * width as usize..c + 3 * width as usize]);
+        }
+    }
+
+    // The last row's last cell ends where the file does: still there.
+    let before: Vec<Vec<u8>> = bufs.clone();
+    let last = [(63 * ROW, ROW)];
+    let mut tail = vec![Vec::new()];
+    assert!(io.try_read_cells_sync(&last, &[(24, 16)], &mut tail.iter_mut().collect::<Vec<_>>()));
+    assert_eq!(tail[0], data[data.len() - 16..]);
+    // One byte further is not, in the last of several rows and the last of
+    // several columns: nothing is appended to any buffer.
+    for cell in [(25u32, 16u32), (33, 8), (39, 2), (40, 1), (37, 4)] {
+        let rows = [(0, ROW), (17 * ROW, ROW), (63 * ROW, ROW)];
+        let cells = [(0, 8), (8, 4), cell];
+        let mut three: Vec<Vec<u8>> = vec![vec![1, 2, 3], Vec::new(), vec![9]];
+        let copied = io.try_read_cells_sync(&rows, &cells, &mut three.iter_mut().collect::<Vec<_>>());
+        assert!(!copied, "a cell {cell:?} past the file's end was copied");
+        assert_eq!(three, [vec![1, 2, 3], Vec::new(), vec![9]], "a refused batch left bytes behind for {cell:?}");
+    }
+    // A row whose start no offset can be added to, and buffers that do not
+    // match the cells.
+    assert!(!io.try_read_cells_sync(&[(u64::MAX - 2, ROW)], &[(8, 1)], &mut vec![&mut Vec::new()]));
+    assert!(!io.try_read_cells_sync(&last, &[(0, 1), (1, 1)], &mut vec![&mut Vec::new()]));
+    assert_eq!(bufs, before);
+}
+
+/// An in-place write that overlaps a batch read makes the read run again
+/// (the file's seqlock). The batch then holds each cell once, not once per
+/// attempt: columns a run longer than the others would pair every later
+/// row's value with another row's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
+    use crate::core::storage_providers::file_sync::LocalStorageProvider;
+    use crate::core::storage_providers::traits::StorageIO;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (dir, _cleanup) = scratch("cells_seq");
+    std::fs::create_dir_all(&dir).expect("the scratch directory");
+    const ROW: u64 = 40;
+    let data: Vec<u8> = (0..512 * ROW).map(|i| ((i / ROW) * 7 + (i % ROW) * 3) as u8).collect();
+    LocalStorageProvider::new(&dir, Some("cells")).await.append_data(&data, true).await;
+    let io = std::sync::Arc::new(LocalStorageProvider::new(&dir, Some("cells")).await);
+
+    // A writer rewriting one row with the bytes it already holds, over and
+    // over: nothing a reader sees changes, only the seqlock's count. It
+    // yields between writes; flat out, it overlapped every read of this
+    // size and the reader made 14 reads in a second and a half.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (io, stop, row) = (io.clone(), stop.clone(), data[200 * ROW as usize..201 * ROW as usize].to_vec());
+        tokio::spawn(async move {
+            let mut writes = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                io.write_data(200 * ROW, &row).await;
+                writes += 1;
+                tokio::task::yield_now().await;
+                std::thread::yield_now();
+            }
+            writes
+        })
+    };
+
+    let rows: Vec<(u64, u64)> = (180..244u64).map(|r| (r * ROW, ROW)).collect();
+    let cells: [(u32, u32); 3] = [(0, 8), (8, 4), (12, 1)];
+    let expect: Vec<Vec<u8>> = cells
+        .iter()
+        .map(|&(offset, width)| {
+            let mut column = vec![0xEE; 3];
+            for &(row, _) in &rows {
+                let at = (row + offset as u64) as usize;
+                column.extend_from_slice(&data[at..at + width as usize]);
+            }
+            column
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let mut reads = 0u64;
+    while started.elapsed() < std::time::Duration::from_millis(1500) {
+        let mut bufs: Vec<Vec<u8>> = vec![vec![0xEE; 3]; cells.len()];
+        if io.try_read_cells_sync(&rows, &cells, &mut bufs.iter_mut().collect::<Vec<_>>()) {
+            assert!(bufs == expect, "read {reads}: a batch read beside a writer holds other than each cell once");
+            reads += 1;
+        }
+        if reads % 32 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let writes = writer.await.expect("the writer");
+    assert!(reads > 100 && writes > 100, "{reads} reads beside {writes} writes: too few to have overlapped");
 }

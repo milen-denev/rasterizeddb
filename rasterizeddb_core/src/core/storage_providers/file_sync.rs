@@ -2415,6 +2415,66 @@ impl StorageIO for LocalStorageProvider {
         }))
     }
 
+    fn try_read_cells_sync(&self, rows: &[(u64, u64)], cells: &[(u32, u32)], out: &mut [&mut Vec<u8>]) -> bool {
+        if cells.len() != out.len() {
+            return false;
+        }
+        let main_len = self.load_file_len();
+        // As `try_read_vectored_sync`: staged data may hold some of the rows.
+        if self.temp_has_data.load(Ordering::Relaxed) {
+            return false;
+        }
+        let before: SmallVec<[usize; 16]> = out.iter().map(|buf| buf.len()).collect();
+        let copied = self.inplace.read(|| {
+            // An in-place write that overlapped makes this run again, so it
+            // starts from what the buffers held, not from what a torn pass
+            // left on them.
+            for (buf, len) in out.iter_mut().zip(before.iter()) {
+                buf.truncate(*len);
+            }
+            self.with_cached_mmap(|mmap| {
+                let bytes: &[u8] = &mmap[..];
+                // Every byte from the mapping, and inside the file's length.
+                let limit = (bytes.len() as u64).min(main_len);
+                for (buf, &(offset, width)) in out.iter_mut().zip(cells) {
+                    let offset = offset as u64;
+                    buf.reserve(rows.len() * width as usize);
+                    // A column at a time, so the width is one decision and
+                    // the usual widths copy as a load and a store.
+                    macro_rules! copy {
+                        ($width:expr) => {
+                            for &(row, _) in rows {
+                                let Some(at) = row.checked_add(offset) else { return false };
+                                if at.saturating_add($width as u64) > limit {
+                                    return false;
+                                }
+                                let at = at as usize;
+                                buf.extend_from_slice(&bytes[at..at + $width]);
+                            }
+                        };
+                    }
+                    match width {
+                        0 => {}
+                        1 => copy!(1usize),
+                        2 => copy!(2usize),
+                        4 => copy!(4usize),
+                        8 => copy!(8usize),
+                        12 => copy!(12usize),
+                        16 => copy!(16usize),
+                        other => copy!(other as usize),
+                    }
+                }
+                true
+            })
+        });
+        if !copied {
+            for (buf, len) in out.iter_mut().zip(before.iter()) {
+                buf.truncate(*len);
+            }
+        }
+        copied
+    }
+
     async fn write_data_seek(&self, seek: SeekFrom, buffer: &[u8]) {
         let _registered = gated!(self, Site::WriteSeek, |e| {
             GatedIo::record_failure(&self.location, &self.table_name, Failure::Untokened, e);
