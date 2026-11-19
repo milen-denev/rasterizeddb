@@ -152,6 +152,18 @@ leftovers).
    the branch changed must look on the parent exactly as on the branch, or the
    merge rolls back. A schema changed by a path that did not record its DDL is
    refused, not merged around.
+
+   Statements that shape no table — `CREATE`/`ALTER`/`DROP` of a view,
+   function, procedure, trigger or sequence, `COMMENT` — show in no table's
+   shape, so `SHOW BRANCH DIFF` lists each as a `(schema objects)` row, and a
+   merge replays the log for them even when no table changed. Views,
+   functions, procedures, triggers and sequences are rows of their `__rdb_*`
+   catalogue written in the statement's transaction, so a merge that fails
+   after replaying one takes it back. If the parent already has the branch's
+   table changes but not its other statements, the merge refuses and names
+   them. Only statements a client sent are recorded: those a statement runs
+   for itself (an `ALTER TYPE`'s constraint, a view's catalogue row) are not,
+   so nothing is replayed twice.
 3. **Rows**, compared as text as a client reads them:
    - a table with a primary or full unique key, row by row on the key:
      unchanged on the branch → skip; changed only on the branch → applied;

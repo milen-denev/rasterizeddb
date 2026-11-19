@@ -1183,3 +1183,40 @@ async fn rows_referencing_each_other_are_renumbered_in_order() {
     );
     assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_objects_alone_are_merged_by_their_statements() {
+    let fx = seeded("objects").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    // No table changes shape: only objects the comparison of tables does
+    // not see.
+    dev.exec("CREATE VIEW cheap AS SELECT id, name FROM items WHERE qty < 25").await;
+    dev.exec("CREATE SEQUENCE tickets START 100").await;
+
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    let objects: Vec<&String> = diff.iter().filter(|r| r[0] == "(schema objects)").map(|r| &r[6]).collect();
+    assert_eq!(objects.len(), 2, "{diff:?}");
+    assert!(objects[0].starts_with("CREATE VIEW cheap"), "{diff:?}");
+
+    admin.exec("MERGE BRANCH dev").await;
+    let mut prod = fx.client("prod");
+    assert_eq!(
+        prod.rows("SELECT name FROM cheap ORDER BY id").await,
+        vec![row(&["apple"]), row(&["pear"])]
+    );
+    assert_eq!(prod.scalar("SELECT nextval('tickets')").await, "100");
+    // Replayed once: a second merge offers nothing.
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+
+    // A merge that fails after replaying one takes it back with the rest.
+    admin.exec("CREATE BRANCH dev2 FROM prod").await;
+    let mut dev2 = fx.client("dev2");
+    dev2.exec("CREATE VIEW dear AS SELECT id FROM items WHERE qty > 25").await;
+    dev2.exec("UPDATE items SET qty = 31 WHERE id = 3").await;
+    prod.exec("UPDATE items SET qty = 32 WHERE id = 3").await;
+    let refused = admin.try_exec("MERGE BRANCH dev2").await.expect_err("merged a conflict");
+    assert_eq!(refused.0, "40001", "{refused:?}");
+    assert!(prod.try_exec("SELECT id FROM dear").await.is_err(), "a rolled-back merge left its view");
+}

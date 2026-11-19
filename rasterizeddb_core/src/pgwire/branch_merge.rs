@@ -344,6 +344,43 @@ fn sequence_filled(database: &Database, table: &str, column: &str) -> bool {
     })
 }
 
+/// Whether a recorded statement creates, changes or drops a table or an
+/// index — what the shapes compared above show. Everything else (views,
+/// functions, triggers, sequences, types, comments) shows nowhere but in
+/// the log.
+fn shapes_a_table(stmt: &str) -> bool {
+    let words: Vec<String> = stmt
+        .split_whitespace()
+        .take(3)
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
+    let at = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    matches!(at(0), "CREATE" | "ALTER" | "DROP")
+        && (matches!(at(1), "TABLE" | "INDEX") || (at(1) == "UNIQUE" && at(2) == "INDEX"))
+}
+
+/// Whether `stmt` makes, changes or drops an object kept as a row of a
+/// `__rdb_*` catalogue — a view, function, procedure, trigger or sequence —
+/// written in the statement's own transaction, so a rolled-back merge takes
+/// it back with everything else. (A materialized view makes a table, and is
+/// the block DDL's to judge.)
+fn written_in_the_transaction(stmt: &str) -> bool {
+    let words: Vec<String> = stmt
+        .split_whitespace()
+        .take(4)
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
+    let mut i = 1;
+    if words.get(1).map(String::as_str) == Some("OR") && words.get(2).map(String::as_str) == Some("REPLACE") {
+        i = 3;
+    }
+    matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER" | "DROP"))
+        && matches!(
+            words.get(i).map(String::as_str),
+            Some("VIEW" | "FUNCTION" | "PROCEDURE" | "TRIGGER" | "SEQUENCE")
+        )
+}
+
 /// Tables `table` references by foreign key.
 fn references_of(database: &Database, table: &str) -> BTreeSet<String> {
     database
@@ -1562,6 +1599,34 @@ async fn merge_with(
         });
     }
 
+    // Recorded DDL that changes no table's shape — views, functions,
+    // triggers, sequences, types, comments: invisible to the comparison
+    // above, so listed (and replayed) by the statements themselves.
+    let object_ddl: Vec<&String> = ddl.iter().filter(|stmt| !shapes_a_table(stmt)).collect();
+    for stmt in &object_ddl {
+        rows.push(DiffRow {
+            table: "(schema objects)".to_string(),
+            change: "schema",
+            inserts: 0,
+            updates: 0,
+            deletes: 0,
+            conflicts: 0,
+            detail: stmt.chars().take(160).collect(),
+        });
+    }
+    if needs_ddl.is_empty() && !already.is_empty() && !object_ddl.is_empty() {
+        schema_conflicts.push(format!(
+            "the parent already has the branch's table changes ({}), so its recorded statements cannot be \
+             replayed, and they also make other schema objects ({}); create those on the parent yourself, then \
+             merge",
+            already.iter().cloned().collect::<Vec<_>>().join(", "),
+            object_ddl
+                .iter()
+                .map(|s| s.split_whitespace().take(4).collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
     if !needs_ddl.is_empty() && ddl.is_empty() {
         schema_conflicts.push(format!(
             "the schema of {} changed on the branch, but no record of the statements that changed it was \
@@ -1579,7 +1644,7 @@ async fn merge_with(
         ));
     }
 
-    let apply_ddl = !needs_ddl.is_empty();
+    let apply_ddl = !needs_ddl.is_empty() || (!object_ddl.is_empty() && already.is_empty());
     if let Some((_, allow_drop)) = apply {
         if !schema_conflicts.is_empty() {
             return Err((
@@ -1608,6 +1673,7 @@ async fn merge_with(
                 if crate::core::database::catalog::branch::is_recorded_ddl(stmt)
                     && !parent_db.block_ddl_covers(stmt)
                     && !index
+                    && !written_in_the_transaction(stmt)
                 {
                     return Err((
                         "0A000",
