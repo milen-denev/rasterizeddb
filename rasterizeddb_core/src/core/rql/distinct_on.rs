@@ -133,13 +133,13 @@ fn word_positions<'a>(text: &'a str, word: &'a str) -> impl Iterator<Item = usiz
 /// The aggregates PostgreSQL has, by name. A call to one in the select list or
 /// the `ORDER BY` is what the native path refuses; naming one that is not an
 /// aggregate here only costs the derived table.
-const AGGREGATES: &[&str] = &[
+pub(crate) const AGGREGATES: &[&str] = &[
     "count", "sum", "avg", "min", "max", "string_agg", "array_agg", "bool_and", "bool_or", "every", "json_agg",
     "jsonb_agg", "json_object_agg", "jsonb_object_agg", "stddev", "stddev_pop", "stddev_samp", "variance",
     "var_pop", "var_samp", "bit_and", "bit_or", "bit_xor", "percentile_cont", "percentile_disc", "mode",
 ];
 
-fn calls_an_aggregate(text: &str) -> bool {
+pub(crate) fn calls_an_aggregate(text: &str) -> bool {
     AGGREGATES.iter().any(|name| {
         word_positions(text, name).any(|at| text[at + name.len()..].trim_start().starts_with('('))
     })

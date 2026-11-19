@@ -21,10 +21,19 @@
 //! An `UPDATE` reads its new values out of such a SELECT, keyed by the
 //! target's identifying key, and writes them back through `UPDATE … FROM`.
 //!
-//! Refused rather than guessed (0A000): an outer `GROUP BY`/`HAVING`, whose
-//! grouping the join would change; a set operation; a subquery returning more
-//! than one column (42601, as PostgreSQL); and whatever `LATERAL` refuses
-//! (references to two outer items, an outer alias named bare).
+//! In a grouped SELECT the join runs before the grouping. A subquery in the
+//! `WHERE`, an aggregate's argument or a `FILTER` is a value per row, as
+//! there. Anywhere else a group evaluates it once: it may read only the outer
+//! columns the query is grouped by (42803 otherwise, as PostgreSQL), so its
+//! value is added to the `GROUP BY` without changing any group, and a
+//! `HAVING` term testing it alone moves into the `WHERE` (`group_by_values`).
+//!
+//! Refused rather than guessed (0A000): a set operation; in a grouped SELECT,
+//! a `GROUP BY` over expressions, the value inside a larger select-list
+//! expression, in the `ORDER BY`, or compared with an aggregate in one
+//! `HAVING` term (what a grouped join cannot take); a subquery returning
+//! more than one column (42601, as PostgreSQL); and whatever `LATERAL`
+//! refuses (references to two outer items, an outer alias named bare).
 
 use crate::core::rql::join::find_keyword;
 
@@ -101,17 +110,16 @@ fn rewrite_select_inner(sql: &str) -> Result<String, String> {
             return refuse(kw);
         }
     }
-    if find_keyword(sql, "GROUP", 0).is_some() {
-        return refuse("GROUP BY");
-    }
-    if find_keyword(sql, "HAVING", 0).is_some() {
-        return refuse("HAVING");
-    }
     let mut current = sql.trim().trim_end_matches(';').trim_end().to_string();
     // Every subquery replaced first, its join kept to append after: an
     // appended join's body is itself a correlated subquery the finder would
     // return next.
     let mut joins: Vec<String> = Vec::new();
+    // Each subquery that a grouped query evaluates once per group, with the
+    // outer columns it reads (see `group_by_values`).
+    let mut per_group: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    // Whether one of them is part of a larger select-list expression.
+    let mut in_select_expression = false;
     for n in 0..=32usize {
         let Some(sub) = outside_from(&current) else {
             break;
@@ -137,6 +145,10 @@ fn rewrite_select_inner(sql: &str) -> Result<String, String> {
         } else {
             format!("{alias}.{VALUE}")
         };
+        if !per_row(&current, sub.start) {
+            per_group.push((alias.clone(), crate::core::rql::subquery::outer_refs(&sub.inner_sql)));
+            in_select_expression |= sub.start < from && !alone_in_item(before, after);
+        }
         current = format!("{}{}{}", &current[..sub.start], replacement, &current[sub.end..]);
         joins.push(format!("LEFT JOIN LATERAL ({body}) {alias} ON true"));
     }
@@ -146,7 +158,229 @@ fn rewrite_select_inner(sql: &str) -> Result<String, String> {
     let from = find_keyword(&current, "FROM", 0).ok_or_else(|| "no FROM".to_string())?;
     let end = from_list_end(&current, from);
     let (head, tail) = current.split_at(end);
-    Ok(format!("{} {} {}", head.trim_end(), joins.join(" "), tail.trim_start()).trim_end().to_string())
+    let joined = format!("{} {} {}", head.trim_end(), joins.join(" "), tail.trim_start()).trim_end().to_string();
+    group_by_values(joined, &per_group, in_select_expression)
+}
+
+/// Whether the subquery at `at` is evaluated once per row of the outer
+/// query even when that query groups: in its `WHERE`, or inside an
+/// aggregate's argument or `FILTER`. Anywhere else (the select list,
+/// `HAVING`, `ORDER BY`) a grouped query evaluates it once per group.
+fn per_row(sql: &str, at: usize) -> bool {
+    if let Some(wh) = find_keyword(sql, "WHERE", 0) {
+        let end = ["GROUP", "HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
+            .iter()
+            .filter_map(|kw| find_keyword(sql, kw, wh + 5))
+            .min()
+            .unwrap_or(sql.len());
+        if wh < at && at < end {
+            return true;
+        }
+    }
+    // The parentheses open around `at`, each judged by the word before it.
+    let bytes = sql.as_bytes();
+    let mut open: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < at {
+        match bytes[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < at && bytes[i] != q {
+                    i += 1;
+                }
+            }
+            b'(' => open.push(i),
+            b')' => {
+                open.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    open.iter().any(|&paren| {
+        let before = sql[..paren].trim_end();
+        let word_start = before
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |p| p + 1);
+        let word = before[word_start..].to_ascii_lowercase();
+        word == "filter" || crate::core::rql::distinct_on::AGGREGATES.contains(&word.as_str())
+    })
+}
+
+/// `sql` with the value of each subquery in `per_group` added to its `GROUP
+/// BY`, when the query groups: as PostgreSQL requires, a subquery a group
+/// evaluates once reads only the outer columns the group is keyed by, so its
+/// value is one per group and keying by it as well changes no group. One
+/// reading another outer column is 42803, as there; a `GROUP BY` over
+/// anything but plain columns is refused, not guessed.
+fn group_by_values(
+    sql: String,
+    per_group: &[(String, Vec<(String, String)>)],
+    in_select_expression: bool,
+) -> Result<String, String> {
+    let group = find_keyword(&sql, "GROUP", 0);
+    let grouped = group.is_some() || find_keyword(&sql, "HAVING", 0).is_some() || aggregates_in_select_list(&sql)?;
+    if !grouped || per_group.is_empty() {
+        return Ok(sql);
+    }
+    let Some(group) = group else {
+        // Grouped by an aggregate or HAVING alone: no column is a key.
+        return Err(match per_group.iter().find_map(|(_, refs)| refs.first()) {
+            Some((q, c)) => format!("subquery uses ungrouped column \"{q}.{c}\" from outer query"),
+            None => "a correlated scalar subquery in a grouped SELECT is not supported yet; write it as a join".into(),
+        });
+    };
+    let by = sql[group + 5..].trim_start();
+    if !starts_with_word(by, "BY") {
+        return Err("a correlated scalar subquery in a SELECT with GROUP BY is not supported here yet; write it as a join".into());
+    }
+    let list_start = sql.len() - by.len() + 2;
+    let list_end = ["HAVING", "WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
+        .iter()
+        .filter_map(|kw| find_keyword(&sql, kw, list_start))
+        .min()
+        .unwrap_or(sql.len());
+    let mut keys: Vec<(Option<String>, String)> = Vec::new();
+    for key in crate::core::sql_scan::split_top_level(&sql[list_start..list_end], b',') {
+        match plain_column(key.trim()) {
+            Some(k) => keys.push(k),
+            None => {
+                return Err(format!(
+                    "a correlated scalar subquery in a SELECT grouped by {} is not supported yet; write it as a join",
+                    key.trim()
+                ));
+            }
+        }
+    }
+    // A grouped join selects a joined column only on its own.
+    if in_select_expression {
+        return Err("a correlated scalar subquery inside an expression in a grouped SELECT is not supported yet; \
+                    select it on its own"
+            .into());
+    }
+    // A grouped join orders only by what it selects.
+    if let Some(order) = find_keyword(&sql, "ORDER", 0)
+        && per_group.iter().any(|(alias, _)| sql[order..].contains(&format!("{alias}.{VALUE}")))
+    {
+        return Err("a correlated scalar subquery in the ORDER BY of a grouped SELECT is not supported yet; \
+                    select it and order by its name"
+            .into());
+    }
+    let mut added = String::new();
+    for (alias, refs) in per_group {
+        for (q, c) in refs {
+            let keyed = keys.iter().any(|(kq, kc)| kc == c && kq.as_ref().is_none_or(|kq| kq == q));
+            if !keyed {
+                return Err(format!("subquery uses ungrouped column \"{q}.{c}\" from outer query"));
+            }
+        }
+        added.push_str(&format!(", {alias}.{VALUE}"));
+    }
+    let head = sql[..list_end].trim_end();
+    let tail = &sql[list_end..];
+    let grouped_sql = format!("{head}{added} {}", tail.trim_start()).trim_end().to_string();
+    having_to_where(grouped_sql, per_group)
+}
+
+/// `sql` (grouped, with a `GROUP BY`) with each `HAVING` conjunct that reads
+/// a per-group subquery's value and calls no aggregate moved into `WHERE`.
+/// It reads group keys only, so it keeps or drops a group's rows together,
+/// and filtering them before grouping leaves the same groups. A `HAVING`
+/// over a join takes only aggregate tests, which is why it moves.
+fn having_to_where(sql: String, per_group: &[(String, Vec<(String, String)>)]) -> Result<String, String> {
+    let Some(having) = find_keyword(&sql, "HAVING", 0) else {
+        return Ok(sql);
+    };
+    let start = having + "HAVING".len();
+    let end = ["WINDOW", "ORDER", "LIMIT", "OFFSET", "FETCH", "FOR"]
+        .iter()
+        .filter_map(|kw| find_keyword(&sql, kw, start))
+        .min()
+        .unwrap_or(sql.len());
+    let reads_value = |term: &str| per_group.iter().any(|(alias, _)| term.contains(&format!("{alias}.{VALUE}")));
+    let (moved, kept): (Vec<_>, Vec<_>) = crate::core::rql::having::conjuncts(&sql[start..end])?
+        .into_iter()
+        .partition(|(term, aggregate)| !aggregate && reads_value(term));
+    if kept.iter().any(|(term, aggregate)| *aggregate && reads_value(term)) {
+        return Err("a correlated scalar subquery compared with an aggregate in HAVING is not supported yet; \
+                    write it as a join"
+            .into());
+    }
+    if moved.is_empty() {
+        return Ok(sql);
+    }
+    let group = find_keyword(&sql, "GROUP", 0).ok_or_else(|| "no GROUP BY".to_string())?;
+    let moved: Vec<String> = moved.into_iter().map(|(t, _)| format!("({t})")).collect();
+    let filter = moved.join(" AND ");
+    let before_group = match find_keyword(&sql[..group], "WHERE", 0) {
+        Some(wh) => format!(
+            "{} WHERE ({}) AND {filter}",
+            sql[..wh].trim_end(),
+            sql[wh + "WHERE".len()..group].trim()
+        ),
+        None => format!("{} WHERE {filter}", sql[..group].trim_end()),
+    };
+    let grouping = sql[group..having].trim_end();
+    let having = if kept.is_empty() {
+        String::new()
+    } else {
+        format!(" HAVING {}", kept.into_iter().map(|(t, _)| t).collect::<Vec<_>>().join(" AND "))
+    };
+    Ok(format!("{before_group} {grouping}{having} {}", sql[end..].trim_start()).trim_end().to_string())
+}
+
+/// Whether the top-level select list of `sql` calls an aggregate (which
+/// makes the query grouped with no `GROUP BY`). A window function there is
+/// refused: telling `sum(x) OVER ()` from `sum(x)` is not done here.
+fn aggregates_in_select_list(sql: &str) -> Result<bool, String> {
+    let Some(from) = find_keyword(sql, "FROM", 0) else {
+        return Ok(false);
+    };
+    let list = &sql[..from];
+    let calls = crate::core::rql::distinct_on::calls_an_aggregate(list);
+    if calls && find_keyword(list, "OVER", 0).is_some() {
+        return Err("a correlated scalar subquery beside a window function is not supported yet; write it as a join".into());
+    }
+    Ok(calls)
+}
+
+/// `name` or `qualifier.name`, folded as [`subquery::outer_refs`] folds
+/// them; `None` for anything else (an expression, an ordinal).
+fn plain_column(text: &str) -> Option<(Option<String>, String)> {
+    let fold = |p: &str| -> Option<String> {
+        if p.len() >= 2 && p.starts_with('"') && p.ends_with('"') {
+            return Some(p[1..p.len() - 1].to_string());
+        }
+        let ok = p.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        ok.then(|| p.to_ascii_lowercase())
+    };
+    let parts: Vec<&str> = text.split('.').collect();
+    match parts.as_slice() {
+        [c] => Some((None, fold(c)?)),
+        [q, c] => Some((Some(fold(q)?), fold(c)?)),
+        _ => None,
+    }
+}
+
+/// Whether the subquery between `before` and `after` is a whole select
+/// item, `AS name` (or a bare name) after it allowed.
+fn alone_in_item(before: &str, after: &str) -> bool {
+    let starts_item = before.ends_with(',') || starts_with_word_end(before, "SELECT") || starts_with_word_end(before, "DISTINCT");
+    let mut rest = after.trim_start();
+    if starts_with_word(rest, "AS") {
+        rest = rest[2..].trim_start();
+    }
+    if !(rest.starts_with(',') || starts_with_word(rest, "FROM")) {
+        // A name: quoted, or a word that is not FROM.
+        let name_len = if rest.starts_with('"') {
+            rest[1..].find('"').map_or(0, |q| q + 2)
+        } else {
+            rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len())
+        };
+        rest = rest[name_len..].trim_start();
+    }
+    starts_item && (rest.starts_with(',') || starts_with_word(rest, "FROM"))
 }
 
 /// Whether `text` ends with the word `word`.
@@ -282,7 +516,20 @@ mod tests {
             "SELECT id, __cs0.__v AS \"max\" FROM ct LEFT JOIN LATERAL (SELECT max(v) AS __v FROM cu WHERE cu.k = ct.k) __cs0 ON true WHERE id > 1 ORDER BY id"
         );
         assert!(rewrite_select("SELECT id FROM ct").is_none());
-        assert!(rewrite_select("SELECT k, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct GROUP BY k").unwrap().is_err());
+        assert_eq!(
+            rewrite_select("SELECT k, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct GROUP BY k").unwrap().unwrap(),
+            "SELECT k, __cs0.__v AS \"max\" FROM ct LEFT JOIN LATERAL (SELECT max(v) AS __v FROM cu WHERE cu.k = ct.k) __cs0 ON true GROUP BY k, __cs0.__v"
+        );
+        // A grouped query evaluates it once per group: the outer columns it
+        // reads must be keys (42803 otherwise, as PostgreSQL), and per row
+        // in an aggregate's argument, which adds no key.
+        assert!(rewrite_select("SELECT d, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct GROUP BY d").unwrap().is_err());
+        assert!(rewrite_select("SELECT count(*), (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct").unwrap().is_err());
+        assert_eq!(
+            rewrite_select("SELECT d, sum((SELECT max(v) FROM cu WHERE cu.k = ct.k)) FROM ct GROUP BY d").unwrap().unwrap(),
+            "SELECT d, sum(__cs0.__v) FROM ct LEFT JOIN LATERAL (SELECT max(v) AS __v FROM cu WHERE cu.k = ct.k) __cs0 ON true GROUP BY d"
+        );
+        assert!(rewrite_select("SELECT k, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct GROUP BY k + 1").unwrap().is_err());
         assert!(rewrite_select("SELECT (SELECT v, k FROM cu WHERE cu.k = ct.k) FROM ct").unwrap().is_err());
     }
 }

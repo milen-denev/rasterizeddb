@@ -7055,7 +7055,14 @@ where
             correlated.as_str()
         }
         Some(Err(e)) => {
-            fail_statement(state, stream, if e.contains("only one column") { "42601" } else { "0A000" }, &e).await?;
+            let code = if e.contains("only one column") {
+                "42601"
+            } else if e.contains("uses ungrouped column") {
+                "42803"
+            } else {
+                "0A000"
+            };
+            fail_statement(state, stream, code, &e).await?;
             return Ok(());
         }
         None => stmt,
@@ -8347,7 +8354,11 @@ fn materialize_class(code: &'static str) -> &'static str {
     // (42P01, 42703, 42702), not a missing feature.
     // `21`: a scalar subquery inside it that gave more than one row (a
     // correlated one runs as a derived relation), the data's, not a feature.
-    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702"].iter().any(|class| code.starts_with(class)) {
+    // 42803: a grouped query reading an ungrouped column, in a subquery too.
+    if ["21", "23", "22", "40", "57", "55", "53", "58", "42P01", "42703", "42702", "42803"]
+        .iter()
+        .any(|class| code.starts_with(class))
+    {
         code
     } else {
         "0A000"
@@ -8540,6 +8551,7 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     }
     if has("aggregate functions are not allowed in transform expressions")
         || has("must appear in the group by clause or be used in an aggregate function")
+        || has("subquery uses ungrouped column")
     {
         return "42803";
     }

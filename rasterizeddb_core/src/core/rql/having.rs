@@ -593,6 +593,22 @@ fn split_conjuncts(toks: &[Token]) -> Vec<(usize, usize)> {
     out
 }
 
+/// `text`'s top-level conjuncts as written, split as [`parse`] splits a
+/// clause, each with whether it calls an aggregate.
+pub(crate) fn conjuncts(text: &str) -> Result<Vec<(String, bool)>, String> {
+    let toks = lex(text)?;
+    let mut out = Vec::new();
+    for (from, to) in split_conjuncts(&toks) {
+        let part = &toks[from..to];
+        if part.is_empty() {
+            return Err("HAVING has an empty condition around AND".to_string());
+        }
+        let has_aggregate = (0..part.len()).any(|i| is_aggregate_call(part, i));
+        out.push((text[part[0].start..part[part.len() - 1].end].to_string(), has_aggregate));
+    }
+    Ok(out)
+}
+
 /// Parses a `HAVING` clause. See the module documentation for the contract.
 pub fn parse(
     text: &str,

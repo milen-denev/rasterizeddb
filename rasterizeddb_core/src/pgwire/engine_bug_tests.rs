@@ -648,9 +648,121 @@ async fn a_correlated_subquery_inside_a_derived_table_reads_each_row() {
     for (sql, expected) in cases {
         assert_eq!(one(&db, &mut s, sql).await, expected, "{sql}");
     }
-    // Still refused, not guessed: the join would change the grouping.
-    let e = rows(&db, &mut s, "SELECT j FROM (SELECT (SELECT max(mt.v) FROM mt WHERE mt.id = ms.id) AS j FROM ms GROUP BY ms.id) z")
+    // Grouped by the column it reads: one value per group (refused before).
+    assert_eq!(
+        one(&db, &mut s, "SELECT j FROM (SELECT (SELECT max(mt.v) FROM mt WHERE mt.id = ms.id) AS j FROM ms GROUP BY ms.id) z ORDER BY j")
+            .await,
+        vec![r(&[Some("A")]), r(&[None])]
+    );
+}
+
+/// A correlated scalar subquery in a grouped SELECT (refused, 0A000,
+/// before): once per group in the select list, `HAVING` and `ORDER BY`,
+/// where it may read only the outer columns the query is grouped by;
+/// once per row in the `WHERE`, an aggregate's argument and a `FILTER`.
+/// Every answer is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_subquery_in_a_grouped_select_answers_as_postgresql_does() {
+    let db = db().await;
+    let mut s = session(&db);
+    ok(&db, &mut s, "CREATE TABLE gt (id int PRIMARY KEY, k int, d text)").await;
+    ok(&db, &mut s, "INSERT INTO gt VALUES (1,1,'a'),(2,1,'b'),(3,2,'a'),(4,3,'c'),(5,NULL,'a')").await;
+    ok(&db, &mut s, "CREATE TABLE gu (k int, v int)").await;
+    ok(&db, &mut s, "INSERT INTO gu VALUES (1,10),(1,20),(2,5),(4,7)").await;
+    let cases: [(&str, Rows); 9] = [
+        // A key-only HAVING term moves into the WHERE, beside one with OR.
+        (
+            "SELECT k FROM gt WHERE id > 1 OR id < 0 GROUP BY k \
+             HAVING (SELECT max(v) FROM gu WHERE gu.k = gt.k) > 6 AND count(*) > 0 ORDER BY k",
+            vec![r(&[Some("1")])],
+        ),
+        (
+            "SELECT k, count(*), (SELECT max(v) FROM gu WHERE gu.k = gt.k) FROM gt GROUP BY k ORDER BY k",
+            vec![
+                r(&[Some("1"), Some("2"), Some("20")]),
+                r(&[Some("2"), Some("1"), Some("5")]),
+                r(&[Some("3"), Some("1"), None]),
+                r(&[None, Some("1"), None]),
+            ],
+        ),
+        (
+            "SELECT gt.k, (SELECT sum(v) FROM gu WHERE gu.k = gt.k) AS s FROM gt GROUP BY gt.k \
+             HAVING (SELECT count(*) FROM gu WHERE gu.k = gt.k) > 0 ORDER BY gt.k",
+            vec![r(&[Some("1"), Some("30")]), r(&[Some("2"), Some("5")])],
+        ),
+        (
+            "SELECT d, sum((SELECT max(v) FROM gu WHERE gu.k = gt.k)) FROM gt GROUP BY d ORDER BY d",
+            vec![r(&[Some("a"), Some("25")]), r(&[Some("b"), Some("20")]), r(&[Some("c"), None])],
+        ),
+        (
+            "SELECT d, count(*) FROM gt WHERE (SELECT max(v) FROM gu WHERE gu.k = gt.k) > 6 GROUP BY d ORDER BY d",
+            vec![r(&[Some("a"), Some("1")]), r(&[Some("b"), Some("1")])],
+        ),
+        (
+            "SELECT k, d, (SELECT count(*) FROM gu WHERE gu.k = gt.k) AS c FROM gt GROUP BY k, d ORDER BY k, d",
+            vec![
+                r(&[Some("1"), Some("a"), Some("2")]),
+                r(&[Some("1"), Some("b"), Some("2")]),
+                r(&[Some("2"), Some("a"), Some("1")]),
+                r(&[Some("3"), Some("c"), Some("0")]),
+                r(&[None, Some("a"), Some("0")]),
+            ],
+        ),
+        (
+            "SELECT k, (SELECT max(v) FROM gu WHERE gu.k = gt.k) AS m FROM gt GROUP BY k ORDER BY m NULLS FIRST, k",
+            vec![
+                r(&[Some("3"), None]),
+                r(&[None, None]),
+                r(&[Some("2"), Some("5")]),
+                r(&[Some("1"), Some("20")]),
+            ],
+        ),
+        (
+            "SELECT k, max(id), (SELECT max(v) FROM gu WHERE gu.k = gt.k) AS m FROM gt GROUP BY k \
+             HAVING count(*) >= 1 ORDER BY k",
+            vec![
+                r(&[Some("1"), Some("2"), Some("20")]),
+                r(&[Some("2"), Some("3"), Some("5")]),
+                r(&[Some("3"), Some("4"), None]),
+                r(&[None, Some("5"), None]),
+            ],
+        ),
+        (
+            "SELECT d, count(*) FILTER (WHERE (SELECT max(v) FROM gu WHERE gu.k = gt.k) > 6) FROM gt GROUP BY d ORDER BY d",
+            vec![r(&[Some("a"), Some("1")]), r(&[Some("b"), Some("1")]), r(&[Some("c"), Some("0")])],
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(one(&db, &mut s, sql).await, expected, "{sql}");
+    }
+    // Reading a column the query is not grouped by: 42803, as PostgreSQL.
+    for sql in [
+        "SELECT d, (SELECT max(v) FROM gu WHERE gu.k = gt.k) FROM gt GROUP BY d",
+        "SELECT count(*), (SELECT max(v) FROM gu WHERE gu.k = gt.k) FROM gt",
+    ] {
+        let e = rows(&db, &mut s, sql).await.expect_err(sql);
+        assert_eq!(sqlstate_of(&e), "42803", "{sql}: {e}");
+    }
+    // Refused, not guessed: the value inside a select-list expression
+    // (PostgreSQL: 21, 6, NULL, NULL for k = 1, 2, 3, NULL).
+    let e = rows(&db, &mut s, "SELECT k, (SELECT max(v) FROM gu WHERE gu.k = gt.k) + 1 FROM gt GROUP BY k")
         .await
         .expect_err("refused");
+    assert_eq!(sqlstate_of(&e), "0A000", "{e}");
+    // Refused, not guessed: ordered by the value without selecting it
+    // (PostgreSQL: 3, NULL, 2, 1), which a grouped join cannot.
+    let e = rows(&db, &mut s, "SELECT k FROM gt GROUP BY k ORDER BY (SELECT max(v) FROM gu WHERE gu.k = gt.k) NULLS FIRST, k")
+        .await
+        .expect_err("refused");
+    assert_eq!(sqlstate_of(&e), "0A000", "{e}");
+    // Refused, not guessed: an aggregate compared with the value in one
+    // HAVING term (PostgreSQL: (1,2),(2,1),(3,1),(NULL,1)).
+    let e = rows(
+        &db,
+        &mut s,
+        "SELECT k, count(*) FROM gt GROUP BY k HAVING count(*) >= (SELECT count(*) FROM gu WHERE gu.k = gt.k) ORDER BY k",
+    )
+    .await
+    .expect_err("refused");
     assert_eq!(sqlstate_of(&e), "0A000", "{e}");
 }

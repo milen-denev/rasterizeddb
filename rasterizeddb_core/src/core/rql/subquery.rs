@@ -308,10 +308,19 @@ fn scalar_subquery(sql: &str, correlated: bool) -> Option<InSubquery> {
 /// Deliberately conservative: an unqualified column is not evidence either way,
 /// so only a qualifier that matches none of the subquery's own relations counts.
 pub fn is_correlated(inner_sql: &str) -> bool {
+    !outer_refs(inner_sql).is_empty()
+}
+
+/// The outer row's columns `inner_sql` reads, as `(qualifier, column)` in
+/// the order they appear, by [`is_correlated`]'s rule: a qualified name
+/// whose qualifier is none of the subquery's own relations. Unquoted names
+/// are folded to lowercase.
+pub fn outer_refs(inner_sql: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
     let from_at = match crate::core::rql::join::find_keyword(inner_sql, "FROM", 0) {
         Some(at) => at,
         // No FROM means no relations of its own, so nothing to correlate with.
-        None => return false,
+        None => return found,
     };
     let after_from = &inner_sql[from_at + "FROM".len()..];
     let end = ["WHERE", "GROUP", "ORDER", "LIMIT", "HAVING"]
@@ -367,14 +376,22 @@ pub fn is_correlated(inner_sql: &str) -> bool {
                         || n.rsplit('.').next().is_some_and(|last| last.trim_matches('"').eq_ignore_ascii_case(qualifier))
                 };
                 if !qualifier.is_empty() && !own.iter().any(named) {
-                    return true;
+                    let raw: Vec<&str> = word.split('.').collect();
+                    let fold = |p: &str| {
+                        if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_ascii_lowercase() }
+                    };
+                    let column = raw.last().map(|c| fold(c)).unwrap_or_default();
+                    let reference = (fold(raw[raw.len() - parts.len()]), column);
+                    if !found.contains(&reference) {
+                        found.push(reference);
+                    }
                 }
             }
             continue;
         }
         i += 1;
     }
-    false
+    found
 }
 
 /// Renders the single value a scalar subquery returned.
