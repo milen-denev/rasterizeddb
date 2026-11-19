@@ -360,7 +360,8 @@ fn shapes_a_table(stmt: &str) -> bool {
 }
 
 /// Whether `stmt` makes, changes or drops an object kept as a row of a
-/// `__rdb_*` catalogue — a view, function, procedure, trigger or sequence —
+/// `__rdb_*` catalogue — a view, function, procedure, trigger, sequence or
+/// type (its registry reads the row in the statement's transaction) —
 /// written in the statement's own transaction, so a rolled-back merge takes
 /// it back with everything else. (A materialized view makes a table, and is
 /// the block DDL's to judge.)
@@ -377,7 +378,7 @@ fn written_in_the_transaction(stmt: &str) -> bool {
     matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER" | "DROP"))
         && matches!(
             words.get(i).map(String::as_str),
-            Some("VIEW" | "FUNCTION" | "PROCEDURE" | "TRIGGER" | "SEQUENCE")
+            Some("VIEW" | "FUNCTION" | "PROCEDURE" | "TRIGGER" | "SEQUENCE" | "TYPE")
         )
 }
 

@@ -157,7 +157,7 @@ leftovers).
    function, procedure, trigger or sequence, `COMMENT` — show in no table's
    shape, so `SHOW BRANCH DIFF` lists each as a `(schema objects)` row, and a
    merge replays the log for them even when no table changed. Views,
-   functions, procedures, triggers and sequences are rows of their `__rdb_*`
+   functions, procedures, triggers, sequences and types are rows of their `__rdb_*`
    catalogue written in the statement's transaction, so a merge that fails
    after replaying one takes it back. If the parent already has the branch's
    table changes but not its other statements, the merge refuses and names
