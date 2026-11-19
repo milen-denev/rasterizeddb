@@ -2646,7 +2646,7 @@ impl Session {
         };
         let schema = view.schema();
         let mut rows = Vec::new();
-        let mut push = |key: &str, non_unique: bool, columns: &[String]| {
+        let mut push = |key: &str, non_unique: bool, columns: &[String], kind: &str| {
             for (seq, column) in columns.iter().enumerate() {
                 rows.push(vec![
                     Some(name.clone()),
@@ -2659,7 +2659,7 @@ impl Session {
                     None,
                     None,
                     Some(String::new()),
-                    Some("BTREE".into()),
+                    Some(kind.into()),
                     Some(String::new()),
                     Some(String::new()),
                     Some("YES".into()),
@@ -2668,7 +2668,7 @@ impl Session {
             }
         };
         if let Some(pk) = &schema.primary_key {
-            push("PRIMARY", false, std::slice::from_ref(pk));
+            push("PRIMARY", false, std::slice::from_ref(pk), "BTREE");
         }
         for key in schema.unique_keys.iter().filter(|k| !k.is_deleted) {
             // The primary key's own constraint is the PRIMARY row already.
@@ -2683,6 +2683,7 @@ impl Session {
                 translate::plain_index_name(&name, &key.name),
                 false,
                 &key.columns,
+                "BTREE",
             );
         }
         for index in schema.secondary_indexes.iter().filter(|i| !i.is_deleted) {
@@ -2697,10 +2698,14 @@ impl Session {
                 })
                 .map(|f| f.name.clone())
                 .collect();
+            // A full-text key, as MySQL lists one (and SHOW CREATE TABLE
+            // writes it back, which a dump reloads).
+            let kind = if index.method.is_text() { "FULLTEXT" } else { "BTREE" };
             push(
                 translate::plain_index_name(&name, &index.name),
                 !index.unique,
                 &columns,
+                kind,
             );
         }
         Ok(rows)
@@ -2731,17 +2736,18 @@ impl Session {
             })
             .collect();
         let rows = self.index_rows(&name)?;
-        let mut keys: Vec<(String, bool, Vec<String>)> = Vec::new();
+        let mut keys: Vec<(String, bool, Vec<String>, bool)> = Vec::new();
         for r in rows {
             let key = r[2].clone().unwrap_or_default();
             let non_unique = r[1].as_deref() == Some("1");
             let column = r[4].clone().unwrap_or_default();
+            let fulltext = r[10].as_deref() == Some("FULLTEXT");
             match keys.iter_mut().find(|k| k.0 == key) {
                 Some(k) => k.2.push(column),
-                None => keys.push((key, non_unique, vec![column])),
+                None => keys.push((key, non_unique, vec![column], fulltext)),
             }
         }
-        for (key, non_unique, columns) in keys {
+        for (key, non_unique, columns, fulltext) in keys {
             let cols = columns
                 .iter()
                 .map(|c| format!("`{c}`"))
@@ -2749,6 +2755,8 @@ impl Session {
                 .join(",");
             lines.push(if key == "PRIMARY" {
                 format!("  PRIMARY KEY ({cols})")
+            } else if fulltext {
+                format!("  FULLTEXT KEY `{key}` ({cols})")
             } else if non_unique {
                 format!("  KEY `{key}` ({cols})")
             } else {
@@ -2829,9 +2837,12 @@ impl Session {
         // `@v` and `@@v` are read at each execute in MySQL; their values are
         // written into the translation, so such a statement is translated
         // again at each execute rather than prepared on the engine.
+        // So is a full-text search string bound to a `?`: the query it
+        // means is made from its text (`fulltext::expression`).
         let reads_variables = tokens
             .iter()
-            .any(|t| matches!(t.tok, Tok::UserVar(_) | Tok::SysVar(_)));
+            .any(|t| matches!(t.tok, Tok::UserVar(_) | Tok::SysVar(_)))
+            || super::fulltext::binds_search_string(&tokens);
         if matches!(action, Action::Data) {
             self.load_on_update(&tokens).await;
             let forward = match translate::translate(sql, tokens, self, true) {

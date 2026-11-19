@@ -292,6 +292,9 @@ pub(crate) struct Cx<'a> {
     table: Option<String>,
     /// What the DDL changes in the ON UPDATE record.
     meta: Vec<MetaOp>,
+    /// A `MATCH … AGAINST` here is read as its relevance score: a select-list
+    /// item, an `ORDER BY` term, a function's argument.
+    relevance: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -303,6 +306,7 @@ impl<'a> Cx<'a> {
             aliases: Vec::new(),
             table: None,
             meta: Vec::new(),
+            relevance: false,
         }
     }
 }
@@ -686,7 +690,20 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
             {
                 let close = matching_paren(&tokens, i + 1)
                     .ok_or_else(|| MyError::syntax("unbalanced parentheses"))?;
-                if let Some(replacement) = rewrite_call(word, &tokens[i + 2..close], cx)? {
+                if word.eq_ignore_ascii_case("MATCH") {
+                    let (sql, end) = match_against(&tokens, i, close, &out, cx)?;
+                    let mut v = Token::raw(sql);
+                    v.space = t.space;
+                    out.push(v);
+                    i = end + 1;
+                    continue;
+                }
+                // A function's arguments are values: a `MATCH` among them is
+                // its score.
+                let condition = std::mem::replace(&mut cx.relevance, true);
+                let replacement = rewrite_call(word, &tokens[i + 2..close], cx);
+                cx.relevance = condition;
+                if let Some(replacement) = replacement? {
                     out.extend(replacement);
                     i = close + 1;
                     continue;
@@ -697,8 +714,10 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 let mut open = tokens[i + 1].clone();
                 open.space = false;
                 out.push(open);
-                let inner = rewrite_expr(tokens[i + 2..close].to_vec(), cx)?;
-                out.extend(inner);
+                let condition = std::mem::replace(&mut cx.relevance, true);
+                let inner = rewrite_expr(tokens[i + 2..close].to_vec(), cx);
+                cx.relevance = condition;
+                out.extend(inner?);
                 out.push(tokens[close].clone());
                 i = close + 1;
                 continue;
@@ -859,9 +878,6 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                         out.push(t.clone());
                     }
                     "STRAIGHT_JOIN" => out.push(Token::word("JOIN")),
-                    "MATCH" => {
-                        return Err(MyError::unsupported("MATCH … AGAINST (full-text search)"));
-                    }
                     _ => {
                         if let Some(alias) = cx.aliases.iter().find(|a| a.eq_ignore_ascii_case(w)) {
                             if !out.last().is_some_and(|p| p.is_op("."))
@@ -901,6 +917,69 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
 
 /// One function call, rewritten; `None` when the name is not one MySQL and
 /// the engine spell differently.
+/// `MATCH (columns) AGAINST (search [mode])`, the `MATCH` at `at` with its
+/// column list closing at `close`: the SQL it is and the index of the
+/// `AGAINST` list's `)`. A condition where it stands as one (after `WHERE`,
+/// `ON`, `HAVING`, `WHEN`, `AND`, `OR`, `NOT`, or alone outside a value
+/// position) so the engine can answer it from a full-text index; its score
+/// everywhere else ([`super::fulltext`]).
+fn match_against(
+    tokens: &[Token],
+    at: usize,
+    close: usize,
+    out: &[Token],
+    cx: &mut Cx,
+) -> Result<(String, usize), MyError> {
+    use super::fulltext;
+    if !kw(tokens, close + 1, "AGAINST") || !tokens.get(close + 2).is_some_and(|p| p.is_op("(")) {
+        return Err(MyError::syntax("MATCH (…) needs AGAINST (…)"));
+    }
+    let end = matching_paren(tokens, close + 2).ok_or_else(|| MyError::syntax("unbalanced parentheses"))?;
+    let mut columns = Vec::new();
+    for part in split_commas(&tokens[at + 2..close]) {
+        let reference = part.iter().enumerate().all(|(k, t)| if k % 2 == 1 { t.is_op(".") } else { t.ident().is_some() });
+        if part.is_empty() || part.len() % 2 == 0 || !reference {
+            return Err(MyError::syntax("MATCH lists columns"));
+        }
+        columns.push(render(&rewrite_expr(part, cx)?)?);
+    }
+    let inner = &tokens[close + 3..end];
+    let mode_at = find_top(inner, 0, &["IN", "WITH"]).unwrap_or(inner.len());
+    let mode = fulltext::mode_of(&inner[mode_at..])?;
+    let search = match &inner[..mode_at] {
+        [Token { tok: Tok::Param(_), .. }] if cx.placeholders => {
+            // Bound at execute; the statement is translated again then.
+            let _ = rewrite_expr(inner[..mode_at].to_vec(), cx)?;
+            None
+        }
+        written => {
+            let value = rewrite_expr(written.to_vec(), cx)?;
+            Some(str_of(&value).ok_or_else(|| MyError::unsupported("an AGAINST search string that is not a literal"))?)
+        }
+    };
+    let before = match out.last() {
+        // The start of a clause or a group: a condition unless this is a
+        // value position.
+        None => !cx.relevance,
+        Some(t) if t.is_op("(") => !cx.relevance,
+        Some(t) => ["WHERE", "HAVING", "ON", "WHEN", "AND", "OR", "NOT"].iter().any(|w| t.is_word(w)),
+    };
+    let after = match tokens.get(end + 1) {
+        None => true,
+        Some(t) => {
+            t.is_op(")")
+                || t.is_op(";")
+                || t.is_op("&&")
+                || t.is_op("||")
+                || ["AND", "OR", "THEN", "ORDER", "GROUP", "LIMIT", "HAVING", "UNION", "WINDOW", "FOR", "LOCK"]
+                    .iter()
+                    .any(|w| t.is_word(w))
+        }
+    };
+    let relevance = !(before && after);
+    Ok((fulltext::expression(&columns, search.as_deref(), mode, relevance), end))
+}
+
 fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<Token>>, MyError> {
     let upper = name.to_ascii_uppercase();
     let raw_args = || split_commas(inner);
@@ -1325,7 +1404,6 @@ fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<T
                 return Ok(None);
             }
         }
-        "MATCH" => return Err(MyError::unsupported("MATCH … AGAINST (full-text search)")),
         _ => return Ok(None),
     }))
 }
@@ -1413,7 +1491,10 @@ pub(crate) fn rewrite_select(
         if k > 0 {
             out.push(Token::op(","));
         }
-        let rewritten = rewrite_expr(expr, cx)?;
+        let condition = std::mem::replace(&mut cx.relevance, true);
+        let rewritten = rewrite_expr(expr, cx);
+        cx.relevance = condition;
+        let rewritten = rewritten?;
         if let Some(n) = &name {
             item_texts.push((render(&rewritten)?, n.clone()));
         }
@@ -1444,6 +1525,7 @@ pub(crate) fn rewrite_select(
                     direction.push(body.pop().unwrap());
                 }
                 let mut probe = Cx::new(cx.env, cx.placeholders);
+                probe.relevance = true;
                 let text = render(&rewrite_expr(body, &mut probe)?)?;
                 match item_texts.iter().find(|(t, _)| *t == text) {
                     Some((_, alias)) => {
@@ -2557,7 +2639,24 @@ fn rewrite_create_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
                     cols.join(", ")
                 ));
             }
-            "FULLTEXT" | "SPATIAL" => {
+            "FULLTEXT" => {
+                // FULLTEXT [INDEX|KEY] [name] (cols) [WITH PARSER …]
+                let mut q = p + 1;
+                if kw(&part, q, "KEY") || kw(&part, q, "INDEX") {
+                    q += 1;
+                }
+                let cols = super::fulltext::key_columns(&part[paren + 1..pclose])?;
+                super::fulltext::check_key_options(&part[pclose + 1..])?;
+                let name = if q < paren { part[q].ident().map(|s| s.to_lowercase()) } else { None }
+                    .unwrap_or_else(|| cols[0].to_lowercase());
+                after_statements.push(super::fulltext::index_statement(
+                    &index_name(&table, &name),
+                    &table,
+                    &cols,
+                    if_not_exists,
+                ));
+            }
+            "SPATIAL" => {
                 return Err(MyError::unsupported(format!("{head} indexes")));
             }
             "FOREIGN" => {
@@ -2657,6 +2756,22 @@ fn rewrite_alter_table(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyErr
                         let pclose = matching_paren(&spec, paren)
                             .ok_or_else(|| MyError::syntax("unbalanced key"))?;
                         match what.as_str() {
+                            "FULLTEXT" => {
+                                let mut q = k + 1;
+                                if kw(&spec, q, "KEY") || kw(&spec, q, "INDEX") {
+                                    q += 1;
+                                }
+                                let cols = super::fulltext::key_columns(&spec[paren + 1..pclose])?;
+                                super::fulltext::check_key_options(&spec[pclose + 1..])?;
+                                let name = if q < paren { spec[q].ident().map(|s| s.to_lowercase()) } else { None }
+                                    .unwrap_or_else(|| cols[0].to_lowercase());
+                                statements.push(super::fulltext::index_statement(
+                                    &index_name(&table, &name),
+                                    &table,
+                                    &cols,
+                                    false,
+                                ));
+                            }
                             "INDEX" | "KEY" => {
                                 let name = if k + 1 < paren {
                                     spec[k + 1].ident().map(|s| s.to_lowercase())
@@ -3004,8 +3119,12 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
     if unique {
         i += 1;
     }
-    if kw(&tokens, i, "FULLTEXT") || kw(&tokens, i, "SPATIAL") {
-        return Err(MyError::unsupported("FULLTEXT and SPATIAL indexes"));
+    let fulltext = kw(&tokens, i, "FULLTEXT");
+    if fulltext {
+        i += 1;
+    }
+    if kw(&tokens, i, "SPATIAL") {
+        return Err(MyError::unsupported("SPATIAL indexes"));
     }
     i += 1; // INDEX
     let mut if_not_exists = false;
@@ -3027,8 +3146,24 @@ fn rewrite_create_index(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, MyEr
         .ok_or_else(|| MyError::syntax("CREATE INDEX needs columns"))?;
     let close =
         matching_paren(&tokens, paren).ok_or_else(|| MyError::syntax("unbalanced column list"))?;
-    let cols = index_columns(&tokens[paren + 1..close])?;
     let _ = cx;
+    if fulltext {
+        let cols = super::fulltext::key_columns(&tokens[paren + 1..close])?;
+        super::fulltext::check_key_options(&tokens[close + 1..])?;
+        return Ok(Forward {
+            statements: vec![super::fulltext::index_statement(
+                &index_name(&table, &name),
+                &table,
+                &cols,
+                if_not_exists,
+            )],
+            kind: Kind::Ddl,
+            found_rows: None,
+            params: 0,
+            deferred: Vec::new(),
+        });
+    }
+    let cols = index_columns(&tokens[paren + 1..close])?;
     let statement = if unique {
         format!(
             "ALTER TABLE {} ADD CONSTRAINT {} UNIQUE ({})",

@@ -21,6 +21,7 @@
 
 pub(crate) mod admin;
 pub(crate) mod conn;
+pub(crate) mod fulltext;
 pub(crate) mod lex;
 pub(crate) mod load;
 pub(crate) mod packet;

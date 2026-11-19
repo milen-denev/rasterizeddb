@@ -455,3 +455,16 @@ pub(crate) fn plain_index_name<'a>(table: &str, name: &'a str) -> &'a str {
     name.strip_prefix(&format!("{}__", table.to_lowercase()))
         .unwrap_or(name)
 }
+
+/// The full-text document a front end's full-text key indexes and its
+/// search predicates read, over `columns` (each already SQL): each column
+/// NULL-safe, joined by a space, which ends a word, so the engine keys a row
+/// by each column's own lexemes (`core::index::ddl::tsvector_expression`)
+/// and answers a search over any of them from the same index.
+pub(crate) fn fulltext_document(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("coalesce({c}, '')"))
+        .collect::<Vec<_>>()
+        .join(" || ' ' || ")
+}

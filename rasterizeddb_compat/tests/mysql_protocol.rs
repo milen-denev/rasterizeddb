@@ -838,3 +838,104 @@ async fn mysql_stored_procedures() {
         .unwrap_err();
     assert_eq!(code(&e).0, Some(1235), "{e}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mysql_full_text_search() {
+    let s = start(MyAuth::Password);
+    let mut c = mysql(&s).await;
+    c.execute(
+        "CREATE TABLE articles (id INT PRIMARY KEY, title VARCHAR(200), body TEXT, FULLTEXT KEY ft (title, body))",
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO articles VALUES
+         (1, 'MySQL Tutorial', 'DBMS stands for DataBase ...'),
+         (2, 'How To Use MySQL Well', 'After you went through a ...'),
+         (3, 'Optimizing MySQL', 'In this tutorial, we show ...'),
+         (4, '1001 MySQL Tricks', '1. Never run mysqld as root. 2. ...'),
+         (5, 'MySQL vs. YourSQL', 'In the following database comparison ...'),
+         (6, 'MySQL Security', 'When configured properly, MySQL ...'),
+         (7, NULL, 'a tutorial without a title')",
+    )
+    .await
+    .unwrap();
+    let ids = |rows: Vec<sqlx::mysql::MySqlRow>| rows.iter().map(|r| r.get::<i32, _>(0)).collect::<Vec<_>>();
+
+    // Natural language: any word, case-insensitive.
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('DATABASE') ORDER BY id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![1, 5]);
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('tutorial security' IN NATURAL LANGUAGE MODE) ORDER BY id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![1, 3, 6, 7]);
+    // Words InnoDB never indexes find nothing: a stop word, a short word.
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('the') OR MATCH (title, body) AGAINST ('as')")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+
+    // Boolean mode.
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('+MySQL -YourSQL' IN BOOLEAN MODE) ORDER BY id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![1, 2, 3, 4, 6]);
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('tutor*' IN BOOLEAN MODE) ORDER BY id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![1, 3, 7]);
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('\"database comparison\"' IN BOOLEAN MODE)")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![5]);
+
+    // Relevance: a number, 0 where the row does not match, ordered by.
+    let rows = sqlx::query(
+        "SELECT id, MATCH (title, body) AGAINST ('security tutorial') AS score FROM articles ORDER BY score DESC, id",
+    )
+    .fetch_all(&mut c)
+    .await
+    .unwrap();
+    let scores: Vec<(i32, f64)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert!(scores[..4].iter().all(|(_, s)| *s > 0.0), "{scores:?}");
+    assert!(scores[4..].iter().all(|(_, s)| *s == 0.0), "{scores:?}");
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('tutorial') > 0 ORDER BY id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![1, 3, 7]);
+
+    // A search string bound at execute.
+    let rows = sqlx::query("SELECT id FROM articles WHERE MATCH (title, body) AGAINST (? IN BOOLEAN MODE) ORDER BY id")
+        .bind("+root +mysqld")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(ids(rows), vec![4]);
+
+    // The other two ways to declare one, and dropping one.
+    c.execute("CREATE TABLE notes (id INT PRIMARY KEY, txt TEXT)").await.unwrap();
+    c.execute("INSERT INTO notes VALUES (1, 'alpha beta'), (2, 'gamma delta')").await.unwrap();
+    c.execute("ALTER TABLE notes ADD FULLTEXT INDEX ft_txt (txt)").await.unwrap();
+    c.execute("CREATE FULLTEXT INDEX ft_txt2 ON notes (txt)").await.unwrap();
+    let rows = sqlx::query("SELECT id FROM notes WHERE MATCH (txt) AGAINST ('delta')").fetch_all(&mut c).await.unwrap();
+    assert_eq!(ids(rows), vec![2]);
+    c.execute("DROP INDEX ft_txt2 ON notes").await.unwrap();
+
+    // Refused rather than answered differently.
+    for sql in [
+        "SELECT id FROM articles WHERE MATCH (title, body) AGAINST ('database' WITH QUERY EXPANSION)",
+        "CREATE TABLE ng (id INT PRIMARY KEY, t TEXT, FULLTEXT KEY f (t) WITH PARSER ngram)",
+    ] {
+        let e = c.execute(sql).await.expect_err(sql);
+        assert_eq!(code(&e).0, Some(1235), "{sql}: {e}");
+    }
+}
