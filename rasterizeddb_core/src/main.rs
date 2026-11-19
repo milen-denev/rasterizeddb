@@ -513,6 +513,24 @@ struct Args {
     #[arg(long = "rdb-tcp", value_name = "on|off", default_value = "on")]
     rdb_tcp: String,
 
+    /// How long one native-protocol request may run, in seconds, before it is
+    /// abandoned and answered as timed out (default 30). A connection idle this
+    /// long is closed too. Raise it for long statements sent over the native
+    /// protocol (a backup, an import, a rebalance, a large report); pgwire has
+    /// no such limit.
+    #[arg(long = "rdb-request-timeout", value_name = "SECONDS")]
+    rdb_request_timeout: Option<u64>,
+
+    /// PEM certificate chain the native TCP listener presents (with
+    /// --rdb-key). Without one it makes a self-signed certificate at every
+    /// start, which a client can encrypt to but never verify.
+    #[arg(long = "rdb-cert", value_name = "PATH", requires = "rdb_key")]
+    rdb_cert: Option<String>,
+
+    /// PEM private key for --rdb-cert.
+    #[arg(long = "rdb-key", value_name = "PATH", requires = "rdb_cert")]
+    rdb_key: Option<String>,
+
     /// Permissions of every unix socket this server serves, in octal (default
     /// 600: this server's user only; 660 admits its group too). Connecting
     /// needs write permission. A socket that admits users outside its owner
@@ -1860,6 +1878,24 @@ fn main() -> std::io::Result<()> {
                 }
                 if let Some(port) = args.rdb_port {
                     listen.port = port;
+                }
+                if let Some(seconds) = args.rdb_request_timeout {
+                    if seconds == 0 {
+                        eprintln!("--rdb-request-timeout 0: a request has to be given some time; use a number of seconds");
+                        std::process::exit(2);
+                    }
+                    listen.request_timeout = Some(std::time::Duration::from_secs(seconds));
+                }
+                if let (Some(cert), Some(key)) = (&args.rdb_cert, &args.rdb_key) {
+                    // Read now, so a wrong path stops the start-up with its
+                    // own message rather than as a failed bind.
+                    if let Err(e) = rastcp::tls::load_certificates(cert)
+                        .and_then(|_| rastcp::tls::load_private_key(key))
+                    {
+                        eprintln!("--rdb-cert/--rdb-key: {e}");
+                        std::process::exit(2);
+                    }
+                    listen.certificate = Some((cert.clone(), key.clone()));
                 }
                 listen.tcp = match args.rdb_tcp.trim().to_ascii_lowercase().as_str() {
                     "on" | "true" | "yes" => true,

@@ -4730,7 +4730,9 @@ name = "rdb_studio"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "futures-core",
  "iced",
+ "rasterizeddb_client",
  "rfd",
  "rustls 0.23.46",
  "rustls-pki-types",
@@ -4739,6 +4741,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "webpki-roots",
 ]
 
 [[package]]

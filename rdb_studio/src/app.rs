@@ -93,6 +93,13 @@ pub struct Studio {
     pub data_page: usize,
     pub page_size: usize,
     pub data_total: Option<u64>,
+    /// Where each page of the data browser ended, so the next one can start
+    /// after its last key instead of at an offset.
+    pub data_keyset: Keyset,
+    /// The data browser's filter box, as typed.
+    pub data_filter: String,
+    /// The filter the page on screen was read with.
+    pub data_filter_applied: Option<dialect::RowFilter>,
     pub editing: Option<CellEdit>,
     pub inserting: Option<Vec<String>>,
     /// Column widths the user has dragged to, keyed by table and column so two
@@ -119,6 +126,22 @@ pub struct Studio {
     pub pending_sql: Option<String>,
     /// How long the last run took, for the results header.
     pub last_elapsed: Option<Duration>,
+    /// What stops the run in flight; `None` when nothing is running.
+    pub query_cancel: Option<crate::conn::Canceller>,
+    /// A cancel has been sent for the run in flight.
+    pub cancel_sent: bool,
+    /// How many rows of each result the editor keeps.
+    pub row_limit: RowLimit,
+    /// What the last run's statements raised as notices.
+    pub query_notices: Vec<String>,
+    /// The server's roles, for the ROLES tab.
+    pub roles: Vec<RoleInfo>,
+    /// What Ctrl+Space offered for the word before the editor's cursor.
+    pub completions: Vec<String>,
+    /// The KEYS tab.
+    pub kv: KvBrowser,
+    /// Where the editor's own transaction stands, when the transport says.
+    pub editor_transaction: Option<rasterizeddb_client::TransactionStatus>,
 
     pub modal: Option<Modal>,
     /// A dialog's statement is with the server. The dialog stays open until
@@ -208,6 +231,18 @@ pub struct Studio {
     pub flavor_warning: Option<String>,
 }
 
+/// Where each page of the data browser ended, for paging by key.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Keyset {
+    /// The statement of the first page the ends belong to
+    /// ([`Studio::page_query`]); another table, filter, order or page size
+    /// starts over.
+    pub signature: String,
+    /// The key literal after page `p`'s last row, at `after[p]`; `None` when
+    /// that page had no row or no usable key.
+    pub after: Vec<Option<String>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
@@ -223,11 +258,13 @@ pub enum Tab {
     Storage,
     Replication,
     Migrate,
+    Keys,
+    Roles,
     Config,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 14] = [
+    pub const ALL: [Tab; 16] = [
         Tab::Dashboard,
         Tab::Overview,
         Tab::Tables,
@@ -252,6 +289,10 @@ impl Tab {
         Tab::Storage,
         Tab::Replication,
         Tab::Migrate,
+        // The key/value store: data, but not tables.
+        Tab::Keys,
+        // Before CONFIG: who may connect, then how the server behaves.
+        Tab::Roles,
         Tab::Config,
     ];
 
@@ -270,6 +311,8 @@ impl Tab {
             Tab::Storage => "STORAGE",
             Tab::Replication => "REPLICATION",
             Tab::Migrate => "MIGRATE",
+            Tab::Keys => "KEYS",
+            Tab::Roles => "ROLES",
             Tab::Config => "CONFIG",
         }
     }
@@ -336,11 +379,97 @@ pub enum Modal {
     AddColumn { table: String, column: NewColumn, error: Option<String> },
     CreateIndex { table: String, index: NewIndex, error: Option<String> },
     Confirm { title: String, body: String, statement: String, refresh: Refresh },
+    /// Renaming a column, changing its type, or whether it takes NULL.
+    EditColumn { table: String, edit: ColumnEdit, error: Option<String> },
+    CreateRole {
+        name: String,
+        password: String,
+        login: bool,
+        superuser: bool,
+        error: Option<String>,
+    },
+    RolePassword { role: String, password: String, error: Option<String> },
     /// A restore, which reports rows rather than a count and therefore cannot
     /// go through the ordinary confirmation path.
     ConfirmRestore { body: String, statement: String },
     /// An import, likewise — and it reports a whole document.
     ConfirmImport { body: String, statement: String },
+    /// A CSV file read and ready to go into the selected table.
+    ConfirmCsv {
+        table: String,
+        file: String,
+        rows: usize,
+        columns: Vec<String>,
+        scripts: Vec<crate::import::Script>,
+    },
+}
+
+/// A column being changed in a dialog: what it is, and what it is to become.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnEdit {
+    pub original: String,
+    pub original_type: String,
+    pub original_nullable: bool,
+    pub name: String,
+    /// Free text: whatever the server takes after `TYPE`, `NUMERIC(12,2)`
+    /// included.
+    pub data_type: String,
+    pub nullable: bool,
+}
+
+impl ColumnEdit {
+    pub fn of(column: &ColumnInfo) -> Self {
+        ColumnEdit {
+            original: column.name.clone(),
+            original_type: column.data_type.clone(),
+            original_nullable: column.nullable,
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+        }
+    }
+
+    /// The statements the change takes, as one script: the type and the
+    /// nullability under the old name, then the rename, so each names a
+    /// column that exists when it runs. Sent together, they run as one
+    /// implicit transaction, so a refused type change leaves the name alone.
+    pub fn statements(&self, table: &str) -> Result<String, String> {
+        let name = self.name.trim();
+        let data_type = self.data_type.trim();
+        if name.is_empty() {
+            return Err("the column needs a name".to_string());
+        }
+        if data_type.is_empty() {
+            return Err("the column needs a type".to_string());
+        }
+        if data_type.contains(';') || data_type.contains("--") || data_type.contains("/*") {
+            return Err("a type is one type name, like NUMERIC(12,2)".to_string());
+        }
+        let table = dialect::quote_ident(table);
+        let column = dialect::quote_ident(&self.original);
+        let mut statements = Vec::new();
+        if !data_type.eq_ignore_ascii_case(self.original_type.trim()) {
+            statements.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {column} TYPE {data_type}"
+            ));
+        }
+        if self.nullable != self.original_nullable {
+            statements.push(format!(
+                "ALTER TABLE {table} ALTER COLUMN {column} {} NOT NULL",
+                if self.nullable { "DROP" } else { "SET" }
+            ));
+        }
+        if name != self.original {
+            statements.push(format!(
+                "ALTER TABLE {table} RENAME COLUMN {column} TO {}",
+                dialect::quote_ident(name)
+            ));
+        }
+        if statements.is_empty() {
+            return Err("nothing is changed".to_string());
+        }
+        Ok(statements.join(";\n"))
+    }
 }
 
 /// A column being described in a dialog.
@@ -582,6 +711,8 @@ pub enum DetailSection {
 /// What to reload after a statement succeeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refresh {
+    Keys,
+    Roles,
     Tables,
     Databases,
     CurrentTable,
@@ -605,6 +736,10 @@ pub enum Message {
     FormPassword(String),
     FormFlavor(Flavor),
     FormTls(TlsMode),
+    FormTransport(crate::model::Transport),
+    FormLogin(crate::model::NativeLogin),
+    FormVerify(bool),
+    FormCaFile(String),
     FormSavePassword(bool),
     LoadProfile(usize),
     SaveProfile,
@@ -633,7 +768,19 @@ pub enum Message {
     PartitionsLoaded(String, Result<Vec<PartitionInfo>, String>),
     SchemaLoaded(Result<SchemaGraph, String>),
     ConfigLoaded(Result<Vec<ConfigEntry>, String>),
-    DataLoaded(Result<(Grid, Option<u64>), String>),
+    RolesLoaded(Result<Vec<RoleInfo>, String>),
+    /// The KEYS tab's pattern box.
+    KvPattern(String),
+    /// Scan from the start (`false`) or on from the last page (`true`).
+    KvScan(bool),
+    KvScanned(bool, Result<(Option<String>, Vec<String>, Option<u64>), String>),
+    KvSelect(String),
+    KvLoaded(Result<KvEntry, String>),
+    /// Open the dialog that sets a role's password.
+    RolePassword(String),
+    /// A page of the data browser: which page it was, the signature of the
+    /// statement it was read under ([`Studio::page_query`]), and the rows.
+    DataLoaded(usize, String, Result<(Grid, Option<u64>), String>),
 
     // --- backups
     ReloadBackups,
@@ -759,6 +906,10 @@ pub enum Message {
     EditorNewline,
     /// Ctrl+/: comment the touched lines out, or back in.
     ToggleComment,
+    /// Ctrl+Space: complete the name before the cursor.
+    Complete,
+    /// A completion picked from the list.
+    ApplyCompletion(String),
     RunQuery,
     RunSelection,
     /// Ctrl+Shift+Enter: the statement the cursor is in, and no other.
@@ -776,6 +927,11 @@ pub enum Message {
     OpenSqlFile,
     SaveSqlFile,
     SqlFileOpened(Result<Option<(std::path::PathBuf, String)>, String>),
+    /// Pick a CSV file to import into the selected table.
+    ImportCsv,
+    CsvOpened(Result<Option<(std::path::PathBuf, String)>, String>),
+    /// How many rows went in, and the failure that stopped the rest.
+    CsvImported(u64, Option<String>, Duration),
     FileSaved(Result<Option<std::path::PathBuf>, String>),
     Copied(String),
     LoadHistory(usize),
@@ -783,7 +939,18 @@ pub enum Message {
     CopyHistory(usize),
     DeleteHistory(usize),
     ClearHistory,
-    QueryFinished(Result<Vec<Outcome>, String>, Duration),
+    QueryFinished(crate::conn::EditorAnswer, Duration),
+    /// The data browser's filter box.
+    DataFilter(String),
+    ApplyDataFilter,
+    ClearDataFilter,
+    /// Stop the run in flight.
+    CancelQuery,
+    CancelSent(Result<String, String>),
+    SetRowLimit(RowLimit),
+    /// Keep the editor's open transaction from being closed as idle.
+    EditorKeepalive,
+    EditorKept(Result<(), String>),
 
     // --- configuration
     ConfigFilter(String),
@@ -796,6 +963,8 @@ pub enum Message {
     ModalField(ModalField, String),
     ModalToggle(ModalField, bool),
     ModalAddColumn,
+    /// Open the dialog that renames a column or changes its type.
+    EditColumn(String),
     ModalRemoveColumn(usize),
     ModalColumnField(usize, ModalField, String),
     ModalColumnToggle(usize, ModalField, bool),
@@ -969,6 +1138,7 @@ pub enum ImportField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalKind {
+    CreateRole,
     CreateTable,
     CreateDatabase,
     AddColumn,
@@ -985,6 +1155,11 @@ pub enum ModalField {
     PrimaryKey,
     Unique,
     Default,
+    /// A column's type, as written.
+    DataType,
+    Password,
+    Login,
+    Superuser,
 }
 
 impl Studio {
@@ -1034,6 +1209,9 @@ impl Studio {
             data_page: 0,
             page_size: DEFAULT_PAGE,
             data_total: None,
+            data_keyset: Keyset::default(),
+            data_filter: String::new(),
+            data_filter_applied: None,
             editing: None,
             inserting: None,
             column_widths: HashMap::new(),
@@ -1051,6 +1229,14 @@ impl Studio {
             history: Vec::new(),
             pending_sql: None,
             last_elapsed: None,
+            query_cancel: None,
+            cancel_sent: false,
+            row_limit: RowLimit::default(),
+            query_notices: Vec::new(),
+            roles: Vec::new(),
+            completions: Vec::new(),
+            kv: KvBrowser::default(),
+            editor_transaction: None,
             modal: None,
             modal_pending: false,
             metrics: Metrics::default(),
@@ -1127,10 +1313,24 @@ impl Studio {
     /// not be sending a statistics query every two seconds to a database
     /// nobody is looking at.
     pub fn subscription(&self) -> Subscription<Message> {
-        if self.session.is_none() || !self.live || self.tab != Tab::Dashboard {
-            return Subscription::none();
+        let mut subscriptions = Vec::new();
+        if self.session.is_some() && self.live && self.tab == Tab::Dashboard {
+            subscriptions.push(
+                iced::time::every(Duration::from_secs(self.interval.max(1))).map(|_| Message::Tick),
+            );
         }
-        iced::time::every(Duration::from_secs(self.interval.max(1))).map(|_| Message::Tick)
+        // A native server closes a connection quiet for its request timeout
+        // (30 s by default), rolling back the block on it: an open block in
+        // the editor is kept alive while its user thinks.
+        let in_block = self
+            .editor_transaction
+            .is_some_and(|t| t != rasterizeddb_client::TransactionStatus::Idle);
+        if in_block && self.query_cancel.is_none() {
+            subscriptions.push(
+                iced::time::every(EDITOR_KEEPALIVE).map(|_| Message::EditorKeepalive),
+            );
+        }
+        Subscription::batch(subscriptions)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -1237,13 +1437,30 @@ impl Studio {
             Message::FormUser(v) => { self.form.user = v; Task::none() }
             Message::FormPassword(v) => { self.form.password = v; Task::none() }
             Message::FormFlavor(v) => {
+                // Switching flavour can switch the protocol (PostgreSQL has
+                // only the wire protocol), and a port still at the old
+                // protocol's default is almost always a mistake about to be
+                // made, so it follows. One somebody typed is theirs.
+                let before = self.form.effective_transport().default_port();
                 self.form.flavor = v;
-                // The two default to different ports often enough that
-                // switching flavour while the port is still the other's
-                // default is almost always a mistake being made.
+                if self.form.port == before || self.form.port == 0 {
+                    self.form.port = self.form.effective_transport().default_port();
+                }
                 Task::none()
             }
             Message::FormTls(v) => { self.form.tls = v; Task::none() }
+            Message::FormTransport(v) => {
+                // A port still at the other protocol's default follows the
+                // switch; one somebody typed is theirs.
+                if self.form.port == self.form.transport.default_port() || self.form.port == 0 {
+                    self.form.port = v.default_port();
+                }
+                self.form.transport = v;
+                Task::none()
+            }
+            Message::FormLogin(v) => { self.form.login = v; Task::none() }
+            Message::FormVerify(v) => { self.form.verify_server = v; Task::none() }
+            Message::FormCaFile(v) => { self.form.ca_file = v; Task::none() }
             Message::FormSavePassword(v) => { self.form.save_password = v; Task::none() }
 
             Message::LoadProfile(index) => {
@@ -1281,11 +1498,29 @@ impl Studio {
             Message::Connected(Ok(session)) => {
                 self.connecting = false;
                 self.session = Some(session.clone());
+                self.query_cancel = None;
+                self.cancel_sent = false;
+                self.editor_transaction = None;
                 self.status = Status::Done(format!(
-                    "connected to {} ({})",
+                    "connected to {} ({}, {})",
                     session.server,
-                    if session.encrypted { "TLS" } else { "cleartext" }
+                    session.transport,
+                    match session.link() {
+                        "TLS VERIFIED" => "TLS, server verified",
+                        "TLS" => "TLS, server not verified",
+                        "SOCKET" => "unix socket",
+                        _ => "cleartext",
+                    }
                 ));
+                // The benchmark's default follows the session: what the
+                // other protocol offers would be refused.
+                self.bench.protocol = match (session.transport, self.bench.protocol) {
+                    (crate::model::Transport::Native, _) => crate::bench::Protocol::Native,
+                    (crate::model::Transport::Wire, crate::bench::Protocol::Native) => {
+                        crate::bench::Protocol::Simple
+                    }
+                    (crate::model::Transport::Wire, protocol) => protocol,
+                };
                 Task::batch([
                     Task::perform(async move { conn::detect_flavor(&session).await }, Message::FlavorDetected),
                     self.reload_everything(),
@@ -1319,6 +1554,11 @@ impl Studio {
                 // on against a server the console has left.
                 self.bench.stop();
                 self.session = None;
+                self.query_cancel = None;
+                self.cancel_sent = false;
+                self.editor_transaction = None;
+                self.kv = KvBrowser::default();
+                self.roles.clear();
                 self.flavor_warning = None;
                 self.backup = None;
                 self.activity = None;
@@ -1344,6 +1584,8 @@ impl Studio {
                     // needs until they open the tab.
                     Tab::Schema if self.schema.tables.is_empty() => self.load_schema(),
                     Tab::Config if self.config.is_empty() => self.load_config(),
+                    Tab::Roles => self.load_roles(),
+                    Tab::Keys if self.kv.keys.is_empty() => self.kv_scan(false),
                     Tab::Data if self.data.columns.is_empty() => self.load_page(),
                     // Always reloaded rather than cached: a backup catalogue
                     // that is minutes stale is the one thing on this page that
@@ -1373,6 +1615,9 @@ impl Studio {
                     self.data_viewport = None;
                     self.data = Grid::default();
                     self.data_total = None;
+                    // A condition on the old table's columns.
+                    self.data_filter.clear();
+                    self.data_filter_applied = None;
                     self.editing = None;
                     self.inserting = None;
                     // The previous table's columns are not this one's. Left in
@@ -1389,6 +1634,21 @@ impl Studio {
                 Task::batch([self.load_table_stats(), self.load_columns()])
             }
             Message::SelectDatabase(name) => {
+                // A native listener serves one database. Reconnecting "to"
+                // another would open the same one again and show its tables
+                // under the other's name, so it is refused and the way to it
+                // named.
+                if let Some(session) = &self.session
+                    && session.transport == crate::model::Transport::Native
+                    && name != session.database
+                {
+                    self.status = Status::Failed(format!(
+                        "the native protocol serves one database per listener ({}); to open {}, connect \
+                         with Protocol set to PostgreSQL wire",
+                        session.database, name
+                    ));
+                    return Task::none();
+                }
                 // Switching database means a new connection: the protocol binds
                 // one per session, and both engines refuse to change it after
                 // start-up.
@@ -1492,11 +1752,53 @@ impl Studio {
                 studio.schema_zoom = 1.0;
                 studio.schema_cache.clear();
             }),
+            Message::KvPattern(pattern) => { self.kv.pattern = pattern; Task::none() }
+            Message::KvScan(more) => self.kv_scan(more),
+            Message::KvScanned(more, result) => self.absorb(result, |studio, (cursor, keys, size)| {
+                if !more {
+                    studio.kv.keys.clear();
+                }
+                studio.kv.keys.extend(keys);
+                studio.kv.cursor = cursor;
+                if size.is_some() {
+                    studio.kv.size = size;
+                }
+            }),
+            Message::KvSelect(key) => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                self.kv.selected = None;
+                Task::perform(
+                    async move {
+                        let described = session.run(&dialect::kv_describe_sql(&key)).await?;
+                        let first = |i: usize| match described.get(i) {
+                            Some(Outcome::Rows(grid)) => {
+                                grid.rows.first().and_then(|r| r.first().cloned()).flatten()
+                            }
+                            _ => None,
+                        };
+                        let kind = first(0).unwrap_or_else(|| "none".to_string());
+                        let ttl = first(1).and_then(|t| t.parse().ok()).unwrap_or(-1);
+                        let value = match dialect::kv_value_sql(&kind, &key) {
+                            Some(sql) => Some(session.query(&sql).await?),
+                            None => None,
+                        };
+                        Ok(KvEntry { key, kind, ttl, value })
+                    },
+                    Message::KvLoaded,
+                )
+            }
+            Message::KvLoaded(result) => self.absorb(result, |studio, entry| {
+                studio.kv.selected = Some(entry);
+            }),
+            Message::RolesLoaded(result) => self.absorb(result, |studio, roles| {
+                studio.roles = roles;
+            }),
             Message::ConfigLoaded(result) => self.absorb(result, |studio, config| {
                 studio.config = config;
                 studio.config_edits.clear();
             }),
-            Message::DataLoaded(result) => self.absorb(result, |studio, (grid, total)| {
+            Message::DataLoaded(page, signature, result) => self.absorb(result, |studio, (grid, total)| {
+                studio.note_page_end(page, &signature, &grid);
                 studio.data = grid;
                 if let Some(total) = total {
                     studio.data_total = Some(total);
@@ -2207,7 +2509,45 @@ impl Studio {
             Message::DeleteSelectedRow(row) => self.delete_row(row),
 
             // ---- query editor ----------------------------------------------
-            Message::EditorAction(action) => { self.editor.perform(action); Task::none() }
+            Message::EditorAction(action) => {
+                // The list was for the word as it stood; typing on changes it.
+                if action.is_edit() {
+                    self.completions.clear();
+                }
+                self.editor.perform(action);
+                Task::none()
+            }
+            Message::Complete => {
+                let prefix = crate::sqledit::word_before_cursor(&self.editor);
+                let candidates = crate::sqledit::completions(
+                    &prefix,
+                    &self.completion_names(),
+                    crate::sqllex::KEYWORDS,
+                );
+                self.completions.clear();
+                match candidates.as_slice() {
+                    [] => {
+                        self.status = Status::Failed(if prefix.is_empty() {
+                            "type the start of a name, then Ctrl+Space".to_string()
+                        } else {
+                            format!("nothing known starts with `{}`", prefix)
+                        });
+                    }
+                    [only] => crate::sqledit::complete(&mut self.editor, only),
+                    _ => {
+                        if let Some(common) = crate::sqledit::common_completion(&prefix, &candidates) {
+                            crate::sqledit::complete(&mut self.editor, &common);
+                        }
+                        self.completions = candidates;
+                    }
+                }
+                iced::widget::operation::focus(crate::views::query::editor_id())
+            }
+            Message::ApplyCompletion(choice) => {
+                crate::sqledit::complete(&mut self.editor, &choice);
+                self.completions.clear();
+                iced::widget::operation::focus(crate::views::query::editor_id())
+            }
             Message::EditorNewline => { crate::sqledit::newline(&mut self.editor); Task::none() }
             Message::ToggleComment => { crate::sqledit::toggle_comment(&mut self.editor); Task::none() }
             Message::RunStatement => {
@@ -2320,6 +2660,57 @@ impl Studio {
                 self.save_file("session-history", "sql", "SQL", contents)
             }
 
+            Message::ImportCsv => {
+                if self.selected_table.is_none() || self.columns.is_empty() {
+                    self.status = Status::Failed("select a table first".into());
+                    return Task::none();
+                }
+                Task::perform(crate::files::open("CSV", &["csv", "txt"]), Message::CsvOpened)
+            }
+            Message::CsvOpened(Ok(None)) => Task::none(),
+            Message::CsvOpened(Err(e)) => { self.status = Status::Failed(e); Task::none() }
+            Message::CsvOpened(Ok(Some((path, contents)))) => {
+                let Some(table) = self.selected_table.clone() else { return Task::none() };
+                let file = path.display().to_string();
+                let read = crate::import::parse(&contents)
+                    .and_then(|csv| {
+                        crate::import::scripts(&table, &csv, &self.columns)
+                            .map(|scripts| (csv, scripts))
+                    });
+                match read {
+                    Err(e) => self.status = Status::Failed(format!("{}: {}", file, e)),
+                    Ok((csv, scripts)) => {
+                        self.modal = Some(Modal::ConfirmCsv {
+                            table,
+                            file,
+                            rows: csv.rows.len(),
+                            columns: csv.header,
+                            scripts,
+                        });
+                        self.modal_pending = false;
+                    }
+                }
+                Task::none()
+            }
+            Message::CsvImported(rows, failure, elapsed) => {
+                self.status = match failure {
+                    None => Status::Done(format!(
+                        "{} row{} imported in {}",
+                        count(rows),
+                        if rows == 1 { "" } else { "s" },
+                        duration(elapsed)
+                    )),
+                    Some(e) => Status::Failed(format!(
+                        "the import stopped after {} row{}: {}",
+                        count(rows),
+                        if rows == 1 { "" } else { "s" },
+                        e
+                    )),
+                };
+                self.data_total = None;
+                Task::batch([self.load_page(), self.load_table_stats()])
+            }
+
             Message::OpenSqlFile => Task::perform(
                 crate::files::open("SQL", &["sql", "txt"]),
                 Message::SqlFileOpened,
@@ -2384,9 +2775,15 @@ impl Studio {
             }
             Message::ClearHistory => { self.history.clear(); Task::none() }
 
-            Message::QueryFinished(result, elapsed) => {
+            Message::QueryFinished(answer, elapsed) => {
                 let sql = self.pending_sql.take().unwrap_or_default();
-                match result {
+                self.query_cancel = None;
+                self.cancel_sent = false;
+                self.query_notices = answer.notices;
+                if answer.transaction.is_some() {
+                    self.editor_transaction = answer.transaction;
+                }
+                match answer.result {
                     Ok(outcomes) => {
                         let rows: usize = outcomes
                             .iter()
@@ -2424,6 +2821,63 @@ impl Studio {
                         self.status = Status::Failed(e);
                         self.last_elapsed = Some(elapsed);
                     }
+                }
+                Task::none()
+            }
+            Message::CancelQuery => {
+                let Some(canceller) = self.query_cancel.clone() else { return Task::none() };
+                self.cancel_sent = true;
+                self.status = Status::Busy("cancelling".to_string());
+                Task::perform(canceller.cancel(), Message::CancelSent)
+            }
+            Message::CancelSent(result) => {
+                // The run reports its own end (57014); this only says whether
+                // the request got there, and only while the run is still out.
+                if self.query_cancel.is_some() {
+                    self.status = match result {
+                        Ok(said) => Status::Busy(said),
+                        Err(e) => Status::Failed(e),
+                    };
+                }
+                Task::none()
+            }
+            Message::SetRowLimit(limit) => { self.row_limit = limit; Task::none() }
+            Message::DataFilter(text) => { self.data_filter = text; Task::none() }
+            Message::ApplyDataFilter => match dialect::RowFilter::parse(&self.data_filter) {
+                Err(e) => { self.status = Status::Failed(e); Task::none() }
+                Ok(filter) => {
+                    self.data_filter_applied = filter;
+                    self.data_page = 0;
+                    self.data_total = None;
+                    self.data_viewport = None;
+                    self.editing = None;
+                    self.load_page()
+                }
+            },
+            Message::ClearDataFilter => {
+                self.data_filter.clear();
+                if self.data_filter_applied.take().is_none() {
+                    return Task::none();
+                }
+                self.data_page = 0;
+                self.data_total = None;
+                self.data_viewport = None;
+                self.editing = None;
+                self.load_page()
+            }
+            Message::EditorKeepalive => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                Task::perform(
+                    async move { session.keep_editor_alive().await },
+                    Message::EditorKept,
+                )
+            }
+            Message::EditorKept(result) => {
+                if let Some(session) = &self.session {
+                    self.editor_transaction = session.editor_transaction();
+                }
+                if let Err(e) = result {
+                    self.status = Status::Failed(format!("the editor's transaction was lost: {}", e));
                 }
                 Task::none()
             }
@@ -2470,6 +2924,13 @@ impl Studio {
             // ---- modals ------------------------------------------------------
             Message::OpenModal(kind) => {
                 self.modal = Some(match kind {
+                    ModalKind::CreateRole => Modal::CreateRole {
+                        name: String::new(),
+                        password: String::new(),
+                        login: true,
+                        superuser: false,
+                        error: None,
+                    },
                     ModalKind::CreateTable => Modal::CreateTable {
                         name: String::new(),
                         columns: vec![NewColumn::key(self.flavor())],
@@ -2617,6 +3078,26 @@ impl Studio {
                 Task::none()
             }
             Message::ModalSubmit => self.submit_modal(),
+            Message::RolePassword(role) => {
+                self.modal = Some(Modal::RolePassword { role, password: String::new(), error: None });
+                self.modal_pending = false;
+                Task::none()
+            }
+            Message::EditColumn(name) => {
+                let (Some(table), Some(info)) = (
+                    self.selected_table.clone(),
+                    self.columns.iter().find(|c| c.name == name),
+                ) else {
+                    return Task::none();
+                };
+                self.modal = Some(Modal::EditColumn {
+                    table,
+                    edit: ColumnEdit::of(info),
+                    error: None,
+                });
+                self.modal_pending = false;
+                Task::none()
+            }
 
             Message::Confirm { title, body, statement, refresh } => {
                 self.modal = Some(Modal::Confirm { title, body, statement, refresh });
@@ -2635,6 +3116,11 @@ impl Studio {
                 match refresh {
                     Refresh::Tables => Task::batch([self.load_tables(), self.load_schema()]),
                     Refresh::Databases => self.load_databases(),
+                    Refresh::Roles => self.load_roles(),
+                    Refresh::Keys => {
+                        self.kv.selected = None;
+                        self.kv_scan(false)
+                    }
                     Refresh::CurrentTable => Task::batch([
                         self.load_page(),
                         self.load_table_stats(),
@@ -3256,6 +3742,57 @@ impl Studio {
         )
     }
 
+    /// The names Ctrl+Space completes: every table, the selected table's
+    /// columns, and every column the schema map has loaded.
+    fn completion_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tables.iter().map(|t| t.name.clone()).collect();
+        names.extend(self.columns.iter().map(|c| c.name.clone()));
+        for table in &self.schema.tables {
+            names.push(table.name.clone());
+            names.extend(table.columns.iter().map(|c| c.name.clone()));
+        }
+        names
+    }
+
+    /// A page of the KEYS tab's scan: from the start, or on from the last
+    /// page's cursor. The start also counts the store.
+    fn kv_scan(&mut self, more: bool) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        if session.flavor != Flavor::Rasterized {
+            return Task::none();
+        }
+        let cursor = if more { self.kv.cursor.clone().unwrap_or_default() } else { "0".into() };
+        if more && self.kv.cursor.is_none() {
+            return Task::none();
+        }
+        let sql = dialect::kv_scan_sql(&cursor, &self.kv.pattern, KV_PAGE);
+        Task::perform(
+            async move {
+                let (cursor, keys) = dialect::parse_kv_scan(&session.query(&sql).await?);
+                let size = if more {
+                    None
+                } else {
+                    session
+                        .query("KV DBSIZE")
+                        .await
+                        .ok()
+                        .and_then(|g| g.number(0, "value"))
+                };
+                Ok((cursor, keys, size))
+            },
+            move |result| Message::KvScanned(more, result),
+        )
+    }
+
+    fn load_roles(&self) -> Task<Message> {
+        let Some(session) = self.session.clone() else { return Task::none() };
+        let sql = dialect::roles_sql(session.flavor);
+        Task::perform(
+            async move { session.query(sql).await.map(|g| dialect::parse_roles(&g)) },
+            Message::RolesLoaded,
+        )
+    }
+
     fn load_config(&self) -> Task<Message> {
         let Some(session) = self.session.clone() else { return Task::none() };
         let sql = dialect::config_sql(session.flavor).to_string();
@@ -3275,16 +3812,13 @@ impl Studio {
         else {
             return Task::none();
         };
-        let key = self.row_key();
-        let sort = self.data_sort();
-        let sql = dialect::page_sql(
-            &table,
-            key.as_ref().map(|k| k.column.as_str()),
-            sort.as_ref().map(|s| (s.column.as_str(), s.descending)),
-            self.page_size,
-            self.data_page * self.page_size,
-        );
-        let count_sql = (self.data_total.is_none()).then(|| dialect::count_sql(&table));
+        let filter = self.data_filter_applied.clone();
+        let Some((sql, signature)) = self.page_query() else {
+            return Task::none();
+        };
+        let page = self.data_page;
+        let count_sql =
+            (self.data_total.is_none()).then(|| dialect::count_sql(&table, filter.as_ref()));
 
         Task::perform(
             async move {
@@ -3299,8 +3833,88 @@ impl Studio {
                 };
                 Ok((grid, total))
             },
-            Message::DataLoaded,
+            move |result| Message::DataLoaded(page, signature, result),
         )
+    }
+
+    /// The key column, its direction and kind, when the browser's order is
+    /// that key's alone and its values can be written back exactly: then a
+    /// page can start after the previous page's last key.
+    fn keyset_order(&self) -> Option<(String, bool, dialect::KeysetKind)> {
+        let key = self.row_key()?;
+        let descending = match self.data_sort() {
+            None => false,
+            Some(sort) if sort.column == key.column => sort.descending,
+            // Ordered by another column first: rows sharing its value are
+            // ordered by the key, so the key alone does not say where a page
+            // ended.
+            Some(_) => return None,
+        };
+        let column = self.columns.iter().find(|c| c.name == key.column)?;
+        let kind = dialect::KeysetKind::of(&column.data_type)?;
+        Some((key.column, descending, kind))
+    }
+
+    /// The statement for the data browser's current page, and the signature
+    /// that ties a page's end to it: the first page's statement, which names
+    /// the table, filter, order and page size. A page starts after the
+    /// previous page's last key when that is known under the same
+    /// signature, and at an offset otherwise.
+    pub fn page_query(&self) -> Option<(String, String)> {
+        let table = self.selected_table.as_deref()?;
+        let key = self.row_key();
+        let sort = self.data_sort();
+        let filter = self.data_filter_applied.as_ref();
+        let at = |offset| {
+            dialect::page_sql(
+                table,
+                filter,
+                key.as_ref().map(|k| k.column.as_str()),
+                sort.as_ref().map(|s| (s.column.as_str(), s.descending)),
+                self.page_size,
+                offset,
+            )
+        };
+        let signature = at(0);
+        let page = self.data_page;
+        let after = (page > 0 && self.data_keyset.signature == signature)
+            .then(|| self.data_keyset.after.get(page - 1).cloned().flatten())
+            .flatten();
+        let sql = match (after, self.keyset_order()) {
+            (Some(after), Some((key, descending, _))) => {
+                dialect::page_after_sql(table, filter, &key, descending, &after, self.page_size)
+            }
+            _ => at(page * self.page_size),
+        };
+        Some((sql, signature))
+    }
+
+    /// Records where page `page` ended, when it is still the page shown under
+    /// the same statement. A late answer (two NEXTs pressed quickly, or a
+    /// page read before the filter changed) is not recorded: its last key
+    /// would start some other page, and that page would skip or repeat rows
+    /// with nothing to show for it.
+    fn note_page_end(&mut self, page: usize, signature: &str, grid: &Grid) {
+        let current = self.page_query().map(|(_, signature)| signature);
+        if page != self.data_page || current.as_deref() != Some(signature) {
+            return;
+        }
+        if self.data_keyset.signature != signature {
+            self.data_keyset = Keyset {
+                signature: signature.to_string(),
+                after: Vec::new(),
+            };
+        }
+        self.data_keyset.after.truncate(page);
+        if self.data_keyset.after.len() != page {
+            return;
+        }
+        let after = self.keyset_order().and_then(|(key, _, kind)| {
+            let at = grid.columns.iter().position(|c| *c == key)?;
+            let last = grid.rows.last()?;
+            dialect::key_literal(last.get(at)?.as_deref()?, kind)
+        });
+        self.data_keyset.after.push(after);
     }
 
     // -- writing -------------------------------------------------------------
@@ -3310,20 +3924,28 @@ impl Studio {
         if sql.trim().is_empty() {
             return Task::none();
         }
+        if self.query_cancel.is_some() {
+            self.status = Status::Failed("a run is still in flight — wait for it, or cancel it".into());
+            return Task::none();
+        }
         self.status = Status::Busy("running".to_string());
         // Held rather than pushed: the entry is only worth keeping once it has
         // an outcome and a duration to keep with it.
         self.pending_sql = Some(sql.clone());
+        let canceller = session.canceller();
+        self.query_cancel = Some(canceller.clone());
+        self.cancel_sent = false;
+        let max_rows = self.row_limit.rows();
 
         Task::perform(
             async move {
                 // Round trip, measured around the whole exchange. It includes
                 // the network, so it is never labelled as the server's time.
                 let started = Instant::now();
-                let result = session.run(&sql).await;
-                (result, started.elapsed())
+                let answer = session.run_editor(&sql, max_rows, &canceller).await;
+                (answer, started.elapsed())
             },
-            |(result, elapsed)| Message::QueryFinished(result, elapsed),
+            |(answer, elapsed)| Message::QueryFinished(answer, elapsed),
         )
     }
 
@@ -3358,6 +3980,9 @@ impl Studio {
         if sql.trim().is_empty() {
             return;
         }
+        // Kept for the session, shown, and exported as a script: never with
+        // a password in it.
+        let sql = dialect::redact_passwords(&sql);
         self.history.push(HistoryEntry {
             sql,
             elapsed,
@@ -3495,6 +4120,19 @@ impl Studio {
         match &mut self.modal {
             Some(Modal::CreateTable { name, .. }) if field == ModalField::Name => *name = value,
             Some(Modal::CreateDatabase { name, .. }) if field == ModalField::Name => *name = value,
+            Some(Modal::CreateRole { name, password, .. }) => match field {
+                ModalField::Name => *name = value,
+                ModalField::Password => *password = value,
+                _ => {}
+            },
+            Some(Modal::RolePassword { password, .. }) if field == ModalField::Password => {
+                *password = value
+            }
+            Some(Modal::EditColumn { edit, .. }) => match field {
+                ModalField::Name => edit.name = value,
+                ModalField::DataType => edit.data_type = value,
+                _ => {}
+            },
             Some(Modal::AddColumn { column, .. }) => match field {
                 ModalField::Name => column.rename(value, flavor),
                 ModalField::Length => column.length = digits(&value),
@@ -3508,6 +4146,18 @@ impl Studio {
     }
 
     fn modal_toggle(&mut self, field: ModalField, value: bool) {
+        if let Some(Modal::CreateRole { login, superuser, .. }) = &mut self.modal {
+            match field {
+                ModalField::Login => *login = value,
+                ModalField::Superuser => *superuser = value,
+                _ => {}
+            }
+        }
+        if let Some(Modal::EditColumn { edit, .. }) = &mut self.modal
+            && field == ModalField::Nullable
+        {
+            edit.nullable = value;
+        }
         if let Some(Modal::AddColumn { column, .. }) = &mut self.modal {
             match field {
                 ModalField::Nullable => column.nullable = value,
@@ -3535,6 +4185,33 @@ impl Studio {
             Modal::Confirm { statement, refresh, .. } => self.statement(statement, refresh),
 
             Modal::ConfirmImport { statement, .. } => self.start_import(statement),
+
+            Modal::ConfirmCsv { scripts, .. } => {
+                let Some(session) = self.session.clone() else { return Task::none() };
+                self.status = Status::Busy("importing".to_string());
+                Task::perform(
+                    async move {
+                        let started = Instant::now();
+                        let mut imported = 0u64;
+                        for script in &scripts {
+                            if let Err(e) = session.execute(&script.sql).await {
+                                return (
+                                    imported,
+                                    Some(format!(
+                                        "records {}–{} of the file were refused, and none of them \
+                                         went in: {}",
+                                        script.first, script.last, e
+                                    )),
+                                    started.elapsed(),
+                                );
+                            }
+                            imported += (script.last - script.first + 1) as u64;
+                        }
+                        (imported, None, started.elapsed())
+                    },
+                    |(rows, failure, elapsed)| Message::CsvImported(rows, failure, elapsed),
+                )
+            }
 
             Modal::ConfirmRestore { statement, .. } => {
                 let Some(session) = self.session.clone() else { return Task::none() };
@@ -3577,6 +4254,51 @@ impl Studio {
                     }
                 }
             }
+
+            Modal::CreateRole { name, password, login, superuser, .. } => {
+                match dialect::create_role_sql(&name, &password, login, superuser) {
+                    Ok(sql) => self.modal_statement(
+                        Modal::CreateRole { name, password, login, superuser, error: None },
+                        sql,
+                        Refresh::Roles,
+                    ),
+                    Err(e) => {
+                        self.modal = Some(Modal::CreateRole {
+                            name,
+                            password,
+                            login,
+                            superuser,
+                            error: Some(e),
+                        });
+                        Task::none()
+                    }
+                }
+            }
+            Modal::RolePassword { role, password, .. } => {
+                match dialect::role_password_sql(&role, &password) {
+                    Ok(sql) => self.modal_statement(
+                        Modal::RolePassword { role, password, error: None },
+                        sql,
+                        Refresh::Roles,
+                    ),
+                    Err(e) => {
+                        self.modal = Some(Modal::RolePassword { role, password, error: Some(e) });
+                        Task::none()
+                    }
+                }
+            }
+
+            Modal::EditColumn { table, edit, .. } => match edit.statements(&table) {
+                Ok(sql) => self.modal_statement(
+                    Modal::EditColumn { table, edit, error: None },
+                    sql,
+                    Refresh::CurrentTable,
+                ),
+                Err(e) => {
+                    self.modal = Some(Modal::EditColumn { table, edit, error: Some(e) });
+                    Task::none()
+                }
+            },
 
             Modal::AddColumn { table, column, .. } => match add_column_sql(&table, &column) {
                 Ok(sql) => self.modal_statement(
@@ -3633,6 +4355,9 @@ impl Studio {
             Modal::CreateTable { error, .. }
             | Modal::CreateDatabase { error, .. }
             | Modal::AddColumn { error, .. }
+            | Modal::EditColumn { error, .. }
+            | Modal::CreateRole { error, .. }
+            | Modal::RolePassword { error, .. }
             | Modal::CreateIndex { error, .. },
         ) = &mut self.modal
         {
@@ -3940,9 +4665,131 @@ pub fn add_column_sql(table: &str, column: &NewColumn) -> Result<String, String>
     Ok(sql)
 }
 
+/// How many keys a scan asks for at a time.
+const KV_PAGE: u32 = 500;
+
+/// The KEYS tab's state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvBrowser {
+    /// A Redis glob: `*`, `user:*`, `session:??`.
+    pub pattern: String,
+    pub keys: Vec<String>,
+    /// Where the scan goes on from; `None` once it has reached the end.
+    pub cursor: Option<String>,
+    /// How many keys the store holds, all patterns.
+    pub size: Option<u64>,
+    pub selected: Option<KvEntry>,
+}
+
+impl Default for KvBrowser {
+    fn default() -> Self {
+        KvBrowser {
+            pattern: "*".to_string(),
+            keys: Vec::new(),
+            cursor: None,
+            size: None,
+            selected: None,
+        }
+    }
+}
+
+/// A key read for the KEYS tab: its type, time to live (`-1` for none), and
+/// its value as rows (a string's one value, a hash's fields, a list's items).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvEntry {
+    pub key: String,
+    pub kind: String,
+    pub ttl: i64,
+    /// `None` for a type the tab does not show.
+    pub value: Option<Grid>,
+}
+
+/// How often an open block in the editor is kept alive: well inside the
+/// native server's default request timeout of 30 s.
+const EDITOR_KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// How many rows of each result the editor keeps. The rest are counted, not
+/// held: a `SELECT *` on a big table must not take the console's memory, nor
+/// lay out a grid of a million rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowLimit {
+    Thousand,
+    #[default]
+    TenThousand,
+    HundredThousand,
+    Unlimited,
+}
+
+impl RowLimit {
+    pub const ALL: [RowLimit; 4] = [
+        RowLimit::Thousand,
+        RowLimit::TenThousand,
+        RowLimit::HundredThousand,
+        RowLimit::Unlimited,
+    ];
+
+    pub fn rows(self) -> Option<u64> {
+        match self {
+            RowLimit::Thousand => Some(1_000),
+            RowLimit::TenThousand => Some(10_000),
+            RowLimit::HundredThousand => Some(100_000),
+            RowLimit::Unlimited => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RowLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RowLimit::Thousand => "1,000 rows",
+            RowLimit::TenThousand => "10,000 rows",
+            RowLimit::HundredThousand => "100,000 rows",
+            RowLimit::Unlimited => "no row limit",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The type and nullability go under the old name and the rename last,
+    /// so every statement names a column that exists when it runs; an
+    /// unchanged field writes nothing, and a type cannot carry a second
+    /// statement.
+    #[test]
+    fn a_column_edit_is_written_in_an_order_that_runs() {
+        let info = ColumnInfo {
+            name: "amt".into(),
+            data_type: "NUMERIC(12,1)".into(),
+            nullable: true,
+            ..ColumnInfo::default()
+        };
+        let mut edit = ColumnEdit::of(&info);
+        assert_eq!(edit.statements("t"), Err("nothing is changed".to_string()));
+        edit.data_type = " numeric(12,1) ".into();
+        assert_eq!(edit.statements("t"), Err("nothing is changed".to_string()));
+        edit.name = "amount".into();
+        edit.data_type = "NUMERIC(14,2)".into();
+        edit.nullable = false;
+        assert_eq!(
+            edit.statements("t").unwrap(),
+            "ALTER TABLE \"t\" ALTER COLUMN \"amt\" TYPE NUMERIC(14,2);\n\
+             ALTER TABLE \"t\" ALTER COLUMN \"amt\" SET NOT NULL;\n\
+             ALTER TABLE \"t\" RENAME COLUMN \"amt\" TO \"amount\""
+        );
+        let mut only_null = ColumnEdit::of(&ColumnInfo { nullable: false, ..info.clone() });
+        only_null.nullable = true;
+        assert_eq!(
+            only_null.statements("t").unwrap(),
+            "ALTER TABLE \"t\" ALTER COLUMN \"amt\" DROP NOT NULL"
+        );
+        for bad in ["BIGINT; DROP TABLE t", "BIGINT -- x", "", "  "] {
+            let mut edit = ColumnEdit::of(&info);
+            edit.data_type = bad.into();
+            assert!(edit.statements("t").is_err(), "{bad}");
+        }
+    }
 
     fn column(name: &str, ty: &str) -> NewColumn {
         let mut column = NewColumn::new(Flavor::Rasterized);
@@ -4002,6 +4849,7 @@ mod tests {
         assert_eq!(
             dialect::page_sql(
                 "rdb_roles",
+                None,
                 studio.row_key().as_ref().map(|k| k.column.as_str()),
                 None,
                 200,
@@ -4010,6 +4858,107 @@ mod tests {
             "SELECT * FROM \"rdb_roles\" LIMIT 200 OFFSET 0",
             "a table with no key is paged unordered, not by a column it lacks"
         );
+    }
+
+    fn keyed(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            position: 1,
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: false,
+            unique: true,
+            primary_key: true,
+            indexed: true,
+            ..ColumnInfo::default()
+        }
+    }
+
+    fn page_of(ids: &[&str]) -> Grid {
+        Grid {
+            columns: vec!["id".into(), "label".into()],
+            rows: ids
+                .iter()
+                .map(|id| vec![Some(id.to_string()), Some(format!("row {id}"))])
+                .collect(),
+            tag: format!("SELECT {}", ids.len()),
+            total: None,
+        }
+    }
+
+    /// Past the first page, a table ordered by its integer key is paged after
+    /// the previous page's last key rather than at an offset; a late answer
+    /// for a page no longer shown records nothing; another order, or a key
+    /// whose type is not vouched for, stays at an offset.
+    ///
+    /// Mutation: record a page's end without checking it is the page shown
+    /// (the late page-0 answer sets the cursor page 1 starts from).
+    #[test]
+    fn pages_past_the_first_start_after_the_last_key() {
+        let (mut studio, _) = Studio::new(None);
+        studio.tables = vec![table("users", "id")];
+        studio.selected_table = Some("users".to_string());
+        studio.columns = vec![keyed("id", "BIGINT")];
+        studio.page_size = 3;
+
+        let (first, signature) = studio.page_query().unwrap();
+        assert_eq!(first, "SELECT * FROM \"users\" ORDER BY \"id\" LIMIT 3 OFFSET 0");
+        let _ = studio.update(Message::DataLoaded(0, signature.clone(), Ok((page_of(&["1", "2", "5"]), Some(9)))));
+
+        studio.data_page = 1;
+        let (second, same) = studio.page_query().unwrap();
+        assert_eq!(same, signature);
+        assert_eq!(second, "SELECT * FROM \"users\" WHERE \"id\" > 5 ORDER BY \"id\" LIMIT 3");
+        let _ = studio.update(Message::DataLoaded(1, signature.clone(), Ok((page_of(&["7", "8", "9"]), None))));
+
+        // A late answer for page 0, arriving while page 1 is shown, is not
+        // where page 1 starts.
+        let _ = studio.update(Message::DataLoaded(0, signature.clone(), Ok((page_of(&["1", "2", "3"]), None))));
+        assert_eq!(
+            studio.data_keyset.after,
+            vec![Some("5".to_string()), Some("9".to_string())]
+        );
+        studio.data_page = 2;
+        assert!(studio.page_query().unwrap().0.contains("WHERE \"id\" > 9 "));
+
+        // Back to page 1: after page 0's end again.
+        studio.data_page = 1;
+        assert!(studio.page_query().unwrap().0.contains("WHERE \"id\" > 5 "));
+
+        // Descending by the key: before it.
+        studio.sort.insert(
+            format!("{}users", views::DATA_SCOPE),
+            GridSort { column: "id".into(), descending: true },
+        );
+        studio.data_page = 0;
+        let (_, descending) = studio.page_query().unwrap();
+        assert_ne!(descending, signature, "a new order is a new signature");
+        let _ = studio.update(Message::DataLoaded(0, descending, Ok((page_of(&["9", "8", "7"]), None))));
+        studio.data_page = 1;
+        assert_eq!(
+            studio.page_query().unwrap().0,
+            "SELECT * FROM \"users\" WHERE \"id\" < 7 ORDER BY \"id\" DESC LIMIT 3"
+        );
+
+        // Ordered by another column first: an offset.
+        studio.columns.push(ColumnInfo { name: "label".into(), data_type: "TEXT".into(), position: 2, ..ColumnInfo::default() });
+        studio.sort.insert(
+            format!("{}users", views::DATA_SCOPE),
+            GridSort { column: "label".into(), descending: false },
+        );
+        studio.data_page = 0;
+        let (_, by_label) = studio.page_query().unwrap();
+        let _ = studio.update(Message::DataLoaded(0, by_label, Ok((page_of(&["1", "2", "5"]), None))));
+        studio.data_page = 1;
+        assert!(studio.page_query().unwrap().0.ends_with("LIMIT 3 OFFSET 3"));
+
+        // A UUID key: an offset.
+        studio.sort.clear();
+        studio.columns = vec![keyed("id", "UUID")];
+        studio.data_page = 0;
+        let (_, by_uuid) = studio.page_query().unwrap();
+        let _ = studio.update(Message::DataLoaded(0, by_uuid, Ok((page_of(&["a", "b", "c"]), None))));
+        studio.data_page = 1;
+        assert!(studio.page_query().unwrap().0.ends_with("LIMIT 3 OFFSET 3"));
     }
 
     /// A skeleton `UPDATE` or `DELETE` with no `WHERE` is a whole-table write

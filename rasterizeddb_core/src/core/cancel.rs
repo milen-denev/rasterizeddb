@@ -393,6 +393,93 @@ fn keys_match(a: &[u8; 4], b: &[u8; 4]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
+// ------------------------------------------------- native cancel tokens
+
+/// A native simple query's cancellation target, published under the token
+/// its client chose (`\x01SIMPLE:cancel=<token>;`), for a `\x01CANCEL;<token>`
+/// request on any connection of the same user to find.
+///
+/// The native protocol has no `BackendKeyData` to hand a key out in before
+/// the statement runs, so the client picks the key itself. Tokens are scoped
+/// by the user that registered them, so two users choosing the same token
+/// never meet, and a cancel can only ever stop its own user's statement.
+/// While the token is registered the slot behaves exactly as a pgwire
+/// session's does (see [`SessionCancel`]): each statement of the query
+/// publishes itself in turn, and a cancel flags the one running.
+pub struct TokenRegistration {
+    key: (String, String),
+    session: Arc<SessionCancel>,
+}
+
+impl TokenRegistration {
+    /// The slot a statement run under this token publishes itself in.
+    pub fn session(&self) -> Arc<SessionCancel> {
+        self.session.clone()
+    }
+}
+
+impl Drop for TokenRegistration {
+    fn drop(&mut self) {
+        let mut map = tokens().lock().unwrap_or_else(|e| e.into_inner());
+        if map
+            .get(&self.key)
+            .is_some_and(|s| Arc::ptr_eq(s, &self.session))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
+type TokenMap = std::collections::HashMap<(String, String), Arc<SessionCancel>>;
+
+fn tokens() -> &'static std::sync::Mutex<TokenMap> {
+    static TOKENS: std::sync::OnceLock<std::sync::Mutex<TokenMap>> = std::sync::OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+/// Registers `token` for `user` until the returned guard is dropped; `None`
+/// when that user already has a query running under it (a client reusing a
+/// token it is still waiting on).
+pub fn register_token(user: &str, token: &str) -> Option<TokenRegistration> {
+    let key = (user.to_string(), token.to_string());
+    let mut map = tokens().lock().unwrap_or_else(|e| e.into_inner());
+    if map.contains_key(&key) {
+        return None;
+    }
+    let session = Arc::new(SessionCancel {
+        key: [0; 4],
+        current: std::sync::Mutex::new(None),
+    });
+    map.insert(key.clone(), session.clone());
+    Some(TokenRegistration { key, session })
+}
+
+/// Answers a native `CANCEL`: stops the statement `user`'s query registered
+/// under `token` is running. Returns whether one was flagged; `false` when no
+/// query holds the token, or one does but is between two statements.
+pub fn cancel_token(user: &str, token: &str) -> bool {
+    let session = tokens()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(user.to_string(), token.to_string()))
+        .cloned();
+    let Some(session) = session else {
+        return false;
+    };
+    let running = session
+        .current
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match running {
+        Some(statement) => {
+            statement.flag(CancelReason::UserRequest);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod peer_ask_tests {
     use super::*;

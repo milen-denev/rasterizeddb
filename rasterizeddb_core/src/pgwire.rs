@@ -80,6 +80,14 @@ mod wire_out;
 
 pub(crate) use native_session::NativeSession;
 pub(crate) use native_session::is_transaction_control as native_session_is_transaction_control;
+#[cfg(test)]
+pub(crate) use native_session::{
+    SIMPLE_QUERY_PREFIX as NATIVE_SIMPLE_QUERY_PREFIX, SimpleOptions as NativeSimpleOptions,
+    parse_simple as native_parse_simple,
+};
+pub(crate) use native_session::{
+    MARK as NATIVE_MARK, answer_marked as native_answer_marked,
+};
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
 ///

@@ -116,6 +116,7 @@ pub(crate) struct Dial {
     pub(crate) timeout: Option<Duration>,
     pub(crate) max_message_size: usize,
     pub(crate) authenticator: Option<Arc<dyn ClientAuthenticator>>,
+    pub(crate) trust: crate::Trust,
 }
 
 /// A finished transaction's connection, kept for the next.
@@ -142,10 +143,10 @@ impl Connections {
     /// A plain (`rastcp/1`) connection of its own: the server handles its
     /// requests one at a time and in order, which is what lets it hold a
     /// transaction block. Never reopened behind the caller's back.
-    async fn open(&self) -> Result<TcpClient> {
-        let mut builder = TcpClientBuilder::new(&self.dial.addr)
-            .verify_certificate(false)
-            .max_message_size(self.dial.max_message_size);
+    pub(crate) async fn open(&self) -> Result<TcpClient> {
+        let mut builder =
+            crate::client::with_trust(TcpClientBuilder::new(&self.dial.addr), &self.dial.trust)
+                .max_message_size(self.dial.max_message_size);
         builder = match self.dial.timeout {
             Some(timeout) => builder.timeout(timeout),
             None => builder.no_timeout(),

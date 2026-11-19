@@ -42,6 +42,7 @@ static CLIENT: async_lazy::Lazy<Arc<Client>> = async_lazy::Lazy::new(|| {
                 migrations: Some(Migrator::default()),
                 auto_migrate: AutoMigrate::Off,
                 idle_reconnect: Some(Duration::from_secs(120)),
+                ..Options::default()
             },
         )
         .await

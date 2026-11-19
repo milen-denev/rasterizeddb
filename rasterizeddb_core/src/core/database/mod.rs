@@ -174,6 +174,16 @@ pub struct NativeListen {
     /// A unix socket served alongside the TCP address, for clients on the
     /// same machine. `None` serves TCP only.
     pub socket: Option<NativeSocket>,
+    /// How long one request may run before it is abandoned and answered as
+    /// timed out, on both the TCP address and the socket; a connection idle
+    /// this long is also closed. `None` is rastcp's default, 30 s.
+    /// `--rdb-request-timeout`.
+    pub request_timeout: Option<std::time::Duration>,
+    /// The TCP listener's certificate chain and private key, as PEM file
+    /// paths (`--rdb-cert`, `--rdb-key`). `None` makes a self-signed
+    /// certificate at every start, which a client can encrypt to but never
+    /// verify.
+    pub certificate: Option<(String, String)>,
 }
 
 /// The native protocol on a unix socket: no TLS, no TCP stack, and the
@@ -221,6 +231,8 @@ impl Default for NativeListen {
             port: SERVER_PORT,
             tcp: true,
             socket: None,
+            request_timeout: None,
+            certificate: None,
         }
     }
 }
@@ -232,6 +244,8 @@ impl NativeListen {
             port,
             tcp: true,
             socket: None,
+            request_timeout: None,
+            certificate: None,
         }
     }
 
@@ -274,6 +288,18 @@ async fn bind_native_listener(
 
     for attempt in 1..=BIND_ATTEMPTS {
         let mut builder = TcpServerBuilder::new(&listen.addr, listen.port);
+        if let Some(timeout) = listen.request_timeout {
+            builder = builder.request_timeout(timeout);
+        }
+        if let Some((cert, key)) = &listen.certificate {
+            let invalid = |e: rastcp::error::RastcpError| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+            };
+            builder = builder.with_certificates(
+                rastcp::tls::load_certificates(cert).map_err(invalid)?,
+                rastcp::tls::load_private_key(key).map_err(invalid)?,
+            );
+        }
         if let Some(authenticator) = authenticator.clone() {
             builder = builder.authenticator(authenticator);
         }
@@ -4452,6 +4478,7 @@ impl Database {
         auth: &crate::native_auth::NativeAuthConfig,
         socket: &NativeSocket,
         credential_exists: bool,
+        request_timeout: Option<std::time::Duration>,
     ) -> io::Result<(TcpServer, bool)> {
         use crate::auth::AuthMethod;
         use crate::native_auth::{NativeAuthConfig, RoleAuthenticator};
@@ -4497,6 +4524,9 @@ impl Database {
         }
 
         let mut builder = TcpServerBuilder::unix(&socket.path).unix_mode(socket.mode);
+        if let Some(timeout) = request_timeout {
+            builder = builder.request_timeout(timeout);
+        }
         if let Some(group) = socket.group {
             builder = builder.unix_group(group);
         }
@@ -4536,6 +4566,7 @@ impl Database {
         _auth: &crate::native_auth::NativeAuthConfig,
         _socket: &NativeSocket,
         _credential_exists: bool,
+        _request_timeout: Option<std::time::Duration>,
     ) -> io::Result<(TcpServer, bool)> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -4618,7 +4649,14 @@ impl Database {
         // a socket that cannot be served stops start-up before anything does.
         let socket_server = match listen.socket.as_ref() {
             Some(socket) => Some(
-                Self::bind_native_socket(&database, &auth, socket, credential_exists).await?,
+                Self::bind_native_socket(
+                    &database,
+                    &auth,
+                    socket,
+                    credential_exists,
+                    listen.request_timeout,
+                )
+                .await?,
             ),
             None => None,
         };
@@ -5948,6 +5986,16 @@ async fn process_native_request(
     session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    // A marked request (`pgwire::native_session::answer_marked`): the
+    // simple-query form, whose text is a PostgreSQL simple query run by the
+    // connection's session through pgwire's own path (its gates, statement
+    // log and statistics included) and answered with pgwire's messages, or a
+    // CANCEL of one. Ahead of the one-statement rule below, because a simple
+    // query may hold several.
+    if request_vec.first() == Some(&crate::pgwire::NATIVE_MARK) {
+        return crate::pgwire::native_answer_marked(session, &principal.user, &request_vec).await;
+    }
+
     let query = String::from_utf8_lossy(&request_vec);
 
     // One statement per request: the native protocol answers each request

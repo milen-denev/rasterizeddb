@@ -110,6 +110,9 @@ pub(crate) struct FrameReader {
     /// Bytes before each payload: the length, and for a multiplexed stream
     /// the tag.
     header: usize,
+    /// Refuse a frame whose kind is not [`KIND_DATA`] as soon as its header
+    /// is read: what a server reads requests with ([`FrameReader::requests`]).
+    requests_only: bool,
 }
 
 impl FrameReader {
@@ -123,6 +126,23 @@ impl FrameReader {
         Self::with_header(PREFIX + TAG)
     }
 
+    /// A reader of multiplexed (`rastcp/2`) requests, as a server reads them:
+    /// a frame of any other kind is refused at its header, without waiting
+    /// for the body its header claims.
+    ///
+    /// What arrives there is not always a frame. A client that logs in to a
+    /// server running no exchange sends its login hello first, and the
+    /// hello's bytes read as a header naming a body longer than the hello:
+    /// the connection then sat until the handshake's timeout, 15 seconds,
+    /// before the client heard anything. The hello's fifth byte, read as the
+    /// kind, is the first letter of a user name, never a request's.
+    pub(crate) fn requests() -> Self {
+        Self {
+            requests_only: true,
+            ..Self::tagged()
+        }
+    }
+
     fn with_header(header: usize) -> Self {
         Self {
             // Initialised once. Reading into initialised memory spares the
@@ -132,6 +152,7 @@ impl FrameReader {
             end: 0,
             partial: None,
             header,
+            requests_only: false,
         }
     }
 
@@ -205,6 +226,14 @@ impl FrameReader {
                 } else {
                     Tag::data(0)
                 };
+
+                if self.requests_only && tag.kind != KIND_DATA {
+                    return Poll::Ready(Err(RastcpError::ProtocolError(format!(
+                        "a frame of kind {} where a request belongs (a login sent to a \
+                         server that asks for none reads as one)",
+                        tag.kind
+                    ))));
+                }
 
                 // Checked on the prefix alone, before anything is reserved: a
                 // peer cannot make this side allocate by claiming a length.
@@ -770,6 +799,42 @@ mod tests {
 
                 drop(sender.await.unwrap());
             }
+        })
+        .await
+    }
+
+    /// A request reader refuses a frame of another kind at its header. A
+    /// login hello sent to a server that asks for none (kind = a user
+    /// name's first letter, a length longer than the hello) used to wait
+    /// for a body that was never coming. Requests still read as before.
+    ///
+    /// Mutation: drop the kind check (the hello waits out the bound).
+    #[tokio::test]
+    async fn a_request_reader_refuses_another_kind_at_its_header() {
+        bounded(async {
+            let (mut near, mut far) = duplex(1 << 16);
+            let mut writer = FrameWriter::new();
+            writer.queue_tagged_copy(Tag::data(3), b"SELECT 1").unwrap();
+            let mut wire = Vec::new();
+            writer.swap(&mut wire);
+            // The client's hello, framed as a plain message: C_HELLO,
+            // version 1, the name's length, the name.
+            let hello = [1u8, 1, 5, 0, b'a', b'l', b'i', b'c', b'e'];
+            wire.extend_from_slice(&(hello.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&hello);
+            far.write_all(&wire).await.unwrap();
+
+            let mut reader = FrameReader::requests();
+            let (tag, body) = std::future::poll_fn(|cx| reader.poll_tagged(&mut near, cx, MAX))
+                .await
+                .unwrap();
+            assert_eq!((tag.id, tag.kind, body.as_slice()), (3, KIND_DATA, &b"SELECT 1"[..]));
+            let refused = std::future::poll_fn(|cx| reader.poll_tagged(&mut near, cx, MAX)).await;
+            assert!(
+                matches!(refused, Err(RastcpError::ProtocolError(_))),
+                "{refused:?}"
+            );
+            drop(far);
         })
         .await
     }

@@ -52,6 +52,24 @@ pub struct Connection {
     #[serde(default)]
     pub save_password: bool,
     pub tls: TlsMode,
+    /// Which protocol carries the statements. A profile saved before there
+    /// was a choice has none written, and was the PostgreSQL wire protocol on
+    /// a pgwire port, so that is what it reads as.
+    #[serde(default = "Transport::saved_before_the_choice")]
+    pub transport: Transport,
+    /// How a native connection logs in. The wire protocol asks the server and
+    /// answers with the password, so it needs no choice.
+    #[serde(default)]
+    pub login: NativeLogin,
+    /// Whether the server's certificate must be signed by `ca_file` (or, with
+    /// none, by a public authority), and name the host. Off by default: a
+    /// server makes itself a self-signed certificate, which nothing verifies.
+    #[serde(default)]
+    pub verify_server: bool,
+    /// A PEM file of the certificate authority that signed the server's
+    /// certificate; empty for the public roots.
+    #[serde(default)]
+    pub ca_file: String,
 }
 
 impl Default for Connection {
@@ -60,13 +78,112 @@ impl Default for Connection {
             name: "local".to_string(),
             flavor: Flavor::Rasterized,
             host: "127.0.0.1".to_string(),
-            port: 5432,
+            port: NATIVE_PORT,
             database: "postgres".to_string(),
             user: "rasterized".to_string(),
             password: String::new(),
             save_password: false,
             tls: TlsMode::Prefer,
+            transport: Transport::Native,
+            login: NativeLogin::Password,
+            verify_server: false,
+            ca_file: String::new(),
         }
+    }
+}
+
+impl Connection {
+    /// The transport this profile actually uses: the native protocol is
+    /// RasterizedDB's own, so a PostgreSQL profile always speaks the wire
+    /// protocol whatever was picked.
+    pub fn effective_transport(&self) -> Transport {
+        match self.flavor {
+            Flavor::Postgres => Transport::Wire,
+            Flavor::Rasterized => self.transport,
+        }
+    }
+}
+
+/// The server's native-protocol port (`--rdb-port`'s default).
+pub const NATIVE_PORT: u16 = 61170;
+/// The PostgreSQL wire protocol's port (`--pg-port`'s default).
+pub const WIRE_PORT: u16 = 5432;
+
+/// Which protocol a connection speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Transport {
+    /// RasterizedDB's own protocol (rastcp), through `rasterizeddb_client`:
+    /// TLS over TCP, or a unix socket file (`--rdb-socket`). One database per
+    /// listener.
+    Native,
+    /// The PostgreSQL wire protocol, through `tokio-postgres`: what
+    /// PostgreSQL itself, and RasterizedDB's pgwire listener, speak.
+    Wire,
+}
+
+impl Transport {
+    pub const ALL: [Transport; 2] = [Transport::Native, Transport::Wire];
+
+    fn saved_before_the_choice() -> Self {
+        Transport::Wire
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Transport::Native => "native",
+            Transport::Wire => "PostgreSQL wire",
+        }
+    }
+
+    /// The port a server listens on for this protocol by default.
+    pub fn default_port(&self) -> u16 {
+        match self {
+            Transport::Native => NATIVE_PORT,
+            Transport::Wire => WIRE_PORT,
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// How a native connection authenticates. Explicit rather than inferred from
+/// whether a password was typed: a password login to a server that asks for
+/// none is refused (the server never proves it holds the password's
+/// verifier), and a trust login to one that does ask connects and then fails
+/// its first statement, so neither guess fails in an obvious place.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum NativeLogin {
+    /// SCRAM-SHA-256 with the user and password.
+    #[default]
+    Password,
+    /// The operating-system user, on a unix socket under `--rdb-socket-auth peer`.
+    Peer,
+    /// No exchange, for a listener under `trust`.
+    Trust,
+}
+
+impl NativeLogin {
+    pub const ALL: [NativeLogin; 3] =
+        [NativeLogin::Password, NativeLogin::Peer, NativeLogin::Trust];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            NativeLogin::Password => "password",
+            NativeLogin::Peer => "peer",
+            NativeLogin::Trust => "trust",
+        }
+    }
+}
+
+impl std::fmt::Display for NativeLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -112,6 +229,9 @@ pub struct Grid {
     pub rows: Vec<Vec<Option<String>>>,
     /// What the server tagged the statement with, e.g. `SELECT 12`.
     pub tag: String,
+    /// How many rows the statement returned, when that is more than `rows`
+    /// holds: the editor's row limit kept only the first ones.
+    pub total: Option<u64>,
 }
 
 impl Grid {
@@ -196,8 +316,16 @@ pub fn storage_is_durable(kind: &str) -> bool {
     !matches!(kind, "memory" | "kv-memory" | "temporary" | "file-unlogged")
 }
 
+/// A role the server knows: who can log in, and who can do everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleInfo {
+    pub name: String,
+    pub can_login: bool,
+    pub superuser: bool,
+}
+
 /// A column of a table.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ColumnInfo {
     pub position: u64,
     pub name: String,
@@ -1030,6 +1158,7 @@ mod tests {
     #[test]
     fn a_null_is_not_an_empty_string() {
         let grid = Grid {
+            total: None,
             columns: vec!["a".into()],
             rows: vec![vec![None], vec![Some(String::new())]],
             tag: String::new(),

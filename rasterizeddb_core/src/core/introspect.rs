@@ -1688,8 +1688,7 @@ fn columns(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, String> {
         // back, so reporting the storage type here would name something no
         // statement can use: `WHERE body = <uuid>` is not what anyone means.
         let declared = if json_table.is_empty() {
-            // `literal_type`: a `timestamp` column is named as one.
-            sql_type_name(&field.literal_type()).to_string()
+            declared_type(field, schema)
         } else {
             "JSONB".to_string()
         };
@@ -3086,6 +3085,45 @@ pub fn parse_bool(value: &str) -> Result<bool, String> {
 
 /// The SQL type name a column would be declared with.
 ///
+/// A column's type as it was declared, modifiers included: `VARCHAR(40)`,
+/// `CHAR(3)`, `NUMERIC(10,2)`, `TIMESTAMP(3)`, `INTEGER[]`. Each is a name
+/// `CREATE TABLE` and `ALTER COLUMN … TYPE` accept, so a console can offer
+/// it back unchanged.
+///
+/// The bare storage name dropped them: a `VARCHAR(40)` column read `TEXT`
+/// and a `NUMERIC(10,2)` one `NUMERIC`, so a console editing the column
+/// offered a different type than the one it had, and saving the form
+/// unchanged would have lifted the length limit.
+fn declared_type(
+    field: &crate::core::row::schema::SchemaField,
+    schema: &crate::core::row::schema::TableSchema,
+) -> String {
+    use crate::core::rql::type_modifier::TextTypmod;
+    // `literal_type`: a `timestamp` column is named as one.
+    let base = field.literal_type();
+    match (&base, field.text_typmod()) {
+        (_, Some(TextTypmod::Varchar(0))) => "VARCHAR".to_string(),
+        (_, Some(TextTypmod::Varchar(n))) => format!("VARCHAR({n})"),
+        (_, Some(TextTypmod::Bpchar(0))) => "BPCHAR".to_string(),
+        (_, Some(TextTypmod::Bpchar(n))) => format!("CHAR({n})"),
+        (_, Some(element @ TextTypmod::Element(_))) => element.type_name().to_ascii_uppercase(),
+        (DbType::BPCHAR(n), None) if *n > 0 => format!("CHAR({n})"),
+        (DbType::DECIMAL, _) => match schema
+            .type_modifiers
+            .iter()
+            .find(|m| !m.is_deleted && m.column == field.name)
+        {
+            Some(m) => format!("NUMERIC({},{})", m.precision, m.scale),
+            None => "NUMERIC".to_string(),
+        },
+        (
+            DbType::TIMESTAMP | DbType::DATETIME | DbType::TIME | DbType::TIMETZ | DbType::INTERVAL,
+            Some(TextTypmod::Precision(p)),
+        ) => format!("{}({p})", sql_type_name(&base)),
+        _ => sql_type_name(&base).to_string(),
+    }
+}
+
 /// Fuller than `json_map::sql_type_name`, which only has to name the types JSON
 /// inference produces; a console shows whatever the schema actually holds.
 pub fn sql_type_name(db_type: &DbType) -> &'static str {
@@ -3115,7 +3153,10 @@ pub fn sql_type_name(db_type: &DbType) -> &'static str {
         DbType::ARRAY => "ARRAY",
         DbType::DECIMAL => "NUMERIC",
         DbType::NULL => "NULL",
-        _ => "UNKNOWN",
+        // DATE, TIME, INTERVAL, the network, bit, geometric and range
+        // types: each named as a column declares it. They read `UNKNOWN`,
+        // which no statement accepts back.
+        other => crate::core::rql::cte::sql_type_name(other).unwrap_or("UNKNOWN"),
     }
 }
 

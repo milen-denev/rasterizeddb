@@ -33,8 +33,9 @@
 //! come back empty rather than zero.
 
 use crate::model::{
-    BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, MergePolicy, ColumnInfo, ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner,
-    PartitionInfo, PeerStatus, Relationship, RestoreReport, RestoreTarget, Stat, StatementRecord,
+    BackupEntry, BranchDiffRow, BranchForm, BranchInfo, BranchPointKind, ColumnInfo,
+    ConfigEntry, DatabaseInfo, Flavor, Grid, IndexInfo, IndexOwner, MergePolicy, PartitionInfo,
+    PeerStatus, Relationship, RestoreReport, RestoreTarget, RoleInfo, Stat, StatementRecord,
     StatementShape, StorageLocation, TableInfo, TablePlacement,
 };
 
@@ -125,6 +126,161 @@ pub fn schema_map_sql(flavor: Flavor) -> &'static str {
         Flavor::Rasterized => "SHOW SCHEMA MAP",
         Flavor::Postgres => PG_SCHEMA_MAP,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The key/value store (RasterizedDB's `KV` commands)
+// ---------------------------------------------------------------------------
+
+/// One page of the store's keys matching `pattern` (Redis glob), from
+/// `cursor`.
+pub fn kv_scan_sql(cursor: &str, pattern: &str, count: u32) -> String {
+    let cursor = if cursor.bytes().all(|b| b.is_ascii_digit()) && !cursor.is_empty() {
+        cursor
+    } else {
+        "0"
+    };
+    let pattern = if pattern.trim().is_empty() { "*" } else { pattern };
+    format!("KV SCAN {} MATCH {} COUNT {}", cursor, quote_literal(pattern), count)
+}
+
+/// A SCAN page: the cursor to continue from (`None` when the scan is done)
+/// and its keys. A page that matched nothing still says where to go on, as a
+/// row whose key is NULL.
+pub fn parse_kv_scan(grid: &Grid) -> (Option<String>, Vec<String>) {
+    let cursor = grid
+        .value(0, "cursor")
+        .map(str::to_string)
+        .filter(|c| c != "0");
+    let keys = (0..grid.rows.len())
+        .filter_map(|row| grid.value(row, "key").map(str::to_string))
+        .collect();
+    (cursor, keys)
+}
+
+/// The statement that reads a key's value, by its type; `None` for a type
+/// this console does not show. Long collections are read in part.
+pub fn kv_value_sql(kind: &str, key: &str) -> Option<String> {
+    let key = quote_literal(key);
+    Some(match kind {
+        "string" => format!("KV GET {key}"),
+        "hash" => format!("KV HGETALL {key}"),
+        "list" => format!("KV LRANGE {key} 0 {}", KV_SHOWN - 1),
+        "set" => format!("KV SMEMBERS {key}"),
+        "zset" => format!("KV ZRANGE {key} 0 {} WITHSCORES", KV_SHOWN - 1),
+        _ => return None,
+    })
+}
+
+/// How many items of a list or sorted set are shown.
+pub const KV_SHOWN: usize = 500;
+
+/// A key's type and time to live, in one request.
+pub fn kv_describe_sql(key: &str) -> String {
+    let key = quote_literal(key);
+    format!("KV TYPE {key}; KV TTL {key}")
+}
+
+// ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+/// The roles, without their password hashes: a console has no use for them,
+/// and a hash on screen is a hash in a screenshot.
+pub fn roles_sql(flavor: Flavor) -> &'static str {
+    match flavor {
+        Flavor::Rasterized => {
+            "SELECT name, can_login, is_superuser FROM rdb_roles ORDER BY name"
+        }
+        // The predefined `pg_*` roles are PostgreSQL's own and cannot be
+        // dropped or logged in as.
+        Flavor::Postgres => {
+            "SELECT rolname AS name, rolcanlogin AS can_login, rolsuper AS is_superuser \
+             FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY rolname"
+        }
+    }
+}
+
+pub fn parse_roles(grid: &Grid) -> Vec<RoleInfo> {
+    (0..grid.rows.len())
+        .filter_map(|row| {
+            Some(RoleInfo {
+                name: grid.value(row, "name")?.to_string(),
+                can_login: grid.flag(row, "can_login").unwrap_or(false),
+                superuser: grid.flag(row, "is_superuser").unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// `CREATE ROLE`, in the form both servers take. An empty password sets
+/// none, which on both means the role cannot log in with one.
+pub fn create_role_sql(
+    name: &str,
+    password: &str,
+    login: bool,
+    superuser: bool,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the role needs a name".to_string());
+    }
+    if login && password.is_empty() {
+        return Err(
+            "a role that logs in needs a password (or untick LOGIN and set one later)".to_string(),
+        );
+    }
+    let mut sql = format!("CREATE ROLE {}", quote_ident(name));
+    if superuser {
+        sql.push_str(" SUPERUSER");
+    }
+    sql.push_str(if login { " LOGIN" } else { " NOLOGIN" });
+    if !password.is_empty() {
+        sql.push_str(&format!(" PASSWORD {}", quote_literal(password)));
+    }
+    Ok(sql)
+}
+
+pub fn role_password_sql(name: &str, password: &str) -> Result<String, String> {
+    if password.is_empty() {
+        return Err("type the new password".to_string());
+    }
+    Ok(format!(
+        "ALTER ROLE {} PASSWORD {}",
+        quote_ident(name),
+        quote_literal(password)
+    ))
+}
+
+/// A statement as it may be kept and shown: every string literal after
+/// `PASSWORD` replaced, so the history, its export and the status bar never
+/// hold a password the console sent (or one typed in the editor).
+pub fn redact_passwords(sql: &str) -> String {
+    let lexed = crate::sqllex::lex(sql);
+    let mut cuts: Vec<(usize, usize, usize)> = Vec::new();
+    // From a `PASSWORD` to the first token that is not part of a string: a
+    // literal over several lines lexes as one string token per line.
+    let mut redacting = false;
+    for token in &lexed.tokens {
+        match token.token.kind {
+            crate::sqllex::Kind::Comment => continue,
+            crate::sqllex::Kind::String if redacting => {
+                cuts.push((token.line, token.token.start, token.token.end));
+                continue;
+            }
+            _ => {}
+        }
+        redacting = token.token.kind == crate::sqllex::Kind::Word
+            && lexed.text(token).eq_ignore_ascii_case("password");
+    }
+    if cuts.is_empty() {
+        return sql.to_string();
+    }
+    let mut lines: Vec<String> = crate::sqllex::lines(sql).iter().map(|l| l.to_string()).collect();
+    for (line, start, end) in cuts.into_iter().rev() {
+        lines[line].replace_range(start..end, "'********'");
+    }
+    lines.join("\n")
 }
 
 /// What to send for the runtime configuration.
@@ -379,12 +535,16 @@ pub fn set_config_sql(flavor: Flavor, entry: &ConfigEntry, value: &str) -> Resul
 /// to avoid — the key behind it breaks every tie the same way each time.
 pub fn page_sql(
     table: &str,
+    filter: Option<&RowFilter>,
     order_by: Option<&str>,
     sort: Option<(&str, bool)>,
     limit: usize,
     offset: usize,
 ) -> String {
     let mut sql = format!("SELECT * FROM {}", quote_ident(table));
+    if let Some(filter) = filter {
+        sql.push_str(&filter.where_clause());
+    }
 
     let mut terms: Vec<String> = Vec::new();
     if let Some((column, descending)) = sort {
@@ -409,9 +569,150 @@ pub fn page_sql(
     sql
 }
 
+/// A page that starts after a key rather than at an offset: the rows whose
+/// `key` is past `after` (the key of the previous page's last row, as a
+/// literal from [`key_literal`]), in key order, `limit` of them.
+///
+/// The same rows as `page_sql` ordered by the key alone gives at the
+/// matching offset, without the server producing and skipping every row
+/// before them: `OFFSET 90000` is ninety thousand rows read, sorted and
+/// thrown away for each page that deep.
+pub fn page_after_sql(
+    table: &str,
+    filter: Option<&RowFilter>,
+    key: &str,
+    descending: bool,
+    after: &str,
+    limit: usize,
+) -> String {
+    let past = format!(
+        "{} {} {}",
+        quote_ident(key),
+        if descending { "<" } else { ">" },
+        after
+    );
+    let condition = match filter {
+        Some(filter) => format!("{} AND {}", filter.where_clause(), past),
+        None => format!(" WHERE {}", past),
+    };
+    format!(
+        "SELECT * FROM {}{} ORDER BY {}{} LIMIT {}",
+        quote_ident(table),
+        condition,
+        quote_ident(key),
+        if descending { " DESC" } else { "" },
+        limit
+    )
+}
+
+/// How a key column's values are written back as a literal, when a page can
+/// start after one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysetKind {
+    /// An integer, written as its digits.
+    Integer,
+    /// Text, written as a quoted string.
+    Text,
+}
+
+impl KeysetKind {
+    /// The kind of a column declared `data_type`, or `None` for a type whose
+    /// order and literal this does not vouch for (a float, a timestamp, a
+    /// UUID, NUMERIC): those pages stay at an offset.
+    pub fn of(data_type: &str) -> Option<KeysetKind> {
+        let upper = data_type.trim().to_ascii_uppercase();
+        let base = upper.split('(').next().unwrap_or("").trim();
+        match base {
+            "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "INT2" | "INT4" | "INT8" | "TINYINT"
+            | "UTINYINT" | "USMALLINT" | "UINTEGER" | "UINT" | "UBIGINT" | "HUGEINT"
+            | "UHUGEINT" | "SMALLSERIAL" | "SERIAL" | "BIGSERIAL" => Some(KeysetKind::Integer),
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" => Some(KeysetKind::Text),
+            _ => None,
+        }
+    }
+}
+
+/// A key's value, as the grid shows it, as a literal to page after; `None`
+/// when it cannot be written exactly (an integer cell that is not one).
+pub fn key_literal(value: &str, kind: KeysetKind) -> Option<String> {
+    match kind {
+        KeysetKind::Integer => {
+            let digits = value.strip_prefix('-').unwrap_or(value);
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.to_string())
+        }
+        KeysetKind::Text => Some(quote_literal(value)),
+    }
+}
+
 /// The exact row count, which both engines answer by scanning.
-pub fn count_sql(table: &str) -> String {
-    format!("SELECT COUNT(*) AS n FROM {}", quote_ident(table))
+pub fn count_sql(table: &str, filter: Option<&RowFilter>) -> String {
+    format!(
+        "SELECT COUNT(*) AS n FROM {}{}",
+        quote_ident(table),
+        filter.map(RowFilter::where_clause).unwrap_or_default()
+    )
+}
+
+/// A condition typed into the data browser, checked to be one condition.
+///
+/// It is the user's own SQL, and they can run any SQL in the editor, so this
+/// is not a defence against them. It keeps the browser's own statement
+/// intact around it: a `;` would make the page two statements (and the
+/// second would run), an unbalanced `)` would close the `WHERE` early and let
+/// the rest change what the `ORDER BY` and `LIMIT` apply to, and a `--`
+/// comment would swallow them; it ends at the line break placed after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowFilter(String);
+
+impl RowFilter {
+    /// The condition, or why it cannot be one; `None` for an empty one.
+    pub fn parse(text: &str) -> Result<Option<RowFilter>, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let lexed = crate::sqllex::lex(text);
+        if lexed.open.is_some() {
+            return Err(
+                "the filter ends inside a string, a quoted name or a comment".to_string(),
+            );
+        }
+        let mut depth = 0i32;
+        for token in &lexed.tokens {
+            if token.token.kind != crate::sqllex::Kind::Punct {
+                continue;
+            }
+            match lexed.text(token) {
+                ";" => {
+                    return Err(
+                        "the filter is one condition, as written after WHERE; it may not hold a ';'"
+                            .to_string(),
+                    );
+                }
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err("the filter closes a parenthesis it did not open".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return Err("the filter leaves a parenthesis open".to_string());
+        }
+        Ok(Some(RowFilter(text.to_string())))
+    }
+
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+
+    fn where_clause(&self) -> String {
+        format!(" WHERE (\n{}\n)", self.0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1878,6 +2179,7 @@ mod tests {
 
     fn index_grid(columns: &[&str], rows: &[&[&str]]) -> Grid {
         Grid {
+            total: None,
             columns: columns.iter().map(|c| c.to_string()).collect(),
             rows: rows
                 .iter()
@@ -2041,6 +2343,7 @@ mod tests {
     fn the_statement_grids_are_read_the_same_from_either_server() {
         // RasterizedDB: `SHOW QUERIES`, which answers every column.
         let rdb = Grid {
+            total: None,
             columns: vec![
                 "started_at".into(),
                 "duration_ms".into(),
@@ -2069,6 +2372,7 @@ mod tests {
         // PostgreSQL: `pg_stat_activity`, which cannot answer two of them and
         // says so with an empty string rather than a zero.
         let pg = Grid {
+            total: None,
             columns: rdb.columns.clone(),
             rows: vec![vec![
                 Some("2026-09-01 09:14:02.710300".into()),
@@ -2105,6 +2409,7 @@ mod tests {
     #[test]
     fn a_refused_statement_reads_as_failed() {
         let grid = Grid {
+            total: None,
             columns: vec!["status".into(), "error".into(), "statement".into()],
             rows: vec![
                 vec![Some("error".into()), Some("relation does not exist".into()), Some("SELECT 1".into())],
@@ -2139,6 +2444,7 @@ mod tests {
         ];
 
         let rdb = Grid {
+            total: None,
             columns: columns.clone(),
             rows: vec![vec![
                 Some("2537360768813479364".into()),
@@ -2158,6 +2464,7 @@ mod tests {
         };
 
         let pg = Grid {
+            total: None,
             columns,
             rows: vec![vec![
                 // PostgreSQL's queryid is signed, and half of them are
@@ -2225,6 +2532,7 @@ mod tests {
     #[test]
     fn a_table_list_without_a_storage_column_still_parses() {
         let grid = Grid {
+            total: None,
             columns: vec!["table_name".into(), "row_slots".into(), "primary_key".into()],
             rows: vec![vec![Some("orders".into()), Some("12".into()), Some("id".into())]],
             ..Grid::default()
@@ -2238,6 +2546,7 @@ mod tests {
     #[test]
     fn the_storage_kind_is_read_from_either_server() {
         let grid = Grid {
+            total: None,
             columns: vec!["table_name".into(), "storage".into()],
             rows: vec![
                 vec![Some("a".into()), Some("file".into())],
@@ -2259,6 +2568,7 @@ mod tests {
     #[test]
     fn the_locations_grid_is_read_the_same_from_either_server() {
         let grid = Grid {
+            total: None,
             columns: vec![
                 "location".into(),
                 "role".into(),
@@ -2313,6 +2623,7 @@ mod tests {
     #[test]
     fn a_report_is_read_from_the_first_column_whatever_it_is_called() {
         let grid = Grid {
+            total: None,
             columns: vec!["storage".into()],
             rows: vec![
                 vec![Some("2 table(s), 4.4 KiB would move:".into())],
@@ -2423,6 +2734,7 @@ mod tests {
     #[test]
     fn a_saving_server_makes_restart_rows_editable_but_not_fixed_ones() {
         let grid = Grid {
+            total: None,
             columns: ["section", "key", "value", "hot_reload", "set_with", "help", "pending", "options", "source"]
                 .iter()
                 .map(|c| c.to_string())
@@ -2678,16 +2990,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_kv_scan_continues_from_its_cursor_and_quotes_its_pattern() {
+        assert_eq!(kv_scan_sql("0", "user:*", 500), "KV SCAN 0 MATCH 'user:*' COUNT 500");
+        assert_eq!(kv_scan_sql("17", "", 10), "KV SCAN 17 MATCH '*' COUNT 10");
+        assert_eq!(kv_scan_sql("1; DROP", "it's", 10), "KV SCAN 0 MATCH 'it''s' COUNT 10");
+        let page = Grid {
+            columns: vec!["cursor".into(), "key".into()],
+            rows: vec![vec![Some("3".into()), Some("a".into())], vec![Some("3".into()), Some("b".into())]],
+            tag: String::new(),
+            total: None,
+        };
+        assert_eq!(parse_kv_scan(&page), (Some("3".to_string()), vec!["a".into(), "b".into()]));
+        let empty_done = Grid {
+            columns: vec!["cursor".into(), "key".into()],
+            rows: vec![vec![Some("0".into()), None]],
+            tag: String::new(),
+            total: None,
+        };
+        assert_eq!(parse_kv_scan(&empty_done), (None, vec![]));
+        assert_eq!(kv_value_sql("hash", "h'1").as_deref(), Some("KV HGETALL 'h''1'"));
+        assert_eq!(kv_value_sql("stream", "x"), None);
+    }
+
+    #[test]
+    fn a_password_never_reaches_the_history() {
+        assert_eq!(
+            redact_passwords("CREATE ROLE \"a\" LOGIN PASSWORD 'it''s secret'"),
+            "CREATE ROLE \"a\" LOGIN PASSWORD '********'"
+        );
+        assert_eq!(
+            redact_passwords("alter role a password /* new */ E'x\\'y'; SELECT 'password'"),
+            "alter role a password /* new */ '********'; SELECT 'password'"
+        );
+        assert_eq!(
+            redact_passwords("ALTER ROLE a PASSWORD 'line one\nline two' LOGIN"),
+            "ALTER ROLE a PASSWORD '********'\n'********' LOGIN"
+        );
+        assert_eq!(redact_passwords("SELECT password FROM t"), "SELECT password FROM t");
+    }
+
+    #[test]
+    fn a_role_is_created_in_the_form_both_servers_take() {
+        assert_eq!(
+            create_role_sql(" ops ", "pw'1", true, true).unwrap(),
+            "CREATE ROLE \"ops\" SUPERUSER LOGIN PASSWORD 'pw''1'"
+        );
+        assert_eq!(
+            create_role_sql("reader", "", false, false).unwrap(),
+            "CREATE ROLE \"reader\" NOLOGIN"
+        );
+        assert!(create_role_sql("", "x", true, false).is_err());
+        assert!(create_role_sql("a", "", true, false).is_err());
+        assert_eq!(
+            role_password_sql("ops", "n").unwrap(),
+            "ALTER ROLE \"ops\" PASSWORD 'n'"
+        );
+        assert!(role_password_sql("ops", "").is_err());
+    }
+
+    /// The filter goes in whole, between the table and the order, and a line
+    /// comment in it ends before the `ORDER BY` and `LIMIT`.
+    #[test]
+    fn a_filter_is_one_condition_inside_the_page() {
+        let filter = RowFilter::parse("  status = 'a;b' -- open ones\n AND (n > 1) ")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page_sql("users", Some(&filter), Some("id"), None, 50, 0),
+            "SELECT * FROM \"users\" WHERE (\nstatus = 'a;b' -- open ones\n AND (n > 1)\n) \
+             ORDER BY \"id\" LIMIT 50 OFFSET 0"
+        );
+        assert_eq!(
+            count_sql("users", Some(&filter)),
+            "SELECT COUNT(*) AS n FROM \"users\" WHERE (\nstatus = 'a;b' -- open ones\n AND (n > 1)\n)"
+        );
+        assert_eq!(count_sql("users", None), "SELECT COUNT(*) AS n FROM \"users\"");
+        assert_eq!(RowFilter::parse("   ").unwrap(), None);
+        for bad in [
+            "1 = 1; DELETE FROM users",
+            "id = 1) OR (1 = 1",
+            "(id = 1",
+            "name = 'open",
+            "id = 1 /* unfinished",
+        ] {
+            assert!(RowFilter::parse(bad).is_err(), "{bad}");
+        }
+    }
+
     /// Paging without an order is paging on nothing: the same row can appear on
     /// two pages and another on none.
     #[test]
     fn a_page_orders_by_the_key_when_there_is_one() {
         assert_eq!(
-            page_sql("users", Some("id"), None, 50, 100),
+            page_sql("users", None, Some("id"), None, 50, 100),
             "SELECT * FROM \"users\" ORDER BY \"id\" LIMIT 50 OFFSET 100"
         );
         assert_eq!(
-            page_sql("users", None, None, 50, 0),
+            page_sql("users", None, None, None, 50, 0),
             "SELECT * FROM \"users\" LIMIT 50 OFFSET 0"
         );
     }
@@ -2698,11 +3098,11 @@ mod tests {
     #[test]
     fn a_clicked_header_orders_in_front_of_the_key() {
         assert_eq!(
-            page_sql("users", Some("id"), Some(("email", false)), 50, 0),
+            page_sql("users", None, Some("id"), Some(("email", false)), 50, 0),
             "SELECT * FROM \"users\" ORDER BY \"email\", \"id\" LIMIT 50 OFFSET 0"
         );
         assert_eq!(
-            page_sql("users", Some("id"), Some(("email", true)), 50, 0),
+            page_sql("users", None, Some("id"), Some(("email", true)), 50, 0),
             "SELECT * FROM \"users\" ORDER BY \"email\" DESC, \"id\" LIMIT 50 OFFSET 0"
         );
     }
@@ -2712,7 +3112,7 @@ mod tests {
     #[test]
     fn sorting_by_the_key_names_it_once() {
         assert_eq!(
-            page_sql("users", Some("id"), Some(("id", true)), 50, 0),
+            page_sql("users", None, Some("id"), Some(("id", true)), 50, 0),
             "SELECT * FROM \"users\" ORDER BY \"id\" DESC LIMIT 50 OFFSET 0"
         );
     }
@@ -2722,7 +3122,7 @@ mod tests {
     #[test]
     fn a_keyless_table_still_sorts() {
         assert_eq!(
-            page_sql("events", None, Some(("at", true)), 50, 0),
+            page_sql("events", None, None, Some(("at", true)), 50, 0),
             "SELECT * FROM \"events\" ORDER BY \"at\" DESC LIMIT 50 OFFSET 0"
         );
     }
@@ -2876,6 +3276,30 @@ mod branch_sql_tests {
     }
 
     #[test]
+    fn a_keyset_page_starts_after_its_key_with_or_without_a_filter() {
+        assert_eq!(
+            page_after_sql("t", None, "id", false, "42", 100),
+            "SELECT * FROM \"t\" WHERE \"id\" > 42 ORDER BY \"id\" LIMIT 100"
+        );
+        let filter = RowFilter::parse("a = 1 OR b = 2").unwrap().unwrap();
+        assert_eq!(
+            page_after_sql("t", Some(&filter), "name", true, "'o''brien'", 10),
+            "SELECT * FROM \"t\" WHERE (\na = 1 OR b = 2\n) AND \"name\" < 'o''brien' ORDER BY \"name\" DESC LIMIT 10"
+        );
+        assert_eq!(KeysetKind::of("bigint"), Some(KeysetKind::Integer));
+        assert_eq!(KeysetKind::of("VARCHAR(40)"), Some(KeysetKind::Text));
+        assert_eq!(KeysetKind::of("character varying"), Some(KeysetKind::Text));
+        for other in ["UUID", "NUMERIC(10,2)", "DOUBLE PRECISION", "TIMESTAMPTZ", "CHAR(3)", "INTERVAL"] {
+            assert_eq!(KeysetKind::of(other), None, "{other}");
+        }
+        assert_eq!(key_literal("-17", KeysetKind::Integer).as_deref(), Some("-17"));
+        assert_eq!(key_literal("1e3", KeysetKind::Integer), None);
+        assert_eq!(key_literal("", KeysetKind::Integer), None);
+        assert_eq!(key_literal("1; DROP", KeysetKind::Integer), None);
+        assert_eq!(key_literal("it's", KeysetKind::Text).as_deref(), Some("'it''s'"));
+    }
+
+    #[test]
     fn rows_parse_by_column_name() {
         let grid = Grid {
             columns: ["branch", "parent", "parent_exists", "point", "parent_lsn", "method", "created_at", "merged_at", "size_bytes", "base_bytes", "sessions"]
@@ -2889,6 +3313,7 @@ mod branch_sql_tests {
                     .collect(),
             ],
             tag: "SELECT 1".into(),
+            total: None,
         };
         let parsed = parse_branches(&grid);
         assert_eq!(parsed.len(), 1);

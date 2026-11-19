@@ -466,6 +466,12 @@ without proving it holds the verifier. On a unix socket (`--rdb-socket`),
 `Login::Peer` logs in as the operating-system user, and `Login::Trust` sends no
 credentials.
 
+TCP is TLS. The server makes itself a self-signed certificate at every start
+unless given one with `--rdb-cert`/`--rdb-key`; a client that should verify it
+sets `Options::trust` (`rasterizeddb_client::load_ca("ca.pem")?` for a private
+CA, `Trust::WebPki` for a public one). The default encrypts without
+authenticating the server.
+
 The client shares its connections (`Options::connections`, one by default)
 between all the statements in flight, which is the faster arrangement whenever
 more than one is: 4 concurrent callers ran 12% more point queries a second over

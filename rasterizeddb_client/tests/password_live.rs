@@ -114,12 +114,21 @@ async fn a_server_that_skips_the_exchange_is_refused() {
             return;
         };
         // The server never proves who it is, so a client holding a password
-        // will not talk to it. (A trust listener does not answer the hello at
-        // all, so this is the handshake's timeout rather than the client's
-        // own refusal; either way nothing is sent.)
+        // will not talk to it. A trust listener runs no exchange, so it reads
+        // the hello as a request frame and closes the connection at its
+        // header; the client says to use Login::Trust. It used to wait for
+        // the rest of a body the hello's bytes seemed to announce, and the
+        // client heard nothing until the 15 s handshake timeout.
+        let started = std::time::Instant::now();
         let refused =
             Client::connect(&server.socket, login(Login::password("alice", "hunter2"))).await;
-        assert!(refused.is_err(), "a password login accepted a server that asked for nothing");
+        let error = refused.err().expect("a password login accepted a server that asked for nothing");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal took {:?}: {error}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("Login::Trust"), "{error}");
     })
     .await
     .expect("the test did not finish within 120 s");

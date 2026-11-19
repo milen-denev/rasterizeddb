@@ -98,6 +98,8 @@ fn server(dir: String, port: u16, threads: usize, socket: Option<String>) {
                 port,
                 tcp: true,
                 socket: socket.map(rasterizeddb_core::core::database::NativeSocket::new),
+                request_timeout: None,
+                certificate: None,
             },
         )
         .await
