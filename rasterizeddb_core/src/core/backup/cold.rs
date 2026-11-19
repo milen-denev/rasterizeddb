@@ -79,7 +79,7 @@ fn databases(location: &Path) -> Vec<(PathBuf, String)> {
 
 /// The `(table, spec)` placements in a database's pool file. Read here rather
 /// than through `StorageManager`, whose open installs logs for locations.
-fn placements(database: &Path) -> Vec<(String, String)> {
+pub(crate) fn placements(database: &Path) -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string(database.join(POOL_FILE)) else {
         return Vec::new();
     };
@@ -95,7 +95,7 @@ fn placements(database: &Path) -> Vec<(String, String)> {
 /// (docs/kv-partitions.md §1), by uid, with the stores' names: read from
 /// every map log generation in the directory. A map that does not read is
 /// passed over here; the table it belongs to does not open either.
-fn partitioned_on_stores(database: &Path) -> BTreeMap<u64, Vec<String>> {
+pub(crate) fn partitioned_on_stores(database: &Path) -> BTreeMap<u64, Vec<String>> {
     use crate::core::partition::files::{PartFile, parse_name};
     use crate::core::partition::store::{store_name, store_spec};
     let mut out: BTreeMap<u64, Vec<String>> = BTreeMap::new();
@@ -222,7 +222,7 @@ pub async fn copy_cold_tables(location: &Path, now: impl Fn() -> u64) -> ColdCop
 
 /// The table of `tables` that owns `file`: the longest one that does, so `a`
 /// never takes `a_b`'s files.
-fn owner<'t>(tables: &'t [String], file: &str) -> Option<&'t String> {
+pub(crate) fn owner<'t>(tables: &'t [String], file: &str) -> Option<&'t String> {
     tables
         .iter()
         .filter(|table| crate::core::database::table_owns_file(table, file))

@@ -907,3 +907,70 @@ async fn a_promoted_middle_takes_its_branches_with_it() {
         vec![row(&["dev", "77"])]
     );
 }
+
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_on_a_store_comes_over_as_the_branchs_own() {
+    let fx = seeded("kv").await;
+    let kv = fx.root.join("kvstore");
+    let mut prod = fx.client("prod");
+    prod.exec(&format!(
+        "STORAGE ADD STORE scratch DIRECTORY WITH (PATH = '{}', PREFIX = 'scratch', CHUNK_SIZE = '16KiB', PAGE_SIZE = '4KiB')",
+        kv.display()
+    ))
+    .await;
+    prod.exec("STORAGE PLACE TABLE events AT 'kv:scratch'").await;
+    prod.exec("CREATE TABLE events (id INT PRIMARY KEY, what TEXT)").await;
+    for i in 0..50 {
+        prod.exec(&format!("INSERT INTO events (id, what) VALUES ({i}, 'e{i}')"))
+            .await;
+    }
+    prod.exec("UPDATE events SET what = 'changed' WHERE id = 7").await;
+
+    let mut admin = fx.client("postgres");
+    let said = admin.exec("CREATE BRANCH dev FROM prod").await;
+    assert!(
+        said.notices.iter().any(|n| n.contains("events") && n.contains("key/value")),
+        "{:?}",
+        said.notices
+    );
+    let dev_dir = fx.root.join("dev");
+    assert!(!dev_dir.join("db_kv.cfg").exists(), "the branch shares the parent's stores");
+    let mut dev = fx.client("dev");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM events").await, "50");
+    assert_eq!(dev.scalar("SELECT what FROM events WHERE id = 7").await, "changed");
+
+    // Each side's writes are its own.
+    dev.exec("DELETE FROM events WHERE id < 10").await;
+    dev.exec("INSERT INTO events (id, what) VALUES (100, 'dev')").await;
+    prod.exec("INSERT INTO events (id, what) VALUES (200, 'prod')").await;
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM events").await, "41");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM events").await, "51");
+
+    // And a restart reads both back the same.
+    drop((dev, prod, admin));
+    let mut fx = fx;
+    fx.reopen().await;
+    let mut dev = fx.client("dev");
+    let mut prod = fx.client("prod");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM events").await, "41");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM events").await, "51");
+
+    // The branch merges back onto the store's table.
+    let mut admin = fx.client("postgres");
+    admin.exec("MERGE BRANCH dev").await;
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM events").await, "42");
+    assert_eq!(prod.scalar("SELECT what FROM events WHERE id = 100").await, "dev");
+
+    // Partitions on a store are refused, by name of the store.
+    prod.exec("STORAGE PLACE TABLE logs AT 'kv:scratch'").await;
+    prod.exec("CREATE TABLE logs (id INT PRIMARY KEY, n INT) PARTITION BY HASH (id) PARTITIONS 2")
+        .await;
+    prod.exec("INSERT INTO logs (id, n) VALUES (1, 1), (2, 2)").await;
+    let refused = admin
+        .try_exec("CREATE BRANCH other FROM prod")
+        .await
+        .expect_err("branched partitions on a store");
+    assert!(refused.1.contains("'scratch'"), "{refused:?}");
+    assert!(fx.catalog.get("other").is_none());
+}

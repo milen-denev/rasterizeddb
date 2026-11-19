@@ -255,6 +255,13 @@ fn excluded(name: &str) -> bool {
         || name.starts_with(".rdb_")
         || name == "RESTORED.json"
         || name == REPLAY_FILE
+        // A branch never shares its parent's stores: their objects are the
+        // parent's, and a table the branch placed there would write among
+        // them. Their tables are copied out of them ([`copy_store_tables`]).
+        || name == "db_kv.cfg"
+        || name == "db_kv.cfg.tmp"
+        || name == "db_kv_secrets.cfg"
+        || name == "db_kv_secrets.cfg.tmp"
 }
 
 /// The files of a database directory to copy: flat, because a database's own
@@ -316,34 +323,6 @@ struct Stream {
     named: Vec<String>,
 }
 
-/// Tables of `dir`'s pool placed on a key/value store, which have no files to
-/// copy and no log to replay.
-#[cfg(feature = "storage_pools")]
-fn kv_tables(dir: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(dir.join(crate::core::storage::POOL_FILE)) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = text
-        .lines()
-        .filter_map(
-            |line| match line.split('\t').collect::<Vec<_>>().as_slice() {
-                ["table", spec, table]
-                    if matches!(
-                        crate::core::storage::TableBackend::parse(spec),
-                        crate::core::storage::TableBackend::KeyValue(_)
-                    ) =>
-                {
-                    Some((*table).to_string())
-                }
-                _ => None,
-            },
-        )
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// The name a storage location outside the parent's directory is copied to
 /// inside the branch: what a restore elsewhere names it.
 fn location_dir_name(path: &str) -> String {
@@ -378,19 +357,7 @@ async fn copy_live(
     let mut moved: Vec<(String, String)> = Vec::new();
     #[cfg(feature = "storage_pools")]
     {
-        let kv = kv_tables(source);
-        if !kv.is_empty() {
-            return Err(io::Error::other(format!(
-                "cannot branch: {} kept on a key/value store, which a branch cannot copy yet: {}. \
-                 STORAGE MOVE TABLE moves a table back into a directory first.",
-                if kv.len() == 1 {
-                    "a table is"
-                } else {
-                    "tables are"
-                },
-                kv.join(", ")
-            )));
-        }
+        refuse_uncopyable(source)?;
         let source_norm = crate::core::storage::normalize(&source.to_string_lossy());
         for path in crate::core::storage::data_locations(source)? {
             let path_norm = crate::core::storage::normalize(&path);
@@ -599,10 +566,143 @@ async fn copy_live(
     .await
     .map_err(io::Error::other)??;
 
+    // After the replay: the log may still name a file a table had before it
+    // moved onto a store, and its records must not land on the copy.
+    copy_store_tables(source, staging).await?;
+
     crate::core::database::incompat::fence_restored_directory(staging)?;
     repoint(staging, final_dir, source, &moved)?;
 
     Ok((lsns.first().copied().unwrap_or(0), stats))
+}
+
+/// Refuses a database holding something a branch cannot copy: the partitions
+/// of a partitioned table placed on a key/value store (which a backup does
+/// not copy either, `backup::cold`). And says what a branch holds
+/// differently: in-memory tables come over empty.
+#[cfg(feature = "storage_pools")]
+fn refuse_uncopyable(source: &Path) -> io::Result<()> {
+    use crate::core::backup::cold;
+    use crate::core::storage::TableBackend;
+    let partitioned = cold::partitioned_on_stores(source);
+    if !partitioned.is_empty() {
+        let stores: std::collections::BTreeSet<&String> = partitioned.values().flatten().collect();
+        return Err(io::Error::other(format!(
+            "cannot branch: {} partitioned table(s) keep partitions on key/value store(s) {}, which a branch \
+             cannot copy yet; STORAGE MOVE moves them back into a directory first",
+            partitioned.len(),
+            stores
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let placements = cold::placements(source);
+    #[cfg(not(feature = "kv_storage"))]
+    {
+        let on_stores: Vec<&String> = placements
+            .iter()
+            .filter(|(_, spec)| matches!(TableBackend::parse(spec), TableBackend::KeyValue(_)))
+            .map(|(t, _)| t)
+            .collect();
+        if !on_stores.is_empty() {
+            return Err(io::Error::other(format!(
+                "cannot branch: this build has no key/value storage, so the tables on stores cannot be read: {}",
+                on_stores.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
+    let memory: Vec<&String> = placements
+        .iter()
+        .filter(|(_, spec)| matches!(TableBackend::parse(spec), TableBackend::Memory))
+        .map(|(t, _)| t)
+        .collect();
+    if !memory.is_empty() {
+        crate::core::notice::push(
+            "WARNING",
+            "01000",
+            format!(
+                "in-memory table(s) {} come over empty: nothing of them is on disk to copy",
+                memory.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn refuse_uncopyable(_source: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Copies the tables `source` keeps on key/value stores into `staging` as
+/// ordinary files, one crash-consistent cut per store (the backup's
+/// `kv::export`): on the branch they are tables of its own directory, the
+/// pool file's rewrite dropping their placements. Never onto the store
+/// itself, where the branch would write among the parent's objects; for the
+/// same reason the store definitions are not copied ([`excluded`]).
+///
+/// Each store is cut at its own moment, after the directories' copy: a
+/// transaction that wrote both a store's table and a directory's may be in
+/// one copy and not the other.
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+async fn copy_store_tables(source: &Path, staging: &Path) -> io::Result<()> {
+    use crate::core::backup::cold;
+    use crate::core::storage::TableBackend;
+    let mut on_store: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (table, spec) in cold::placements(source) {
+        if let TableBackend::KeyValue(store) = TableBackend::parse(&spec) {
+            on_store.entry(store).or_default().push(table);
+        }
+    }
+    if on_store.is_empty() {
+        return Ok(());
+    }
+    let stores = crate::core::storage::kv_registry::KvRegistry::open(&source.to_string_lossy());
+    let mut copied: Vec<String> = Vec::new();
+    for (store, tables) in on_store {
+        let scratch = staging.join(format!(".kv-export-{store}"));
+        remove_quietly(&scratch);
+        let (client, config) = stores
+            .connect(&store)
+            .map_err(|e| io::Error::other(format!("cannot branch: store '{store}': {e}")))?;
+        let owned = |file: &str| cold::owner(&tables, file).is_some();
+        let files = crate::core::storage_providers::kv::export::export(client, config, owned, &scratch)
+            .await
+            .map_err(|e| {
+                remove_quietly(&scratch);
+                io::Error::other(format!("cannot branch: the tables on store '{store}' could not be copied: {e}"))
+            })?;
+        for table in &tables {
+            if !files.iter().any(|f| cold::owner(&tables, &f.name) == Some(table)) {
+                remove_quietly(&scratch);
+                return Err(io::Error::other(format!(
+                    "cannot branch: store '{store}' holds no files for table {table}"
+                )));
+            }
+        }
+        for f in &files {
+            std::fs::rename(&f.path, staging.join(&f.name))?;
+        }
+        remove_quietly(&scratch);
+        copied.extend(tables);
+    }
+    crate::core::notice::push(
+        "NOTICE",
+        "00000",
+        format!(
+            "table(s) {} were copied out of their key/value store(s): on the branch they are ordinary tables \
+             in its own directory, and the stores are not part of it",
+            copied.join(", ")
+        ),
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "storage_pools", feature = "kv_storage")))]
+async fn copy_store_tables(_source: &Path, _staging: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Rewrites the pool file in `dir` from `from` to `to`.
