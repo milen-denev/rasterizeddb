@@ -5500,6 +5500,7 @@ impl<S: StorageIO> Table<S> {
         layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
         reader: TxId,
     ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        self.data()?;
         self.query_columns(query, schema_fields, query_row_fetch, layout, reader, None, true).await
     }
 
@@ -5515,6 +5516,7 @@ impl<S: StorageIO> Table<S> {
         visibility: Visibility,
         cache: bool,
     ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        self.data()?;
         self.query_columns(query, schema_fields, query_row_fetch, layout, FROZEN_TX, Some(visibility), cache)
             .await
     }
