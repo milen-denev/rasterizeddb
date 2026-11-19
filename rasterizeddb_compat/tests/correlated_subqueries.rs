@@ -95,8 +95,20 @@ async fn an_update_sets_each_row_from_its_own_subquery() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_subquery_over_a_group_key_has_a_value_per_group() {
+    let (_s, pool) = server().await;
+    // Refused (0A000) until the grouped rewrite; PostgreSQL 17's answer.
+    assert_eq!(
+        rows(&pool, "SELECT k, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct GROUP BY k ORDER BY k").await,
+        ["1|30", "2|5", "9|NULL"]
+    );
+    // A subquery reading a column that is not a group key is PostgreSQL's
+    // grouping error.
+    assert_eq!(code_of(&pool, "SELECT k, (SELECT max(v) FROM cu WHERE cu.k = ct.id) FROM ct GROUP BY k").await, "42803");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn shapes_not_supported_yet_are_refused() {
     let (_s, pool) = server().await;
-    assert_eq!(code_of(&pool, "SELECT k, (SELECT max(v) FROM cu WHERE cu.k = ct.k) FROM ct GROUP BY k").await, "0A000");
     assert_eq!(code_of(&pool, "SELECT (SELECT v, k FROM cu WHERE cu.k = ct.k) FROM ct").await, "42601");
 }
