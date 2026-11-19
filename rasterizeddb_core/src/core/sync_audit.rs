@@ -22,9 +22,13 @@ use parking_lot::Mutex;
 static WATCHERS: AtomicUsize = AtomicUsize::new(0);
 static WATCHED: Mutex<Vec<(PathBuf, Vec<(&'static str, PathBuf)>)>> = Mutex::new(Vec::new());
 
-/// One noted sync with what a crash image needs to know about it: the file's
-/// length when the sync was issued, which every byte of is durable once it
-/// returns, and the thread that issued it.
+/// One noted sync with what a crash image needs to know about it: how much
+/// of the file is durable once it returns, and the thread that issued it.
+///
+/// `len` is the file's length when the sync was issued, except for a log,
+/// which says where its records ended ([`note_extent`]): a log is longer
+/// than its records by the zeros it writes ahead of them, and records
+/// written after the sync land inside that length.
 #[cfg(any(test, feature = "index_store_failpoints"))]
 #[derive(Debug, Clone)]
 pub struct SyncEvent {
@@ -50,6 +54,20 @@ static EVENTS: Mutex<Vec<(PathBuf, Vec<SyncEvent>)>> = Mutex::new(Vec::new());
 /// Records a sync of `path` from the site named `tag`.
 #[inline]
 pub fn note(tag: &'static str, path: &Path) {
+    note_as(tag, path, None)
+}
+
+/// [`note`] for a file whose durable part is not its whole length: `extent`
+/// bytes of it are what the sync makes durable. The log's syncs, which cover
+/// its records and not the padding past them.
+#[inline]
+pub fn note_extent(tag: &'static str, path: &Path, extent: u64) {
+    note_as(tag, path, Some(extent))
+}
+
+#[inline]
+#[cfg_attr(not(any(test, feature = "index_store_failpoints")), allow(unused_variables))]
+fn note_as(tag: &'static str, path: &Path, extent: Option<u64>) {
     if WATCHERS.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -73,7 +91,7 @@ pub fn note(tag: &'static str, path: &Path) {
             // Taken before the caller's sync, so it is a lower bound on what
             // that sync makes durable: a crash image cut here never claims
             // more than the disk could hold.
-            let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let len = extent.unwrap_or_else(|| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
             let thread = std::thread::current().id();
             let event = SyncEvent {
                 tag,

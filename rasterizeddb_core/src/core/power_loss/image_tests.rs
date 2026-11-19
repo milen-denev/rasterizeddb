@@ -433,7 +433,7 @@ fn the_model_knows_every_noted_sync_tag() {
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();
-            for call in ["sync_audit::note(\"", "sync_audit::note_file(\""] {
+            for call in ["sync_audit::note(\"", "sync_audit::note_file(\"", "sync_audit::note_extent(\""] {
                 for (i, _) in text.match_indices(call) {
                     let rest = &text[i + call.len()..];
                     let tag = &rest[..rest.find('"').unwrap()];

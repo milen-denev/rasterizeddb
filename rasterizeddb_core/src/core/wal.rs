@@ -702,6 +702,34 @@ fn only_zeros(path: &Path, from: u64, to: u64) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Where the records of the log at `path` end: its length without the zeros
+/// written ahead of them. The whole length for a log with a torn tail, which
+/// is appended to at its end.
+///
+/// For the crash harnesses, which build an image of a log by cutting it at a
+/// length: they compare this with the extents its syncs were noted at
+/// ([`crate::core::sync_audit::note_extent`]). The file's own length says
+/// nothing about either.
+#[cfg(test)]
+pub(crate) fn records_len(path: &Path) -> u64 {
+    let len = std::fs::metadata(path).map_or(0, |m| m.len());
+    match log_extent(path, len) {
+        Some(found) if found.zero_tail => found.valid,
+        _ => len,
+    }
+}
+
+/// The bytes of `path` as a crash harness should see them: a log
+/// ([`DEFAULT_WAL_NAME`]) up to [`records_len`], any other file whole.
+#[cfg(test)]
+pub(crate) fn read_records(path: &Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(path).unwrap_or_default();
+    if path.file_name().is_some_and(|n| n == DEFAULT_WAL_NAME) {
+        bytes.truncate(records_len(path) as usize);
+    }
+    bytes
+}
+
 /// What [`Wal::reserve_locked`] writes from.
 static ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
 
@@ -1540,7 +1568,12 @@ impl Wal {
         // pages after reporting the error, so a second call could return success
         // while the data is gone. Poisoning instead makes every later commit
         // fail loudly rather than silently downgrading durability.
-        crate::core::sync_audit::note("wal.log", &self.path);
+        // The records written so far, not the file's length: the padding
+        // past them is not what this sync is for, and a crash harness that
+        // cut the log at the file's length would keep every record written
+        // after it. Read before the sync is issued, so it never claims more
+        // than the sync covers.
+        crate::core::sync_audit::note_extent("wal.log", &self.path, self.write_pos.load(Ordering::Relaxed));
         #[cfg(test)]
         let synced = match test_hooks::FAIL_LOG_SYNC.with(|f| f.take()) {
             Some(errno) => Err(io::Error::from_raw_os_error(errno)),
@@ -1775,10 +1808,14 @@ impl Wal {
         }
     }
 
-    /// This log's padding chunk, whatever the process-wide setting: a test
-    /// that flipped that would change every log its siblings have open.
-    #[cfg(test)]
-    pub(crate) fn set_prealloc_for_tests(&self, bytes: u64) {
+    /// Sets this log's padding chunk, whatever the process-wide setting
+    /// ([`crate::WAL_PREALLOC_BYTES`]); 0 turns padding off for it. Padding
+    /// already written stays until the log is next cut.
+    ///
+    /// For a caller that opens a log of its own, and for tests: one that
+    /// flipped the process-wide setting would change every log its siblings
+    /// have open.
+    pub fn set_prealloc(&self, bytes: u64) {
         let _writer = self.writer.lock();
         self.prealloc.store(bytes, Ordering::Relaxed);
     }
@@ -3786,11 +3823,7 @@ mod tests {
     /// its append point, which is what the file was before it had any.
     fn records(p: &Path) -> Vec<u8> {
         let mut raw = read_file(p);
-        if let Some(found) = log_extent(p, raw.len() as u64)
-            && found.zero_tail
-        {
-            raw.truncate(found.valid as usize);
-        }
+        raw.truncate(records_len(p) as usize);
         raw
     }
 
@@ -7283,7 +7316,7 @@ mod prealloc_tests {
 
     fn open(path: &Path, chunk: u64) -> Wal {
         let wal = Wal::open(path).unwrap();
-        wal.set_prealloc_for_tests(chunk);
+        wal.set_prealloc(chunk);
         wal
     }
 

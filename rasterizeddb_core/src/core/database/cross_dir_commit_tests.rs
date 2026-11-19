@@ -202,7 +202,8 @@ fn take_baseline(src: &Path, img: &Path) -> Baseline {
         let bytes = std::fs::read(&path).unwrap();
         let name = path.file_name().unwrap();
         if name == DEFAULT_WAL_NAME {
-            wal = bytes.clone();
+            // Its records: the zeros past them are overwritten as it grows.
+            wal = crate::core::wal::read_records(&path);
         }
         std::fs::write(img.join(name), &bytes).unwrap();
         files.insert(path);
@@ -221,7 +222,7 @@ fn take_baseline(src: &Path, img: &Path) -> Baseline {
 /// at, never below the baseline. Returns that length and the source log's.
 fn finish_image(b: &Baseline, events: &[SyncEvent]) -> (u64, u64) {
     let wal_path = b.src.join(DEFAULT_WAL_NAME);
-    let current = std::fs::read(&wal_path).unwrap_or_default();
+    let current = crate::core::wal::read_records(&wal_path);
     assert!(
         current.starts_with(&b.wal),
         "{} no longer begins with its baseline bytes: it was truncated or replaced \
@@ -737,7 +738,7 @@ fn log_syncs(events: Vec<SyncEvent>, me: ThreadId) -> (Vec<SyncEvent>, Vec<SyncE
 /// Some sync among `events`, whoever issued it, covered the whole of `wal` as
 /// it is now: what a statement that wrote there and committed must leave.
 fn assert_log_covered(wal: &Path, events: &[SyncEvent]) {
-    let len = std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0);
+    let len = crate::core::wal::records_len(wal);
     let synced = events
         .iter()
         .filter(|e| e.tag == "wal.log" && e.path.as_path() == wal)
