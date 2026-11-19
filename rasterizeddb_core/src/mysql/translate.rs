@@ -3782,12 +3782,15 @@ mod tests {
             UNIQUE KEY `users_email_unique` (`email`),
             KEY `idx_created` (`created_at`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        // A column's own `_ci` collation is the engine's case- and
+        // accent-insensitive one; the table's `COLLATE=` default is not
+        // applied (mysqldump writes it on every table).
         let out = tr(&e, sql);
         assert_eq!(
             out,
             "CREATE TABLE IF NOT EXISTS users (id bigserial NOT NULL, email varchar(255) NOT NULL, \
              active boolean NOT NULL DEFAULT 1, role varchar(5) DEFAULT 'user', CHECK (role IN ('admin', 'user')), \
-             created_at timestamptz NULL DEFAULT CURRENT_TIMESTAMP, bio text, PRIMARY KEY (id), \
+             created_at timestamptz NULL DEFAULT CURRENT_TIMESTAMP, bio text COLLATE rdb_ci_ai, PRIMARY KEY (id), \
              CONSTRAINT users__users_email_unique UNIQUE (email)); \
              CREATE INDEX IF NOT EXISTS users__idx_created ON users (created_at)"
         );
