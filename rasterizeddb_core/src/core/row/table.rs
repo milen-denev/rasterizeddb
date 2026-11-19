@@ -4603,20 +4603,7 @@ impl<S: StorageIO> Table<S> {
     /// Each `NUMERIC(p, s)` column's scale, where it is not the engine
     /// default, so a literal is bounded where the column stores it.
     fn decimal_scales(&self) -> smallvec::SmallVec<[(u32, u32); 4]> {
-        self.schema
-            .fields
-            .iter()
-            .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
-            .filter_map(|f| {
-                // A column that keeps each value's own scale, by its sentinel.
-                if crate::core::value_codec::keeps_own_scale(f) {
-                    return Some((f.write_order as u32, crate::core::value_codec::OWN_SCALE_SENTINEL));
-                }
-                f.scale
-                    .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
-                    .map(|s| (f.write_order as u32, s))
-            })
-            .collect()
+        crate::core::value_codec::decimal_scales(&self.schema.fields)
     }
 
     /// The candidate slots a secondary index gives for a tokenized WHERE

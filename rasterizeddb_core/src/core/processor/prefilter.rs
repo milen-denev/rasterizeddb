@@ -25,11 +25,15 @@
 //! * **The kernels are exact.** Each is held to `perform_comparison_operation`
 //!   value for value, PostgreSQL's NaN order included (see the kernel module).
 //! * **Only types those kernels decide exactly are admitted**, by the column's
-//!   *declared* type: the integer widths, `BOOL`, `CHAR`, `DATETIME` and the two
-//!   floats. Not `NUMERIC`, whose literal needs rescaling to the column's
-//!   scale, and not text or anything stored as text (JSONB, BYTEA, arrays),
-//!   whose order is not a fixed-width compare. A predicate on any other column
-//!   is opaque, and an opaque term keeps every row.
+//!   *declared* type: the integer widths, `BOOL`, `CHAR`, `DATETIME`, the two
+//!   floats, and a `NUMERIC` stored as one integer at one scale, which is
+//!   compared as that integer with the literal `sarg` has put at the same
+//!   scale (a literal with more places than the column keeps is left opaque
+//!   there, as is every comparison of a `NUMERIC` that keeps each value's own
+//!   scale: its cells are not one integer order). Not text or anything stored
+//!   as text (JSONB, BYTEA, arrays), whose order is not a fixed-width compare.
+//!   A predicate on any other column is opaque, and an opaque term keeps every
+//!   row.
 //! * **NULL cannot cause a drop.** A NULL stores its type's zero, with the
 //!   truth in a `__null_` companion, so the kernel compares a placeholder and
 //!   its answer for that row is arbitrary. That is still sound, because only
@@ -206,6 +210,8 @@ enum Kind {
     U64,
     F32,
     F64,
+    /// A `NUMERIC` cell: sixteen bytes, an `i128` at the column's scale.
+    I128,
 }
 
 impl Kind {
@@ -225,6 +231,9 @@ impl Kind {
             DbType::U64 => Kind::U64,
             DbType::F32 => Kind::F32,
             DbType::F64 => Kind::F64,
+            // One that keeps each value's own scale is not sixteen bytes wide,
+            // and `build` drops any column not as wide as its kind.
+            DbType::DECIMAL => Kind::I128,
             _ => return None,
         })
     }
@@ -235,6 +244,7 @@ impl Kind {
             Kind::I16 | Kind::U16 => 2,
             Kind::I32 | Kind::U32 | Kind::F32 => 4,
             Kind::I64 | Kind::U64 | Kind::F64 => 8,
+            Kind::I128 => 16,
         }
     }
 }
@@ -253,7 +263,7 @@ enum Node {
         col: usize,
         op: CmpOp,
         /// The literal's little-endian bytes, `kind.width()` of them.
-        lit: [u8; 8],
+        lit: [u8; 16],
     },
     And(Vec<Node>),
     Or(Vec<Node>),
@@ -354,8 +364,10 @@ impl BatchPrefilter {
             return None;
         }
 
-        // No `NUMERIC` gets past the gate, so no scales are needed.
-        let program = sarg::extract_gated(tokens, &|wo| usable.iter().any(|(u, _)| *u == wo), &[])?;
+        // A `NUMERIC` literal is encoded where its column stores it, by the
+        // scales every other reader of the clause is given.
+        let scales = crate::core::value_codec::decimal_scales(schema);
+        let program = sarg::extract_gated(tokens, &|wo| usable.iter().any(|(u, _)| *u == wo), &scales)?;
 
         let mut columns: SmallVec<[Column; 4]> = SmallVec::new();
         let mut slot_of: SmallVec<[(u32, usize); 4]> = SmallVec::new();
@@ -571,7 +583,7 @@ fn compile(
                 *exact = false;
                 return Node::All;
             }
-            let mut lit = [0u8; 8];
+            let mut lit = [0u8; 16];
             lit[..width].copy_from_slice(&p.value);
             let col = match slot_of.iter().find(|(wo, _)| *wo == p.write_order) {
                 Some((_, slot)) => *slot,
@@ -618,7 +630,7 @@ fn compile(
     }
 }
 
-fn compare_column(kind: Kind, buf: &[u64], m: usize, op: CmpOp, lit: &[u8; 8], out: &mut [u64]) {
+fn compare_column(kind: Kind, buf: &[u64], m: usize, op: CmpOp, lit: &[u8; 16], out: &mut [u64]) {
     // SAFETY: `buf` holds at least `m * width` initialised bytes and is 8-byte
     // aligned, which satisfies every lane type here.
     unsafe fn view<T>(buf: &[u64], m: usize) -> &[T] {
@@ -636,10 +648,24 @@ fn compare_column(kind: Kind, buf: &[u64], m: usize, op: CmpOp, lit: &[u8; 8], o
             Kind::U16 => go(view::<u16>(buf, m), op, u16::from_le_bytes([lit[0], lit[1]]), out),
             Kind::I32 => go(view::<i32>(buf, m), op, i32::from_le_bytes(lit[..4].try_into().unwrap()), out),
             Kind::U32 => go(view::<u32>(buf, m), op, u32::from_le_bytes(lit[..4].try_into().unwrap()), out),
-            Kind::I64 => go(view::<i64>(buf, m), op, i64::from_le_bytes(*lit), out),
-            Kind::U64 => go(view::<u64>(buf, m), op, u64::from_le_bytes(*lit), out),
+            Kind::I64 => go(view::<i64>(buf, m), op, i64::from_le_bytes(lit[..8].try_into().unwrap()), out),
+            Kind::U64 => go(view::<u64>(buf, m), op, u64::from_le_bytes(lit[..8].try_into().unwrap()), out),
             Kind::F32 => go(view::<f32>(buf, m), op, f32::from_le_bytes(lit[..4].try_into().unwrap()), out),
-            Kind::F64 => go(view::<f64>(buf, m), op, f64::from_le_bytes(*lit), out),
+            Kind::F64 => go(view::<f64>(buf, m), op, f64::from_le_bytes(lit[..8].try_into().unwrap()), out),
+            // No lane type: the buffer is eight-byte aligned and an `i128`
+            // wants sixteen, and there is no 128-bit compare to feed it to.
+            // A plain loop over a batch is still microseconds, against the
+            // fetch and interpretation of each row it spares.
+            Kind::I128 => {
+                let k = i128::from_le_bytes(*lit);
+                let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, m * 16);
+                let words = words_for(m);
+                out[..words].iter_mut().for_each(|w| *w = 0);
+                for (i, cell) in bytes.chunks_exact(16).enumerate() {
+                    let v = i128::from_le_bytes(cell.try_into().unwrap());
+                    out[i >> 6] |= (op.holds(v.cmp(&k)) as u64) << (i & 63);
+                }
+            }
         }
     }
 }
@@ -718,7 +744,7 @@ mod tests {
             cell(rng, |r| if r.next() % 2 == 0 { "true" } else { "false" }.to_string(), &[]),
             cell(rng, |r| format!("'2024-{:02}-15 12:00:00+00'", r.next() % 12 + 1), &[]),
             cell(rng, |r| format!("'x{}'", r.next() % 10), &["''"]),
-            cell(rng, |r| format!("{:.2}", small(r) as f64 / 8.0), &[]),
+            cell(rng, |r| format!("{:.2}", small(r) as f64 / 8.0), &["99999999.99", "-99999999.99"]),
         ];
         format!("({id}, {})", v.join(", "))
     }
@@ -959,6 +985,14 @@ mod tests {
         "(i32c > 10 AND i64c < 0) OR (u8c = 7 AND f IS NULL)",
         // `predicate_rewrite` pushes the `NOT` down to `i32c <= 10`.
         "NOT i32c > 10",
+        // A `NUMERIC(10,2)`: its cells are one integer each, at two places.
+        "n > 1.5",
+        "n <= -2.25",
+        "n = 0.5",
+        "n > 1.5 AND i32c < 0",
+        "n BETWEEN -1 AND 1",
+        "n IS NULL OR n < 0",
+        "n >= 99999999.99 OR n = -99999999.99",
     ];
 
     /// Clauses with a term left opaque, alone or beside a decided one: the
@@ -969,7 +1003,9 @@ mod tests {
         "s = 'x5'",
         "s = 'x5' AND i32c > 0",
         "s = 'x5' OR i32c > 40",
-        "n > 1.5 AND i32c < 0",
+        // More places than the column keeps: the evaluator compares that
+        // one at the engine's scale, so `sarg` leaves it alone.
+        "n > 1.555 AND i32c < 0",
         "i32c + 1 > 10",
         "i32c > 10 AND i32c != 12",
     ];
