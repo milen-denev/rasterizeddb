@@ -183,6 +183,9 @@ fn user_tables(database: &Database) -> BTreeSet<String> {
 struct Shape {
     columns: Vec<(String, String)>,
     indexes: BTreeSet<String>,
+    /// Columns `information_schema` reports `NOT NULL` (already part of
+    /// each column's signature; kept apart to be asked).
+    not_null: BTreeSet<String>,
 }
 
 impl Shape {
@@ -205,7 +208,7 @@ async fn shapes(
              character_maximum_length, numeric_precision, numeric_scale FROM information_schema.columns",
         )
         .await?;
-    let mut ordered: Vec<(String, i64, String, String)> = columns
+    let mut ordered: Vec<(String, i64, String, String, String)> = columns
         .rows
         .iter()
         .map(|r| {
@@ -222,12 +225,16 @@ async fn shapes(
                     text(&at(6)),
                     text(&at(7))
                 ),
+                text(&at(4)),
             )
         })
         .collect();
     ordered.sort();
-    for (table, _, column, signature) in ordered {
+    for (table, _, column, signature, nullable) in ordered {
         if let Some(shape) = out.get_mut(&table) {
+            if nullable == "NO" {
+                shape.not_null.insert(column.clone());
+            }
             shape.columns.push((column, signature));
         }
     }
@@ -343,9 +350,17 @@ async fn read_projected(
     table: &str,
     columns: &[String],
 ) -> Result<(Projected, Vec<i32>), String> {
-    let said = session
-        .run(&format!("SELECT * FROM {}", ident(table)))
-        .await?;
+    read_query(session, &format!("SELECT * FROM {}", ident(table)), columns).await
+}
+
+/// Runs `sql`, a `SELECT *` of one table, and projects its rows onto
+/// `columns`.
+async fn read_query(
+    session: &mut Internal,
+    sql: &str,
+    columns: &[String],
+) -> Result<(Projected, Vec<i32>), String> {
+    let said = session.run(sql).await?;
     let oids = said.columns.clone().unwrap_or_default();
     let at: Vec<Option<usize>> = columns
         .iter()
@@ -709,6 +724,7 @@ fn plan_keyless(input: &TableInput<'_>, skip: &[bool], plan: &mut TablePlan) {
     // A row is found on the parent by the columns it has.
     let all: Vec<usize> = (0..input.columns.len()).filter(|&i| !skip[i]).collect();
     let mut inserts: Vec<Vec<Cell>> = Vec::new();
+    let mut added: Vec<Vec<Cell>> = Vec::new();
     let mut tuples: Vec<&Vec<Cell>> = cb.keys().chain(cr.keys()).collect();
     tuples.sort();
     tuples.dedup();
@@ -734,7 +750,7 @@ fn plan_keyless(input: &TableInput<'_>, skip: &[bool], plan: &mut TablePlan) {
         if r > p {
             plan.inserts += r - p;
             for _ in 0..(r - p) {
-                inserts.push(t.clone());
+                added.push(t.clone());
             }
         } else {
             // There is no way to delete some of identical rows: all go, and
@@ -753,6 +769,8 @@ fn plan_keyless(input: &TableInput<'_>, skip: &[bool], plan: &mut TablePlan) {
     let statements = insert_statements(input, skip, &inserts);
     // Written back after the delete that made room for them.
     plan.deletes_sql.extend(statements);
+    // Rows only added go with the other inserts, parents first.
+    plan.writes.extend(insert_statements(input, skip, &added));
 }
 
 /// Orders tables so a table comes after the ones it references.
@@ -784,6 +802,232 @@ fn parents_first(tables: &[String], references: &HashMap<String, BTreeSet<String
         visit(t, tables, references, &mut visiting, &mut out);
     }
     out
+}
+
+/// Rows per page of a paged comparison: what one round holds of each side.
+#[cfg(not(test))]
+const MERGE_PAGE: usize = 20_000;
+/// A few, in tests: every merge a test runs then pages.
+#[cfg(test)]
+const MERGE_PAGE: usize = 3;
+
+/// The block a merge (and a diff) reads in: every page at one snapshot, and
+/// a write over a row another session changed meanwhile refused rather than
+/// lost.
+const SNAPSHOT_BLOCK: &str = "BEGIN ISOLATION LEVEL REPEATABLE READ";
+
+/// The three sessions a comparison reads.
+struct Sides<'a> {
+    base: &'a mut Internal,
+    branch: &'a mut Internal,
+    parent: &'a mut Internal,
+}
+
+/// What a pass over one table does besides comparing it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pass {
+    /// Nothing: a diff.
+    Count,
+    /// Runs the deletes (a keyless table's rewrites among them).
+    Deletes,
+    /// Runs the updates and inserts.
+    Writes,
+}
+
+/// One table, as every page of it is compared.
+struct TableSpec {
+    table: String,
+    /// The branch's columns, which every side is read as.
+    columns: Vec<String>,
+    /// The columns identifying a row (`key_of`).
+    key: Option<Vec<usize>>,
+    /// The primary key, when the table is compared a page at a time on it;
+    /// `None` reads each side whole.
+    stream: Option<Vec<usize>>,
+    generated: BTreeSet<String>,
+    defaulted: BTreeSet<String>,
+    in_base: bool,
+    in_parent: bool,
+}
+
+/// One table's totals over its pages.
+#[derive(Default)]
+struct TableTotals {
+    inserts: u64,
+    updates: u64,
+    deletes: u64,
+    conflicts: u64,
+    /// The first conflicts, described; the rest are only counted.
+    shown: Vec<String>,
+    left_out: BTreeSet<String>,
+}
+
+/// Reads `table` from `session`, projected onto `columns`: whole, or with
+/// `order` (key positions and the column types their bounds are written
+/// as), the rows after `after` and through `upto` in key order, at most a
+/// page. Whether the page came back full is the third value: rows past it
+/// in the range may remain.
+async fn read_range(
+    session: &mut Internal,
+    table: &str,
+    columns: &[String],
+    order: Option<(&[usize], &[i32])>,
+    after: Option<&[Cell]>,
+    upto: Option<&[Cell]>,
+) -> Result<(Projected, Vec<i32>, bool), String> {
+    let Some((key, oids)) = order else {
+        let (projected, oids) = read_projected(session, table, columns).await?;
+        return Ok((projected, oids, false));
+    };
+    let names: Vec<String> = key.iter().map(|&i| ident(&columns[i])).collect();
+    let tuple = |parts: Vec<String>| {
+        if parts.len() == 1 {
+            parts.into_iter().next().unwrap_or_default()
+        } else {
+            format!("({})", parts.join(", "))
+        }
+    };
+    let lhs = tuple(names.clone());
+    let bound = |row: &[Cell]| tuple(key.iter().map(|&i| literal(oids[i], &row[i])).collect());
+    let mut conditions = Vec::new();
+    if let Some(after) = after {
+        conditions.push(format!("{lhs} > {}", bound(after)));
+    }
+    if let Some(upto) = upto {
+        conditions.push(format!("{lhs} <= {}", bound(upto)));
+    }
+    let sql = format!(
+        "SELECT * FROM {}{} ORDER BY {} LIMIT {MERGE_PAGE}",
+        ident(table),
+        if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        },
+        names.join(", ")
+    );
+    let (projected, oids) = read_query(session, &sql, columns).await?;
+    let full = projected.rows.len() >= MERGE_PAGE;
+    Ok((projected, oids, full))
+}
+
+fn as_ref(o: &Option<(Vec<usize>, Vec<i32>)>) -> Option<(&[usize], &[i32])> {
+    o.as_ref().map(|(k, x)| (k.as_slice(), x.as_slice()))
+}
+
+/// Compares `spec`'s table a page at a time (or whole, unpaged), adding to
+/// `totals` and running what `pass` runs on the parent.
+///
+/// A round reads the branch's next page, then the base's and the parent's
+/// within it; a side whose page comes back full ends the round's range at
+/// its last row, and the sides read before are read again up to there. So
+/// every side holds each row of the range, the range's bound is the
+/// engine's own ordering, and no round holds more than a page of a side.
+async fn run_table(
+    sides: &mut Sides<'_>,
+    spec: &TableSpec,
+    policy: ConflictPolicy,
+    pass: Pass,
+    totals: &mut TableTotals,
+) -> Result<(), Failure> {
+    let internal = |e: String| ("XX000", e);
+    let t = spec.table.as_str();
+    let cols = spec.columns.as_slice();
+    let mut oids: Vec<i32> = Vec::new();
+    let mut after: Option<Vec<Cell>> = None;
+    loop {
+        let order = |oids: &[i32]| -> Option<(Vec<usize>, Vec<i32>)> {
+            spec.stream.as_ref().map(|k| (k.clone(), oids.to_vec()))
+        };
+        let o = order(&oids);
+        let (mut r, r_oids, r_full) = read_range(sides.branch, t, cols, as_ref(&o), after.as_deref(), None)
+            .await
+            .map_err(internal)?;
+        if oids.is_empty() {
+            oids = r_oids.clone();
+        }
+        let o = order(&oids);
+        let mut upto: Option<Vec<Cell>> = if r_full { r.rows.last().cloned() } else { None };
+        let mut b = None;
+        if spec.in_base {
+            let (page, _, full) = read_range(sides.base, t, cols, as_ref(&o), after.as_deref(), upto.as_deref())
+                .await
+                .map_err(internal)?;
+            if full {
+                upto = page.rows.last().cloned();
+                r = read_range(sides.branch, t, cols, as_ref(&o), after.as_deref(), upto.as_deref())
+                    .await
+                    .map_err(internal)?
+                    .0;
+            }
+            b = Some(page);
+        }
+        let mut p = None;
+        if spec.in_parent {
+            let (page, _, full) = read_range(sides.parent, t, cols, as_ref(&o), after.as_deref(), upto.as_deref())
+                .await
+                .map_err(internal)?;
+            if full {
+                upto = page.rows.last().cloned();
+                r = read_range(sides.branch, t, cols, as_ref(&o), after.as_deref(), upto.as_deref())
+                    .await
+                    .map_err(internal)?
+                    .0;
+                if spec.in_base {
+                    b = Some(
+                        read_range(sides.base, t, cols, as_ref(&o), after.as_deref(), upto.as_deref())
+                            .await
+                            .map_err(internal)?
+                            .0,
+                    );
+                }
+            }
+            p = Some(page);
+        }
+
+        let plan = plan_table(TableInput {
+            table: t,
+            columns: cols,
+            oids: &oids,
+            key: spec.key.clone(),
+            generated: &spec.generated,
+            defaulted: &spec.defaulted,
+            base: b,
+            branch: r,
+            parent: p,
+            policy,
+        });
+        totals.inserts += plan.inserts;
+        totals.updates += plan.updates;
+        totals.deletes += plan.deletes;
+        totals.conflicts += plan.conflicts.len() as u64;
+        for c in plan.conflicts {
+            if totals.shown.len() < CONFLICTS_SHOWN {
+                totals.shown.push(c);
+            }
+        }
+        totals.left_out.extend(plan.left_out);
+        let run = match pass {
+            Pass::Count => Vec::new(),
+            Pass::Deletes => plan.deletes_sql,
+            Pass::Writes => plan.writes,
+        };
+        for stmt in run {
+            sides.parent.run(&stmt).await.map_err(|e| {
+                (
+                    "55000",
+                    format!(
+                        "merging failed on the parent ({e}) at `{}`; nothing was merged",
+                        stmt.chars().take(160).collect::<String>()
+                    ),
+                )
+            })?;
+        }
+        match upto {
+            Some(bound) => after = Some(bound),
+            None => return Ok(()),
+        }
+    }
 }
 
 /// Diffs the branch `name` against its parent and base; with `apply`, also
@@ -1024,7 +1268,7 @@ async fn merge_with(
                 }
             }
         }
-        parent.run("BEGIN").await.map_err(internal)?;
+        parent.run(SNAPSHOT_BLOCK).await.map_err(internal)?;
         if apply_ddl {
             for stmt in ddl {
                 if let Err(e) = parent.run(stmt).await {
@@ -1073,7 +1317,16 @@ async fn merge_with(
     } else {
         parent_tables.clone()
     };
-    let mut plans: Vec<(String, TablePlan)> = Vec::new();
+    // Each table as the parent has it now: as the branch has it once its
+    // DDL replayed (checked above), else as it was.
+    let parent_shape = |t: &String| -> Option<&Shape> {
+        if apply_ddl && needs_ddl.contains(t) {
+            branch_shapes.get(t)
+        } else {
+            parent_shapes.get(t)
+        }
+    };
+    let mut specs: Vec<TableSpec> = Vec::new();
     let mut references: HashMap<String, BTreeSet<String>> = HashMap::new();
     for table in &branch_tables {
         let Some(shape) = branch_shapes.get(table) else {
@@ -1086,66 +1339,100 @@ async fn merge_with(
             continue;
         }
         let columns = shape.column_names();
-        let read = async {
-            let (branch_rows, oids) = read_projected(&mut branch, table, &columns).await?;
-            let base_rows = if base_tables.contains(table) {
-                Some(read_projected(&mut base, table, &columns).await?.0)
-            } else {
-                None
+        let in_base = base_tables.contains(table);
+        let in_parent = parent_now.contains(table);
+        // Paged on the key rows are matched by, when none of its columns
+        // can be NULL (a NULL has no place in a range) and every side read
+        // has them.
+        let key = key_of(branch_db, table, &columns);
+        let stream = key.clone().filter(|k| k.iter().all(|&i| shape.not_null.contains(&columns[i]))).filter(|pk| {
+            let has = |shape: Option<&Shape>| {
+                shape.is_some_and(|s| {
+                    pk.iter()
+                        .all(|&i| s.columns.iter().any(|(n, _)| n == &columns[i]))
+                })
             };
-            let parent_rows = if parent_now.contains(table) {
-                Some(read_projected(&mut parent, table, &columns).await?.0)
-            } else {
-                None
-            };
-            Ok::<_, String>((branch_rows, oids, base_rows, parent_rows))
-        };
-        let (branch_rows, oids, base_rows, parent_rows) = match read.await {
-            Ok(r) => r,
-            Err(e) => {
-                parent.rollback().await;
-                return Err(internal(e));
-            }
-        };
-        let generated = generated_of(branch_db, table);
-        let defaulted = defaulted_of(branch_db, table);
-        let plan = plan_table(TableInput {
-            table,
-            columns: &columns,
-            oids: &oids,
-            key: key_of(branch_db, table, &columns),
-            generated: &generated,
-            defaulted: &defaulted,
-            base: base_rows,
-            branch: branch_rows,
-            parent: parent_rows,
-            policy,
+            (!in_base || has(base_shapes.get(table))) && (!in_parent || has(parent_shape(table)))
         });
         references.insert(table.clone(), references_of(branch_db, table));
-        plans.push((table.clone(), plan));
+        specs.push(TableSpec {
+            table: table.clone(),
+            key,
+            stream,
+            generated: generated_of(branch_db, table),
+            defaulted: defaulted_of(branch_db, table),
+            columns,
+            in_base,
+            in_parent,
+        });
+    }
+    let names: Vec<String> = specs.iter().map(|s| s.table.clone()).collect();
+    let order = parents_first(&names, &references);
+    let by_name: HashMap<&String, &TableSpec> = specs.iter().map(|s| (&s.table, s)).collect();
+
+    // A diff reads the live parent and branch, each at one point.
+    if apply.is_none() {
+        for session in [&mut parent, &mut branch] {
+            session.run(SNAPSHOT_BLOCK).await.map_err(internal)?;
+        }
+    }
+    let mut sides = Sides {
+        base: &mut base,
+        branch: &mut branch,
+        parent: &mut parent,
+    };
+    // First pass, children first: every table compared whole, conflicts
+    // counted, and on a merge the deletes run. Then, parents first, the
+    // updates and inserts.
+    let mut totals: HashMap<String, TableTotals> = HashMap::new();
+    let mut failed: Option<Failure> = None;
+    let first = if apply.is_some() { Pass::Deletes } else { Pass::Count };
+    for t in order.iter().rev() {
+        let mut total = TableTotals::default();
+        if let Err(e) = run_table(&mut sides, by_name[t], policy, first, &mut total).await {
+            failed = Some(e);
+            break;
+        }
+        totals.insert(t.clone(), total);
+    }
+    let conflicted: u64 = totals.values().map(|t| t.conflicts).sum::<u64>() + schema_conflicts.len() as u64;
+    if failed.is_none() && apply.is_some() && !(policy == ConflictPolicy::Fail && conflicted > 0) {
+        for t in &order {
+            let mut ignored = TableTotals::default();
+            if let Err(e) = run_table(&mut sides, by_name[t], policy, Pass::Writes, &mut ignored).await {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = failed {
+        parent.rollback().await;
+        branch.rollback().await;
+        return Err(e);
     }
 
     let mut conflicts: Vec<String> = schema_conflicts.clone();
-    for (table, plan) in &plans {
-        if plan.inserts + plan.updates + plan.deletes == 0
-            && plan.conflicts.is_empty()
-            && plan.left_out.is_empty()
+    for t in &order {
+        let total = &totals[t];
+        if total.inserts + total.updates + total.deletes == 0
+            && total.conflicts == 0
+            && total.left_out.is_empty()
         {
             continue;
         }
-        conflicts.extend(plan.conflicts.iter().map(|c| format!("{table}: {c}")));
+        conflicts.extend(total.shown.iter().map(|c| format!("{t}: {c}")));
         rows.push(DiffRow {
-            table: table.clone(),
+            table: t.clone(),
             change: "data",
-            inserts: plan.inserts,
-            updates: plan.updates,
-            deletes: plan.deletes,
-            conflicts: plan.conflicts.len() as u64,
-            detail: match (plan.conflicts.first(), plan.left_out.is_empty()) {
+            inserts: total.inserts,
+            updates: total.updates,
+            deletes: total.deletes,
+            conflicts: total.conflicts,
+            detail: match (total.shown.first(), total.left_out.is_empty()) {
                 (Some(c), _) => c.clone(),
                 (None, false) => format!(
                     "the parent has no column {}; the branch's values in it are left out",
-                    plan.left_out.iter().cloned().collect::<Vec<_>>().join(", ")
+                    total.left_out.iter().cloned().collect::<Vec<_>>().join(", ")
                 ),
                 (None, true) => String::new(),
             },
@@ -1153,16 +1440,16 @@ async fn merge_with(
     }
 
     if apply.is_some() {
-        if policy == ConflictPolicy::Fail && !conflicts.is_empty() {
+        if policy == ConflictPolicy::Fail && conflicted > 0 {
             parent.rollback().await;
             let shown: Vec<String> = conflicts.iter().take(CONFLICTS_SHOWN).cloned().collect();
-            let more = conflicts.len().saturating_sub(CONFLICTS_SHOWN);
+            let more = (conflicted as usize).saturating_sub(shown.len());
             return Err((
                 "40001",
                 format!(
                     "merge conflict: {} change(s) were made differently on both sides, and nothing was merged: \
                      {}{}. SHOW BRANCH DIFF lists them; ON CONFLICT BRANCH WINS or PARENT WINS resolves them",
-                    conflicts.len(),
+                    conflicted,
                     shown.join("; "),
                     if more > 0 {
                         format!("; and {more} more")
@@ -1172,32 +1459,13 @@ async fn merge_with(
                 ),
             ));
         }
-        let names: Vec<String> = plans.iter().map(|(t, _)| t.clone()).collect();
-        let order = parents_first(&names, &references);
-        let by_name: HashMap<&String, &TablePlan> = plans.iter().map(|(t, p)| (t, p)).collect();
-        let mut statements: Vec<&String> = Vec::new();
-        for t in order.iter().rev() {
-            statements.extend(by_name[t].deletes_sql.iter());
-        }
-        for t in &order {
-            statements.extend(by_name[t].writes.iter());
-        }
-        for stmt in statements {
-            if let Err(e) = parent.run(stmt).await {
-                parent.rollback().await;
-                return Err((
-                    "55000",
-                    format!(
-                        "merging failed on the parent ({e}) at `{}`; nothing was merged",
-                        stmt.chars().take(160).collect::<String>()
-                    ),
-                ));
-            }
-        }
         if let Err(e) = parent.run("COMMIT").await {
             parent.rollback().await;
             return Err(("55000", format!("the merge could not commit: {e}")));
         }
+    } else {
+        parent.rollback().await;
+        branch.rollback().await;
     }
     rows.sort_by(|a, b| a.table.cmp(&b.table).then(b.change.cmp(a.change)));
     Ok(rows)

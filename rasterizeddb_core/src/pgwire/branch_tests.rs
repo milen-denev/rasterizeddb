@@ -974,3 +974,85 @@ async fn a_table_on_a_store_comes_over_as_the_branchs_own() {
     assert!(refused.1.contains("'scratch'"), "{refused:?}");
     assert!(fx.catalog.get("other").is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_pages_through_a_table_and_a_late_conflict_undoes_it_all() {
+    // Pages are three rows in tests: thirty rows on a composite key take
+    // a dozen rounds, with the sides' changes in different pages.
+    let fx = Fixture::new("paged").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE DATABASE prod").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE TABLE grid (a INT, b TEXT, v INT, w TEXT, PRIMARY KEY (a, b))")
+        .await;
+    let values: Vec<String> = (1..=30)
+        .map(|i| format!("({}, '{}', {i}, 'w{i}')", i % 10, ["x", "y", "z"][i / 10 % 3]))
+        .collect();
+    prod.exec(&format!("INSERT INTO grid (a, b, v, w) VALUES {}", values.join(", ")))
+        .await;
+    let before = prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await;
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+
+    let mut dev = fx.client("dev");
+    dev.exec("DELETE FROM grid WHERE a = 1").await; // early pages
+    dev.exec("UPDATE grid SET v = v + 100 WHERE a = 5").await; // middle
+    dev.exec("INSERT INTO grid (a, b, v, w) VALUES (9, 'q', 900, 'new'), (0, 'a', 0, 'first')")
+        .await;
+    prod.exec("UPDATE grid SET w = 'parent' WHERE a = 7").await;
+    prod.exec("INSERT INTO grid (a, b, v, w) VALUES (8, 'p', 800, 'p')").await;
+    // Denser on the parent than on either other side: its pages end the
+    // rounds' ranges there.
+    prod.exec("INSERT INTO grid (a, b, v, w) VALUES (3, 'a', 1, 'p'), (3, 'b', 2, 'p'), (3, 'c', 3, 'p'), (3, 'd', 4, 'p')")
+        .await;
+
+    // A conflict in the last page fails the whole merge: the early pages'
+    // deletes are undone with it.
+    dev.exec("UPDATE grid SET w = 'branch' WHERE a = 9 AND b = 'z'").await;
+    prod.exec("UPDATE grid SET w = 'theirs' WHERE a = 9 AND b = 'z'").await;
+    let parent_before = prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await;
+    let refused = admin
+        .try_exec("MERGE BRANCH dev")
+        .await
+        .expect_err("a conflict merged");
+    assert_eq!(refused.0, "40001", "{refused:?}");
+    assert!(refused.1.contains("a=9, b=z"), "{refused:?}");
+    assert_eq!(
+        prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await,
+        parent_before,
+        "a failed merge left writes behind"
+    );
+
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    let grid = diff.iter().find(|r| r[0] == "grid").unwrap_or_else(|| panic!("{diff:?}"));
+    assert_eq!(&grid[2..6], &["2", "3", "3", "1"], "{diff:?}");
+
+    admin.exec("MERGE BRANCH dev ON CONFLICT PARENT WINS").await;
+    // What the merge should have made, worked out row by row.
+    let mut expected: Vec<Vec<String>> = before
+        .into_iter()
+        .filter(|r| r[0] != "1")
+        .map(|mut r| {
+            if r[0] == "5" {
+                r[2] = (r[2].parse::<i64>().unwrap() + 100).to_string();
+            }
+            if r[0] == "7" {
+                r[3] = "parent".into();
+            }
+            if r[0] == "9" && r[1] == "z" {
+                r[3] = "theirs".into();
+            }
+            r
+        })
+        .collect();
+    expected.push(row(&["9", "q", "900", "new"]));
+    expected.push(row(&["0", "a", "0", "first"]));
+    expected.push(row(&["8", "p", "800", "p"]));
+    for (b, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        expected.push(row(&["3", b, v, "p"]));
+    }
+    expected.sort_by(|x, y| {
+        (x[0].parse::<i64>().unwrap(), x[1].clone()).cmp(&(y[0].parse::<i64>().unwrap(), y[1].clone()))
+    });
+    assert_eq!(prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await, expected);
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}
