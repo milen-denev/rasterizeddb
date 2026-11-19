@@ -569,6 +569,82 @@ pub fn page_sql(
     sql
 }
 
+/// A page that starts after a key rather than at an offset: the rows whose
+/// `key` is past `after` (the key of the previous page's last row, as a
+/// literal from [`key_literal`]), in key order, `limit` of them.
+///
+/// The same rows as `page_sql` ordered by the key alone gives at the
+/// matching offset, without the server producing and skipping every row
+/// before them: `OFFSET 90000` is ninety thousand rows read, sorted and
+/// thrown away for each page that deep.
+pub fn page_after_sql(
+    table: &str,
+    filter: Option<&RowFilter>,
+    key: &str,
+    descending: bool,
+    after: &str,
+    limit: usize,
+) -> String {
+    let past = format!(
+        "{} {} {}",
+        quote_ident(key),
+        if descending { "<" } else { ">" },
+        after
+    );
+    let condition = match filter {
+        Some(filter) => format!("{} AND {}", filter.where_clause(), past),
+        None => format!(" WHERE {}", past),
+    };
+    format!(
+        "SELECT * FROM {}{} ORDER BY {}{} LIMIT {}",
+        quote_ident(table),
+        condition,
+        quote_ident(key),
+        if descending { " DESC" } else { "" },
+        limit
+    )
+}
+
+/// How a key column's values are written back as a literal, when a page can
+/// start after one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysetKind {
+    /// An integer, written as its digits.
+    Integer,
+    /// Text, written as a quoted string.
+    Text,
+}
+
+impl KeysetKind {
+    /// The kind of a column declared `data_type`, or `None` for a type whose
+    /// order and literal this does not vouch for (a float, a timestamp, a
+    /// UUID, NUMERIC): those pages stay at an offset.
+    pub fn of(data_type: &str) -> Option<KeysetKind> {
+        let upper = data_type.trim().to_ascii_uppercase();
+        let base = upper.split('(').next().unwrap_or("").trim();
+        match base {
+            "SMALLINT" | "INTEGER" | "INT" | "BIGINT" | "INT2" | "INT4" | "INT8" | "TINYINT"
+            | "UTINYINT" | "USMALLINT" | "UINTEGER" | "UINT" | "UBIGINT" | "HUGEINT"
+            | "UHUGEINT" | "SMALLSERIAL" | "SERIAL" | "BIGSERIAL" => Some(KeysetKind::Integer),
+            "TEXT" | "VARCHAR" | "CHARACTER VARYING" => Some(KeysetKind::Text),
+            _ => None,
+        }
+    }
+}
+
+/// A key's value, as the grid shows it, as a literal to page after; `None`
+/// when it cannot be written exactly (an integer cell that is not one).
+pub fn key_literal(value: &str, kind: KeysetKind) -> Option<String> {
+    match kind {
+        KeysetKind::Integer => {
+            let digits = value.strip_prefix('-').unwrap_or(value);
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.to_string())
+        }
+        KeysetKind::Text => Some(quote_literal(value)),
+    }
+}
+
 /// The exact row count, which both engines answer by scanning.
 pub fn count_sql(table: &str, filter: Option<&RowFilter>) -> String {
     format!(
@@ -3197,6 +3273,30 @@ mod branch_sql_tests {
             merge_branch_sql("dev", MergePolicy::BranchWins, true),
             "MERGE BRANCH \"dev\" ON CONFLICT BRANCH WINS ALLOW DROP"
         );
+    }
+
+    #[test]
+    fn a_keyset_page_starts_after_its_key_with_or_without_a_filter() {
+        assert_eq!(
+            page_after_sql("t", None, "id", false, "42", 100),
+            "SELECT * FROM \"t\" WHERE \"id\" > 42 ORDER BY \"id\" LIMIT 100"
+        );
+        let filter = RowFilter::parse("a = 1 OR b = 2").unwrap().unwrap();
+        assert_eq!(
+            page_after_sql("t", Some(&filter), "name", true, "'o''brien'", 10),
+            "SELECT * FROM \"t\" WHERE (\na = 1 OR b = 2\n) AND \"name\" < 'o''brien' ORDER BY \"name\" DESC LIMIT 10"
+        );
+        assert_eq!(KeysetKind::of("bigint"), Some(KeysetKind::Integer));
+        assert_eq!(KeysetKind::of("VARCHAR(40)"), Some(KeysetKind::Text));
+        assert_eq!(KeysetKind::of("character varying"), Some(KeysetKind::Text));
+        for other in ["UUID", "NUMERIC(10,2)", "DOUBLE PRECISION", "TIMESTAMPTZ", "CHAR(3)", "INTERVAL"] {
+            assert_eq!(KeysetKind::of(other), None, "{other}");
+        }
+        assert_eq!(key_literal("-17", KeysetKind::Integer).as_deref(), Some("-17"));
+        assert_eq!(key_literal("1e3", KeysetKind::Integer), None);
+        assert_eq!(key_literal("", KeysetKind::Integer), None);
+        assert_eq!(key_literal("1; DROP", KeysetKind::Integer), None);
+        assert_eq!(key_literal("it's", KeysetKind::Text).as_deref(), Some("'it''s'"));
     }
 
     #[test]

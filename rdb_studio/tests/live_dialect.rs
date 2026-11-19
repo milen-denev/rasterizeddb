@@ -1675,3 +1675,113 @@ async fn a_verifying_profile_accepts_only_its_ca() {
     let session = conn::connect(plain).await.unwrap();
     assert!(!session.verified, "{url}");
 }
+
+/// Pages the data browser reads after the previous page's last key hold the
+/// same rows, in the same order, as the same pages read at an offset: by an
+/// integer key and by a text key holding quotes, ascending and descending,
+/// with and without a filter. Driven through the browser's own state, so
+/// the statements are the ones it sends.
+async fn exercise_keyset(session: &Session) {
+    use rdb_studio::app::{GridSort, Message, Studio};
+    let flavor = session.flavor;
+    let table = "studio_keyset_probe";
+    let quoted = dialect::quote_ident(table);
+    let _ = session.execute(&format!("DROP TABLE IF EXISTS {quoted}")).await;
+    session
+        .execute(&format!(
+            "CREATE TABLE {quoted} (id BIGINT PRIMARY KEY, n INTEGER NOT NULL)"
+        ))
+        .await
+        .unwrap();
+    let values = (1..=25)
+        .map(|i| format!("({}, {})", (i * 37) % 101, i % 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    session
+        .execute(&format!("INSERT INTO {quoted} (id, n) VALUES {values}"))
+        .await
+        .unwrap();
+    let text_table = "studio_keyset_text_probe";
+    let text_quoted = dialect::quote_ident(text_table);
+    let _ = session.execute(&format!("DROP TABLE IF EXISTS {text_quoted}")).await;
+    session
+        .execute(&format!(
+            "CREATE TABLE {text_quoted} (name TEXT PRIMARY KEY, n INTEGER NOT NULL)"
+        ))
+        .await
+        .unwrap();
+    let values = (1..=23)
+        .map(|i| format!("('o''k {:02}', {})", (i * 7) % 29, i % 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    session
+        .execute(&format!("INSERT INTO {text_quoted} (name, n) VALUES {values}"))
+        .await
+        .unwrap();
+
+    for (table, key) in [(table, "id"), (text_table, "name")] {
+        for descending in [false, true] {
+            for filter in [None, Some("n <> 2")] {
+                let (mut studio, _) = Studio::new(None);
+                studio.selected_table = Some(table.to_string());
+                studio.columns = dialect::parse_columns(
+                    &session.query(&dialect::columns_sql(flavor, table)).await.unwrap(),
+                );
+                assert!(
+                    studio.columns.iter().any(|c| c.name == key && c.primary_key),
+                    "{flavor}: {table} reports no key {key}"
+                );
+                studio.page_size = 4;
+                studio.data_filter_applied =
+                    filter.map(|f| dialect::RowFilter::parse(f).unwrap().unwrap());
+                if descending {
+                    studio.sort.insert(
+                        format!("{}{}", rdb_studio::views::DATA_SCOPE, table),
+                        GridSort { column: key.to_string(), descending: true },
+                    );
+                }
+                let mut keyset_pages = 0;
+                for page in 0..10 {
+                    studio.data_page = page;
+                    let (sql, signature) = studio.page_query().unwrap();
+                    keyset_pages += usize::from(sql.contains(" > ") || sql.contains(" < "));
+                    let got = session.query(&sql).await.unwrap_or_else(|e| panic!("{flavor}: {sql}: {e}"));
+                    let offset = dialect::page_sql(
+                        table,
+                        studio.data_filter_applied.as_ref(),
+                        Some(key),
+                        descending.then_some((key, true)),
+                        4,
+                        page * 4,
+                    );
+                    let want = session.query(&offset).await.unwrap();
+                    assert_eq!(got.rows, want.rows, "{flavor}: {sql}\n  vs {offset}");
+                    let empty = got.rows.is_empty();
+                    let _ = studio.update(Message::DataLoaded(page, signature, Ok((got, None))));
+                    if empty {
+                        break;
+                    }
+                }
+                assert!(
+                    keyset_pages >= 4,
+                    "{flavor}: {table} desc={descending} filter={filter:?} paged by key {keyset_pages} times"
+                );
+            }
+        }
+    }
+    let _ = session.execute(&format!("DROP TABLE {quoted}")).await;
+    let _ = session.execute(&format!("DROP TABLE {text_quoted}")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn keyset_pages_hold_the_offset_pages_rows() {
+    let _serial = serial().await;
+    for (variable, flavor) in [
+        ("RDB_STUDIO_TEST_PG", Flavor::Postgres),
+        ("RDB_STUDIO_TEST_RDB", Flavor::Rasterized),
+    ] {
+        if let Some(session) = open(variable, flavor).await {
+            exercise_keyset(&session).await;
+        }
+    }
+}

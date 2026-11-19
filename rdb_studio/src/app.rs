@@ -93,6 +93,9 @@ pub struct Studio {
     pub data_page: usize,
     pub page_size: usize,
     pub data_total: Option<u64>,
+    /// Where each page of the data browser ended, so the next one can start
+    /// after its last key instead of at an offset.
+    pub data_keyset: Keyset,
     /// The data browser's filter box, as typed.
     pub data_filter: String,
     /// The filter the page on screen was read with.
@@ -226,6 +229,18 @@ pub struct Studio {
     /// until it is fixed, and a message that scrolls past leaves the user
     /// looking at six empty tabs with no explanation.
     pub flavor_warning: Option<String>,
+}
+
+/// Where each page of the data browser ended, for paging by key.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Keyset {
+    /// The statement of the first page the ends belong to
+    /// ([`Studio::page_query`]); another table, filter, order or page size
+    /// starts over.
+    pub signature: String,
+    /// The key literal after page `p`'s last row, at `after[p]`; `None` when
+    /// that page had no row or no usable key.
+    pub after: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,7 +778,9 @@ pub enum Message {
     KvLoaded(Result<KvEntry, String>),
     /// Open the dialog that sets a role's password.
     RolePassword(String),
-    DataLoaded(Result<(Grid, Option<u64>), String>),
+    /// A page of the data browser: which page it was, the signature of the
+    /// statement it was read under ([`Studio::page_query`]), and the rows.
+    DataLoaded(usize, String, Result<(Grid, Option<u64>), String>),
 
     // --- backups
     ReloadBackups,
@@ -1192,6 +1209,7 @@ impl Studio {
             data_page: 0,
             page_size: DEFAULT_PAGE,
             data_total: None,
+            data_keyset: Keyset::default(),
             data_filter: String::new(),
             data_filter_applied: None,
             editing: None,
@@ -1779,7 +1797,8 @@ impl Studio {
                 studio.config = config;
                 studio.config_edits.clear();
             }),
-            Message::DataLoaded(result) => self.absorb(result, |studio, (grid, total)| {
+            Message::DataLoaded(page, signature, result) => self.absorb(result, |studio, (grid, total)| {
+                studio.note_page_end(page, &signature, &grid);
                 studio.data = grid;
                 if let Some(total) = total {
                     studio.data_total = Some(total);
@@ -3793,17 +3812,11 @@ impl Studio {
         else {
             return Task::none();
         };
-        let key = self.row_key();
-        let sort = self.data_sort();
         let filter = self.data_filter_applied.clone();
-        let sql = dialect::page_sql(
-            &table,
-            filter.as_ref(),
-            key.as_ref().map(|k| k.column.as_str()),
-            sort.as_ref().map(|s| (s.column.as_str(), s.descending)),
-            self.page_size,
-            self.data_page * self.page_size,
-        );
+        let Some((sql, signature)) = self.page_query() else {
+            return Task::none();
+        };
+        let page = self.data_page;
         let count_sql =
             (self.data_total.is_none()).then(|| dialect::count_sql(&table, filter.as_ref()));
 
@@ -3820,8 +3833,88 @@ impl Studio {
                 };
                 Ok((grid, total))
             },
-            Message::DataLoaded,
+            move |result| Message::DataLoaded(page, signature, result),
         )
+    }
+
+    /// The key column, its direction and kind, when the browser's order is
+    /// that key's alone and its values can be written back exactly: then a
+    /// page can start after the previous page's last key.
+    fn keyset_order(&self) -> Option<(String, bool, dialect::KeysetKind)> {
+        let key = self.row_key()?;
+        let descending = match self.data_sort() {
+            None => false,
+            Some(sort) if sort.column == key.column => sort.descending,
+            // Ordered by another column first: rows sharing its value are
+            // ordered by the key, so the key alone does not say where a page
+            // ended.
+            Some(_) => return None,
+        };
+        let column = self.columns.iter().find(|c| c.name == key.column)?;
+        let kind = dialect::KeysetKind::of(&column.data_type)?;
+        Some((key.column, descending, kind))
+    }
+
+    /// The statement for the data browser's current page, and the signature
+    /// that ties a page's end to it: the first page's statement, which names
+    /// the table, filter, order and page size. A page starts after the
+    /// previous page's last key when that is known under the same
+    /// signature, and at an offset otherwise.
+    pub fn page_query(&self) -> Option<(String, String)> {
+        let table = self.selected_table.as_deref()?;
+        let key = self.row_key();
+        let sort = self.data_sort();
+        let filter = self.data_filter_applied.as_ref();
+        let at = |offset| {
+            dialect::page_sql(
+                table,
+                filter,
+                key.as_ref().map(|k| k.column.as_str()),
+                sort.as_ref().map(|s| (s.column.as_str(), s.descending)),
+                self.page_size,
+                offset,
+            )
+        };
+        let signature = at(0);
+        let page = self.data_page;
+        let after = (page > 0 && self.data_keyset.signature == signature)
+            .then(|| self.data_keyset.after.get(page - 1).cloned().flatten())
+            .flatten();
+        let sql = match (after, self.keyset_order()) {
+            (Some(after), Some((key, descending, _))) => {
+                dialect::page_after_sql(table, filter, &key, descending, &after, self.page_size)
+            }
+            _ => at(page * self.page_size),
+        };
+        Some((sql, signature))
+    }
+
+    /// Records where page `page` ended, when it is still the page shown under
+    /// the same statement. A late answer (two NEXTs pressed quickly, or a
+    /// page read before the filter changed) is not recorded: its last key
+    /// would start some other page, and that page would skip or repeat rows
+    /// with nothing to show for it.
+    fn note_page_end(&mut self, page: usize, signature: &str, grid: &Grid) {
+        let current = self.page_query().map(|(_, signature)| signature);
+        if page != self.data_page || current.as_deref() != Some(signature) {
+            return;
+        }
+        if self.data_keyset.signature != signature {
+            self.data_keyset = Keyset {
+                signature: signature.to_string(),
+                after: Vec::new(),
+            };
+        }
+        self.data_keyset.after.truncate(page);
+        if self.data_keyset.after.len() != page {
+            return;
+        }
+        let after = self.keyset_order().and_then(|(key, _, kind)| {
+            let at = grid.columns.iter().position(|c| *c == key)?;
+            let last = grid.rows.last()?;
+            dialect::key_literal(last.get(at)?.as_deref()?, kind)
+        });
+        self.data_keyset.after.push(after);
     }
 
     // -- writing -------------------------------------------------------------
@@ -4765,6 +4858,107 @@ mod tests {
             "SELECT * FROM \"rdb_roles\" LIMIT 200 OFFSET 0",
             "a table with no key is paged unordered, not by a column it lacks"
         );
+    }
+
+    fn keyed(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            position: 1,
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: false,
+            unique: true,
+            primary_key: true,
+            indexed: true,
+            ..ColumnInfo::default()
+        }
+    }
+
+    fn page_of(ids: &[&str]) -> Grid {
+        Grid {
+            columns: vec!["id".into(), "label".into()],
+            rows: ids
+                .iter()
+                .map(|id| vec![Some(id.to_string()), Some(format!("row {id}"))])
+                .collect(),
+            tag: format!("SELECT {}", ids.len()),
+            total: None,
+        }
+    }
+
+    /// Past the first page, a table ordered by its integer key is paged after
+    /// the previous page's last key rather than at an offset; a late answer
+    /// for a page no longer shown records nothing; another order, or a key
+    /// whose type is not vouched for, stays at an offset.
+    ///
+    /// Mutation: record a page's end without checking it is the page shown
+    /// (the late page-0 answer sets the cursor page 1 starts from).
+    #[test]
+    fn pages_past_the_first_start_after_the_last_key() {
+        let (mut studio, _) = Studio::new(None);
+        studio.tables = vec![table("users", "id")];
+        studio.selected_table = Some("users".to_string());
+        studio.columns = vec![keyed("id", "BIGINT")];
+        studio.page_size = 3;
+
+        let (first, signature) = studio.page_query().unwrap();
+        assert_eq!(first, "SELECT * FROM \"users\" ORDER BY \"id\" LIMIT 3 OFFSET 0");
+        let _ = studio.update(Message::DataLoaded(0, signature.clone(), Ok((page_of(&["1", "2", "5"]), Some(9)))));
+
+        studio.data_page = 1;
+        let (second, same) = studio.page_query().unwrap();
+        assert_eq!(same, signature);
+        assert_eq!(second, "SELECT * FROM \"users\" WHERE \"id\" > 5 ORDER BY \"id\" LIMIT 3");
+        let _ = studio.update(Message::DataLoaded(1, signature.clone(), Ok((page_of(&["7", "8", "9"]), None))));
+
+        // A late answer for page 0, arriving while page 1 is shown, is not
+        // where page 1 starts.
+        let _ = studio.update(Message::DataLoaded(0, signature.clone(), Ok((page_of(&["1", "2", "3"]), None))));
+        assert_eq!(
+            studio.data_keyset.after,
+            vec![Some("5".to_string()), Some("9".to_string())]
+        );
+        studio.data_page = 2;
+        assert!(studio.page_query().unwrap().0.contains("WHERE \"id\" > 9 "));
+
+        // Back to page 1: after page 0's end again.
+        studio.data_page = 1;
+        assert!(studio.page_query().unwrap().0.contains("WHERE \"id\" > 5 "));
+
+        // Descending by the key: before it.
+        studio.sort.insert(
+            format!("{}users", views::DATA_SCOPE),
+            GridSort { column: "id".into(), descending: true },
+        );
+        studio.data_page = 0;
+        let (_, descending) = studio.page_query().unwrap();
+        assert_ne!(descending, signature, "a new order is a new signature");
+        let _ = studio.update(Message::DataLoaded(0, descending, Ok((page_of(&["9", "8", "7"]), None))));
+        studio.data_page = 1;
+        assert_eq!(
+            studio.page_query().unwrap().0,
+            "SELECT * FROM \"users\" WHERE \"id\" < 7 ORDER BY \"id\" DESC LIMIT 3"
+        );
+
+        // Ordered by another column first: an offset.
+        studio.columns.push(ColumnInfo { name: "label".into(), data_type: "TEXT".into(), position: 2, ..ColumnInfo::default() });
+        studio.sort.insert(
+            format!("{}users", views::DATA_SCOPE),
+            GridSort { column: "label".into(), descending: false },
+        );
+        studio.data_page = 0;
+        let (_, by_label) = studio.page_query().unwrap();
+        let _ = studio.update(Message::DataLoaded(0, by_label, Ok((page_of(&["1", "2", "5"]), None))));
+        studio.data_page = 1;
+        assert!(studio.page_query().unwrap().0.ends_with("LIMIT 3 OFFSET 3"));
+
+        // A UUID key: an offset.
+        studio.sort.clear();
+        studio.columns = vec![keyed("id", "UUID")];
+        studio.data_page = 0;
+        let (_, by_uuid) = studio.page_query().unwrap();
+        let _ = studio.update(Message::DataLoaded(0, by_uuid, Ok((page_of(&["a", "b", "c"]), None))));
+        studio.data_page = 1;
+        assert!(studio.page_query().unwrap().0.ends_with("LIMIT 3 OFFSET 3"));
     }
 
     /// A skeleton `UPDATE` or `DELETE` with no `WHERE` is a whole-table write

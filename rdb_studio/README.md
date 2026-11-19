@@ -345,6 +345,26 @@ browser says so and says what would fix it. The alternative — matching an
 `UPDATE` on the row's own values — writes to every duplicate of the row that was
 clicked, reports success, and is undetectable afterwards.
 
+For the same reason a page is always ordered by that key. Without an `ORDER BY`
+neither engine promises the same order twice, so page 2 can repeat a row from
+page 1 and skip another.
+
+Past the first page, a table ordered by its key alone is read **after the
+previous page's last key** (`WHERE "id" > 4711 ORDER BY "id" LIMIT 200`)
+rather than at an offset. `OFFSET 90000` makes the server read, order and throw
+away ninety thousand rows for every page that deep; the key needs none of them.
+It applies to integer and text keys, ascending or descending, with or without a
+filter. A page sorted by another column, or keyed by a type whose literal the
+browser does not write exactly (a UUID, a timestamp, `NUMERIC`), still pages at
+an offset. Where a page ended is kept only for the page on screen under the
+same table, filter, order and page size, so a late answer from a page already
+left behind never decides where the next one starts.
+
+Clicking a header in the data browser sorts the **table**, not the page: the
+statement goes back to the server with an `ORDER BY` in front of the key and
+comes back from page one. Sorting the page in hand would rearrange the hundred
+rows that happened to arrive under a heading claiming to order the whole thing.
+
 Columns are dragged to width from the divider in the header, remembered per
 table, and double-clicked back to the default.
 
@@ -359,15 +379,6 @@ the empty string, as the export writes them. Up to 20,000 rows go in one
 request, which is one transaction: a file that size imports whole or not at
 all; a bigger one goes request by request and a refusal stops it with the
 rows before it kept, and the report says which records.
-
-For the same reason a page is always ordered by that key. Without an `ORDER BY`
-neither engine promises the same order twice, so page 2 can repeat a row from
-page 1 and skip another.
-
-Clicking a header in the data browser sorts the **table**, not the page: the
-statement goes back to the server with an `ORDER BY` in front of the key and
-comes back from page one. Sorting the page in hand would rearrange the hundred
-rows that happened to arrive under a heading claiming to order the whole thing.
 
 ## Columns
 
