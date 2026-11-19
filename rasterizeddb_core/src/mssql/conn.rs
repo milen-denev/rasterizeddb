@@ -533,6 +533,15 @@ impl Env for Scope<'_> {
     fn variable(&self, name: &str) -> Option<Value> {
         self.s.vars.get(name).map(|v| v.value.clone())
     }
+    fn param_text(&self, name: &str) -> Option<Option<String>> {
+        let p = self.params?;
+        let k = p.decls.iter().position(|d| d.0 == name)?;
+        Some(match p.values.get(k)? {
+            tds::ParamValue::Null => None,
+            tds::ParamValue::Text(t) => Some(t.clone()),
+            tds::ParamValue::Bytes(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        })
+    }
     fn param(&self, name: &str) -> Option<ParamSlot> {
         let p = self.params?;
         let k = p.decls.iter().position(|d| d.0 == name)?;

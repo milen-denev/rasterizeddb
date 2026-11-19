@@ -889,3 +889,75 @@ async fn tiberius_for_json_and_xml() {
     .unwrap();
     assert_eq!(r[0][0].get::<&str, _>("last"), Some("Third"));
 }
+
+/// Full-text search: CREATE FULLTEXT CATALOG / INDEX, CONTAINS, FREETEXT,
+/// CONTAINSTABLE and FREETEXTTABLE, answered from the engine's GIN indexes.
+#[tokio::test(flavor = "multi_thread")]
+async fn tiberius_full_text_search() {
+    let s = start();
+    let mut c = connect(&s).await;
+    batch(
+        &mut c,
+        "CREATE TABLE Docs (Id int NOT NULL PRIMARY KEY, Title nvarchar(100), Body nvarchar(max));
+         INSERT INTO Docs VALUES
+           (1, N'Running shoes', N'Light shoes for a daily run'),
+           (2, N'Trail guide', N'Where the trail runs past the old mill'),
+           (3, N'Apple pie', N'A recipe for apple pie with a crumbly crust'),
+           (4, N'Pie charts', N'Charts for applications'),
+           (5, NULL, N'The quick brown fox jumps over the lazy dog');
+         CREATE FULLTEXT CATALOG ftCatalog AS DEFAULT;
+         CREATE FULLTEXT INDEX ON dbo.Docs (Title LANGUAGE 1033, Body) KEY INDEX PK_Docs ON ftCatalog WITH CHANGE_TRACKING AUTO;
+         ALTER FULLTEXT INDEX ON Docs START FULL POPULATION;",
+    )
+    .await
+    .unwrap();
+    let ids = |r: &Vec<Vec<tiberius::Row>>| r[0].iter().map(|row| row.get::<i32, _>(0).unwrap()).collect::<Vec<_>>();
+
+    for (condition, want) in [
+        ("CONTAINS(Body, 'pie')", vec![3]),
+        ("CONTAINS((Title, Body), '\"apple pie\"')", vec![3]),
+        ("CONTAINS((Title, Body), 'pie AND NOT crust')", vec![4]),
+        ("CONTAINS((Title, Body), '\"appl*\"')", vec![3, 4]),
+        ("CONTAINS(Body, 'fox OR mill')", vec![2, 5]),
+        ("CONTAINS(Body, 'NEAR((quick, fox), 2)')", vec![5]),
+        ("CONTAINS(Body, 'NEAR((fox, quick), 2, TRUE)')", vec![]),
+        ("CONTAINS((Title, Body), 'FORMSOF(INFLECTIONAL, run)')", vec![1, 2]),
+        ("FREETEXT((Title, Body), 'running')", vec![1, 2]),
+        ("CONTAINS(Body, 'run')", vec![1]),
+    ] {
+        let r = batch(&mut c, &format!("SELECT Id FROM Docs WHERE {condition} ORDER BY Id")).await.unwrap();
+        assert_eq!(ids(&r), want, "{condition}");
+    }
+
+    // A parameter, as sp_executesql binds it.
+    let r = c
+        .query("SELECT Id FROM Docs WHERE CONTAINS(Body, @P1) ORDER BY Id", &[&"crust OR charts"])
+        .await
+        .unwrap()
+        .into_results()
+        .await
+        .unwrap();
+    assert_eq!(ids(&r), vec![3, 4]);
+
+    // The table-valued forms join on KEY and order by RANK.
+    let r = batch(
+        &mut c,
+        "SELECT d.Id, ct.RANK FROM Docs AS d INNER JOIN CONTAINSTABLE(Docs, *, 'pie') AS ct ON d.Id = ct.[KEY] ORDER BY ct.RANK DESC, d.Id",
+    )
+    .await
+    .unwrap();
+    let ranked: Vec<(i32, i32)> = r[0].iter().map(|row| (row.get(0).unwrap(), row.get(1).unwrap())).collect();
+    assert_eq!(ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3, 4], "{ranked:?}");
+    assert!(ranked.iter().all(|(_, rank)| (1..=1000).contains(rank)), "{ranked:?}");
+    let r = batch(&mut c, "SELECT [KEY] FROM FREETEXTTABLE(Docs, (Title, Body), 'runs', 1)").await.unwrap();
+    assert_eq!(r[0].len(), 1);
+
+    // Refused rather than read another way.
+    let e = batch(&mut c, "SELECT Id FROM Docs WHERE CONTAINS(Body, 'NOT fox')").await.expect_err("NOT first");
+    assert_eq!(number(&e), Some(7630), "{e}");
+
+    batch(&mut c, "DROP FULLTEXT INDEX ON Docs; DROP FULLTEXT CATALOG ftCatalog").await.unwrap();
+    // Without the index the predicates still answer, from a scan.
+    let r = batch(&mut c, "SELECT Id FROM Docs WHERE CONTAINS(Body, 'pie') ORDER BY Id").await.unwrap();
+    assert_eq!(ids(&r), vec![3]);
+}

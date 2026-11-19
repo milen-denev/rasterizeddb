@@ -120,6 +120,11 @@ pub(crate) trait Env {
     fn temp_name(&self, name: &str) -> String {
         name.to_lowercase()
     }
+    /// A parameter's value as text, where the statement is translated with
+    /// its values in hand (`sp_executesql`): `Some(None)` for NULL.
+    fn param_text(&self, _name: &str) -> Option<Option<String>> {
+        None
+    }
 }
 
 /// What a statement answers with.
@@ -287,8 +292,11 @@ fn statement_end(tokens: &[Token], start: usize) -> usize {
                             | "CONSTRAINT"
                     ),
                     "WITH" => {
-                        // A table hint or options, not a CTE.
-                        tokens.get(j + 1).is_some_and(|n| n.is_op("("))
+                        // A table hint or options, not a CTE. A full-text
+                        // index's options may go unparenthesised
+                        // (`WITH CHANGE_TRACKING AUTO`).
+                        (matches!(head.as_str(), "CREATE" | "ALTER") && kw(tokens, start + 1, "FULLTEXT"))
+                            || tokens.get(j + 1).is_some_and(|n| n.is_op("("))
                             || matches!(prev.as_str(), "ROLLUP" | "CUBE")
                             || tokens.get(j + 1).is_some_and(|n| {
                                 n.is_word("CHECK") || n.is_word("TIES") || n.is_word("GRANT")
@@ -890,6 +898,15 @@ pub(crate) fn rewrite_expr(tokens: Vec<Token>, cx: &mut Cx) -> Result<Vec<Token>
                 cx.window_next = kw(&tokens, close + 1, "OVER");
                 if let Some(replacement) = rewrite_call(word, &tokens[i + 2..close], cx)? {
                     out.extend(replacement);
+                    // A table-valued full-text function may go without an
+                    // alias in SQL Server; the derived table it is needs one.
+                    if (word.eq_ignore_ascii_case("CONTAINSTABLE") || word.eq_ignore_ascii_case("FREETEXTTABLE"))
+                        && !tokens.get(close + 1).is_some_and(|a| {
+                            a.is_word("AS") || (matches!(a.tok, Tok::Word(_) | Tok::Quoted(_)) && !is_clause_word(a))
+                        })
+                    {
+                        out.push(Token::raw(format!("AS {}", word.to_ascii_lowercase())));
+                    }
                     i = close + 1;
                     continue;
                 }
@@ -1064,8 +1081,108 @@ fn is_clause_word(t: &Token) -> bool {
     })
 }
 
+/// The columns of a full-text predicate's first argument: `col`, `t.col`,
+/// or `(col, …)`, each as SQL. `*` names the full-text index's columns,
+/// which only the table-valued forms know the table of.
+fn fulltext_columns(arg: &[Token], cx: &mut Cx) -> Result<Vec<String>, TsqlError> {
+    let list: Vec<Vec<Token>> = if arg.first().is_some_and(|t| t.is_op("(")) && matching_paren(arg, 0) == Some(arg.len() - 1) {
+        split_commas(&arg[1..arg.len() - 1])
+    } else {
+        vec![arg.to_vec()]
+    };
+    let mut out = Vec::new();
+    for part in list {
+        if part.len() == 1 && part[0].is_op("*") {
+            return Err(TsqlError::unsupported("CONTAINS or FREETEXT over * (name the columns)"));
+        }
+        let reference = part.iter().enumerate().all(|(k, t)| if k % 2 == 1 { t.is_op(".") } else { t.ident().is_some() });
+        if part.is_empty() || part.len() % 2 == 0 || !reference {
+            return Err(TsqlError::syntax("a full-text predicate names columns"));
+        }
+        out.push(render_text(&rewrite_expr(part, cx)?));
+    }
+    Ok(out)
+}
+
+/// A full-text predicate's search string, from a literal, a variable or a
+/// parameter of the statement.
+fn fulltext_search(arg: &[Token], cx: &Cx) -> Result<String, TsqlError> {
+    super::fulltext::search_text(arg, |name| {
+        if cx.env.param(name).is_some() {
+            return cx.env.param_text(name);
+        }
+        cx.env.variable(name).map(|v| match v {
+            Value::Null => None,
+            Value::Str(s) => Some(s),
+            Value::Int(i) => Some(i.to_string()),
+            Value::Num(n) => Some(n),
+            Value::Bytes(b) => Some(String::from_utf8_lossy(&b).into_owned()),
+        })
+    })
+}
+
+/// The columns a table's full-text index covers, from its word index.
+fn fulltext_index_columns(database: &Database, table: &str) -> Option<Vec<String>> {
+    let view = database.schema_view(table)?;
+    let schema = view.schema();
+    let [words, _] = super::fulltext::index_names(table);
+    let decl = schema
+        .secondary_indexes
+        .iter()
+        .find(|d| !d.is_deleted && d.name.eq_ignore_ascii_case(&words) && d.method.is_text())?;
+    decl.columns
+        .iter()
+        .map(|wo| {
+            schema
+                .fields
+                .iter()
+                .find(|f| !f.is_deleted && f.write_order as u32 == *wo)
+                .map(|f| ident_sql(&f.name))
+        })
+        .collect()
+}
+
 fn rewrite_call(name: &str, inner: &[Token], cx: &mut Cx) -> Result<Option<Vec<Token>>, TsqlError> {
     let upper = name.to_ascii_uppercase();
+    if matches!(upper.as_str(), "CONTAINS" | "FREETEXT") {
+        use super::fulltext::{Predicate, condition};
+        let a = split_commas(inner);
+        if !(2..=3).contains(&a.len()) {
+            return Err(TsqlError::syntax(format!("{upper} takes columns and a search condition")));
+        }
+        let predicate = if upper == "CONTAINS" { Predicate::Contains } else { Predicate::Freetext };
+        let columns = fulltext_columns(&a[0], cx)?;
+        let search = fulltext_search(&a[1], cx)?;
+        return Ok(Some(vec![Token::raw(condition(predicate, &columns, &search)?)]));
+    }
+    if matches!(upper.as_str(), "CONTAINSTABLE" | "FREETEXTTABLE") {
+        use super::fulltext::{Predicate, table};
+        let a = split_commas(inner);
+        if !(3..=5).contains(&a.len()) {
+            return Err(TsqlError::syntax(format!("{upper} takes a table, columns and a search condition")));
+        }
+        let predicate = if upper == "CONTAINSTABLE" { Predicate::Contains } else { Predicate::Freetext };
+        let (name, _) = table_name_at(&a[0], 0).ok_or_else(|| TsqlError::syntax(format!("{upper} needs a table")))?;
+        let name = name.to_lowercase();
+        let database = cx.env.database().clone();
+        let key = primary_key(&database, &name).ok_or_else(|| {
+            TsqlError::new(7601, format!("Cannot use a CONTAINS or FREETEXT predicate on table '{name}' because it is not full-text indexed."))
+        })?;
+        let columns = if a[1].len() == 1 && a[1][0].is_op("*") {
+            fulltext_index_columns(&database, &name).ok_or_else(|| {
+                TsqlError::new(7601, format!("Cannot use a CONTAINS or FREETEXT predicate on table '{name}' because it is not full-text indexed."))
+            })?
+        } else {
+            fulltext_columns(&a[1], cx)?
+        };
+        let search = fulltext_search(&a[2], cx)?;
+        // `LANGUAGE x` is set aside; a number is top_n_by_rank.
+        let top = a[3..].iter().find_map(|x| match x.as_slice() {
+            [Token { tok: Tok::Num(n), .. }] => n.parse::<u64>().ok(),
+            _ => None,
+        });
+        return Ok(Some(vec![Token::raw(table(predicate, &name, &key, &columns, &search, top)?)]));
+    }
     let raw = || split_commas(inner);
     let args = |cx: &mut Cx| -> Result<Vec<Vec<Token>>, TsqlError> {
         let mut out = Vec::new();
@@ -3662,6 +3779,56 @@ fn rewrite_drop(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
 /// It is an INSERT of those rows. The source columns OUTPUT names cannot
 /// be RETURNED, so each row's are put back by position: the engine returns
 /// an INSERT's rows in the order of its VALUES.
+/// `CREATE | DROP | ALTER FULLTEXT CATALOG | INDEX …` ([`super::fulltext`]).
+fn fulltext_ddl(tokens: Vec<Token>, cx: &mut Cx) -> Result<Forward, TsqlError> {
+    let verb = tokens[0].upper().unwrap_or_default();
+    let nothing = || Forward {
+        statements: vec![String::new()],
+        kind: Kind::Ddl,
+        extra_column: None,
+    };
+    if kw(&tokens, 2, "CATALOG") || kw(&tokens, 2, "STOPLIST") {
+        // A catalog groups indexes for SQL Server's own administration; there
+        // is nothing to keep for one here.
+        return Ok(nothing());
+    }
+    if !kw(&tokens, 2, "INDEX") || !kw(&tokens, 3, "ON") {
+        return Err(TsqlError::syntax(format!("{verb} FULLTEXT INDEX ON table …")));
+    }
+    let (table, after) =
+        table_name_at(&tokens, 4).ok_or_else(|| TsqlError::syntax("a full-text index needs a table"))?;
+    let table = table.to_lowercase();
+    let statements = match verb.as_str() {
+        "CREATE" => {
+            if !tokens.get(after).is_some_and(|t| t.is_op("(")) {
+                return Err(TsqlError::syntax("CREATE FULLTEXT INDEX ON table (columns) KEY INDEX name"));
+            }
+            let close = matching_paren(&tokens, after).ok_or_else(|| TsqlError::syntax("unbalanced column list"))?;
+            if !kw(&tokens, close + 1, "KEY") {
+                return Err(TsqlError::syntax("CREATE FULLTEXT INDEX needs KEY INDEX"));
+            }
+            let columns = super::fulltext::index_columns(&tokens[after + 1..close])?;
+            super::fulltext::index_statements(&table, &columns)
+        }
+        "DROP" => super::fulltext::drop_statements(&table),
+        _ => {
+            // ENABLE, DISABLE, SET CHANGE_TRACKING, START/STOP … POPULATION:
+            // the index is kept current with every write.
+            if tokens[after..].iter().any(|t| t.is_word("ADD") || t.is_word("DROP")) {
+                return Err(TsqlError::unsupported(
+                    "ALTER FULLTEXT INDEX … ADD / DROP (drop the full-text index and create it again)",
+                ));
+            }
+            return Ok(nothing());
+        }
+    };
+    Ok(Forward {
+        statements,
+        kind: Kind::Ddl,
+        extra_column: None,
+    })
+}
+
 fn merge_refused() -> TsqlError {
     TsqlError::unsupported("MERGE (only the insert-only form with ON 1 = 0 is translated)")
 }
@@ -3899,6 +4066,7 @@ pub(crate) fn translate(
         "UPDATE" => rewrite_update(tokens, &mut cx),
         "DELETE" => rewrite_delete(tokens, &mut cx),
         "MERGE" => rewrite_merge_insert(tokens, &mut cx),
+        "CREATE" | "DROP" | "ALTER" if kw(&tokens, 1, "FULLTEXT") => fulltext_ddl(tokens, &mut cx),
         "CREATE" => {
             let second = tokens.get(1).and_then(|t| t.upper()).unwrap_or_default();
             match second.as_str() {

@@ -15,6 +15,7 @@
 //! login-only encryption is not offered). Windows authentication is not.
 
 pub(crate) mod conn;
+pub(crate) mod fulltext;
 pub(crate) mod lex;
 pub(crate) mod merge;
 pub(crate) mod routines;

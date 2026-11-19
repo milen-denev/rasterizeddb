@@ -111,12 +111,33 @@ nothing. Comment-only queries answer OK.
 - **Server-side cursors**: `COM_STMT_EXECUTE` with a cursor type and
   `COM_STMT_FETCH` (Connector/J's `useCursorFetch`).
 
+**Full-text search** is the engine's (`to_tsvector`, `@@`, and a GIN index
+over `to_tsvector(…)`). A `FULLTEXT` key (in `CREATE TABLE`, `ALTER TABLE …
+ADD FULLTEXT`, `CREATE FULLTEXT INDEX`) is such an index over its columns
+under the `simple` configuration, which lowercases and neither stems nor
+drops words, as InnoDB's tokenizer does. `MATCH (cols) AGAINST (…)` reads the
+same document, so the index answers it:
+
+- natural language mode finds rows with any of the words; boolean mode takes
+  `+`, `-`, `*` (prefix), `"phrases"` and `( … )` groups (`>`, `<`, `~` rank
+  only, and are read as plain words);
+- InnoDB's default stop words and words shorter than 3 or longer than 84
+  characters are left out of the search, as InnoDB leaves them out of its
+  index;
+- where it stands as a condition it is one; read as a number (select list,
+  `ORDER BY`, a comparison) it is the row's relevance, 0 when the row does
+  not match. The scores are `ts_rank`'s, not InnoDB's, so rows that score
+  close can come back in another order;
+- a search string bound to a `?` is read at each execute;
+- `MATCH` does not need a `FULLTEXT` key over exactly its columns, as InnoDB
+  does (error 1191): without one the rows are scanned.
+
 Tables whose names start with `__` are not listed by `SHOW TABLES`; a
 PostgreSQL client sees them.
 
 **Refused** (an error, never a different answer): stored functions, triggers
-and events (they would run inside the engine's queries), `FULLTEXT`/`SPATIAL`
-indexes and `MATCH … AGAINST`, `PARTITION BY`, `CREATE TABLE … LIKE/SELECT`,
+and events (they would run inside the engine's queries), `SPATIAL` indexes,
+full-text `WITH QUERY EXPANSION` and `WITH PARSER`, `PARTITION BY`, `CREATE TABLE … LIKE/SELECT`,
 `XOR`, `LOAD DATA … SET`, a `REPLACE` that leaves columns out (MySQL resets
 them to their defaults), `SELECT @v = @v + …` over more than one row (MySQL
 folds it row by row; use `GROUP_CONCAT` or `SUM`), `sql_select_limit`, and
@@ -196,6 +217,29 @@ client can create and drop its own (`EnsureCreated`, `EnsureDeleted`).
   `bcp` send, in one transaction; `SET FMTONLY ON` answers a query's
   columns as the table declares them.
 
+**Full-text search** is the engine's. `CREATE FULLTEXT INDEX ON t (cols) KEY
+INDEX …` makes two GIN indexes over the columns' text: `simple` (words as
+written, without case) for `CONTAINS`, `english` (stemmed, stop words out) for
+`FREETEXT` and `FORMSOF(INFLECTIONAL, …)`. Catalogs, stop lists and
+`ALTER FULLTEXT INDEX … ENABLE / START … POPULATION / SET CHANGE_TRACKING` are
+accepted and change nothing: the index is current after every write.
+
+- `CONTAINS(col | (cols), condition)`: words, `"phrases"`, `"prefix*"`,
+  `AND`/`&`, `OR`/`|`, `AND NOT`/`&!`, parentheses, `FORMSOF(INFLECTIONAL,
+  …)`, `FORMSOF(THESAURUS, …)` (the words themselves: there is no
+  thesaurus), `NEAR((a, b), n [, TRUE])` with `n` up to 20 or no distance,
+  `a NEAR b`, `ISABOUT(…)` (weights rank only);
+- `FREETEXT(cols, text)`: any of the words, stemmed;
+- `CONTAINSTABLE` / `FREETEXTTABLE (table, cols | *, …, [top_n])`: `KEY`
+  (the primary key) and `RANK` (0–1000, from `ts_rank`, not SQL Server's
+  statistic);
+- the condition may be a literal, a variable or a parameter.
+
+There is no noise-word list for `CONTAINS` (`"the"` finds rows with "the"),
+and `CONTAINS(*, …)` is refused (name the columns; the table-valued forms take
+`*`). `ALTER FULLTEXT INDEX … ADD/DROP` is refused: drop the index and create
+it again.
+
 **Refused**: `MERGE … OUTPUT` (other than EF Core's insert form) and a `MERGE`
 that updates a column its `ON` reads, `FOR XML RAW/AUTO/EXPLICIT`, stored
 functions and triggers, `rowversion`, computed columns, filtered indexes,
@@ -217,7 +261,6 @@ and `mssql_protocol.rs` run in the compat suite; the client harnesses are in
 
 ## Not offered
 
-Case-insensitive collations (both databases' default) and full-text search
-need the engine: a front end that folded case could not make a unique key or
-an index compare the same way, and MySQL's relevance ranking cannot be
-answered from a filter.
+Case-insensitive collations (both databases' default) need the engine: a
+front end that folded case could not make a unique key or an index compare
+the same way.
