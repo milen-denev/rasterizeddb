@@ -42,6 +42,8 @@ mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
 mod copy;
+mod notify;
+mod explain;
 mod temp_tables;
 mod privilege_statements;
 #[cfg(test)]
@@ -1565,6 +1567,26 @@ tokio::task_local! {
     static INTERNAL_RUN: ();
 }
 
+tokio::task_local! {
+    /// The SELECT whose `RowDescription` is being sent, and its database:
+    /// where [`send_row_description`] reads each column's table, number,
+    /// type and modifier (`catalog_model::column_origins`). Every column was
+    /// "no table, no column", and `varchar(20)` was `text` with no length,
+    /// so a driver could not say which table a column came from, whether it
+    /// was a key or nullable, or how long it could be.
+    static DESCRIBED: (Arc<Database>, StdArc<str>);
+}
+
+/// Runs `fut` with `sql` as the statement [`send_row_description`] reads
+/// column origins from, when it is a SELECT.
+async fn describing<F: std::future::Future>(database: &Arc<Database>, sql: &str, fut: F) -> F::Output {
+    if sql.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) {
+        DESCRIBED.scope((database.clone(), StdArc::from(sql)), fut).await
+    } else {
+        fut.await
+    }
+}
+
 /// Runs `fut`, a statement run for another, outside the reply hold.
 pub(super) async fn internal_run<F: std::future::Future>(fut: F) -> F::Output {
     INTERNAL_RUN.scope((), fut).await
@@ -2075,6 +2097,7 @@ where
                 context.limits,
                 stream,
                 startup_timeout,
+                registration.pid,
             ),
         )
         .await
@@ -2325,11 +2348,14 @@ async fn run_message_loop<S>(
     // `statement_timeout` and `lock_timeout` from the StartupMessage.
     // And `rdb.shape_change` (Q2), when the StartupMessage named one.
     startup_timeouts: (Option<u64>, Option<u64>, Option<ShapeChangeMode>),
+    // The process id `BackendKeyData` gave the session.
+    backend_pid: i32,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut state = SessionState::new(catalog, database.name.clone(), auth, principal, limits);
+    state.backend_pid = backend_pid;
     // Applied before the first statement, so a driver that set it at connection
     // time is protected by it from the very first query rather than from
     // whenever it happens to issue a `SET`.
@@ -2455,12 +2481,45 @@ where
                 // completed has consumed nothing, so a message arriving as the timer
                 // fires is not torn.
                 let idle = if ready { state.idle_limit() } else { None };
-                let read = match idle {
-                    None => stream.read_exact(&mut tag).await,
-                    Some((limit, kind)) => {
-                        match tokio::time::timeout(limit, stream.read_exact(&mut tag)).await {
-                            Ok(read) => read,
-                            Err(_) => return terminate_idle_session(database, state, stream, kind).await,
+                let deadline = idle.map(|(limit, kind)| (tokio::time::Instant::now() + limit, kind));
+                // A listening session is sent its notifications while it waits
+                // (`notify`), as drivers' listen loops wait for them; the read
+                // goes on after each.
+                enum Woke {
+                    Read(io::Result<usize>),
+                    Note(Option<notify::Note>),
+                    Idle,
+                }
+                let read = loop {
+                    let woke = {
+                        let read_next = stream.read_exact(&mut tag);
+                        let listener = state.listener.as_mut();
+                        tokio::select! {
+                            read = read_next => Woke::Read(read),
+                            note = async {
+                                match listener {
+                                    Some(l) => l.rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Woke::Note(note),
+                            _ = async {
+                                match deadline {
+                                    Some((at, _)) => tokio::time::sleep_until(at).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Woke::Idle,
+                        }
+                    };
+                    match woke {
+                        Woke::Read(read) => break read,
+                        Woke::Note(Some(note)) => {
+                            notify::send_note(stream, &note).await?;
+                            stream.flush().await?;
+                        }
+                        Woke::Note(None) => {}
+                        Woke::Idle => {
+                            let (_, kind) = deadline.expect("woken by its deadline");
+                            return terminate_idle_session(database, state, stream, kind).await;
                         }
                     }
                 };
@@ -2813,6 +2872,12 @@ struct SessionState {
     /// second `ReadyForQuery` the client did not expect, and the connection
     /// broke on its next statement.
     copy_in_ran: bool,
+    /// The channels this session listens on and its notifications' queue
+    /// (`notify`), from its first `LISTEN`.
+    listener: Option<notify::Listener>,
+    /// The process id the session was given in `BackendKeyData`, which a
+    /// notification it raises carries.
+    backend_pid: i32,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -3039,6 +3104,9 @@ struct Savepoint {
 /// An open `BEGIN` block.
 struct SessionTransaction {
     id: TxId,
+    /// `NOTIFY`s raised in the block, sent when it commits (`notify`) and
+    /// dropped with it when it does not.
+    notifies: Vec<(String, String)>,
     /// What to put `SessionState::synchronous_commit` back to when this block
     /// ends, if a `SET LOCAL` inside it changed the value.
     ///
@@ -3191,6 +3259,8 @@ impl SessionState {
             temp_tables: Vec::new(),
             temp_session: fastrand::u64(..),
             copy_in_ran: false,
+            listener: None,
+            backend_pid: 0,
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -3971,7 +4041,7 @@ where
             });
             info.shape_refused = false;
         }
-        send_row_description(stream, &fields, &result_formats).await?;
+        describing(database, &sql, send_row_description(stream, &fields, &result_formats)).await?;
         return Ok(());
     }
 
@@ -5430,6 +5500,16 @@ async fn describe_resolved(
             .to_vec(),
             true,
         )));
+    }
+
+    // `EXPLAIN` answers one text column; `pg_notify`'s void is one too.
+    if let Some(Ok(_)) = explain::parse_explain(stmt) {
+        return Ok(Some((vec![("QUERY PLAN".to_string(), DbType::STRING)], true)));
+    }
+    if stmt.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT"))
+        && let Some(Ok(_)) = notify::parse_notify_statement(stmt)
+    {
+        return Ok(Some((vec![("pg_notify".to_string(), DbType::STRING)], true)));
     }
 
     let purpose = match recognize_query_purpose(stmt) {
@@ -7115,7 +7195,11 @@ where
     };
     let ran = crate::core::rql::sequence::session::scoped(
         scope,
-        Box::pin(execute_single_statement_unscoped(database, state, stream, stmt, result_formats, omit_description)),
+        describing(
+            database,
+            stmt,
+            Box::pin(execute_single_statement_unscoped(database, state, stream, stmt, result_formats, omit_description)),
+        ),
     )
     .await;
     crate::core::rql::sequence_catalog::flush(database).await;
@@ -7209,6 +7293,21 @@ where
     if let Some(parsed) = crate::core::rql::merge::parse_merge(stmt) {
         return match parsed {
             Ok(merge) => merge_exec::run_merge(database, state, stream, merge, result_formats, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // `EXPLAIN [ANALYZE] …` (`explain`).
+    if let Some(parsed) = explain::parse_explain(stmt) {
+        return match parsed {
+            Ok(statement) => explain::run_explain(database, state, stream, statement, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // `LISTEN`, `UNLISTEN`, `NOTIFY`, `SELECT pg_notify(…)` (`notify`).
+    if let Some(parsed) = notify::parse_notify_statement(stmt) {
+        let function_form = stmt.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT"));
+        return match parsed {
+            Ok(statement) => notify::run(database, state, stream, statement, function_form, omit_description).await,
             Err((code, message)) => fail_statement(state, stream, code, &message).await,
         };
     }
@@ -9754,6 +9853,7 @@ fn open_block(
     }
     state.transaction = Some(SessionTransaction {
         id,
+        notifies: Vec::new(),
         // A chained block starts fresh: `SET LOCAL` belongs to the block that
         // ran it, and `COMMIT AND CHAIN` carries the characteristics over, not
         // the settings.
@@ -9828,6 +9928,22 @@ fn opens_an_implicit_block(sql: &str) -> bool {
 /// to report is returned: a commit whose rows or outcome could not be made
 /// durable is not a commit.
 async fn commit_block(
+    database: &Arc<Database>,
+    state: &SessionState,
+    mut t: SessionTransaction,
+) -> Result<(), (&'static str, String)> {
+    // The block's notifications, sent once it has committed (`notify`).
+    let notifies = std::mem::take(&mut t.notifies);
+    let committed = Box::pin(commit_block_inner(database, state, t)).await;
+    if committed.is_ok() {
+        for (channel, payload) in &notifies {
+            notify::publish(database.id, state.backend_pid, channel, payload);
+        }
+    }
+    committed
+}
+
+async fn commit_block_inner(
     database: &Arc<Database>,
     state: &SessionState,
     t: SessionTransaction,
@@ -13445,6 +13561,13 @@ where
     send_message(stream, b'N', &payload).await
 }
 
+/// The name in an error's `constraint "name"`, its first.
+fn quoted_constraint(message: &str) -> Option<&str> {
+    let at = message.find("constraint \"")? + "constraint \"".len();
+    let end = message[at..].find('"')?;
+    Some(&message[at..at + end]).filter(|n| !n.is_empty())
+}
+
 async fn send_error_response<S>(stream: &mut S, sqlstate: &str, message: &str) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -13464,6 +13587,17 @@ where
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
+
+    // The constraint an integrity error names, as its own field: what an ORM
+    // maps the error to a key or a check by (node-postgres's `constraint`,
+    // Npgsql's `ConstraintName`).
+    if sqlstate.starts_with("23")
+        && let Some(name) = quoted_constraint(message)
+    {
+        payload.push(b'n');
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+    }
 
     // PostgreSQL's routine for the one error a driver dispatches on by it
     // (see `CACHED_PLAN_ROUTINE`).
@@ -13534,28 +13668,49 @@ where
     // number of fields
     payload.extend_from_slice(&(fields.len() as i16).to_be_bytes());
 
+    // Each column's table, number and declared type, when the statement's
+    // items are columns of its tables (`DESCRIBED`). Taken only where they
+    // line up with the fields described.
+    let origins = DESCRIBED
+        .try_with(|(database, sql)| {
+            let flat = crate::core::sql_scan::flatten_whitespace(sql);
+            crate::core::rql::catalog_model::column_origins(database, &flat)
+        })
+        .ok()
+        .flatten()
+        .filter(|o| o.len() == fields.len());
+
     for (i, (name, db_type)) in fields.iter().enumerate() {
         // field name
         payload.extend_from_slice(name.as_ref().as_bytes());
         payload.push(0);
 
+        let oid = db_type.pg_oid();
+        let origin = origins.as_ref().and_then(|o| o[i]);
+        // The declared type where it is the one described or its narrowing:
+        // a `varchar(n)` described as `text` is `varchar` with its length.
+        let (type_oid, typmod) = match origin {
+            Some(o) if o.type_oid as u32 == oid => (oid as i32, o.typmod),
+            Some(o) if oid == 25 && matches!(o.type_oid, 1043) => (o.type_oid, o.typmod),
+            _ => (oid as i32, db_type.pg_typmod()),
+        };
+
         // table_oid
-        payload.extend_from_slice(&0i32.to_be_bytes());
+        payload.extend_from_slice(&origin.map_or(0, |o| o.table_oid).to_be_bytes());
 
         // column_attr
-        payload.extend_from_slice(&0i16.to_be_bytes());
+        payload.extend_from_slice(&origin.map_or(0, |o| o.attnum).to_be_bytes());
 
         // type_oid
-        let oid = db_type.pg_oid();
-        payload.extend_from_slice(&(oid as i32).to_be_bytes());
+        payload.extend_from_slice(&type_oid.to_be_bytes());
 
         // type_size
         let size = db_type.pg_type_size();
         payload.extend_from_slice(&(size as i16).to_be_bytes());
 
-        // type_modifier: a `character(n)`'s length plus four, as
-        // PostgreSQL reports it; -1 for every other type.
-        payload.extend_from_slice(&db_type.pg_typmod().to_be_bytes());
+        // type_modifier: a declared length, precision and scale or
+        // fractional digits as PostgreSQL reports them; -1 for none.
+        payload.extend_from_slice(&typmod.to_be_bytes());
 
         // format_code
         let format_code = if result_formats.is_empty() {

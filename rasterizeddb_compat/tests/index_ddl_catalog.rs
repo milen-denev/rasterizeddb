@@ -151,7 +151,7 @@ async fn index_statements_answer_with_their_own_tags_and_codes() {
             _ => None,
         })
         .unwrap_or_else(|| panic!("no 23505: {}", wire::render(&r)));
-    assert!(message.starts_with("duplicate value for UNIQUE constraint") && !message.contains("None"), "{message}");
+    assert!(message.starts_with("duplicate key value violates unique constraint") && !message.contains("None"), "{message}");
 
     // Index DDL is a write: refused in a read-only transaction.
     for sql in [

@@ -588,6 +588,98 @@ fn table_columns(schema: &TableSchema) -> Vec<Column> {
         .collect()
 }
 
+/// Where a result column comes from: the relation's oid, the column's
+/// number, its type and modifier, as a `RowDescription` names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnOrigin {
+    pub table_oid: i32,
+    pub attnum: i16,
+    pub type_oid: i32,
+    pub typmod: i32,
+}
+
+/// Each result column of `sql`, a SELECT whose items are columns of the
+/// tables it names (`*`, `t.*`, `col`, `t.col`, aliased or not), as the
+/// table and column it reads; `None` for an item that computes. `None`
+/// overall for a statement whose items cannot be read so (a UNION, a derived
+/// table, a view or a relation this database has not).
+pub(crate) fn column_origins(database: &Database, sql: &str) -> Option<Vec<Option<ColumnOrigin>>> {
+    use crate::core::rql::join::find_keyword;
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    if !sql.get(..6).is_some_and(|w| w.eq_ignore_ascii_case("SELECT")) || find_keyword(sql, "UNION", 0).is_some() {
+        return None;
+    }
+    let from = find_keyword(sql, "FROM", 0)?;
+    let list = sql[6..from].trim_start();
+    let list = if list.get(..8).is_some_and(|w| w.eq_ignore_ascii_case("DISTINCT")) { &list[8..] } else { list };
+    let rest = &sql[from + 4..];
+    let end = ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FOR", "WINDOW", "INTERSECT", "EXCEPT"]
+        .iter()
+        .filter_map(|k| find_keyword(rest, k, 0))
+        .min()
+        .unwrap_or(rest.len());
+    let from_text = rest[..end].trim();
+    if from_text.contains('(') {
+        return None;
+    }
+    let relations = crate::core::rql::join::parse_from_clause(from_text).ok()?;
+    // Each relation's columns, numbered as `pg_attribute` numbers them.
+    let mut tables: Vec<(String, i64, Vec<Column>)> = Vec::with_capacity(relations.len());
+    for r in &relations {
+        let relation = database.relation(&r.table)?;
+        let schema = relation.schema();
+        tables.push((r.label.clone(), oid_of(&r.table), table_columns(&schema)));
+    }
+    let origin = |oid: i64, c: &Column| ColumnOrigin {
+        table_oid: oid as i32,
+        attnum: c.attnum as i16,
+        type_oid: c.type_oid as i32,
+        typmod: c.typmod as i32,
+    };
+    let unquote = |s: &str| {
+        let s = s.trim();
+        if s.starts_with('"') { s.trim_matches('"').to_string() } else { s.to_ascii_lowercase() }
+    };
+    let mut out = Vec::new();
+    for item in crate::core::sql_scan::split_top_level(list, b',') {
+        let (expr, _) = crate::core::rql::lexer_query::split_alias(item.trim());
+        let expr = expr.trim();
+        if expr == "*" {
+            for (_, oid, columns) in &tables {
+                out.extend(columns.iter().map(|c| Some(origin(*oid, c))));
+            }
+            continue;
+        }
+        let is_name = |s: &str| {
+            let s = s.trim();
+            !s.is_empty()
+                && (s.starts_with('"') && s.ends_with('"') && s.len() >= 2
+                    || s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !s.as_bytes()[0].is_ascii_digit())
+        };
+        let (qualifier, column) = match expr.split_once('.') {
+            Some((q, c)) if is_name(q) && (c.trim() == "*" || is_name(c)) => (Some(unquote(q)), c.trim()),
+            _ if is_name(expr) => (None, expr),
+            _ => {
+                out.push(None);
+                continue;
+            }
+        };
+        if column == "*" {
+            let (_, oid, columns) = tables.iter().find(|(label, _, _)| Some(label.to_ascii_lowercase()) == qualifier.as_ref().map(|q| q.to_ascii_lowercase()))?;
+            out.extend(columns.iter().map(|c| Some(origin(*oid, c))));
+            continue;
+        }
+        let column = unquote(column);
+        let found: Vec<ColumnOrigin> = tables
+            .iter()
+            .filter(|(label, _, _)| qualifier.as_ref().is_none_or(|q| label.eq_ignore_ascii_case(q)))
+            .filter_map(|(_, oid, columns)| columns.iter().find(|c| c.name == column).map(|c| origin(*oid, c)))
+            .collect();
+        out.push(if found.len() == 1 { Some(found[0]) } else { None });
+    }
+    Some(out)
+}
+
 fn quote_ident(name: &str) -> String {
     crate::core::rql::views::quote_ident(name)
 }

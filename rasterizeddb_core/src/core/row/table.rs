@@ -3354,6 +3354,17 @@ impl<S: StorageIO> Table<S> {
         }
     }
 
+    /// The constraint a column's own UNIQUE is, as PostgreSQL names it: the
+    /// table's `_pkey` when it is the primary key, its `_<column>_key`
+    /// otherwise.
+    fn column_constraint_name(&self, column: &str) -> String {
+        if self.schema.primary_key.as_deref().is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
+            crate::core::rql::unique_key::pkey_name(&self.schema.name)
+        } else {
+            crate::core::rql::unique_key::implicit_key_name(&self.schema.name, column)
+        }
+    }
+
     async fn check_unique(
         &self,
         row_write: &RowWrite,
@@ -3449,8 +3460,9 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     vec![field.name.clone()],
                     format!(
-                        "duplicate value for UNIQUE column {:?} (row {} already holds it)",
-                        field.name, existing
+                        "duplicate key value violates unique constraint \"{}\" (row {} already holds it)",
+                        self.column_constraint_name(&field.name),
+                        existing
                     ),
                 );
                 continue;
@@ -3461,8 +3473,8 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     vec![field.name.clone()],
                     format!(
-                        "duplicate value for UNIQUE column {:?} (an earlier row of this statement holds it)",
-                        field.name
+                        "duplicate key value violates unique constraint \"{}\" (an earlier row of this statement holds it)",
+                        self.column_constraint_name(&field.name)
                     ),
                 );
             }
@@ -3578,8 +3590,8 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     key.columns.clone(),
                     format!(
-                        "duplicate value for UNIQUE constraint {} (row {} already holds it): {}{}",
-                        key.describe(),
+                        "duplicate key value violates unique constraint \"{}\" (row {} already holds it): {}{}",
+                        key.name,
                         existing,
                         shown.join(", "),
                         updated
@@ -3593,8 +3605,8 @@ impl<S: StorageIO> Table<S> {
                 violations.push(
                     key.columns.clone(),
                     format!(
-                        "duplicate value for UNIQUE constraint {} (an earlier row of this statement holds it)",
-                        key.describe()
+                        "duplicate key value violates unique constraint \"{}\" (an earlier row of this statement holds it)",
+                        key.name
                     ),
                 );
             }
