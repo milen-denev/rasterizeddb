@@ -71,6 +71,11 @@ fn now_ms() -> u64 {
 }
 
 impl ViewRegistry {
+    /// Whether a view of that name is known to this process.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.names.contains_key(name)
+    }
+
     fn note(&self, name: &str) {
         self.names.insert(name.to_string(), ());
     }

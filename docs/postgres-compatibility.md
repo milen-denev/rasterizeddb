@@ -1391,14 +1391,16 @@ Checked against PostgreSQL 17 on 2026-11-19 with the differential harness
 sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
 `RIGHT`/`FULL`/`CROSS JOIN`, `JOIN … USING`, `NATURAL JOIN`,
 `ROLLUP`/`CUBE`/`GROUPING SETS`, `WITH RECURSIVE`, a column list on a table
-alias (`FROM t AS x(a, b)`), `^@` and `OVERLAPS` all run now and are no
-longer gaps. What is still missing:
+alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
+`::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
 
 - **Types**: `CREATE TYPE` for composites and ranges (enums work, see
   "Enum types" above), `CREATE DOMAIN`, range types
   (`int4range`, `daterange`), multidimensional array literals (`ARRAY[[1,2],[3,4]]`),
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
-  PostgreSQL prints `$12.50`.
+  PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
+  PostgreSQL): a sequence's name is not known to the text pass that reads
+  the cast.
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.

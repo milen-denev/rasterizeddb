@@ -9092,6 +9092,11 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
             refused.get_or_insert(e);
             return operand.to_string();
         }
+        // `random()` answers anew for every row: folded once, `WHERE
+        // random() < 0.5` kept every row or none.
+        if crate::core::rql::replicated_values::calls_volatile(trimmed) {
+            return operand.to_string();
+        }
         if let Some(typed) = typed_text_literal(trimmed) {
             return wrap(typed);
         }

@@ -48,6 +48,7 @@ pub(crate) mod lateral;
 pub(crate) mod correlated;
 pub(crate) mod outer_columns;
 pub(crate) mod table_column_lists;
+pub(crate) mod reg_casts;
 pub mod user_types;
 pub mod truncate;
 pub mod pg_functions;

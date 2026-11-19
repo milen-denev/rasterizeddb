@@ -4950,7 +4950,13 @@ pub(crate) async fn describe_query(
         std::borrow::Cow::Borrowed(stmt)
     };
     let flat = crate::core::sql_scan::flatten_whitespace(&uncommented).into_owned();
-    let catalog = crate::core::sql_scan::catalog_syntax(&flat).into_owned();
+    let mut catalog = crate::core::sql_scan::catalog_syntax(&flat).into_owned();
+    // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
+    if let Some(text) = crate::core::rql::reg_casts::rewrite(&catalog, &|name: &str| {
+        database.schema_view(name).is_some() || database.views.contains(name)
+    }) {
+        catalog = text;
+    }
     let arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
     let mut shorthands = crate::core::sql_scan::statement_shorthands(&arrays).into_owned();
     if let Ok(Some(text)) = crate::core::sql_scan::row_assignments(&shorthands) {
@@ -7390,6 +7396,12 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `'t'::regclass`, `'int4'::regtype` and `to_regclass('t')` as the name
+    // or oid they stand for (`rql::reg_casts`).
+    let reg = crate::core::rql::reg_casts::rewrite(&stmt, &|name: &str| {
+        database.schema_view(name).is_some() || database.views.contains(name)
+    });
+    take(&mut stmt, reg);
     // `ARRAY(SELECT …)` as the aggregate it is (`sql_scan::array_subqueries`).
     if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
         stmt = Cow::Owned(text);

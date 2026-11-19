@@ -68,6 +68,17 @@ struct Call {
     function: usize,
 }
 
+/// Whether `text` calls a function that answers anew at every call
+/// (`random()`, `gen_random_uuid()`, `clock_timestamp()`, `timeofday()`):
+/// an expression no fold may compute once for the statement.
+pub fn calls_volatile(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if !FUNCTIONS.iter().any(|(name, _, kind, _)| *kind == Kind::Volatile && lower.contains(name)) {
+        return false;
+    }
+    calls_in(text).iter().any(|c| FUNCTIONS[c.function].2 == Kind::Volatile)
+}
+
 /// See the module documentation. `sql` is one statement.
 pub fn fold(sql: &str) -> Fold {
     // Almost every statement mentions none of them: one cheap pass decides.
@@ -321,6 +332,18 @@ fn evaluate_as_text(call: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volatile_calls_are_told_from_stable_ones() {
+        assert!(calls_volatile("random() < 0.5"));
+        assert!(calls_volatile("gen_random_uuid()::text"));
+        assert!(!calls_volatile("now() - interval '1 day'"));
+        assert!(!calls_volatile("'random()'"));
+        assert!(!calls_volatile("random_col < 0.5"));
+        // Never folded to one value for the statement.
+        let folded = crate::core::rql::executor::fold_where_constants("SELECT id FROM t WHERE random() < 0.5 AND id < 1 + 1");
+        assert_eq!(folded, "SELECT id FROM t WHERE random() < 0.5 AND id < 2");
+    }
 
     fn rewritten(sql: &str) -> String {
         match fold(sql) {
