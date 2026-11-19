@@ -33,6 +33,23 @@ async fn rows(pool: &sqlx::PgPool, sql: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Rows of a text column and an `integer` one, as `array_length` and
+/// `array_ndims` answer (`int4`, as in PostgreSQL), each shown as text.
+async fn text_and_int_rows(pool: &sqlx::PgPool, sql: &str) -> Vec<(String, String)> {
+    sqlx::query(AssertSqlSafe(sql.to_string()))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{}\n  failed: {}", sql, e.to_string().lines().next().unwrap_or("")))
+        .iter()
+        .map(|r| {
+            (
+                r.get::<Option<String>, _>(0).unwrap_or_default(),
+                r.get::<Option<i32>, _>(1).map(|n| n.to_string()).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_document_becomes_its_stemmed_lexemes() {
     let (_s, pool) = seeded().await;
@@ -72,7 +89,7 @@ async fn the_simple_configuration_does_not_stem() {
 #[tokio::test(flavor = "multi_thread")]
 async fn array_length_counts_elements_and_is_null_for_none() {
     let (_s, pool) = seeded().await;
-    let out = rows(
+    let out = text_and_int_rows(
         &pool,
         "SELECT firmware_version, array_length(sensor_readings, 1) \
          FROM test_iot_telemetry ORDER BY firmware_version",
@@ -90,7 +107,7 @@ async fn array_length_counts_elements_and_is_null_for_none() {
 #[tokio::test(flavor = "multi_thread")]
 async fn array_ndims_counts_the_value_dimensions() {
     let (_s, pool) = seeded().await;
-    let out = rows(
+    let out = text_and_int_rows(
         &pool,
         "SELECT firmware_version, array_ndims(calibration_matrix) \
          FROM test_iot_telemetry ORDER BY firmware_version",

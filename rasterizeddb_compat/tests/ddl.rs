@@ -278,7 +278,8 @@ async fn unique_is_enforced_on_insert_and_update() {
     let err = run(&pool, "INSERT INTO u (id, email) VALUES (2, 'a@x')")
         .await
         .expect_err("a duplicate");
-    assert!(err.contains("UNIQUE"), "the reason must reach the client: {}", err);
+    // PostgreSQL's words: `duplicate key value violates unique constraint "u_email_key"`.
+    assert!(err.contains("violates unique constraint"), "the reason must reach the client: {}", err);
     assert!(err.contains("email"), "and name the column: {}", err);
 
     // An update into a taken value is the same violation by another route.
@@ -286,7 +287,7 @@ async fn unique_is_enforced_on_insert_and_update() {
     let err = run(&pool, "UPDATE u SET email = 'a@x' WHERE id = 3")
         .await
         .expect_err("an update into a taken value");
-    assert!(err.contains("UNIQUE"), "{}", err);
+    assert!(err.contains("violates unique constraint"), "{}", err);
 }
 
 #[tokio::test(flavor = "multi_thread")]

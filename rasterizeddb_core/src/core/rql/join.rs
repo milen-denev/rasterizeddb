@@ -4322,6 +4322,14 @@ pub fn plan(
                                 field.size = db_type.get_size();
                             }
                         }
+                        // An expression over the grouping keys, echoed as
+                        // the key it is grouped by.
+                        crate::core::rql::aggregate::SelectItem::Column { field, .. } => {
+                            if field.write_order as usize == *position {
+                                field.db_type = db_type.clone();
+                                field.size = db_type.get_size();
+                            }
+                        }
                         // A call inside an expression reads its computed
                         // argument the same way.
                         crate::core::rql::aggregate::SelectItem::Computed { inputs, .. } => {
@@ -4333,6 +4341,12 @@ pub fn plan(
                             }
                         }
                         _ => {}
+                    }
+                }
+                for key in plan.group_by.iter_mut() {
+                    if key.write_order as usize == *position {
+                        key.db_type = db_type.clone();
+                        key.size = db_type.get_size();
                     }
                 }
             }
@@ -5185,6 +5199,38 @@ fn build_aggregate_stage(
         // and the surrounding expression is evaluated once per emitted group,
         // exactly as the single-relation path does.
         let calls = crate::core::rql::lexer_query::find_aggregate_calls(expr);
+
+        // An expression over the grouping keys and no aggregate —
+        // `upper(c.name)`, `c.id + 1`, `coalesce(c.name, '-')`: computed by
+        // the join's projection as a column
+        // of its own and grouped by too, which splits no group, as it reads
+        // only what the group is keyed on. The single-relation path reads it
+        // the same way (`computed_keys`). Read as a call, it was "function
+        // 'upper' is not supported yet"; as a column, "not found".
+        if calls.is_empty() && resolve(expr).is_err() {
+            for name in column_references(expr) {
+                let Ok((rel, field)) = resolve(&name) else {
+                    continue;
+                };
+                let positioned = positional(rel, field, items);
+                let keyed = group_by.iter().any(|g| g.write_order == positioned.write_order)
+                    || determined.get(rel).copied().unwrap_or(false);
+                if !keyed {
+                    return Err(format!(
+                        "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                        name
+                    ));
+                }
+            }
+            let label = alias.unwrap_or_else(|| pg_column_name(expr));
+            let field = project_computed_argument(expr, items, expr_arguments);
+            if !group_by.iter().any(|g| g.write_order == field.write_order) {
+                group_by.push(field.clone());
+            }
+            fold_items.push(SelectItem::Column { field, label });
+            continue;
+        }
+
         let wrapped =
             !calls.is_empty() && !(calls.len() == 1 && calls[0].0 == 0 && calls[0].1 == expr.len());
         if wrapped {

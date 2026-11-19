@@ -69,7 +69,15 @@ async fn every_catalogue_view_announces_its_columns() {
             ],
         ),
     ] {
-        assert_eq!(described(&pool, sql).await, expected, "for {sql:?}");
+        // The columns named here first, in this order. The views have
+        // since gained the columns drivers read after them (`column_default`
+        // and the identity columns, `reltype`, `relowner`, …), which those
+        // drivers address by name.
+        let announced = described(&pool, sql).await;
+        assert!(
+            announced.len() >= expected.len() && announced[..expected.len()] == expected[..],
+            "for {sql:?}: announced {announced:?}"
+        );
     }
 }
 

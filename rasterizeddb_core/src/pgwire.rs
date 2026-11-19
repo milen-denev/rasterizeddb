@@ -38,6 +38,7 @@ use crate::pg_params::{BoundParam, inline_params};
 mod param_infer;
 mod view_statements;
 mod sequence_statements;
+mod column_origins;
 mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
@@ -7484,6 +7485,12 @@ async fn execute_single_statement_unscoped<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // sqlx's query for where a result's columns come from, answered from the
+    // tables with the record array it reads (`column_origins`), as written:
+    // the passes below make its `VALUES` list a derived table.
+    if let Some(pairs) = column_origins::sqlx_origin_pairs(stmt) {
+        return column_origins::answer(database, stream, &pairs, omit_description).await;
+    }
     // The text-only rewrites, shared with the native protocol
     // (`rewrite_statement_text`).
     let rewritten = match rewrite_statement_text(database, stmt) {

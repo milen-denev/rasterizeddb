@@ -684,6 +684,36 @@ fn quote_ident(name: &str) -> String {
     crate::core::rql::views::quote_ident(name)
 }
 
+/// The names of the columns `pairs` point at, `(table oid, attnum)` as a
+/// `RowDescription` from [`column_origins`] names them, grouped by table in
+/// the order the tables are first named: (table oid, table name, its
+/// (attnum, column name)s). A pair naming no column of a table here is
+/// left out, as an inner join with `pg_attribute` leaves it.
+pub(crate) fn origin_names(database: &Database, pairs: &[(i64, i64)]) -> Vec<(i64, String, Vec<(i64, String)>)> {
+    let mut out: Vec<(i64, String, Vec<(i64, String)>)> = Vec::new();
+    let mut tables: Vec<(i64, String, Vec<Column>)> = Vec::new();
+    for (oid, attnum) in pairs {
+        if !tables.iter().any(|(o, _, _)| o == oid) {
+            if let Some(name) = database.table_names().into_iter().find(|n| oid_of(n) == *oid)
+                && let Some(relation) = database.relation(&name)
+            {
+                tables.push((*oid, name, table_columns(&relation.schema())));
+            }
+        }
+        let Some((_, name, columns)) = tables.iter().find(|(o, _, _)| o == oid) else { continue };
+        let Some(column) = columns.iter().find(|c| c.attnum == *attnum) else { continue };
+        match out.iter_mut().find(|(o, _, _)| o == oid) {
+            Some((_, _, named)) => {
+                if !named.iter().any(|(n, _)| n == attnum) {
+                    named.push((*attnum, column.name.clone()));
+                }
+            }
+            None => out.push((*oid, name.clone(), vec![(*attnum, column.name.clone())])),
+        }
+    }
+    out
+}
+
 fn action_code(
     a: &crate::core::rql::foreign_key::ReferentialAction,
 ) -> (&'static str, &'static str) {
