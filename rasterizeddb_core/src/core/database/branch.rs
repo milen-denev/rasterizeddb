@@ -845,6 +845,31 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Waits (up to a few seconds) until this process holds no file under
+/// `dir` open: a database just dropped closes its files from its own tasks,
+/// shortly after. Removing them while open works on most filesystems, but on
+/// a FUSE one (ntfs-3g) leaves `.fuse_hidden` files the removal then trips
+/// over.
+async fn released(dir: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        for _ in 0..50 {
+            let open = std::fs::read_dir("/proc/self/fd").ok().is_some_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&dir)))
+            });
+            if !open {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = dir;
+}
+
 /// Removes a directory if it exists, logging rather than failing.
 fn remove_quietly(path: &Path) {
     if path.exists()
@@ -1478,6 +1503,7 @@ impl DatabaseCatalog {
         std::mem::forget(guard);
         match self.attach(name).await {
             Ok(_) => {
+                released(&retiring).await;
                 remove_quietly(&retiring);
                 // The old base generation goes with what it described.
                 if let Some((_, (_, open))) = self.bases.remove(name) {
@@ -1485,6 +1511,7 @@ impl DatabaseCatalog {
                 }
                 if let Some(old) = self.base_path(name, meta.base_generation) {
                     forget_directory(&old);
+                    released(&old).await;
                     remove_quietly(&old);
                 }
                 info!("Reset branch \"{}\" from \"{}\"", name, meta.parent);
@@ -1642,7 +1669,7 @@ impl DatabaseCatalog {
     /// the branch's base after a merge committed, and records the merge. The
     /// DDL the merge replayed — the first `ddl_replayed` lines — is dropped
     /// from the branch's log.
-    pub fn adopt_base(
+    pub async fn adopt_base(
         &self,
         name: &str,
         generation: u64,
@@ -1664,15 +1691,17 @@ impl DatabaseCatalog {
         }
         if let Some(old) = self.base_path(name, old) {
             forget_directory(&old);
+            released(&old).await;
             remove_quietly(&old);
         }
         Ok(())
     }
 
     /// Drops a next generation a merge did not commit.
-    pub fn discard_base(&self, name: &str, generation: u64) {
+    pub async fn discard_base(&self, name: &str, generation: u64) {
         if let Some(next) = self.base_path(name, generation) {
             forget_directory(&next);
+            released(&next).await;
             remove_quietly(&next);
         }
     }

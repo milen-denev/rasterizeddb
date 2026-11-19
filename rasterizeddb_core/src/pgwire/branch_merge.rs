@@ -1414,9 +1414,12 @@ pub(super) async fn run(
     let ddl = catalog.branch_ddl(name);
 
     let outcome = merge_with(&base_db, &branch_db, &parent_db, &ddl, apply, &meta.merge_id(name)).await;
+    // The old base is retired once the new one is adopted: let it go first,
+    // so its files are closed when its directory is removed.
+    drop(base_db);
     match (outcome, next) {
         (Ok(rows), Some(generation)) => {
-            if let Err(e) = catalog.adopt_base(name, generation, branch_db, ddl.len()) {
+            if let Err(e) = catalog.adopt_base(name, generation, branch_db, ddl.len()).await {
                 crate::core::notice::push(
                     "WARNING",
                     "01000",
@@ -1431,7 +1434,7 @@ pub(super) async fn run(
         (Ok(rows), None) => Ok(rows),
         (Err(e), Some(generation)) => {
             drop(branch_db);
-            catalog.discard_base(name, generation);
+            catalog.discard_base(name, generation).await;
             Err(e)
         }
         (Err(e), None) => Err(e),

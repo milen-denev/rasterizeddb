@@ -750,9 +750,33 @@ async fn a_dropped_database_lets_go_of_everything() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    eprintln!("still held: database by {others} other(s), fds={fds:?}");
     let left = (others != 0, fds);
     assert!(!left.0 && left.1.is_empty(), "the dropped database is still held: {left:?}");
+
+    // A branch's RESET and MERGE retire copies of it too: none is held
+    // open once they return.
+    let fx = seeded("letgo2").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("INSERT INTO items (id, name, qty) VALUES (5, 'x', 1)").await;
+    admin.exec("MERGE BRANCH dev").await;
+    admin.exec("RESET BRANCH dev").await;
+    admin.exec("MERGE BRANCH dev").await;
+    drop(dev);
+    let deleted = |root: &std::path::Path| -> Vec<String> {
+        open_under(root).into_iter().filter(|p| p.ends_with("(deleted)")).collect()
+    };
+    let mut held = deleted(&fx.root);
+    for _ in 0..50 {
+        if held.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        held = deleted(&fx.root);
+    }
+    assert!(held.is_empty(), "retired copies still open: {held:?}");
+    assert!(!fx.root.join(".retiring-dev").exists());
 }
 
 /// `SHOW BRANCHES` as `(branch, parent, depth, path, children, via)`.
