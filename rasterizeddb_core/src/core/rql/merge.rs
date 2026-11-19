@@ -133,7 +133,7 @@ pub fn parse_merge(sql: &str) -> Option<Result<Merge, Refusal>> {
     // PostgreSQL's MERGE is `MERGE INTO`; any other word after MERGE is
     // another statement's (`MERGE BRANCH dev`), which its own handler reads.
     let next = text[5..].trim_start();
-    if !(next.len() > 4 && next[..4].eq_ignore_ascii_case("INTO") && next.as_bytes()[4].is_ascii_whitespace()) {
+    if !(next.len() > 4 && next.as_bytes()[..4].eq_ignore_ascii_case(b"INTO") && next.as_bytes()[4].is_ascii_whitespace()) {
         return None;
     }
     Some(parse(text))
@@ -205,7 +205,7 @@ fn clause(text: &str) -> Result<WhenClause, Refusal> {
     let head = rest[..then].trim();
     let condition = if head.is_empty() {
         None
-    } else if head.len() >= 3 && head[..3].eq_ignore_ascii_case("AND") {
+    } else if head.len() >= 3 && head.as_bytes()[..3].eq_ignore_ascii_case(b"AND") {
         Some(head[3..].trim().to_string())
     } else {
         return Err(syntax(&format!("unexpected \"{head}\"")));
@@ -300,5 +300,8 @@ mod tests {
         assert!(parse_merge("SELECT 1").is_none());
         assert!(parse_merge("MERGE BRANCH dev").is_none());
         assert!(parse_merge("merge branch dev INTO main").is_none());
+        // A word of several-byte characters after MERGE is no INTO, and no panic.
+        assert!(parse_merge("MERGE ab€ x").is_none());
+        assert!(parse_merge("MERGE ßßßß x").is_none());
     }
 }
