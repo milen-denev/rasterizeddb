@@ -1080,7 +1080,11 @@ mod tests {
                 let classified = DECIDED.contains(clause) || UNDECIDED.contains(clause);
                 let mut statements = vec![
                     ("count", format!("SELECT COUNT(*) FROM t WHERE {clause}")),
-                    ("sum", format!("SELECT COUNT(*), SUM(i16c), MIN(f), MAX(u8c) FROM t WHERE {clause}")),
+                    // No MIN or MAX of a float: -0 and 0 are one value and
+                    // the fold keeps the first it meets, so which of the two
+                    // bit patterns comes back is the scan's order to say
+                    // (`(i8c > 10 OR u8c < 20) AND f >= 0` showed either).
+                    ("sum", format!("SELECT COUNT(*), SUM(i16c), MIN(i64c), MAX(u8c), COUNT(f) FROM t WHERE {clause}")),
                 ];
                 if classified {
                     statements.push(("rows", format!("SELECT {COLUMN_NAMES} FROM t WHERE {clause} ORDER BY id")));
@@ -1094,9 +1098,7 @@ mod tests {
                     let (from_mask, decided) = counting(run(&db, &sql)).await;
                     assert!(
                         from_mask == evaluated,
-                        "round {round}, {sql}: {} bytes with the mask deciding, {} with every row evaluated",
-                        from_mask.len(),
-                        evaluated.len()
+                        "round {round}, {sql}: with the mask deciding {from_mask:02x?}, with every row evaluated {evaluated:02x?}"
                     );
                     if DECIDED.contains(clause) && decided == 0 {
                         misjudged.push(format!("round {round}, {shape}, {clause}: not decided by the mask, so nothing was compared"));
