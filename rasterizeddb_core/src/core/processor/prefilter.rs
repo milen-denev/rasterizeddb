@@ -716,6 +716,15 @@ mod tests {
         executor::execute(purpose, db.clone()).await
     }
 
+    /// Whether a mask can decide at all in this process. `RDB_MASK_DECIDES=0`
+    /// turns it off for good, whatever the switch says, and a run of the
+    /// suite under it (the routine has one) still compares every answer but
+    /// has no decided mask to make claims about.
+    fn masks_can_decide() -> bool {
+        super::set_mask_decides(true);
+        super::mask_decides()
+    }
+
     /// Runs `statement` and returns its reply with how many rows its own
     /// prefilters' masks decided: this statement's, and no other test's.
     async fn counting<F: std::future::Future<Output = Vec<u8>>>(statement: F) -> (Vec<u8>, u64) {
@@ -1100,7 +1109,7 @@ mod tests {
                         from_mask == evaluated,
                         "round {round}, {sql}: with the mask deciding {from_mask:02x?}, with every row evaluated {evaluated:02x?}"
                     );
-                    if DECIDED.contains(clause) && decided == 0 {
+                    if DECIDED.contains(clause) && decided == 0 && masks_can_decide() {
                         misjudged.push(format!("round {round}, {shape}, {clause}: not decided by the mask, so nothing was compared"));
                     }
                     if UNDECIDED.contains(clause) && decided != 0 {
@@ -1127,7 +1136,7 @@ mod tests {
                     evaluated.len()
                 );
                 assert!(evaluated.len() > 100, "round {round}, {sql}: matched nothing");
-                if decided == 0 {
+                if decided == 0 && masks_can_decide() {
                     misjudged.push(format!("round {round}, {sql}: not decided by the mask"));
                 }
             }
@@ -1199,7 +1208,10 @@ mod tests {
             super::set_mask_decides(true);
             let (outside, decided_outside) = counting(run(&db, &sql)).await;
             let (inside, decided_inside) = counting(within(&db, tx, &sql)).await;
-            assert!(decided_outside > 0 && decided_inside > 0, "{sql}: not counted from the mask");
+            assert!(
+                (decided_outside > 0 && decided_inside > 0) || !masks_can_decide(),
+                "{sql}: not counted from the mask"
+            );
             assert!(
                 &outside_evaluated == committed,
                 "{sql}: another transaction's uncommitted writes changed what an evaluated count sees"
