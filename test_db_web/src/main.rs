@@ -1,21 +1,22 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{fmt::Write, io};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::Path;
+use axum::extract::{Path, RawQuery};
 use axum::http::{StatusCode, header};
 use axum::{response::Response, routing::get};
-use once_cell::sync::Lazy;
 
 use rand::RngExt;
 
-use rasterizeddb_client::{Client, Options, Rows};
+use rasterizeddb_client::Login;
+use rasterizeddb_client::orm::AutoMigrate;
+use rasterizeddb_client::orm::Migrator;
+use rasterizeddb_client::{Client, Options, Param, Rows};
 use tokio::sync::OnceCell;
 
 static CLIENT: async_lazy::Lazy<Arc<Client>> = async_lazy::Lazy::new(|| {
@@ -23,11 +24,24 @@ static CLIENT: async_lazy::Lazy<Arc<Client>> = async_lazy::Lazy::new(|| {
         // One connection shared by every request this server is handling,
         // in place of a pool of up to 128: the database runs each query on a
         // task of its own whichever connection it arrives on.
+        // Where and as whom, from the environment: `RDB_ADDR` (default the
+        // local server), and `RDB_USER` with `RDB_PASSWORD` for a server
+        // that asks for a password (none given: no login exchange).
+        let addr = std::env::var("RDB_ADDR").unwrap_or_else(|_| "127.0.0.1:61170".into());
+        let login = match (std::env::var("RDB_USER"), std::env::var("RDB_PASSWORD")) {
+            (Ok(user), Ok(password)) => Login::Password { user, password },
+            _ => Login::Trust,
+        };
         let client = Client::connect(
-            "127.0.0.1:61170",
+            &addr,
             Options {
                 timeout: Some(Duration::from_secs(2)),
-                ..Options::default()
+                connections: 2,
+                login,
+                max_message_size: 8_198_000,
+                migrations: Some(Migrator::default()),
+                auto_migrate: AutoMigrate::Off,
+                idle_reconnect: Some(Duration::from_secs(120)),
             },
         )
         .await
@@ -66,20 +80,10 @@ static CLIENT: async_lazy::Lazy<Arc<Client>> = async_lazy::Lazy::new(|| {
     })
 });
 
-static RESPONSE_CACHE: Lazy<Mutex<HashMap<u64, Arc<OnceCell<Bytes>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
 #[derive(Debug)]
 struct HttpResponseError {
     status: StatusCode,
     message: String,
-}
-
-fn response_cache_cell(id: u64) -> Arc<OnceCell<Bytes>> {
-    let mut cache = RESPONSE_CACHE.lock().expect("response cache mutex poisoned");
-    cache.entry(id)
-        .or_insert_with(|| Arc::new(OnceCell::new()))
-        .clone()
 }
 
 fn text_response(status: StatusCode, body: impl Into<Body>) -> Response {
@@ -120,18 +124,24 @@ fn render_rows(rows: &Rows) -> Result<Bytes, io::Error> {
     Ok(Bytes::from(output))
 }
 
-async fn fetch_response_body(id: u64) -> Result<Bytes, HttpResponseError> {
-    let query = build_query(id);
-    let client = CLIENT.force().await;
-
-    let rows = client.run(&query).await.map_err(|err| HttpResponseError {
+/// A database error as an HTTP one: 502 for an error the server answered
+/// with, 503 for one that never reached an answer.
+fn db_error(err: rasterizeddb_client::Error) -> HttpResponseError {
+    HttpResponseError {
         status: if matches!(err, rasterizeddb_client::Error::Server(_)) {
             StatusCode::BAD_GATEWAY
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
         message: format!("db error: {err}"),
-    })?;
+    }
+}
+
+async fn fetch_response_body(id: u64) -> Result<Bytes, HttpResponseError> {
+    let query = build_query(id);
+    let client = CLIENT.force().await;
+
+    let rows = client.run(&query).await.map_err(db_error)?;
 
     render_rows(&rows).map_err(|err| HttpResponseError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -139,29 +149,228 @@ async fn fetch_response_body(id: u64) -> Result<Bytes, HttpResponseError> {
     })
 }
 
+/// The next unused id. `employees` has no serial column, so ids are handed
+/// out here, starting after the largest one in the table when the first row
+/// is added. Only this process counts: two copies of the server adding at
+/// once would hand out the same ids.
+static NEXT_ID: OnceCell<AtomicU64> = OnceCell::const_new();
+
+/// Reserves `count` consecutive ids and returns the first.
+async fn reserve_ids(client: &Client, count: u64) -> Result<u64, HttpResponseError> {
+    let next = NEXT_ID
+        .get_or_try_init(|| async {
+            let rows = client
+                .run("SELECT MAX(id) FROM employees")
+                .await
+                .map_err(db_error)?;
+            // An empty table answers NULL (or no row at all).
+            let max: Option<u64> = match rows.get(0) {
+                Some(row) => row.get(0).map_err(|err| HttpResponseError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("could not read MAX(id): {err}"),
+                })?,
+                None => None,
+            };
+            Ok::<_, HttpResponseError>(AtomicU64::new(max.map_or(1, |max| max + 1)))
+        })
+        .await?;
+    Ok(next.fetch_add(count, Ordering::Relaxed))
+}
+
+/// The most rows one request may add.
+const MAX_ADD: u64 = 100_000;
+/// Rows per `INSERT` statement.
+const INSERT_BATCH: usize = 1_000;
+
+/// The column list every insert names, in the order `person_params` gives.
+const INSERT_COLUMNS: &str = "id, name, job_title, salary, department, age, manager, location, \
+     hire_date, degree, skills, current_project, performance_score, is_active, created_at, \
+     updated_at, is_fired";
+const INSERT_WIDTH: usize = 17;
+
+fn person_params(id: u64, p: &Person) -> [Param<'_>; INSERT_WIDTH] {
+    [
+        Param::U64(id),
+        Param::Text(&p.name),
+        Param::Text(&p.job_title),
+        Param::F32(p.salary),
+        Param::Text(&p.department),
+        Param::I32(p.age as i32),
+        Param::Text(&p.manager),
+        Param::Text(&p.location),
+        Param::U64(p.hire_date),
+        Param::Text(&p.degree),
+        Param::Text(&p.skills),
+        Param::Text(&p.current_project),
+        Param::F32(p.performance_score),
+        Param::Bool(p.is_active),
+        Param::U64(p.created_at),
+        Param::U64(p.updated_at),
+        Param::Bool(p.is_fired),
+    ]
+}
+
+/// `INSERT INTO employees (...) VALUES ($1, ..., $17), ($18, ...), ...` for
+/// `rows` rows.
+fn insert_statement(rows: usize) -> String {
+    let mut sql = String::with_capacity(96 + rows * INSERT_WIDTH * 6);
+    let _ = write!(&mut sql, "INSERT INTO employees ({INSERT_COLUMNS}) VALUES ");
+    for row in 0..rows {
+        sql.push_str(if row == 0 { "(" } else { ", (" });
+        for column in 0..INSERT_WIDTH {
+            if column > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(&mut sql, "${}", row * INSERT_WIDTH + column + 1);
+        }
+        sql.push(')');
+    }
+    sql
+}
+
+/// Adds `count` generated employees and answers with the ids they got.
+async fn add_rows(count: u64) -> Result<Bytes, HttpResponseError> {
+    if count == 0 || count > MAX_ADD {
+        return Err(HttpResponseError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("count must be between 1 and {MAX_ADD}"),
+        });
+    }
+
+    let client = CLIENT.force().await;
+    let first = reserve_ids(client, count).await?;
+    let last = first + count - 1;
+
+    let people: Vec<Person> = (0..count).map(|_| generate_person()).collect();
+    let mut added = 0u64;
+    for (chunk_index, chunk) in people.chunks(INSERT_BATCH).enumerate() {
+        let chunk_first = first + (chunk_index * INSERT_BATCH) as u64;
+        let params: Vec<Param<'_>> = chunk
+            .iter()
+            .enumerate()
+            .flat_map(|(i, person)| person_params(chunk_first + i as u64, person))
+            .collect();
+        match client.execute(&insert_statement(chunk.len()), &params).await {
+            Ok(n) => added += n,
+            Err(err) => {
+                let mut error = db_error(err);
+                error.message = format!(
+                    "{} (after {added} of {count} rows were added, ids {first}..={})",
+                    error.message,
+                    first + added.saturating_sub(1)
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(Bytes::from(format!("added {added} rows, ids {first}..={last}")))
+}
+
 #[tokio::main]
 async fn main() {
     let app = Router::new()
-        .route("/get/{id}", get(query));
+        .route("/get/{id}", get(query))
+        // GET as well as POST, so a browser can call it like `/get`.
+        .route("/add", get(add_one).post(add_one))
+        .route("/add/{count}", get(add_many).post(add_many))
+        // The in-memory key/value store (`KV ...` over the native protocol).
+        .route("/kv/{key}", get(kv_get))
+        .route("/kv/set/{key}/{value}", get(kv_set));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:80").await.unwrap();
+    // `RDB_WEB_ADDR` to listen elsewhere.
+    let listen = std::env::var("RDB_WEB_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let listener = tokio::net::TcpListener::bind(&listen).await.unwrap();
 
     axum::serve(listener, app).await.unwrap();
 }
 
-// get id from query param
-async fn query(Path(id): Path<u64>) -> Response {
-    let cache_cell = response_cache_cell(id);
+async fn add_one() -> Response {
+    add_response(1).await
+}
 
-    match cache_cell
-        .get_or_try_init(|| async move { fetch_response_body(id).await })
-        .await
-    {
-        Ok(body) => text_response(StatusCode::OK, Body::from(body.clone())),
-        Err(err) => text_response(err.status, Body::from(err.message.clone())),
+async fn add_many(Path(count): Path<u64>) -> Response {
+    add_response(count).await
+}
+
+async fn add_response(count: u64) -> Response {
+    match add_rows(count).await {
+        Ok(body) => text_response(StatusCode::OK, Body::from(body)),
+        Err(err) => text_response(err.status, Body::from(err.message)),
     }
 }
 
+/// `?ttl=<seconds>` from the query string, if given. `Err` names a bad one.
+fn ttl_from_query(query: Option<&str>) -> Result<Option<Duration>, Response> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("ttl=") {
+            return match value.parse::<u64>() {
+                Ok(secs) if secs > 0 => Ok(Some(Duration::from_secs(secs))),
+                _ => Err(text_response(
+                    StatusCode::BAD_REQUEST,
+                    "ttl must be a whole number of seconds above 0",
+                )),
+            };
+        }
+    }
+    Ok(None)
+}
+
+async fn kv_store(key: &str, value: &[u8], ttl: Option<Duration>) -> Response {
+    let client = CLIENT.force().await;
+    match client.kv().set(key.as_bytes(), value, ttl).await {
+        Ok(()) => {
+            let expiry = match ttl {
+                Some(ttl) => format!(", expires in {}s", ttl.as_secs()),
+                None => String::new(),
+            };
+            text_response(
+                StatusCode::OK,
+                format!("set {key} ({} bytes{expiry})", value.len()),
+            )
+        }
+        Err(err) => {
+            let err = db_error(err);
+            text_response(err.status, err.message)
+        }
+    }
+}
+
+/// `GET /kv/set/{key}/{value}[?ttl=<seconds>]`.
+async fn kv_set(
+    Path((key, value)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    match ttl_from_query(query.as_deref()) {
+        Ok(ttl) => kv_store(&key, value.as_bytes(), ttl).await,
+        Err(response) => response,
+    }
+}
+
+/// `GET /kv/{key}`: the value, or 404 when the key is not there (never set,
+/// deleted, or expired).
+async fn kv_get(Path(key): Path<String>) -> Response {
+    let client = CLIENT.force().await;
+    match client.kv().get(key.as_bytes()).await {
+        Ok(Some(value)) => text_response(StatusCode::OK, value),
+        Ok(None) => text_response(StatusCode::NOT_FOUND, format!("no key {key}")),
+        Err(err) => {
+            let err = db_error(err);
+            text_response(err.status, err.message)
+        }
+    }
+}
+
+// get id from query param
+async fn query(Path(id): Path<u64>) -> Response {
+    match fetch_response_body(id).await {
+        Ok(body) => text_response(StatusCode::OK, Body::from(body)),
+        Err(err) => text_response(err.status, Body::from(err.message)),
+    }
+}
 
 // A simple struct to hold the generated data.
 struct Person {

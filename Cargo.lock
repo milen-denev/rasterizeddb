@@ -5983,7 +5983,6 @@ version = "0.1.0"
 dependencies = [
  "async-lazy",
  "axum",
- "once_cell",
  "rand 0.10.3",
  "rasterizeddb_client",
  "tokio",
