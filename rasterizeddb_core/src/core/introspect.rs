@@ -1053,7 +1053,7 @@ async fn database_stats(database: &Arc<Database>) -> Result<Vec<Row>, String> {
     push(
         "auto_compactions",
         crate::core::auto_compact::RUNS.load(Ordering::Relaxed).to_string(),
-        "tables compacted automatically, their slots far past their live rows",
+        "tables and partitions compacted automatically, their slots mostly dead (SHOW CONFIG auto_compact.*)",
     );
     push(
         "auto_compactions_skipped_busy",
@@ -2458,6 +2458,62 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "background reclamation, for every table in this database",
     },
     ConfigKey {
+        section: "auto_compact",
+        key: "enabled",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.enabled = on",
+        options: "on|off",
+        help: "compact (VACUUM FULL) tables and partitions whose pointer slots are mostly dead, without being asked",
+    },
+    ConfigKey {
+        section: "auto_compact",
+        key: "interval_secs",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.interval_secs = 60",
+        options: "",
+        help: "seconds between two looks at every table and open partition",
+    },
+    ConfigKey {
+        section: "auto_compact",
+        key: "min_slots",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.min_slots = 2048",
+        options: "",
+        help: "pointer slots a table or partition has before it can be due at all",
+    },
+    ConfigKey {
+        section: "auto_compact",
+        key: "ratio",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.ratio = 8",
+        options: "",
+        help: "due when the slots are this many times the live rows (an update-heavy table); 0 turns this rule off",
+    },
+    ConfigKey {
+        section: "auto_compact",
+        key: "dead_fraction",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.dead_fraction = 0.25",
+        options: "",
+        help: "due when this fraction of the slots is dead (a retention table or partition), 0..1; 0 turns this rule off",
+    },
+    ConfigKey {
+        section: "auto_compact",
+        key: "dead_fraction_max_slots",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.dead_fraction_max_slots = 131072",
+        options: "",
+        help: "the dead_fraction rule applies only up to this many slots, bounding how long it stops a table; 0 is no limit",
+    },
+    ConfigKey {
+        section: "auto_compact",
+        key: "cooldown_secs",
+        hot: true,
+        set_with: "SET CONFIG auto_compact.cooldown_secs = 600",
+        options: "",
+        help: "least seconds between two automatic compactions of one table or partition",
+    },
+    ConfigKey {
         section: "partition",
         key: "open_budget",
         hot: true,
@@ -2621,6 +2677,13 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             #[cfg(not(feature = "query_stats"))]
             ("query_stats", _) => "not built".to_string(),
             ("vacuum", "enabled") => "per table".to_string(),
+            ("auto_compact", "enabled") => if crate::auto_compact_enabled() { "on" } else { "off" }.to_string(),
+            ("auto_compact", "interval_secs") => crate::auto_compact_interval_secs().to_string(),
+            ("auto_compact", "min_slots") => crate::auto_compact_min_slots().to_string(),
+            ("auto_compact", "ratio") => crate::auto_compact_ratio().to_string(),
+            ("auto_compact", "dead_fraction") => crate::auto_compact_dead_fraction().to_string(),
+            ("auto_compact", "dead_fraction_max_slots") => crate::auto_compact_dead_fraction_max_slots().to_string(),
+            ("auto_compact", "cooldown_secs") => crate::auto_compact_cooldown_secs().to_string(),
             ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
             ("index_snapshot", "idle_checkpoint_secs") => {
@@ -2850,6 +2913,51 @@ async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<
                 }
                 _ => Err(format!("`{}` has no live setter", key)),
             }
+        }
+        "auto_compact" => {
+            let v = value.trim().trim_matches('\'');
+            match name {
+                "enabled" => {
+                    let on = parse_bool(v)?;
+                    crate::set_auto_compact_enabled(on);
+                    return Ok(format!("automatic compaction is now {}", if on { "on" } else { "off" }));
+                }
+                "dead_fraction" => {
+                    let f: f64 = v
+                        .parse()
+                        .map_err(|_| format!("`{}` is not a fraction (0..1) for {}", value, key))?;
+                    crate::set_auto_compact_dead_fraction(f)?;
+                    return Ok(format!("{key} is now {}", crate::auto_compact_dead_fraction()));
+                }
+                _ => {}
+            }
+            let n: u64 = v
+                .parse()
+                .map_err(|_| format!("`{}` is not a whole number for {}", value, key))?;
+            let now = match name {
+                "interval_secs" => {
+                    crate::set_auto_compact_interval_secs(n);
+                    crate::auto_compact_interval_secs()
+                }
+                "min_slots" => {
+                    crate::set_auto_compact_min_slots(n);
+                    crate::auto_compact_min_slots()
+                }
+                "ratio" => {
+                    crate::set_auto_compact_ratio(n);
+                    crate::auto_compact_ratio()
+                }
+                "dead_fraction_max_slots" => {
+                    crate::set_auto_compact_dead_fraction_max_slots(n);
+                    crate::auto_compact_dead_fraction_max_slots()
+                }
+                "cooldown_secs" => {
+                    crate::set_auto_compact_cooldown_secs(n);
+                    crate::auto_compact_cooldown_secs()
+                }
+                _ => return Err(format!("`{}` has no live setter", key)),
+            };
+            Ok(format!("{key} is now {now}"))
         }
         "partition" => {
             use crate::core::partition::budget::settings;

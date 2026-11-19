@@ -10,10 +10,15 @@
 //! rewrites the slots, and nothing ran it.
 //!
 //! This task runs it, on a table whose slots are at least
-//! [`crate::auto_compact_min_slots`] and at least
-//! [`crate::auto_compact_ratio`] times its live rows (as the reclamation
-//! sweep last measured them, `VacuumStats::live_rows`), no more often than
-//! [`crate::auto_compact_cooldown_secs`] per table. It is the statement
+//! [`crate::auto_compact_min_slots`] and either at least
+//! [`crate::auto_compact_ratio`] times its live rows or at least
+//! [`crate::auto_compact_dead_fraction`] dead (the latter only up to
+//! [`crate::auto_compact_dead_fraction_max_slots`] slots), its live rows as
+//! the reclamation sweep last measured them (`VacuumStats::live_rows`), no
+//! more often than [`crate::auto_compact_cooldown_secs`] per table. Why those
+//! defaults is at their declaration in `lib.rs`; every one of them is a
+//! `--auto-compact-*` flag and a hot `SET CONFIG auto_compact.*` key, read
+//! afresh each pass ([`Policy::current`]). It is the statement
 //! itself, through the executor: the same ACCESS EXCLUSIVE and the same
 //! interaction with backups and replication as an operator's `VACUUM FULL
 //! <table>`, nothing of its own.
@@ -31,7 +36,7 @@
 //! Compaction stops the table while it runs, so a busy table is skipped
 //! rather than queued for: the statement runs with a short `lock_timeout`
 //! ([`LOCK_WAIT_MS`]), and a table whose lock is not free at once is tried
-//! again next interval. Kept small by the threshold, a run is brief (about
+//! again next interval. Kept small by the thresholds, a run is brief (about
 //! 0.4 s at 20 000 slots); a table that already holds far more pays one long
 //! run the first time.
 //!
@@ -62,31 +67,69 @@ pub struct Measure {
 }
 
 impl Measure {
-    /// Due when the slots pass the floor and outnumber the live rows by the
-    /// ratio. A table whose live rows are unmeasured (no complete sweep yet)
-    /// is never due: slots alone cannot tell dead from live.
-    pub fn due(&self, min_slots: u64, ratio: u64) -> bool {
-        self.slots >= min_slots && self.slots >= ratio.max(1).saturating_mul(self.live.max(1))
+    /// Due when the slots pass the floor and either outnumber the live rows
+    /// by the ratio (an update-heavy table: a heartbeat, a lease) or are dead
+    /// by at least the fraction, on a relation no larger than that rule's
+    /// cap (a retention table, a partition of one). A rule whose setting is
+    /// 0 is off. A table whose live rows are unmeasured (no complete sweep
+    /// yet) has no `Measure`, so is never due: slots alone cannot tell dead
+    /// from live.
+    pub fn due(&self, t: &Thresholds) -> bool {
+        if self.slots < t.min_slots {
+            return false;
+        }
+        let live = self.live.min(self.slots);
+        let amplified = t.ratio > 0 && self.slots >= t.ratio.saturating_mul(live.max(1));
+        let dead = (self.slots - live) as f64;
+        let mostly_dead = t.dead_fraction > 0.0
+            && (t.dead_fraction_max_slots == 0 || self.slots <= t.dead_fraction_max_slots)
+            && dead >= t.dead_fraction * self.slots as f64;
+        amplified || mostly_dead
+    }
+}
+
+/// What makes a relation due ([`Measure::due`]): the `auto_compact.*`
+/// settings but the interval and the cooldown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    pub min_slots: u64,
+    pub ratio: u64,
+    pub dead_fraction: f64,
+    pub dead_fraction_max_slots: u64,
+}
+
+impl Thresholds {
+    /// The settings as they stand now.
+    pub fn current() -> Self {
+        Thresholds {
+            min_slots: crate::auto_compact_min_slots(),
+            ratio: crate::auto_compact_ratio(),
+            dead_fraction: crate::auto_compact_dead_fraction(),
+            dead_fraction_max_slots: crate::auto_compact_dead_fraction_max_slots(),
+        }
     }
 }
 
 /// The policy one pass applies: the settings, read once per pass.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    min_slots: u64,
-    ratio: u64,
+    thresholds: Thresholds,
     cooldown: Duration,
 }
 
 impl Policy {
     fn current() -> Self {
         Policy {
-            min_slots: crate::auto_compact_min_slots(),
-            ratio: crate::auto_compact_ratio(),
+            thresholds: Thresholds::current(),
             cooldown: Duration::from_secs(crate::auto_compact_cooldown_secs()),
         }
     }
 }
+
+/// The longest the task sleeps before it looks at the settings again, so a
+/// shortened interval or a re-enabled task takes effect within it rather
+/// than after whatever interval was running.
+const SETTINGS_POLL: Duration = Duration::from_secs(5);
 
 /// The plain table's measure, `None` when it cannot be read, its live rows
 /// were never measured, or it is partitioned (see [`measure_partitions`]).
@@ -124,20 +167,34 @@ async fn measure_table(
 }
 
 /// Starts the task over `databases` (the catalogue's map, held weakly).
+///
+/// It runs whether or not [`crate::auto_compact_enabled`] is on now, since
+/// `SET CONFIG auto_compact.enabled` can turn it on later; while off, a pass
+/// does nothing.
 pub fn spawn<M>(databases: std::sync::Weak<M>, all: fn(&M) -> Vec<rclite::Arc<Database>>)
 where
     M: Send + Sync + 'static,
 {
-    if !crate::auto_compact_enabled() {
-        return;
-    }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
     handle.spawn(async move {
         let mut last: Last = HashMap::new();
+        let mut since = Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(crate::auto_compact_interval_secs().max(1))).await;
+            let interval = Duration::from_secs(crate::auto_compact_interval_secs().max(1));
+            let waited = since.elapsed();
+            if waited < interval {
+                tokio::time::sleep((interval - waited).min(SETTINGS_POLL)).await;
+                if databases.strong_count() == 0 {
+                    return;
+                }
+                continue;
+            }
+            since = Instant::now();
+            if !crate::auto_compact_enabled() {
+                continue;
+            }
             let Some(map) = databases.upgrade() else { return };
             let all_databases = all(&map);
             drop(map);
@@ -176,7 +233,7 @@ async fn tick_with(database: &rclite::Arc<Database>, last: &mut Last, policy: Po
         if database.is_partitioned(&name) {
             for (pid, m) in measure_partitions(database, &name).await {
                 let key = (database.id, name.clone(), Some(pid));
-                if last.get(&key).is_some_and(|at| at.elapsed() < policy.cooldown) || !m.due(policy.min_slots, policy.ratio) {
+                if last.get(&key).is_some_and(|at| at.elapsed() < policy.cooldown) || !m.due(&policy.thresholds) {
                     continue;
                 }
                 let what = format!("partition {pid} of \"{name}\"");
@@ -197,7 +254,7 @@ async fn tick_with(database: &rclite::Arc<Database>, last: &mut Last, policy: Po
             continue;
         }
         let Some(m) = measure(database, &name).await else { continue };
-        if !m.due(policy.min_slots, policy.ratio) {
+        if !m.due(&policy.thresholds) {
             continue;
         }
         let what = format!("\"{name}\"");

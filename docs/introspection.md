@@ -172,6 +172,7 @@ it and names the flag instead of failing obscurely.
 | `filter.*` | `SET FILTER …` (`core::filter::sql`) |
 | `replication.*` | `REPLICATION SET …` (`replication::sql`) |
 | `vacuum.enabled` | `Table::set_vacuum_enabled`, for every table in the database |
+| `auto_compact.*` | the automatic compaction's settings (`lib.rs`, read by `core::auto_compact` each pass); see docs/space-reclamation.md |
 
 That is what keeps `SET CONFIG filter.max_f = 20` and `SET FILTER max_f = 20`
 from drifting into meaning different things.

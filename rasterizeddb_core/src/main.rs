@@ -119,6 +119,49 @@ struct Args {
     #[arg(long = "query-stats", alias = "query_stats", value_name = "on|off")]
     query_stats: Option<String>,
 
+    /// Whether tables and partitions whose pointer slots are mostly dead are
+    /// compacted (`VACUUM FULL`) without being asked (default: on)
+    ///
+    /// Pointer slots are given back only by a compaction; plain `VACUUM`
+    /// reuses row bytes, not slots. A table or partition is due when it has at
+    /// least `--auto-compact-min-slots` slots and either its slots are
+    /// `--auto-compact-ratio` times its live rows or `--auto-compact-dead-fraction`
+    /// of them are dead. A busy one is skipped, never waited for. Every
+    /// `--auto-compact-*` flag is the starting value of the hot
+    /// `SET CONFIG auto_compact.*` key of the same name.
+    #[arg(long = "auto-compact", alias = "auto_compact", value_name = "on|off")]
+    auto_compact: Option<String>,
+
+    /// Seconds between two looks at every table and open partition (default: 60)
+    #[arg(long = "auto-compact-interval-secs", value_name = "SECS")]
+    auto_compact_interval_secs: Option<u64>,
+
+    /// Pointer slots a table or partition has before it can be due at all
+    /// (default: 2048)
+    #[arg(long = "auto-compact-min-slots", value_name = "N")]
+    auto_compact_min_slots: Option<u64>,
+
+    /// Due when the slots are this many times the live rows, an update-heavy
+    /// table's shape (default: 8; 0 turns this rule off)
+    #[arg(long = "auto-compact-ratio", value_name = "N")]
+    auto_compact_ratio: Option<u64>,
+
+    /// Due when this fraction of the slots is dead, a retention table's
+    /// shape (default: 0.25; 0 turns this rule off)
+    #[arg(long = "auto-compact-dead-fraction", value_name = "0..1")]
+    auto_compact_dead_fraction: Option<f64>,
+
+    /// The dead-fraction rule applies only to a table or partition of at most
+    /// this many slots, bounding how long it stops one (default: 131072, about
+    /// 2 s; 0 is no limit)
+    #[arg(long = "auto-compact-dead-fraction-max-slots", value_name = "N")]
+    auto_compact_dead_fraction_max_slots: Option<u64>,
+
+    /// Least seconds between two automatic compactions of one table or
+    /// partition (default: 600)
+    #[arg(long = "auto-compact-cooldown-secs", value_name = "SECS")]
+    auto_compact_cooldown_secs: Option<u64>,
+
     /// glibc malloc arenas, a low-memory mode (default: 0, glibc's own, 8 per
     /// core)
     ///
@@ -1352,6 +1395,33 @@ fn main() -> std::io::Result<()> {
             Ok(on) => rasterizeddb_core::core::query_stats::set_enabled(on),
             Err(e) => return Err(std::io::Error::other(format!("--query-stats: {}", e))),
         }
+    }
+    // The same runtime state `SET CONFIG auto_compact.*` writes; before any
+    // catalogue opens, so its task's first pass sees them.
+    if let Some(spec) = args.auto_compact.as_deref() {
+        match rasterizeddb_core::core::introspect::parse_bool(spec) {
+            Ok(on) => rasterizeddb_core::set_auto_compact_enabled(on),
+            Err(e) => return Err(std::io::Error::other(format!("--auto-compact: {}", e))),
+        }
+    }
+    if let Some(secs) = args.auto_compact_interval_secs {
+        rasterizeddb_core::set_auto_compact_interval_secs(secs);
+    }
+    if let Some(n) = args.auto_compact_min_slots {
+        rasterizeddb_core::set_auto_compact_min_slots(n);
+    }
+    if let Some(n) = args.auto_compact_ratio {
+        rasterizeddb_core::set_auto_compact_ratio(n);
+    }
+    if let Some(f) = args.auto_compact_dead_fraction {
+        rasterizeddb_core::set_auto_compact_dead_fraction(f)
+            .map_err(|e| std::io::Error::other(format!("--auto-compact-dead-fraction: {e}")))?;
+    }
+    if let Some(n) = args.auto_compact_dead_fraction_max_slots {
+        rasterizeddb_core::set_auto_compact_dead_fraction_max_slots(n);
+    }
+    if let Some(secs) = args.auto_compact_cooldown_secs {
+        rasterizeddb_core::set_auto_compact_cooldown_secs(secs);
     }
     {
         use rasterizeddb_core::core::index::paged;

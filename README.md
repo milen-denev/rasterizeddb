@@ -395,6 +395,24 @@ VACUUM FULL;        -- compact in place and return space to the filesystem
 SHOW TABLE STATS users;   -- includes how much is reclaimable
 ```
 
+Pointer slots are given back only by `VACUUM FULL`, so a background task runs
+it on a table or partition whose slots are mostly dead: at least 2 048 slots,
+and either 8× its live rows or a quarter dead (the latter up to 131 072 slots,
+so it never stops a large table for long), each at most once per 10 minutes,
+skipping one that is in use. Every threshold is a hot `SET CONFIG` key and a
+flag:
+
+```sql
+SET CONFIG auto_compact.dead_fraction = 0.3;   -- also enabled, interval_secs,
+                                               -- min_slots, ratio, cooldown_secs,
+                                               -- dead_fraction_max_slots
+```
+
+```sh
+rasterizeddb_core --location <PATH> --auto-compact on --auto-compact-min-slots 4096 \
+    --auto-compact-dead-fraction 0.3 --auto-compact-cooldown-secs 900
+```
+
 See [docs/space-reclamation.md](docs/space-reclamation.md).
 
 ### JSON documents

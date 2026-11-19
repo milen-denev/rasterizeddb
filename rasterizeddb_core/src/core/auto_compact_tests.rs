@@ -2,18 +2,185 @@
 
 use super::*;
 
+/// The settings' defaults, as `lib.rs` declares them.
+const DEFAULTS: Thresholds = Thresholds {
+    min_slots: 2_048,
+    ratio: 8,
+    dead_fraction: 0.25,
+    dead_fraction_max_slots: 131_072,
+};
+
+/// The first rule alone: the floor and the ratio, the dead-fraction rule off.
+const RATIO_ONLY: Thresholds = Thresholds {
+    min_slots: 20_000,
+    ratio: 8,
+    dead_fraction: 0.0,
+    dead_fraction_max_slots: 0,
+};
+
+fn m(slots: u64, live: u64) -> Measure {
+    Measure { slots, live }
+}
+
 #[test]
 fn a_table_is_due_past_the_floor_and_the_ratio() {
-    let m = |slots, live| Measure { slots, live };
     // The heartbeat: 8 live rows in 38 030 slots.
-    assert!(m(38_030, 8).due(20_000, 8));
+    assert!(m(38_030, 8).due(&RATIO_ONLY));
     // Below the floor, whatever the ratio.
-    assert!(!m(19_999, 1).due(20_000, 8));
+    assert!(!m(19_999, 1).due(&RATIO_ONLY));
     // A table that mostly inserts: slots near its live rows.
-    assert!(!m(472_468, 400_000).due(20_000, 8));
-    assert!(m(472_468, 1_012).due(20_000, 8));
+    assert!(!m(472_468, 400_000).due(&RATIO_ONLY));
+    assert!(m(472_468, 1_012).due(&RATIO_ONLY));
     // An empty table counts as one live row, never divides by zero.
-    assert!(m(20_000, 0).due(20_000, 8));
+    assert!(m(20_000, 0).due(&RATIO_ONLY));
+    // Under the defaults the same, the ratio rule having no size cap.
+    assert!(m(38_030, 8).due(&DEFAULTS));
+    assert!(m(472_468, 1_012).due(&DEFAULTS));
+    assert!(!m(472_468, 400_000).due(&DEFAULTS));
+}
+
+/// The case the first rule never reached: a 32-partition telemetry table at
+/// 500 000 rows, 31 % of each partition's slots dead. It was not due under
+/// the old rule, and is under the defaults, read either way: 15 625 slots a
+/// partition with 31 % of them dead, or 15 625 live rows a partition with 31 %
+/// of the slots dead (22 645 slots).
+#[test]
+fn a_retention_partition_is_due_by_its_dead_fraction() {
+    let slots_31_dead = m(15_625, 10_781);
+    let live_31_dead = m(22_645, 15_625);
+    for p in [slots_31_dead, live_31_dead] {
+        assert!(!p.due(&RATIO_ONLY), "the old rule: {p:?}");
+        assert!(p.due(&DEFAULTS), "the defaults: {p:?}");
+    }
+    // Exactly at the fraction is due; just under is not.
+    assert!(m(10_000, 7_500).due(&DEFAULTS));
+    assert!(!m(10_000, 7_501).due(&DEFAULTS));
+    // The rule off, only the ratio is left.
+    let off = Thresholds { dead_fraction: 0.0, ..DEFAULTS };
+    assert!(!slots_31_dead.due(&off));
+    // Live rows the sweep over-counted are clamped to the slots: nothing dead.
+    assert!(!m(10_000, 12_000).due(&DEFAULTS));
+}
+
+/// A tiny relation, a barely dead one and a large one do not churn.
+#[test]
+fn a_small_or_lightly_dead_relation_is_not_due() {
+    // Under the floor, however dead.
+    assert!(!m(2_047, 100).due(&DEFAULTS));
+    assert!(!m(500, 0).due(&DEFAULTS));
+    // At the floor, dead enough, it is.
+    assert!(m(2_048, 1_000).due(&DEFAULTS));
+    // A partition with a tenth of its slots dead.
+    assert!(!m(15_625, 14_063).due(&DEFAULTS));
+    // A large plain table a third dead is past the dead-fraction rule's cap:
+    // stopping it for seconds is not worth a third of its slots.
+    assert!(!m(1_000_000, 660_000).due(&DEFAULTS));
+    assert!(m(131_072, 90_000).due(&DEFAULTS));
+    assert!(!m(131_073, 90_000).due(&DEFAULTS));
+    // With the cap off it is due.
+    assert!(m(1_000_000, 660_000).due(&Thresholds { dead_fraction_max_slots: 0, ..DEFAULTS }));
+    // The ratio rule off, a heartbeat-shaped table past the cap is not.
+    assert!(!m(472_468, 1_012).due(&Thresholds { ratio: 0, ..DEFAULTS }));
+}
+
+/// Puts every `auto_compact.*` setting back to its default when dropped, so
+/// a failing assertion leaves no other test a changed setting.
+struct RestoreDefaults;
+
+impl Drop for RestoreDefaults {
+    fn drop(&mut self) {
+        crate::set_auto_compact_enabled(true);
+        crate::set_auto_compact_interval_secs(60);
+        crate::set_auto_compact_min_slots(DEFAULTS.min_slots);
+        crate::set_auto_compact_ratio(DEFAULTS.ratio);
+        crate::set_auto_compact_dead_fraction(DEFAULTS.dead_fraction).expect("default fraction");
+        crate::set_auto_compact_dead_fraction_max_slots(DEFAULTS.dead_fraction_max_slots);
+        crate::set_auto_compact_cooldown_secs(600);
+    }
+}
+
+/// `SET CONFIG auto_compact.*` changes what the next pass decides: the
+/// thresholds each pass reads ([`Policy::current`]) are the ones the
+/// statement wrote, and a bad value is refused and changes nothing.
+///
+/// The only test that changes these settings; it changes them only toward
+/// stricter, and puts them back, so a catalogue another test opened in this
+/// process is never compacted because of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_config_changes_the_decision() {
+    let _restore = RestoreDefaults;
+    let dir = tempfile::tempdir().expect("dir");
+    let database = rclite::Arc::new(Database::new(dir.path().to_str().expect("utf-8")).await);
+    let set = |sql: &'static str| {
+        let database = database.clone();
+        async move {
+            let statement = crate::core::introspect::parse(sql).expect("introspection").expect(sql);
+            let out = crate::core::introspect::execute(&statement, &database).await;
+            (out.first() != Some(&3), String::from_utf8_lossy(&out).into_owned())
+        }
+    };
+    let partition = m(15_625, 10_781);
+
+    assert_eq!(Thresholds::current(), DEFAULTS, "the defaults are the declared ones");
+    assert!(partition.due(&Policy::current().thresholds));
+
+    let (ok, out) = set("SET CONFIG auto_compact.dead_fraction = 0.4").await;
+    assert!(ok, "{out}");
+    assert_eq!(crate::auto_compact_dead_fraction(), 0.4);
+    assert!(!partition.due(&Policy::current().thresholds), "31 % dead is under 0.4");
+
+    let (ok, out) = set("SET CONFIG auto_compact.dead_fraction = '0.25'").await;
+    assert!(ok, "{out}");
+    assert!(partition.due(&Policy::current().thresholds));
+
+    let (ok, out) = set("SET CONFIG auto_compact.min_slots = 20000").await;
+    assert!(ok, "{out}");
+    assert!(!partition.due(&Policy::current().thresholds), "15 625 slots is under the floor");
+
+    let (ok, out) = set("SET CONFIG auto_compact.dead_fraction_max_slots = 10000").await;
+    assert!(ok, "{out}");
+    assert_eq!(crate::auto_compact_dead_fraction_max_slots(), 10_000);
+
+    let (ok, out) = set("SET CONFIG auto_compact.cooldown_secs = 1200").await;
+    assert!(ok, "{out}");
+    assert_eq!(Policy::current().cooldown, Duration::from_secs(1200));
+
+    let (ok, out) = set("SET CONFIG auto_compact.enabled = off").await;
+    assert!(ok, "{out}");
+    assert!(!crate::auto_compact_enabled());
+
+    // Refused, and nothing changed.
+    for bad in [
+        "SET CONFIG auto_compact.dead_fraction = 1.5",
+        "SET CONFIG auto_compact.dead_fraction = -0.1",
+        "SET CONFIG auto_compact.min_slots = lots",
+        "SET CONFIG auto_compact.enabled = maybe",
+        "SET CONFIG auto_compact.nonsense = 1",
+    ] {
+        let (ok, out) = set(bad).await;
+        assert!(!ok, "{bad} was accepted: {out}");
+    }
+    assert_eq!(crate::auto_compact_dead_fraction(), 0.25);
+    assert_eq!(crate::auto_compact_min_slots(), 20_000);
+    assert!(!crate::auto_compact_enabled());
+
+    // SHOW CONFIG reports what was set.
+    let statement = crate::core::introspect::parse("SHOW CONFIG").expect("introspection").expect("show");
+    let out = crate::core::introspect::execute(&statement, &database).await;
+    let rows = crate::core::row::row::vec_into_rows(&out[1..]).expect("rows");
+    let text = |row: &crate::core::row::row::Row, i: usize| {
+        String::from_utf8_lossy(row.columns[i].data.into_slice()).into_owned()
+    };
+    let value = |key: &str| {
+        rows.iter()
+            .find(|r| text(r, 0) == "auto_compact" && text(r, 1) == key)
+            .map(|r| text(r, 2))
+            .unwrap_or_else(|| panic!("SHOW CONFIG has no auto_compact.{key}"))
+    };
+    assert_eq!(value("min_slots"), "20000");
+    assert_eq!(value("dead_fraction"), "0.25");
+    assert_eq!(value("enabled"), "off");
+    assert_eq!(value("cooldown_secs"), "1200");
 }
 
 /// A table updated in place of growing reaches the threshold, the task
@@ -46,7 +213,7 @@ async fn an_update_heavy_table_is_compacted_and_keeps_its_rows() {
     let before = measure(&database, "hb").await.expect("measured");
     assert_eq!(before.live, 3);
     assert!(before.slots >= 1_800, "{before:?}");
-    assert!(before.due(1_000, 8));
+    assert!(before.due(&small_policy().thresholds));
 
     let mut last = HashMap::new();
     // The policy below the defaults, as a small table needs.
@@ -64,8 +231,7 @@ async fn an_update_heavy_table_is_compacted_and_keeps_its_rows() {
 /// The policy the tests compact small tables under.
 fn small_policy() -> Policy {
     Policy {
-        min_slots: 1_000,
-        ratio: 8,
+        thresholds: Thresholds { min_slots: 1_000, ..DEFAULTS },
         cooldown: Duration::from_secs(600),
     }
 }
@@ -141,7 +307,7 @@ async fn update_heavy_partitions(dir: &std::path::Path, place: Option<&std::path
     let before = measure_partitions(&database, "ph").await;
     assert_eq!(before.len(), 2, "both partitions are open and measured: {before:?}");
     for (pid, m) in &before {
-        assert!(m.due(1_000, 8), "partition {pid}: {m:?}");
+        assert!(m.due(&small_policy().thresholds), "partition {pid}: {m:?}");
     }
     // The plain measure does not see a partitioned table.
     assert!(measure(&database, "ph").await.is_none());

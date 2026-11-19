@@ -355,39 +355,110 @@ pub static JSON_SHADOW_TABLES: OnceLock<bool> = OnceLock::new();
 /// entirely.
 pub static VACUUM_INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
 
-/// Whether tables whose pointer slots far outnumber their live rows are
-/// compacted automatically (`core::auto_compact`). Default: on.
-pub static AUTO_COMPACT_ENABLED: OnceLock<bool> = OnceLock::new();
-/// How often the automatic compaction looks. Default: 60 seconds.
-pub static AUTO_COMPACT_INTERVAL_SECS: OnceLock<u64> = OnceLock::new();
-/// The fewest pointer slots a table has before it is compacted. Default:
-/// 20 000 (a compaction of that many takes about 0.4 s).
-pub static AUTO_COMPACT_MIN_SLOTS: OnceLock<u64> = OnceLock::new();
-/// How many times its live rows a table's slots must be. Default: 8.
-pub static AUTO_COMPACT_RATIO: OnceLock<u64> = OnceLock::new();
-/// The least time between two automatic compactions of one table. Default:
-/// 600 seconds.
-pub static AUTO_COMPACT_COOLDOWN_SECS: OnceLock<u64> = OnceLock::new();
+// Automatic compaction (`core::auto_compact`): process-wide and changed live
+// by `SET CONFIG auto_compact.<key>` and seeded by the `--auto-compact-*`
+// flags, so atomics rather than `OnceLock`s. Every pass reads them afresh.
+//
+// The defaults are chosen for a hash-partitioned retention table, the case the
+// first rule (slots ≥ 20 000 *and* ≥ 8× live, nothing else) never reached: a
+// 32-partition telemetry table at 500 000 rows holds ~15 600 slots per
+// partition, 31 % of them dead, so no partition ever passed the floor, and
+// even one that had would have needed 87.5 % dead slots to pass the ratio. Its
+// operator ran a nightly `VACUUM FULL` of every partition at once (5.5 s under
+// ACCESS EXCLUSIVE) because of it, as pointer slots are only ever given back
+// by a compaction.
+//
+// So a relation is now also due when a quarter of its slots are dead
+// ([`auto_compact_dead_fraction`] 0.25: PostgreSQL's autovacuum scale factor
+// is 0.2, and at 0.25 a compaction rewrites at most four slots for each one it
+// gives back), from a floor of 2 048 slots ([`auto_compact_min_slots`]: a
+// pointer file of ~70 KiB, below which there is nothing worth stopping a
+// table for). The dead-fraction rule stops at 131 072 slots
+// ([`auto_compact_dead_fraction_max_slots`], a run of about 1.5–2.5 s at the
+// measured 11–20 µs a slot): a large plain table is not stopped for seconds
+// because a quarter of it turned over, while a partition — the unit a
+// partitioned table is compacted in — stays well under it (131 072 a
+// partition is 4 million rows over 32). The 8× amplification rule keeps no
+// such cap: a heartbeat table at 8 live rows in 38 030 slots is due however
+// large it is, as before. The 600 s cooldown bounds how often any one table
+// or partition is stopped.
 
+static AUTO_COMPACT_ENABLED: AtomicBool = AtomicBool::new(true);
+static AUTO_COMPACT_INTERVAL_SECS: AtomicU64 = AtomicU64::new(60);
+static AUTO_COMPACT_MIN_SLOTS: AtomicU64 = AtomicU64::new(2_048);
+static AUTO_COMPACT_RATIO: AtomicU64 = AtomicU64::new(8);
+static AUTO_COMPACT_DEAD_FRACTION: AtomicU64 = AtomicU64::new(0.25f64.to_bits());
+static AUTO_COMPACT_DEAD_FRACTION_MAX_SLOTS: AtomicU64 = AtomicU64::new(131_072);
+static AUTO_COMPACT_COOLDOWN_SECS: AtomicU64 = AtomicU64::new(600);
+
+/// Whether tables and partitions whose pointer slots are mostly dead are
+/// compacted automatically. Default: on.
 #[inline]
 pub fn auto_compact_enabled() -> bool {
-    *AUTO_COMPACT_ENABLED.get().unwrap_or(&true)
+    AUTO_COMPACT_ENABLED.load(AtomicOrdering::Relaxed)
 }
+/// How often the automatic compaction looks, in seconds. Default: 60.
 #[inline]
 pub fn auto_compact_interval_secs() -> u64 {
-    *AUTO_COMPACT_INTERVAL_SECS.get().unwrap_or(&60)
+    AUTO_COMPACT_INTERVAL_SECS.load(AtomicOrdering::Relaxed)
 }
+/// The fewest pointer slots a table or partition has before either rule
+/// makes it due. Default: 2 048.
 #[inline]
 pub fn auto_compact_min_slots() -> u64 {
-    *AUTO_COMPACT_MIN_SLOTS.get().unwrap_or(&20_000)
+    AUTO_COMPACT_MIN_SLOTS.load(AtomicOrdering::Relaxed)
 }
+/// Due when the slots are at least this many times the live rows. Default:
+/// 8. 0 turns this rule off.
 #[inline]
 pub fn auto_compact_ratio() -> u64 {
-    *AUTO_COMPACT_RATIO.get().unwrap_or(&8)
+    AUTO_COMPACT_RATIO.load(AtomicOrdering::Relaxed)
 }
+/// Due when at least this fraction of the slots is dead (0..1). Default:
+/// 0.25. 0 turns this rule off.
+#[inline]
+pub fn auto_compact_dead_fraction() -> f64 {
+    f64::from_bits(AUTO_COMPACT_DEAD_FRACTION.load(AtomicOrdering::Relaxed))
+}
+/// The most slots a table or partition has for the dead-fraction rule to
+/// apply to it. Default: 131 072. 0 is no limit.
+#[inline]
+pub fn auto_compact_dead_fraction_max_slots() -> u64 {
+    AUTO_COMPACT_DEAD_FRACTION_MAX_SLOTS.load(AtomicOrdering::Relaxed)
+}
+/// The least time between two automatic compactions of one table or
+/// partition, in seconds. Default: 600.
 #[inline]
 pub fn auto_compact_cooldown_secs() -> u64 {
-    *AUTO_COMPACT_COOLDOWN_SECS.get().unwrap_or(&600)
+    AUTO_COMPACT_COOLDOWN_SECS.load(AtomicOrdering::Relaxed)
+}
+
+pub fn set_auto_compact_enabled(on: bool) {
+    AUTO_COMPACT_ENABLED.store(on, AtomicOrdering::Relaxed);
+}
+/// At least 1 second.
+pub fn set_auto_compact_interval_secs(secs: u64) {
+    AUTO_COMPACT_INTERVAL_SECS.store(secs.max(1), AtomicOrdering::Relaxed);
+}
+pub fn set_auto_compact_min_slots(n: u64) {
+    AUTO_COMPACT_MIN_SLOTS.store(n, AtomicOrdering::Relaxed);
+}
+pub fn set_auto_compact_ratio(n: u64) {
+    AUTO_COMPACT_RATIO.store(n, AtomicOrdering::Relaxed);
+}
+/// A fraction outside 0..1 (or not a number) is refused.
+pub fn set_auto_compact_dead_fraction(fraction: f64) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(format!("auto_compact.dead_fraction takes 0 to 1, not {fraction}"));
+    }
+    AUTO_COMPACT_DEAD_FRACTION.store(fraction.to_bits(), AtomicOrdering::Relaxed);
+    Ok(())
+}
+pub fn set_auto_compact_dead_fraction_max_slots(n: u64) {
+    AUTO_COMPACT_DEAD_FRACTION_MAX_SLOTS.store(n, AtomicOrdering::Relaxed);
+}
+pub fn set_auto_compact_cooldown_secs(secs: u64) {
+    AUTO_COMPACT_COOLDOWN_SECS.store(secs, AtomicOrdering::Relaxed);
 }
 
 /// Dead bytes below which a scan does not bother publishing a free list.
