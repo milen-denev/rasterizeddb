@@ -14,10 +14,11 @@
 //! | [`Time`] | 30 | `i64` µs since midnight, big-endian |
 //! | [`Interval`] | 24 | `i64` µs, `i32` days, `i32` months, big-endian |
 //!
-//! [`Numeric`] and [`Json`] carry text. A `NUMERIC` column's stored bytes are
-//! scaled by a modifier the native protocol does not send, and a `JSONB`
-//! column's are the engine's own document encoding, so neither is decoded from
-//! bytes: select them as `col::text` (the ORM's queries do so already).
+//! [`Numeric`] and [`Json`] carry text. The server sends a `NUMERIC` with its
+//! scale and a `JSONB` document as its JSON text; a server that predates that
+//! sends a `NUMERIC(p, s)` with no scale and a document in the engine's own
+//! encoding, which are refused rather than guessed: select them as
+//! `col::text` there (the ORM's queries do so already).
 
 use std::fmt;
 use std::str::FromStr;
@@ -677,10 +678,9 @@ fn parse_clock_unbounded(text: &str) -> Option<i64> {
 ///
 /// Kept as text because that is what the server reads and writes exactly, and
 /// so no precision is lost on the way to a decimal type of your choosing
-/// (`Numeric::as_str().parse::<rust_decimal::Decimal>()`). A `NUMERIC` column
-/// must be selected as `col::text` to read it with this type: its stored bytes
-/// are scaled by the column's modifier, which the native protocol does not
-/// send.
+/// (`Numeric::as_str().parse::<rust_decimal::Decimal>()`). The server sends a
+/// `NUMERIC` with its scale; from a server that predates that, a
+/// `NUMERIC(p, s)` column is refused and must be selected as `col::text`.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Numeric(String);
 

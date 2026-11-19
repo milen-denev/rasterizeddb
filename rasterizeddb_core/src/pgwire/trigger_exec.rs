@@ -104,8 +104,13 @@ pub(super) async fn query_in(
 ) -> io::Result<Result<Rows, String>> {
     let mut sink = std::io::Cursor::new(Vec::<u8>::new());
     let was_internal = std::mem::replace(&mut state.view_internal, true);
+    // Its rows to this buffer, never a native session's answer.
+    let was_capturing = std::mem::replace(&mut state.native_capture, false);
+    let kept_result = state.native_result.take();
     let ran =
         internal_run(Box::pin(execute_single_statement(database, state, &mut sink, sql, result_formats, false))).await;
+    state.native_capture = was_capturing;
+    state.native_result = kept_result;
     state.view_internal = was_internal;
     ran?;
     if state.statement_failed {

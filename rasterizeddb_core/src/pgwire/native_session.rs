@@ -97,6 +97,14 @@ pub(crate) struct NativeSession {
     /// The one-database catalogue a block's statements resolve against,
     /// made the first time a block opens.
     catalog: std::sync::OnceLock<Arc<DatabaseCatalog>>,
+    /// The connection's `nextval` results, for `currval` and `lastval`,
+    /// across its statements (each statement's session reads them).
+    sequence_values:
+        StdArc<std::sync::Mutex<crate::core::rql::sequence::session::SessionSequences>>,
+    /// The connection's temporary tables, handed to each statement's session
+    /// and taken back after it (`temp_tables`).
+    temp_tables: std::sync::Mutex<Vec<super::temp_tables::TempTable>>,
+    temp_session: u64,
 }
 
 impl NativeSession {
@@ -117,7 +125,89 @@ impl NativeSession {
             poisoned: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(None),
             catalog: std::sync::OnceLock::new(),
+            sequence_values: StdArc::default(),
+            temp_tables: std::sync::Mutex::new(Vec::new()),
+            temp_session: fastrand::u64(..),
         }
+    }
+
+    /// Whether `query` needs pgwire's statement path, not the native
+    /// autocommit one: a CTE or derived table, a view, a statement of the
+    /// objects kept above the engine (views, sequences, routines, triggers,
+    /// MERGE, temporary tables, grants), a call of a user's function or a
+    /// sequence function, a write to a table with triggers, a temporary
+    /// table, or a correlated subquery. Such a statement runs through
+    /// [`Self::run_alone`].
+    pub(crate) async fn needs_session_path(&self, query: &str) -> bool {
+        let database = &self.database;
+        let stmt = query.trim();
+        if crate::core::rql::correlated::rewrite_select(stmt).is_some()
+            || crate::core::rql::cte::has_with_clause(stmt)
+            || crate::core::rql::cte::next_derived_table(stmt).is_some()
+            || crate::core::rql::views::parse_view_statement(stmt).is_some()
+            || crate::core::rql::sequence_catalog::parse_sequence_statement(stmt).is_some()
+            || crate::core::rql::functions::parse_routine_statement(stmt).is_some()
+            || crate::core::rql::triggers::parse_trigger_statement(stmt).is_some()
+            || crate::core::rql::merge::parse_merge(stmt).is_some()
+            || crate::core::rql::privileges::parse_privilege_statement(stmt).is_some()
+        {
+            return true;
+        }
+        let upper_head: String = stmt
+            .chars()
+            .take(40)
+            .collect::<String>()
+            .to_ascii_uppercase();
+        if upper_head.starts_with("CREATE TEMP")
+            || upper_head.starts_with("CREATE LOCAL TEMP")
+            || upper_head.starts_with("CREATE GLOBAL TEMP")
+        {
+            return true;
+        }
+        let has = |needle: &[u8]| crate::core::sql_scan::contains_ignore_ascii_case(stmt, needle);
+        if has(b"nextval")
+            || has(b"currval")
+            || has(b"setval")
+            || has(b"lastval")
+            || has(b"pg_get_serial_sequence")
+        {
+            return true;
+        }
+        {
+            let temps = self.temp_tables.lock().unwrap_or_else(|e| e.into_inner());
+            if super::temp_tables::rewrite(&temps, stmt).is_some() {
+                return true;
+            }
+        }
+        if crate::core::rql::views::may_name_a_view(database, stmt).await
+            || crate::core::rql::functions::may_call_a_routine(database, stmt).await
+        {
+            return true;
+        }
+        // A privilege check (a non-superuser's statement), or the owner a
+        // new relation is given. A superuser's other statements stay on the
+        // native path.
+        if database.has_table(crate::core::rql::privileges::ACL_TABLE)
+            && ((self.authenticated && !self.superuser) || upper_head.starts_with("CREATE"))
+        {
+            return true;
+        }
+        if database.has_table(crate::core::rql::triggers::TRIGGER_TABLE) {
+            let head = upper_head.split_whitespace().next().unwrap_or("");
+            if matches!(head, "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE") {
+                for r in crate::core::rql::lock_set::relation_references(stmt) {
+                    if r.mode != crate::core::mvcc::table_locks::TableMode::AccessShare
+                        && crate::core::rql::triggers::may_have_triggers(database, &r.name).await
+                    {
+                        return true;
+                    }
+                }
+                if head == "TRUNCATE" {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Whether `query` is this session's to run rather than the native
@@ -156,6 +246,7 @@ impl NativeSession {
 
         let state = slot.get_or_insert_with(|| self.new_state());
         let answer = self.run_in(state, query).await;
+        self.keep_temp_tables(state);
 
         let open = state.transaction.is_some();
         if !open {
@@ -176,6 +267,7 @@ impl NativeSession {
     pub(crate) async fn run_alone(&self, query: &str) -> Vec<u8> {
         let mut state = self.new_state();
         let answer = Box::pin(self.run_in(&mut state, query)).await;
+        self.keep_temp_tables(&state);
         // Not reachable for a statement that is not transaction control, but
         // a block left open here would hold its locks with no client to end
         // it.
@@ -252,7 +344,7 @@ impl NativeSession {
             .catalog
             .get_or_init(|| DatabaseCatalog::single_unmanaged(self.database.clone()))
             .clone();
-        SessionState::new(
+        let mut state = SessionState::new(
             catalog,
             self.database.name.clone(),
             AuthConfig::default(),
@@ -262,7 +354,30 @@ impl NativeSession {
                 authenticated: self.authenticated,
             },
             ConnectionLimits::default(),
-        )
+        );
+        // The connection's, not the statement's.
+        state.sequence_values = self.sequence_values.clone();
+        state.temp_tables = self
+            .temp_tables
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        state.temp_session = self.temp_session;
+        state
+    }
+
+    /// The connection's sequence values, for a statement on the native
+    /// autocommit path.
+    pub(crate) fn sequence_scope(&self) -> crate::core::rql::sequence::session::Scope {
+        crate::core::rql::sequence::session::Scope {
+            database: self.database.id,
+            values: self.sequence_values.clone(),
+        }
+    }
+
+    /// Takes back the temporary tables a statement's session made or dropped.
+    fn keep_temp_tables(&self, state: &SessionState) {
+        *self.temp_tables.lock().unwrap_or_else(|e| e.into_inner()) = state.temp_tables.clone();
     }
 }
 
@@ -270,6 +385,31 @@ impl Drop for NativeSession {
     /// The connection is gone and nothing of it is running: an open block is
     /// rolled back, as `run_message_loop` rolls back a PostgreSQL session's.
     fn drop(&mut self) {
+        // The connection's temporary tables go with it.
+        let temps = std::mem::take(
+            self.temp_tables
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !temps.is_empty()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let database = self.database.clone();
+            runtime.spawn(async move {
+                for t in temps {
+                    let sql = format!(
+                        "DROP TABLE IF EXISTS {}",
+                        crate::core::rql::views::quote_ident(&t.real)
+                    );
+                    let _ = crate::core::rql::executor::run_statement(
+                        &sql,
+                        &database,
+                        crate::core::mvcc::transaction::FROZEN_TX,
+                    )
+                    .await;
+                }
+            });
+        }
         let Some(mut state) = self.state.get_mut().take() else {
             return;
         };

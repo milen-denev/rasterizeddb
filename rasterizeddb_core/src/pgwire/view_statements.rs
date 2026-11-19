@@ -27,7 +27,12 @@ fn last_command_tag(bytes: &[u8]) -> String {
 pub(super) async fn run_internal(database: &Arc<Database>, state: &mut SessionState, sql: &str) -> io::Result<Result<String, String>> {
     let mut sink = std::io::Cursor::new(Vec::<u8>::new());
     let was_internal = std::mem::replace(&mut state.view_internal, true);
+    // Its rows to this buffer, never a native session's answer.
+    let was_capturing = std::mem::replace(&mut state.native_capture, false);
+    let kept_result = state.native_result.take();
     let ran = internal_run(Box::pin(execute_single_statement(database, state, &mut sink, sql, &[], true))).await;
+    state.native_capture = was_capturing;
+    state.native_result = kept_result;
     state.view_internal = was_internal;
     ran?;
     if state.statement_failed {
@@ -85,7 +90,12 @@ async fn run_for_view_described(
 ) -> io::Result<Result<Vec<String>, String>> {
     let mut sink = std::io::Cursor::new(Vec::<u8>::new());
     let was_internal = std::mem::replace(&mut state.view_internal, true);
+    // Its rows to this buffer, never a native session's answer.
+    let was_capturing = std::mem::replace(&mut state.native_capture, false);
+    let kept_result = state.native_result.take();
     let ran = internal_run(Box::pin(execute_single_statement(database, state, &mut sink, sql, &[], false))).await;
+    state.native_capture = was_capturing;
+    state.native_result = kept_result;
     state.view_internal = was_internal;
     ran?;
     if state.statement_failed {

@@ -44,7 +44,7 @@
 //! | chapter | |
 //! |---|---|
 //! | [Getting started](guide::getting_started) | connecting, sharing a client, what the native protocol cannot do |
-//! | [Types](guide::types) | the Rust ⇄ SQL mapping, and the three types that need `::text` |
+//! | [Types](guide::types) | the Rust ⇄ SQL mapping, and how `jsonb`, arrays and `NUMERIC` arrive |
 //! | [Queries](guide::queries) | the calls, rows, atomic writes, errors |
 //! | [Transactions](guide::transactions) | `begin`/`commit`, the retrying closure, savepoints, lost connections |
 //! | [The ORM](guide::orm) | `#[derive(Model)]`, CRUD, the query builder |

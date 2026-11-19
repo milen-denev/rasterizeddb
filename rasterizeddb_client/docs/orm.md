@@ -109,8 +109,8 @@ nothing to update, writes a no-op `DO UPDATE SET k = EXCLUDED.k` so the
 stored row still comes back from the same statement.
 
 The ORM names its columns rather than `RETURNING *` (which the server also
-takes) because a `NUMERIC`, `JSONB` or array column has to be cast to text
-to arrive readable over the native protocol.
+takes) and casts a `NUMERIC`, `JSONB` or array column to text, so a model
+reads the same from a server that sends those columns in their stored form.
 
 ## Upserts
 
@@ -471,9 +471,9 @@ let by_region: Vec<RegionTotal> = Sale::query()
 | `col.avg()` over an integer or `Numeric` column; over a float | `Option<Numeric>` (as text, exact); `Option<f64>` | `None` |
 | `col.min()`, `col.max()` | `Option<T>` (a `Numeric` as text) | `None` |
 
-**Why the cast.** `SUM` over a `BIGINT` is a `NUMERIC`, and the native
-protocol sends a `NUMERIC` of that kind without its scale, which this client
-refuses to guess. The cast goes *outside* the sum, so the server adds exact
+**Why the cast.** `SUM` over a `BIGINT` is a `NUMERIC`, which an older
+server sends without its scale and this client refuses to guess, and an
+`i64` is what a sum of integers is read as. The cast goes *outside* the sum, so the server adds exact
 integers and only the total is converted; a total past `i64` is the
 server's error, never a wrapped number.
 

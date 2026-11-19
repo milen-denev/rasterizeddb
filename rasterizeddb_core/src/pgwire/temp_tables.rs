@@ -23,7 +23,7 @@ pub(super) enum OnCommit {
 
 /// One of the session's temporary tables.
 #[derive(Debug, Clone)]
-pub(super) struct TempTable {
+pub(crate) struct TempTable {
     /// The name the session writes (lowercased unless it was quoted).
     pub(super) name: String,
     /// The table's real name.

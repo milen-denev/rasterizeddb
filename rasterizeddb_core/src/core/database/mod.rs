@@ -6066,14 +6066,14 @@ async fn process_native_request(
     // through pgwire's path, in a session made for this statement alone
     // (`NativeSession::run_alone`).
     if let Some(session) = session
-        && crate::core::rql::correlated::rewrite_select(&query).is_some()
+        && session.needs_session_path(&query).await
     {
         return session.run_alone(&query).await;
     }
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query(&query, context.database).await
+        run_native_query_in(&query, context.database, session).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -6082,11 +6082,11 @@ async fn process_native_request(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query(&query, context.database).await;
+            return run_native_query_in(&query, context.database, session).await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response = run_native_query(&query, context.database).await;
+            let response = run_native_query_in(&query, context.database, session).await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -6160,6 +6160,26 @@ pub(crate) async fn run_native_query_for_tests(query: &str, database: Arc<Databa
 /// a session: a transaction block, a CTE's or derived table's statement
 /// transaction. Those are refused by name rather than reaching the parser as
 /// text it cannot read.
+/// [`run_native_query`], with the connection's sequence values in reach of
+/// the statement (a column's `DEFAULT nextval(…)` records its value for the
+/// connection's `currval` and `lastval`), and a sequence's reservation
+/// written ahead after it, as pgwire's `execute_single_statement` does.
+async fn run_native_query_in(
+    query: &str,
+    database: Arc<Database>,
+    session: Option<&crate::pgwire::NativeSession>,
+) -> Vec<u8> {
+    let response = match session {
+        Some(session) => {
+            crate::core::rql::sequence::session::scoped(session.sequence_scope(), run_native_query(query, database.clone()))
+                .await
+        }
+        None => run_native_query(query, database.clone()).await,
+    };
+    crate::core::rql::sequence_catalog::flush(&database).await;
+    response
+}
+
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {
     // An autocommit statement is its own transaction: `now()` is its start,
     // one instant for every call and row of it, as pgwire's
@@ -6349,9 +6369,20 @@ async fn run_native_statement(query: &str, database: Arc<Database>) -> Vec<u8> {
         };
     };
     info!("Recognized query purpose: {:?}", query_purpose);
+    let read = matches!(query_purpose, crate::core::rql::lexer_s1::QueryPurpose::QueryRows(_));
     // A named owner for the native protocol's statements (§7 Owner;
     // finding L3): never `FROZEN_TX`, and one per statement.
-    execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database).await
+    let response = execute_as(crate::core::mvcc::owner::OwnerKind::Native, query_purpose, database.clone()).await;
+    // The rows typed by their columns (`pgwire::native_retag`), from the
+    // statement's description, read only when a cell may need it.
+    if read
+        && crate::pgwire::native_answer_needs_retag(&response, &database, query)
+        && let Some(purpose) = recognize_query_purpose(query)
+    {
+        let (fields, scales) = crate::pgwire::result_description(&database, &purpose).unwrap_or((None, None));
+        return crate::pgwire::native_retag(response, fields.as_deref(), scales.as_deref());
+    }
+    response
 }
 
 /// Rows a native-protocol response reports: the count a write carries, or the

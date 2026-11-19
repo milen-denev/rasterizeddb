@@ -7891,7 +7891,8 @@ where
                         for row in &rows {
                             row.extend_serialized(&mut answer);
                         }
-                        state.native_result = Some(answer);
+                        let described: Vec<(String, DbType)> = columns.iter().map(|(n, t)| (n.to_string(), t.clone())).collect();
+                        state.native_result = Some(native_retag(answer, Some(&described), Some(&scales)));
                         return send_command_complete(stream, &tag).await;
                     }
                     return send_query_result(
@@ -8059,7 +8060,7 @@ where
 /// `describe-and-payload-share-one-source`). Read from the tables' schemas
 /// with no lock. `Err((sqlstate, message))` when the statement cannot be
 /// described as it would run.
-fn result_description(
+pub(crate) fn result_description(
     database: &Arc<Database>,
     purpose: &QueryPurpose,
 ) -> Result<(Option<Vec<(String, DbType)>>, Option<Vec<u32>>), (&'static str, String)> {
@@ -8312,6 +8313,146 @@ fn result_description(
     Ok((select_fields, select_scales))
 }
 
+/// A native answer's rows (`2` and the serialized rows) with each cell
+/// typed as its column is declared, not as it is stored: a `jsonb` document
+/// as its JSON text (tag `JSON`), a `json` column's text as `JSONTEXT`, a
+/// `bytea` as `BYTEA`, an array as `ARRAY`, a `timestamp` as `TIMESTAMP`,
+/// and a sixteen-byte `NUMERIC` carrying its scale (`decimal_cell_with_scale`):
+/// the column's, from `scales`, or the engine's own trimmed of trailing
+/// zeros, as the PostgreSQL listener's text shows it. Each went out under its
+/// storage type: a document as engine bytes a client refused, an array or a
+/// `bytea` as text, a NUMERIC with no point.
+pub(crate) fn native_retag(answer: Vec<u8>, fields: Option<&[(String, DbType)]>, scales: Option<&[u32]>) -> Vec<u8> {
+    if answer.first() != Some(&2) {
+        return answer;
+    }
+    // Read from the first row: a column's cells share its type, and an
+    // answer nothing retypes is left as it is, unparsed.
+    let applies = |stored: &DbType, declared: Option<&DbType>| {
+        matches!(
+            (stored, declared),
+            (DbType::DECIMAL, _)
+                | (DbType::STRING | DbType::JSONB, Some(DbType::JSONB))
+                | (DbType::STRING, Some(DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_)))
+                | (DbType::DATETIME, Some(DbType::TIMESTAMP))
+        )
+    };
+    let first = crate::core::row::row::serialized_rows(&answer[1..])
+        .next()
+        .and_then(|r| r.ok())
+        .and_then(|r| crate::core::row::row::Row::decode(r).ok());
+    let Some(first) = first else {
+        return answer;
+    };
+    if !first
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(at, c)| applies(&c.column_type, fields.and_then(|f| f.get(at)).map(|(_, t)| t)))
+    {
+        return answer;
+    }
+    drop(first);
+    let Ok(mut rows) = crate::core::row::row::vec_into_rows(&answer[1..]) else {
+        return answer;
+    };
+    let mut changed = false;
+    let block = |bytes: &[u8]| {
+        let mut b = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
+        b.into_slice_mut().copy_from_slice(bytes);
+        b
+    };
+    for row in rows.iter_mut() {
+        for (at, cell) in row.columns.iter_mut().enumerate() {
+            let declared = fields.and_then(|f| f.get(at)).map(|(_, t)| t);
+            match (&cell.column_type, declared) {
+                (DbType::DECIMAL, _) if cell.data.into_slice().len() == 16 => {
+                    let mut mantissa = i128::from_le_bytes(cell.data.into_slice().try_into().expect("sixteen bytes"));
+                    let scale = match scales.and_then(|s| s.get(at)).copied() {
+                        Some(scale) => scale,
+                        None => {
+                            let mut scale = crate::core::value_codec::DECIMAL_SCALE;
+                            while scale > 0 && mantissa % 10 == 0 {
+                                mantissa /= 10;
+                                scale -= 1;
+                            }
+                            scale
+                        }
+                    };
+                    cell.data = block(&crate::core::value_codec::decimal_cell_with_scale(mantissa, scale));
+                    changed = true;
+                }
+                (DbType::STRING | DbType::JSONB, Some(DbType::JSONB)) => {
+                    let mut text = Vec::new();
+                    if crate::core::jsonb::render_text_into(cell.data.into_slice(), &mut text).is_ok() {
+                        cell.data = block(&text);
+                        cell.column_type = DbType::JSON;
+                        changed = true;
+                    }
+                }
+                (DbType::STRING, Some(DbType::JSONTEXT)) => {
+                    cell.column_type = DbType::JSONTEXT;
+                    changed = true;
+                }
+                (DbType::STRING, Some(DbType::BYTEA)) => {
+                    cell.column_type = DbType::BYTEA;
+                    changed = true;
+                }
+                (DbType::STRING, Some(DbType::ARRAY | DbType::ARRAYOF(_))) => {
+                    cell.column_type = DbType::ARRAY;
+                    changed = true;
+                }
+                (DbType::DATETIME, Some(DbType::TIMESTAMP)) => {
+                    cell.column_type = DbType::TIMESTAMP;
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if !changed {
+        return answer;
+    }
+    let mut out = vec![2u8];
+    for row in &rows {
+        row.extend_serialized(&mut out);
+    }
+    out
+}
+
+/// Whether a native answer to `query` holds a cell [`native_retag`] may
+/// retype, read from its first row alone: a NUMERIC, a document or a
+/// timestamp, or a text cell when a table `query` names declares a column
+/// stored as text but typed otherwise (`jsonb`, `json`, `bytea`, an array).
+/// The check that keeps a second parse of the statement and of its rows off
+/// every other answer.
+pub(crate) fn native_answer_needs_retag(answer: &[u8], database: &Database, query: &str) -> bool {
+    if answer.first() != Some(&2) {
+        return false;
+    }
+    let Some(Ok(first)) = crate::core::row::row::serialized_rows(&answer[1..]).next() else {
+        return false;
+    };
+    let Ok(row) = crate::core::row::row::Row::decode(first) else {
+        return false;
+    };
+    let mut text = false;
+    for c in &row.columns {
+        match c.column_type {
+            DbType::DECIMAL | DbType::DATETIME | DbType::JSONB => return true,
+            DbType::STRING => text = true,
+            _ => {}
+        }
+    }
+    text && crate::core::rql::lock_set::relation_references(query).iter().any(|r| {
+        database.schema_view(&r.name).is_some_and(|t| {
+            t.schema().fields.iter().any(|f| {
+                matches!(f.db_type, DbType::JSONB | DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_))
+            })
+        })
+    })
+}
+
 /// Turns the engine's answer to a statement into the wire messages that
 /// answer the client.
 #[allow(clippy::too_many_arguments)]
@@ -8349,7 +8490,7 @@ where
             };
             #[cfg(feature = "query_stats")]
             crate::core::query_stats::note_rows(rows as u64);
-            state.native_result = Some(resp);
+            state.native_result = Some(native_retag(resp, select_fields.as_deref(), select_scales.as_deref()));
             return send_command_complete(stream, &format!("SELECT {}", rows)).await;
         }
         state.native_result = Some(resp.clone());

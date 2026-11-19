@@ -47,30 +47,30 @@ Every non-text type also reads from text, so a column selected as
 `col::text` reads back as its own type: `"2026-01-02"` as a `Date`,
 `"{1,2}"` as a `Vec<i64>`.
 
-## Three types that need `::text`
+## `jsonb`, arrays, `bytea` and `NUMERIC`
 
-The native protocol sends a cell's stored bytes and a type tag, nothing
-more. For three kinds of column that is not enough to know the value:
+The native protocol sends a cell's bytes and a type tag. The server tags
+each cell by its column's declared type, not by how it is stored:
 
-* **`jsonb`** arrives under the text tag holding the engine's binary
-  document. Reading it as [`Json`](crate::Json) is an error; select
-  `col::text`.
-* **Arrays** arrive under the text tag holding PostgreSQL's binary array.
-  This client decodes that form too, but `col::text` is the one to rely on.
-* **`NUMERIC(p, s)`** arrives as an integer scaled by `s`, and `s` is not
-  sent: `12.34` in a `NUMERIC(10,2)` column and a `sum()` of `1234` are the
-  same bytes. Reading one is an error naming the fix (`col::text`, or a cast
-  such as `sum(x)::bigint`); an unconstrained `NUMERIC` (and `avg`) carries
-  its scale and reads directly.
+* **`jsonb`** arrives as its JSON text, under the `JSON` tag: read it as
+  [`Json`](crate::Json) or `String`.
+* **Arrays** arrive under the array tag and read as `Vec<T>`.
+* **`bytea`** arrives under the bytes tag and reads as `Vec<u8>`.
+* **`NUMERIC(p, s)`** arrives with its scale, `12.50` from a
+  `NUMERIC(10,2)`; a `sum()` over integers, which PostgreSQL types `NUMERIC`
+  too, reads as a [`Numeric`](crate::Numeric) such as `6`.
 
-These are errors, never a plausible wrong value. The ORM writes its select
-lists with these casts, so its models read correctly by construction.
+A server older than this protocol behaviour sends the stored form: a
+`jsonb` as engine bytes and a `NUMERIC(p, s)` with no scale. Reading
+either is then an error naming the fix (`col::text`), never a plausible
+wrong value. The ORM writes its select lists with these casts, so its
+models read correctly from either server.
 
 ```rust,no_run
 # use rasterizeddb_client::prelude::*;
 # async fn demo(client: &Client) -> rasterizeddb_client::Result<()> {
 let (price, doc, tags): (Numeric, Json, Vec<String>) = client
-    .fetch_one("SELECT price::text, doc::text, tags::text FROM items WHERE id = $1", params![7i64])
+    .fetch_one("SELECT price, doc, tags FROM items WHERE id = $1", params![7i64])
     .await?;
 # let _ = (price, doc, tags); Ok(()) }
 ```
