@@ -1317,7 +1317,7 @@ impl TcpServer {
         H: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
     {
-        let mut reader = FrameReader::tagged();
+        let mut reader = FrameReader::requests();
         let mut writer = FrameWriter::new();
         let mut in_flight = InFlight(JoinSet::new());
         // Which request each task is handling, for the one case where the

@@ -27,8 +27,9 @@ pub enum Login {
     /// (`tls-exporter` over TCP, rastcp's own binding on a unix socket). The
     /// password never crosses the wire, and the server must prove it holds
     /// the user's verifier: a server that lets the connection in without the
-    /// exchange (one run under `trust`) is refused, because it never proved
-    /// it is the server meant. Use [`Login::Trust`] for such a server.
+    /// exchange (one run under `trust`) is refused at once, because it never
+    /// proved it is the server meant; the error says to use [`Login::Trust`]
+    /// for such a server.
     Password {
         /// The role to log in as.
         user: String,
@@ -95,6 +96,31 @@ const C_SASL_FINAL: u8 = 0x03;
 const S_OK: u8 = 0x00;
 const S_SASL: u8 = 0x01;
 const S_CONTINUE: u8 = 0x02;
+const S_ERROR: u8 = 0xFF;
+
+/// A server that runs no login exchange (a unix socket under
+/// `--rdb-socket-auth trust`) takes the hello for a request: a multiplexed
+/// connection is closed at once, a plain one answers it as a request. Either
+/// way the login failed for a reason the caller can act on, said as such
+/// rather than as a closed connection or the bytes of a query's answer.
+fn no_exchange_here(what_happened: &str) -> RastcpError {
+    RastcpError::AuthenticationError(format!(
+        "the server did not take part in the login ({what_happened}): it most likely asks for \
+         none, as a unix socket under --rdb-socket-auth trust does; connect with Login::Trust \
+         if that server is meant"
+    ))
+}
+
+/// The server's answer to the hello.
+async fn hello_reply(channel: &mut AuthChannel<'_>) -> Result<(u8, String), RastcpError> {
+    match server_reply(channel).await {
+        Err(RastcpError::ConnectionClosed) => Err(no_exchange_here("it closed the connection")),
+        Ok((tag, _)) if !matches!(tag, S_OK | S_SASL | S_ERROR) => {
+            Err(no_exchange_here(&format!("it answered with a message of kind {tag}")))
+        }
+        other => other,
+    }
+}
 
 /// The opening message: who the caller wants to be.
 fn hello(user: &str) -> Result<Vec<u8>, RastcpError> {
@@ -135,7 +161,7 @@ impl fmt::Debug for PasswordLogin {
 impl PasswordLogin {
     async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<(), RastcpError> {
         channel.send(&hello(&self.user)?).await?;
-        match server_reply(channel).await? {
+        match hello_reply(channel).await? {
             (S_SASL, _) => {}
             (S_OK, _) => {
                 return Err(RastcpError::AuthenticationError(
@@ -208,21 +234,14 @@ impl PeerLogin {
         hello.extend_from_slice(&len.to_le_bytes());
         hello.extend_from_slice(self.user.as_bytes());
         channel.send(&hello).await?;
-
-        let reply = channel.recv().await?;
-        match reply.split_first() {
-            Some((&S_OK, _)) => Ok(()),
-            Some((&S_SASL, _)) => Err(RastcpError::AuthenticationError(
+        match hello_reply(channel).await? {
+            (S_OK, _) => Ok(()),
+            (S_SASL, _) => Err(RastcpError::AuthenticationError(
                 "the server asks for a password: peer login needs a unix socket under \
                  --rdb-socket-auth peer"
                     .to_string(),
             )),
-            Some((_, message)) => Err(RastcpError::AuthenticationError(
-                String::from_utf8_lossy(message).into_owned(),
-            )),
-            None => Err(RastcpError::AuthenticationError(
-                "the server sent an empty authentication message".to_string(),
-            )),
+            (_, message) => Err(RastcpError::AuthenticationError(message)),
         }
     }
 }
