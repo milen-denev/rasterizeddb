@@ -2267,6 +2267,14 @@ const CONFIG_KEYS: &[ConfigKey] = &[
     },
     ConfigKey {
         section: "wal",
+        key: "prealloc_kb",
+        hot: false,
+        set_with: "--wal-prealloc-kb KB (restart)",
+        options: "",
+        help: "KiB of zeros the log is extended by ahead of its appends; 0 = off",
+    },
+    ConfigKey {
+        section: "wal",
         key: "synchronous_commit",
         hot: true,
         set_with: "SET CONFIG wal.synchronous_commit = off",
@@ -2629,6 +2637,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("index", "delta_mb") => crate::core::index::paged::delta_mb_setting().to_string(),
             ("wal", "enabled") => crate::wal_enabled().to_string(),
             ("wal", "checkpoint_bytes") => crate::wal_checkpoint_bytes().to_string(),
+            ("wal", "prealloc_kb") => (crate::wal_prealloc_bytes() / 1024).to_string(),
             // `on`/`off`, not `true`/`false`: it carries a PostgreSQL setting's
             // name, its help and `set_with` both spell it that way, and it is
             // what someone types back into a console's edit box.
@@ -2762,6 +2771,7 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
         ("server", "concurrent_threads") => number(1, 4096),
         ("server", "malloc_arenas") => number(0, 4096),
         ("wal", "checkpoint_bytes") => number(1, u64::MAX),
+        ("wal", "prealloc_kb") => number(0, 1 << 20),
         ("cache", "enabled") => parse_bool(v).map(|b| b.to_string()),
         ("index", "residency") => crate::core::index::paged::Residency::parse(v)
             .map(|r| r.name().to_string())

@@ -488,6 +488,13 @@ fn keep(p: f64, rng: &mut Rng) -> bool {
 /// `base` with each 4 KiB page that differs from `current` kept (current
 /// bytes) or dropped (base bytes, zeros past its end), at a length between
 /// the two.
+///
+/// `at_base_len` is the file exactly as last synced: that length, and no
+/// page kept. Cutting the length alone was the same thing while a log only
+/// grew, since nothing inside its synced length ever changed. A log that
+/// overwrites its own zero padding ([`crate::WAL_PREALLOC_BYTES`]) puts
+/// unsynced records inside that length, and keeping those pages would turn
+/// "the log lost everything unsynced" into "the log lost nothing".
 pub fn mix_pages(base: &[u8], current: &[u8], p: f64, at_base_len: bool, rng: &mut Rng) -> Vec<u8> {
     let len = if at_base_len || p <= 0.0 {
         base.len()
@@ -502,7 +509,7 @@ pub fn mix_pages(base: &[u8], current: &[u8], p: f64, at_base_len: bool, rng: &m
     while at < len {
         let end = (at + PAGE).min(len);
         let differs = (at..end).any(|j| current.get(j) != base.get(j));
-        let kept = differs && keep(p, rng);
+        let kept = !at_base_len && differs && keep(p, rng);
         for (j, b) in out[at..end].iter_mut().enumerate() {
             let j = at + j;
             let synced = base.get(j).copied().unwrap_or(0);

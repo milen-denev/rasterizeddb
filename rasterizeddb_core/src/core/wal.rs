@@ -49,6 +49,37 @@
 //! `file_id` is derived from the file's *name within the database directory*,
 //! never its absolute path, so a database directory can be moved or restored
 //! under a different mount point and its log still replays.
+//!
+//! # Padding
+//!
+//! The file is longer than its records. A record that would grow the file is
+//! preceded by a chunk of zeros past the end ([`crate::WAL_PREALLOC_BYTES`],
+//! 1 MiB), and it and the records after it are written over those zeros. A
+//! sync of a file that grew also commits the filesystem's journal for the new
+//! length, and on ext4 that doubles it: 4.7-4.9 ms against 2.2-2.4 ms for one
+//! small record, measured 2026-11-19, and 135-148 single-row `INSERT`s a
+//! second against 289-353 through the whole engine.
+//!
+//! Nothing in the format changed for it. Replay already stopped at the first
+//! thing that is not a record, and zeros are not one. What changed is every
+//! place that took the end of the file for the end of the log:
+//!
+//! - the append point of a reopened log is the end of its records, found by
+//!   reading them ([`log_extent`]), and a log recovery keeps is resumed at
+//!   the end of the records recovery itself read;
+//! - a tail of nothing but zeros is not a torn tail
+//!   ([`RecoveryStats::truncated_tail`]). Any other byte past the records
+//!   still is, and that log is discarded once replayed, as before. That
+//!   matters more than it did: records now overwrite, so a power cut can
+//!   keep a later page and lose an earlier one, leaving a whole record past
+//!   a gap. Nothing may be appended into such a gap, or the stray record
+//!   could follow the new one exactly and be replayed after it;
+//! - a discarded log is cut to nothing, padding included, in the one change
+//!   of length it always was; the next record pads again.
+//!
+//! A build from before the padding opens such a log safely. It appends at the
+//! end of the file, which only matters if it keeps the log; its recovery sees
+//! the zeros as a torn tail and discards the log once replayed.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -329,7 +360,13 @@ pub struct RecoveryStats {
     /// was taken: see [`Wal::recover_restoring`].
     pub emptied: u64,
     /// Bytes of trailing garbage ignored — a partial record from a crash.
+    /// Zeros are not garbage: the log is extended with them ahead of its
+    /// append point ([`crate::WAL_PREALLOC_BYTES`]), and a tail of nothing
+    /// else is a log that ends where its records do.
     pub truncated_tail: u64,
+    /// Length of the prefix of whole records, which is where a log kept
+    /// after recovery takes its next record.
+    pub valid_bytes: u64,
     /// Highest transaction id any record in the log carries. A log that is
     /// kept after recovery must not see these ids handed out again: its
     /// commit markers would mark the new transactions committed.
@@ -399,6 +436,18 @@ pub struct Wal {
     issued: AtomicU64,
     /// Byte offset of the log's append point, maintained under the writer lock.
     write_pos: AtomicU64,
+    /// Length of the log file, maintained under the writer lock: `write_pos`
+    /// plus the zeros [`Wal::reserve_locked`] has put ahead of it. Nothing
+    /// but zeros lies between the two.
+    allocated: AtomicU64,
+    /// How many zeros each extension writes; 0 for none. Read from
+    /// [`crate::wal_prealloc_bytes`] when the log is opened.
+    prealloc: AtomicU64,
+    /// Set when extending the log with zeros failed, so it is not retried for
+    /// every record: the log then grows by its appends, as it did before
+    /// there was any padding. Cleared when the log is next discarded, since
+    /// a full disk is the likely cause and a checkpoint is what frees it.
+    prealloc_failed: AtomicBool,
     /// Highest `issued` value known to be on stable storage.
     durable: AtomicU64,
     /// Serializes the flush so waiters share one.
@@ -582,8 +631,19 @@ struct DirtyFiles {
     all: bool,
 }
 
-/// The files the records already in the log at `path` describe, read from
-/// their headers: what this process's first checkpoint owes a sync.
+/// What a log already on disk holds, read at open.
+struct LogExtent {
+    /// The files its records describe: what this process's first checkpoint
+    /// owes a sync.
+    ids: HashSet<u64>,
+    /// Length of the prefix of whole records.
+    valid: u64,
+    /// Whether everything past `valid` is zeros: padding (or nothing), as
+    /// against the torn tail of a crash.
+    zero_tail: bool,
+}
+
+/// Reads the headers of the log at `path`, `len` bytes long.
 ///
 /// A reopened log used to be answered with "every registered file", and the
 /// registry of a reopened directory is every file in it — each table's
@@ -596,7 +656,7 @@ struct DirtyFiles {
 /// records past a torn one are never replayed, so their files are owed
 /// nothing. `None` if the log cannot be read at all, for the caller to fall
 /// back to syncing everything.
-fn files_named_by_log(path: &Path) -> Option<HashSet<u64>> {
+fn log_extent(path: &Path, len: u64) -> Option<LogExtent> {
     let mut scan = LogScanner::open(path).ok()?;
     let mut ids = HashSet::new();
     loop {
@@ -607,10 +667,55 @@ fn files_named_by_log(path: &Path) -> Option<HashSet<u64>> {
             Ok(Some(h)) => {
                 ids.insert(h.file_id);
             }
-            Ok(None) => return Some(ids),
+            Ok(None) => break,
             Err(_) => return None,
         }
     }
+    let valid = scan.consumed;
+    let zero_tail = only_zeros(path, valid, len).ok()?;
+    Some(LogExtent { ids, valid, zero_tail })
+}
+
+/// Whether `path` holds nothing but zeros from `from` up to `to` (or its end,
+/// if that comes first). True of an empty range.
+fn only_zeros(path: &Path, from: u64, to: u64) -> io::Result<bool> {
+    if from >= to {
+        return Ok(true);
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(from))?;
+    let mut left = to - from;
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let got = match file.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if buf[..got].iter().any(|b| *b != 0) {
+            return Ok(false);
+        }
+        left -= got as u64;
+    }
+    Ok(true)
+}
+
+/// What [`Wal::reserve_locked`] writes from.
+static ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
+
+/// Writes `len` zeros at `at`, leaving the file's cursor where it was.
+#[cfg(unix)]
+fn write_zeros_at(file: &File, mut at: u64, mut len: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while len > 0 {
+        let n = len.min(ZEROS.len() as u64) as usize;
+        file.write_all_at(&ZEROS[..n], at)?;
+        at += n as u64;
+        len -= n as u64;
+    }
+    Ok(())
 }
 
 impl Wal {
@@ -635,7 +740,27 @@ impl Wal {
             sync_parent_dir(&path)?;
         }
 
-        let end = writer.seek(SeekFrom::End(0))?;
+        let len = writer.seek(SeekFrom::End(0))?;
+
+        // Where the records end, which is not where the file does: the log
+        // is extended with zeros ahead of its append point, and a log left
+        // by a crash or kept by recovery still carries them. Appending after
+        // them would put every new record where replay, which stops at the
+        // first thing that is not a record, never looks.
+        //
+        // Only a tail of nothing but zeros is appended into. Anything else
+        // past the records is a torn tail, and a record written over its
+        // start could be followed by a whole stale one further on, which
+        // replay would then take for the next. That log is appended to at
+        // its end, as it always was; `open_and_recover` discards it.
+        let extent = if len == 0 { None } else { log_extent(&path, len) };
+        let end = match &extent {
+            Some(found) if found.zero_tail => found.valid,
+            _ => len,
+        };
+        if end != len {
+            writer.seek(SeekFrom::Start(end))?;
+        }
 
         // Opened now rather than at the first sync, so no commit's sync can
         // fail at an `open` after its marker is already in the file (R7).
@@ -650,11 +775,14 @@ impl Wal {
 
         // Records this process did not write still have to reach their files
         // before a checkpoint may drop them; their headers say which files.
-        let dirty = if end == 0 {
+        let dirty = if len == 0 {
             DirtyFiles::default()
         } else {
-            match files_named_by_log(&path) {
-                Some(ids) => DirtyFiles { ids, all: false },
+            match extent {
+                Some(found) => DirtyFiles {
+                    ids: found.ids,
+                    all: false,
+                },
                 None => DirtyFiles {
                     ids: HashSet::new(),
                     all: true,
@@ -669,6 +797,9 @@ impl Wal {
             writer: Mutex::new(writer),
             issued: AtomicU64::new(0),
             write_pos: AtomicU64::new(end),
+            allocated: AtomicU64::new(len),
+            prealloc: AtomicU64::new(crate::wal_prealloc_bytes()),
+            prealloc_failed: AtomicBool::new(false),
             durable: AtomicU64::new(0),
             gate: Mutex::new(()),
             sync_handle: Mutex::new(Some(sync_handle)),
@@ -1537,6 +1668,8 @@ impl Wal {
     /// the statement that wrote it has lost anything.
     fn append_locked(&self, file: &mut File, bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
         let at = self.write_pos.load(Ordering::Relaxed);
+        let framed: u64 = bufs.iter().map(|b| b.len() as u64).sum();
+        self.reserve_locked(file, at, framed);
         #[cfg(test)]
         let written = match test_hooks::SHORT_WAL_WRITE.with(|h| h.take()) {
             Some(keep) => {
@@ -1560,14 +1693,105 @@ impl Wal {
             let rolled_back = file
                 .set_len(at)
                 .and_then(|()| file.seek(SeekFrom::Start(at)).map(|_| ()));
-            if let Err(cut) = rolled_back {
-                self.poison(format!(
+            match rolled_back {
+                // The cut took the padding past the record with it.
+                Ok(()) => self.allocated.store(at, Ordering::Relaxed),
+                Err(cut) => self.poison(format!(
                     "appending to the log failed ({}) and the partial record could not be cut \
                      back: {}",
                     e, cut
-                ));
+                )),
             }
             return Err(e);
+        }
+        // A record past the padding (a large one, or padding that is off or
+        // failed) grew the file itself.
+        self.allocated.fetch_max(at + framed, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Puts a chunk of zeros ahead of the append point when a record of
+    /// `need` bytes at `at` would otherwise grow the file, so that it and the
+    /// records after it overwrite blocks the file already owns (see
+    /// [`crate::WAL_PREALLOC_BYTES`] for what that buys). Call under the
+    /// writer lock.
+    ///
+    /// The zeros need no sync of their own. They are written before the
+    /// record, and the `fdatasync` that makes the record durable flushes
+    /// them with it; until then a power cut may keep any of them or none,
+    /// and all replay asks of the bytes past the last record is that they
+    /// are not a record. Zeros are not (the magic is wrong), and whatever
+    /// else a crash leaves there is a torn tail, as it was before.
+    ///
+    /// Best effort: no commit fails for want of padding. If the zeros cannot
+    /// be written the log grows by its appends as it always did, and nothing
+    /// tries again until the log is next discarded. A record of a chunk or
+    /// more is not padded for: writing it twice would cost more than the
+    /// journal commit it saves.
+    #[allow(unused_variables)]
+    fn reserve_locked(&self, file: &File, at: u64, need: u64) {
+        #[cfg(unix)]
+        {
+            let chunk = self.prealloc.load(Ordering::Relaxed);
+            let allocated = self.allocated.load(Ordering::Relaxed);
+            if chunk == 0
+                || need >= chunk
+                || at + need <= allocated
+                || self.prealloc_failed.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            // From the end of the file, never from `at`: what lies between
+            // the two is zeros already.
+            #[cfg(test)]
+            let filled = if test_hooks::FAIL_PREALLOC.with(|f| f.replace(false)) {
+                Err(io::Error::other("injected failure to extend the log"))
+            } else {
+                write_zeros_at(file, allocated, chunk)
+            };
+            #[cfg(not(test))]
+            let filled = write_zeros_at(file, allocated, chunk);
+            match filled {
+                Ok(()) => {
+                    self.allocated.store(allocated + chunk, Ordering::Relaxed);
+                    #[cfg(test)]
+                    test_hooks::PREALLOCS.with(|n| n.set(n.get() + 1));
+                }
+                Err(e) => {
+                    self.prealloc_failed.store(true, Ordering::Relaxed);
+                    // However much of the chunk landed is zeros past the end.
+                    if let Ok(meta) = file.metadata() {
+                        self.allocated.fetch_max(meta.len(), Ordering::Relaxed);
+                    }
+                    log::warn!(
+                        "Could not extend {} with {} bytes of zeros ({}); it grows by its \
+                         appends until its next checkpoint",
+                        self.path.display(),
+                        chunk,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    /// This log's padding chunk, whatever the process-wide setting: a test
+    /// that flipped that would change every log its siblings have open.
+    #[cfg(test)]
+    pub(crate) fn set_prealloc_for_tests(&self, bytes: u64) {
+        let _writer = self.writer.lock();
+        self.prealloc.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Moves the append point of a log recovery kept to `at`, the end of the
+    /// records recovery itself read: one scan decides both what was replayed
+    /// and where the next record goes.
+    fn resume_at(&self, at: u64) -> io::Result<()> {
+        let mut file = self.writer.lock();
+        if self.write_pos.load(Ordering::Relaxed) != at {
+            file.seek(SeekFrom::Start(at))?;
+            self.write_pos.store(at, Ordering::Relaxed);
+            self.bytes_since_checkpoint.store(at, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1957,6 +2181,11 @@ impl Wal {
         // later cut-back to it would leave a zero gap that replay stops at.
         self.write_pos.store(0, Ordering::Relaxed);
         self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
+        // The padding went with the records. It is put back by the next
+        // record, not here: a log nothing writes to stays empty, and this
+        // stays one atomic change of length.
+        self.allocated.store(0, Ordering::Relaxed);
+        self.prealloc_failed.store(false, Ordering::Relaxed);
         // From here whether the truncation reached the disk is unknown if
         // anything fails (fsyncgate): records written from offset zero over a
         // log the disk may still hold could replay ahead of older ones. So a
@@ -2474,6 +2703,9 @@ impl Wal {
 
         self.write_pos.store(tail_len, Ordering::Relaxed);
         self.bytes_since_checkpoint.store(tail_len, Ordering::Relaxed);
+        // The new file is the tail and nothing else: no padding yet.
+        self.allocated.store(tail_len, Ordering::Relaxed);
+        self.prealloc_failed.store(false, Ordering::Relaxed);
         // Only what the sync pass covered. The tail is durable too — it was
         // just synced into the new file — but its own committers will say so.
         self.durable.fetch_max(covered_issued, Ordering::AcqRel);
@@ -2706,7 +2938,15 @@ impl Wal {
         // log to itself by design, and `open_and_recover` truncating at the end
         // says so. This is the arithmetic refusing to make a violated
         // assumption worse than it already is.
+        stats.valid_bytes = valid_bytes;
         stats.truncated_tail = discarded_tail(total, valid_bytes);
+        // Zeros past the records are the log's padding, or a record that
+        // never reached the disk at all: nothing was discarded, and nothing
+        // past them can be mistaken for a record. Read up to `total` and no
+        // further, for the reason above.
+        if stats.truncated_tail > 0 && only_zeros(path, valid_bytes, total)? {
+            stats.truncated_tail = 0;
+        }
 
         // Recovery is only complete once what it wrote is itself durable.
         for target in open_files.values_mut().flatten() {
@@ -2947,6 +3187,12 @@ pub(crate) mod test_hooks {
         /// would. Taken when it fires.
         pub static FAIL_FORGET_IN: std::cell::RefCell<Option<std::path::PathBuf>> =
             const { std::cell::RefCell::new(None) };
+
+        /// Chunks of zeros this thread has extended logs with.
+        pub static PREALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+        /// Fails the next extension of the log with zeros, on this thread.
+        pub static FAIL_PREALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
         /// Makes the next WAL write on this thread put only this many bytes
         /// in the file and then fail, as a full disk or EIO would.
@@ -3323,6 +3569,10 @@ pub fn open_and_recover(dir: &str) -> io::Result<(Arc<Wal>, RecoveryStats)> {
         );
         // The log has served its purpose; a fresh one starts empty.
         wal.truncate()?;
+    } else {
+        // Kept: its next record goes where the records this replay read end,
+        // which with padding is short of where the file does.
+        wal.resume_at(stats.valid_bytes)?;
     }
 
     Ok((wal, stats))
@@ -3532,6 +3782,18 @@ mod tests {
         std::fs::read(p).unwrap_or_default()
     }
 
+    /// The records of the log at `p`: the file without the zeros ahead of
+    /// its append point, which is what the file was before it had any.
+    fn records(p: &Path) -> Vec<u8> {
+        let mut raw = read_file(p);
+        if let Some(found) = log_extent(p, raw.len() as u64)
+            && found.zero_tail
+        {
+            raw.truncate(found.valid as usize);
+        }
+        raw
+    }
+
     fn resolver(p: PathBuf) -> impl Fn(u64) -> Option<PathBuf> {
         move |_| Some(p.clone())
     }
@@ -3736,9 +3998,9 @@ mod tests {
 
         let wal = Wal::open(&wal_path).unwrap();
         wal.log_and_commit(id, 0, b"kept").unwrap(); // commit sequence 1
-        let before_barrier = std::fs::metadata(&wal_path).unwrap().len();
+        let before_barrier = records(&wal_path).len() as u64;
         wal.forget_files(&[id]).unwrap(); // commit sequence 2
-        let with_barrier = std::fs::read(&wal_path).unwrap();
+        let with_barrier = records(&wal_path);
 
         // Cut just before the barrier's marker: a torn tail.
         let torn = dir.path().join("torn.log");
@@ -3781,7 +4043,7 @@ mod tests {
         let wal = Wal::open(&wal_path).unwrap();
         wal.forget_files(&[id]).unwrap();
         drop(wal);
-        assert_eq!(files_named_by_log(&wal_path), Some(HashSet::new()));
+        assert!(log_extent(&wal_path, std::fs::metadata(&wal_path).unwrap().len()).unwrap().ids.is_empty());
     }
 
     /// An in-place write logged before its file was deleted waits for its
@@ -4350,7 +4612,7 @@ mod tests {
             let id = file_id_for_name("data.db");
             wal.register_file(id, &data).unwrap();
             wal.log_and_commit(id, 8, b"PRIOR").unwrap();
-            let before = read_file(&wal_path).len();
+            let before = records(&wal_path).len();
 
             let t = wal.begin();
             if site == 1 {
@@ -4366,7 +4628,7 @@ mod tests {
             assert!(failed.is_err(), "site {site}: the injected failure was swallowed");
             let expect = if site == 1 { before + HEADER_LEN + 300 } else { before };
             assert_eq!(
-                read_file(&wal_path).len(),
+                records(&wal_path).len(),
                 expect,
                 "site {site}: a partial record was left in the log"
             );
@@ -4969,7 +5231,7 @@ mod tests {
             wal.sync_pending().unwrap();
             assert_eq!(wal.durable_through(), 4);
         }
-        let full = read_file(&wal_path);
+        let full = records(&wal_path);
         let frame = 2 * HEADER_LEN + 4;
         let start = full.len() - frame;
         // The frame is one record and one marker, in that order.
@@ -5005,7 +5267,7 @@ mod tests {
         }
 
         // A third record cut off mid-header, as a crash would leave it.
-        let mut raw = read_file(&wal_path);
+        let mut raw = records(&wal_path);
         let intact = raw.len();
         raw.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
         raw.push(FORMAT_VERSION);
@@ -6042,11 +6304,11 @@ mod tests {
         assert!(Arc::ptr_eq(&new, &wal_for(&format!("{path_str}/")).unwrap()));
 
         let log_file = path.join(DEFAULT_WAL_NAME);
-        let before = std::fs::metadata(&log_file).map(|m| m.len()).unwrap_or(0);
+        let before = records(&log_file).len();
         exec_sql(&second, "CREATE TABLE t (id UBIGINT, v VARCHAR);").await;
         let out = exec_sql(&second, "INSERT INTO t (id, v) VALUES (7, 'new');").await;
         assert_eq!(out.first(), Some(&0u8), "{:?}", String::from_utf8_lossy(&out));
-        let after = std::fs::metadata(&log_file).unwrap().len();
+        let after = records(&log_file).len();
         assert!(after > before, "the write never reached the visible log ({before} -> {after})");
         assert_eq!(old.bytes_since_checkpoint(), old_bytes, "a write went to the dropped log");
         drop(second);
@@ -6991,12 +7253,396 @@ mod recovery_race_tests {
         // bare header. Counting only the data records put this ceiling at half
         // the true size and failed a test that was behaving correctly.
         let per_record = (HEADER_LEN + 8) + HEADER_LEN;
-        let ceiling = ((SEED_RECORDS + WRITER_BUDGET) * per_record) as u64;
+        // And the zeros ahead of the last of them: less than two chunks.
+        let ceiling =
+            ((SEED_RECORDS + WRITER_BUDGET) * per_record) as u64 + 2 * crate::wal_prealloc_bytes();
         assert!(
             size <= ceiling,
             "the log grew to {} bytes, past its {} ceiling",
             size,
             ceiling
         );
+    }
+}
+
+/// The zeros the log puts ahead of its append point
+/// ([`crate::WAL_PREALLOC_BYTES`]): that records land in them, that replay
+/// and the next open find where the records end, and that anything else past
+/// the records is still the torn tail it always was.
+#[cfg(test)]
+mod prealloc_tests {
+    use super::*;
+
+    const CHUNK: u64 = 64 * 1024;
+    /// One `log_and_commit` of four bytes: a record and its marker.
+    const FRAME: u64 = (2 * HEADER_LEN + 4) as u64;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::Builder::new().prefix("rastdb_walpad_").tempdir().unwrap()
+    }
+
+    fn open(path: &Path, chunk: u64) -> Wal {
+        let wal = Wal::open(path).unwrap();
+        wal.set_prealloc_for_tests(chunk);
+        wal
+    }
+
+    fn len(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    fn at(wal: &Wal) -> u64 {
+        wal.write_pos.load(Ordering::Relaxed)
+    }
+
+    /// Record `i` of a run: four bytes naming it, at its own offset, so the
+    /// data file says exactly which records were replayed.
+    fn put(wal: &Wal, id: u64, i: u32) {
+        wal.log_and_commit(id, 4 * i as u64, &(i + 1).to_le_bytes()).unwrap();
+    }
+
+    /// Which records of a [`put`] run the data file holds.
+    fn replayed(data: &Path) -> Vec<u32> {
+        let bytes = std::fs::read(data).unwrap_or_default();
+        bytes
+            .chunks(4)
+            .enumerate()
+            .filter(|(_, c)| c.iter().any(|b| *b != 0))
+            .map(|(i, c)| {
+                let mut word = [0u8; 4];
+                word[..c.len()].copy_from_slice(c);
+                assert_eq!(u32::from_le_bytes(word), i as u32 + 1, "record {i} holds another's bytes");
+                i as u32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn records_land_in_the_padding_and_the_file_grows_a_chunk_at_a_time() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let wal = open(&path, CHUNK);
+        assert_eq!(len(&path), 0, "a log nothing has written to was padded");
+
+        put(&wal, 1, 0);
+        assert_eq!(len(&path), CHUNK);
+        let mut n = 1u32;
+        while at(&wal) + FRAME <= CHUNK {
+            put(&wal, 1, n);
+            n += 1;
+            assert_eq!(len(&path), CHUNK, "record {n} grew the file");
+        }
+        assert_eq!(at(&wal), n as u64 * FRAME);
+        // The record that does not fit takes the next chunk, from the end of
+        // the file and not from the append point.
+        put(&wal, 1, n);
+        n += 1;
+        assert_eq!(len(&path), 2 * CHUNK);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(stats.applied, n as u64);
+        assert_eq!(stats.valid_bytes, n as u64 * FRAME);
+        assert_eq!(stats.truncated_tail, 0, "padding was counted as a torn tail");
+        assert_eq!(replayed(&data), (0..n).collect::<Vec<_>>());
+    }
+
+    /// Off, the file is its records and nothing else, as it was before.
+    #[test]
+    fn a_log_with_padding_off_ends_where_its_records_do() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let wal = open(&path, 0);
+        for i in 0..50 {
+            put(&wal, 1, i);
+            assert_eq!(len(&path), (i as u64 + 1) * FRAME);
+        }
+    }
+
+    /// The next open of a padded log, whatever its own setting: a record
+    /// appended at the end of the file would sit past the zeros, where
+    /// replay never looks, and its commit would be lost with no error.
+    #[test]
+    fn a_reopened_log_takes_its_next_record_where_its_records_end() {
+        for reopened_with in [CHUNK, 0] {
+            let dir = temp_dir();
+            let path = dir.path().join(DEFAULT_WAL_NAME);
+            let data = dir.path().join("t.db");
+            {
+                let wal = open(&path, CHUNK);
+                put(&wal, 1, 0);
+                put(&wal, 1, 1);
+            }
+            assert_eq!(len(&path), CHUNK);
+            let wal = open(&path, reopened_with);
+            assert_eq!(at(&wal), 2 * FRAME);
+            put(&wal, 1, 2);
+            drop(wal);
+
+            let stats = Wal::recover(&path, |_| Some(data.clone())).unwrap();
+            assert_eq!(replayed(&data), vec![0, 1, 2], "reopened with {reopened_with}");
+            assert_eq!(stats.truncated_tail, 0);
+        }
+    }
+
+    /// A log recovery keeps (its records name a file that is not there yet)
+    /// used to be kept only when it had no tail at all. Padding is not a
+    /// tail: the log is still kept, and still appended to after its records.
+    #[test]
+    fn a_log_recovery_keeps_is_resumed_after_its_records() {
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("later.db");
+        let id = file_id_for_name("later.db");
+        {
+            let wal = open(&path, CHUNK);
+            put(&wal, id, 0);
+        }
+        let (wal, stats) = open_and_recover(&dir_str).unwrap();
+        assert_eq!((stats.applied, stats.unresolved, stats.truncated_tail), (0, 1, 0));
+        assert_eq!(len(&path), CHUNK, "a log whose records were never applied was discarded");
+        assert_eq!(at(&wal), FRAME);
+        put(&wal, id, 1);
+        remove_for(&dir_str);
+        drop(wal);
+
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1]);
+    }
+
+    /// The bytes of one committed record a later run of the same log could
+    /// have written: valid in every way but where it lies.
+    fn stray_frame(dir: &Path, id: u64, i: u32) -> Vec<u8> {
+        let path = dir.join("stray.wal");
+        let wal = open(&path, 0);
+        put(&wal, id, i);
+        drop(wal);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        bytes
+    }
+
+    /// What a power cut leaves when it keeps a later page of the log and
+    /// drops an earlier one: the records, a gap of zeros, and a whole
+    /// committed record past it. That is a torn tail. Were the gap taken for
+    /// padding, the next record would be written into it and the stray one
+    /// could follow it exactly, replaying a write nobody was ever told had
+    /// committed, after one that was.
+    #[test]
+    fn a_record_past_a_gap_of_zeros_is_a_torn_tail_and_the_log_is_discarded() {
+        use std::os::unix::fs::FileExt;
+        let dir = temp_dir();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        std::fs::write(&data, b"").unwrap();
+        let id = file_id_for_name("t.db");
+        {
+            let wal = open(&path, CHUNK);
+            put(&wal, id, 0);
+        }
+        let stray = stray_frame(dir.path(), id, 5);
+        // Exactly one frame further on: where the next record would end.
+        let file = File::options().write(true).open(&path).unwrap();
+        file.write_all_at(&stray, 2 * FRAME).unwrap();
+        drop(file);
+
+        let stats = Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.truncated_tail, CHUNK - FRAME);
+        // Opened without recovery it is appended to at its end, as a torn
+        // log always was, never into the gap.
+        assert_eq!(at(&Wal::open(&path).unwrap()), CHUNK);
+
+        let (wal, _) = open_and_recover(&dir_str).unwrap();
+        assert_eq!(len(&path), 0, "a log with a torn tail was kept");
+        put(&wal, id, 1);
+        remove_for(&dir_str);
+        drop(wal);
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1], "the stray record was replayed");
+    }
+
+    /// Any bytes at all in the padding, not only a whole record.
+    #[test]
+    fn one_stray_byte_in_the_padding_is_a_torn_tail() {
+        use std::os::unix::fs::FileExt;
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        {
+            let wal = open(&path, CHUNK);
+            put(&wal, 1, 0);
+        }
+        for offset in [FRAME, FRAME + 1, 4096, CHUNK - 1] {
+            let file = File::options().write(true).open(&path).unwrap();
+            file.write_all_at(&[1], offset).unwrap();
+            let stats = Wal::recover(&path, |_| None).unwrap();
+            assert_eq!(stats.truncated_tail, CHUNK - FRAME, "a stray byte at {offset}");
+            assert_eq!(at(&Wal::open(&path).unwrap()), CHUNK, "a stray byte at {offset}");
+            file.write_all_at(&[0], offset).unwrap();
+        }
+        assert_eq!(Wal::recover(&path, |_| None).unwrap().truncated_tail, 0);
+    }
+
+    /// A write that fails is cut back to the append point, and the padding
+    /// past it goes with the cut. The next record puts a chunk back.
+    #[test]
+    fn a_failed_write_takes_the_padding_with_it_and_the_next_puts_it_back() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let wal = open(&path, CHUNK);
+        put(&wal, 1, 0);
+
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(Some(HEADER_LEN + 2)));
+        let failed = wal.log_and_commit(1, 4, &2u32.to_le_bytes());
+        test_hooks::SHORT_WAL_WRITE.with(|h| h.set(None));
+        assert!(failed.is_err());
+        assert!(!wal.is_poisoned());
+        assert_eq!((at(&wal), len(&path)), (FRAME, FRAME));
+
+        put(&wal, 1, 1);
+        assert_eq!((at(&wal), len(&path)), (2 * FRAME, FRAME + CHUNK));
+        drop(wal);
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1]);
+    }
+
+    /// No commit fails for want of padding, and nothing retries it record by
+    /// record; discarding the log clears that, since a full disk is the
+    /// likely cause and a checkpoint is what frees it.
+    #[test]
+    fn padding_that_cannot_be_written_is_gone_without_until_the_log_is_discarded() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let data = dir.path().join("t.db");
+        let wal = open(&path, CHUNK);
+
+        test_hooks::FAIL_PREALLOC.with(|f| f.set(true));
+        put(&wal, 1, 0);
+        assert!(!test_hooks::FAIL_PREALLOC.with(|f| f.get()), "the extension was never tried");
+        put(&wal, 1, 1);
+        assert_eq!(len(&path), 2 * FRAME, "it was tried again for the next record");
+        assert!(!wal.is_poisoned());
+        Wal::recover(&path, |_| Some(data.clone())).unwrap();
+        assert_eq!(replayed(&data), vec![0, 1]);
+
+        wal.truncate().unwrap();
+        assert_eq!(len(&path), 0);
+        put(&wal, 1, 2);
+        assert_eq!(len(&path), CHUNK);
+    }
+
+    /// Writing a large record twice would cost more than the journal commit
+    /// the padding saves, so it grows the file itself and the next small one
+    /// pads from there.
+    #[test]
+    fn a_record_of_a_chunk_or_more_is_not_padded_for() {
+        let dir = temp_dir();
+        let path = dir.path().join(DEFAULT_WAL_NAME);
+        let wal = open(&path, CHUNK);
+        let extended = || test_hooks::PREALLOCS.with(|n| n.get());
+        let before = extended();
+        wal.log_and_commit(1, 0, &vec![7u8; CHUNK as usize]).unwrap();
+        let big = CHUNK + 2 * HEADER_LEN as u64;
+        assert_eq!((at(&wal), len(&path)), (big, big));
+        // The length alone would not show it: zeros the record then covers
+        // leave the file exactly as long.
+        assert_eq!(extended(), before, "zeros were written under a record that replaced them all");
+        wal.log_and_commit(1, 0, b"tiny").unwrap();
+        assert_eq!((at(&wal), len(&path)), (big + FRAME, big + CHUNK));
+        assert_eq!(extended(), before + 1);
+    }
+
+    /// Every way a power cut can leave a padded log, page by page: each
+    /// unsynced 4 KiB page kept or dropped, as the crash-image model does
+    /// it. Whatever is left, replay applies every record that was synced and
+    /// then a run of the unsynced ones in order with none skipped; and the
+    /// log that goes on from there never replays a record past that run.
+    #[test]
+    fn every_page_mix_of_a_padded_log_replays_a_prefix_and_goes_on_from_it() {
+        use crate::core::power_loss::image::{Rng, mix_pages};
+        const SYNCED: u32 = 150;
+        const TOTAL: u32 = 400;
+        let source = temp_dir();
+        let source_log = source.path().join(DEFAULT_WAL_NAME);
+        let id = file_id_for_name("t.db");
+        let wal = open(&source_log, CHUNK);
+        for i in 0..SYNCED {
+            put(&wal, id, i);
+        }
+        let base = std::fs::read(&source_log).unwrap();
+        for i in SYNCED..TOTAL {
+            put(&wal, id, i);
+        }
+        drop(wal);
+        let current = std::fs::read(&source_log).unwrap();
+        assert_eq!(base.len(), current.len(), "the unsynced records grew the file: pad more");
+
+        let (mut kept_logs, mut discarded_logs, mut partial) = (0, 0, 0);
+        for seed in 0..300u64 {
+            let p = match seed % 3 {
+                0 => 0.5,
+                1 => 0.9,
+                _ => 0.1,
+            };
+            let image = mix_pages(&base, &current, p, false, &mut Rng::new(seed));
+            let dir = temp_dir();
+            let dir_str = dir.path().to_string_lossy().to_string();
+            let path = dir.path().join(DEFAULT_WAL_NAME);
+            let data = dir.path().join("t.db");
+            std::fs::write(&path, &image).unwrap();
+            // Odd seeds find the data file there and replay into it. Even
+            // ones do not, so recovery applies nothing and keeps the log if
+            // it has no torn tail: the one way a log is appended to after
+            // its own old records.
+            let resolved = seed % 2 == 1;
+            if resolved {
+                std::fs::write(&data, b"").unwrap();
+            }
+
+            let (wal, stats) = open_and_recover(&dir_str).unwrap();
+            let seen = (stats.applied + stats.unresolved) as u32;
+            assert!(
+                (SYNCED..=TOTAL).contains(&seen),
+                "seed {seed}: {seen} records read, {SYNCED} were synced"
+            );
+            if seen > SYNCED && seen < TOTAL {
+                partial += 1;
+            }
+            let kept = len(&path) != 0;
+            assert!(!(kept && stats.truncated_tail != 0), "seed {seed}: a log with a torn tail was kept");
+            if kept {
+                kept_logs += 1;
+            } else {
+                discarded_logs += 1;
+            }
+            if resolved {
+                assert!(!kept, "seed {seed}: a replayed log was kept");
+                assert_eq!(
+                    replayed(&data),
+                    (0..seen).collect::<Vec<_>>(),
+                    "seed {seed}: replay skipped a record or took one out of order"
+                );
+            }
+
+            // The run goes on with one more record.
+            put(&wal, id, TOTAL);
+            remove_for(&dir_str);
+            drop(wal);
+            Wal::recover(&path, |_| Some(data.clone())).unwrap();
+            // A kept log still holds what it held; a discarded one, with
+            // nothing applied, lost its records as a torn log always did.
+            let mut expect: Vec<u32> = if resolved || kept { (0..seen).collect() } else { Vec::new() };
+            expect.push(TOTAL);
+            assert_eq!(
+                replayed(&data),
+                expect,
+                "seed {seed}: a record past the ones recovery read came back"
+            );
+        }
+        assert!(kept_logs > 0 && discarded_logs > 0, "kept {kept_logs}, discarded {discarded_logs}");
+        assert!(partial > 0, "no image kept some unsynced records and lost others");
     }
 }
