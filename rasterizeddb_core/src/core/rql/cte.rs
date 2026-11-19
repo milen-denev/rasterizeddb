@@ -200,7 +200,7 @@ pub(crate) fn without_set_quantifier(list: &str) -> &str {
     let trimmed = list.trim_start();
     let word = |w: &str| {
         trimmed.len() > w.len()
-            && trimmed[..w.len()].eq_ignore_ascii_case(w)
+            && trimmed.as_bytes()[..w.len()].eq_ignore_ascii_case(w.as_bytes())
             && !trimmed.as_bytes()[w.len()].is_ascii_alphanumeric()
             && trimmed.as_bytes()[w.len()] != b'_'
     };

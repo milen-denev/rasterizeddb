@@ -39,7 +39,7 @@ pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&
     let runs_now = head.starts_with('(')
         || ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "VALUES", "MERGE", "TABLE"]
             .iter()
-            .any(|w| head.len() > w.len() && head[..w.len()].eq_ignore_ascii_case(w) && !is_identifier_byte(head.as_bytes()[w.len()]));
+            .any(|w| head.len() > w.len() && head.as_bytes()[..w.len()].eq_ignore_ascii_case(w.as_bytes()) && !is_identifier_byte(head.as_bytes()[w.len()]));
     if !runs_now {
         return Ok(None);
     }

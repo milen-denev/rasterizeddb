@@ -384,7 +384,25 @@ logged, which an unlogged one is allowed to be); `ROW(a, b)`;
 `a [NOT] SIMILAR TO p`; `UPDATE … SET (a, b) = (x, y)` and `= (SELECT p, q
 …)` (one scalar subquery per column, so a volatile function in it runs once
 per column); `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
-read as the left side's type either way).
+read as the left side's type either way); a derived table's column list,
+`FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
+
+### Subqueries reading outer columns
+
+A subquery may name an outer column without its qualifier, `EXISTS (SELECT 1
+FROM ord WHERE customer_id = id)`, as PostgreSQL scopes it: the subquery's own
+relations first, then each enclosing query's, nearest first. The name is
+qualified with the relation it is found in before the correlated subquery is
+planned. Where that cannot be decided for certain (a level whose relations'
+columns are not all known, or two relations of one level with the column) the
+name is left as written and the statement fails as before, never with
+another relation's column.
+
+`(a, b) [NOT] IN (SELECT x, y …)` with an uncorrelated subquery runs the
+subquery once and compares the row with each of its rows three-valued: a NULL
+on either side makes that comparison unknown, so `NOT IN` keeps only the rows
+that differ for certain, as in PostgreSQL. A subquery with no rows makes `IN`
+false and `NOT IN` true, whatever the row holds.
 
 ### `LIKE` and `ILIKE`
 
@@ -1353,9 +1371,11 @@ longer gaps. What is still missing:
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
 - **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
-  WHERE u.k = t.k)`; an uncorrelated one works), a correlated `EXISTS` over a
-  derived table that names its columns (`FROM (SELECT …) s(c1, c2)`) or reads
-  an outer column unqualified (`WHERE s.x = a`; `t.a` works), `TABLESAMPLE`,
+  WHERE u.k = t.k)`; an uncorrelated one works), a column list on a table
+  alias (`FROM t AS x(a, b)`; on a derived table it works), an outer column
+  named bare where the subquery's relations are not all known (a CTE, a
+  function in `FROM`, `SELECT *` in a derived table) or two outer relations
+  have it, `TABLESAMPLE`,
   the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
   on a table with no unique column, and a `WINDOW` clause inside a subquery
   (the outermost one works).

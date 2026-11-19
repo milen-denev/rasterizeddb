@@ -6339,6 +6339,17 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
     }
     let stmt = folded.as_str();
 
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(&database, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
+    };
     // A correlated scalar subquery, as the LATERAL join it means.
     let correlated;
     let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {

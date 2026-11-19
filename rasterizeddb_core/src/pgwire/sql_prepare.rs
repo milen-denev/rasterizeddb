@@ -27,7 +27,7 @@ pub(crate) enum SqlPrepare {
 fn word_at(text: &str, word: &str) -> Option<usize> {
     let n = word.len();
     (text.len() >= n
-        && text[..n].eq_ignore_ascii_case(word)
+        && text.as_bytes()[..n].eq_ignore_ascii_case(word.as_bytes())
         && text.as_bytes().get(n).is_none_or(|b| !is_identifier_byte(*b)))
     .then_some(n)
 }

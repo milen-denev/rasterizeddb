@@ -483,7 +483,7 @@ async fn run_statements(
 /// statement.
 fn dynamic_execute(text: &str) -> Option<&str> {
     let t = text.trim();
-    (t.len() > 8 && t[..7].eq_ignore_ascii_case("EXECUTE") && !crate::core::sql_scan::is_identifier_byte(t.as_bytes()[7]))
+    (t.len() > 8 && t.as_bytes()[..7].eq_ignore_ascii_case(b"EXECUTE") && !crate::core::sql_scan::is_identifier_byte(t.as_bytes()[7]))
         .then(|| t[7..].trim())
 }
 
@@ -492,14 +492,14 @@ fn dynamic_execute(text: &str) -> Option<&str> {
 /// language.
 pub(super) fn parse_do(stmt: &str) -> Option<Result<String, Failure>> {
     let s = stmt.trim().trim_end_matches(';').trim_end();
-    if !(s.len() > 3 && s[..2].eq_ignore_ascii_case("DO") && s.as_bytes()[2].is_ascii_whitespace()) {
+    if !(s.len() > 3 && s.as_bytes()[..2].eq_ignore_ascii_case(b"DO") && s.as_bytes()[2].is_ascii_whitespace()) {
         return None;
     }
     let mut rest = s[2..].trim_start();
     let mut language: Option<String> = None;
     let mut take_language = |rest: &mut &str| {
         let r = rest.trim_start();
-        if r.len() > 8 && r[..8].eq_ignore_ascii_case("LANGUAGE") {
+        if r.len() > 8 && r.as_bytes()[..8].eq_ignore_ascii_case(b"LANGUAGE") {
             let after = r[8..].trim_start();
             let len = after.bytes().take_while(|b| crate::core::sql_scan::is_identifier_byte(*b) || *b == b'\'').count();
             language = Some(after[..len].trim_matches('\'').to_ascii_lowercase());

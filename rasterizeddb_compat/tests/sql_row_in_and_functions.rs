@@ -125,3 +125,43 @@ async fn overlay_jsonb_insert_and_jsonb_pretty() {
     );
     assert_eq!(rows(&c, "SELECT id, jsonb_insert(doc, '{d}', '1') ? 'd' FROM jp").await, ["1|t"]);
 }
+
+/// A subquery naming an outer column bare (`WHERE customer_id = id`) reads
+/// it as PostgreSQL scopes it: the subquery's own relations first, then the
+/// enclosing query's. It was "unknown identifier 'id'".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subquery_reads_an_outer_column_named_bare() {
+    let server = TestServer::start().await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute(
+        "CREATE TABLE cu (id int, name text); CREATE TABLE ord (oid int, customer_id int, total int);
+         INSERT INTO cu VALUES (1,'a'),(2,'b'),(3,'c');
+         INSERT INTO ord VALUES (10,1,5),(11,1,7),(12,3,1)",
+    )
+    .await
+    .expect("setup");
+
+    assert_eq!(rows(&c, "SELECT name FROM cu WHERE EXISTS (SELECT 1 FROM ord WHERE customer_id = id) ORDER BY 1").await, ["a", "c"]);
+    assert_eq!(rows(&c, "SELECT name FROM cu WHERE EXISTS (SELECT 1 FROM ord o WHERE o.customer_id = id) ORDER BY 1").await, ["a", "c"]);
+    assert_eq!(rows(&c, "SELECT name FROM cu WHERE NOT EXISTS (SELECT 1 FROM ord WHERE customer_id = id) ORDER BY 1").await, ["b"]);
+    assert_eq!(
+        rows(&c, "SELECT name FROM cu WHERE EXISTS (SELECT 1 FROM ord WHERE oid = 10 AND customer_id = id) ORDER BY 1").await,
+        ["a"]
+    );
+    assert_eq!(
+        rows(&c, "SELECT name, (SELECT count(*) FROM ord WHERE customer_id = id) FROM cu ORDER BY 1").await,
+        ["a|2", "b|0", "c|1"]
+    );
+    // Through a derived table that renames its columns.
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT name FROM cu WHERE EXISTS (SELECT 1 FROM (SELECT customer_id, total FROM ord) AS s(k, t) WHERE s.k = id) ORDER BY 1"
+        )
+        .await,
+        ["a", "c"]
+    );
+    // A write's target.
+    c.batch_execute("DELETE FROM cu WHERE NOT EXISTS (SELECT 1 FROM ord WHERE customer_id = id)").await.expect("delete");
+    assert_eq!(rows(&c, "SELECT name FROM cu ORDER BY 1").await, ["a", "c"]);
+}

@@ -705,7 +705,7 @@ pub fn standard_syntax(upper: &str, args: &str) -> Option<(String, String)> {
             let mut func = "BTRIM";
             for (word, name) in [("BOTH", "BTRIM"), ("LEADING", "LTRIM"), ("TRAILING", "RTRIM")] {
                 if rest.len() > word.len()
-                    && rest[..word.len()].eq_ignore_ascii_case(word)
+                    && rest.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
                     && !rest.as_bytes()[word.len()].is_ascii_alphanumeric()
                 {
                     func = name;

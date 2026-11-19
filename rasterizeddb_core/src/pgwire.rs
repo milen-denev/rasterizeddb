@@ -4987,6 +4987,16 @@ pub(crate) async fn describe_query(
         }
         _ => stmt,
     };
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(database, stmt) {
+        Some(text) => {
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
+    };
     // And a correlated scalar subquery as the `LATERAL` join it runs as.
     let correlated;
     let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {
@@ -7966,6 +7976,17 @@ where
     };
     let stmt = catalog.as_ref().map(|c| c.rewritten.as_str()).unwrap_or(stmt);
 
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(database, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
+    };
     // A correlated scalar subquery (`(SELECT max(v) FROM u WHERE u.k =
     // t.k)`), as the `LATERAL` join it means (`rql::correlated`), before the
     // passes that materialise such joins.
@@ -11304,7 +11325,7 @@ fn plain_setting(stmt: &str) -> Option<(bool, String, Option<String>)> {
     let after = rest[name_len..].trim_start();
     let value = if let Some(v) = after.strip_prefix('=') {
         v.trim()
-    } else if after.len() >= 3 && after[..3].eq_ignore_ascii_case("to ") {
+    } else if after.len() >= 3 && after.as_bytes()[..3].eq_ignore_ascii_case(b"to ") {
         after[3..].trim()
     } else {
         return None;

@@ -46,6 +46,7 @@ pub(crate) mod join_using;
 pub(crate) mod grouping_sets;
 pub(crate) mod lateral;
 pub(crate) mod correlated;
+pub(crate) mod outer_columns;
 pub mod truncate;
 pub mod pg_functions;
 pub mod table_functions;
