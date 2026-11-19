@@ -103,9 +103,24 @@ pub struct BranchMeta {
     /// from the first of them.
     #[serde(default)]
     pub via: Vec<String>,
+    /// Names this copy among every branch ever made under its name: what a
+    /// merge's renumbered keys are recorded against in the parent, so a
+    /// branch made again (or reset) never takes an old one's.
+    #[serde(default)]
+    pub id: String,
 }
 
 impl BranchMeta {
+    /// [`BranchMeta::id`], or for metadata written before it existed, the
+    /// name and creation time.
+    pub fn merge_id(&self, name: &str) -> String {
+        if self.id.is_empty() {
+            format!("{name}@{}", self.created_at)
+        } else {
+            self.id.clone()
+        }
+    }
+
     pub fn read(dir: &Path) -> Option<BranchMeta> {
         let text = std::fs::read_to_string(dir.join(META_FILE)).ok()?;
         serde_json::from_str(&text).ok()
@@ -814,6 +829,15 @@ fn human(bytes: u64) -> String {
     }
 }
 
+/// A new [`BranchMeta::id`] for a copy named `name`.
+fn fresh_id(name: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{name}@{nanos:x}.{:x}", std::process::id())
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1210,6 +1234,7 @@ impl DatabaseCatalog {
             merged_at: None,
             base_generation,
             via: Vec::new(),
+            id: fresh_id(name),
         };
         if options.with_base {
             self.write_base(name, staging, final_dir, base_generation)
@@ -1540,6 +1565,7 @@ impl DatabaseCatalog {
                 merged_at: None,
                 base_generation: 0,
                 via: Vec::new(),
+                id: fresh_id(name),
             },
         };
         let swapped = intent
@@ -1755,6 +1781,11 @@ pub fn is_recorded_ddl(stmt: &str) -> bool {
         return false;
     }
     let second = second.unwrap_or("").to_ascii_uppercase();
+    // A merge's record of renumbered keys is the parent's own, never a
+    // schema change to carry further up.
+    if stmt.contains(crate::pgwire::KEYMAP_TABLE_NAME) {
+        return false;
+    }
     !matches!(
         second.as_str(),
         "DATABASE" | "BRANCH" | "ROLE" | "USER" | "TEMP" | "TEMPORARY" | "GROUP"

@@ -1056,3 +1056,99 @@ async fn a_merge_pages_through_a_table_and_a_late_conflict_undoes_it_all() {
     assert_eq!(prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await, expected);
     assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rows_both_sides_numbered_alike_are_renumbered_with_their_references() {
+    let fx = Fixture::new("serial").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE DATABASE prod").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE TABLE orders (id SERIAL PRIMARY KEY, what TEXT)").await;
+    prod.exec("CREATE TABLE lines (id SERIAL PRIMARY KEY, order_id INT REFERENCES orders(id), qty INT)")
+        .await;
+    prod.exec("INSERT INTO orders (what) VALUES ('one'), ('two')").await;
+    prod.exec("INSERT INTO lines (order_id, qty) VALUES (1, 1)").await;
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+
+    // Both sides take the next numbers for different rows.
+    let mut dev = fx.client("dev");
+    dev.exec("INSERT INTO orders (what) VALUES ('dev-a'), ('dev-b')").await; // 3, 4
+    dev.exec("INSERT INTO lines (order_id, qty) VALUES (3, 5), (4, 6)").await; // 2, 3
+    dev.exec("UPDATE lines SET order_id = 4 WHERE id = 1").await;
+    prod.exec("INSERT INTO orders (what) VALUES ('prod-x')").await; // 3
+    prod.exec("INSERT INTO lines (order_id, qty) VALUES (3, 9)").await; // 2
+
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    for t in ["orders", "lines"] {
+        let r = diff.iter().find(|r| r[0] == t).unwrap_or_else(|| panic!("{diff:?}"));
+        assert_eq!(r[5], "0", "{t} would conflict: {diff:?}");
+    }
+    admin.exec("MERGE BRANCH dev").await;
+    let joined = "SELECT l.qty, o.what FROM lines l JOIN orders o ON o.id = l.order_id ORDER BY l.qty";
+    assert_eq!(
+        prod.rows(joined).await,
+        vec![
+            row(&["1", "dev-b"]),
+            row(&["5", "dev-a"]),
+            row(&["6", "dev-b"]),
+            row(&["9", "prod-x"]),
+        ]
+    );
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM orders").await, "5");
+    // The parent's sequence moved past every row it holds.
+    prod.exec("INSERT INTO orders (what) VALUES ('after')").await;
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM orders").await, "6");
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+
+    // Later, the branch changes rows it knows by their old numbers.
+    let mut dev = fx.client("dev");
+    dev.exec("UPDATE orders SET what = 'dev-a2' WHERE id = 3").await;
+    dev.exec("UPDATE lines SET qty = 50 WHERE id = 2").await;
+    dev.exec("DELETE FROM lines WHERE id = 3").await;
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    let orders = diff.iter().find(|r| r[0] == "orders").unwrap_or_else(|| panic!("{diff:?}"));
+    assert_eq!(&orders[2..6], &["0", "1", "0", "0"], "{diff:?}");
+    let lines = diff.iter().find(|r| r[0] == "lines").unwrap_or_else(|| panic!("{diff:?}"));
+    assert_eq!(&lines[2..6], &["0", "1", "1", "0"], "{diff:?}");
+    admin.exec("MERGE BRANCH dev").await;
+    assert_eq!(
+        prod.rows(joined).await,
+        vec![row(&["1", "dev-b"]), row(&["9", "prod-x"]), row(&["50", "dev-a2"])]
+    );
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rows_referencing_each_other_are_renumbered_in_order() {
+    let fx = Fixture::new("serial_tree").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE DATABASE prod").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE TABLE cats (id SERIAL PRIMARY KEY, parent_id INT REFERENCES cats(id), name TEXT)")
+        .await;
+    prod.exec("INSERT INTO cats (parent_id, name) VALUES (NULL, 'root')").await; // 1
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("INSERT INTO cats (parent_id, name) VALUES (1, 'fruit')").await; // 2
+    dev.exec("INSERT INTO cats (parent_id, name) VALUES (2, 'apple')").await; // 3
+    // An older row moved under a new one: inserted after it on the parent.
+    dev.exec("INSERT INTO cats (parent_id, name) VALUES (NULL, 'pear')").await; // 4
+    dev.exec("UPDATE cats SET parent_id = 4 WHERE id = 3").await;
+    dev.exec("UPDATE cats SET parent_id = 2 WHERE id = 4").await;
+    prod.exec("INSERT INTO cats (parent_id, name) VALUES (1, 'veg'), (1, 'nuts')").await; // 2, 3
+
+    admin.exec("MERGE BRANCH dev").await;
+    let tree = "SELECT c.name, p.name FROM cats c LEFT JOIN cats p ON p.id = c.parent_id ORDER BY c.name";
+    assert_eq!(
+        prod.rows(tree).await,
+        vec![
+            row(&["apple", "pear"]),
+            row(&["fruit", "root"]),
+            row(&["nuts", "root"]),
+            row(&["pear", "fruit"]),
+            row(&["root", "NULL"]),
+            row(&["veg", "root"]),
+        ]
+    );
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}

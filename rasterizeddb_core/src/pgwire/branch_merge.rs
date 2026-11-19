@@ -174,6 +174,7 @@ fn user_tables(database: &Database) -> BTreeSet<String> {
         .into_iter()
         .filter(|n| !n.starts_with("__") || n.starts_with("__rdb_"))
         .filter(|n| n != crate::auth::ROLE_TABLE)
+        .filter(|n| n != KEYMAP_TABLE)
         .collect()
 }
 
@@ -321,6 +322,18 @@ fn defaulted_of(database: &Database, table: &str) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Whether `column` of `table` is filled by a sequence when an insert
+/// leaves it out: a `SERIAL`, or a `DEFAULT nextval(…)`.
+fn sequence_filled(database: &Database, table: &str, column: &str) -> bool {
+    database.relation(table).is_some_and(|r| {
+        r.schema().defaults.iter().any(|d| {
+            !d.is_deleted
+                && d.column.eq_ignore_ascii_case(column)
+                && d.expression.to_ascii_lowercase().contains("nextval(")
+        })
+    })
+}
+
 /// Tables `table` references by foreign key.
 fn references_of(database: &Database, table: &str) -> BTreeSet<String> {
     database
@@ -404,6 +417,9 @@ struct TablePlan {
     /// them, or never had them: a branch re-parented past the branch that
     /// added them), left out of what is written.
     left_out: BTreeSet<String>,
+    /// Rows the branch inserted into a table keyed on a sequence, to be
+    /// inserted with a new key ([`TableInput::renumber`]).
+    renumbered: Vec<Vec<Cell>>,
 }
 
 struct TableInput<'a> {
@@ -418,6 +434,10 @@ struct TableInput<'a> {
     branch: Projected,
     parent: Option<Projected>,
     policy: ConflictPolicy,
+    /// The key is a sequence's: a row only the branch has is inserted with
+    /// a key from the parent's sequence ([`TablePlan::renumbered`]), never
+    /// matched to a parent row by the number it happens to share.
+    renumber: bool,
 }
 
 fn condition(columns: &[String], oids: &[i32], positions: &[usize], row: &[Cell]) -> String {
@@ -599,6 +619,15 @@ fn plan_keyed(
                 .collect::<Vec<Cell>>()
         });
         let (eb, ep) = (effective_base.as_ref(), effective_parent.as_ref());
+        if input.renumber
+            && eb.is_none()
+            && let Some(r) = r
+        {
+            plan.inserts += 1;
+            note_left_out(input, skip, r, plan);
+            plan.renumbered.push(r.clone());
+            continue;
+        }
         enum Act {
             Nothing,
             Apply,
@@ -848,6 +877,14 @@ struct TableSpec {
     defaulted: BTreeSet<String>,
     in_base: bool,
     in_parent: bool,
+    /// The key column, when the key is one column a sequence fills: rows
+    /// the branch inserted are renumbered ([`TableInput::renumber`]).
+    serial: Option<usize>,
+    /// Columns referencing a table whose rows may be renumbered, and that
+    /// table.
+    refs: Vec<(usize, String)>,
+    /// Which of `columns` the parent has.
+    parent_has: Vec<bool>,
 }
 
 /// One table's totals over its pages.
@@ -915,6 +952,61 @@ fn as_ref(o: &Option<(Vec<usize>, Vec<i32>)>) -> Option<(&[usize], &[i32])> {
     o.as_ref().map(|(k, x)| (k.as_slice(), x.as_slice()))
 }
 
+/// The table, in the parent, recording keys a merge renumbered: per branch
+/// (by [`BranchMeta::merge_id`]), table and the key the branch knows the row
+/// by, the key the parent gave it. Written in the merge's own transaction,
+/// so it holds exactly what committed. Never merged, nor recorded as a
+/// branch's DDL.
+///
+/// [`BranchMeta::merge_id`]: crate::core::database::catalog::branch::BranchMeta::merge_id
+pub(crate) const KEYMAP_TABLE: &str = "__rdb_branch_keymap";
+
+/// One table's renumbered keys, as text.
+#[derive(Default)]
+struct KeyMap {
+    /// From earlier merges: the branch's key to the parent's.
+    prior: HashMap<String, String>,
+    /// The parent's keys of `prior`.
+    prior_new: std::collections::HashSet<String>,
+    /// From this merge.
+    fresh: HashMap<String, String>,
+}
+
+impl KeyMap {
+    fn get(&self, old: &str) -> Option<&String> {
+        self.prior.get(old).or_else(|| self.fresh.get(old))
+    }
+}
+
+/// Renumbered keys by table.
+type KeyMaps = HashMap<String, KeyMap>;
+
+fn key_text(cell: &Cell) -> Option<String> {
+    cell.as_ref().map(|b| String::from_utf8_lossy(b).into_owned())
+}
+
+/// Rewrites, in a base or branch row, each column referencing a renumbered
+/// table to the key the parent knows the row by.
+fn translate_refs(row: &mut [Cell], refs: &[(usize, String)], maps: &KeyMaps) {
+    for (i, table) in refs {
+        if let Some(map) = maps.get(table)
+            && let Some(old) = key_text(&row[*i])
+            && let Some(new) = map.get(&old)
+        {
+            row[*i] = Some(new.clone().into_bytes());
+        }
+    }
+}
+
+/// What a merge does with the keys a sequence gave: whether it renumbers,
+/// the keys known so far, and whose they are.
+struct Renumbering<'a> {
+    maps: &'a mut KeyMaps,
+    branch_id: &'a str,
+    /// Whether [`KEYMAP_TABLE`] exists on the parent yet.
+    table_ready: bool,
+}
+
 /// Compares `spec`'s table a page at a time (or whole, unpaged), adding to
 /// `totals` and running what `pass` runs on the parent.
 ///
@@ -923,12 +1015,18 @@ fn as_ref(o: &Option<(Vec<usize>, Vec<i32>)>) -> Option<(&[usize], &[i32])> {
 /// its last row, and the sides read before are read again up to there. So
 /// every side holds each row of the range, the range's bound is the
 /// engine's own ordering, and no round holds more than a page of a side.
+///
+/// A table keyed on a sequence: rows an earlier merge renumbered are left
+/// out of the ranges (their keys differ between the sides) and compared
+/// afterwards by their recorded keys; a row only the branch has is inserted
+/// with a key from the parent's sequence.
 async fn run_table(
     sides: &mut Sides<'_>,
     spec: &TableSpec,
     policy: ConflictPolicy,
     pass: Pass,
     totals: &mut TableTotals,
+    renumbering: &mut Renumbering<'_>,
 ) -> Result<(), Failure> {
     let internal = |e: String| ("XX000", e);
     let t = spec.table.as_str();
@@ -985,49 +1083,288 @@ async fn run_table(
             p = Some(page);
         }
 
-        let plan = plan_table(TableInput {
-            table: t,
-            columns: cols,
-            oids: &oids,
-            key: spec.key.clone(),
-            generated: &spec.generated,
-            defaulted: &spec.defaulted,
-            base: b,
-            branch: r,
-            parent: p,
-            policy,
-        });
-        totals.inserts += plan.inserts;
-        totals.updates += plan.updates;
-        totals.deletes += plan.deletes;
-        totals.conflicts += plan.conflicts.len() as u64;
-        for c in plan.conflicts {
-            if totals.shown.len() < CONFLICTS_SHOWN {
-                totals.shown.push(c);
+        // Rows renumbered before are compared after the ranges, by key.
+        if let Some(c) = spec.serial
+            && let Some(map) = renumbering.maps.get(t)
+            && !map.prior.is_empty()
+        {
+            let mine = |row: &Vec<Cell>| key_text(&row[c]).is_some_and(|k| map.prior.contains_key(&k));
+            r.rows.retain(|row| !mine(row));
+            if let Some(b) = &mut b {
+                b.rows.retain(|row| !mine(row));
+            }
+            if let Some(p) = &mut p {
+                p.rows.retain(|row| !key_text(&row[c]).is_some_and(|k| map.prior_new.contains(&k)));
             }
         }
-        totals.left_out.extend(plan.left_out);
-        let run = match pass {
-            Pass::Count => Vec::new(),
-            Pass::Deletes => plan.deletes_sql,
-            Pass::Writes => plan.writes,
-        };
-        for stmt in run {
-            sides.parent.run(&stmt).await.map_err(|e| {
-                (
-                    "55000",
-                    format!(
-                        "merging failed on the parent ({e}) at `{}`; nothing was merged",
-                        stmt.chars().take(160).collect::<String>()
-                    ),
-                )
-            })?;
-        }
+        compare_page(sides, spec, policy, pass, totals, renumbering, &oids, b, r, p, true).await?;
         match upto {
             Some(bound) => after = Some(bound),
-            None => return Ok(()),
+            None => break,
         }
     }
+
+    // The rows renumbered before: base and branch read by the keys they
+    // know them by, the parent by its own, and matched once the first two
+    // are rewritten to the parent's.
+    let Some(c) = spec.serial else { return Ok(()) };
+    let pairs: Vec<(String, String)> = renumbering
+        .maps
+        .get(t)
+        .map(|m| m.prior.iter().map(|(o, n)| (o.clone(), n.clone())).collect())
+        .unwrap_or_default();
+    let in_list = |keys: &[&String]| {
+        keys.iter()
+            .map(|k| literal(oids.get(c).copied().unwrap_or(0), &Some(k.as_bytes().to_vec())))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for chunk in pairs.chunks(MERGE_PAGE) {
+        let olds: Vec<&String> = chunk.iter().map(|(o, _)| o).collect();
+        let news: Vec<&String> = chunk.iter().map(|(_, n)| n).collect();
+        let by = |keys: &[&String]| format!("SELECT * FROM {} WHERE {} IN ({})", ident(t), ident(&cols[c]), in_list(keys));
+        let rewrite = |mut page: Projected, maps: &KeyMaps| {
+            for row in &mut page.rows {
+                if let Some(new) = key_text(&row[c]).and_then(|k| maps.get(t).and_then(|m| m.prior.get(&k)).cloned()) {
+                    row[c] = Some(new.into_bytes());
+                }
+            }
+            page
+        };
+        let r = rewrite(read_query(sides.branch, &by(&olds), cols).await.map_err(internal)?.0, renumbering.maps);
+        let b = if spec.in_base {
+            Some(rewrite(read_query(sides.base, &by(&olds), cols).await.map_err(internal)?.0, renumbering.maps))
+        } else {
+            None
+        };
+        let p = if spec.in_parent {
+            Some(read_query(sides.parent, &by(&news), cols).await.map_err(internal)?.0)
+        } else {
+            None
+        };
+        compare_page(sides, spec, policy, pass, totals, renumbering, &oids, b, r, p, false).await?;
+    }
+    Ok(())
+}
+
+/// Plans one page of `spec`'s table, adds it to `totals`, and runs what
+/// `pass` runs. `fresh_keys`: a row only the branch has may be renumbered
+/// (false for rows matched by recorded keys, which are never new).
+#[allow(clippy::too_many_arguments)]
+async fn compare_page(
+    sides: &mut Sides<'_>,
+    spec: &TableSpec,
+    policy: ConflictPolicy,
+    pass: Pass,
+    totals: &mut TableTotals,
+    renumbering: &mut Renumbering<'_>,
+    oids: &[i32],
+    mut b: Option<Projected>,
+    mut r: Projected,
+    p: Option<Projected>,
+    fresh_keys: bool,
+) -> Result<(), Failure> {
+    let t = spec.table.as_str();
+    // The branch's rows as it holds them, for those inserted with new keys:
+    // their references are rewritten once, at the insert, from the branch's
+    // numbers — never from numbers already rewritten to the parent's, which
+    // may be another branch row's.
+    let raw: HashMap<String, Vec<Cell>> = match spec.serial {
+        Some(c) if pass == Pass::Writes => r
+            .rows
+            .iter()
+            .filter_map(|row| key_text(&row[c]).map(|k| (k, row.clone())))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    // References to renumbered rows, as the parent knows them.
+    if !spec.refs.is_empty() {
+        for row in r.rows.iter_mut().chain(b.iter_mut().flat_map(|b| b.rows.iter_mut())) {
+            translate_refs(row, &spec.refs, renumbering.maps);
+        }
+    }
+    let plan = plan_table(TableInput {
+        table: t,
+        columns: &spec.columns,
+        oids,
+        key: spec.key.clone(),
+        generated: &spec.generated,
+        defaulted: &spec.defaulted,
+        base: b,
+        branch: r,
+        parent: p,
+        policy,
+        renumber: spec.serial.is_some() && fresh_keys,
+    });
+    totals.inserts += plan.inserts;
+    totals.updates += plan.updates;
+    totals.deletes += plan.deletes;
+    totals.conflicts += plan.conflicts.len() as u64;
+    for c in plan.conflicts {
+        if totals.shown.len() < CONFLICTS_SHOWN {
+            totals.shown.push(c);
+        }
+    }
+    totals.left_out.extend(plan.left_out);
+    let run = match pass {
+        Pass::Count => Vec::new(),
+        Pass::Deletes => plan.deletes_sql,
+        Pass::Writes => plan.writes,
+    };
+    for stmt in run {
+        run_on_parent(sides.parent, &stmt).await?;
+    }
+    if pass == Pass::Writes && !plan.renumbered.is_empty() {
+        let c = spec.serial.expect("renumbered rows come from a sequence-keyed table");
+        let rows: Vec<Vec<Cell>> = plan
+            .renumbered
+            .into_iter()
+            .map(|row| key_text(&row[c]).and_then(|k| raw.get(&k).cloned()).unwrap_or(row))
+            .collect();
+        insert_renumbered(sides.parent, spec, oids, rows, renumbering).await?;
+    }
+    Ok(())
+}
+
+async fn run_on_parent(parent: &mut Internal, stmt: &str) -> Result<Said, Failure> {
+    parent.run(stmt).await.map_err(|e| {
+        (
+            "55000",
+            format!(
+                "merging failed on the parent ({e}) at `{}`; nothing was merged",
+                stmt.chars().take(160).collect::<String>()
+            ),
+        )
+    })
+}
+
+/// Inserts rows the branch added to a table keyed on a sequence, each with a
+/// key the parent's sequence gives, and records the pairing (in
+/// [`KEYMAP_TABLE`], in the merge's transaction, and in `renumbering` for
+/// the rows referencing them that are merged after).
+///
+/// `rows` are as the branch holds them: their references are rewritten here,
+/// once. A row referencing another of the same table that is inserted here
+/// waits for that one, so it is written with its new key.
+async fn insert_renumbered(
+    parent: &mut Internal,
+    spec: &TableSpec,
+    oids: &[i32],
+    rows: Vec<Vec<Cell>>,
+    renumbering: &mut Renumbering<'_>,
+) -> Result<(), Failure> {
+    let t = spec.table.as_str();
+    let c = spec.serial.expect("a renumbered table has a sequence key");
+    let skip: Vec<bool> = (0..spec.columns.len())
+        .map(|i| {
+            i == c
+                || spec.generated.contains(&spec.columns[i].to_ascii_lowercase())
+                || !spec.parent_has.get(i).copied().unwrap_or(true)
+        })
+        .collect();
+    let writable: Vec<usize> = (0..spec.columns.len()).filter(|&i| !skip[i]).collect();
+    let self_refs: Vec<usize> = spec.refs.iter().filter(|(_, to)| to == t).map(|(i, _)| *i).collect();
+    let mut pending: Vec<Vec<Cell>> = rows;
+    let mut recorded: Vec<(String, String)> = Vec::new();
+    while !pending.is_empty() {
+        let waiting: std::collections::HashSet<String> = pending.iter().filter_map(|r| key_text(&r[c])).collect();
+        let (ready, rest): (Vec<Vec<Cell>>, Vec<Vec<Cell>>) = pending.into_iter().partition(|row| {
+            self_refs.iter().all(|&i| {
+                key_text(&row[i]).is_none_or(|v| v == key_text(&row[c]).unwrap_or_default() || !waiting.contains(&v))
+            })
+        });
+        if ready.is_empty() {
+            return Err((
+                "55000",
+                format!(
+                    "rows the branch inserted into {t} refer to each other in a cycle, so they cannot be given new \
+                     keys one by one; nothing was merged"
+                ),
+            ));
+        }
+        for mut row in ready {
+            let old = key_text(&row[c]).unwrap_or_default();
+            translate_refs(&mut row, &spec.refs, renumbering.maps);
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({}) RETURNING {}",
+                ident(t),
+                writable.iter().map(|&i| ident(&spec.columns[i])).collect::<Vec<_>>().join(", "),
+                writable.iter().map(|&i| literal(oids[i], &row[i])).collect::<Vec<_>>().join(", "),
+                ident(&spec.columns[c])
+            );
+            let said = run_on_parent(parent, &sql).await?;
+            let new = said
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .and_then(key_text)
+                .ok_or_else(|| ("XX000", format!("inserting into {t} returned no key")))?;
+            renumbering.maps.entry(t.to_string()).or_default().fresh.insert(old.clone(), new.clone());
+            recorded.push((old, new));
+        }
+        pending = rest;
+    }
+    if !renumbering.table_ready {
+        run_on_parent(
+            parent,
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {KEYMAP_TABLE} (branch TEXT NOT NULL, tbl TEXT NOT NULL, old_key TEXT NOT \
+                 NULL, new_key TEXT NOT NULL, PRIMARY KEY (branch, tbl, old_key))"
+            ),
+        )
+        .await?;
+        renumbering.table_ready = true;
+    }
+    let quote = |v: &str| format!("'{}'", v.replace('\'', "''"));
+    for chunk in recorded.chunks(INSERT_BATCH) {
+        let values = chunk
+            .iter()
+            .map(|(o, n)| format!("({}, {}, {}, {})", quote(renumbering.branch_id), quote(t), quote(o), quote(n)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        run_on_parent(parent, &format!("INSERT INTO {KEYMAP_TABLE} (branch, tbl, old_key, new_key) VALUES {values}")).await?;
+    }
+    Ok(())
+}
+
+/// Removes what merges of the branch `branch_id` recorded in `parent`'s
+/// [`KEYMAP_TABLE`]: the branch is gone, and nothing reads them again.
+/// Best effort — a row left behind is never read (no branch has its id).
+pub(super) async fn forget_keys(parent: Arc<Database>, branch_id: &str) {
+    if parent.relation(KEYMAP_TABLE).is_none() {
+        return;
+    }
+    let mut session = Internal::new(parent);
+    let _ = session
+        .run(&format!(
+            "DELETE FROM {KEYMAP_TABLE} WHERE branch = '{}'",
+            branch_id.replace('\'', "''")
+        ))
+        .await;
+}
+
+/// The keys earlier merges of the branch `branch_id` renumbered, from the
+/// parent's [`KEYMAP_TABLE`].
+async fn load_keymaps(parent: &mut Internal, parent_db: &Database, branch_id: &str) -> Result<KeyMaps, String> {
+    let mut maps = KeyMaps::new();
+    if parent_db.relation(KEYMAP_TABLE).is_none() {
+        return Ok(maps);
+    }
+    let said = parent
+        .run(&format!(
+            "SELECT tbl, old_key, new_key FROM {KEYMAP_TABLE} WHERE branch = '{}'",
+            branch_id.replace('\'', "''")
+        ))
+        .await?;
+    for row in &said.rows {
+        let at = |i: usize| row.get(i).cloned().flatten().map(|b| String::from_utf8_lossy(&b).into_owned());
+        if let (Some(t), Some(o), Some(n)) = (at(0), at(1), at(2)) {
+            let map = maps.entry(t).or_default();
+            map.prior_new.insert(n.clone());
+            map.prior.insert(o, n);
+        }
+    }
+    Ok(maps)
 }
 
 /// Diffs the branch `name` against its parent and base; with `apply`, also
@@ -1076,7 +1413,7 @@ pub(super) async fn run(
     };
     let ddl = catalog.branch_ddl(name);
 
-    let outcome = merge_with(&base_db, &branch_db, &parent_db, &ddl, apply).await;
+    let outcome = merge_with(&base_db, &branch_db, &parent_db, &ddl, apply, &meta.merge_id(name)).await;
     match (outcome, next) {
         (Ok(rows), Some(generation)) => {
             if let Err(e) = catalog.adopt_base(name, generation, branch_db, ddl.len()) {
@@ -1107,6 +1444,7 @@ async fn merge_with(
     parent_db: &Arc<Database>,
     ddl: &[String],
     apply: Option<(ConflictPolicy, bool)>,
+    branch_id: &str,
 ) -> Result<Vec<DiffRow>, Failure> {
     let internal = |e: String| ("XX000", e);
     let mut base = Internal::new(base_db.clone());
@@ -1328,6 +1666,17 @@ async fn merge_with(
     };
     let mut specs: Vec<TableSpec> = Vec::new();
     let mut references: HashMap<String, BTreeSet<String>> = HashMap::new();
+    // Tables keyed on one sequence-filled column, by that column's name.
+    let serials: HashMap<String, String> = branch_tables
+        .iter()
+        .filter_map(|t| {
+            let shape = branch_shapes.get(t)?;
+            let columns = shape.column_names();
+            let key = key_of(branch_db, t, &columns)?;
+            let [c] = key.as_slice() else { return None };
+            sequence_filled(branch_db, t, &columns[*c]).then(|| (t.clone(), columns[*c].clone()))
+        })
+        .collect();
     for table in &branch_tables {
         let Some(shape) = branch_shapes.get(table) else {
             continue;
@@ -1345,7 +1694,36 @@ async fn merge_with(
         // can be NULL (a NULL has no place in a range) and every side read
         // has them.
         let key = key_of(branch_db, table, &columns);
-        let stream = key.clone().filter(|k| k.iter().all(|&i| shape.not_null.contains(&columns[i]))).filter(|pk| {
+        let serial = serials
+            .get(table)
+            .and_then(|c| columns.iter().position(|n| n == c));
+        let refs: Vec<(usize, String)> = branch_db
+            .relation(table)
+            .map(|r| r.schema().foreign_keys.clone())
+            .unwrap_or_default()
+            .iter()
+            .filter(|f| !f.is_deleted)
+            .filter(|f| {
+                serials
+                    .get(&f.parent_table)
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&f.parent_column))
+            })
+            .filter_map(|f| {
+                columns
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(&f.column))
+                    .map(|i| (i, f.parent_table.clone()))
+            })
+            .collect();
+        // Read whole: a table whose rows reference each other by renumbered
+        // keys (inserted in an order the references allow), and one whose
+        // key holds such a reference (rewritten, it is no longer the key
+        // the ranges are in).
+        let whole = (serial.is_some() && refs.iter().any(|(_, to)| to == table))
+            || key
+                .as_ref()
+                .is_some_and(|k| refs.iter().any(|(i, _)| k.contains(i)));
+        let stream = key.clone().filter(|_| !whole).filter(|k| k.iter().all(|&i| shape.not_null.contains(&columns[i]))).filter(|pk| {
             let has = |shape: Option<&Shape>| {
                 shape.is_some_and(|s| {
                     pk.iter()
@@ -1361,9 +1739,15 @@ async fn merge_with(
             stream,
             generated: generated_of(branch_db, table),
             defaulted: defaulted_of(branch_db, table),
+            parent_has: columns
+                .iter()
+                .map(|c| !in_parent || parent_shape(table).is_none_or(|s| s.columns.iter().any(|(n, _)| n == c)))
+                .collect(),
             columns,
             in_base,
             in_parent,
+            serial,
+            refs,
         });
     }
     let names: Vec<String> = specs.iter().map(|s| s.table.clone()).collect();
@@ -1376,6 +1760,19 @@ async fn merge_with(
             session.run(SNAPSHOT_BLOCK).await.map_err(internal)?;
         }
     }
+    let mut maps = match load_keymaps(&mut parent, parent_db, branch_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            parent.rollback().await;
+            branch.rollback().await;
+            return Err(internal(e));
+        }
+    };
+    let mut renumbering = Renumbering {
+        maps: &mut maps,
+        branch_id,
+        table_ready: parent_db.relation(KEYMAP_TABLE).is_some(),
+    };
     let mut sides = Sides {
         base: &mut base,
         branch: &mut branch,
@@ -1389,7 +1786,7 @@ async fn merge_with(
     let first = if apply.is_some() { Pass::Deletes } else { Pass::Count };
     for t in order.iter().rev() {
         let mut total = TableTotals::default();
-        if let Err(e) = run_table(&mut sides, by_name[t], policy, first, &mut total).await {
+        if let Err(e) = run_table(&mut sides, by_name[t], policy, first, &mut total, &mut renumbering).await {
             failed = Some(e);
             break;
         }
@@ -1399,7 +1796,7 @@ async fn merge_with(
     if failed.is_none() && apply.is_some() && !(policy == ConflictPolicy::Fail && conflicted > 0) {
         for t in &order {
             let mut ignored = TableTotals::default();
-            if let Err(e) = run_table(&mut sides, by_name[t], policy, Pass::Writes, &mut ignored).await {
+            if let Err(e) = run_table(&mut sides, by_name[t], policy, Pass::Writes, &mut ignored, &mut renumbering).await {
                 failed = Some(e);
                 break;
             }
@@ -1504,6 +1901,7 @@ mod tests {
         let oids = vec![23, 25];
         let generated = BTreeSet::new();
         plan_table(TableInput {
+            renumber: false,
             table: "t",
             columns: &columns,
             oids: &oids,
