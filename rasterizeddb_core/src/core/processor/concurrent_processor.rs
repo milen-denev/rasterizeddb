@@ -836,8 +836,13 @@ impl ConcurrentProcessor {
         // workers count the rows it keeps, or read each one once for what the
         // statement returns, and never fetch a row to evaluate the same
         // comparisons again. See `BatchPrefilter::is_exact`.
-        BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch)
-            .map(|built| Arc::new(built.deciding()))
+        let built = BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch)
+            .map(|built| Arc::new(built.deciding()));
+        #[cfg(test)]
+        if let Some(built) = built.as_ref() {
+            prefilter::note_built(built);
+        }
+        built
     }
 
     /// Compiles the `WHERE` clause into a transformer plan.
@@ -1288,7 +1293,9 @@ impl ConcurrentProcessor {
                                 }
                             }
                             counted += matched;
-                            prefilter::note_decided_by_mask(matched);
+                            if let Some(pf) = prefilter_ref.as_deref() {
+                                pf.note_decided(matched);
+                            }
                             unprocessed = &[];
                         }
                         // Any other scan with such a mask: a kept row matches,
@@ -1491,7 +1498,9 @@ impl ConcurrentProcessor {
                                 }
                             }
                         }
-                        prefilter::note_decided_by_mask(decided_rows);
+                        if let Some(pf) = prefilter_ref.as_deref() {
+                            pf.note_decided(decided_rows);
+                        }
                     }
 
                     // Keep only this worker's best `cap` rows.

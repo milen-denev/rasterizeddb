@@ -174,10 +174,19 @@ pub fn rows_decided_by_mask() -> u64 {
     ROWS_DECIDED.load(Ordering::Relaxed)
 }
 
-pub(crate) fn note_decided_by_mask(rows: u64) {
-    if rows != 0 {
-        ROWS_DECIDED.fetch_add(rows, Ordering::Relaxed);
-    }
+#[cfg(test)]
+tokio::task_local! {
+    /// The prefilters built for the statement running on this task. A test
+    /// reads how many rows its own statement's masks decided from them: the
+    /// process-wide count also moves for every other test's scan, one that
+    /// began before a switch was flipped included.
+    pub(crate) static BUILT: std::cell::RefCell<Vec<rclite::Arc<BatchPrefilter>>>;
+}
+
+/// Hands a statement's prefilter to the test whose statement it is.
+#[cfg(test)]
+pub(crate) fn note_built(prefilter: &rclite::Arc<BatchPrefilter>) {
+    let _ = BUILT.try_with(|built| built.borrow_mut().push(prefilter.clone()));
 }
 
 /// `--scan-prefilter`. On by default.
@@ -290,6 +299,8 @@ pub(crate) struct BatchPrefilter {
     passed: AtomicU64,
     /// Given up: see the module docs.
     off: AtomicBool,
+    /// Rows this statement's masks decided.
+    decided: AtomicU64,
 }
 
 /// One worker's reusable buffers, so a batch allocates nothing but its read
@@ -384,6 +395,7 @@ impl BatchPrefilter {
             seen: AtomicU64::new(0),
             passed: AtomicU64::new(0),
             off: AtomicBool::new(false),
+            decided: AtomicU64::new(0),
         })
     }
 
@@ -412,8 +424,22 @@ impl BatchPrefilter {
     /// evaluated; here a passing row is not evaluated, so the column read is
     /// what replaces that work, whatever fraction passes.
     pub(crate) fn deciding(mut self) -> BatchPrefilter {
-        self.decisive = self.exact && mask_decides();
+        self.decisive = self.is_exact() && mask_decides();
         self
+    }
+
+    /// Counts rows a mask kept and no interpreter evaluated.
+    pub(crate) fn note_decided(&self, rows: u64) {
+        if rows != 0 {
+            self.decided.fetch_add(rows, Ordering::Relaxed);
+            ROWS_DECIDED.fetch_add(rows, Ordering::Relaxed);
+        }
+    }
+
+    /// Rows this statement's masks have decided so far.
+    #[cfg(test)]
+    pub(crate) fn decided(&self) -> u64 {
+        self.decided.load(Ordering::Relaxed)
     }
 
     /// Whether the scan takes this prefilter's masks as the answer.
@@ -688,6 +714,18 @@ mod tests {
     async fn run(db: &Arc<Database>, sql: &str) -> Vec<u8> {
         let purpose = recognize_query_purpose(sql).unwrap_or_else(|| panic!("parse: {sql}"));
         executor::execute(purpose, db.clone()).await
+    }
+
+    /// Runs `statement` and returns its reply with how many rows its own
+    /// prefilters' masks decided: this statement's, and no other test's.
+    async fn counting<F: std::future::Future<Output = Vec<u8>>>(statement: F) -> (Vec<u8>, u64) {
+        super::BUILT
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let reply = statement.await;
+                let decided = super::BUILT.with(|built| built.borrow().iter().map(|p| p.decided()).sum());
+                (reply, decided)
+            })
+            .await
     }
 
     struct RemoveDir(String);
@@ -1050,12 +1088,10 @@ mod tests {
                 }
                 for (shape, sql) in statements {
                     super::set_mask_decides(false);
-                    let before = super::rows_decided_by_mask();
-                    let evaluated = run(&db, &sql).await;
-                    assert_eq!(super::rows_decided_by_mask(), before, "{sql}: decided by a mask while off");
+                    let (evaluated, decided) = counting(run(&db, &sql)).await;
+                    assert_eq!(decided, 0, "{sql}: decided by a mask while off");
                     super::set_mask_decides(true);
-                    let from_mask = run(&db, &sql).await;
-                    let decided = super::rows_decided_by_mask() - before;
+                    let (from_mask, decided) = counting(run(&db, &sql)).await;
                     assert!(
                         from_mask == evaluated,
                         "round {round}, {sql}: {} bytes with the mask deciding, {} with every row evaluated",
@@ -1079,10 +1115,9 @@ mod tests {
                 "SELECT id FROM t WHERE id >= 2000 AND id < 2050 ORDER BY id DESC",
             ] {
                 super::set_mask_decides(false);
-                let before = super::rows_decided_by_mask();
                 let evaluated = run(&db, sql).await;
                 super::set_mask_decides(true);
-                let from_mask = run(&db, sql).await;
+                let (from_mask, decided) = counting(run(&db, sql)).await;
                 assert!(
                     from_mask == evaluated,
                     "round {round}, {sql}: {} bytes with the mask deciding, {} with every row evaluated",
@@ -1090,7 +1125,7 @@ mod tests {
                     evaluated.len()
                 );
                 assert!(evaluated.len() > 100, "round {round}, {sql}: matched nothing");
-                if super::rows_decided_by_mask() == before {
+                if decided == 0 {
                     misjudged.push(format!("round {round}, {sql}: not decided by the mask"));
                 }
             }
@@ -1160,10 +1195,9 @@ mod tests {
             let outside_evaluated = run(&db, &sql).await;
             let inside_evaluated = within(&db, tx, &sql).await;
             super::set_mask_decides(true);
-            let before = super::rows_decided_by_mask();
-            let outside = run(&db, &sql).await;
-            let inside = within(&db, tx, &sql).await;
-            assert!(super::rows_decided_by_mask() > before, "{sql}: not counted from the mask");
+            let (outside, decided_outside) = counting(run(&db, &sql)).await;
+            let (inside, decided_inside) = counting(within(&db, tx, &sql)).await;
+            assert!(decided_outside > 0 && decided_inside > 0, "{sql}: not counted from the mask");
             assert!(
                 &outside_evaluated == committed,
                 "{sql}: another transaction's uncommitted writes changed what an evaluated count sees"
