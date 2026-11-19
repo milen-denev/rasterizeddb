@@ -635,7 +635,13 @@ fn simple(item: &str) -> Result<PlStmt, Refusal> {
             }
             PlStmt::Sql(item.to_string())
         }
-        "LOOP" | "WHILE" | "FOR" | "FOREACH" | "EXIT" | "CONTINUE" | "CASE" | "EXECUTE" | "GET" | "OPEN" | "FETCH"
+        // DDL and the other utility statements run as they are; `EXECUTE
+        // expr` is the dynamic statement, whose text is computed when it
+        // runs (`trigger_exec`).
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "GRANT" | "REVOKE" | "COMMENT" | "MERGE" | "NOTIFY" | "EXECUTE" => {
+            PlStmt::Sql(item.to_string())
+        }
+        "LOOP" | "WHILE" | "FOR" | "FOREACH" | "EXIT" | "CONTINUE" | "CASE" | "GET" | "OPEN" | "FETCH"
         | "CLOSE" | "BEGIN" | "DECLARE" | "COMMIT" | "ROLLBACK" | "CALL" | "ASSERT" => return Err(unsupported(&first)),
         _ => {
             let (at, len) = match item.find(":=") {

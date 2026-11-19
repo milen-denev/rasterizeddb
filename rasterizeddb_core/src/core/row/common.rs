@@ -391,7 +391,7 @@ fn classify_pattern(p: &[u8]) -> (bool, bool, bool) {
 ///
 /// PostgreSQL defines `ILIKE` for a multi-byte encoding as `lower(value) LIKE
 /// lower(pattern)`, so that is what this does, with the lowering `lower()`
-/// itself uses here (`str::to_lowercase`) — `'É' ILIKE 'é'` and
+/// itself uses here (`pg_functions::pg_lower`) — `'É' ILIKE 'é'` and
 /// `lower('É') = lower('é')` cannot disagree. The ASCII folders cannot be used
 /// for this even when one side is ASCII: lowering changes lengths (`'K'`, the
 /// Kelvin sign, is three bytes and lowers to an ASCII `k`), so their
@@ -411,7 +411,9 @@ fn ci_compare_unicode(input1: &[u8], input2: &[u8], operation: &ComparerOperatio
             _ => like_match(input1, input2, true),
         };
     };
-    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    // Lowered one character at a time, as PostgreSQL's `ILIKE` and `lower`
+    // do (`pg_functions::pg_lower`).
+    let (a, b) = (crate::core::rql::pg_functions::pg_lower(a), crate::core::rql::pg_functions::pg_lower(b));
     match operation {
         ComparerOperation::EqualsCaseInsensitive => a == b,
         ComparerOperation::ContainsCaseInsensitive => a.contains(b.as_str()),

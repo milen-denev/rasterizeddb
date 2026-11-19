@@ -178,6 +178,36 @@ pub enum PgFunc {
     /// than written in the wrong one.
     ConvertTo,
     ConvertFrom,
+    Sin,
+    Cos,
+    Tan,
+    Cot,
+    Asin,
+    Acos,
+    Atan,
+    Atan2,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    IsFinite,
+    GetByte,
+    RegexpCount,
+    RegexpSubstr,
+    RegexpSplitToArray,
+    ArrayPosition,
+    ArrayRemove,
+    ArrayReplace,
+    ArrayUpper,
+    ArrayLower,
+    ArrayDims,
+    TrimArray,
+    ArrayFill,
+    Scale,
+    MinScale,
+    TrimScale,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -196,6 +226,10 @@ pub const NAMES: &[&str] = &[
     "PG_ENCODING_TO_CHAR", "OBJ_DESCRIPTION", "COL_DESCRIPTION", "SHOBJ_DESCRIPTION", "PG_RELATION_IS_PUBLISHABLE",
     "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
     "PG_GET_RULEDEF", "SHA224", "SHA256", "SHA384", "SHA512", "CONVERT_TO", "CONVERT_FROM",
+    "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
+    "ISFINITE", "GET_BYTE", "REGEXP_COUNT", "REGEXP_SUBSTR", "REGEXP_SPLIT_TO_ARRAY", "ARRAY_POSITION",
+    "ARRAY_REMOVE", "ARRAY_REPLACE", "ARRAY_UPPER", "ARRAY_LOWER", "ARRAY_DIMS", "TRIM_ARRAY", "ARRAY_FILL",
+    "SCALE", "MIN_SCALE", "TRIM_SCALE",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -274,6 +308,36 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "POWER" | "POW" => (Power, &[2]),
         "SQRT" => (Sqrt, &[1]),
         "CBRT" => (Cbrt, &[1]),
+        "SIN" => (Sin, &[1]),
+        "COS" => (Cos, &[1]),
+        "TAN" => (Tan, &[1]),
+        "COT" => (Cot, &[1]),
+        "ASIN" => (Asin, &[1]),
+        "ACOS" => (Acos, &[1]),
+        "ATAN" => (Atan, &[1]),
+        "ATAN2" => (Atan2, &[2]),
+        "SINH" => (Sinh, &[1]),
+        "COSH" => (Cosh, &[1]),
+        "TANH" => (Tanh, &[1]),
+        "ASINH" => (Asinh, &[1]),
+        "ACOSH" => (Acosh, &[1]),
+        "ATANH" => (Atanh, &[1]),
+        "ISFINITE" => (IsFinite, &[1]),
+        "GET_BYTE" => (GetByte, &[2]),
+        "REGEXP_COUNT" => (RegexpCount, &[2, 3, 4]),
+        "REGEXP_SUBSTR" => (RegexpSubstr, &[2, 3, 4, 5, 6]),
+        "REGEXP_SPLIT_TO_ARRAY" => (RegexpSplitToArray, &[2, 3]),
+        "ARRAY_POSITION" => (ArrayPosition, &[2, 3]),
+        "ARRAY_REMOVE" => (ArrayRemove, &[2]),
+        "ARRAY_REPLACE" => (ArrayReplace, &[3]),
+        "ARRAY_UPPER" => (ArrayUpper, &[2]),
+        "ARRAY_LOWER" => (ArrayLower, &[2]),
+        "ARRAY_DIMS" => (ArrayDims, &[1]),
+        "TRIM_ARRAY" => (TrimArray, &[2]),
+        "ARRAY_FILL" => (ArrayFill, &[2]),
+        "SCALE" => (Scale, &[1]),
+        "MIN_SCALE" => (MinScale, &[1]),
+        "TRIM_SCALE" => (TrimScale, &[1]),
         "EXP" => (Exp, &[1]),
         "LN" => (Ln, &[1]),
         "LOG" => (Log, &[1, 2]),
@@ -386,6 +450,12 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
             DbType::DECIMAL
         }
         Power | Cbrt | Exp | Ln | Log | Log10 | Pi | Degrees | Radians | Random => DbType::F64,
+        Sin | Cos | Tan | Cot | Asin | Acos | Atan | Atan2 | Sinh | Cosh | Tanh | Asinh | Acosh | Atanh => DbType::F64,
+        IsFinite => DbType::BOOL,
+        GetByte | RegexpCount | ArrayPosition | ArrayUpper | ArrayLower => DbType::I32,
+        RegexpSplitToArray | ArrayRemove | ArrayReplace | TrimArray | ArrayFill => DbType::ARRAY,
+        Scale | MinScale => DbType::I32,
+        TrimScale => DbType::DECIMAL,
         NextVal | CurrVal | SetVal | LastVal => DbType::I64,
         PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetFunctionResult
         | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName => DbType::STRING,
@@ -974,7 +1044,12 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat);
+    let non_strict = matches!(func, ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
+    // An element argument may be NULL (it finds, removes or replaces the
+    // array's NULLs, as PostgreSQL's do); a NULL array is a NULL answer.
+    if matches!(func, ArrayPosition | ArrayRemove | ArrayReplace) && (args[0].is_null() || args.get(2).is_some_and(|a| func == ArrayPosition && a.is_null())) {
+        return Ok(Value::Null);
+    }
     if !non_strict && args.iter().any(Value::is_null) {
         return Ok(Value::Null);
     }
@@ -1070,9 +1145,9 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             for c in s(0).chars() {
                 if c.is_alphanumeric() {
                     if in_word {
-                        out.extend(c.to_lowercase());
+                        out.push(pg_lower_char(c));
                     } else {
-                        out.extend(c.to_uppercase());
+                        out.push(pg_upper_char(c));
                     }
                     in_word = true;
                 } else {
@@ -1101,6 +1176,91 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             let flags = args.get(3).map(text_of).unwrap_or_default();
             regexp_replace(&s(0), &s(1), &s(2), &flags)?
         }
+        Sin | Cos | Tan | Cot | Asin | Acos | Atan | Sinh | Cosh | Tanh | Asinh | Acosh | Atanh => {
+            let x = float_of(&args[0])?;
+            let out_of_range = || Err("input is out of range".to_string());
+            float_value(match func {
+                Sin => x.sin(),
+                Cos => x.cos(),
+                Tan => x.tan(),
+                Cot => 1.0 / x.tan(),
+                Asin if !(-1.0..=1.0).contains(&x) => return out_of_range(),
+                Asin => x.asin(),
+                Acos if !(-1.0..=1.0).contains(&x) => return out_of_range(),
+                Acos => x.acos(),
+                Atan => x.atan(),
+                Sinh => x.sinh(),
+                Cosh => x.cosh(),
+                Tanh => x.tanh(),
+                Asinh => x.asinh(),
+                Acosh if x < 1.0 => return out_of_range(),
+                Acosh => x.acosh(),
+                Atanh if !(-1.0..=1.0).contains(&x) => return out_of_range(),
+                Atanh if x == 1.0 => f64::INFINITY,
+                Atanh if x == -1.0 => f64::NEG_INFINITY,
+                _ => x.atanh(),
+            })
+        }
+        Atan2 => float_value(float_of(&args[0])?.atan2(float_of(&args[1])?)),
+        // Finite unless it is `infinity` or `-infinity`, as a date, a
+        // timestamp or an interval can be.
+        IsFinite => {
+            let text = s(0);
+            data(vec![u8::from(!matches!(text.as_str(), "infinity" | "-infinity"))], DbType::BOOL)
+        }
+        GetByte => {
+            let Value::Data { bytes, db_type: DbType::BYTEA } = &args[0] else {
+                return Err("function get_byte needs a bytea".to_string());
+            };
+            let n = int_of(&args[1], "the offset")?;
+            match usize::try_from(n).ok().and_then(|i| bytes.get(i)) {
+                Some(b) => int_value(i64::from(*b)),
+                None => return Err(format!("index {n} out of valid range, 0..{}", bytes.len() as i64 - 1)),
+            }
+        }
+        RegexpCount | RegexpSubstr | RegexpSplitToArray => regexp_spans_call(func, args)?,
+        // A NUMERIC's scale as shown, the fewest places that keep its value,
+        // and the value at that scale.
+        Scale | MinScale | TrimScale => {
+            let n = numeric_of(&args[0])?;
+            let (mut m, mut scale) = (n.m, n.s);
+            if func != Scale {
+                while scale > 0 && m % 10 == 0 {
+                    m /= 10;
+                    scale -= 1;
+                }
+            }
+            match func {
+                TrimScale => numeric_value(PgNum::new(m, scale).ok_or("numeric out of range")?),
+                _ => int_value(i64::from(scale)),
+            }
+        }
+        // `array_fill(value, ARRAY[n])`: one dimension of `n` copies.
+        // Its value may be NULL (`{NULL,NULL}`); its dimensions may not.
+        ArrayFill => {
+            if args[1].is_null() {
+                return Err("dimension array or low bound array cannot be null".to_string());
+            }
+            let Value::Data { bytes: dims_raw, db_type: DbType::ARRAY } = &args[1] else {
+                return Err("array_fill needs its dimensions as an integer array".to_string());
+            };
+            let dims = array_elements(&text_of(&data(dims_raw.clone(), DbType::ARRAY)))?;
+            let [Some(n)] = dims.as_slice() else {
+                return Err("array_fill over more than one dimension is not supported yet".to_string());
+            };
+            let n: usize = n.trim().parse().map_err(|_| "array_fill needs a whole number of elements".to_string())?;
+            if n > 1_000_000 {
+                return Err("array size exceeds the maximum allowed".to_string());
+            }
+            let copies: Vec<Value> = std::iter::repeat_n(args[0].clone(), n).collect();
+            if copies.is_empty() {
+                let empty: Vec<Value> = Vec::new();
+                call(ArrayCtor, &empty)?
+            } else {
+                call(ArrayCtor, &copies)?
+            }
+        }
+        ArrayPosition | ArrayRemove | ArrayReplace | ArrayUpper | ArrayLower | ArrayDims | TrimArray => array_call(func, args)?,
         Ceil | Floor => {
             if is_numeric(&args[0]) {
                 let n = numeric_of(&args[0])?;
@@ -1981,6 +2141,152 @@ fn regexp_replace(text: &str, pattern: &str, replacement: &str, flags: &str) -> 
     }
 }
 
+/// `regexp_count`, `regexp_substr` and `regexp_split_to_array`, with the
+/// match boundaries `regexp_replace` vouches for (`exact_boundaries`).
+fn regexp_spans_call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
+    use PgFunc::*;
+    let name = match func {
+        RegexpCount => "regexp_count",
+        RegexpSubstr => "regexp_substr",
+        _ => "regexp_split_to_array",
+    };
+    let text = text_of(&args[0]);
+    let pattern = text_of(&args[1]);
+    exact_boundaries(name, &pattern)?;
+    // The 1-based character the search starts at, and the flags, where each
+    // function takes them.
+    let (start, flags, nth, group) = match func {
+        RegexpCount => (args.get(2).map(|a| int_of(a, "the start")).transpose()?.unwrap_or(1), args.get(3).map(text_of).unwrap_or_default(), 1, 0),
+        RegexpSubstr => (
+            args.get(2).map(|a| int_of(a, "the start")).transpose()?.unwrap_or(1),
+            args.get(4).map(text_of).unwrap_or_default(),
+            args.get(3).map(|a| int_of(a, "the occurrence")).transpose()?.unwrap_or(1),
+            args.get(5).map(|a| int_of(a, "the subexpression")).transpose()?.unwrap_or(0),
+        ),
+        _ => (1, args.get(2).map(text_of).unwrap_or_default(), 1, 0),
+    };
+    if start < 1 {
+        return Err(format!("invalid value for parameter \"start\": {start}"));
+    }
+    if nth < 1 {
+        return Err(format!("invalid value for parameter \"n\": {nth}"));
+    }
+    if group < 0 {
+        return Err(format!("invalid value for parameter \"subexpr\": {group}"));
+    }
+    if flags.contains('g') {
+        return Err(format!("{name}() does not support the \"global\" option"));
+    }
+    let re = crate::core::rql::pg_regex::compile_cached(&pattern, &flags).map_err(|e| e.message())?;
+    let from = text.char_indices().nth(start as usize - 1).map(|(b, _)| b).unwrap_or(text.len());
+    let spans = re
+        .spans(&text, from)
+        .ok_or_else(|| format!("{name} over non-ASCII text with the pattern '{pattern}' is not supported yet"))?;
+    Ok(match func {
+        RegexpCount => int_value(spans.len() as i64),
+        RegexpSubstr => match spans.get(nth as usize - 1).and_then(|groups| groups.get(group as usize).copied().flatten()) {
+            Some((a, b)) => text_value(text[a..b].to_string()),
+            None => Value::Null,
+        },
+        _ => {
+            // PostgreSQL's rule: a zero-length match at the start or the
+            // end of the text, or right after the previous match, splits
+            // nothing.
+            let mut pieces: Vec<String> = Vec::new();
+            let mut last = 0usize;
+            for groups in &spans {
+                let Some((a, b)) = groups[0] else { continue };
+                if a == b && (a == 0 || a == text.len() || a == last) {
+                    continue;
+                }
+                pieces.push(text[last..a].to_string());
+                last = b;
+            }
+            pieces.push(text[last..].to_string());
+            let items: Vec<Value> = pieces.into_iter().map(text_value).collect();
+            call(ArrayCtor, &items)?
+        }
+    })
+}
+
+/// The patterns whose match boundaries the translated regex places where
+/// PostgreSQL's longest-match engine does: refused, as `regexp_replace`
+/// refuses them, with alternation, a lazy quantifier or a quantified group.
+fn exact_boundaries(name: &str, pattern: &str) -> Result<(), String> {
+    let b = pattern.as_bytes();
+    let quantified_group = (0..b.len()).any(|i| b[i] == b')' && matches!(b.get(i + 1), Some(b'*' | b'+' | b'?' | b'{')));
+    if pattern.contains('|') || pattern.contains("*?") || pattern.contains("+?") || pattern.contains("??") || quantified_group {
+        return Err(format!(
+            "{name} with the pattern '{pattern}' is not supported yet: alternation, a lazy quantifier and a quantified \
+             group may match differently here"
+        ));
+    }
+    Ok(())
+}
+
+/// The one-dimensional array functions over a stored array's elements.
+fn array_call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
+    use PgFunc::*;
+    let Value::Data { bytes: raw, db_type: DbType::ARRAY } = &args[0] else {
+        return Err("the first argument must be an array".to_string());
+    };
+    let (oid, dims, elements) = crate::core::value_codec::decode_array_dims(raw).ok_or("could not read the array")?;
+    let multi = dims.len() > 1;
+    // An element argument as the array's elements are held: its text.
+    let probe = |v: &Value| -> Option<Vec<u8>> { (!v.is_null()).then(|| text_of(v).into_bytes()) };
+    let same = |e: Option<&[u8]>, p: &Option<Vec<u8>>| match (e, p) {
+        (None, None) => true,
+        (Some(e), Some(p)) => crate::core::value_codec::array_elements_equal(oid, e, p),
+        _ => false,
+    };
+    let rebuilt = |items: Vec<Option<&[u8]>>| {
+        let dims: Vec<usize> = if items.is_empty() { Vec::new() } else { vec![items.len()] };
+        data(crate::core::value_codec::build_array_dims(oid, &dims, items.into_iter()), DbType::ARRAY)
+    };
+    Ok(match func {
+        ArrayUpper | ArrayLower => {
+            let dim = int_of(&args[1], "the dimension")?;
+            match usize::try_from(dim).ok().filter(|d| *d >= 1).and_then(|d| dims.get(d - 1)) {
+                Some(len) if func == ArrayUpper => int_value(*len as i64),
+                Some(_) => int_value(1),
+                None => Value::Null,
+            }
+        }
+        ArrayDims => {
+            if dims.is_empty() {
+                Value::Null
+            } else {
+                text_value(dims.iter().map(|d| format!("[1:{d}]")).collect())
+            }
+        }
+        _ if multi => return Err("searching for elements in multidimensional arrays is not supported".to_string()),
+        ArrayPosition => {
+            let p = probe(&args[1]);
+            let from = args.get(2).map(|a| int_of(a, "the start")).transpose()?.unwrap_or(1).max(1) as usize;
+            match elements.iter().enumerate().skip(from - 1).find(|(_, e)| same(**e, &p)) {
+                Some((i, _)) => int_value(i as i64 + 1),
+                None => Value::Null,
+            }
+        }
+        ArrayRemove => {
+            let p = probe(&args[1]);
+            rebuilt(elements.iter().copied().filter(|e| !same(*e, &p)).collect())
+        }
+        ArrayReplace => {
+            let (from, to) = (probe(&args[1]), probe(&args[2]));
+            let items: Vec<Option<&[u8]>> = elements.iter().map(|e| if same(*e, &from) { to.as_deref() } else { *e }).collect();
+            rebuilt(items)
+        }
+        _ => {
+            let n = int_of(&args[1], "the number of elements")?;
+            if n < 0 || n as usize > elements.len() {
+                return Err("number of elements to trim must be between 0 and the array's length".to_string());
+            }
+            rebuilt(elements[..elements.len() - n as usize].to_vec())
+        }
+    })
+}
+
 /// A JSON value's text for `v`, as `to_json` writes it.
 fn json_of(v: &Value) -> Result<String, String> {
     Ok(match v {
@@ -2611,5 +2917,61 @@ mod tests {
         assert_eq!((a.months, a.days, a.micros), (1, 16, 14 * 3_600_000_000));
         let b = age(us(2024, 1, 31), us(2023, 2, 28));
         assert_eq!((b.months, b.days, b.micros), (11, 3, 0));
+    }
+}
+
+/// `c` lowered as PostgreSQL lowers text: one character at a time, each to
+/// its single-character mapping, or kept when it has none. Rust's
+/// `to_lowercase` follows the full mapping instead: `İ` became `i̇` (two
+/// characters), and a word-final `Σ` became `ς` where PostgreSQL gives `σ`.
+pub fn pg_lower_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    let mut mapped = c.to_lowercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(one), None) => one,
+        // The one character whose full mapping is longer than its simple
+        // one: `İ` (U+0130) lowers to `i`.
+        _ if c == '\u{130}' => 'i',
+        _ => c,
+    }
+}
+
+/// `c` raised as PostgreSQL raises text: `ß` stays `ß` (its full mapping is
+/// `SS`, two characters; PostgreSQL's `upper('straße')` is `STRAßE`).
+pub fn pg_upper_char(c: char) -> char {
+    if c.is_ascii() {
+        return c.to_ascii_uppercase();
+    }
+    let mut mapped = c.to_uppercase();
+    match (mapped.next(), mapped.next()) {
+        (Some(one), None) => one,
+        _ => c,
+    }
+}
+
+/// `lower(text)` as PostgreSQL computes it (`pg_lower_char`).
+pub fn pg_lower(text: &str) -> String {
+    text.chars().map(pg_lower_char).collect()
+}
+
+/// `upper(text)` as PostgreSQL computes it (`pg_upper_char`).
+pub fn pg_upper(text: &str) -> String {
+    text.chars().map(pg_upper_char).collect()
+}
+
+#[cfg(test)]
+mod case_mapping_tests {
+    use super::*;
+
+    /// PostgreSQL 17's answers (`.claude/reviews/pgdiff`, C.UTF-8).
+    #[test]
+    fn case_maps_one_character_at_a_time() {
+        assert_eq!(pg_upper("straße"), "STRAßE");
+        assert_eq!(pg_lower("ÄB"), "äb");
+        assert_eq!(pg_lower("ΟΔΟΣ"), "οδοσ");
+        assert_eq!(pg_lower("İ"), "i");
+        assert_eq!(pg_upper("ǆ"), "Ǆ");
     }
 }

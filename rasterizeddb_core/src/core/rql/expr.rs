@@ -1735,40 +1735,67 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
             // expressions: its arguments are `name => value` pairs, which are
             // not expressions and would fail there first.
             if name.eq_ignore_ascii_case("make_interval") {
-                let mut micros = 0i64;
-                for arg in split_args(args_text) {
+                // PostgreSQL's parameters in order, so a positional argument
+                // is the one at its place: `make_interval(1, 2)` is a year
+                // and two months. Years and months stay months, weeks and
+                // days stay days, as PostgreSQL keeps them: `days => 3` is
+                // `3 days`, and was `72:00:00`, which adds differently across
+                // a daylight-saving change and prints differently.
+                const PARAMETERS: [&str; 7] = ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+                let mut iv = crate::core::pg_types::Interval { months: 0, days: 0, micros: 0 };
+                let too_large = || "interval out of range".to_string();
+                for (position, arg) in split_args(args_text).into_iter().enumerate() {
                     let arg = arg.trim();
-                    let Some(at) = arg.find("=>") else {
-                        return Err(format!(
-                            "make_interval takes named arguments, as in \
-                             `make_interval(secs => 30)`; got '{}'",
-                            arg
-                        ));
+                    if arg.is_empty() {
+                        continue;
+                    }
+                    let (unit, amount_text) = match arg.find("=>") {
+                        Some(at) => (arg[..at].trim().to_ascii_lowercase(), arg[at + 2..].trim()),
+                        None => match PARAMETERS.get(position) {
+                            Some(unit) => (unit.to_string(), arg),
+                            None => return Err("function make_interval takes at most 7 arguments".to_string()),
+                        },
                     };
-                    let unit = arg[..at].trim();
                     // A bound parameter can arrive quoted — PostgreSQL casts
                     // `'120'` to the argument's type, so the quotes are stripped
                     // rather than treated as a different value.
-                    let amount_text = arg[at + 2..].trim().trim_matches('\'');
-                    let amount: i64 = amount_text.parse().map_err(|_| {
-                        format!("make_interval needs a whole number for '{}'", unit)
-                    })?;
-                    micros = micros
-                        .checked_add(
-                            unit_micros(unit)?
-                                .checked_mul(amount)
-                                .ok_or_else(|| "interval is too large".to_string())?,
-                        )
-                        .ok_or_else(|| "interval is too large".to_string())?;
+                    let amount_text = amount_text.trim_matches('\'');
+                    if unit == "secs" {
+                        let secs: f64 = amount_text
+                            .parse()
+                            .map_err(|_| "make_interval needs a number for 'secs'".to_string())?;
+                        let micros = (secs * 1_000_000.0).round();
+                        if !micros.is_finite() || micros.abs() > i64::MAX as f64 {
+                            return Err(too_large());
+                        }
+                        iv.micros = iv.micros.checked_add(micros as i64).ok_or_else(too_large)?;
+                        continue;
+                    }
+                    let amount: i64 = amount_text
+                        .parse()
+                        .map_err(|_| format!("make_interval needs a whole number for '{}'", unit))?;
+                    let as_i32 = |n: i64| i32::try_from(n).map_err(|_| too_large());
+                    match unit.as_str() {
+                        "years" => iv.months = iv.months.checked_add(as_i32(amount.checked_mul(12).ok_or_else(too_large)?)?).ok_or_else(too_large)?,
+                        "months" => iv.months = iv.months.checked_add(as_i32(amount)?).ok_or_else(too_large)?,
+                        "weeks" => iv.days = iv.days.checked_add(as_i32(amount.checked_mul(7).ok_or_else(too_large)?)?).ok_or_else(too_large)?,
+                        "days" => iv.days = iv.days.checked_add(as_i32(amount)?).ok_or_else(too_large)?,
+                        "hours" | "mins" => {
+                            let per = if unit == "hours" { 3_600_000_000i64 } else { 60_000_000 };
+                            iv.micros = iv.micros.checked_add(amount.checked_mul(per).ok_or_else(too_large)?).ok_or_else(too_large)?;
+                        }
+                        other => {
+                            return Err(format!(
+                                "make_interval has no argument named '{}' (it takes years, months, weeks, days, hours, mins and secs)",
+                                other
+                            ));
+                        }
+                    }
                 }
                 // An interval, not a bare count of microseconds: a count is an
                 // integer, and an integer next to a date is a number of days.
                 return Ok(Expr::Literal {
-                    bytes: crate::core::pg_types::encode_interval(crate::core::pg_types::Interval {
-                        months: 0,
-                        days: 0,
-                        micros,
-                    }),
+                    bytes: crate::core::pg_types::encode_interval(iv),
                     db_type: DbType::INTERVAL,
                 });
             }
@@ -3263,6 +3290,24 @@ fn local_timestamp_literal(column: &Expr, literal: &mut Expr) {
 /// quoted literal compared with it is read (its zone discarded, or applied):
 /// the two questions the storage type cannot answer. F1's `yields_bpchar`
 /// answers the same kind of question for `character(n)`.
+/// The two sides of a `||` as `bytea`, when it is `bytea || bytea`: both
+/// `bytea`, or one beside a string literal, which PostgreSQL reads as
+/// `bytea` input there (`'x' || '\\x01'::bytea` is `\\x7801`).
+fn bytea_operands(lhs: &Expr, a: &Value, rhs: &Expr, b: &Value) -> Option<(Vec<u8>, Vec<u8>)> {
+    let side = |e: &Expr, v: &Value, other_is_bytea: bool| -> Option<Vec<u8>> {
+        match v {
+            Value::Data { bytes, db_type: DbType::BYTEA } => Some(bytes.clone()),
+            Value::Data { bytes, db_type: DbType::STRING } if other_is_bytea && matches!(e, Expr::Literal { db_type: DbType::STRING, .. }) => {
+                crate::core::value_codec::parse_bytea_literal(std::str::from_utf8(bytes).ok()?)
+            }
+            _ => None,
+        }
+    };
+    let a_bytea = matches!(a, Value::Data { db_type: DbType::BYTEA, .. });
+    let b_bytea = matches!(b, Value::Data { db_type: DbType::BYTEA, .. });
+    Some((side(lhs, a, b_bytea)?, side(rhs, b, a_bytea)?))
+}
+
 pub fn yields_timestamp(expr: &Expr) -> bool {
     match expr {
         Expr::Column(f) => f.literal_type() == DbType::TIMESTAMP,
@@ -3624,6 +3669,13 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::TypmodCast { value, .. } => static_type(value),
         Expr::Concat(lhs, rhs) if concat_is_jsonb(lhs, rhs) => DbType::JSONB,
         Expr::Concat(lhs, rhs) if static_type(lhs) == DbType::ARRAY || static_type(rhs) == DbType::ARRAY => DbType::ARRAY,
+        Expr::Concat(lhs, rhs)
+            if (static_type(lhs) == DbType::BYTEA || matches!(**lhs, Expr::Literal { db_type: DbType::STRING, .. }))
+                && (static_type(rhs) == DbType::BYTEA || matches!(**rhs, Expr::Literal { db_type: DbType::STRING, .. }))
+                && (static_type(lhs) == DbType::BYTEA || static_type(rhs) == DbType::BYTEA) =>
+        {
+            DbType::BYTEA
+        }
         Expr::Concat(_, _) => DbType::STRING,
         Expr::Call(TextFunc::ColumnSize | TextFunc::RelationSize, _) => DbType::I64,
         Expr::Call(TextFunc::DateTrunc, _) => DbType::DATETIME,
@@ -4386,7 +4438,10 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
         TextFunc::Like | TextFunc::ILike => {
             let (value, pattern) = (as_text(&args[0]), as_text(&args[1]));
             let matched = if func == TextFunc::ILike {
-                crate::core::row::common::like_match(value.to_lowercase().as_bytes(), pattern.to_lowercase().as_bytes(), false)
+                {
+                    use crate::core::rql::pg_functions::pg_lower;
+                    crate::core::row::common::like_match(pg_lower(&value).as_bytes(), pg_lower(&pattern).as_bytes(), false)
+                }
             } else {
                 crate::core::row::common::like_match(value.as_bytes(), pattern.as_bytes(), false)
             };
@@ -4559,7 +4614,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
                 db_type: DbType::DATETIME,
             }
         }
-        TextFunc::Lower => string(as_text(&args[0]).to_lowercase()),
+        TextFunc::Lower => string(crate::core::rql::pg_functions::pg_lower(&as_text(&args[0]))),
         TextFunc::CiKey => string(crate::core::rql::collation::key(
             &as_text(&args[0]),
             crate::core::rql::collation::Strength::CaseInsensitive,
@@ -4568,7 +4623,7 @@ fn call(func: TextFunc, args: &[Value], row: &Row) -> Result<Value, String> {
             &as_text(&args[0]),
             crate::core::rql::collation::Strength::CaseAccentInsensitive,
         )),
-        TextFunc::Upper => string(as_text(&args[0]).to_uppercase()),
+        TextFunc::Upper => string(crate::core::rql::pg_functions::pg_upper(&as_text(&args[0]))),
 
         // Full-text search. Both sides carry their canonical text form — see
         // `crate::core::text_search` for why that rather than a packed layout —
@@ -8070,6 +8125,14 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                     bytes: crate::core::jsonb::concat(&as_jsonb(a)?, &as_jsonb(b)?)?,
                     db_type: DbType::JSONB,
                 }
+            } else if let Some((x, y)) = bytea_operands(lhs, &a, rhs, &b) {
+                // `bytea || bytea` is the bytes of both, a `bytea`. It was
+                // their raw bytes as text: the client read control
+                // characters (`'\x0102'::bytea || '\x03'::bytea` showed as
+                // nothing) where PostgreSQL answers `\x010203`.
+                let mut bytes = x;
+                bytes.extend_from_slice(&y);
+                Value::Data { bytes, db_type: DbType::BYTEA }
             } else {
                 // A timestamp's text has the `+00` its `cast` to text has,
                 // except a `timestamp` (without time zone) one's
@@ -8081,6 +8144,16 @@ pub fn eval(expr: &Expr, row: &Row, schema: &[SchemaField]) -> Result<Value, Str
                 let text_of = |e: &Expr, v: &Value| {
                     if let Value::Data { bytes, db_type: DbType::BOOL } = v {
                         return bool_text(bytes).to_string();
+                    }
+                    // A `bytea` beside text is its text, `\x` and hex, as
+                    // its cast to text is.
+                    if let Value::Data { bytes, db_type: DbType::BYTEA } = v {
+                        let mut hex = String::with_capacity(2 + bytes.len() * 2);
+                        hex.push_str("\\x");
+                        for b in bytes {
+                            hex.push_str(&format!("{b:02x}"));
+                        }
+                        return hex;
                     }
                     let mut text = as_text(v);
                     if matches!(v, Value::Data { db_type: DbType::DATETIME, .. }) && !yields_timestamp(e) {

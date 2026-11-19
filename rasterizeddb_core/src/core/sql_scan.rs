@@ -295,6 +295,456 @@ fn array_aggregate(query: &str) -> Option<String> {
     Some(format!("COALESCE((SELECT {aggregate} {}), '{{}}')", rest.trim()))
 }
 
+/// An `UPDATE`'s row assignments as one assignment per column:
+/// `SET (a, b) = (x, y)` (or `= ROW(x, y)`) is `SET a = x, b = y`, and
+/// `SET (a, b) = (SELECT p, q FROM …)` is `SET a = (SELECT p FROM …), b =
+/// (SELECT q FROM …)`. Each subquery is read under the statement's one
+/// snapshot, so the columns come from the same row; more than one row is the
+/// error a scalar subquery's is, as PostgreSQL's is. A volatile function in
+/// it runs once per column rather than once.
+///
+/// `Ok(None)` when the statement has none; 42601's message when a side has
+/// a different number of items than the other, as PostgreSQL refuses it.
+pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
+    use crate::core::rql::join::find_keyword;
+    let head = sql.trim_start();
+    if !(head.len() > 7 && head[..6].eq_ignore_ascii_case("UPDATE") && head.as_bytes()[6].is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    let Some(set) = find_keyword(sql, "SET", 0) else { return Ok(None) };
+    let list_start = set + 3;
+    let list_end = ["FROM", "WHERE", "RETURNING"]
+        .iter()
+        .filter_map(|k| find_keyword(sql, k, list_start))
+        .min()
+        .unwrap_or(sql.len());
+    let list = &sql[list_start..list_end];
+    if !list.trim_start().starts_with('(') && !list.contains(", (") && !list.contains(",(") {
+        return Ok(None);
+    }
+    let mut changed = false;
+    let mut out_items: Vec<String> = Vec::new();
+    for item in split_top_level(list, b',') {
+        if !item.starts_with('(') {
+            out_items.push(item.to_string());
+            continue;
+        }
+        let Some(close) = matching_close(item, 0) else { return Ok(None) };
+        let columns = split_top_level(&item[1..close], b',');
+        let rest = item[close + 1..].trim_start();
+        let Some(rhs) = rest.strip_prefix('=') else { return Ok(None) };
+        let mut rhs = rhs.trim();
+        if rhs.len() > 3 && rhs[..3].eq_ignore_ascii_case("ROW") && rhs[3..].trim_start().starts_with('(') {
+            rhs = rhs[3..].trim_start();
+        }
+        if !rhs.starts_with('(') || matching_close(rhs, 0) != Some(rhs.len() - 1) {
+            return Ok(None);
+        }
+        let inner = rhs[1..rhs.len() - 1].trim();
+        let is_query = inner.len() > 6 && inner[..6].eq_ignore_ascii_case("SELECT") && !is_identifier_byte(inner.as_bytes()[6]);
+        if is_query {
+            let from = find_keyword(inner, "FROM", 0).unwrap_or(inner.len());
+            let items = split_top_level(&inner[6..from], b',');
+            if items.len() != columns.len() {
+                return Err(format!(
+                    "number of columns does not match number of values ({} columns, the subquery returns {})",
+                    columns.len(),
+                    items.len()
+                ));
+            }
+            let tail = &inner[from..];
+            for (column, value) in columns.iter().zip(items) {
+                out_items.push(format!("{column} = (SELECT {value} {tail})"));
+            }
+        } else {
+            let values = split_top_level(inner, b',');
+            if values.len() != columns.len() {
+                return Err(format!(
+                    "number of columns does not match number of values ({} columns, {} values)",
+                    columns.len(),
+                    values.len()
+                ));
+            }
+            for (column, value) in columns.iter().zip(values) {
+                out_items.push(format!("{column} = {value}"));
+            }
+        }
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    Ok(Some(format!("{} {} {}", sql[..list_start].trim_end(), out_items.join(", "), sql[list_end..].trim_start())))
+}
+
+/// A `WINDOW` clause's named windows written into each `OVER` that names
+/// one, and the clause dropped: `OVER w … WINDOW w AS (ORDER BY x)` is
+/// `OVER (ORDER BY x)`, and `OVER (w ROWS …)` extends it as `OVER (ORDER BY
+/// x ROWS …)`. A window may name an earlier one (`WINDOW a AS (PARTITION BY
+/// p), b AS (a ORDER BY x)`). The clause of the outermost SELECT only.
+///
+/// `Ok(None)` when there is none; 42P20's message for an `OVER` naming a
+/// window the clause does not define.
+pub fn named_windows(sql: &str) -> Result<Option<String>, String> {
+    use crate::core::rql::join::find_keyword;
+    if !contains_ignore_ascii_case(sql, b"over") {
+        return Ok(None);
+    }
+    // With no clause, an `OVER name` still names a window that does not
+    // exist (42P20, as PostgreSQL).
+    let (at, clause_end) = match find_keyword(sql, "WINDOW", 0) {
+        Some(at) => (
+            at,
+            ["ORDER", "LIMIT", "OFFSET", "FETCH", "FOR", "UNION", "INTERSECT", "EXCEPT"]
+                .iter()
+                .filter_map(|k| find_keyword(sql, k, at + "WINDOW".len()))
+                .min()
+                .unwrap_or(sql.len()),
+        ),
+        None => (sql.len(), sql.len()),
+    };
+    let clause_start = (at + "WINDOW".len()).min(clause_end);
+    let mut windows: Vec<(String, String)> = Vec::new();
+    for definition in split_top_level(&sql[clause_start..clause_end], b',') {
+        let name_len = definition.bytes().take_while(|b| is_identifier_byte(*b)).count();
+        let name = definition[..name_len].to_ascii_lowercase();
+        let rest = definition[name_len..].trim_start();
+        let Some(rest) = rest.get(..2).filter(|w| w.eq_ignore_ascii_case("AS")).map(|_| rest[2..].trim_start()) else {
+            return Ok(None);
+        };
+        if name.is_empty() || !rest.starts_with('(') || matching_close(rest, 0) != Some(rest.len() - 1) {
+            return Ok(None);
+        }
+        let spec = expand_window_spec(rest[1..rest.len() - 1].trim(), &windows)?;
+        windows.push((name, spec));
+    }
+    let body = if at == sql.len() {
+        sql.to_string()
+    } else {
+        format!("{} {}", sql[..at].trim_end(), sql[clause_end..].trim_start())
+    };
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len() + 64);
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        // `OVER` after a call's `)`: a column may be named `over`.
+        let after_call = body[..i].trim_end().ends_with(')');
+        let at_word = i == 0 || !is_identifier_byte(bytes[i - 1]);
+        if at_word && after_call && bytes.len() - i > 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"OVER") && !is_identifier_byte(bytes[i + 4]) {
+            let after = &body[i + 4..];
+            let gap = after.len() - after.trim_start().len();
+            let start = i + 4 + gap;
+            if bytes.get(start) == Some(&b'(') {
+                let Some(close) = matching_close(&body, start) else { return Ok(None) };
+                let spec = body[start + 1..close].trim();
+                let expanded = expand_window_spec(spec, &windows)?;
+                if expanded != spec {
+                    out.push_str(&body[copied..start]);
+                    out.push_str(&format!("({expanded})"));
+                    copied = close + 1;
+                }
+                i = close + 1;
+                continue;
+            }
+            let name_len = body[start..].bytes().take_while(|b| is_identifier_byte(*b)).count();
+            if name_len > 0 {
+                let name = body[start..start + name_len].to_ascii_lowercase();
+                let Some((_, spec)) = windows.iter().find(|(n, _)| *n == name) else {
+                    return Err(format!("window \"{name}\" does not exist"));
+                };
+                out.push_str(&body[copied..start]);
+                out.push_str(&format!("({spec})"));
+                copied = start + name_len;
+                i = copied;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if at == sql.len() {
+        // No clause and no name used: nothing to write.
+        return Ok(None);
+    }
+    out.push_str(&body[copied..]);
+    Ok(Some(out))
+}
+
+/// A window specification with the window it opens with, when it names one
+/// of `windows`, written out in front of the rest.
+fn expand_window_spec(spec: &str, windows: &[(String, String)]) -> Result<String, String> {
+    let name_len = spec.bytes().take_while(|b| is_identifier_byte(*b)).count();
+    if name_len == 0 {
+        return Ok(spec.to_string());
+    }
+    let first = spec[..name_len].to_ascii_lowercase();
+    if ["partition", "order", "rows", "range", "groups"].contains(&first.as_str()) {
+        return Ok(spec.to_string());
+    }
+    match windows.iter().find(|(n, _)| *n == first) {
+        Some((_, base)) => Ok(format!("{} {}", base, spec[name_len..].trim()).trim().to_string()),
+        None => Err(format!("window \"{first}\" does not exist")),
+    }
+}
+
+/// `ANY`/`ALL`/`SOME` over a string literal or an `ARRAY[…]` with an array
+/// cast (`'{1,2}'::int[]`, `ARRAY[1,2]::bigint[]`), without the cast. `None`
+/// when there is none.
+fn quantified_array_casts(sql: &str) -> Option<String> {
+    if !(contains_ignore_ascii_case(sql, b"any") || contains_ignore_ascii_case(sql, b"all") || contains_ignore_ascii_case(sql, b"some"))
+        || !sql.contains("[]")
+    {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let at_word = i == 0 || !is_identifier_byte(bytes[i - 1]);
+        let word_len = [3usize, 4]
+            .into_iter()
+            .find(|&n| {
+                bytes.len() - i > n
+                    && matches!(&sql[i..i + n].to_ascii_uppercase()[..], "ANY" | "ALL" | "SOME")
+                    && !is_identifier_byte(bytes[i + n])
+            });
+        if let (true, Some(n)) = (at_word, word_len) {
+            let after = &sql[i + n..];
+            let open = i + n + (after.len() - after.trim_start().len());
+            if bytes.get(open) == Some(&b'(')
+                && let Some(close) = matching_close(sql, open)
+            {
+                let inner = &sql[open + 1..close];
+                // The value ends where its cast starts: after the literal's
+                // closing quote, or the `ARRAY[…]`'s bracket.
+                let value_end = if inner.trim_start().starts_with('\'') {
+                    let start = open + 1 + (inner.len() - inner.trim_start().len());
+                    Some(skip_quoted(bytes, start).unwrap_or(start))
+                } else {
+                    let t = inner.trim_start();
+                    let start = open + 1 + (inner.len() - t.len());
+                    (t.len() > 5 && t[..5].eq_ignore_ascii_case("ARRAY") && t[5..].trim_start().starts_with('['))
+                        .then(|| {
+                            let bracket = start + 5 + (t[5..].len() - t[5..].trim_start().len());
+                            matching_close(sql, bracket).map(|c| c + 1)
+                        })
+                        .flatten()
+                };
+                if let Some(value_end) = value_end {
+                    let cast = sql[value_end..close].trim();
+                    let is_array_cast = cast.starts_with("::")
+                        && cast.ends_with("[]")
+                        && cast[2..cast.len() - 2]
+                            .bytes()
+                            .all(|b| is_identifier_byte(b) || b == b' ' || b == b'(' || b == b')' || b == b',' || b == b'"' || b == b'.');
+                    if is_array_cast {
+                        out.push_str(&sql[copied..value_end]);
+                        copied = close;
+                    }
+                }
+                i = open + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// `CREATE UNLOGGED TABLE` and `SELECT … INTO t` (see `statement_shorthands`).
+fn unlogged_and_select_into(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let head = sql.trim_start();
+    let words: Vec<&str> = head.splitn(4, char::is_whitespace).collect();
+    if words.len() >= 3 && words[0].eq_ignore_ascii_case("CREATE") && words[1].eq_ignore_ascii_case("UNLOGGED") && words[2].eq_ignore_ascii_case("TABLE") {
+        let at = head.find(words[1])?;
+        return Some(format!("{}{}", &head[..at], head[at + words[1].len()..].trim_start()));
+    }
+    if !(head.len() > 7 && head[..6].eq_ignore_ascii_case("SELECT") && head.as_bytes()[6].is_ascii_whitespace()) {
+        return None;
+    }
+    let into = find_keyword(head, "INTO", 0)?;
+    let target_start = into + "INTO".len();
+    let target_end = ["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "OFFSET", "FETCH", "FOR"]
+        .iter()
+        .filter_map(|k| find_keyword(head, k, target_start))
+        .min()
+        .unwrap_or(head.len());
+    let mut target: Vec<&str> = head[target_start..target_end].split_whitespace().collect();
+    let mut temp = false;
+    while let Some(first) = target.first() {
+        match first.to_ascii_uppercase().as_str() {
+            "TEMP" | "TEMPORARY" => temp = true,
+            "UNLOGGED" | "TABLE" => {}
+            _ => break,
+        }
+        target.remove(0);
+    }
+    let [name] = target.as_slice() else { return None };
+    Some(format!(
+        "CREATE {}TABLE {} AS {} {}",
+        if temp { "TEMP " } else { "" },
+        name,
+        head[..into].trim_end(),
+        head[target_end..].trim_start()
+    ).trim_end().to_string())
+}
+
+/// `ROW(a, b)` as `(a, b)` (see `statement_shorthands`). A one-item `ROW(x)`
+/// is kept: without its keyword it would be the parenthesised value.
+fn row_constructors(sql: &str) -> Option<String> {
+    if !contains_ignore_ascii_case(sql, b"row") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let at_word = i == 0 || !(is_identifier_byte(bytes[i - 1]) || bytes[i - 1] == b'.');
+        if at_word && bytes[i..i + 3].eq_ignore_ascii_case(b"ROW") && !is_identifier_byte(bytes[i + 3]) {
+            let after = &sql[i + 3..];
+            let open = i + 3 + (after.len() - after.trim_start().len());
+            if bytes.get(open) == Some(&b'(')
+                && let Some(close) = matching_close(sql, open)
+                && split_top_level(&sql[open + 1..close], b',').len() >= 2
+            {
+                out.push_str(&sql[copied..i]);
+                copied = open;
+                i = open + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// PostgreSQL's shorthands, as the statements they stand for:
+///
+/// - `x = ANY('{1,2}'::int[])` is `x = ANY('{1,2}')`, and `ANY(ARRAY[…]::int[])`
+///   is `ANY(ARRAY[…])`: the elements are read as the left side's type
+///   either way (`quantified_array_casts`). The cast was refused in a
+///   `WHERE`, which is where every driver's `= ANY($1)` with an array
+///   parameter arrives;
+/// - `INSERT INTO t DEFAULT VALUES` is `INSERT INTO t VALUES (DEFAULT)`,
+///   every column its default either way;
+/// - `CREATE UNLOGGED TABLE` is `CREATE TABLE`: a table here is always
+///   written ahead, which an unlogged one is allowed to be;
+/// - `SELECT … INTO [TEMP] [TABLE] t FROM …` is `CREATE [TEMP] TABLE t AS
+///   SELECT … FROM …`;
+/// - `ROW(a, b)` is `(a, b)`, the row constructor with its keyword;
+/// - `a [NOT] SIMILAR TO p [ESCAPE e]` is `a [!]~ similar_to_escape(p [,
+///   e])`, as PostgreSQL itself reads it (`check::lower_similar_to`);
+/// - `TABLE t …` is `SELECT * FROM t …`;
+/// - a CTE's `AS MATERIALIZED (…)` / `AS NOT MATERIALIZED (…)` is `AS (…)`:
+///   a planner hint, and every CTE here is materialised once whichever is
+///   asked for, which is what each spelling's answer is.
+///
+/// Each was a syntax error. Borrowed when there is none.
+pub fn statement_shorthands(sql: &str) -> Cow<'_, str> {
+    let mut text = Cow::Borrowed(sql);
+    if let Some(t) = quantified_array_casts(&text) {
+        text = Cow::Owned(t);
+    }
+    if let Some(t) = unlogged_and_select_into(&text) {
+        text = Cow::Owned(t);
+    }
+    if let Some(t) = row_constructors(&text) {
+        text = Cow::Owned(t);
+    }
+    if contains_ignore_ascii_case(&text, b"similar") {
+        let lowered = crate::core::rql::check::lower_similar_to(&text);
+        if lowered != *text {
+            text = Cow::Owned(lowered);
+        }
+    }
+    if contains_ignore_ascii_case(&text, b"default")
+        && let Some(at) = crate::core::rql::join::find_phrase(&text, &["DEFAULT", "VALUES"], 0)
+        && text.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("INSERT"))
+    {
+        let after = &text[at + "DEFAULT".len()..];
+        let values_end = at + "DEFAULT".len() + (after.len() - after.trim_start().len()) + "VALUES".len();
+        text = Cow::Owned(format!("{}VALUES (DEFAULT){}", &text[..at], &text[values_end..]));
+    }
+    let trimmed = text.trim_start();
+    if trimmed.len() > 6
+        && trimmed[..5].eq_ignore_ascii_case("TABLE")
+        && trimmed.as_bytes()[5].is_ascii_whitespace()
+    {
+        let rest = trimmed[6..].trim_start();
+        text = Cow::Owned(format!("SELECT * FROM {rest}"));
+    }
+    if contains_ignore_ascii_case(&text, b"materialized") {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut copied = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if let Some(end) = skip_quoted(bytes, i) {
+                i = end.max(i + 1);
+                continue;
+            }
+            let at_word = i == 0 || !is_identifier_byte(bytes[i - 1]);
+            if at_word && bytes.len() - i >= 2 && bytes[i..i + 2].eq_ignore_ascii_case(b"AS") && bytes.get(i + 2).is_some_and(|b| b.is_ascii_whitespace()) {
+                let mut j = i + 2;
+                let skip_ws = |mut k: usize| {
+                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    k
+                };
+                j = skip_ws(j);
+                let word = |k: usize, w: &[u8]| {
+                    bytes.len() - k >= w.len()
+                        && bytes[k..k + w.len()].eq_ignore_ascii_case(w)
+                        && bytes.get(k + w.len()).is_none_or(|b| !is_identifier_byte(*b))
+                };
+                if word(j, b"NOT") {
+                    j = skip_ws(j + 3);
+                }
+                if word(j, b"MATERIALIZED") {
+                    let k = skip_ws(j + "MATERIALIZED".len());
+                    if bytes.get(k) == Some(&b'(') {
+                        out.push_str(&text[copied..i]);
+                        out.push_str("AS ");
+                        copied = k;
+                        i = k;
+                        continue;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if copied > 0 {
+            out.push_str(&text[copied..]);
+            text = Cow::Owned(out);
+        }
+    }
+    text
+}
+
 /// `sql` with every tab, line break, vertical tab and form feed outside
 /// quotes made a space: whitespace to PostgreSQL, and one kind of it to the
 /// parsers downstream, many of which test for a keyword followed by a space
@@ -2183,5 +2633,82 @@ mod tests {
         );
         assert_eq!(split_top_level("a,,b", b','), vec!["a", "", "b"]);
         assert_eq!(matching_close("(a, (b), ')', E'\\')') x", 0), Some(20));
+    }
+}
+
+#[cfg(test)]
+mod statement_shorthand_tests {
+    use super::statement_shorthands;
+
+    #[test]
+    fn shorthands_are_the_statements_they_stand_for() {
+        assert_eq!(statement_shorthands("TABLE t2 ORDER BY id LIMIT 2"), "SELECT * FROM t2 ORDER BY id LIMIT 2");
+        assert_eq!(
+            statement_shorthands("SELECT id FROM t WHERE id = ANY('{1,2}'::int[]) AND s <> ALL (ARRAY['a', 'b']::varchar(3)[])"),
+            "SELECT id FROM t WHERE id = ANY('{1,2}') AND s <> ALL (ARRAY['a', 'b'])"
+        );
+        assert_eq!(statement_shorthands("SELECT '{1}'::int[] FROM t"), "SELECT '{1}'::int[] FROM t");
+        assert_eq!(statement_shorthands("INSERT INTO t DEFAULT  VALUES RETURNING id"), "INSERT INTO t VALUES (DEFAULT) RETURNING id");
+        assert_eq!(statement_shorthands("SELECT 'DEFAULT VALUES' FROM t"), "SELECT 'DEFAULT VALUES' FROM t");
+        assert_eq!(statement_shorthands("CREATE UNLOGGED TABLE d (a int)"), "CREATE TABLE d (a int)");
+        assert_eq!(
+            statement_shorthands("SELECT id INTO TEMP d21 FROM t1 WHERE id < 3"),
+            "CREATE TEMP TABLE d21 AS SELECT id FROM t1 WHERE id < 3"
+        );
+        assert_eq!(statement_shorthands("SELECT 1 INTO x"), "CREATE TABLE x AS SELECT 1");
+        assert_eq!(statement_shorthands("SELECT ROW(1,2) < ROW(1,3), row(4)"), "SELECT (1,2) < (1,3), row(4)");
+        assert_eq!(statement_shorthands("SELECT t.row FROM t"), "SELECT t.row FROM t");
+        assert_eq!(
+            statement_shorthands("WITH x AS MATERIALIZED (SELECT 1), y AS NOT MATERIALIZED (SELECT 2) SELECT * FROM x, y"),
+            "WITH x AS (SELECT 1), y AS (SELECT 2) SELECT * FROM x, y"
+        );
+        for same in ["SELECT 'AS MATERIALIZED (' FROM t", "SELECT tablename FROM t", "SELECT 1 AS materialized FROM t", "CREATE MATERIALIZED VIEW v AS SELECT 1"] {
+            assert_eq!(statement_shorthands(same), same);
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_assignment_tests {
+    use super::row_assignments;
+
+    #[test]
+    fn a_row_assignment_is_one_per_column() {
+        assert_eq!(
+            row_assignments("UPDATE d SET (a, b) = (a + 10, upper(b)) WHERE a = 1").unwrap().as_deref(),
+            Some("UPDATE d SET a = a + 10, b = upper(b) WHERE a = 1")
+        );
+        assert_eq!(
+            row_assignments("UPDATE d SET c = 1, (a, b) = ROW(2, 'x')").unwrap().as_deref(),
+            Some("UPDATE d SET c = 1, a = 2, b = 'x' ")
+        );
+        assert_eq!(
+            row_assignments("UPDATE d SET (a, b) = (SELECT p, q FROM e WHERE e.id = d.id) RETURNING a").unwrap().as_deref(),
+            Some("UPDATE d SET a = (SELECT p FROM e WHERE e.id = d.id), b = (SELECT q FROM e WHERE e.id = d.id) RETURNING a")
+        );
+        assert!(row_assignments("UPDATE d SET (a, b) = (1)").is_err());
+        assert_eq!(row_assignments("UPDATE d SET a = (1 + 2) WHERE b = 1").unwrap(), None);
+        assert_eq!(row_assignments("SELECT (a, b) = (1, 2) FROM d").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod named_window_tests {
+    use super::named_windows;
+
+    #[test]
+    fn a_named_window_is_written_where_it_is_used() {
+        assert_eq!(
+            named_windows("SELECT id, rank() OVER w, dense_rank() OVER w FROM t1 WINDOW w AS (ORDER BY sm) ORDER BY id LIMIT 5").unwrap().as_deref(),
+            Some("SELECT id, rank() OVER (ORDER BY sm), dense_rank() OVER (ORDER BY sm) FROM t1 ORDER BY id LIMIT 5")
+        );
+        assert_eq!(
+            named_windows("SELECT sum(x) OVER (b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WINDOW a AS (PARTITION BY p), b AS (a ORDER BY x)").unwrap().as_deref(),
+            Some("SELECT sum(x) OVER (PARTITION BY p ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ")
+        );
+        assert!(named_windows("SELECT rank() OVER nope FROM t WINDOW w AS (ORDER BY x)").is_err());
+        assert_eq!(named_windows("SELECT rank() OVER (ORDER BY x) FROM t").unwrap(), None);
+        assert!(named_windows("SELECT rank() OVER nope FROM t").is_err());
+        assert_eq!(named_windows("SELECT over AS x FROM t").unwrap(), None);
     }
 }

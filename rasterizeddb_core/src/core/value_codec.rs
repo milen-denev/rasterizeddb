@@ -1892,6 +1892,12 @@ pub fn array_order(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 
 /// Two elements' text, as `typed` orders them when both read as it, else as
 /// text.
+/// Whether two elements of an array of element type `oid` are equal, as
+/// that type compares them (`'1.0'` and `'1'` in a `numeric[]`).
+pub fn array_elements_equal(oid: i32, x: &[u8], y: &[u8]) -> bool {
+    element_order(element_type_of_oid(oid).as_ref(), x, y) == std::cmp::Ordering::Equal
+}
+
 fn element_order(typed: Option<&crate::core::db_type::DbType>, x: &[u8], y: &[u8]) -> std::cmp::Ordering {
     if let Some(t) = typed
         && let (Ok(xs), Ok(ys)) = (std::str::from_utf8(x), std::str::from_utf8(y))

@@ -573,7 +573,7 @@ fn drop_collations(text: &str) -> String {
 
 /// `a [NOT] SIMILAR TO b [ESCAPE e]` as `a [!]~ similar_to_escape(b [, e])`,
 /// what it means in PostgreSQL, so one regular-expression reader decides it.
-fn lower_similar_to(text: &str) -> String {
+pub(crate) fn lower_similar_to(text: &str) -> String {
     let mut out = text.to_string();
     for _ in 0..64 {
         let upper = out.to_ascii_uppercase();

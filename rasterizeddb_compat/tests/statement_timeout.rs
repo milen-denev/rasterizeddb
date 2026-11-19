@@ -102,7 +102,8 @@ async fn a_timeout_cancels_with_an_error_rather_than_a_short_answer() {
         .expect("show")
         .try_get(0)
         .expect("value");
-    assert_eq!(shown, "0ms", "zero is no limit");
+    // PostgreSQL 17 prints it without a unit.
+    assert_eq!(shown, "0", "zero is no limit");
 
     let rows = sqlx::query(AssertSqlSafe("SELECT id FROM wide"))
         .fetch_all(&mut conn)

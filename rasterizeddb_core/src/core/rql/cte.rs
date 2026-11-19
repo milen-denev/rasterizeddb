@@ -439,13 +439,55 @@ async fn select_labels(query: &str, database: &Arc<Database>) -> Option<Vec<Stri
 ///
 /// `WITH x AS (INSERT … RETURNING id)` publishes `id` to the statement that
 /// follows, exactly as a SELECT publishes its select list.
-fn returning_labels(body: &str) -> Option<Vec<String>> {
+fn returning_labels(body: &str, database: &Database) -> Option<Vec<String>> {
     let (_, tail) = crate::core::rql::lexer_ir::returning_split(body)?;
-    crate::core::rql::lexer_ct::split_definitions(tail)
-        .iter()
-        .map(|item| item_label(item))
-        .collect::<Option<Vec<String>>>()
-        .filter(|labels| !labels.is_empty())
+    let mut labels = Vec::new();
+    for item in crate::core::rql::lexer_ct::split_definitions(tail) {
+        let item = item.trim();
+        // `RETURNING *` (or `t.*`): the target's columns, in their order,
+        // as the rows come back. It had no label to read, so a CTE
+        // returning `*` was refused as having no RETURNING clause.
+        if item == "*" || item.ends_with(".*") {
+            let table = dml_target(body)?;
+            let view = database.schema_view(&table)?;
+            labels.extend(
+                view.schema()
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                    .map(|f| f.name.clone()),
+            );
+            continue;
+        }
+        labels.push(item_label(item)?);
+    }
+    (!labels.is_empty()).then_some(labels)
+}
+
+/// The table an `INSERT INTO t`, `UPDATE [ONLY] t` or `DELETE FROM [ONLY] t`
+/// writes, as stored: a quoted name as written, a bare one lowercased, its
+/// schema qualifier dropped.
+fn dml_target(body: &str) -> Option<String> {
+    let mut words = body.split_whitespace();
+    let verb = words.next()?.to_ascii_uppercase();
+    let mut next = words.next()?;
+    if verb == "INSERT" || verb == "DELETE" {
+        if !next.eq_ignore_ascii_case(if verb == "INSERT" { "INTO" } else { "FROM" }) {
+            return None;
+        }
+        next = words.next()?;
+    } else if verb != "UPDATE" {
+        return None;
+    }
+    if next.eq_ignore_ascii_case("ONLY") {
+        next = words.next()?;
+    }
+    let name = next.split('(').next()?;
+    let last = crate::core::sql_scan::last_name_segment(name);
+    Some(match last.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(quoted) => quoted.to_string(),
+        None => last.to_ascii_lowercase(),
+    })
 }
 
 /// The SQL type name that reads back as `db_type`, for the temporary table.
@@ -1541,7 +1583,7 @@ async fn materialize_inner(
 
         let labels: Vec<String> = if modifies {
             renamed(
-                returning_labels(&body).ok_or_else(|| {
+                returning_labels(&body, database).ok_or_else(|| {
                     format!(
                         "the WITH clause '{}' modifies data but has no RETURNING clause to name \
                          its columns",
