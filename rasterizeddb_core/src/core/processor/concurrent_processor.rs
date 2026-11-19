@@ -832,7 +832,12 @@ impl ConcurrentProcessor {
         if no_filter || !worth_prefiltering(expected) {
             return None;
         }
-        BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch).map(Arc::new)
+        // Where it decides the whole `WHERE`, its mask is the answer: the
+        // workers count the rows it keeps, or read each one once for what the
+        // statement returns, and never fetch a row to evaluate the same
+        // comparisons again. See `BatchPrefilter::is_exact`.
+        BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch)
+            .map(|built| Arc::new(built.deciding()))
     }
 
     /// Compiles the `WHERE` clause into a transformer plan.
@@ -1074,6 +1079,11 @@ impl ConcurrentProcessor {
                 let mut row_layout_built = false;
 
                 let mut prefilter_scratch = prefilter::Scratch::default();
+                // The mask is the `WHERE`'s answer, not only a superset of it.
+                let mask_decides = prefilter_ref.as_deref().is_some_and(BatchPrefilter::decides);
+                // And nothing is emitted or cached, so the mask is all this
+                // scan needs of a batch.
+                let count_from_mask = mask_decides && count_only_ref.is_some() && tx_rp_clone.is_none();
 
                 // Per-worker result accumulators. Sent ONCE at the end of
                 // this worker's lifetime to avoid per-batch channel sends
@@ -1249,7 +1259,44 @@ impl ConcurrentProcessor {
                             _ => None,
                         };
 
-                        for (batch_index, pointer) in pointers.iter().enumerate() {
+                        // A count whose `WHERE` the mask decides whole: the
+                        // kept rows are the matches, so they are counted here
+                        // and none is fetched. The same three tests the loop
+                        // below makes of a matched row, in the same order:
+                        // not deleted, not reclaimable (the mask leaves those
+                        // rows' bits set without reading them), and visible
+                        // to this snapshot. A batch whose column read failed
+                        // has no mask and takes the loop below.
+                        let mut unprocessed: &[RowPointer] = &pointers[..];
+                        if let (Some(keep), true) = (keep, count_from_mask) {
+                            let mut matched = 0u64;
+                            for (batch_index, pointer) in pointers.iter().enumerate() {
+                                if prefilter::kept(keep, batch_index)
+                                    && !pointer.deleted
+                                    && !horizon_ref.is_reclaimable(
+                                        pointer.deleted,
+                                        pointer.xmin,
+                                        pointer.xmax,
+                                    )
+                                    && visibility_ref.visible(
+                                        pointer.deleted,
+                                        pointer.xmin,
+                                        pointer.xmax,
+                                    )
+                                {
+                                    matched += 1;
+                                }
+                            }
+                            counted += matched;
+                            prefilter::note_decided_by_mask(matched);
+                            unprocessed = &[];
+                        }
+                        // Any other scan with such a mask: a kept row matches,
+                        // so it is not fetched and interpreted to find out.
+                        let decided = mask_decides && keep.is_some();
+                        let mut decided_rows = 0u64;
+
+                        for (batch_index, pointer) in unprocessed.iter().enumerate() {
                             if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
                                 break;
                             }
@@ -1295,52 +1342,58 @@ impl ConcurrentProcessor {
                                 }
                             }
 
-                            // The reason is logged, not discarded: this fires in
-                            // bursts on a hot row and the pointer alone says
-                            // nothing about whether the read was short, the
-                            // layout disagreed, or the slot had been reused.
-                            if let Err(e) = pointer
-                                .fetch_row_reuse_async(
-                                    io_rows_ref,
-                                    query_row_fetch,
-                                    &mut buffer.row,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Failed to fetch query row for pointer {:?}: {}",
-                                    pointer, e
-                                );
-                                continue;
-                            }
+                            let result = if decided {
+                                // Its bit survived the test above.
+                                decided_rows += 1;
+                                true
+                            } else {
+                                // The reason is logged, not discarded: this fires in
+                                // bursts on a hot row and the pointer alone says
+                                // nothing about whether the read was short, the
+                                // layout disagreed, or the slot had been reused.
+                                if let Err(e) = pointer
+                                    .fetch_row_reuse_async(
+                                        io_rows_ref,
+                                        query_row_fetch,
+                                        &mut buffer.row,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to fetch query row for pointer {:?}: {}",
+                                        pointer, e
+                                    );
+                                    continue;
+                                }
 
-                            if !row_layout_built {
-                                build_write_order_map(
-                                    &mut buffer.write_order_to_col,
-                                    &buffer.row,
-                                    schema_ref.as_slice(),
-                                );
-                                row_layout_built = true;
-                            }
+                                if !row_layout_built {
+                                    build_write_order_map(
+                                        &mut buffer.write_order_to_col,
+                                        &buffer.row,
+                                        schema_ref.as_slice(),
+                                    );
+                                    row_layout_built = true;
+                                }
 
-                            let result = {
-                                let processor = unsafe { &mut *processor_cell.get() };
-                                processor.execute_row(
-                                    &RowView::new(&buffer.row, &buffer.write_order_to_col),
-                                    &mut buffer.bool_buffer,
-                                )
-                            };
+                                let result = {
+                                    let processor = unsafe { &mut *processor_cell.get() };
+                                    processor.execute_row(
+                                        &RowView::new(&buffer.row, &buffer.write_order_to_col),
+                                        &mut buffer.bool_buffer,
+                                    )
+                                };
 
-                            let result = match result {
-                                Ok(matched) => matched,
-                                Err(e) => {
-                                    // Record the first failure and stop every
-                                    // worker. Continuing would emit whatever
-                                    // this worker matched so far as if the
-                                    // query had succeeded.
-                                    eval_error_ref.record(e);
-                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    break;
+                                match result {
+                                    Ok(matched) => matched,
+                                    Err(e) => {
+                                        // Record the first failure and stop every
+                                        // worker. Continuing would emit whatever
+                                        // this worker matched so far as if the
+                                        // query had succeeded.
+                                        eval_error_ref.record(e);
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             };
 
@@ -1379,7 +1432,13 @@ impl ConcurrentProcessor {
                                 // payload this deferral exists to skip.
                                 let matched_fetch = deferred_ref
                                     .as_deref()
-                                    .or((!query_covers_requested).then_some(requested_row_fetch));
+                                    .or((!query_covers_requested).then_some(requested_row_fetch))
+                                    // A row the mask decided was never read.
+                                    // Where the `WHERE` fetch covers what is
+                                    // asked for, its buffer is what is emitted,
+                                    // extra columns and all, so that is the
+                                    // read it is owed.
+                                    .or(decided.then_some(query_row_fetch));
                                 if let Some(matched_fetch) = matched_fetch {
                                     if let Err(e) = pointer
                                         .fetch_row_reuse_async(
@@ -1432,6 +1491,7 @@ impl ConcurrentProcessor {
                                 }
                             }
                         }
+                        prefilter::note_decided_by_mask(decided_rows);
                     }
 
                     // Keep only this worker's best `cap` rows.

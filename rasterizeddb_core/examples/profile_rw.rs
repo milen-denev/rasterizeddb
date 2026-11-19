@@ -183,6 +183,8 @@ async fn read_mode(database: &Arc<Database>, args: &Args) {
             "agg",
             "like",
             "count",
+            "count_where",
+            "count_narrow",
             "topn",
             "topn_narrow",
         ]
@@ -266,6 +268,10 @@ fn query_for(workload: &str, i: u64, rows: usize) -> String {
         // cost of touching a table, and on the 192.168.1.7 node it is ~600 ns
         // per slot — 580 ms to count a million rows.
         "count" => "SELECT COUNT(*) FROM bench".to_string(),
+        // Counts with a predicate the batch prefilter decides whole: half the
+        // table, and about one row in a hundred.
+        "count_where" => "SELECT COUNT(*) FROM bench WHERE age > 44".to_string(),
+        "count_narrow" => "SELECT COUNT(*) FROM bench WHERE age = 42 AND salary > 30000.0".to_string(),
         // `ORDER BY … LIMIT k`. The sort key defeats the early-exit that makes
         // a bare `LIMIT` cheap, so this pays the full pass above and then keeps
         // only k rows. Measured on that node: 1.5 ms without the ORDER BY,

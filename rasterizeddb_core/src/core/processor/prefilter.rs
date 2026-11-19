@@ -71,6 +71,41 @@
 //! parts whose result cannot matter, so it makes the same choice.
 //! `tests::prefilter_cost` measures both ends.
 //!
+//! # When the mask is the answer
+//!
+//! A superset is all the above needs, but for most clauses this understands
+//! the mask is more than that: it is the clause. That holds when **no term
+//! was left opaque** ([`BatchPrefilter::is_exact`]), and for these reasons:
+//!
+//! * the clause that reaches the scan is already two-valued.
+//!   `predicate_rewrite` guards every comparison of a nullable column with
+//!   its `__null_` companion (`x > 5` arrives as `__null_x = 0 AND x > 5`),
+//!   and the guard is an ordinary `BOOL` comparison the kernels take. So the
+//!   placeholder a NULL stores is never what decides a row;
+//! * a `NOT` has been pushed down to the comparison's complement, a float
+//!   literal against an integer column lowered to integer bounds, and the
+//!   literal coerced by the evaluator's own `coerce_literal` (`sarg`);
+//! * the kernels are exact, as above.
+//!
+//! The scan then takes the mask as the `WHERE`'s result
+//! ([`BatchPrefilter::deciding`]): a count adds up the kept rows its
+//! snapshot sees and reads nothing else, and any other scan reads a kept row
+//! once, for what it returns, without fetching its predicate columns and
+//! running the interpreter over them to reach the same answer. Deleted and
+//! reclaimable rows are skipped and visibility is tested exactly as before;
+//! the mask only replaces the evaluation. Such a prefilter does not turn
+//! itself off, since a passing row no longer costs a second read.
+//!
+//! Only the read path does this. `UPDATE` and `DELETE` still evaluate every
+//! kept row. `RDB_MASK_DECIDES=0` turns it off.
+//!
+//! Measured 2026-11-19 over a million rows, the mask deciding against the
+//! same binary with it off (medians of three interleaved rounds, on a busy
+//! box): `COUNT(*) WHERE age > 44`, half the table, 54 -> 22 ms; `COUNT(*),
+//! AVG(salary)` over the same half 157 -> 116 ms; four columns of that half
+//! returned 650 -> 584 ms; a clause passing 1% of rows unchanged, since
+//! almost nothing there was being evaluated.
+//!
 //! # What it is worth, measured
 //!
 //! `COUNT(*)` over a 500k-row file-backed table, i9-11900K, medians of nine
@@ -113,6 +148,33 @@ pub const GIVE_UP_PASS_RATE: f64 = 0.9;
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static ROWS_CHECKED: AtomicU64 = AtomicU64::new(0);
 static ROWS_DROPPED: AtomicU64 = AtomicU64::new(0);
+static MASK_DECIDES: AtomicBool = AtomicBool::new(true);
+static ROWS_DECIDED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the mask of a `WHERE` the kernels decide whole is taken as the
+/// clause's answer, so that no row is fetched and interpreted to decide it
+/// again (see [`BatchPrefilter::deciding`]). On unless `RDB_MASK_DECIDES=0`,
+/// which is there to A/B it and to turn it off.
+pub fn mask_decides() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    MASK_DECIDES.load(Ordering::Relaxed)
+        && *ENV.get_or_init(|| std::env::var_os("RDB_MASK_DECIDES").is_none_or(|v| v != "0"))
+}
+
+pub fn set_mask_decides(on: bool) {
+    MASK_DECIDES.store(on, Ordering::Relaxed);
+}
+
+/// Rows a mask kept and no interpreter evaluated, since the process started.
+pub fn rows_decided_by_mask() -> u64 {
+    ROWS_DECIDED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_decided_by_mask(rows: u64) {
+    if rows != 0 {
+        ROWS_DECIDED.fetch_add(rows, Ordering::Relaxed);
+    }
+}
 
 /// `--scan-prefilter`. On by default.
 pub fn set_enabled(on: bool) {
@@ -207,6 +269,12 @@ impl Node {
 pub(crate) struct BatchPrefilter {
     columns: SmallVec<[Column; 4]>,
     root: Node,
+    /// Every term of the `WHERE` became a comparison the kernels decide, so
+    /// the mask is the clause's answer and not only a superset of it.
+    exact: bool,
+    /// Its mask is the scan's answer (see [`Self::deciding`]), so it does not
+    /// turn itself off.
+    decisive: bool,
     /// Rows checked and rows passed, over the whole statement.
     seen: AtomicU64,
     passed: AtomicU64,
@@ -291,17 +359,58 @@ impl BatchPrefilter {
 
         let mut columns: SmallVec<[Column; 4]> = SmallVec::new();
         let mut slot_of: SmallVec<[(u32, usize); 4]> = SmallVec::new();
-        let root = compile(&program.root, &usable, &mut columns, &mut slot_of);
+        let mut exact = true;
+        let root = compile(&program.root, &usable, &mut columns, &mut slot_of, &mut exact);
         if root.is_all() {
             return None;
         }
         Some(BatchPrefilter {
             columns,
             root,
+            exact,
+            decisive: false,
             seen: AtomicU64::new(0),
             passed: AtomicU64::new(0),
             off: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the mask is the `WHERE` clause's answer for every row read,
+    /// not only a superset of it.
+    ///
+    /// True when no term was left opaque. The clause the scan evaluates is
+    /// two-valued by then: `predicate_rewrite` has guarded every comparison
+    /// of a nullable column with its `__null_` companion, which is an
+    /// ordinary `BOOL` comparison here, so a NULL's placeholder bytes are
+    /// decided by the guard beside them. What is left is `AND`/`OR` over
+    /// comparisons of a column with a literal, in the bytes and the order
+    /// the evaluator uses (`sarg`), by kernels held to it value for value.
+    pub(crate) fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    /// For a scan that takes an exact mask as the `WHERE`'s answer: the
+    /// rows it keeps are the matches, and none is fetched and interpreted to
+    /// find that out again. A count then reads no row at all, and any other
+    /// scan reads a kept row once, for what it returns. When the mask is not
+    /// exact (or [`mask_decides`] is off) this is the prefilter it was.
+    ///
+    /// A deciding prefilter never gives up. The give-up rule weighs the
+    /// column read against rows that pass and are then read again to be
+    /// evaluated; here a passing row is not evaluated, so the column read is
+    /// what replaces that work, whatever fraction passes.
+    pub(crate) fn deciding(mut self) -> BatchPrefilter {
+        self.decisive = self.exact && mask_decides();
+        self
+    }
+
+    /// Whether the scan takes this prefilter's masks as the answer.
+    pub(crate) fn decides(&self) -> bool {
+        self.decisive
+    }
+
+    fn is_off(&self) -> bool {
+        !self.decisive && self.off.load(Ordering::Relaxed)
     }
 
     /// Choose the rows of a batch to check: every pointer except those `skip`
@@ -318,7 +427,7 @@ impl BatchPrefilter {
     ) -> bool {
         s.idx.clear();
         s.pos.clear();
-        if self.off.load(Ordering::Relaxed) {
+        if self.is_off() {
             return false;
         }
         for (i, p) in pointers.into_iter().enumerate() {
@@ -339,7 +448,7 @@ impl BatchPrefilter {
         s: &'s mut Scratch,
     ) -> Option<&'s [u64]> {
         let m = s.idx.len();
-        if m == 0 || self.off.load(Ordering::Relaxed) {
+        if m == 0 || self.is_off() {
             return None;
         }
 
@@ -390,7 +499,7 @@ impl BatchPrefilter {
         ROWS_DROPPED.fetch_add(m - passed, Ordering::Relaxed);
         let seen = self.seen.fetch_add(m, Ordering::Relaxed) + m;
         let passed = self.passed.fetch_add(passed, Ordering::Relaxed) + passed;
-        if seen >= GIVE_UP_AFTER && passed as f64 > seen as f64 * GIVE_UP_PASS_RATE {
+        if !self.decisive && seen >= GIVE_UP_AFTER && passed as f64 > seen as f64 * GIVE_UP_PASS_RATE {
             self.off.store(true, Ordering::Relaxed);
         }
 
@@ -434,21 +543,32 @@ impl BatchPrefilter {
 
 /// `MaskExpr` to `Node`, numbering the columns it reads. `All` absorbs an `OR`
 /// and vanishes from an `AND`, as in `MaskExpr::is_all`.
+///
+/// `exact` is cleared wherever a term comes out as `All`: the tree is then a
+/// superset of the clause and no longer the clause. Those are the only
+/// places an `All` is made, so a tree compiled with `exact` still set holds
+/// every term of the clause as the comparison it is.
 fn compile(
     e: &MaskExpr,
     usable: &[(u32, Column)],
     columns: &mut SmallVec<[Column; 4]>,
     slot_of: &mut SmallVec<[(u32, usize); 4]>,
+    exact: &mut bool,
 ) -> Node {
     match e {
-        MaskExpr::All => Node::All,
+        MaskExpr::All => {
+            *exact = false;
+            Node::All
+        }
         MaskExpr::Pred(p) => {
             let Some((_, column)) = usable.iter().find(|(wo, _)| *wo == p.write_order) else {
+                *exact = false;
                 return Node::All;
             };
             let width = column.kind.width();
             // A literal coerced to some other width is not this column's value.
             if p.value.len() != width {
+                *exact = false;
                 return Node::All;
             }
             let mut lit = [0u8; 8];
@@ -473,7 +593,7 @@ fn compile(
         MaskExpr::And(children) => {
             let kids: Vec<Node> = children
                 .iter()
-                .map(|c| compile(c, usable, columns, slot_of))
+                .map(|c| compile(c, usable, columns, slot_of, exact))
                 .filter(|n| !n.is_all())
                 .collect();
             match kids.len() {
@@ -485,7 +605,7 @@ fn compile(
         MaskExpr::Or(children) => {
             let kids: Vec<Node> = children
                 .iter()
-                .map(|c| compile(c, usable, columns, slot_of))
+                .map(|c| compile(c, usable, columns, slot_of, exact))
                 .collect();
             if kids.is_empty() || kids.iter().any(Node::is_all) {
                 Node::All
@@ -812,6 +932,229 @@ mod tests {
             "the prefilter never dropped a row on the write path: the test proved nothing"
         );
         assert!(errors * 4 < statements.len(), "{errors} of {} statements failed", statements.len());
+    }
+
+    /// `WHERE` clauses the kernels decide whole, each matching some rows of
+    /// the test table through every round of [`decided_differential`]: a
+    /// scan over one takes the mask as the answer.
+    const DECIDED: &[&str] = &[
+        "i32c > 10",
+        "i32c >= 10 AND i32c < 20",
+        "5 < i32c",
+        "i32c BETWEEN -5 AND 5",
+        "i32c IN (1, 2, 3, 40)",
+        "i64c < 0 OR i16c > 30",
+        "(i8c > 10 OR u8c < 20) AND f >= 0",
+        "u8c > 200",
+        "f = 'NaN'",
+        "f >= 'NaN'",
+        "f < 'NaN'",
+        "r > -1 AND r <= 1",
+        "flag = true",
+        "flag = false AND i32c > 0",
+        "ts > '2024-06-01 00:00:00+00'",
+        "i32c IS NULL",
+        "i32c IS NOT NULL AND i32c > 0",
+        "i32c > 0 OR i32c IS NULL",
+        "(i32c > 10 AND i64c < 0) OR (u8c = 7 AND f IS NULL)",
+        // `predicate_rewrite` pushes the `NOT` down to `i32c <= 10`.
+        "NOT i32c > 10",
+    ];
+
+    /// Clauses with a term left opaque, alone or beside a decided one: the
+    /// mask is a superset there, and taking it for the answer would return
+    /// rows the clause rejects.
+    const UNDECIDED: &[&str] = &[
+        "i32c != 3",
+        "s = 'x5'",
+        "s = 'x5' AND i32c > 0",
+        "s = 'x5' OR i32c > 40",
+        "n > 1.5 AND i32c < 0",
+        "i32c + 1 > 10",
+        "i32c > 10 AND i32c != 12",
+    ];
+
+    /// A decided mask taken as the answer, against the same statement with
+    /// every kept row fetched and evaluated: the same reply for every clause
+    /// and every shape of statement (rows, a count, a top-N), over a table
+    /// with NULLs, NaNs and each type's extremes, before and after updates
+    /// and deletes have left versions no snapshot sees. And the claim the
+    /// test rests on: decided clauses skip the evaluation, undecided ones
+    /// never do.
+    async fn decided_differential(in_memory: bool) {
+        let _g = SWITCH.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "prefilter_decided_differential_{}_{}",
+            std::process::id(),
+            in_memory
+        ));
+        let dir = dir.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _cleanup = RemoveDir(dir.clone());
+        let db = Arc::new(Database::new_with_backend(&dir, in_memory).await);
+        // Two batches, the second partial.
+        let rows = 12_000;
+        table(&db, rows).await;
+
+        let mut misjudged: Vec<String> = Vec::new();
+        for round in 0..2 {
+            for clause in CLAUSES.iter().chain(DECIDED).chain(UNDECIDED) {
+                // Every clause as a count and as an aggregate over columns the
+                // clause need not name; the ones this test classifies also as
+                // the rows themselves and as a top-N, which
+                // `differential` runs for the rest with the prefilter off.
+                let classified = DECIDED.contains(clause) || UNDECIDED.contains(clause);
+                let mut statements = vec![
+                    ("count", format!("SELECT COUNT(*) FROM t WHERE {clause}")),
+                    ("sum", format!("SELECT COUNT(*), SUM(i16c), MIN(f), MAX(u8c) FROM t WHERE {clause}")),
+                ];
+                if classified {
+                    statements.push(("rows", format!("SELECT {COLUMN_NAMES} FROM t WHERE {clause} ORDER BY id")));
+                    statements.push(("top", format!("SELECT id, f FROM t WHERE {clause} ORDER BY id DESC LIMIT 7")));
+                }
+                for (shape, sql) in statements {
+                    super::set_mask_decides(false);
+                    let before = super::rows_decided_by_mask();
+                    let evaluated = run(&db, &sql).await;
+                    assert_eq!(super::rows_decided_by_mask(), before, "{sql}: decided by a mask while off");
+                    super::set_mask_decides(true);
+                    let from_mask = run(&db, &sql).await;
+                    let decided = super::rows_decided_by_mask() - before;
+                    assert!(
+                        from_mask == evaluated,
+                        "round {round}, {sql}: {} bytes with the mask deciding, {} with every row evaluated",
+                        from_mask.len(),
+                        evaluated.len()
+                    );
+                    if DECIDED.contains(clause) && decided == 0 {
+                        misjudged.push(format!("round {round}, {shape}, {clause}: not decided by the mask, so nothing was compared"));
+                    }
+                    if UNDECIDED.contains(clause) && decided != 0 {
+                        misjudged.push(format!("round {round}, {shape}, {clause}: {decided} rows decided by a mask that is only a superset"));
+                    }
+                }
+            }
+            // Statements whose `WHERE` reads exactly the columns they return,
+            // in that order: the scan then emits the buffer the `WHERE` was
+            // read into, which a decided row never filled.
+            for sql in [
+                "SELECT id FROM t WHERE id > 6000 ORDER BY id",
+                "SELECT id FROM t WHERE id < 100 OR id >= 11900 ORDER BY id",
+                "SELECT id FROM t WHERE id >= 2000 AND id < 2050 ORDER BY id DESC",
+            ] {
+                super::set_mask_decides(false);
+                let before = super::rows_decided_by_mask();
+                let evaluated = run(&db, sql).await;
+                super::set_mask_decides(true);
+                let from_mask = run(&db, sql).await;
+                assert!(
+                    from_mask == evaluated,
+                    "round {round}, {sql}: {} bytes with the mask deciding, {} with every row evaluated",
+                    from_mask.len(),
+                    evaluated.len()
+                );
+                assert!(evaluated.len() > 100, "round {round}, {sql}: matched nothing");
+                if super::rows_decided_by_mask() == before {
+                    misjudged.push(format!("round {round}, {sql}: not decided by the mask"));
+                }
+            }
+            // Leave versions behind for the next round: rows rewritten (the
+            // old version stays, stamped), rows deleted, rows made NULL.
+            let changes: &[&str] = &[
+                "UPDATE t SET i32c = 11, f = 'NaN' WHERE u8c < 60",
+                "DELETE FROM t WHERE i16c > 40",
+                "UPDATE t SET i32c = NULL WHERE i8c = 3",
+                "UPDATE t SET i64c = -7, flag = true WHERE i32c = 11 AND u16c < 30",
+                "INSERT INTO t (id, i32c, i64c, f) VALUES (900001, 12, -1, 'NaN'), (900002, NULL, 5, 0)",
+            ];
+            if round != 0 {
+                break;
+            }
+            for change in changes {
+                let reply = run(&db, change).await;
+                assert!(reply.first() != Some(&3), "{change}: {}", String::from_utf8_lossy(&reply));
+            }
+        }
+        super::set_mask_decides(true);
+        assert!(misjudged.is_empty(), "{}", misjudged.join("\n"));
+    }
+
+    /// The mask says which rows match the clause. Which of those a statement
+    /// may count is its snapshot's to say: not the rows another transaction
+    /// has inserted and not committed, still the rows it has deleted and not
+    /// committed, and for that transaction itself the reverse. None of those
+    /// versions is reclaimable while the transaction is open, so nothing but
+    /// the visibility test tells them apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_decided_count_counts_what_its_snapshot_sees() {
+        let _g = SWITCH.lock().await;
+        let dir = std::env::temp_dir().join(format!("prefilter_decided_snapshot_{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _cleanup = RemoveDir(dir.clone());
+        let db = Arc::new(Database::new_with_backend(&dir, false).await);
+        table(&db, 12_000).await;
+
+        async fn within(db: &Arc<Database>, tx: crate::core::mvcc::TxId, sql: &str) -> Vec<u8> {
+            let purpose = recognize_query_purpose(sql).unwrap_or_else(|| panic!("parse: {sql}"));
+            Box::pin(executor::execute_with_context(purpose, db.clone(), 0, tx)).await
+        }
+        const COUNTS: &[&str] = &["i32c > 10", "i64c < 0 OR i16c > 30", "i32c IS NULL", "u8c > 200"];
+        let sql_of = |clause: &str| format!("SELECT COUNT(*) FROM t WHERE {clause}");
+        let mut committed = Vec::new();
+        for clause in COUNTS {
+            committed.push(run(&db, &sql_of(clause)).await);
+        }
+
+        let tx = db.transactions.begin();
+        let fresh: Vec<String> = (0..400).map(|i| format!("({}, 20, -5, 40, 250)", 800_000 + i)).collect();
+        for change in [
+            format!("INSERT INTO t (id, i32c, i64c, i16c, u8c) VALUES {}", fresh.join(", ")),
+            "DELETE FROM t WHERE i32c > 30".to_string(),
+            "UPDATE t SET i32c = NULL WHERE i8c = 3".to_string(),
+        ] {
+            let reply = within(&db, tx, &change).await;
+            assert!(reply.first() != Some(&3), "{change}: {}", String::from_utf8_lossy(&reply));
+        }
+
+        let mut own_view_differs = 0;
+        for (clause, committed) in COUNTS.iter().zip(&committed) {
+            let sql = sql_of(clause);
+            super::set_mask_decides(false);
+            let outside_evaluated = run(&db, &sql).await;
+            let inside_evaluated = within(&db, tx, &sql).await;
+            super::set_mask_decides(true);
+            let before = super::rows_decided_by_mask();
+            let outside = run(&db, &sql).await;
+            let inside = within(&db, tx, &sql).await;
+            assert!(super::rows_decided_by_mask() > before, "{sql}: not counted from the mask");
+            assert!(
+                &outside_evaluated == committed,
+                "{sql}: another transaction's uncommitted writes changed what an evaluated count sees"
+            );
+            assert!(&outside == committed, "{sql}: the mask counted another transaction's uncommitted writes");
+            assert!(inside == inside_evaluated, "{sql}: the mask and the evaluator count the transaction's own view apart");
+            if &inside != committed {
+                own_view_differs += 1;
+            }
+        }
+        assert!(own_view_differs >= 3, "the transaction's writes changed {own_view_differs} of its own counts");
+
+        db.abort_transaction(tx);
+        for (clause, committed) in COUNTS.iter().zip(&committed) {
+            assert!(&run(&db, &sql_of(clause)).await == committed, "{clause}: an aborted transaction's writes are counted");
+        }
+        super::set_mask_decides(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_decided_mask_is_the_answer_file_backed() {
+        decided_differential(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_decided_mask_is_the_answer_in_memory() {
+        decided_differential(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
