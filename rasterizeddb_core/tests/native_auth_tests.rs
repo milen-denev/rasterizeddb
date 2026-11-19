@@ -526,6 +526,8 @@ mod unix_socket {
                 port: free_port(),
                 tcp: true,
                 socket: Some(socket),
+                request_timeout: None,
+                certificate: None,
             };
             let auth = NativeAuthConfig {
                 method: AuthMethod::Trust,
@@ -560,6 +562,8 @@ mod unix_socket {
                 port: free_port(),
                 tcp: true,
                 socket: Some(socket),
+                request_timeout: None,
+                certificate: None,
             };
             let auth = NativeAuthConfig {
                 method: AuthMethod::Trust,
@@ -609,6 +613,8 @@ mod unix_socket {
                 port: free_port(),
                 tcp: false,
                 socket: None,
+                request_timeout: None,
+                certificate: None,
             };
             let outcome = tokio::time::timeout(
                 Duration::from_secs(30),
@@ -642,6 +648,8 @@ mod unix_socket {
                 port,
                 tcp: false,
                 socket: Some(socket),
+                request_timeout: None,
+                certificate: None,
             };
             let auth = NativeAuthConfig {
                 method: AuthMethod::Trust,
@@ -692,6 +700,8 @@ mod unix_socket {
                 port: free_port(),
                 tcp: true,
                 socket: Some(socket),
+                request_timeout: None,
+                certificate: None,
             };
             // The TCP side asks for a password, which exists: the socket's
             // method is its own.

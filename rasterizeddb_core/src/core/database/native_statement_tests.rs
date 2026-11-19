@@ -310,3 +310,537 @@ async fn a_taken_port_is_an_error_naming_the_way_out() {
     }
     drop(holder);
 }
+
+// ---- the simple-query form (`NativeSession::run_simple`) -----------------
+
+/// What a simple-query answer's PostgreSQL messages said.
+#[derive(Debug, Default)]
+struct SimpleSaid {
+    /// Per result: its column names, its rows' text cells, its tag.
+    results: Vec<(Vec<String>, Vec<Vec<Option<String>>>, String)>,
+    errors: Vec<(String, String)>,
+    /// The last `ReadyForQuery` status.
+    status: u8,
+}
+
+fn read_simple(answer: &[u8]) -> SimpleSaid {
+    assert_eq!(
+        answer.first(),
+        Some(&crate::pgwire::NativeSession::SIMPLE_ANSWER_FOR_TESTS),
+        "{answer:?}"
+    );
+    let mut said = SimpleSaid::default();
+    let (mut columns, mut rows) = (None::<Vec<String>>, Vec::new());
+    let mut at = 1;
+    let cstr = |b: &[u8], p: &mut usize| {
+        let end = *p + b[*p..].iter().position(|c| *c == 0).expect("nul");
+        let s = String::from_utf8_lossy(&b[*p..end]).to_string();
+        *p = end + 1;
+        s
+    };
+    while at < answer.len() {
+        let tag = answer[at];
+        let len = i32::from_be_bytes(answer[at + 1..at + 5].try_into().unwrap()) as usize;
+        let body = &answer[at + 5..at + 1 + len];
+        at += 1 + len;
+        let mut p = 0;
+        match tag {
+            b'T' => {
+                let n = i16::from_be_bytes(body[0..2].try_into().unwrap());
+                p = 2;
+                let mut names = Vec::new();
+                for _ in 0..n {
+                    names.push(cstr(body, &mut p));
+                    p += 18;
+                }
+                columns = Some(names);
+                rows = Vec::new();
+            }
+            b'D' => {
+                let n = i16::from_be_bytes(body[0..2].try_into().unwrap());
+                p = 2;
+                let mut row = Vec::new();
+                for _ in 0..n {
+                    let l = i32::from_be_bytes(body[p..p + 4].try_into().unwrap());
+                    p += 4;
+                    if l < 0 {
+                        row.push(None);
+                    } else {
+                        row.push(Some(
+                            String::from_utf8_lossy(&body[p..p + l as usize]).to_string(),
+                        ));
+                        p += l as usize;
+                    }
+                }
+                rows.push(row);
+            }
+            b'C' => {
+                let tag = cstr(body, &mut p);
+                said.results.push((
+                    columns.take().unwrap_or_default(),
+                    std::mem::take(&mut rows),
+                    tag,
+                ));
+            }
+            b'E' => {
+                let (mut code, mut message) = (String::new(), String::new());
+                while body[p] != 0 {
+                    let field = body[p];
+                    p += 1;
+                    let value = cstr(body, &mut p);
+                    match field {
+                        b'C' => code = value,
+                        b'M' => message = value,
+                        _ => {}
+                    }
+                }
+                said.errors.push((code, message));
+            }
+            b'Z' => said.status = body[0],
+            _ => {}
+        }
+    }
+    said
+}
+
+fn simple_request(sql: &str) -> Vec<u8> {
+    let mut request = crate::pgwire::NATIVE_SIMPLE_QUERY_PREFIX.to_vec();
+    request.extend_from_slice(sql.as_bytes());
+    request
+}
+
+async fn simple(
+    context: &NativeContext,
+    session: Option<&crate::pgwire::NativeSession>,
+    sql: &str,
+) -> SimpleSaid {
+    let answer = process_native_request(
+        context.clone(),
+        std::sync::Arc::new(rastcp::session::Principal::new("svc", true)),
+        session,
+        simple_request(sql),
+    )
+    .await;
+    read_simple(&answer)
+}
+
+/// Counted on a connection of its own, outside any block under test.
+async fn count(context: &NativeContext, table: &str) -> i64 {
+    let session =
+        crate::pgwire::NativeSession::new(context.database.clone(), "svc", true, false, true);
+    let said = simple(
+        context,
+        Some(&session),
+        &format!("SELECT count(*) AS n FROM {table}"),
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    said.results[0].1[0][0]
+        .as_deref()
+        .expect("a count")
+        .parse()
+        .expect("a number")
+}
+
+/// The form answers as pgwire would: column names (aliases included), text
+/// cells, a NULL as NULL, a tag per statement, and several statements in one
+/// request. A CTE runs, which the plain native path refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_simple_query_answers_with_names_text_and_tags() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+
+    let said = simple(
+        &context,
+        Some(&session),
+        "CREATE TABLE notes (id BIGINT PRIMARY KEY, body TEXT, score NUMERIC(10,2)); \
+         INSERT INTO notes (id, body, score) VALUES (1, 'one', 1.50), (2, NULL, 2.25)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert_eq!(said.results.len(), 2, "{said:?}");
+    assert_eq!(said.results[1].2, "INSERT 0 2");
+    assert_eq!(said.status, b'I');
+
+    let said = simple(
+        &context,
+        Some(&session),
+        "SELECT id, body AS note, score FROM notes ORDER BY id",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    let (columns, rows, tag) = &said.results[0];
+    assert_eq!(columns, &["id", "note", "score"]);
+    assert_eq!(
+        rows,
+        &vec![
+            vec![
+                Some("1".to_string()),
+                Some("one".to_string()),
+                Some("1.50".to_string())
+            ],
+            vec![Some("2".to_string()), None, Some("2.25".to_string())],
+        ]
+    );
+    assert_eq!(tag, "SELECT 2");
+
+    let said = simple(
+        &context,
+        Some(&session),
+        "WITH big AS (SELECT id FROM notes WHERE id > 1) SELECT count(*) AS n FROM big",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert_eq!(said.results[0].1, vec![vec![Some("1".to_string())]]);
+}
+
+/// Several statements are one implicit transaction, as over pgwire: a
+/// failure in the second takes the first back, and the error carries its
+/// SQLSTATE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_simple_query_takes_its_earlier_statements_back() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let said = simple(
+        &context,
+        Some(&session),
+        "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+
+    let said = simple(
+        &context,
+        Some(&session),
+        "INSERT INTO t (id) VALUES (1); INSERT INTO no_such_table (id) VALUES (2)",
+    )
+    .await;
+    assert_eq!(said.errors.len(), 1, "{said:?}");
+    assert_eq!(said.errors[0].0, "42P01", "{said:?}");
+    assert_eq!(
+        count(&context, "t").await,
+        0,
+        "the first INSERT outlived the failed request"
+    );
+}
+
+/// On rastcp/1 a `BEGIN` holds the connection's block across requests, of
+/// either form; on rastcp/2 a block left open is rolled back and said so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_simple_query_block_belongs_to_a_dedicated_connection_only() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let dedicated = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let said = simple(
+        &context,
+        Some(&dedicated),
+        "CREATE TABLE t (id BIGINT PRIMARY KEY)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+
+    let said = simple(
+        &context,
+        Some(&dedicated),
+        "BEGIN; INSERT INTO t (id) VALUES (1)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert_eq!(said.status, b'T');
+    // The block is the connection's: a plain native request runs in it.
+    let plain = process_native_request(
+        context.clone(),
+        std::sync::Arc::new(rastcp::session::Principal::new("svc", true)),
+        Some(&dedicated),
+        b"INSERT INTO t (id) VALUES (2)".to_vec(),
+    )
+    .await;
+    assert_ne!(plain.first(), Some(&3), "{}", text(&plain));
+    let said = simple(&context, Some(&dedicated), "ROLLBACK").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert_eq!(said.status, b'I');
+    assert_eq!(
+        count(&context, "t").await,
+        0,
+        "the rolled-back block's rows stayed"
+    );
+
+    let shared = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let said = simple(
+        &context,
+        Some(&shared),
+        "BEGIN; INSERT INTO t (id) VALUES (3)",
+    )
+    .await;
+    assert_eq!(said.errors.len(), 1, "{said:?}");
+    assert_eq!(said.errors[0].0, "0A000");
+    assert_eq!(said.status, b'I');
+    assert_eq!(
+        count(&context, "t").await,
+        0,
+        "a block left open on a shared connection was kept"
+    );
+    // A block that ends inside the request is fine there.
+    let said = simple(
+        &context,
+        Some(&shared),
+        "BEGIN; INSERT INTO t (id) VALUES (4); COMMIT",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert_eq!(count(&context, "t").await, 1);
+}
+
+/// The prefix is what keeps a server without the form from running the text:
+/// to the plain path it is two statements, which are refused whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_prefix_makes_a_marked_request_unrunnable_on_the_plain_path() {
+    let request = simple_request("DELETE FROM t");
+    let text = String::from_utf8_lossy(&request);
+    assert!(crate::pgwire::split_statements(&text).len() > 1, "{text:?}");
+
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    // No session: refused in the form's own answer, not as a plain error.
+    let said = simple(&context, None, "SELECT 1").await;
+    assert_eq!(said.errors.len(), 1);
+    assert_eq!(said.errors[0].0, "0A000");
+}
+
+/// The form skips the native path's own superuser gate and relies on
+/// pgwire's, inside the statement's execution. So it must refuse what the
+/// native path refuses: an authenticated user who is not a superuser may not
+/// administer the server, nor slip the statement in after another one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_simple_query_keeps_the_superuser_gate() {
+    let (_dir, database) = database().await;
+    let context = context(&database, true);
+    let user = crate::pgwire::NativeSession::new(database.clone(), "svc", false, true, true);
+    for sql in [
+        "SET CONFIG cache.size = 10",
+        "CREATE ROLE intruder LOGIN PASSWORD 'x'",
+        "SELECT 1; RESET QUERY STATS",
+        "STORAGE REBALANCE DRY RUN",
+    ] {
+        let answer = process_native_request(
+            context.clone(),
+            std::sync::Arc::new(rastcp::session::Principal::new("svc", false)),
+            Some(&user),
+            simple_request(sql),
+        )
+        .await;
+        let said = read_simple(&answer);
+        assert_eq!(said.errors.len(), 1, "{sql}: {said:?}");
+        assert_eq!(said.errors[0].0, "42501", "{sql}: {said:?}");
+    }
+}
+
+/// A request as `user` on `session`, read as a simple-query answer.
+async fn marked(
+    context: &NativeContext,
+    user: &str,
+    session: Option<&crate::pgwire::NativeSession>,
+    request: &[u8],
+) -> SimpleSaid {
+    let answer = process_native_request(
+        context.clone(),
+        std::sync::Arc::new(rastcp::session::Principal::new(user, true)),
+        session,
+        request.to_vec(),
+    )
+    .await;
+    read_simple(&answer)
+}
+
+/// The header's options, and a header this server cannot read refused before
+/// anything runs, so an option a client relies on is never dropped.
+#[test]
+fn a_simple_query_header_is_read_or_refused() {
+    use crate::pgwire::{
+        NativeSimpleOptions as SimpleOptions, native_parse_simple as parse_simple,
+    };
+    assert_eq!(parse_simple(b"SELECT 1"), None);
+    assert_eq!(parse_simple(b"\x01SIMPLEX;SELECT 1"), None);
+    let (options, text) = parse_simple(b"\x01SIMPLE;SELECT 1").unwrap().unwrap();
+    assert_eq!((options, text), (SimpleOptions::default(), &b"SELECT 1"[..]));
+    let (options, text) = parse_simple(b"\x01SIMPLE:cancel=a-B_9,rows=10;SELECT 1; SELECT 2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(options.cancel.as_deref(), Some("a-B_9"));
+    assert_eq!(options.rows, Some(10));
+    assert_eq!(text, b"SELECT 1; SELECT 2");
+    for bad in [
+        &b"\x01SIMPLE:rows=10"[..],
+        b"\x01SIMPLE:rows=ten;SELECT 1",
+        b"\x01SIMPLE:rows=1,rows=2;SELECT 1",
+        b"\x01SIMPLE:cancel=a b;SELECT 1",
+        b"\x01SIMPLE:cancel=;SELECT 1",
+        b"\x01SIMPLE:timeout=5;SELECT 1",
+        b"\x01SIMPLE:rows;SELECT 1",
+    ] {
+        assert!(
+            parse_simple(bad).unwrap().is_err(),
+            "{}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_option_runs_nothing() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let session =
+        crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    simple(&context, Some(&session), "CREATE TABLE opt_t (id BIGINT)").await;
+    let said = marked(
+        &context,
+        "svc",
+        Some(&session),
+        b"\x01SIMPLE:later=1;INSERT INTO opt_t (id) VALUES (1)",
+    )
+    .await;
+    assert_eq!(said.errors.len(), 1, "{said:?}");
+    assert_eq!(said.errors[0].0, "08P01");
+    assert_eq!(count(&context, "opt_t").await, 0);
+}
+
+/// `rows=n` sends at most `n` rows of each result, and the tag still counts
+/// them all. Mutation: the sink keeps every row (the first result has 5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_cap_keeps_the_first_rows_of_each_result_and_the_full_tag() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let session =
+        crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let said = simple(
+        &context,
+        Some(&session),
+        "CREATE TABLE cap_t (id BIGINT, label TEXT); \
+         INSERT INTO cap_t (id, label) VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{said:?}");
+    let said = marked(
+        &context,
+        "svc",
+        Some(&session),
+        b"\x01SIMPLE:rows=2;SELECT id, label FROM cap_t ORDER BY id; \
+          SELECT id FROM cap_t WHERE id > 3 ORDER BY id; SELECT 7 AS seven",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{said:?}");
+    assert_eq!(said.results.len(), 3, "{said:?}");
+    let (columns, rows, tag) = &said.results[0];
+    assert_eq!(columns, &["id", "label"]);
+    assert_eq!(
+        rows,
+        &[
+            vec![Some("1".to_string()), Some("a".to_string())],
+            vec![Some("2".to_string()), Some("b".to_string())],
+        ]
+    );
+    assert_eq!(tag, "SELECT 5");
+    assert_eq!(said.results[1].1.len(), 2);
+    assert_eq!(said.results[1].2, "SELECT 2");
+    assert_eq!(said.results[2].1, vec![vec![Some("7".to_string())]]);
+
+    // A cap of 0 sends the descriptions and tags only.
+    let said = marked(
+        &context,
+        "svc",
+        Some(&session),
+        b"\x01SIMPLE:rows=0;SELECT id FROM cap_t",
+    )
+    .await;
+    assert_eq!(said.results[0].0, ["id"]);
+    assert!(said.results[0].1.is_empty());
+    assert_eq!(said.results[0].2, "SELECT 5");
+}
+
+/// A query sent with `cancel=<token>` is stopped by a CANCEL carrying the
+/// token from another connection of the same user, with 57014; another
+/// user's CANCEL finds nothing, and the token cannot be taken twice while
+/// the query runs. Here the query waits for a table lock another block
+/// holds, so it runs until something stops it.
+///
+/// Mutations: the query runs outside the token's scope (CANCEL 0, and the
+/// wait outlasts the bound); the registry ignores the user (the stranger's
+/// CANCEL stops it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_token_stops_its_own_users_query_only() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    let holder =
+        crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let said = simple(
+        &context,
+        Some(&holder),
+        "CREATE TABLE lock_t (id BIGINT); INSERT INTO lock_t (id) VALUES (1)",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{said:?}");
+    let said = simple(
+        &context,
+        Some(&holder),
+        "BEGIN; LOCK TABLE lock_t IN ACCESS EXCLUSIVE MODE",
+    )
+    .await;
+    assert!(said.errors.is_empty(), "{said:?}");
+    assert_eq!(said.status, b'T');
+
+    let waiter = std::sync::Arc::new(crate::pgwire::NativeSession::new(
+        database.clone(),
+        "svc",
+        true,
+        false,
+        true,
+    ));
+    let started = std::time::Instant::now();
+    let task = {
+        let (context, waiter) = (context.clone(), waiter.clone());
+        tokio::spawn(async move {
+            marked(
+                &context,
+                "svc",
+                Some(&waiter),
+                b"\x01SIMPLE:cancel=tok-1;SELECT id FROM lock_t",
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(!task.is_finished(), "the query did not wait for the lock");
+
+    let other = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, true);
+    let said = marked(
+        &context,
+        "svc",
+        Some(&other),
+        b"\x01SIMPLE:cancel=tok-1;SELECT 1",
+    )
+    .await;
+    assert_eq!(said.errors.first().map(|e| e.0.as_str()), Some("08P01"), "{said:?}");
+
+    let said = marked(&context, "stranger", None, b"\x01CANCEL;tok-1").await;
+    assert_eq!(said.results[0].2, "CANCEL 0", "{said:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!task.is_finished(), "another user's CANCEL stopped the query");
+
+    let said = marked(&context, "svc", None, b"\x01CANCEL;tok-1").await;
+    assert_eq!(said.results[0].2, "CANCEL 1", "{said:?}");
+    let said = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("the cancelled query kept waiting")
+        .unwrap();
+    assert_eq!(said.errors.first().map(|e| e.0.as_str()), Some("57014"), "{said:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // The token is free again once its query has ended.
+    let said = marked(&context, "svc", None, b"\x01CANCEL;tok-1").await;
+    assert_eq!(said.results[0].2, "CANCEL 0", "{said:?}");
+    let said = simple(&context, Some(&holder), "COMMIT").await;
+    assert!(said.errors.is_empty(), "{said:?}");
+}
