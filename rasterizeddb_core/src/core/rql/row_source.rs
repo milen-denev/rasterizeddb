@@ -265,6 +265,46 @@ impl RowSource {
         }
     }
 
+    /// `Table::query_columns_in_txn`: every partition's chunks, one after
+    /// another. Cells carry no order and the caller folds them, so the
+    /// fan-out has nothing to merge.
+    pub(crate) async fn query_columns(
+        &self,
+        where_clause: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: StdArc<crate::core::processor::column_scan::CellLayout>,
+        tx: TxId,
+    ) -> io::Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        match self {
+            RowSource::Single(table) => {
+                table.query_columns_in_txn(where_clause, schema_fields, query_row_fetch, layout, tx).await
+            }
+            RowSource::Partitioned(fan) => {
+                let parts = fan
+                    .each(
+                        |_| false,
+                        |part, visibility, cache| {
+                            let (fetch, layout) = (query_row_fetch.clone(), layout.clone());
+                            async move {
+                                part.query_columns_with_visibility(
+                                    where_clause,
+                                    schema_fields,
+                                    fetch,
+                                    layout,
+                                    visibility,
+                                    cache,
+                                )
+                                .await
+                            }
+                        },
+                    )
+                    .await?;
+                Ok(parts.into_iter().flatten().collect())
+            }
+        }
+    }
+
     /// `Table::query_row_in_txn`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_rows(

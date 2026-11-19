@@ -875,7 +875,7 @@ impl RowPointer {
     /// like a string header's offset (`string_position`). One compare per
     /// fetch rather than one checked add per column.
     #[inline]
-    fn check_column_range(&self) -> std::io::Result<()> {
+    pub(crate) fn check_column_range(&self) -> std::io::Result<()> {
         if unlikely(self.position > u64::MAX - u32::MAX as u64) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

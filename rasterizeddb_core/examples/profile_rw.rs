@@ -183,6 +183,8 @@ async fn read_mode(database: &Arc<Database>, args: &Args) {
             "agg",
             "like",
             "count",
+            "agg_all",
+            "agg_group",
             "count_where",
             "count_narrow",
             "topn",
@@ -270,6 +272,10 @@ fn query_for(workload: &str, i: u64, rows: usize) -> String {
         "count" => "SELECT COUNT(*) FROM bench".to_string(),
         // Counts with a predicate the batch prefilter decides whole: half the
         // table, and about one row in a hundred.
+        // Aggregates the fold reads as cells: over every row, and grouped by
+        // an integer key (about fifty groups).
+        "agg_all" => "SELECT COUNT(*), SUM(salary), MIN(age), MAX(age) FROM bench".to_string(),
+        "agg_group" => "SELECT age, COUNT(*), AVG(salary) FROM bench GROUP BY age".to_string(),
         "count_where" => "SELECT COUNT(*) FROM bench WHERE age > 44".to_string(),
         "count_narrow" => "SELECT COUNT(*) FROM bench WHERE age = 42 AND salary > 30000.0".to_string(),
         // `ORDER BY … LIMIT k`. The sort key defeats the early-exit that makes
