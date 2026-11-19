@@ -176,7 +176,7 @@ fn an_interrupted_promote_is_finished_from_any_point() {
         std::fs::write(parent.join("who"), "parent").unwrap();
         std::fs::write(branch.join("who"), "branch").unwrap();
         meta("prod").write(&branch).unwrap();
-        let mut intent = PromoteIntent {
+        let intent = PromoteIntent {
             parent: "prod".into(),
             branch: "dev".into(),
             step: recorded,
