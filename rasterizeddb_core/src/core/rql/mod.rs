@@ -60,6 +60,7 @@ pub mod path_index;
 pub mod prepared;
 pub mod replicated_values;
 
+pub mod catalog_model;
 pub mod catalog_views;
 pub mod check;
 pub mod pg_regex;

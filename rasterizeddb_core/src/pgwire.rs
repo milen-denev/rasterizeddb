@@ -41,6 +41,7 @@ mod sequence_statements;
 mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
+mod copy;
 mod temp_tables;
 mod privilege_statements;
 #[cfg(test)]
@@ -2518,6 +2519,7 @@ where
                 state.message_us = crate::core::statement_clock::wall_us();
                 let query = read_cstring(&payload);
                 handle_simple_query(database, state, stream, query).await?;
+                state.copy_in_ran = false;
                 // And it closes its own window: it has already answered with
                 // `ReadyForQuery`. A failure inside it (`fail_statement` sets
                 // the flag) otherwise left the window open, so the *next*
@@ -2560,6 +2562,11 @@ where
                     open_implicit_block(database, state);
                 }
                 handle_execute(database, state, stream, &payload).await?;
+                if std::mem::take(&mut state.copy_in_ran)
+                    && let Some(at) = pending.iter().position(|(tag, _)| *tag == b'S')
+                {
+                    pending.remove(at);
+                }
             }
             b'C' => {
                 handle_close(state, stream, &payload).await?;
@@ -2799,6 +2806,13 @@ struct SessionState {
     temp_tables: Vec<temp_tables::TempTable>,
     /// What this session's temporary tables' real names are made unique by.
     temp_session: u64,
+    /// A `COPY … FROM STDIN` ran: the `Sync` an extended-query client sent
+    /// behind its `Execute`, which PostgreSQL ignores during the copy, was
+    /// read ahead before it and is dropped once (the client's next `Sync`,
+    /// after its `CopyDone`, is the one answered). Answered too, it was a
+    /// second `ReadyForQuery` the client did not expect, and the connection
+    /// broke on its next statement.
+    copy_in_ran: bool,
     /// The server's connection limits: what `RESET` returns the idle timeouts
     /// to, and what `SHOW max_connections` reports.
     limits: ConnectionLimits,
@@ -3176,6 +3190,7 @@ impl SessionState {
             kept_ddl_locks: false,
             temp_tables: Vec::new(),
             temp_session: fastrand::u64(..),
+            copy_in_ran: false,
             shape_change: ShapeChangeMode::default(),
             stale_plan: false,
             startup_settings: (None, None, None),
@@ -3788,6 +3803,27 @@ where
                         p.oid = 25;
                     }
                 }
+            }
+        }
+    }
+
+    // A binary value with no type (node-postgres binds a `Buffer` so): the
+    // type its place gives it, as PostgreSQL reads one, rather than "unsupported
+    // binary parameter type OID 0". The statement's inferred types if a
+    // Describe made them, else where each parameter stands.
+    if params.iter().any(|p| p.oid == 0 && p.format == 1 && p.value.is_some())
+        && let Some(info) = state.statements.get(&stmt)
+    {
+        let placed: Vec<Option<i32>> = match &info.inferred_oids {
+            Some(oids) => oids.iter().map(|o| (*o != 0).then_some(*o)).collect(),
+            None => param_infer::infer_where_placed(database, &info.sql, &[]),
+        };
+        for (idx, p) in params.iter_mut().enumerate() {
+            if p.oid == 0
+                && p.format == 1
+                && let Some(Some(oid)) = placed.get(idx)
+            {
+                p.oid = *oid;
             }
         }
     }
@@ -5073,6 +5109,14 @@ async fn cte_relations(
 /// the first stand-in that resolves it. Nothing is run.
 async fn param_scratch_relations(database: &Arc<Database>, sql: &str) -> Vec<(String, Vec<(String, i32)>)> {
     let mut found: Vec<(String, Vec<(String, i32)>)> = Vec::new();
+    // The catalogue relations it names, by their columns: `pg_type t …
+    // WHERE t.oid = $1` is a bigint, not the text a parameter with no
+    // relation to read was taken for.
+    for view in crate::core::rql::catalog_views::views_named(sql) {
+        if let Some(columns) = crate::core::rql::catalog_views::columns_of(view) {
+            found.push((view.to_string(), columns.iter().map(|(n, t)| (n.to_string(), t.pg_oid() as i32)).collect()));
+        }
+    }
     let with = crate::core::rql::cte::split_with(sql).ok().flatten();
     if with.is_none() && crate::core::rql::cte::next_derived_table(sql).is_none() {
         return found;
@@ -5421,6 +5465,27 @@ async fn describe_resolved(
                     }
                 }
             }
+        }
+    }
+    // A statement over more than one catalogue relation, or over one in a
+    // join or a derived table (a driver's, as it connects or describes a
+    // table): described over the relations built as `Execute` builds them,
+    // and dropped again before the answer. Left to the arms below it was
+    // `NoData`, and the rows that followed broke the connection ("Received
+    // unexpected backend message DataRow").
+    if crate::core::rql::catalog_views::view_of_statement(stmt).is_some()
+        && let Ok(Some(built)) = crate::core::rql::catalog_views::materialize(
+            stmt,
+            database,
+            crate::core::mvcc::transaction::FROZEN_TX,
+            None,
+        )
+        .await
+    {
+        let described = Box::pin(describe_query(database, &built.rewritten)).await;
+        crate::core::rql::cte::drop_temps(database, &built.temps, crate::core::mvcc::transaction::FROZEN_TX).await;
+        if let Ok(Some(described)) = described {
+            return Ok(Some(described));
         }
     }
 
@@ -6889,6 +6954,20 @@ pub(crate) fn rewrite_statement_text<'a>(
     } else {
         Cow::Borrowed(stmt)
     };
+    // Line breaks and tabs outside quotes made spaces, once, here
+    // (`sql_scan::flatten_whitespace`): parsers downstream test for a keyword
+    // followed by a space, and a statement laid out over lines (every
+    // driver's catalogue query, most ORMs') failed where its one-line form
+    // ran.
+    if let Cow::Owned(flat) = crate::core::sql_scan::flatten_whitespace(&stmt) {
+        stmt = Cow::Owned(flat);
+    }
+    // `pg_catalog.` qualifiers, `OPERATOR(pg_catalog.~)`, a byte-order
+    // `COLLATE` and the visibility tests, as `psql` and drivers write them
+    // (`sql_scan::catalog_syntax`).
+    if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
+        stmt = Cow::Owned(text);
+    }
     // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
     // before anything reads one: a CTE or derived table is materialised from
     // this text, and `jb.id AS ID` beside `ja.id` must be the second `id`
@@ -7130,6 +7209,13 @@ where
     if let Some(parsed) = crate::core::rql::merge::parse_merge(stmt) {
         return match parsed {
             Ok(merge) => merge_exec::run_merge(database, state, stream, merge, result_formats, omit_description).await,
+            Err((code, message)) => fail_statement(state, stream, code, &message).await,
+        };
+    }
+    // `COPY … FROM STDIN` / `TO STDOUT` (`copy`).
+    if let Some(parsed) = copy::parse_copy(stmt) {
+        return match parsed {
+            Ok(statement) => copy::run_copy(database, state, stream, statement).await,
             Err((code, message)) => fail_statement(state, stream, code, &message).await,
         };
     }
@@ -7384,6 +7470,28 @@ where
     }
     let stmt = folded_where.as_str();
 
+    // A statement naming `pg_class` or `pg_type` gets them built now and
+    // pointed at temporary tables. Before the CTE and derived-table passes,
+    // whose bodies run first: a driver's catalogue query reads `pg_type` from
+    // a derived table (Npgsql's, as it connects), which ran before the
+    // relation existed ("Table not found"). Nothing is built for a statement
+    // that names none, which is every ordinary one.
+    let catalog = match crate::core::rql::catalog_views::materialize(
+        stmt,
+        database,
+        effective_tx,
+        Some(&state.catalog),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
+            return Ok(());
+        }
+    };
+    let stmt = catalog.as_ref().map(|c| c.rewritten.as_str()).unwrap_or(stmt);
+
     // A correlated scalar subquery (`(SELECT max(v) FROM u WHERE u.k =
     // t.k)`), as the `LATERAL` join it means (`rql::correlated`), before the
     // passes that materialise such joins.
@@ -7395,6 +7503,9 @@ where
             correlated.as_str()
         }
         Some(Err(e)) => {
+            if let Some(c) = &catalog {
+                crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+            }
             let code = if e.contains("only one column") {
                 "42601"
             } else if e.contains("uses ungrouped column") {
@@ -7408,6 +7519,7 @@ where
         None => stmt,
     };
 
+
     // A statement with CTE bodies or derived tables runs parts of itself
     // before the engine sees its outer statement, so its whole known table
     // set is taken here, at once and in name order, before any part runs
@@ -7415,6 +7527,9 @@ where
     // plain statement's set is taken at the engine's entry.
     if crate::core::rql::cte::has_with_clause(stmt) || crate::core::rql::lock_set::names_a_subquery(stmt) {
         if let Err(e) = crate::core::rql::executor::lock_statement_set(database, stmt).await {
+            if let Some(c) = &catalog {
+                crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+            }
             fail_statement(state, stream, sqlstate_in(&e, stmt), &e).await?;
             return Ok(());
         }
@@ -7424,6 +7539,9 @@ where
     {
         Ok(m) => m,
         Err(e) => {
+            if let Some(c) = &catalog {
+                crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+            }
             // 0A000 is `feature_not_supported`, which is what an unsupported
             // CTE shape is; a body that ran and failed keeps its own class.
             fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
@@ -7446,6 +7564,9 @@ where
                 if let Some(m) = &materialized {
                     crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
                 }
+                if let Some(c) = &catalog {
+                    crate::core::rql::cte::drop_temps(database, &c.temps, effective_tx).await;
+                }
                 fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
                 return Ok(());
             }
@@ -7455,33 +7576,7 @@ where
         .map(|d| d.rewritten.as_str())
         .unwrap_or(after_cte);
 
-    // A statement naming `pg_class` or `pg_stat_user_tables` gets them built
-    // now and pointed at temporary tables. Nothing is built for a statement
-    // that names none, which is every ordinary one.
-    let catalog = match crate::core::rql::catalog_views::materialize(
-        after_derived,
-        database,
-        effective_tx,
-        Some(&state.catalog),
-    )
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            if let Some(d) = &derived {
-                crate::core::rql::cte::drop_temps(database, &d.temps, effective_tx).await;
-            }
-            if let Some(m) = &materialized {
-                crate::core::rql::cte::drop_temps(database, &m.temps, effective_tx).await;
-            }
-            fail_statement(state, stream, materialize_sqlstate_in(&e, stmt), &e).await?;
-            return Ok(());
-        }
-    };
-    let effective = catalog
-        .as_ref()
-        .map(|c| c.rewritten.as_str())
-        .unwrap_or(after_derived);
+    let effective = after_derived;
     // Materialised relations are per execution, so a parse of the rewritten
     // text names relations the next execution will not have.
     if materialized.is_some() || derived.is_some() || catalog.is_some() {
@@ -12359,10 +12454,14 @@ fn format_column_binary(db_type: DbType, bytes: &[u8], scale: Option<u32>) -> Op
                 // a power of ten. The text renderer beside this one was
                 // already given the scale, which is why the same query
                 // answered differently over the two protocols.
-                Some(crate::core::value_codec::encode_pg_numeric_scaled(
-                    i128::from_le_bytes(arr),
-                    scale.unwrap_or(crate::core::value_codec::DECIMAL_SCALE),
-                ))
+                // Shown at it, as the text form shows it (`12.50`).
+                Some(match scale {
+                    Some(scale) => crate::core::value_codec::encode_pg_numeric_with_dscale(i128::from_le_bytes(arr), scale),
+                    None => crate::core::value_codec::encode_pg_numeric_scaled(
+                        i128::from_le_bytes(arr),
+                        crate::core::value_codec::DECIMAL_SCALE,
+                    ),
+                })
             } else {
                 None
             }

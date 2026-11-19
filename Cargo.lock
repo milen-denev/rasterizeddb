@@ -4583,6 +4583,7 @@ dependencies = [
  "bytes",
  "chrono",
  "env_logger",
+ "futures-util",
  "libc",
  "postgres-types",
  "rasterizeddb_core",

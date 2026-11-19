@@ -73,6 +73,185 @@ pub fn string_literal_end(bytes: &[u8], start: usize, escapes: bool) -> usize {
     }
 }
 
+/// The catalogue spellings drivers and `psql` write, as this engine reads
+/// them, outside quotes:
+///
+/// - a `pg_catalog.` qualifier dropped (`pg_catalog.format_type(…)`,
+///   `::pg_catalog.text`): every built-in lives there, and a name resolves
+///   to it unqualified;
+/// - `OPERATOR(pg_catalog.~)` as the operator `~` it names;
+/// - `COLLATE` dropped for the collations byte order already is (`"C"`,
+///   `"POSIX"`, `"default"`, `pg_catalog.default`, `ucs_basic`); any other
+///   is left, and refused as before;
+/// - `pg_table_is_visible(…)`, `pg_function_is_visible(…)` and
+///   `pg_type_is_visible(…)` as TRUE: everything here is in `public`, which
+///   is on every search path;
+/// - `::"char"` as `::text` and `::oid` as `::bigint`, the types those
+///   columns have here.
+///
+/// Borrowed when the text holds none of them.
+pub fn catalog_syntax(sql: &str) -> Cow<'_, str> {
+    let has = |needle: &[u8]| contains_ignore_ascii_case(sql, needle);
+    if !(has(b"pg_catalog.") || has(b"operator(") || has(b"collate") || has(b"_is_visible") || has(b"\"char\"") || has(b"::oid"))
+    {
+        return Cow::Borrowed(sql);
+    }
+    let bytes = sql.as_bytes();
+    let at = |i: usize, word: &str| bytes.len() - i >= word.len() && bytes[i..i + word.len()].eq_ignore_ascii_case(word.as_bytes());
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80;
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    // Whether the name at `i` starts a word: after a non-identifier byte, or
+    // where a dropped qualifier ended.
+    let mut word_start = true;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            out.push_str(&sql[i..end]);
+            i = end.max(i + 1);
+            word_start = false;
+            continue;
+        }
+        let boundary = word_start || (i > 0 && !ident(bytes[i - 1]) && bytes[i - 1] != b'.');
+        if boundary && at(i, "pg_catalog.") && bytes.get(i + 11).is_some_and(|&b| ident(b) || b == b'"') {
+            i += 11;
+            word_start = true;
+            continue;
+        }
+        if boundary && at(i, "operator") {
+            let open = i + 8 + sql[i + 8..].len() - sql[i + 8..].trim_start().len();
+            if bytes.get(open) == Some(&b'(')
+                && let Some(close) = sql[open..].find(')').map(|c| open + c)
+            {
+                let op = sql[open + 1..close].trim();
+                let op = op.strip_prefix("pg_catalog.").or_else(|| op.strip_prefix("PG_CATALOG.")).unwrap_or(op);
+                out.push(' ');
+                out.push_str(op.trim());
+                out.push(' ');
+                i = close + 1;
+                word_start = true;
+                continue;
+            }
+        }
+        if boundary && at(i, "collate") && bytes.get(i + 7).is_some_and(|&b| b.is_ascii_whitespace()) {
+            let rest = &sql[i + 7..];
+            let name_at = i + 7 + rest.len() - rest.trim_start().len();
+            let name_end = if bytes.get(name_at) == Some(&b'"') {
+                quoted_end(bytes, name_at, b'"')
+            } else {
+                let mut e = name_at;
+                while e < bytes.len() && (ident(bytes[e]) || bytes[e] == b'.') {
+                    e += 1;
+                }
+                e
+            };
+            let name = sql[name_at..name_end].trim_matches('"').to_ascii_lowercase();
+            if matches!(name.as_str(), "c" | "posix" | "default" | "pg_catalog.default" | "ucs_basic") {
+                i = name_end;
+                word_start = true;
+                continue;
+            }
+        }
+        if boundary {
+            let visible =
+                ["pg_table_is_visible", "pg_function_is_visible", "pg_type_is_visible"].iter().find(|w| at(i, w)).copied();
+            if let Some(word) = visible {
+                let open = i + word.len() + sql[i + word.len()..].len() - sql[i + word.len()..].trim_start().len();
+                if bytes.get(open) == Some(&b'(')
+                    && let Some(close) = matching_paren_at(bytes, open)
+                {
+                    out.push_str("TRUE");
+                    i = close + 1;
+                    word_start = false;
+                    continue;
+                }
+            }
+        }
+        if at(i, "::") {
+            let rest = &sql[i + 2..];
+            let ty_at = i + 2 + rest.len() - rest.trim_start().len();
+            if at(ty_at, "\"char\"") {
+                out.push_str("::text");
+                i = ty_at + 6;
+                word_start = false;
+                continue;
+            }
+            if at(ty_at, "oid") && !bytes.get(ty_at + 3).is_some_and(|&b| ident(b)) {
+                out.push_str("::bigint");
+                i = ty_at + 3;
+                word_start = false;
+                continue;
+            }
+        }
+        let ch = sql[i..].chars().next().expect("in bounds");
+        word_start = !(ident(bytes[i]) || bytes[i] == b'.');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Cow::Owned(out)
+}
+
+/// The index of the parenthesis closing the one at `open`, past quotes.
+fn matching_paren_at(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `sql` with every tab, line break, vertical tab and form feed outside
+/// quotes made a space: whitespace to PostgreSQL, and one kind of it to the
+/// parsers downstream, many of which test for a keyword followed by a space
+/// (`CASE ` read `CASE` ending its line as a column named `CASE WHEN …`).
+/// A string, a quoted identifier and a dollar-quoted body keep theirs, so a
+/// routine's PL/pgSQL keeps its lines. Comments are expected gone already
+/// (a line comment's end is its line break). Borrowed when nothing changes.
+pub fn flatten_whitespace(sql: &str) -> Cow<'_, str> {
+    let bytes = sql.as_bytes();
+    let odd = |b: u8| matches!(b, b'\n' | b'\r' | b'\t' | 0x0b | 0x0c);
+    if !bytes.iter().any(|&b| odd(b)) {
+        return Cow::Borrowed(sql);
+    }
+    let mut out = bytes.to_vec();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            i = quoted_end(bytes, i, b).max(i + 1);
+            continue;
+        }
+        // A `$` after an identifier's character continues the identifier,
+        // as PostgreSQL's lexer reads it; elsewhere it may open a body.
+        if b == b'$' && !(i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) {
+            if let Some(end) = dollar_quote_end(bytes, i) {
+                i = end.max(i + 1);
+                continue;
+            }
+        }
+        if odd(b) {
+            out[i] = b' ';
+        }
+        i += 1;
+    }
+    // Only ASCII bytes were replaced, by ASCII.
+    Cow::Owned(String::from_utf8(out).expect("whitespace replaced by a space"))
+}
+
 /// Index just past the `quote`-delimited run opening at `start`, where a
 /// doubled quote stands for itself (or the end of the text, unterminated).
 pub fn quoted_end(bytes: &[u8], start: usize, quote: u8) -> usize {
@@ -1820,6 +1999,41 @@ mod tests {
 
     fn norm(sql: &str) -> String {
         normalize_string_literals(sql).unwrap().into_owned()
+    }
+
+    #[test]
+    fn catalog_spellings_are_read_as_this_engine_reads_them() {
+        use super::catalog_syntax;
+        assert_eq!(
+            catalog_syntax("SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) FROM pg_catalog.pg_attribute a"),
+            "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a"
+        );
+        assert_eq!(
+            catalog_syntax("WHERE c.relname OPERATOR(pg_catalog.~) '^(t)$' COLLATE pg_catalog.default AND pg_catalog.pg_table_is_visible(c.oid)"),
+            "WHERE c.relname  ~  '^(t)$'  AND TRUE"
+        );
+        assert_eq!(catalog_syntax("SELECT x COLLATE \"C\", y COLLATE \"de_DE\""), "SELECT x , y COLLATE \"de_DE\"");
+        assert_eq!(catalog_syntax("SELECT 'r'::\"char\", c.oid::oid, t.oidx"), "SELECT 'r'::text, c.oid::bigint, t.oidx");
+        // Inside a string or a quoted identifier: untouched.
+        assert_eq!(catalog_syntax("SELECT 'pg_catalog.x', \"pg_catalog.y\""), "SELECT 'pg_catalog.x', \"pg_catalog.y\"");
+        // A column named like the qualifier's tail is not a qualifier.
+        assert_eq!(catalog_syntax("SELECT my_pg_catalog.x FROM t"), "SELECT my_pg_catalog.x FROM t");
+        assert!(matches!(catalog_syntax("SELECT 1"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn line_breaks_outside_quotes_become_spaces() {
+        use super::flatten_whitespace;
+        assert_eq!(flatten_whitespace("SELECT CASE\nWHEN a\tTHEN 1 END\r\nFROM t"), "SELECT CASE WHEN a THEN 1 END  FROM t");
+        // Kept inside a string, a quoted identifier and a dollar-quoted body.
+        assert_eq!(flatten_whitespace("SELECT 'a\nb', \"x\ny\"\nFROM t"), "SELECT 'a\nb', \"x\ny\" FROM t");
+        assert_eq!(
+            flatten_whitespace("CREATE FUNCTION f() AS $$\nBEGIN\n  RETURN 1;\nEND $$\nLANGUAGE plpgsql"),
+            "CREATE FUNCTION f() AS $$\nBEGIN\n  RETURN 1;\nEND $$ LANGUAGE plpgsql"
+        );
+        // A `$` inside an identifier opens nothing; a placeholder neither.
+        assert_eq!(flatten_whitespace("SELECT a$b$\nFROM t WHERE x = $1\n"), "SELECT a$b$ FROM t WHERE x = $1 ");
+        assert!(matches!(flatten_whitespace("SELECT 1"), Cow::Borrowed(_)));
     }
 
     #[test]

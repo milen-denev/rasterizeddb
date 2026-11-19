@@ -573,7 +573,9 @@ pub fn needs_evaluation(text: &str) -> bool {
         return true;
     }
     let upper = trimmed.to_ascii_uppercase();
-    if upper.starts_with("CASE ") {
+    // Any whitespace after the keyword: `CASE` ending its line was read as a
+    // column named `CASE WHEN …`.
+    if upper.starts_with("CASE") && upper[4..].starts_with(|c: char| c.is_ascii_whitespace()) {
         return true;
     }
     // `CURRENT_TIMESTAMP` is a value written without a call's parentheses, so
@@ -1582,7 +1584,7 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
         });
     }
 
-    if upper.starts_with("CASE ") || upper == "CASE" {
+    if upper.starts_with("CASE") && (upper.len() == 4 || upper[4..].starts_with(|c: char| c.is_ascii_whitespace())) {
         return parse_case(text, schema);
     }
 
@@ -3622,6 +3624,10 @@ pub fn static_type(expr: &Expr) -> DbType {
         Expr::Call(TextFunc::UuidExtractVersion, _) => DbType::I16,
         // `integer`, as PostgreSQL's length family returns.
         Expr::Call(TextFunc::Length | TextFunc::OctetLength, _) => DbType::I32,
+        // `array_length`'s and `array_ndims`'s `integer`: typed as text, an
+        // emptiness test (`array_length(a, 1) = 0`, `psql`'s `\l`) was
+        // refused as `text = integer`.
+        Expr::Call(TextFunc::ArrayLength | TextFunc::ArrayNdims, _) => DbType::I32,
         Expr::Call(TextFunc::TsMatchVq | TextFunc::TsMatchTq | TextFunc::TsMatchTt, _) => DbType::BOOL,
         Expr::Call(TextFunc::TsRank, _) => DbType::F32,
         // The argument's own type, as PostgreSQL's `abs` family returns.

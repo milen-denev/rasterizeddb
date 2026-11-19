@@ -204,7 +204,10 @@ pub fn parse(clause: &str) -> Result<Vec<SortTerm>, String> {
             return Err("ORDER BY has an empty sort key".to_string());
         }
         let parenthesised;
-        let (token, rest) = if raw.to_ascii_uppercase().starts_with("CASE ") {
+        // Any whitespace after the keyword, a line break included.
+        let (token, rest) = if raw.get(..4).is_some_and(|w| w.eq_ignore_ascii_case("CASE"))
+            && raw[4..].starts_with(|c: char| c.is_ascii_whitespace())
+        {
             match case_block_end(raw) {
                 Some(end) => (&raw[..end], raw[end..].trim()),
                 None => return Err("ORDER BY has a CASE with no END".to_string()),

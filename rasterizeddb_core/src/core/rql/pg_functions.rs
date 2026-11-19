@@ -145,6 +145,28 @@ pub enum PgFunc {
     CurrVal,
     SetVal,
     LastVal,
+    /// The catalogue read by oid (`catalog_model`), as `psql` and drivers
+    /// call it: `pg_get_userbyid`, `format_type`, `pg_get_indexdef`,
+    /// `pg_get_constraintdef`, `pg_get_function_result`,
+    /// `pg_get_function_arguments`, `pg_get_expr`, `pg_encoding_to_char`.
+    PgGetUserById,
+    FormatType,
+    PgGetIndexDef,
+    PgGetConstraintDef,
+    PgGetFunctionResult,
+    PgGetFunctionArguments,
+    PgGetExpr,
+    PgEncodingToChar,
+    /// `obj_description`, `col_description`, `shobj_description`: no object
+    /// here has a comment, so NULL.
+    Description,
+    /// `pg_relation_is_publishable`: nothing is published here.
+    RelationIsPublishable,
+    /// `pg_column_is_updatable`: a table's column is, a view's is not (views
+    /// here are read-only); answered for the relation the oid names.
+    ColumnIsUpdatable,
+    /// `oid::regclass` read as text: the relation's name.
+    RegclassName,
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -158,7 +180,11 @@ pub const NAMES: &[&str] = &[
     "JSON_BUILD_ARRAY", "JSONB_BUILD_ARRAY", "TO_JSON", "TO_JSONB", "JSONB_ARRAY_LENGTH", "JSON_ARRAY_LENGTH",
     "NUM_NONNULLS", "NUM_NULLS", "STRING_TO_ARRAY", "ARRAY_TO_STRING", "CARDINALITY", "TRIM", "PG_TYPEOF",
     "ARRAY_APPEND", "ARRAY_PREPEND", "ARRAY_CAT", "JSONB_SET", "JSONB_STRIP_NULLS", "NEXTVAL", "CURRVAL", "SETVAL",
-    "LASTVAL",
+    "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF",
+    "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
+    "PG_ENCODING_TO_CHAR", "OBJ_DESCRIPTION", "COL_DESCRIPTION", "SHOBJ_DESCRIPTION", "PG_RELATION_IS_PUBLISHABLE",
+    "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
+    "PG_GET_RULEDEF",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -282,6 +308,23 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "CURRVAL" => (CurrVal, &[1]),
         "SETVAL" => (SetVal, &[2, 3]),
         "LASTVAL" => (LastVal, &[0]),
+        "PG_GET_USERBYID" => (PgGetUserById, &[1]),
+        "FORMAT_TYPE" => (FormatType, &[2]),
+        "PG_GET_INDEXDEF" => (PgGetIndexDef, &[1, 3]),
+        "PG_GET_CONSTRAINTDEF" => (PgGetConstraintDef, &[1, 2]),
+        "PG_GET_FUNCTION_RESULT" => (PgGetFunctionResult, &[1]),
+        "PG_GET_FUNCTION_ARGUMENTS" | "PG_GET_FUNCTION_IDENTITY_ARGUMENTS" => (PgGetFunctionArguments, &[1]),
+        "PG_GET_EXPR" => (PgGetExpr, &[2, 3]),
+        "PG_ENCODING_TO_CHAR" => (PgEncodingToChar, &[1]),
+        "OBJ_DESCRIPTION" => (Description, &[1, 2]),
+        "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => (Description, &[2]),
+        // No extended statistics, triggers' text or rules exist here.
+        "PG_GET_STATISTICSOBJDEF_COLUMNS" => (Description, &[1]),
+        "PG_GET_TRIGGERDEF" => (Description, &[1, 2]),
+        "PG_GET_RULEDEF" => (Description, &[1, 2]),
+        "PG_RELATION_IS_PUBLISHABLE" => (RelationIsPublishable, &[1]),
+        "PG_COLUMN_IS_UPDATABLE" => (ColumnIsUpdatable, &[3]),
+        "__REGCLASS_NAME" => (RegclassName, &[1]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -327,6 +370,9 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         }
         Power | Cbrt | Exp | Ln | Log | Log10 | Pi | Degrees | Radians | Random => DbType::F64,
         NextVal | CurrVal | SetVal | LastVal => DbType::I64,
+        PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetFunctionResult
+        | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName => DbType::STRING,
+        RelationIsPublishable | ColumnIsUpdatable => DbType::BOOL,
         Div => DbType::DECIMAL,
         Gcd | Lcm => match first() {
             DbType::I64 => DbType::I64,
@@ -1665,6 +1711,42 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             data(crate::core::jsonb::set_path(&jsonb_of(&args[0])?, &path, &jsonb_of(&args[2])?, create)?, DbType::JSONB)
         }
         JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
+        PgGetUserById => text_value(crate::core::rql::catalog_model::user_by_id(int_of(&args[0], "the role's oid")?)),
+        FormatType => {
+            let typmod = int_of(&args[1], "the type modifier").ok();
+            match crate::core::rql::catalog_model::format_type(int_of(&args[0], "the type's oid")?, typmod) {
+                Some(name) => text_value(name),
+                None => text_value("???".to_string()),
+            }
+        }
+        PgGetIndexDef => {
+            let column = match args.get(1) {
+                Some(v) => int_of(v, "the column number")?,
+                None => 0,
+            };
+            match crate::core::rql::catalog_model::index_definition(int_of(&args[0], "the index's oid")?, column) {
+                Some(text) => text_value(text),
+                None => Value::Null,
+            }
+        }
+        PgGetConstraintDef => match crate::core::rql::catalog_model::constraint_definition(int_of(&args[0], "the constraint's oid")?) {
+            Some(text) => text_value(text),
+            None => Value::Null,
+        },
+        PgGetFunctionResult | PgGetFunctionArguments => {
+            let what = if func == PgGetFunctionResult { "result" } else { "arguments" };
+            match crate::core::rql::catalog_model::function_text(int_of(&args[0], "the function's oid")?, what) {
+                Some(text) => text_value(text),
+                None => Value::Null,
+            }
+        }
+        // `pg_get_expr(adbin, relid)`: a stored expression is its text here.
+        PgGetExpr => text_value(s(0)),
+        PgEncodingToChar => text_value(if int_of(&args[0], "the encoding")? == 6 { "UTF8" } else { "" }.to_string()),
+        Description => Value::Null,
+        RelationIsPublishable => data(vec![0], DbType::BOOL),
+        ColumnIsUpdatable => data(vec![1], DbType::BOOL),
+        RegclassName => text_value(crate::core::rql::catalog_model::regclass_name(int_of(&args[0], "the relation's oid")?)),
         NextVal | CurrVal | SetVal | LastVal => {
             use crate::core::rql::sequence;
             let database = sequence::session::database()

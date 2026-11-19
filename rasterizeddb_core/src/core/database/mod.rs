@@ -1056,16 +1056,19 @@ fn seed_fell_back(_pool: &StoragePool, _seed: &DbStorageProvider, _table_name: &
 /// bought. Everything else about the relation is unchanged: it is a real table
 /// with a real schema, created and dropped through the ordinary paths.
 /// Whether `table_name` is a statement's own relation: a CTE's or a derived
-/// table's (`cte::TEMP_TABLE_PREFIX`), created in memory and dropped before
-/// the statement ends.
+/// table's (`cte::TEMP_TABLE_PREFIX`), or a catalogue view's
+/// (`catalog_views::TEMP_PREFIX`), created in memory and dropped before the
+/// statement ends. The catalogue's were on disk: five files made, synced and
+/// removed, and a catalogue row written and tombstoned, for every relation of
+/// every statement naming `pg_type` or `pg_class` (a driver's connect read
+/// eight, 23 s on a debug build, past Npgsql's connect timeout).
 fn is_statement_scoped(table_name: &str) -> bool {
     table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
+        || table_name.starts_with(crate::core::rql::catalog_views::TEMP_PREFIX)
 }
 
 fn temp_seed(table_name: &str) -> Option<Arc<DbStorageProvider>> {
-    table_name
-        .starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
-        .then(|| Arc::new(DbStorageProvider::new_memory(table_name)))
+    is_statement_scoped(table_name).then(|| Arc::new(DbStorageProvider::new_memory(table_name)))
 }
 
 #[cfg(feature = "storage_pools")]
@@ -1248,7 +1251,7 @@ fn pool_forget(_pool: &StoragePool, _table_name: &str) {}
 /// 192.168.1.7, forever.
 #[cfg(feature = "storage_pools")]
 fn pool_forget_statement_relations(pool: &StoragePool) {
-    let removed = pool.forget_where(|table| table.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX));
+    let removed = pool.forget_where(|table| is_statement_scoped(table));
     if removed > 0 {
         info!("forgot {} placement(s) of statement-scoped relations left by an older build", removed);
     }
@@ -1799,7 +1802,7 @@ impl Database {
             // now answers with memory-backed storage for these names, which
             // would discard nothing. These leftovers predate that and are real
             // files in the database's own directory.
-            if table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+            if is_statement_scoped(&table_name) {
                 // Kept files keep their row too, so the next start tries again.
                 if !discard_files(&io_pointers, &storage, Some(location), &table_name).await {
                     continue;
@@ -3707,7 +3710,7 @@ impl Database {
         // disk, and it is created often enough that a pass over the map each
         // time would show. Two of them cannot share a file either: each name
         // ends in a lower-case hex tag, and no suffix stem does.
-        if name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX) {
+        if is_statement_scoped(name) {
             return None;
         }
         // Every live table, every partitioned table (whose shell may be
@@ -6426,8 +6429,7 @@ impl<'a> SchemaChanged<'a> {
         generation: &'a CacheGuard<std::sync::atomic::AtomicU64>,
         table_name: &str,
     ) -> Option<Self> {
-        let internal = table_name.starts_with(crate::core::rql::cte::TEMP_TABLE_PREFIX)
-            || crate::core::rql::json_map::is_shadow_table(table_name);
+        let internal = is_statement_scoped(table_name) || crate::core::rql::json_map::is_shadow_table(table_name);
         (!internal).then(|| SchemaChanged(generation))
     }
 }
