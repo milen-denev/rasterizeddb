@@ -2481,9 +2481,11 @@ pub struct CellSources {
 
 #[derive(Debug, Clone)]
 struct CellSource {
-    /// The chunk column holding the value, and its width.
+    /// The chunk column holding the value, and its width, or that it is a
+    /// string, whose values the chunk holds end to end.
     col: usize,
     width: usize,
+    text: bool,
     /// The chunk column holding its NULL flag, and that one's width.
     flag: Option<(usize, usize)>,
 }
@@ -2504,7 +2506,7 @@ impl CellSources {
                 return None;
             }
         }
-        Some(chunk.cell(source.col, source.width, row))
+        Some(if source.text { chunk.text(source.col, row) } else { chunk.cell(source.col, source.width, row) })
     }
 }
 
@@ -2532,7 +2534,12 @@ pub fn cell_sources(
             .find(|(value, _)| value == write_order)
             .and_then(|(_, flag)| layout.position(*flag))
             .map(|at| (at, layout.columns[at].width as usize));
-        slots.push(CellSource { col, width: layout.columns[col].width as usize, flag });
+        slots.push(CellSource {
+            col,
+            width: layout.columns[col].width as usize,
+            text: layout.columns[col].text,
+            flag,
+        });
     }
     Some(CellSources { slots })
 }
