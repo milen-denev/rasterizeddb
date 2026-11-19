@@ -106,7 +106,14 @@ pub(crate) fn qualify_in(database: &crate::core::database::Database, sql: &str) 
     qualify(sql, &|name: &str| {
         database
             .schema_view(name)
-            .map(|view| view.schema().fields.iter().map(|f| f.name.clone()).collect())
+            .map(|view| {
+                view.schema()
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                    .map(|f| f.name.clone())
+                    .collect()
+            })
     })
 }
 

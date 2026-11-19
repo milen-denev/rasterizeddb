@@ -387,6 +387,30 @@ per column); `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
 read as the left side's type either way); a derived table's column list,
 `FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
 
+### Enum types
+
+`CREATE TYPE name AS ENUM ('a', 'b')`, `DROP TYPE [IF EXISTS] … [RESTRICT]`,
+`ALTER TYPE … ADD VALUE [IF NOT EXISTS] 'c' [BEFORE | AFTER 'b']`,
+`ALTER TYPE … RENAME VALUE 'a' TO 'z'` and `ALTER TYPE … RENAME TO`, in a
+transaction block as well (a type and a table using it in one migration).
+A column of the type, or of an array of it, takes only its labels (22P02
+otherwise, as a cast of a non-label does); `ORDER BY` such a column sorts by
+the labels' declared order; `pg_type` and `pg_enum` list the type and its
+labels. A column holds the label as `text`, kept to the labels by a hidden
+constraint the type's `ALTER`s replace.
+
+Where it differs from PostgreSQL:
+
+- `<`, `>` and `min`/`max` over enum values compare the labels' text, not
+  their order; only a top-level `ORDER BY` of the column itself follows the
+  declared order.
+- The 22P02 a column reports does not name the value (`invalid input value
+  for enum "Status"`); a cast's does.
+- A row's column is typed `text` on the wire and in `information_schema`.
+- `ALTER TABLE … ALTER COLUMN … TYPE <enum>` and `DROP TYPE … CASCADE` with
+  columns of the type are refused (0A000); type statements are refused over
+  the native protocol.
+
 ### Subqueries reading outer columns
 
 A subquery may name an outer column without its qualifier, `EXISTS (SELECT 1
@@ -1363,7 +1387,8 @@ sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
 `ROLLUP`/`CUBE`/`GROUPING SETS` and `WITH RECURSIVE` all run now and are no
 longer gaps. What is still missing:
 
-- **Types**: `CREATE TYPE` (enums and composites), `CREATE DOMAIN`, range types
+- **Types**: `CREATE TYPE` for composites and ranges (enums work, see
+  "Enum types" above), `CREATE DOMAIN`, range types
   (`int4range`, `daterange`), multidimensional array literals (`ARRAY[[1,2],[3,4]]`),
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
   PostgreSQL prints `$12.50`.

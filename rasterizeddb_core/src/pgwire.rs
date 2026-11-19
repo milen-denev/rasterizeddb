@@ -39,6 +39,7 @@ mod param_infer;
 mod view_statements;
 mod sequence_statements;
 mod column_origins;
+mod type_statements;
 mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
@@ -4958,6 +4959,10 @@ pub(crate) async fn describe_query(
     if let Ok(Some(text)) = crate::core::sql_scan::named_windows(&shorthands) {
         shorthands = text;
     }
+    // Enum types in their stored form, as the statement runs (`user_types`).
+    if let Ok(Some(text)) = crate::core::rql::user_types::rewrite(database, &shorthands, None).await {
+        shorthands = text;
+    }
     let stmt = shorthands.trim();
     // Folded as it runs (`execute_single_statement`).
     let folded = crate::core::sql_scan::fold_core_statement(stmt);
@@ -5969,6 +5974,16 @@ async fn fail_statement<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    // A value no label of its enum type, which the column's constraint
+    // caught: PostgreSQL's 22P02, as a cast of it reports (`user_types`).
+    let enum_message;
+    let (sqlstate, message) = match crate::core::rql::user_types::violation(message) {
+        Some(m) => {
+            enum_message = m;
+            ("22P02", enum_message.as_str())
+        }
+        None => (sqlstate, message),
+    };
     state.statement_failed = true;
     state.error_in_batch = true;
     state.statement_error = Some(message.to_string());
@@ -6544,6 +6559,14 @@ async fn execute_recorded<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Whether this statement failed belongs to this statement, from its
+    // first step: a `DROP TABLE` deferred to its block's end answers before
+    // `execute_recorded_inner` (which resets it too), so a flag left by the
+    // previous statement stood, and a batch after any failed statement
+    // (`DROP TABLE t; SELECT 1`) stopped after the drop, its later
+    // statements dropped without a reply.
+    state.statement_failed = false;
+    state.statement_error = None;
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -7627,6 +7650,17 @@ where
         }
     };
     let stmt = with_session.as_deref().unwrap_or(stmt);
+    // Enum types (`user_types`): a column, a cast and an `ORDER BY` of one
+    // in their stored form, read in this statement's transaction so a type
+    // the block created is seen.
+    let with_types = match crate::core::rql::user_types::rewrite(database, stmt, state.current_tx()).await {
+        Ok(text) => text,
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    let stmt = with_types.as_deref().unwrap_or(stmt);
 
     // Temporary tables (`temp_tables`): created here, and every reference to
     // one written as its real name before anything else reads the text.
@@ -7665,6 +7699,9 @@ where
     }
     if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
         return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::user_types::parse_type_statement(stmt) {
+        return type_statements::handle_type_statement(database, state, stream, parsed).await;
     }
     if let Some(parsed) = crate::core::rql::functions::parse_routine_statement(stmt) {
         return routine_statements::handle_routine_statement(database, state, stream, parsed).await;
