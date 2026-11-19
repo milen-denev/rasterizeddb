@@ -241,6 +241,9 @@ fn audit_b_a_short_wal_write_leaves_no_partial_record() {
     std::fs::write(&data_path, vec![0u8; 64]).unwrap();
 
     let wal = Wal::open(&wal_path).unwrap();
+    // No zeros ahead of the records: the cap below stops a write that grows
+    // the file, and a record written into padding grows nothing.
+    wal.set_prealloc(0);
     let id = file_id_for_name("data.db");
     wal.register_file(id, &data_path).unwrap();
 

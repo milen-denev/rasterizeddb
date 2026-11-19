@@ -74,12 +74,29 @@ fn an_image_holds_each_file_as_of_its_last_completed_sync() {
 fn half_keeps_some_unsynced_pages_and_drops_others() {
     let base = vec![1u8; PAGE * 64];
     let current = vec![2u8; PAGE * 64];
-    let out = mix_pages(&base, &current, 0.5, true, &mut Rng::new(7));
+    let out = mix_pages(&base, &current, 0.5, false, &mut Rng::new(7));
     let kept = out.chunks(PAGE).filter(|p| p[0] == 2).count();
     assert!(kept > 8 && kept < 56, "{kept} of 64 pages kept at p = 0.5");
     for p in out.chunks(PAGE) {
         assert!(p.iter().all(|b| *b == p[0]), "a page is kept or dropped whole");
     }
+}
+
+/// A log overwrites its own zero padding, so its unsynced records lie inside
+/// its synced length. "At its synced length" has to drop those too, at any
+/// keep probability, or the seed that loses the whole unsynced log loses
+/// none of it.
+#[test]
+fn a_file_cut_at_its_synced_length_keeps_no_unsynced_page() {
+    let base = vec![0u8; PAGE * 16];
+    let mut current = base.clone();
+    current[..PAGE * 3].fill(7);
+    current.extend_from_slice(&[9u8; PAGE]);
+    for p in [0.5, 1.0] {
+        assert_eq!(mix_pages(&base, &current, p, true, &mut Rng::new(3)), base, "p = {p}");
+    }
+    // Without it, p = 1 keeps every one of them.
+    assert_eq!(mix_pages(&base, &current, 1.0, false, &mut Rng::new(3)), current);
 }
 
 #[test]
@@ -416,7 +433,7 @@ fn the_model_knows_every_noted_sync_tag() {
                 continue;
             }
             let text = std::fs::read_to_string(&p).unwrap();
-            for call in ["sync_audit::note(\"", "sync_audit::note_file(\""] {
+            for call in ["sync_audit::note(\"", "sync_audit::note_file(\"", "sync_audit::note_extent(\""] {
                 for (i, _) in text.match_indices(call) {
                     let rest = &text[i + call.len()..];
                     let tag = &rest[..rest.find('"').unwrap()];

@@ -173,7 +173,7 @@ fn durable_baseline(dir: &Path) -> Baseline {
         let f = std::fs::File::options().read(true).write(true).open(&path).unwrap();
         f.sync_all().unwrap();
         let ino = f.metadata().unwrap().ino();
-        out.insert(path.clone(), (ino, std::fs::read(&path).unwrap()));
+        out.insert(path.clone(), (ino, crate::core::wal::read_records(&path)));
     }
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();
@@ -233,7 +233,8 @@ fn image_dir(
     let base_log = baseline.get(&wal_path).map(|(_, b)| b.len()).unwrap_or(0);
     for path in regular_files(src) {
         let name = path.file_name().unwrap();
-        let now = std::fs::read(&path).unwrap();
+        // A log's records, any other file whole.
+        let now = crate::core::wal::read_records(&path);
         let bytes = if path == wal_path {
             let synced = synced_log_len(events, &wal_path, now.len()).max(base_log.min(now.len()));
             let cut = if seed == 0 {
@@ -626,8 +627,8 @@ async fn a_vacuum_full_never_moves_rows_over_an_undone_delete() {
         db.transactions.flush_deferred().unwrap();
         // T's outcome is in the root log up to here, unsynced; anything the
         // second location's log holds past its length now is the compaction's.
-        let outcome_len = std::fs::metadata(&root_wal).unwrap().len();
-        let rows_len = std::fs::metadata(&disk_wal).unwrap().len();
+        let outcome_len = crate::core::wal::records_len(&root_wal);
+        let rows_len = crate::core::wal::records_len(&disk_wal);
 
         // Both directories in one watch, so its events are in one order.
         let order = sync_audit::watch(fx.base.path());
@@ -735,8 +736,8 @@ async fn a_sweep_never_makes_a_transaction_durable_in_part() {
         db.commit_transaction(tx);
         db.transactions.flush_deferred().unwrap();
         // T's outcome, and its rows on the second location, end here.
-        let outcome_len = std::fs::metadata(&root_wal).unwrap().len();
-        let rows_len = std::fs::metadata(&disk_wal).unwrap().len();
+        let outcome_len = crate::core::wal::records_len(&root_wal);
+        let rows_len = crate::core::wal::records_len(&disk_wal);
 
         // Both directories in one watch, so its events are in one order.
         let order = sync_audit::watch(fx.base.path());
@@ -842,7 +843,7 @@ async fn a_sweep_never_syncs_another_databases_outcomes() {
         .await;
         db.commit_transaction(tx);
         db.transactions.flush_deferred().unwrap();
-        let outcome_len = std::fs::metadata(&root_wal).unwrap().len();
+        let outcome_len = crate::core::wal::records_len(&root_wal);
         let _ = fx.root_watch.take_events();
         let _ = fx.disk_watch.take_events();
 
@@ -996,8 +997,8 @@ async fn a_log_writer_round_syncs_each_databases_outcomes_after_its_rows() {
         a.transactions.flush_deferred().unwrap();
         let b_root_wal = b_root.join(DEFAULT_WAL_NAME);
         let b_disk_wal = b_disk.join(DEFAULT_WAL_NAME);
-        let outcome_len = std::fs::metadata(&b_root_wal).unwrap().len();
-        let rows_len = std::fs::metadata(&b_disk_wal).unwrap().len();
+        let outcome_len = crate::core::wal::records_len(&b_root_wal);
+        let rows_len = crate::core::wal::records_len(&b_disk_wal);
 
         let watch = sync_audit::watch(base.path());
         let me = std::thread::current().id();

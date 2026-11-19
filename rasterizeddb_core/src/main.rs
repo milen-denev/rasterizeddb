@@ -179,6 +179,14 @@ struct Args {
     #[arg(long = "wal-checkpoint-bytes", alias = "wal_checkpoint_bytes", value_name = "N")]
     wal_checkpoint_bytes: Option<u64>,
 
+    /// KiB of zeros the log is extended by ahead of its appends (default: 1024, 0 = off)
+    ///
+    /// A commit then syncs blocks the log already owns instead of growing
+    /// the file, which about halves the sync on ext4. Costs up to this much
+    /// disk per log, and each chunk of log is written twice.
+    #[arg(long = "wal-prealloc-kb", alias = "wal_prealloc_kb", value_name = "KB")]
+    wal_prealloc_kb: Option<u64>,
+
     /// Logging level off, error, warn, info, debug, trace (default: error)
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
@@ -1071,6 +1079,7 @@ fn apply_saved_settings(args: &mut Args) {
     one("server.concurrent_threads", &mut args.concurrent_threads, &stored, "16");
     one("server.malloc_arenas", &mut args.malloc_arenas, &stored, "0");
     one("wal.checkpoint_bytes", &mut args.wal_checkpoint_bytes, &stored, "67108864");
+    one("wal.prealloc_kb", &mut args.wal_prealloc_kb, &stored, "1024");
     one("cache.enabled", &mut args.enable_cache, &stored, "false");
     one("index.residency", &mut args.index_residency, &stored, "memory");
     one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
@@ -1388,6 +1397,10 @@ fn main() -> std::io::Result<()> {
             return Err(std::io::Error::other("--wal-checkpoint-bytes must be above 0"));
         }
         let _ = rasterizeddb_core::WAL_CHECKPOINT_BYTES.set(bytes);
+    }
+    // Before any database opens too: the first record of each log reads it.
+    if let Some(kb) = args.wal_prealloc_kb {
+        let _ = rasterizeddb_core::WAL_PREALLOC_BYTES.set(kb.saturating_mul(1024));
     }
     #[cfg(feature = "query_stats")]
     if let Some(spec) = args.query_stats.as_deref() {

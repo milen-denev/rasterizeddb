@@ -12551,20 +12551,98 @@ fn fold_serialized(
     folder.finish_into(out)
 }
 
-/// Splits a scan's serialized rows into contiguous parts for a parallel fold:
-/// one part below [`PARALLEL_FOLD_MIN_ROWS`], otherwise one per available
-/// core up to eight (`RDB_FOLD_THREADS` overrides, `1` forces the serial
-/// fold). Parts end on row boundaries.
-fn fold_parts(bytes: &[u8]) -> Vec<&[u8]> {
-    const PARALLEL_FOLD_MIN_ROWS: u64 = 100_000;
+/// Below this many rows a fold runs on the statement's own thread.
+const PARALLEL_FOLD_MIN_ROWS: u64 = 100_000;
+
+/// How many threads a fold may use: one per available core up to eight;
+/// `RDB_FOLD_THREADS` overrides, and `1` forces the serial fold. Read once.
+fn fold_threads() -> usize {
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let threads = *THREADS.get_or_init(|| {
+    *THREADS.get_or_init(|| {
         std::env::var("RDB_FOLD_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)))
             .max(1)
+    })
+}
+
+/// Folds a cell scan's chunks into groups: [`fold_serialized`] for rows read
+/// as cells (`processor::column_scan`), under the same rules.
+///
+/// A scan sends a chunk per worker, and a partitioned table a scan per
+/// partition: far more chunks than threads worth running. So the parts of a
+/// large input are runs of consecutive chunks, one run per thread
+/// ([`fold_threads`]). The first run is folded alone, and the rest each on
+/// a thread and merged in order, unless the first run shows so many groups
+/// that merging would cost what the threads save (the same test, for the
+/// same reason). The groups come out in the order the chunks arrived, which
+/// is as fixed as the order the scan's workers finished in was for
+/// serialized rows: an unordered `GROUP BY` promises none.
+fn fold_cells(
+    plan: &crate::core::rql::aggregate::AggregatePlan,
+    sources: &crate::core::rql::aggregate::CellSources,
+    chunks: &[crate::core::processor::column_scan::ColumnChunk],
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    use crate::core::rql::aggregate::Folder;
+    let total: usize = chunks.iter().map(|c| c.rows).sum();
+    let mut folder = Folder::new(plan);
+    let threads = fold_threads();
+    if threads <= 1 || chunks.len() <= 1 || (total as u64) < PARALLEL_FOLD_MIN_ROWS {
+        for chunk in chunks {
+            folder.push_chunk(sources, chunk)?;
+        }
+        return folder.finish_into(out);
+    }
+    let runs: Vec<&[crate::core::processor::column_scan::ColumnChunk]> =
+        chunks.chunks(chunks.len().div_ceil(threads)).collect();
+    for chunk in runs[0] {
+        folder.push_chunk(sources, chunk)?;
+    }
+    let rest = &runs[1..];
+    if folder.groups().saturating_mul(runs.len()).saturating_mul(4) > total {
+        for chunk in rest.iter().copied().flatten() {
+            folder.push_chunk(sources, chunk)?;
+        }
+        return folder.finish_into(out);
+    }
+    let folded: Vec<Result<Folder<'_>, String>> = std::thread::scope(|scope| {
+        // No aggregate folded here reads the statement's clock (none has a
+        // FILTER or a computed argument); it goes along as it does for the
+        // fold over rows, so that stays true by construction.
+        let clock = crate::core::statement_clock::current();
+        let handles: Vec<_> = rest
+            .iter()
+            .map(|run| {
+                scope.spawn(move || {
+                    crate::core::statement_clock::on_thread(clock, || {
+                        let mut part = Folder::new(plan);
+                        for chunk in run.iter() {
+                            part.push_chunk(sources, chunk)?;
+                        }
+                        Ok(part)
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("a fold worker panicked".to_string())))
+            .collect()
     });
+    for part in folded {
+        folder.merge(part?);
+    }
+    folder.finish_into(out)
+}
+
+/// Splits a scan's serialized rows into contiguous parts for a parallel fold:
+/// one part below [`PARALLEL_FOLD_MIN_ROWS`], otherwise one per available
+/// core up to eight (`RDB_FOLD_THREADS` overrides, `1` forces the serial
+/// fold). Parts end on row boundaries.
+fn fold_parts(bytes: &[u8]) -> Vec<&[u8]> {
+    let threads = fold_threads();
     let rows = crate::core::row::row::count_serialized_rows(bytes);
     if threads <= 1 || rows < PARALLEL_FOLD_MIN_ROWS {
         return vec![bytes];
@@ -22810,6 +22888,46 @@ async fn execute_query_rows_body(
         // that path, because its documents are hydrated (async, per
         // row) before grouping. `RDB_FOLD_ROWS=1` forces it, for A/B.
         if schema.json_columns.is_empty() && !legacy_row_fold() {
+            // An aggregate that reads its rows only as fixed-width cells is
+            // folded from those cells: the scan reads them a batch at a time
+            // and builds, serializes and decodes no row. `cell_sources` says
+            // which plans those are; a fetch naming a string has no layout.
+            let from_cells = crate::core::processor::column_scan::enabled()
+                .then(|| crate::core::processor::column_scan::CellLayout::of(&aggregate_fetch))
+                .flatten()
+                .and_then(|layout| {
+                    crate::core::rql::aggregate::cell_sources(&plan, &layout, &null_flag_pairs(&schema))
+                        .map(|sources| (layout, sources))
+                });
+            if let Some((layout, sources)) = from_cells {
+                #[cfg(test)]
+                crate::core::processor::column_scan::note_fold_from_cells();
+                let folded = match source
+                    .query_columns(
+                        &query_row.where_clause,
+                        &schema.fields,
+                        query_row.query_row_fetch.clone(),
+                        std::sync::Arc::new(layout),
+                        tx,
+                    )
+                    .await
+                {
+                    Ok(chunks) => {
+                        let mut result = vec![2u8];
+                        fold_cells(&plan, &sources, &chunks, &mut result).map(|()| result)
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+                return match folded {
+                    Ok(result) => result,
+                    Err(e) => {
+                        error!("Aggregate failed: {}", e);
+                        let mut result = vec![3u8];
+                        result.extend_from_slice(e.as_bytes());
+                        result
+                    }
+                };
+            }
             let folded = match source
                 .query_bytes(
                     &query_row.where_clause,

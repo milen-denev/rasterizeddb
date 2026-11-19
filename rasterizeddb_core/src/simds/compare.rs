@@ -56,7 +56,7 @@ pub enum CmpOp {
 
 impl CmpOp {
     #[inline]
-    fn holds(self, ord: Ordering) -> bool {
+    pub(crate) fn holds(self, ord: Ordering) -> bool {
         match self {
             CmpOp::Eq => ord == Ordering::Equal,
             CmpOp::Gt => ord == Ordering::Greater,

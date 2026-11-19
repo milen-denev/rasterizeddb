@@ -3029,6 +3029,29 @@ pub fn canonical_float_cell(db_type: &crate::core::db_type::DbType, bytes: &[u8]
     }
 }
 
+/// Each `NUMERIC` column's scale where it is not the engine default, as
+/// `(write_order, scale)`: what `sarg` needs to encode a literal where the
+/// column stores it. A column that keeps each value's own scale is listed
+/// with [`OWN_SCALE_SENTINEL`].
+///
+/// One reader for every structure that compares a literal with stored
+/// `NUMERIC` bytes (the filter index, the secondary indexes, the scan's
+/// batch prefilter): two of them encoding the same literal at different
+/// scales is a wrong answer, not a missed optimisation.
+pub fn decimal_scales(fields: &[crate::core::row::schema::SchemaField]) -> smallvec::SmallVec<[(u32, u32); 4]> {
+    fields
+        .iter()
+        .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
+        .filter_map(|f| {
+            // A column that keeps each value's own scale, by its sentinel.
+            if keeps_own_scale(f) {
+                return Some((f.write_order as u32, OWN_SCALE_SENTINEL));
+            }
+            f.scale.filter(|s| *s != DECIMAL_SCALE).map(|s| (f.write_order as u32, s))
+        })
+        .collect()
+}
+
 /// Whether `field` is an unconstrained NUMERIC column that keeps each value
 /// at its own scale ([`NUMERIC_OWN_SCALE_SIZE`]).
 #[inline]

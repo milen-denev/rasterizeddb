@@ -106,6 +106,8 @@ const CALLED_ON_SHELL: &[&str] = &[
     "query_row",
     "count_rows_in_txn",
     "count_rows_with_visibility",
+    "query_columns_in_txn",
+    "query_columns_with_visibility",
     "query_row_in_txn",
     "query_row_with_visibility",
     "query_row_with_visibility_cached",
@@ -482,6 +484,16 @@ async fn a_shell_refuses_every_data_method() {
     expect(
         "count_rows_with_visibility",
         unit(shell.count_rows_with_visibility("", &fields, fetch(&shell), vis(), false).await),
+    );
+    // No columns: the refusal comes before anything reads the layout.
+    let cells = || std::sync::Arc::new(crate::core::processor::column_scan::CellLayout { columns: Vec::new() });
+    expect(
+        "query_columns_in_txn",
+        unit(shell.query_columns_in_txn("", &fields, fetch(&shell), cells(), FROZEN_TX).await),
+    );
+    expect(
+        "query_columns_with_visibility",
+        unit(shell.query_columns_with_visibility("", &fields, fetch(&shell), cells(), vis(), false).await),
     );
     expect(
         "query_row_in_txn",

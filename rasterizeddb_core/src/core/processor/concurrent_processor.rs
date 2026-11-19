@@ -17,6 +17,7 @@ use smallvec::SmallVec;
 
 use tokio::{sync::Semaphore, task};
 
+use super::column_scan::{self, CellLayout, ColumnChunk};
 use super::prefilter::{self, BatchPrefilter};
 use super::transformer::{ColumnTransformer, Next, TransformerPlan, TransformerProcessor};
 
@@ -832,7 +833,17 @@ impl ConcurrentProcessor {
         if no_filter || !worth_prefiltering(expected) {
             return None;
         }
-        BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch).map(Arc::new)
+        // Where it decides the whole `WHERE`, its mask is the answer: the
+        // workers count the rows it keeps, or read each one once for what the
+        // statement returns, and never fetch a row to evaluate the same
+        // comparisons again. See `BatchPrefilter::is_exact`.
+        let built = BatchPrefilter::build(tokens_arc.as_slice(), schema_arc.as_slice(), query_row_fetch)
+            .map(|built| Arc::new(built.deciding()));
+        #[cfg(test)]
+        if let Some(built) = built.as_ref() {
+            prefilter::note_built(built);
+        }
+        built
     }
 
     /// Compiles the `WHERE` clause into a transformer plan.
@@ -951,6 +962,10 @@ impl ConcurrentProcessor {
         // would be wrong by three orders of magnitude on a table someone reads
         // hourly.
         count_only: Option<Arc<CacheGuard<AtomicU64>>>,
+        // A scan for cells, not rows (see `column_scan`): where a row would be
+        // fetched to be emitted, the worker notes where it starts instead, and
+        // reads the noted rows' cells at the end of each batch.
+        cells: Option<column_scan::CellSink>,
         // Returned with the handles, not instead of them: the workers are
         // already running and must be joined before the error is reported.
         // `Some` means a pointer read failed and the scan stopped short, so the
@@ -1035,6 +1050,7 @@ impl ConcurrentProcessor {
             let top_n_ref = top_n.as_ref().map(Arc::clone);
             let deferred_ref = deferred_payload.as_ref().map(Arc::clone);
             let count_only_ref = count_only.as_ref().map(Arc::clone);
+            let cells_ref = cells.clone();
             // Kept per worker and added once on exit. The shared counter is one
             // cache line every worker would otherwise write to per row, which is
             // the contention the `rows_scanned` counter is batched to avoid.
@@ -1074,6 +1090,12 @@ impl ConcurrentProcessor {
                 let mut row_layout_built = false;
 
                 let mut prefilter_scratch = prefilter::Scratch::default();
+                let mut gather = cells_ref.as_ref().map(|sink| column_scan::Gather::new(&sink.layout));
+                // The mask is the `WHERE`'s answer, not only a superset of it.
+                let mask_decides = prefilter_ref.as_deref().is_some_and(BatchPrefilter::decides);
+                // And nothing is emitted or cached, so the mask is all this
+                // scan needs of a batch.
+                let count_from_mask = mask_decides && count_only_ref.is_some() && tx_rp_clone.is_none();
 
                 // Per-worker result accumulators. Sent ONCE at the end of
                 // this worker's lifetime to avoid per-batch channel sends
@@ -1181,6 +1203,16 @@ impl ConcurrentProcessor {
                                 continue;
                             }
 
+                            // A scan for cells reads this row's with the rest
+                            // of the batch's. A pointer the fetch below would
+                            // refuse is left out here as it is there.
+                            if let Some(gather) = gather.as_mut() {
+                                if likely(pointer.check_column_range().is_ok()) {
+                                    gather.note(pointer.position);
+                                }
+                                continue;
+                            }
+
                             if unlikely(
                                 pointer
                                     .fetch_row_reuse_async(io_rows_ref, scan_fetch, &mut buffer.row)
@@ -1249,7 +1281,46 @@ impl ConcurrentProcessor {
                             _ => None,
                         };
 
-                        for (batch_index, pointer) in pointers.iter().enumerate() {
+                        // A count whose `WHERE` the mask decides whole: the
+                        // kept rows are the matches, so they are counted here
+                        // and none is fetched. The same three tests the loop
+                        // below makes of a matched row, in the same order:
+                        // not deleted, not reclaimable (the mask leaves those
+                        // rows' bits set without reading them), and visible
+                        // to this snapshot. A batch whose column read failed
+                        // has no mask and takes the loop below.
+                        let mut unprocessed: &[RowPointer] = &pointers[..];
+                        if let (Some(keep), true) = (keep, count_from_mask) {
+                            let mut matched = 0u64;
+                            for (batch_index, pointer) in pointers.iter().enumerate() {
+                                if prefilter::kept(keep, batch_index)
+                                    && !pointer.deleted
+                                    && !horizon_ref.is_reclaimable(
+                                        pointer.deleted,
+                                        pointer.xmin,
+                                        pointer.xmax,
+                                    )
+                                    && visibility_ref.visible(
+                                        pointer.deleted,
+                                        pointer.xmin,
+                                        pointer.xmax,
+                                    )
+                                {
+                                    matched += 1;
+                                }
+                            }
+                            counted += matched;
+                            if let Some(pf) = prefilter_ref.as_deref() {
+                                pf.note_decided(matched);
+                            }
+                            unprocessed = &[];
+                        }
+                        // Any other scan with such a mask: a kept row matches,
+                        // so it is not fetched and interpreted to find out.
+                        let decided = mask_decides && keep.is_some();
+                        let mut decided_rows = 0u64;
+
+                        for (batch_index, pointer) in unprocessed.iter().enumerate() {
                             if unlikely(stop_ref.load(std::sync::atomic::Ordering::Relaxed)) {
                                 break;
                             }
@@ -1295,52 +1366,58 @@ impl ConcurrentProcessor {
                                 }
                             }
 
-                            // The reason is logged, not discarded: this fires in
-                            // bursts on a hot row and the pointer alone says
-                            // nothing about whether the read was short, the
-                            // layout disagreed, or the slot had been reused.
-                            if let Err(e) = pointer
-                                .fetch_row_reuse_async(
-                                    io_rows_ref,
-                                    query_row_fetch,
-                                    &mut buffer.row,
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Failed to fetch query row for pointer {:?}: {}",
-                                    pointer, e
-                                );
-                                continue;
-                            }
+                            let result = if decided {
+                                // Its bit survived the test above.
+                                decided_rows += 1;
+                                true
+                            } else {
+                                // The reason is logged, not discarded: this fires in
+                                // bursts on a hot row and the pointer alone says
+                                // nothing about whether the read was short, the
+                                // layout disagreed, or the slot had been reused.
+                                if let Err(e) = pointer
+                                    .fetch_row_reuse_async(
+                                        io_rows_ref,
+                                        query_row_fetch,
+                                        &mut buffer.row,
+                                    )
+                                    .await
+                                {
+                                    error!(
+                                        "Failed to fetch query row for pointer {:?}: {}",
+                                        pointer, e
+                                    );
+                                    continue;
+                                }
 
-                            if !row_layout_built {
-                                build_write_order_map(
-                                    &mut buffer.write_order_to_col,
-                                    &buffer.row,
-                                    schema_ref.as_slice(),
-                                );
-                                row_layout_built = true;
-                            }
+                                if !row_layout_built {
+                                    build_write_order_map(
+                                        &mut buffer.write_order_to_col,
+                                        &buffer.row,
+                                        schema_ref.as_slice(),
+                                    );
+                                    row_layout_built = true;
+                                }
 
-                            let result = {
-                                let processor = unsafe { &mut *processor_cell.get() };
-                                processor.execute_row(
-                                    &RowView::new(&buffer.row, &buffer.write_order_to_col),
-                                    &mut buffer.bool_buffer,
-                                )
-                            };
+                                let result = {
+                                    let processor = unsafe { &mut *processor_cell.get() };
+                                    processor.execute_row(
+                                        &RowView::new(&buffer.row, &buffer.write_order_to_col),
+                                        &mut buffer.bool_buffer,
+                                    )
+                                };
 
-                            let result = match result {
-                                Ok(matched) => matched,
-                                Err(e) => {
-                                    // Record the first failure and stop every
-                                    // worker. Continuing would emit whatever
-                                    // this worker matched so far as if the
-                                    // query had succeeded.
-                                    eval_error_ref.record(e);
-                                    stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    break;
+                                match result {
+                                    Ok(matched) => matched,
+                                    Err(e) => {
+                                        // Record the first failure and stop every
+                                        // worker. Continuing would emit whatever
+                                        // this worker matched so far as if the
+                                        // query had succeeded.
+                                        eval_error_ref.record(e);
+                                        stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             };
 
@@ -1374,12 +1451,27 @@ impl ConcurrentProcessor {
                                     continue;
                                 }
 
+                                // As in the unfiltered branch: its cells are
+                                // read with the rest of the batch's.
+                                if let Some(gather) = gather.as_mut() {
+                                    if likely(pointer.check_column_range().is_ok()) {
+                                        gather.note(pointer.position);
+                                    }
+                                    continue;
+                                }
+
                                 // Overrides `query_covers_requested`: reusing
                                 // the WHERE buffer would keep exactly the wide
                                 // payload this deferral exists to skip.
                                 let matched_fetch = deferred_ref
                                     .as_deref()
-                                    .or((!query_covers_requested).then_some(requested_row_fetch));
+                                    .or((!query_covers_requested).then_some(requested_row_fetch))
+                                    // A row the mask decided was never read.
+                                    // Where the `WHERE` fetch covers what is
+                                    // asked for, its buffer is what is emitted,
+                                    // extra columns and all, so that is the
+                                    // read it is owed.
+                                    .or(decided.then_some(query_row_fetch));
                                 if let Some(matched_fetch) = matched_fetch {
                                     if let Err(e) = pointer
                                         .fetch_row_reuse_async(
@@ -1432,6 +1524,16 @@ impl ConcurrentProcessor {
                                 }
                             }
                         }
+                        if let Some(pf) = prefilter_ref.as_deref() {
+                            pf.note_decided(decided_rows);
+                        }
+                    }
+
+                    // The cells of the rows this batch noted; a row that
+                    // cannot be read is left out, as its fetch would have
+                    // left it out of the rows.
+                    if let Some(gather) = gather.as_mut() {
+                        gather.flush_readable(io_rows_ref).await;
                     }
 
                     // Keep only this worker's best `cap` rows.
@@ -1537,6 +1639,12 @@ impl ConcurrentProcessor {
                 if let Some(ref tx_rp) = tx_rp_clone {
                     if !acc_ptrs.is_empty() {
                         let _ = tx_rp.send(acc_ptrs).await;
+                    }
+                }
+                if let (Some(gather), Some(sink)) = (gather, cells_ref.as_ref()) {
+                    let chunk = gather.finish();
+                    if chunk.rows > 0 {
+                        let _ = sink.chunks.send(chunk).await;
                     }
                 }
             }));
@@ -2150,6 +2258,7 @@ impl ConcurrentProcessor {
             crate::core::cancel::current(),
             None,
             Some(Arc::clone(&counter)),
+            None,
         )
         .await;
 
@@ -2161,6 +2270,150 @@ impl ConcurrentProcessor {
         Self::check_worker_outcome(join_results, &eval_error)?;
 
         Ok(counter.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The cells of the rows matching `where_query`, for a statement that
+    /// reads them only as cells: an aggregate over fixed-width columns. See
+    /// [`column_scan`] for what is read and why it is the rows the bytes
+    /// scan would emit.
+    ///
+    /// The query cache is read and filled as [`Self::process_into_bytes`]
+    /// does it: a cached entry is the pointers matching the clause, and the
+    /// cells of those this snapshot sees are read without a scan.
+    ///
+    /// No `LIMIT` and no `ORDER BY`, as for [`Self::process_count`]: both
+    /// belong to the aggregated output.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn process_columns<'a, S: StorageIO>(
+        &self,
+        table_name: &str,
+        where_query: &str,
+        query_row_fetch: RowFetch,
+        layout: StdArc<CellLayout>,
+        table_schema: &[SchemaField],
+        io_rows: Arc<S>,
+        iterator: &mut RowPointerIterator<S>,
+        generation: Option<u64>,
+        visibility: Visibility,
+    ) -> std::io::Result<Vec<ColumnChunk>> {
+        if let Some(table_generation) = generation {
+            if let Some(entry) = query_cache::lookup(table_name, where_query, table_generation, None) {
+                #[cfg(feature = "query_stats")]
+                crate::core::query_stats::note_rows_scanned(entry.pointers.len() as u64);
+                let mut gather = column_scan::Gather::new(&layout);
+                let mut unreadable = false;
+                for pointer in entry.pointers.iter() {
+                    if !visibility.visible(pointer.deleted, pointer.xmin, pointer.xmax) {
+                        continue;
+                    }
+                    if pointer.check_column_range().is_err() {
+                        unreadable = true;
+                        break;
+                    }
+                    gather.note(pointer.position);
+                    if gather.pending() >= column_scan::CACHED_READ_ROWS && gather.flush(&*io_rows).await.is_err() {
+                        unreadable = true;
+                        break;
+                    }
+                }
+                // An unreadable pointer invalidates the entry and the scan
+                // runs for real, as `try_collect_cached_bytes` has it. What
+                // was read of the entry until then is dropped with `gather`.
+                if !unreadable && gather.flush(&*io_rows).await.is_ok() {
+                    let chunk = gather.finish();
+                    return Ok(if chunk.rows > 0 { vec![chunk] } else { Vec::new() });
+                }
+                query_cache::record_abandoned_hit();
+            }
+        }
+
+        let schema_arc = Self::schema_arc(table_schema);
+        let (no_filter, tokens_arc) =
+            Self::prepare_query(where_query, &schema_arc).map_err(std::io::Error::other)?;
+        let compiled_plan = if no_filter {
+            None
+        } else {
+            Some(Arc::new(
+                Self::compile_query_plan(&schema_arc, &tokens_arc)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+            ))
+        };
+
+        // Both halves are the WHERE's own fetch, as for a count: a matched
+        // row is not fetched, its cells are.
+        let shared_tuple: Arc<(RowFetch, RowFetch)> =
+            Arc::new((query_row_fetch.clone(), query_row_fetch));
+
+        let (tx_cells, rx_cells) = kanal::unbounded_async::<ColumnChunk>();
+        let sink = column_scan::CellSink { layout, chunks: tx_cells };
+
+        let cache_enabled = query_cache::enabled() && generation.is_some();
+        let (tx_rp, rx_rp) = if cache_enabled {
+            let (a, b) = kanal::unbounded_async::<Vec<RowPointer>>();
+            (Some(a), Some(b))
+        } else {
+            (None, None)
+        };
+
+        let limit_counter: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+        let stop_processing: Arc<CacheGuard<AtomicBool>> = Arc::new(AtomicBool::new(false).into());
+        let eval_error: Arc<CacheGuard<ScanFailure>> = Arc::new(ScanFailure::default().into());
+        let reading_time_total: Arc<CacheGuard<AtomicU64>> = Arc::new(AtomicU64::new(0).into());
+
+        let (batch_handles, pointer_read_error) = Self::spawn_batch_tasks(
+            iterator,
+            Arc::clone(&shared_tuple),
+            Arc::clone(&schema_arc),
+            compiled_plan,
+            Self::build_prefilter(no_filter, &tokens_arc, &schema_arc, &shared_tuple.0, iterator.expected_records()),
+            Arc::clone(&io_rows),
+            // No row channel and no bytes channel: cells are the answer.
+            None,
+            None,
+            tx_rp.clone(),
+            None,
+            false,
+            no_filter,
+            // The branch that reads it is past the point a cell scan leaves
+            // the row at.
+            false,
+            Arc::clone(&limit_counter),
+            Arc::clone(&stop_processing),
+            Arc::clone(&reading_time_total),
+            Arc::clone(&eval_error),
+            visibility,
+            crate::core::cancel::current(),
+            None,
+            None,
+            Some(sink.clone()),
+        )
+        .await;
+
+        let join_results = join_all(batch_handles).await;
+        drop(tx_rp);
+        // After the join, so no worker outlives the statement it served.
+        if let Some(e) = pointer_read_error {
+            return Err(e.into());
+        }
+        Self::check_worker_outcome(join_results, &eval_error)?;
+        drop(sink);
+
+        let mut chunks: Vec<ColumnChunk> = Vec::new();
+        if !rx_cells.is_empty() {
+            let _ = rx_cells.drain_into(&mut chunks);
+        }
+        drop(rx_cells);
+
+        if let (Some(rx_rp), Some(generation)) = (rx_rp, generation) {
+            let pointers = Self::drain_row_pointers(rx_rp);
+            // Stored only when the scan ran to its end: a complete match set.
+            // There is no limit for a prefix to be keyed by.
+            if !stop_processing.load(std::sync::atomic::Ordering::Acquire) {
+                query_cache::store(table_name, where_query, generation, None, pointers);
+            }
+        }
+
+        Ok(chunks)
     }
 
     pub async fn process<'a, S: StorageIO>(
@@ -2316,6 +2569,7 @@ impl ConcurrentProcessor {
             // not set `stopped_early`, and caches a complete match set.
             Self::top_n_spec(&schema_arc, &order_by, limit),
             // Rows are the answer here.
+            None,
             None,
         )
         .await;
@@ -2548,6 +2802,7 @@ impl ConcurrentProcessor {
             // to keep a top-N by.
             None,
             // Bytes mode never serves an aggregate.
+            None,
             None,
         )
         .await;

@@ -4615,20 +4615,7 @@ impl<S: StorageIO> Table<S> {
     /// Each `NUMERIC(p, s)` column's scale, where it is not the engine
     /// default, so a literal is bounded where the column stores it.
     fn decimal_scales(&self) -> smallvec::SmallVec<[(u32, u32); 4]> {
-        self.schema
-            .fields
-            .iter()
-            .filter(|f| f.db_type == crate::core::db_type::DbType::DECIMAL)
-            .filter_map(|f| {
-                // A column that keeps each value's own scale, by its sentinel.
-                if crate::core::value_codec::keeps_own_scale(f) {
-                    return Some((f.write_order as u32, crate::core::value_codec::OWN_SCALE_SENTINEL));
-                }
-                f.scale
-                    .filter(|s| *s != crate::core::value_codec::DECIMAL_SCALE)
-                    .map(|s| (f.write_order as u32, s))
-            })
-            .collect()
+        crate::core::value_codec::decimal_scales(&self.schema.fields)
     }
 
     /// The candidate slots a secondary index gives for a tokenized WHERE
@@ -5511,6 +5498,82 @@ impl<S: StorageIO> Table<S> {
             limit
         );
         Ok((bytes, overfetched))
+    }
+
+    /// The cells of the rows matching `query` as `reader` sees them, laid out
+    /// as `layout` says: [`ConcurrentProcessor::process_columns`]. For an
+    /// aggregate that reads its rows only as fixed-width cells; like
+    /// [`Self::count_rows_in_txn`] it takes no limit and no ordering.
+    pub async fn query_columns_in_txn(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
+        reader: TxId,
+    ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        self.data()?;
+        self.query_columns(query, schema_fields, query_row_fetch, layout, reader, None, true).await
+    }
+
+    /// [`Self::query_columns_in_txn`] under a rule the caller took, so a
+    /// statement reading several partitions sees them all through one
+    /// snapshot. `cache == false` neither reads nor fills the query cache.
+    pub async fn query_columns_with_visibility(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
+        visibility: Visibility,
+        cache: bool,
+    ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        self.data()?;
+        self.query_columns(query, schema_fields, query_row_fetch, layout, FROZEN_TX, Some(visibility), cache)
+            .await
+    }
+
+    /// The one cell read: as `reader`, whose snapshot is taken once the read
+    /// holds its guards, or under `visibility` when the caller took one.
+    #[allow(clippy::too_many_arguments)]
+    async fn query_columns(
+        &self,
+        query: &str,
+        schema_fields: &[SchemaField],
+        query_row_fetch: RowFetch,
+        layout: std::sync::Arc<crate::core::processor::column_scan::CellLayout>,
+        reader: TxId,
+        visibility: Option<Visibility>,
+        cache: bool,
+    ) -> Result<Vec<crate::core::processor::column_scan::ColumnChunk>> {
+        let d = self.data()?;
+
+        let _gate = self.compaction_gate.read().await;
+        let _read = d.read_guard();
+
+        // The snapshot first, then the generation: see
+        // `query_row_bytes_reporting`, whose cache rule this shares.
+        let visibility = visibility.unwrap_or_else(|| self.read_visibility_for(reader));
+        let generation = self.cache_generation();
+
+        let mut iterator = RowPointerIterator::new_deferred(d.io_pointers.clone())
+            .await
+            .unwrap();
+        iterator.set_candidates(self.candidates_for(d, query, None).await);
+
+        self.concurrent_processor
+            .process_columns(
+                &self.cache_scope,
+                query,
+                query_row_fetch,
+                layout,
+                schema_fields,
+                d.io_rows.clone(),
+                &mut iterator,
+                cache_generation_for(&visibility, generation).filter(|_| cache && self.caches_queries()),
+                visibility,
+            )
+            .await
     }
 
     /// A fetch of just the columns named by write order, for the index build

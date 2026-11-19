@@ -2454,6 +2454,103 @@ fn fold_with(plan: &AggregatePlan, rows: &[Row], byte_table: bool) -> Result<Vec
     folder.finish()
 }
 
+/// Whether the fold reads each row only as the stored bytes of plain
+/// columns: no computed grouping key, and every aggregate (the HAVING
+/// condition's too) a function of one column or of none, with no `FILTER`,
+/// no computed argument and no values kept in order. Everything else
+/// evaluates an expression against the row, or keeps what the row's other
+/// columns say, and needs the row.
+///
+/// An allowlist over [`AggregatePlan`] and [`SelectItem`]: `group_by` keys
+/// that are not computed are plain columns; `order_by`, `limit` and `offset`
+/// shape the folded output and read no row; `distinct` is the accumulator's
+/// own business (`Acc::Distinct` is fed bytes); a `call` matters only to the
+/// collecting functions, which are refused. A select item of any other kind
+/// than a grouping column or a literal is refused.
+fn reads_only_cells(plan: &AggregatePlan) -> bool {
+    let plain = |item: &SelectItem| {
+        matches!(
+            item,
+            SelectItem::Aggregate { func, filter: None, arg_expr: None, .. } if !func.collects()
+        )
+    };
+    plan.computed_keys.is_empty()
+        && plan.items.iter().all(|item| match item {
+            SelectItem::Aggregate { .. } => plain(item),
+            SelectItem::Column { .. } | SelectItem::Literal { .. } => true,
+            SelectItem::Scalar { .. }
+            | SelectItem::Window { .. }
+            | SelectItem::RowExpr { .. }
+            | SelectItem::Computed { .. } => false,
+        })
+        && plan.having.as_ref().is_none_or(|h| h.aggregates.iter().all(plain))
+}
+
+/// Where each column a fold reads sits in a cell scan's chunks.
+#[derive(Debug, Clone)]
+pub struct CellSources {
+    /// One per column the fold reads, in the fold's own numbering.
+    slots: Vec<CellSource>,
+}
+
+#[derive(Debug, Clone)]
+struct CellSource {
+    /// The chunk column holding the value, and its width.
+    col: usize,
+    width: usize,
+    /// The chunk column holding its NULL flag, and that one's width.
+    flag: Option<(usize, usize)>,
+}
+
+impl CellSources {
+    /// Row `row`'s value for fold column `slot`: `None` when its flag says
+    /// NULL, as a row retyped from its flags reads (`retype_row_nulls`).
+    #[inline(always)]
+    fn cell<'c>(
+        &self,
+        chunk: &'c crate::core::processor::column_scan::ColumnChunk,
+        slot: usize,
+        row: usize,
+    ) -> Option<&'c [u8]> {
+        let source = &self.slots[slot];
+        if let Some((flag, width)) = source.flag {
+            if crate::core::rql::nullable::flag_is_set(chunk.cell(flag, width, row)) {
+                return None;
+            }
+        }
+        Some(chunk.cell(source.col, source.width, row))
+    }
+}
+
+/// How `plan` folds from the cells of a scan laid out as `layout`, or `None`
+/// when it has to see rows: it reads more of a row than plain columns
+/// ([`reads_only_cells`]), or a column it reads is not in the layout.
+///
+/// `null_flags` is `(value write_order, flag write_order)` for every
+/// nullable column. A flag that is not in the layout is never set, as a row
+/// without the flag column is never retyped.
+pub fn cell_sources(
+    plan: &AggregatePlan,
+    layout: &crate::core::processor::column_scan::CellLayout,
+    null_flags: &[(u64, u64)],
+) -> Option<CellSources> {
+    if !reads_only_cells(plan) {
+        return None;
+    }
+    let folder = Folder::new(plan);
+    let mut slots = Vec::with_capacity(folder.positions.wanted.len());
+    for write_order in folder.positions.wanted.iter() {
+        let col = layout.position(*write_order)?;
+        let flag = null_flags
+            .iter()
+            .find(|(value, _)| value == write_order)
+            .and_then(|(_, flag)| layout.position(*flag))
+            .map(|at| (at, layout.columns[at].width as usize));
+        slots.push(CellSource { col, width: layout.columns[col].width as usize, flag });
+    }
+    Some(CellSources { slots })
+}
+
 /// Where one grouping key's bytes come from.
 enum KeySource<'p> {
     /// Evaluated against the row: no scanned column carries it.
@@ -2825,37 +2922,14 @@ impl<'p> Folder<'p> {
                                 }
                             }
                         }
-                        KeySource::Column(slot) => {
-                            let value = self.positions.get(row, *slot);
-                            let canonical;
-                            let float_canonical;
-                            let raw = value;
-                            let value = match value {
-                                Some(b) if *legacy_char => {
-                                    canonical = crate::core::value_codec::legacy_char_canonical(b);
-                                    Some(&canonical[..])
-                                }
-                                Some(b) => match float.as_ref().and_then(|t| crate::core::value_codec::canonical_float_cell(t, b)) {
-                                    Some(c) => {
-                                        float_canonical = c;
-                                        Some(&float_canonical[..])
-                                    }
-                                    None => Some(b),
-                                },
-                                None => None,
-                            };
-                            push_key_part(&mut self.key, plain.as_deref_mut(), value, *document);
-                            // What the group shows is the float as written
-                            // (-0 stays -0 when it came first).
-                            if let (Some(b), Some(v), Some(plain)) = (raw, value, plain.as_deref_mut()) {
-                                if !*legacy_char && b != v {
-                                    let n = plain.len() - 4 - v.len();
-                                    plain.truncate(n);
-                                    plain.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                                    plain.extend_from_slice(b);
-                                }
-                            }
-                        }
+                        KeySource::Column(slot) => push_column_key_part(
+                            &mut self.key,
+                            plain.as_deref_mut(),
+                            self.positions.get(row, *slot),
+                            *document,
+                            *legacy_char,
+                            float.as_ref(),
+                        ),
                     }
                 }
                 self.group_for_key(byte_cell)
@@ -2872,6 +2946,90 @@ impl<'p> Folder<'p> {
             self.n_items,
             run,
         )
+    }
+
+    /// Folds every row of `chunk`, read as cells: [`Folder::push`] for a plan
+    /// [`cell_sources`] accepts, without a `Row`. A key part and an
+    /// aggregate's argument are the same bytes `push` finds in the row, a
+    /// NULL where the cell's flag is set, and they go through the same key
+    /// encoding and the same accumulators.
+    pub fn push_chunk(
+        &mut self,
+        sources: &CellSources,
+        chunk: &crate::core::processor::column_scan::ColumnChunk,
+    ) -> Result<(), String> {
+        let plan = self.plan;
+        if sources.slots.len() != self.positions.wanted.len() {
+            return Err("a cell fold was given another plan's columns".to_string());
+        }
+        for r in 0..chunk.rows {
+            let cell = |slot: usize| sources.cell(chunk, slot, r);
+            let byte_cell = self.byte_slot.and_then(|slot| match cell(slot) {
+                None => Some(256),
+                Some([b]) => Some(*b as usize),
+                Some(_) => None,
+            });
+            let known = byte_cell
+                .map(|cell| self.byte_groups[cell])
+                .filter(|g| *g != u32::MAX);
+            let at = match known {
+                Some(at) => at as usize,
+                None => {
+                    self.key.clear();
+                    self.plain.clear();
+                    let mut plain = self.shown.is_some().then_some(&mut self.plain);
+                    for (((source, document), legacy_char), float) in self
+                        .key_sources
+                        .iter()
+                        .zip(&self.document_keys)
+                        .zip(&self.legacy_char_keys)
+                        .zip(&self.float_keys)
+                    {
+                        match source {
+                            // `cell_sources` accepts no such plan.
+                            KeySource::Computed(_) => {
+                                return Err("a computed grouping key cannot be folded from cells".to_string());
+                            }
+                            KeySource::Column(slot) => push_column_key_part(
+                                &mut self.key,
+                                plain.as_deref_mut(),
+                                cell(*slot),
+                                *document,
+                                *legacy_char,
+                                float.as_ref(),
+                            ),
+                        }
+                    }
+                    self.group_for_key(byte_cell)
+                }
+            };
+            let run = &mut self.accs[at * self.stride..(at + 1) * self.stride];
+            // `accumulate_aggregate` for an aggregate with no FILTER and no
+            // computed argument, which is all `cell_sources` lets through:
+            // the column's bytes under its declared type, `None` for a NULL,
+            // and neither bytes nor type for `COUNT(*)`.
+            for (i, item) in plan.items.iter().enumerate() {
+                if let SelectItem::Aggregate { arg, .. } = item {
+                    let (bytes, ty) = match arg {
+                        Some(f) => (self.item_slots[i].and_then(cell), Some(&f.db_type)),
+                        None => (None, None),
+                    };
+                    run[i].accumulate(bytes, ty);
+                }
+            }
+            if let Some(h) = plan.having.as_ref() {
+                for (j, item) in h.aggregates.iter().enumerate() {
+                    let SelectItem::Aggregate { arg, .. } = item else { continue };
+                    let Some(acc) = run.get_mut(self.n_items + j) else { continue };
+                    let (bytes, ty) = match arg {
+                        Some(f) => (self.having_slots.get(j).copied().flatten().and_then(cell), Some(&f.db_type)),
+                        None => (None, None),
+                    };
+                    acc.accumulate(bytes, ty);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Adds every group of `other` — a folder over a disjoint part of the same
@@ -2984,6 +3142,47 @@ impl<'p> Folder<'p> {
         }
 
         Ok(out)
+    }
+}
+
+/// Appends a plain grouping column's part of a key from its stored bytes
+/// (`None` for a NULL): a legacy `CHAR` and a float by their one form per
+/// value, with the float as written kept for what the group shows. Shared
+/// by the fold over rows and the fold over cells, so the two key alike.
+fn push_column_key_part(
+    key: &mut Vec<u8>,
+    mut plain: Option<&mut Vec<u8>>,
+    raw: Option<&[u8]>,
+    document: bool,
+    legacy_char: bool,
+    float: Option<&DbType>,
+) {
+    let canonical;
+    let float_canonical;
+    let value = match raw {
+        Some(b) if legacy_char => {
+            canonical = crate::core::value_codec::legacy_char_canonical(b);
+            Some(&canonical[..])
+        }
+        Some(b) => match float.and_then(|t| crate::core::value_codec::canonical_float_cell(t, b)) {
+            Some(c) => {
+                float_canonical = c;
+                Some(&float_canonical[..])
+            }
+            None => Some(b),
+        },
+        None => None,
+    };
+    push_key_part(key, plain.as_deref_mut(), value, document);
+    // What the group shows is the float as written
+    // (-0 stays -0 when it came first).
+    if let (Some(b), Some(v), Some(plain)) = (raw, value, plain) {
+        if !legacy_char && b != v {
+            let n = plain.len() - 4 - v.len();
+            plain.truncate(n);
+            plain.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            plain.extend_from_slice(b);
+        }
     }
 }
 

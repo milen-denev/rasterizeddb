@@ -78,6 +78,36 @@ pub fn wal_checkpoint_bytes() -> u64 {
     *WAL_CHECKPOINT_BYTES.get().unwrap_or(&(64 * 1024 * 1024))
 }
 
+/// Bytes of zeros the log is extended by ahead of its append point, so a
+/// commit's `fdatasync` overwrites blocks the file already owns instead of
+/// growing it. 0 turns it off. Default: 1 MiB.
+///
+/// A sync of a file that grew also commits the filesystem journal for the new
+/// length; one of a file that did not is the data flush alone. Measured
+/// 2026-11-19 on ext4/NVMe, one small record per sync: 4.7-4.9 ms growing,
+/// 2.2-2.4 ms into zero-filled space. Zero-filled rather than `fallocate`d:
+/// the first write into an allocated-but-unwritten block commits the journal
+/// too, so a record over 4 KiB gained nothing there (5.0-5.2 ms against
+/// 2.3-2.6 ms zero-filled).
+///
+/// Set by `--wal-prealloc-kb` before any database opens; otherwise read once
+/// from `RASTERIZEDDB_WAL_PREALLOC_KB`, which is how the test routine runs a
+/// suite both ways.
+pub static WAL_PREALLOC_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// The default of [`WAL_PREALLOC_BYTES`].
+pub const DEFAULT_WAL_PREALLOC_BYTES: u64 = 1024 * 1024;
+
+#[inline]
+pub fn wal_prealloc_bytes() -> u64 {
+    *WAL_PREALLOC_BYTES.get_or_init(|| {
+        std::env::var("RASTERIZEDDB_WAL_PREALLOC_KB")
+            .ok()
+            .and_then(|kb| kb.trim().parse::<u64>().ok())
+            .map_or(DEFAULT_WAL_PREALLOC_BYTES, |kb| kb.saturating_mul(1024))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Allocator
 // ---------------------------------------------------------------------------

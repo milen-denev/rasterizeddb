@@ -382,7 +382,7 @@ impl Scenario {
             insert(&db, n as i32, &format!("old_{n:02}")).await;
         }
         db.sync_durable().unwrap();
-        let old_log = std::fs::read(root.join(DEFAULT_WAL_NAME)).unwrap();
+        let old_log = crate::core::wal::read_records(&root.join(DEFAULT_WAL_NAME));
         let baseline = durable_baseline(&root);
         // What a crash image needs from here on is what happened since: the
         // baseline is durable whole.
@@ -401,7 +401,7 @@ impl Scenario {
     fn image(&self, events: &[SyncEvent], seed: u64) -> PathBuf {
         let mut rng = Rng::new(seed);
         let wal_path = self.root.join(DEFAULT_WAL_NAME);
-        let current = std::fs::read(&wal_path).unwrap();
+        let current = crate::core::wal::read_records(&wal_path);
         // The baseline synced the log too, before its events were dropped.
         let synced = synced_log_len(events, &wal_path, current.len()).max(self.old_log.len());
         let cut = if seed == 0 {
@@ -536,7 +536,7 @@ impl Scenario {
         drop(watch);
         drop(db);
         crate::core::wal::remove_for(&path_str(&root));
-        let log = std::fs::read(root.join(DEFAULT_WAL_NAME)).unwrap();
+        let log = crate::core::wal::read_records(&root.join(DEFAULT_WAL_NAME));
         assert!(
             log.starts_with(&old_log),
             "the log no longer holds the old table's records ({} bytes, {} before the \
@@ -950,7 +950,7 @@ async fn a_drop_whose_barrier_may_be_durable_does_not_bring_the_table_back() {
     let events = watch.take_events();
     drop(watch);
     let wal_path = root.join(DEFAULT_WAL_NAME);
-    let current = std::fs::read(&wal_path).unwrap();
+    let current = crate::core::wal::read_records(&wal_path);
     let synced = synced_log_len(&events, &wal_path, current.len());
     assert!(synced < current.len(), "the barrier was synced, so nothing is undecided");
     let mut images = Vec::new();
@@ -1682,7 +1682,7 @@ mod pools {
                     f.sync_all().unwrap();
                     let bytes = std::fs::read(&path).unwrap();
                     if path.file_name().unwrap() == DEFAULT_WAL_NAME {
-                        logs.push((path.clone(), bytes.clone()));
+                        logs.push((path.clone(), crate::core::wal::read_records(&path)));
                     }
                     std::fs::write(img.join(path.file_name().unwrap()), &bytes).unwrap();
                     baseline.insert(path);
@@ -1717,7 +1717,7 @@ mod pools {
             let synced = &events[..=instant];
 
             for (log, at_baseline) in &self.logs {
-                let current = std::fs::read(log).unwrap();
+                let current = crate::core::wal::read_records(log);
                 assert!(
                     current.starts_with(at_baseline),
                     "{} was truncated inside the scenario, which this harness does not model",
@@ -2237,7 +2237,7 @@ mod pools {
             insert(&db, n, &format!("old_{n:02}")).await;
         }
         let root_log = root.join(DEFAULT_WAL_NAME);
-        let logged = std::fs::metadata(&root_log).unwrap().len();
+        let logged = crate::core::wal::records_len(&root_log);
 
         crate::core::wal::test_hooks::FAIL_FORGET_IN.with(|p| *p.borrow_mut() = Some(root_log.clone()));
         let moved = db.move_table_to(TABLE, &path_str(&disk)).await;
@@ -2252,7 +2252,7 @@ mod pools {
         kept.remove(0);
         assert_eq!(labels(&db, &names("old", 6)).await, kept, "after the move back");
         assert!(
-            std::fs::metadata(&root_log).unwrap().len() >= logged,
+            crate::core::wal::records_len(&root_log) >= logged,
             "the root's log was truncated, so it no longer holds the old records to replay"
         );
 
@@ -2510,7 +2510,7 @@ mod partitioned {
         }
         db.sync_durable().unwrap();
         assert_eq!(labels_of(&db, TABLE, &names("old", old)).await, names("old", old));
-        let old_log = std::fs::read(root.join(DEFAULT_WAL_NAME)).unwrap();
+        let old_log = crate::core::wal::read_records(&root.join(DEFAULT_WAL_NAME));
         let baseline = durable_baseline(&root);
         let _ = watch.take_events();
         (
@@ -2864,7 +2864,7 @@ mod partitioned {
         let events = watch.take_events();
         drop(watch);
         let wal_path = root.join(DEFAULT_WAL_NAME);
-        let current = std::fs::read(&wal_path).unwrap();
+        let current = crate::core::wal::read_records(&wal_path);
         let synced = synced_log_len(&events, &wal_path, current.len());
         assert!(synced < current.len(), "the barrier was synced, so nothing is undecided");
         let mut images = Vec::new();

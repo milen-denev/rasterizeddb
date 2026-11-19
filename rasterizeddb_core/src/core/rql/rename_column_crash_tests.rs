@@ -225,7 +225,7 @@ impl Harness {
     fn cut_power(&mut self, point: &str) {
         self.events.extend(self.watch.take_events());
         let wal_path = self.root.join(DEFAULT_WAL_NAME);
-        let current_log = std::fs::read(&wal_path).unwrap();
+        let current_log = crate::core::wal::read_records(&wal_path);
         let synced = synced_log_len(&self.events, &wal_path, current_log.len()).max(self.old_log.len());
         for seed in 0..SEEDS {
             let mut rng = Rng::new(seed + 1000 * self.images.len() as u64);
@@ -369,7 +369,7 @@ async fn crash_images(
     }
     db.sync_durable().unwrap();
 
-    let old_log = std::fs::read(root.join(DEFAULT_WAL_NAME)).unwrap();
+    let old_log = crate::core::wal::read_records(&root.join(DEFAULT_WAL_NAME));
     let baseline = durable_baseline(&root);
     let _ = watch.take_events();
     let harness = std::sync::Arc::new(Mutex::new(Harness {
