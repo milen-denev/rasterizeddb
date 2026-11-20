@@ -1064,3 +1064,47 @@ async fn a_learned_native_select_answers_as_the_plain_path() {
         learned_and_plain(&context, &session, &format!("SELECT price, id FROM lt WHERE id = {id}")).await;
     }
 }
+
+/// A native connection's learned point read on a unique key finds its row by
+/// the bound key (`row::point_key`), and answers exactly as the plain path
+/// while the row it finds is updated, deleted and inserted again; a shape a
+/// key would not answer (the key column under an `OR`) keeps the plain
+/// path's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learned_native_point_read_finds_its_row_by_the_key() {
+    use std::sync::atomic::Ordering;
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    ok(&context, "CREATE TABLE pk (id BIGINT PRIMARY KEY, v BIGINT, s TEXT)").await;
+    for id in 1..=40 {
+        ok(&context, &format!("INSERT INTO pk (id, v, s) VALUES ({id}, {}, 'n{id}')", id % 4)).await;
+    }
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let rounds = |context: NativeContext, session: &'static crate::pgwire::NativeSession| async move {
+        for _ in 0..3 {
+            for id in [1, 2, 3, 5, 8, 13, 999] {
+                learned_and_plain(&context, session, &format!("SELECT id, v, s FROM pk WHERE id = {id}")).await;
+                // Its second value varies too: a template whose values repeat
+                // is never learned, and would check nothing here.
+                let v = id % 3;
+                learned_and_plain(&context, session, &format!("SELECT id FROM pk WHERE id = {id} OR v = {v} ORDER BY id")).await;
+            }
+        }
+    };
+    let session: &'static crate::pgwire::NativeSession = Box::leak(Box::new(session));
+    let before = crate::core::row::point_key::HITS.load(Ordering::Relaxed);
+    rounds(context.clone(), session).await;
+    assert!(
+        crate::core::row::point_key::HITS.load(Ordering::Relaxed) > before,
+        "no learned native point read found its row by the key"
+    );
+    for change in [
+        "UPDATE pk SET v = 100, s = 'moved' WHERE id = 3",
+        "DELETE FROM pk WHERE id = 5",
+        "INSERT INTO pk (id, v, s) VALUES (999, 7, 'late')",
+    ] {
+        ok(&context, change).await;
+        rounds(context.clone(), session).await;
+    }
+}
+

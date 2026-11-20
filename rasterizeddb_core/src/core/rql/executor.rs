@@ -20285,7 +20285,15 @@ async fn execute_prepared_rows(
     };
     let mut query_row = prepared.query_row;
     apply_subquery_need(&mut query_row, need);
-    execute_query_rows(query_row, crate::core::rql::row_source::RowSource::Single(table), &database, tx).await
+    let run = execute_query_rows(query_row, crate::core::rql::row_source::RowSource::Single(table), &database, tx);
+    // The key reaches the scan's candidate lookup through a scope, which
+    // uses it only for this table and this rendered `WHERE`
+    // (`point_key::PointKey`): another scan the statement makes reads its
+    // own `WHERE` as before.
+    match prepared.point {
+        Some(point) => crate::core::row::point_key::scope(point, run).await,
+        None => run.await,
+    }
 }
 
 /// The half of an `INSERT` that writes its one row: generated columns,
