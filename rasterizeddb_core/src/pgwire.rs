@@ -9727,7 +9727,12 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     {
         return "22000";
     }
-    if has("invalid range bound flags") {
+    if has("invalid range bound flags")
+        // A row-form `SET (a, b) = …` whose sides differ
+        // (`sql_scan::row_assignments`), reached through an `ON CONFLICT`.
+        || has("number of columns does not match number of values")
+        || has("source for a multiple-column update item must be a sub-select or row() expression")
+    {
         return "42601";
     }
     // A NULL cast to a `NOT NULL` domain (`domains::checked_cast`).
@@ -10000,6 +10005,11 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // `DROP CONSTRAINT`'s "of relation" too, ahead of the relation rule.
     if has_raw("constraint \"") && (has_raw("\" for table \"") || has_raw("\" of relation \"")) && has("does not exist") {
         return "42704";
+    }
+    // A `SET` target that is no column (`ON CONFLICT … DO UPDATE SET nosuch
+    // = 1`), ahead of the relation rule too.
+    if message.starts_with("column \"") && has_raw("\" of relation \"") && message.ends_with("\" does not exist") {
+        return "42703";
     }
     // `DROP INDEX` of an index a constraint owns (a primary key's, a unique
     // constraint's): PostgreSQL's dependent_objects_still_exist.

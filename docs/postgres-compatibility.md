@@ -385,7 +385,9 @@ Rewritten to the statements they stand for before anything else reads them:
 logged, which an unlogged one is allowed to be); `ROW(a, b)`;
 `a [NOT] SIMILAR TO p`; `UPDATE … SET (a, b) = (x, y)` and `= (SELECT p, q
 …)` (one scalar subquery per column, so a volatile function in it runs once
-per column); `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
+per column, and a list mixing an aggregate with a plain value, `(SELECT
+max(n), 'z' FROM t)`, reads the plain one per row and is refused), in
+`ON CONFLICT … DO UPDATE` too; `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
 read as the left side's type either way); a derived table's column list,
 `FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
 
@@ -1483,8 +1485,10 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   the engine does not is 0A000. Behind a CTE, a derived table, a view or a
   function in `FROM` the engine's own message is kept. A bare name where a
   value belongs — `SET s = nosuch`, `VALUES (…, nosuch)` — is 42703 too; it
-  used to be stored as its own text. An `ON CONFLICT … DO UPDATE SET`
-  naming nothing is refused only when a row conflicts.
+  used to be stored as its own text. An `ON CONFLICT … DO UPDATE` is read
+  with the statement, conflict or not: a name in its `SET` or `WHERE` that
+  names nothing (a column, `excluded.x`, a qualifier) is refused before any
+  row is written, where the first run used to insert and succeed.
 
 ## Statements over the native protocol
 

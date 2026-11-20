@@ -338,10 +338,16 @@ pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
         let rest = item[close + 1..].trim_start();
         let Some(rhs) = rest.strip_prefix('=') else { return Ok(None) };
         let mut rhs = rhs.trim();
-        if rhs.len() > 3 && rhs.as_bytes()[..3].eq_ignore_ascii_case(b"ROW") && rhs[3..].trim_start().starts_with('(') {
+        let row = rhs.len() > 3 && rhs.as_bytes()[..3].eq_ignore_ascii_case(b"ROW") && rhs[3..].trim_start().starts_with('(');
+        if row {
             rhs = rhs[3..].trim_start();
         }
-        if !rhs.starts_with('(') || matching_close(rhs, 0) != Some(rhs.len() - 1) {
+        // A value that is no row at all, `(a, b) = 1` (also `(a, b) = (1)`
+        // once its parentheses were folded away): PostgreSQL's 42601.
+        if !rhs.starts_with('(') {
+            return Err("source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".to_string());
+        }
+        if matching_close(rhs, 0) != Some(rhs.len() - 1) {
             return Ok(None);
         }
         let inner = rhs[1..rhs.len() - 1].trim();
@@ -350,11 +356,7 @@ pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
             let from = find_keyword(inner, "FROM", 0).unwrap_or(inner.len());
             let items = split_top_level(&inner[6..from], b',');
             if items.len() != columns.len() {
-                return Err(format!(
-                    "number of columns does not match number of values ({} columns, the subquery returns {})",
-                    columns.len(),
-                    items.len()
-                ));
+                return Err("number of columns does not match number of values".to_string());
             }
             let tail = &inner[from..];
             for (column, value) in columns.iter().zip(items) {
@@ -362,12 +364,12 @@ pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
             }
         } else {
             let values = split_top_level(inner, b',');
+            // `(1)` is one parenthesised value, not a row: PostgreSQL's 42601.
+            if values.len() == 1 && !row {
+                return Err("source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".to_string());
+            }
             if values.len() != columns.len() {
-                return Err(format!(
-                    "number of columns does not match number of values ({} columns, {} values)",
-                    columns.len(),
-                    values.len()
-                ));
+                return Err("number of columns does not match number of values".to_string());
             }
             for (column, value) in columns.iter().zip(values) {
                 out_items.push(format!("{column} = {value}"));
@@ -3368,7 +3370,22 @@ mod row_assignment_tests {
             row_assignments("UPDATE d SET (a, b) = (SELECT p, q FROM e WHERE e.id = d.id) RETURNING a").unwrap().as_deref(),
             Some("UPDATE d SET a = (SELECT p FROM e WHERE e.id = d.id), b = (SELECT q FROM e WHERE e.id = d.id) RETURNING a")
         );
-        assert!(row_assignments("UPDATE d SET (a, b) = (1)").is_err());
+        assert_eq!(
+            row_assignments("UPDATE d SET (a, b) = (1)").unwrap_err(),
+            "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"
+        );
+        assert_eq!(
+            row_assignments("UPDATE oc SET (n, s) = 1 WHERE TRUE").unwrap_err(),
+            "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"
+        );
+        assert_eq!(
+            row_assignments("UPDATE oc SET (n, s) = (1) WHERE TRUE").unwrap_err(),
+            "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"
+        );
+        assert_eq!(
+            row_assignments("UPDATE d SET (a, b) = ROW(1)").unwrap_err(),
+            "number of columns does not match number of values"
+        );
         assert_eq!(row_assignments("UPDATE d SET a = (1 + 2) WHERE b = 1").unwrap(), None);
         assert_eq!(row_assignments("SELECT (a, b) = (1, 2) FROM d").unwrap(), None);
     }

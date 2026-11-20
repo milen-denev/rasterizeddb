@@ -8156,6 +8156,15 @@ async fn apply_conflict_update(
         }
     );
 
+    // `SET (a, b) = (EXCLUDED.a, EXCLUDED.b)` as one assignment per column,
+    // as pgwire expands a written `UPDATE`'s (`sql_scan::row_assignments`):
+    // this one is built here and reached the parser whole (42703 "column
+    // '(a, b)' does not exist").
+    let statement = match crate::core::sql_scan::row_assignments(&statement) {
+        Ok(Some(expanded)) => expanded,
+        Ok(None) => statement,
+        Err(e) => return ddl_error(&e),
+    };
     let Some(purpose) = recognize_query_purpose(&statement) else {
         return ddl_error(&format!("could not parse the rewritten {}", sql_literal(&statement)));
     };
@@ -8165,6 +8174,89 @@ async fn apply_conflict_update(
     CONFLICT_UPDATE_DEPTH
         .scope(depth, Box::pin(execute_with_context(purpose, database.clone(), depth, tx)))
         .await
+}
+
+/// A name in an `ON CONFLICT … DO UPDATE SET` that names nothing, found
+/// before the insert runs.
+///
+/// The `SET` list was read only when a row conflicted, so `INSERT … ON
+/// CONFLICT (id) DO UPDATE SET s = nosuch` inserted a new row and reported
+/// success, failing only on the second run. PostgreSQL analyses the clause
+/// with the statement (42703, 42P01). The `UPDATE` [`apply_conflict_update`]
+/// would run is built with each `EXCLUDED` value NULL (or the first row's,
+/// when the statement has one) and parsed, not run; only a refusal naming an
+/// undefined name is returned, so a shape the parse alone cannot read is
+/// left to the conflict that runs it.
+fn conflict_update_refusal(
+    database: &Arc<Database>,
+    table_name: &str,
+    insert_sql: &str,
+    spec: &crate::core::rql::lexer_s1::ConflictUpdate,
+) -> Option<String> {
+    let view = database.schema_view(table_name)?;
+    let schema = view.schema();
+    let written = crate::core::rql::lexer_ir::assignments_of_insert(insert_sql).unwrap_or_default();
+    let inserted: Vec<(String, String)> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+        .map(|f| {
+            let value = written
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&f.name))
+                .map(|(_, literal)| literal.clone())
+                .filter(|literal| !literal.trim().eq_ignore_ascii_case("DEFAULT"))
+                .unwrap_or_else(|| "NULL".to_string());
+            (f.name.clone(), value)
+        })
+        .collect();
+    let alias = insert_alias(insert_sql);
+    let known = crate::core::sql_scan::relation_qualifiers(table_name, alias.as_deref());
+    let known: Vec<&str> = known.iter().map(String::as_str).collect();
+    let mut allowed = known.clone();
+    allowed.push("excluded");
+    // PostgreSQL's wordings (`column "x"`, `column excluded.x`) and the
+    // parse's own for a name inside an expression, which pgwire words as
+    // PostgreSQL does (`undefined_names`). Not the engine's `column '(a,
+    // b)'`: a row-form `SET (a, b) = …` the parse alone does not read.
+    let undefined = |message: &str| {
+        ((message.starts_with("column \"") || message.starts_with("column excluded."))
+            && message.ends_with(" does not exist"))
+            || message.starts_with("missing FROM-clause entry for table ")
+            || (message.starts_with('\'') && message.ends_with("' is neither a column nor a value"))
+    };
+    let resolve = |text: &str| -> Result<String, Option<String>> {
+        let text = crate::core::sql_scan::resolve_qualifiers(text, &allowed, "excluded", "EXCLUDED", &known)
+            .map_err(|q| Some(crate::core::sql_scan::missing_from_entry(&q)))?;
+        substitute_excluded(&text, &inserted).map_err(|e| undefined(&e).then_some(e))
+    };
+    let assignments = match resolve(&spec.assignments) {
+        Ok(a) => a,
+        Err(refusal) => return refusal,
+    };
+    let condition = match spec.where_clause.as_deref().map(resolve) {
+        None => "TRUE".to_string(),
+        Some(Ok(c)) => format!("({})", c),
+        Some(Err(refusal)) => return refusal,
+    };
+    let probe = format!("UPDATE {} SET {} WHERE {}", table_name, assignments, condition);
+    let probe = match crate::core::sql_scan::row_assignments(&probe) {
+        Ok(Some(expanded)) => expanded,
+        Ok(None) => probe,
+        // A row form whose sides differ: PostgreSQL's 42601, conflict or not.
+        Err(e) => return Some(e),
+    };
+    let probe = QueryPurpose::UpdateRow(probe);
+    match crate::core::rql::lexer_ur::update_row_with_reason(&probe, &schema.fields, &schema.type_modifiers) {
+        (None, Some(reason)) if undefined(&reason) => Some(reason),
+        // A `SET` target that is no column, worded as PostgreSQL words it.
+        (None, Some(reason)) => reason
+            .strip_prefix("column '")
+            .and_then(|r| r.strip_suffix("' does not exist"))
+            .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .map(|name| format!("column \"{}\" of relation \"{}\" does not exist", name, table_name)),
+        _ => None,
+    }
 }
 
 tokio::task_local! {
@@ -19618,6 +19710,12 @@ async fn execute_autocommit(query: QueryPurpose, database: Arc<Database>, wait: 
         }
         _ => None,
     };
+    if let QueryPurpose::InsertRow(data) = &query
+        && let Some(spec) = data.on_conflict_update.as_ref()
+        && let Some(refusal) = conflict_update_refusal(&database, &data.table_name, &data.query, spec)
+    {
+        return ddl_error(&refusal);
+    }
     // The statement's whole known table set, at once, before its first
     // attempt: held by O, so every retry runs under the same locks.
     if let Some(sql) = statement_lock_text(&query)
@@ -20083,6 +20181,12 @@ async fn execute_in_txn_inner(query: QueryPurpose, database: Arc<Database>, tx: 
         }
         _ => None,
     };
+    if let QueryPurpose::InsertRow(data) = &query
+        && let Some(spec) = data.on_conflict_update.as_ref()
+        && let Some(refusal) = conflict_update_refusal(&database, &data.table_name, &data.query, spec)
+    {
+        return ddl_error(&refusal);
+    }
 
     // The statement's whole known table set, at once, before it runs (see
     // `execute_autocommit`); the block's owner holds it to the block's end.

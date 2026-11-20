@@ -298,10 +298,11 @@ pub(super) fn subject(message: &str) -> Option<Option<NamedFunction>> {
     if COLUMN_WORDINGS.iter().any(|w| message.contains(w)) {
         return Some(None);
     }
-    // A qualified name quoted whole: `column "f.nosuch" does not exist`.
-    if let Some(name) = message.strip_prefix("column \"").and_then(|r| r.strip_suffix("\" does not exist"))
-        && name.contains('.')
-    {
+    // A name quoted whole: `column "f.nosuch" does not exist`, or a bare
+    // one whose qualifier a rewrite took off (`ON CONFLICT … WHERE
+    // t.nosuch`, read as `nosuch`): read again, the name PostgreSQL reports
+    // first, as it spells it.
+    if message.strip_prefix("column \"").and_then(|r| r.strip_suffix("\" does not exist")).is_some() {
         return Some(None);
     }
     None
@@ -690,12 +691,60 @@ impl Reader<'_> {
             .copied()
             .unwrap_or(toks.len());
         if let Some(&at) = self.top_level(0, end, |_, t| t.is_word("values")).first() {
-            return self.expression(at + 1, end, &[], false);
+            self.expression(at + 1, end, &[], false)?;
+        } else if let Some(&at) = self.top_level(0, end, |_, t| t.is_word("select")).first() {
+            self.select(at, end, &[])?;
+        } else {
+            return Err(Stop::Unsure);
         }
-        if let Some(&at) = self.top_level(0, end, |_, t| t.is_word("select")).first() {
-            return self.select(at, end, &[]);
+        self.conflict_update(end)
+    }
+
+    /// The `ON CONFLICT … DO UPDATE SET … [WHERE …]` of an `INSERT` whose
+    /// rows were read: its names are the target's (by its alias when it has
+    /// one) and `excluded`'s, the same columns.
+    fn conflict_update(&self, from: usize) -> Result<(), Stop> {
+        let toks = self.toks;
+        let end = toks.len();
+        let Some(&update) = self
+            .top_level(from, end, |i, t| t.is_word("update") && i > 0 && toks[i - 1].is_word("do"))
+            .first()
+        else {
+            return Ok(());
+        };
+        if !toks.get(update + 1).is_some_and(|t| t.is_word("set")) {
+            return Err(Stop::Unsure);
         }
-        Err(Stop::Unsure)
+        // `INSERT INTO [public.]t [AS a]`.
+        let mut i = 2;
+        let mut table = toks.get(i).filter(|t| t.is_name()).ok_or(Stop::Unsure)?.text.clone();
+        i += 1;
+        if toks.get(i).is_some_and(|t| t.kind == Kind::Dot) {
+            if table != "public" {
+                return Err(Stop::Unsure);
+            }
+            table = toks.get(i + 1).filter(|t| t.is_name()).ok_or(Stop::Unsure)?.text.clone();
+            i += 2;
+        }
+        let qualifier = if toks.get(i).is_some_and(|t| t.is_word("as")) {
+            toks.get(i + 1).filter(|t| t.is_name()).ok_or(Stop::Unsure)?.text.clone()
+        } else {
+            table.clone()
+        };
+        let mut scope = vec![self.relation(&table, qualifier)?];
+        scope.push(self.relation(&table, "excluded".to_string())?);
+        let scopes: Vec<&Scope> = vec![&scope];
+        let marks = self.top_level(update + 2, end, |_, t| t.is_word("where") || t.is_word("returning"));
+        let set_end = marks.first().copied().unwrap_or(end);
+        for (a, b) in self.items(update + 2, set_end) {
+            let eq = (a..b).find(|&k| toks[k].kind == Kind::Op && toks[k].text == "=").ok_or(Stop::Unsure)?;
+            self.expression(eq + 1, b, &scopes, false)?;
+        }
+        if let Some(&at) = marks.first().filter(|&&m| toks[m].is_word("where")) {
+            let stop = marks.get(1).copied().unwrap_or(end);
+            self.expression(at + 1, stop, &scopes, false)?;
+        }
+        Ok(())
     }
 
     /// The type PostgreSQL gives an argument, `None` when this cannot say.
