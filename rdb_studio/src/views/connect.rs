@@ -9,7 +9,7 @@ use iced::widget::{Space, column, container, pick_list, row, rule, scrollable, t
 use iced::{Center, Element, Fill, Length};
 
 use crate::app::{Message, Studio};
-use crate::model::{Flavor, NativeLogin, TlsMode, Transport};
+use crate::model::{Flavor, NativeLogin, PasswordStore, TlsMode, Transport};
 use crate::theme;
 
 use super::{field, primary_button, small_button, toggle};
@@ -104,10 +104,16 @@ pub fn view(studio: &Studio) -> Element<'_, Message> {
             ),
             protocol,
             security,
+            Space::new().width(Fill),
+        ]
+        .spacing(16)
+        .align_y(iced::alignment::Vertical::Bottom),
+        row![
             column![
                 Space::new().height(16),
                 toggle("Save password", studio.form.save_password, Message::FormSavePassword),
             ],
+            password_store(studio),
             Space::new().width(Fill),
         ]
         .spacing(16)
@@ -170,6 +176,25 @@ fn secret<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     ]
     .spacing(4)
     .into()
+}
+
+/// Where a saved password goes, shown only while it is being saved.
+fn password_store(studio: &Studio) -> Element<'_, Message> {
+    if !studio.form.save_password {
+        return Space::new().width(0).into();
+    }
+    labelled(
+        "Keep it in",
+        pick_list(
+            PasswordStore::ALL,
+            Some(studio.form.password_store()),
+            Message::FormPasswordStore,
+        )
+        .padding([6, 8])
+        .text_size(13)
+        .width(Length::Fixed(200.0))
+        .into(),
+    )
 }
 
 fn labelled<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
