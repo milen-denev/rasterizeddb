@@ -464,6 +464,47 @@ pub(crate) fn plain_literal(value: &str) -> bool {
     }
 }
 
+/// Why a value written as a bare name has no value to give, in PostgreSQL's
+/// words: `nosuch`, `"nosuch"` or `x.y` where a value belongs (`VALUES (…)`,
+/// `SET c = …`) names a column, and there is none — `VALUES` sees no column
+/// at all, so even one of the table's own is unknown there.
+///
+/// The name used to be taken for its own text: `UPDATE t SET s = nosuch`
+/// stored the string "nosuch" and reported success, as did `INSERT … VALUES
+/// (…, s)`. `None` for anything else, the keywords that are values (`NULL`,
+/// `TRUE`, `CURRENT_DATE`, `DEFAULT`, …) among it; the caller asks only of a
+/// value that names none of the columns it can see.
+pub(crate) fn bare_name_refusal(value: &str) -> Option<String> {
+    let value = value.trim();
+    let word = |w: &str| {
+        w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && w.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        return (!inner.is_empty() && !inner.contains('"'))
+            .then(|| format!("column \"{}\" does not exist", inner));
+    }
+    if let Some((qualifier, column)) = value.split_once('.') {
+        return (word(qualifier) && word(column))
+            .then(|| format!("missing FROM-clause entry for table \"{}\"", qualifier.to_lowercase()));
+    }
+    if !word(value) {
+        return None;
+    }
+    const VALUE_KEYWORDS: &[&str] = &[
+        "NULL", "TRUE", "FALSE", "DEFAULT", "CURRENT_DATE", "CURRENT_TIME",
+        "CURRENT_TIMESTAMP", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER",
+        "SESSION_USER", "USER", "CURRENT_ROLE", "CURRENT_CATALOG", "CURRENT_SCHEMA",
+        // Not keywords in PostgreSQL, but the engine's own float renderings:
+        // a value it wrote back into a statement must read as it did.
+        "NAN", "INFINITY", "INF",
+    ];
+    if VALUE_KEYWORDS.iter().any(|k| value.eq_ignore_ascii_case(k)) {
+        return None;
+    }
+    Some(format!("column \"{}\" does not exist", value.to_lowercase()))
+}
+
 /// Whether a value written in `VALUES` is NULL: the keyword, or a constant
 /// expression that evaluates to NULL (`NULLIF(1, 1)`, `NULL::text`).
 ///
@@ -1708,6 +1749,10 @@ pub fn insert_row_with_defaults(
             // produces until real nullability lands.
             // `VALUES (…, DEFAULT, …)` means the same as leaving the column
             // out, so it is resolved through the same expression.
+            if let Some(refusal) = bare_name_refusal(value) {
+                REFUSAL.with(|r| *r.borrow_mut() = Some(refusal));
+                return None;
+            }
             let default_owned;
             let value: &str = if value.trim().eq_ignore_ascii_case("DEFAULT") {
                 default_owned =

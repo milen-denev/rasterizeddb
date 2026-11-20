@@ -675,6 +675,16 @@ fn parse_update_row(
                 })
         };
 
+        // A bare name that is no column names nothing: PostgreSQL's 42703,
+        // where it used to be stored as its own text (`SET s = nosuch` wrote
+        // "nosuch").
+        if !assigns_column {
+            if let Some(refusal) = crate::core::rql::lexer_ir::bare_name_refusal(value) {
+                rejection.replace(refusal);
+                return None;
+            }
+        }
+
         // `needs_evaluation` recognises calls and casts; a bare `hits + 5` has
         // neither, so `SET hits = hits + 5` was taken for a literal and refused
         // with "I64 column cannot take the literal \"hits + 5\"". Every
