@@ -427,12 +427,16 @@ type with the domain's `NOT NULL`, its checks (named as PostgreSQL names them:
 `<domain>_check`, `<domain>_check1`, …, or the `CONSTRAINT` name) and its
 default where the column has none. A violated check is PostgreSQL's 23514,
 `value for domain posint violates check constraint "posint_check"`. A cast to
-a domain is a cast to its base type.
+a domain (`x::posint`, `CAST(x AS posint)`) is a cast to its base type
+checked against the domain's constraints, as PostgreSQL's: 23514 for a
+check, 23502 `domain d does not allow null values` for a NULL cast to a
+`NOT NULL` domain.
 
 Where it differs from PostgreSQL:
 
-- A cast to a domain does not check the domain's constraints; only a
-  column's value is checked.
+- A cast to a domain is typed as its base (`pg_typeof(5::posint)` is
+  `integer`), and one of an expression calling a volatile function
+  (`random()::posint`) is refused (0A000).
 - `ALTER DOMAIN` is refused (0A000); `DROP DOMAIN … CASCADE` with columns of
   the domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`.
 - A domain's `NOT NULL` reports the column's 23502 message, not `domain d

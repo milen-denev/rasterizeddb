@@ -90,3 +90,52 @@ async fn a_rolled_back_domain_is_gone() {
         .expect("block");
     c.batch_execute("CREATE DOMAIN rbd AS text").await.expect("the name is free again");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_to_a_domain_checks_its_constraints() {
+    let server = TestServer::start().await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute(
+        "CREATE DOMAIN posint AS int CHECK (VALUE > 0);
+         CREATE DOMAIN nn AS text NOT NULL;
+         CREATE DOMAIN code AS varchar(5) CONSTRAINT short CHECK (length(VALUE) < 4) CHECK (VALUE <> 'x');
+         CREATE TABLE dt (id int PRIMARY KEY, a int, s text);
+         INSERT INTO dt VALUES (1, 3, 'ab'), (2, -1, 'abcde')",
+    )
+    .await
+    .expect("setup");
+    for (sql, want) in [
+        ("SELECT 5::posint, '7'::posint + 1, NULL::posint IS NULL", "5|8|t"),
+        ("SELECT 'ab'::code, s::text::code, upper(s)::code FROM dt WHERE id = 1", "ab|ab|AB"),
+        ("SELECT (a + 1)::posint, CAST(a AS posint) FROM dt WHERE id = 1", "4|3"),
+    ] {
+        assert_eq!(rows(&c, sql).await, [want], "{sql}");
+    }
+    let check = |domain: &str, name: &str| {
+        ("23514".to_string(), format!("value for domain {domain} violates check constraint \"{name}\""))
+    };
+    for (sql, want) in [
+        ("SELECT (-5)::posint", check("posint", "posint_check")),
+        ("SELECT CAST(-1 AS posint)", check("posint", "posint_check")),
+        ("SELECT 'abcd'::code", check("code", "short")),
+        ("SELECT 'x'::code", check("code", "code_check")),
+        ("SELECT 'it''s'::code", check("code", "short")),
+        // Every row's value, as PostgreSQL casts each.
+        ("SELECT id, a::posint FROM dt ORDER BY id", check("posint", "posint_check")),
+        ("SELECT id FROM dt WHERE a::posint > 2", check("posint", "posint_check")),
+        ("INSERT INTO dt VALUES (3, (-4)::posint, 'q')", check("posint", "posint_check")),
+        ("SELECT NULL::nn", ("23502".to_string(), "domain nn does not allow null values".to_string())),
+    ] {
+        assert_eq!(error(&c, sql).await, want, "{sql}");
+    }
+    // Over the extended protocol too: a bound value cast whole, the cast on
+    // the placeholder itself kept, and the column named for the domain.
+    for sql in ["SELECT $1::int::posint", "SELECT $1::posint"] {
+        let err = c.query(sql, &[&-3i32]).await.expect_err(sql);
+        assert_eq!(err.as_db_error().unwrap_or_else(|| panic!("{sql}: {err:?}")).code().code(), "23514", "{sql}");
+    }
+    let row = c.query_one("SELECT $1::int::posint", &[&4i32]).await.expect("extended");
+    assert_eq!(row.columns()[0].name(), "posint");
+    assert_eq!(row.get::<_, i32>(0), 4);
+    assert_eq!(rows(&c, "SELECT count(*) FROM dt").await, ["2"]);
+}

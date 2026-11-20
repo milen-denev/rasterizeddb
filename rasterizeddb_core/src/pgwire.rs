@@ -4084,7 +4084,15 @@ where
         } else {
             Vec::new()
         };
-        let reported = param_infer::infer(database, &sql, &param_oids, &scratch);
+        // A cast to a domain types its parameter as the domain's base
+        // (`$1::posint` is int4): read after the domains' rewrite, where it is
+        // `$1::int`. Unrewritten it was an unknown type, so text, and a client
+        // binding an integer refused to send it.
+        let domain_free = match crate::core::rql::domains::rewrite(database, &sql, state.current_tx()).await {
+            Ok(Some(text)) => std::borrow::Cow::Owned(text),
+            _ => std::borrow::Cow::Borrowed(&*sql),
+        };
+        let reported = param_infer::infer(database, &domain_free, &param_oids, &scratch);
         send_parameter_description(stream, &reported).await?;
         if let Some(info) = state.statements.get_mut(&stmt_name) {
             info.inferred_oids = (reported != param_oids).then_some(reported);
@@ -9721,6 +9729,10 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     }
     if has("invalid range bound flags") {
         return "42601";
+    }
+    // A NULL cast to a `NOT NULL` domain (`domains::checked_cast`).
+    if has(" does not allow null values") && has("domain ") {
+        return "23502";
     }
     if has("could not reserve transaction ids") {
         return if has("(the disk is full)") { "53100" } else { "58030" };

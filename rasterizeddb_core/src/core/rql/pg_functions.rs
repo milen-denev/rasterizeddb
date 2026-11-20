@@ -231,6 +231,10 @@ pub enum PgFunc {
     DateRange,
     TsRange,
     TstzRange,
+    /// `__rdb_domain_value(value, domain, not_null, check, ok, …)`, a cast
+    /// to a domain with constraints (`domains::checked_cast`): the value,
+    /// or the error of the first constraint it violates.
+    DomainValue,
 }
 
 /// The range type a constructor builds.
@@ -281,7 +285,7 @@ pub const NAMES: &[&str] = &[
     "ARRAY_REMOVE", "ARRAY_REPLACE", "ARRAY_UPPER", "ARRAY_LOWER", "ARRAY_DIMS", "TRIM_ARRAY", "ARRAY_FILL",
     "SCALE", "MIN_SCALE", "TRIM_SCALE", "OVERLAY", "JSONB_PRETTY", "JSONB_INSERT",
     "ISEMPTY", "LOWER_INC", "UPPER_INC", "LOWER_INF", "UPPER_INF", "RANGE_MERGE", "INT4RANGE", "INT8RANGE",
-    "NUMRANGE", "DATERANGE", "TSRANGE", "TSTZRANGE",
+    "NUMRANGE", "DATERANGE", "TSRANGE", "TSTZRANGE", "__RDB_DOMAIN_VALUE",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -473,6 +477,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "DATERANGE" => (DateRange, &[2, 3]),
         "TSRANGE" => (TsRange, &[2, 3]),
         "TSTZRANGE" => (TstzRange, &[2, 3]),
+        "__RDB_DOMAIN_VALUE" => (DomainValue, &[]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -480,6 +485,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         ConcatWs => n >= 2,
         JsonBuildObject | JsonBuildObjectText => n % 2 == 0,
         JsonBuildArray | JsonBuildArrayText => true,
+        DomainValue => n >= 3 && (n - 3) % 2 == 0,
         _ => counts.contains(&n),
     };
     if !variadic_ok {
@@ -549,7 +555,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         ArraySubscript => subscript_type(args),
         RangeLower | RangeUpper => range_bound_type(&first()),
         RangeIsEmpty | RangeLowerInc | RangeUpperInc | RangeLowerInf | RangeUpperInf => DbType::BOOL,
-        RangeMerge => first(),
+        RangeMerge | DomainValue => first(),
         Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange => constructed_range(func).expect("a constructor"),
         _ => DbType::STRING,
     }
@@ -1302,7 +1308,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
+    let non_strict = matches!(func, DomainValue | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
     // An element argument may be NULL (it finds, removes or replaces the
     // array's NULLs, as PostgreSQL's do); a NULL array is a NULL answer.
     if matches!(func, ArrayPosition | ArrayRemove | ArrayReplace) && (args[0].is_null() || args.get(2).is_some_and(|a| func == ArrayPosition && a.is_null())) {
@@ -1314,6 +1320,19 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     let s = |i: usize| text_of(&args[i]);
     if let Some(range) = range_call(func, args) {
         return range;
+    }
+    if func == DomainValue {
+        // A check that is NULL passes, as a CHECK constraint does.
+        let domain = text_of(&args[1]);
+        if args[0].is_null() && bool_argument(&args[2]).unwrap_or(false) {
+            return Err(format!("domain {domain} does not allow null values"));
+        }
+        for pair in args[3..].chunks(2) {
+            if !pair[1].is_null() && !bool_argument(&pair[1])? {
+                return Err(format!("value for domain {domain} violates check constraint \"{}\"", text_of(&pair[0])));
+            }
+        }
+        return Ok(args[0].clone());
     }
     Ok(match func {
         Left | Right => {
@@ -2292,7 +2311,7 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         // Answered by `range_call` above.
         RangeLower | RangeUpper | RangeIsEmpty | RangeLowerInc | RangeUpperInc | RangeLowerInf | RangeUpperInf
-        | RangeMerge | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange => {
+        | RangeMerge | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | DomainValue => {
             unreachable!("range functions are answered by range_call")
         }
     })

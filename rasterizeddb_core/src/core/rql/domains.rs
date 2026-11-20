@@ -9,12 +9,17 @@
 //! the column has its own; a domain with no check gets a `CHECK (TRUE)`
 //! marker, so every column of one is known (`DROP DOMAIN`'s dependency).
 //! A cast to a domain (`x::posint`, `CAST(x AS posint)`) is a cast to its
-//! base type. A violated check reports PostgreSQL's 23514, `value for
-//! domain posint violates check constraint "posint_check"`.
+//! base type, checked as PostgreSQL's `domain_in` checks it when the domain
+//! has constraints: `__rdb_domain_value((x)::int, 'posint', FALSE,
+//! 'posint_check', CASE WHEN NOT (((x)::int) > 0) THEN 0 ELSE 1 END)`,
+//! which answers the value or fails. A
+//! violated check reports PostgreSQL's 23514, `value for domain posint
+//! violates check constraint "posint_check"`; a NULL cast to a `NOT NULL`
+//! domain its 23502, `domain d does not allow null values`.
 //!
-//! Not done (docs/postgres-compatibility.md): a cast to a domain does not
-//! check its constraints; `ALTER DOMAIN`; `pg_type` lists no domain; a
-//! domain's `NOT NULL` reports the column's 23502 message.
+//! Not done (docs/postgres-compatibility.md): `ALTER DOMAIN`; `pg_type`
+//! lists no domain; a domain column's `NOT NULL` reports the column's 23502
+//! message.
 
 use std::sync::atomic::Ordering;
 
@@ -491,7 +496,10 @@ pub fn rewrite_with(sql: &str, defs: &[Domain]) -> Result<Option<String>, Refusa
             // `AS d` only inside a CAST: followed by its closing parenthesis.
             let is_cast_as = bytes[i] != b':';
             if !is_cast_as || sql[end..].trim_start().starts_with(')') {
-                edits.push((at, end, d.base.clone()));
+                match checked_cast(sql, i, at, end, d)? {
+                    Some(edit) => edits.push(edit),
+                    None => edits.push((at, end, d.base.clone())),
+                }
                 i = end;
                 continue;
             }
@@ -514,6 +522,175 @@ pub fn rewrite_with(sql: &str, defs: &[Domain]) -> Result<Option<String>, Refusa
     }
     out.push_str(&sql[copied..]);
     Ok(Some(out))
+}
+
+/// A cast to a domain with constraints as the checked call that answers it:
+/// the edit replacing the whole cast, operand included. `None` for a domain
+/// with nothing to check (a plain cast to its base), and for an operand this
+/// cannot delimit. `cast_at` is the `::` or `AS`, `type_at..type_end` the
+/// domain's name.
+fn checked_cast(
+    sql: &str,
+    cast_at: usize,
+    type_at: usize,
+    type_end: usize,
+    d: &Domain,
+) -> Result<Option<(usize, usize, String)>, Refusal> {
+    if d.checks.is_empty() && !d.not_null {
+        return Ok(None);
+    }
+    let (start, end, operand) = if sql.as_bytes()[cast_at] == b':' {
+        let Some(start) = cast_operand_start(sql, cast_at) else { return Ok(None) };
+        (start, type_end, sql[start..cast_at].trim())
+    } else {
+        // `CAST(x AS d)`: from `CAST` to its closing parenthesis.
+        let Some(open) = unmatched_open_before(sql, cast_at) else { return Ok(None) };
+        let head = sql[..open].trim_end();
+        if !(head.len() >= 4 && head[head.len() - 4..].eq_ignore_ascii_case("CAST")) {
+            return Ok(None);
+        }
+        let Some(close) = sql[type_end..].find(')').map(|p| type_end + p) else { return Ok(None) };
+        (head.len() - 4, close + 1, sql[open + 1..cast_at].trim())
+    };
+    let _ = type_at;
+    // The operand is read once per check: one whose value changes between
+    // readings would be checked as one value and answer another.
+    if crate::core::rql::replicated_values::calls_volatile(operand) {
+        return Err(refusal(
+            "0A000",
+            format!("a cast of a volatile expression to the domain {} is not supported yet", d.name),
+        ));
+    }
+    // A `::` operand is a primary expression (`::` binds tightest), written
+    // bare so `$1::int` still types its parameter; a CAST's may be any
+    // expression, and is parenthesised.
+    let value = if sql.as_bytes()[cast_at] == b':' {
+        format!("({operand}::{})", d.base)
+    } else {
+        format!("(({operand})::{})", d.base)
+    };
+    let mut call = format!(
+        "__rdb_domain_value({value}, {}, {}",
+        crate::core::value_codec::quote_sql(&crate::core::rql::user_types::display_name(&d.name)),
+        if d.not_null { "TRUE" } else { "FALSE" }
+    );
+    for (name, expr) in &d.checks {
+        // As a CASE: a condition is no function argument here. A NULL check
+        // passes, as a CHECK constraint's does: `NOT NULL` is NULL, the ELSE.
+        call.push_str(&format!(
+            ", {}, CASE WHEN NOT ({}) THEN 0 ELSE 1 END",
+            crate::core::value_codec::quote_sql(name),
+            value_as(expr, &value)
+        ));
+    }
+    call.push(')');
+    // A whole select item is named for its type, as PostgreSQL names a cast
+    // (`posint`), not for the call that checks it.
+    if crate::core::sql_scan::whole_select_item(sql, start, end) {
+        call.push_str(&format!(" AS {}", crate::core::rql::user_types::display_name(&d.name)));
+    }
+    Ok(Some((start, end, call)))
+}
+
+/// Where the operand of the `::` at `at` begins: a literal, a quoted or
+/// qualified name, a call or parenthesised expression, a subscript, and a
+/// cast chain before it (`x::text::d`). `::` binds tighter than any
+/// operator, so nothing else belongs to it.
+fn cast_operand_start(sql: &str, at: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let back_ws = |mut i: usize| {
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    };
+    let mut i = back_ws(at);
+    loop {
+        if i == 0 {
+            return None;
+        }
+        match bytes[i - 1] {
+            b'\'' => {
+                // Back over `'…'`, a doubled quote inside it included.
+                let mut k = i - 1;
+                loop {
+                    let p = sql[..k].rfind('\'')?;
+                    if p > 0 && bytes[p - 1] == b'\'' {
+                        k = p - 1;
+                        continue;
+                    }
+                    k = p;
+                    break;
+                }
+                i = k;
+                // `E'…'`, `B'…'`, `X'…'`.
+                if i > 0 && matches!(bytes[i - 1], b'E' | b'e' | b'B' | b'b' | b'X' | b'x') && (i < 2 || !is_identifier_byte(bytes[i - 2])) {
+                    i -= 1;
+                }
+            }
+            b'"' => {
+                i = sql[..i - 1].rfind('"')?;
+            }
+            b')' | b']' => {
+                let (open_byte, close_byte) = if bytes[i - 1] == b')' { (b'(', b')') } else { (b'[', b']') };
+                let mut depth = 0usize;
+                let mut k = i;
+                loop {
+                    if k == 0 {
+                        return None;
+                    }
+                    k -= 1;
+                    if bytes[k] == close_byte {
+                        depth += 1;
+                    } else if bytes[k] == open_byte {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                i = k;
+                // A call's name, or what a subscript applies to.
+                if i > 0 && (is_identifier_byte(bytes[i - 1]) || bytes[i - 1] == b'"' || bytes[i - 1] == b']' || bytes[i - 1] == b')') {
+                    continue;
+                }
+            }
+            b if is_identifier_byte(b) || b == b'.' || b == b'$' => {
+                while i > 0 && (is_identifier_byte(bytes[i - 1]) || matches!(bytes[i - 1], b'.' | b'$')) {
+                    i -= 1;
+                    // `t."c"`: the quoted part of a qualified name.
+                    if i > 0 && bytes[i - 1] == b'"' {
+                        i = sql[..i - 1].rfind('"')?;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        // A cast chain: `x::text::d` casts `x::text`.
+        let before = back_ws(i);
+        if before >= 2 && &bytes[before - 2..before] == b"::" {
+            i = back_ws(before - 2);
+            continue;
+        }
+        return Some(i);
+    }
+}
+
+/// The `(` before `at` that no `)` between them closes.
+fn unmatched_open_before(sql: &str, at: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut k = at;
+    while k > 0 {
+        k -= 1;
+        match bytes[k] {
+            b')' => depth += 1,
+            b'(' if depth == 0 => return Some(k),
+            b'(' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -570,10 +747,38 @@ mod tests {
             rewrite_with("CREATE TABLE t (x five PRIMARY KEY, y int)", &d5).unwrap().as_deref(),
             Some("CREATE TABLE t (x int CONSTRAINT \"__domain_five__x\" CHECK (TRUE) PRIMARY KEY DEFAULT 5, y int)")
         );
+        // A domain with a check: the cast is checked, its operand whole.
+        let call = |value: String| {
+            format!("__rdb_domain_value({value}, 'posint', FALSE, 'posint_check', CASE WHEN NOT ({value} > 0) THEN 0 ELSE 1 END)")
+        };
+        // `x::posint`: the operand bare; `CAST(x AS posint)`: parenthesised.
+        let checked = |v: &str| call(format!("({v}::int)"));
+        let cast = |v: &str| call(format!("(({v})::int)"));
         assert_eq!(
-            rewrite_with("SELECT 5::posint, CAST('3' AS posint), x AS posint FROM t", &d).unwrap().as_deref(),
-            Some("SELECT 5::int, CAST('3' AS int), x AS posint FROM t")
+            rewrite_with("SELECT 5::posint, CAST('3' AS posint), x AS posint FROM t", &d).unwrap(),
+            Some(format!("SELECT {} AS posint, {} AS posint, x AS posint FROM t", checked("5"), cast("'3'")))
         );
+        for (operand, sql) in [
+            ("t.a", "SELECT t.a::posint FROM t"),
+            ("'it''s'", "SELECT 'it''s'::posint"),
+            ("upper(s)::text", "SELECT upper(s)::text::posint FROM t"),
+            ("(a + 1)", "SELECT (a + 1)::posint FROM t"),
+            ("a[1]", "SELECT a[1]::posint FROM t"),
+            ("\"A\"", "SELECT \"A\"::posint FROM t"),
+        ] {
+            let rewritten = rewrite_with(sql, &d).unwrap().expect(sql);
+            assert!(rewritten.contains(&checked(operand)), "{sql}: {rewritten}");
+        }
+        // `-5::posint` is `-(5::posint)`, as PostgreSQL binds it.
+        assert_eq!(rewrite_with("SELECT -5::posint", &d).unwrap(), Some(format!("SELECT -{}", checked("5"))));
+        assert_eq!(rewrite_with("SELECT 5::posint + 1", &d).unwrap(), Some(format!("SELECT {} + 1", checked("5"))));
+        assert_eq!(rewrite_with("SELECT random()::posint", &d).unwrap_err().0, "0A000");
+        // Nothing to check: the base type alone.
+        let d5 = vec![match parse_domain_statement("CREATE DOMAIN five AS int DEFAULT 5").unwrap().unwrap() {
+            DomainStatement::Create(d) => d,
+            other => panic!("{other:?}"),
+        }];
+        assert_eq!(rewrite_with("SELECT 1::five", &d5).unwrap().as_deref(), Some("SELECT 1::int"));
         assert_eq!(rewrite_with("ALTER TABLE t ALTER COLUMN x TYPE posint", &d).unwrap_err().0, "0A000");
         assert_eq!(rewrite_with("SELECT 'posint'", &d).unwrap(), None);
     }

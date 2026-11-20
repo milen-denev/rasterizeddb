@@ -178,6 +178,7 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                             None
                         }
                     });
+                let value_at = out.len();
                 match cast_type {
                     Some(oid) => push_param_literal(&mut out, &BoundParam { oid, ..param.clone() })?,
                     None => push_param_literal(&mut out, param)?,
@@ -221,7 +222,13 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                     // A bare type name only. A parameterised or array type —
                     // `numeric(10,2)`, `text[]` — is left in place rather than
                     // half-consumed, which would strand punctuation.
-                    if k > name_start && !matches!(bytes.get(k), Some(b'(') | Some(b'[')) {
+                    // A built-in type only: a domain's or an enum type's name
+                    // is a cast the statement's rewrite still has to see
+                    // (`$1::posint` checks the domain's constraints).
+                    if k > name_start
+                        && !matches!(bytes.get(k), Some(b'(') | Some(b'['))
+                        && is_builtin_type_name(&sql[name_start..k])
+                    {
                         consumed_cast = Some(&sql[name_start..k]);
                         i = k;
                     }
@@ -233,6 +240,14 @@ pub fn inline_params(sql: &str, params: &[BoundParam]) -> Result<String, String>
                 // client declaring the parameter text (sqlx and
                 // tokio-postgres bind strings so) with no cast to say
                 // otherwise. Without the space the two readings agree.
+                // A negative number under a cast left in place is cast whole:
+                // `$1::int::posint` bound to -3 is `(-3)::posint`. Bare it was
+                // `-3::posint`, which is `-(3::posint)`: the same number, but
+                // a cast that checks its value (a domain's) checked 3.
+                if out[value_at..].starts_with('-') && sql[i..].trim_start().starts_with("::") {
+                    out.insert(value_at, '(');
+                    out.push(')');
+                }
                 let typed_text = match consumed_cast {
                     Some(cast) => cast.eq_ignore_ascii_case("text"),
                     None => params[n - 1].oid == OID_TEXT,
@@ -437,6 +452,31 @@ pub fn param_literal(p: &BoundParam) -> Result<String, String> {
     let mut out = String::new();
     push_param_literal(&mut out, p)?;
     Ok(out)
+}
+
+/// PostgreSQL 17's built-in type names (`pg_type` in `pg_catalog`, no array
+/// or `pg_` type) and the SQL spellings of them, sorted: the casts on a
+/// placeholder that are consumed. Any other name — a domain's, an enum
+/// type's — is a cast the statement's rewrite still has to see.
+const BUILTIN_TYPE_NAMES: &[&str] = &[
+    "aclitem", "any", "anyarray", "anycompatible", "anycompatiblearray", "anycompatiblemultirange",
+    "anycompatiblenonarray", "anycompatiblerange", "anyelement", "anyenum", "anymultirange", "anynonarray",
+    "anyrange", "bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "character", "cid", "cidr",
+    "circle", "citext", "cstring", "date", "datemultirange", "daterange", "dec", "decimal", "double",
+    "event_trigger", "fdw_handler", "float", "float4", "float8", "gtsvector", "index_am_handler", "inet", "int",
+    "int2", "int2vector", "int4", "int4multirange", "int4range", "int8", "int8multirange", "int8range", "integer",
+    "internal", "interval", "json", "jsonb", "jsonpath", "language_handler", "line", "lseg", "macaddr",
+    "macaddr8", "money", "name", "nchar", "numeric", "nummultirange", "numrange", "oid", "oidvector", "path",
+    "point", "polygon", "real", "record", "refcursor", "regclass", "regcollation", "regconfig", "regdictionary",
+    "regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype", "smallint",
+    "table_am_handler", "text", "tid", "time", "timestamp", "timestamptz", "timetz", "trigger", "tsm_handler",
+    "tsmultirange", "tsquery", "tsrange", "tstzmultirange", "tstzrange", "tsvector", "txid_snapshot", "unknown",
+    "uuid", "varbit", "varchar", "void", "xid", "xid8", "xml"
+];
+
+/// Whether `name` (any case) is a built-in type ([`BUILTIN_TYPE_NAMES`]).
+fn is_builtin_type_name(name: &str) -> bool {
+    BUILTIN_TYPE_NAMES.binary_search(&name.to_ascii_lowercase().as_str()).is_ok()
 }
 
 fn push_param_literal(out: &mut String, p: &BoundParam) -> Result<(), String> {
@@ -1123,6 +1163,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_negative_number_under_a_cast_is_cast_whole() {
+        assert!(BUILTIN_TYPE_NAMES.windows(2).all(|w| w[0] < w[1]), "sorted");
+        assert!(is_builtin_type_name("INT4") && is_builtin_type_name("regclass") && !is_builtin_type_name("posint"));
+        let n = |v: &str| text(OID_INT4, v);
+        // The placeholder's own cast is consumed; one left after it takes the
+        // whole value, as PostgreSQL casts a bound one.
+        assert_eq!(inline_params("SELECT $1::int::posint", &[n("-3")]).unwrap(), "SELECT (-3)::posint");
+        assert_eq!(inline_params("SELECT $1::posint", &[n("-3")]).unwrap(), "SELECT (-3)::posint");
+        assert_eq!(inline_params("SELECT $1::int, $2", &[n("-3"), n("-4")]).unwrap(), "SELECT -3, -4");
+        assert_eq!(inline_params("SELECT $1::posint", &[n("3")]).unwrap(), "SELECT 3::posint");
+    }
+
     fn text(oid: i32, s: &str) -> BoundParam {
         BoundParam {
             value: Some(s.as_bytes().to_vec()),
@@ -1611,6 +1664,7 @@ mod inline_reference {
                             n
                         ));
                     }
+                    let value_at = out.len();
                     out.push_str(&param_to_literal(&params[n - 1])?);
                     i = j;
 
@@ -1650,9 +1704,16 @@ mod inline_reference {
                         // A bare type name only. A parameterised or array type —
                         // `numeric(10,2)`, `text[]` — is left in place rather than
                         // half-consumed, which would strand punctuation.
-                        if k > name_start && !matches!(bytes.get(k), Some(b'(') | Some(b'[')) {
+                        if k > name_start
+                            && !matches!(bytes.get(k), Some(b'(') | Some(b'['))
+                            && is_builtin_type_name(&sql[name_start..k])
+                        {
                             i = k;
                         }
+                    }
+                    if out[value_at..].starts_with('-') && sql[i..].trim_start().starts_with("::") {
+                        out.insert(value_at, '(');
+                        out.push(')');
                     }
                 }
                 _ => {
