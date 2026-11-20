@@ -3496,6 +3496,12 @@ struct PreparedLearned {
     /// (§7 `shape_epoch`, Q7). The executor re-checks it after the lock: a
     /// change while a run waited takes the text path in the same `Execute`.
     shape_epoch: u64,
+    /// What `SHOW QUERY STATS` records an execution of this statement under,
+    /// worked out once rather than from each execution's text
+    /// (`query_stats::ShapeStats`). Kept across the verifying executions;
+    /// a schema change starts it over with everything else.
+    #[cfg(feature = "query_stats")]
+    stats: StdArc<crate::core::query_stats::ShapeStats>,
 }
 
 /// A cached parse to run instead of the statement text, and the description
@@ -3504,6 +3510,9 @@ struct PreparedRun {
     rows: Box<crate::core::rql::prepared::PreparedRows>,
     fields: Option<LearnedFields>,
     scales: Option<LearnedScales>,
+    /// The learned statement's, for `query_stats::note_shape`.
+    #[cfg(feature = "query_stats")]
+    stats: StdArc<crate::core::query_stats::ShapeStats>,
 }
 
 /// A learned statement's result description, shared by every run it answers
@@ -7207,6 +7216,8 @@ fn watch_step(
                     }),
                     fields: l.fields.clone(),
                     scales: l.scales.clone(),
+                    #[cfg(feature = "query_stats")]
+                    stats: l.stats.clone(),
                 })
             }
             _ => WatchStep::Text,
@@ -7224,6 +7235,8 @@ fn watch_step(
                     }),
                     fields: l.fields.clone(),
                     scales: l.scales.clone(),
+                    #[cfg(feature = "query_stats")]
+                    stats: l.stats.clone(),
                 })
             }
             (_, Some(_)) => WatchStep::Watch,
@@ -7452,6 +7465,8 @@ fn learn_into(
                 exact: false,
                 route: None,
                 shape_epoch,
+                #[cfg(feature = "query_stats")]
+                stats: Default::default(),
             })),
             // A value that also occurs elsewhere in the clause; another
             // execution may place it unambiguously, a few more may not.
@@ -7666,6 +7681,11 @@ async fn execute_prepared<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Here rather than where the run was chosen: this is inside the
+    // statement's measured scope (`execute_recorded_inner`), and outside it
+    // the note reaches nothing.
+    #[cfg(feature = "query_stats")]
+    crate::core::query_stats::note_shape(&run.stats);
     // A statement ran in the block (`SessionTransaction::queried`).
     if let Some(t) = state.transaction.as_mut() {
         t.queried = true;
