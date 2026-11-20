@@ -9709,6 +9709,19 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     if has("more than one row returned by a subquery used as an expression") {
         return "21000";
     }
+    // A range's bounds (`range_ops`): `data_exception`, as PostgreSQL's
+    // `range_serialize` and set operations report them; a bad bounds flag
+    // argument is its syntax error.
+    if has("range lower bound must be less than or equal to range upper bound")
+        || has("result of range union would not be contiguous")
+        || has("result of range difference would not be contiguous")
+        || has("range constructor flags argument must not be null")
+    {
+        return "22000";
+    }
+    if has("invalid range bound flags") {
+        return "42601";
+    }
     if has("could not reserve transaction ids") {
         return if has("(the disk is full)") { "53100" } else { "58030" };
     }

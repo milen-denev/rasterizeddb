@@ -50,6 +50,12 @@ pub enum PgOp {
     KeyExistsAny,
     /// `?&` — every one of an array of keys exists.
     KeyExistsAll,
+    /// `&<` — a range does not extend to the right of another.
+    RangeOverLeft,
+    /// `&>` — a range does not extend to the left of another.
+    RangeOverRight,
+    /// `-|-` — two ranges are adjacent.
+    RangeAdjacent,
 }
 
 impl PgOp {
@@ -67,6 +73,9 @@ impl PgOp {
             "?" => PgOp::KeyExists,
             "?|" => PgOp::KeyExistsAny,
             "?&" => PgOp::KeyExistsAll,
+            "&<" => PgOp::RangeOverLeft,
+            "&>" => PgOp::RangeOverRight,
+            "-|-" => PgOp::RangeAdjacent,
             _ => return None,
         })
     }
@@ -84,6 +93,9 @@ impl PgOp {
             PgOp::KeyExists => "?",
             PgOp::KeyExistsAny => "?|",
             PgOp::KeyExistsAll => "?&",
+            PgOp::RangeOverLeft => "&<",
+            PgOp::RangeOverRight => "&>",
+            PgOp::RangeAdjacent => "-|-",
         }
     }
 
@@ -108,10 +120,14 @@ impl PgOp {
     /// dropping every row — the failure mode this engine is most prone to.
     pub fn applies_to(&self, db_type: &DbType) -> bool {
         match self {
-            PgOp::NetContainedBy
-            | PgOp::NetContainedByOrEq
-            | PgOp::NetContains
-            | PgOp::NetContainsOrEq => matches!(db_type, DbType::INET),
+            // `<<` and `>>` are also a range's strictly left and right of.
+            PgOp::NetContainedBy | PgOp::NetContains => {
+                matches!(db_type, DbType::INET) || pg_types::range_element(db_type).is_some()
+            }
+            PgOp::NetContainedByOrEq | PgOp::NetContainsOrEq => matches!(db_type, DbType::INET),
+            PgOp::RangeOverLeft | PgOp::RangeOverRight | PgOp::RangeAdjacent => {
+                pg_types::range_element(db_type).is_some()
+            }
             PgOp::TextMatch => matches!(db_type, DbType::STRING),
             PgOp::KeyExists | PgOp::KeyExistsAny | PgOp::KeyExistsAll => {
                 matches!(db_type, DbType::JSONB | DbType::JSON)
@@ -154,7 +170,25 @@ pub fn evaluate(
     right_type: &DbType,
     right: &[u8],
 ) -> Option<bool> {
+    // A NULL range stores nothing: PostgreSQL's NULL, which a WHERE treats
+    // as not matching (`false`, as an empty document is, below). It failed
+    // the statement, every row's test evaluated before the result was
+    // known: one NULL range in the table and `r @> 25` was an error.
+    if pg_types::range_element(left_type).is_some() && left.is_empty() {
+        return Some(false);
+    }
+    // A range's position against another of its type (`range_ops`).
+    if pg_types::range_element(left_type).is_some()
+        && left_type == right_type
+        && matches!(
+            op,
+            PgOp::NetContainedBy | PgOp::NetContains | PgOp::RangeOverLeft | PgOp::RangeOverRight | PgOp::RangeAdjacent
+        )
+    {
+        return crate::core::range_ops::position(op.symbol(), left_type, left, right);
+    }
     match op {
+        PgOp::RangeOverLeft | PgOp::RangeOverRight | PgOp::RangeAdjacent => None,
         PgOp::NetContainedBy => inet_relation(left, right, false, false),
         PgOp::NetContainedByOrEq => inet_relation(left, right, false, true),
         PgOp::NetContains => inet_relation(right, left, false, false),

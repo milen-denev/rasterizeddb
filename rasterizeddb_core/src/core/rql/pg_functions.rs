@@ -211,6 +211,53 @@ pub enum PgFunc {
     Overlay,
     JsonbPretty,
     JsonbInsert,
+    /// `lower(r)` / `upper(r)` of a range (`expr::parse` routes a range
+    /// argument here; a text one is `lower(text)`): the bound, NULL when it
+    /// is infinite or the range empty.
+    RangeLower,
+    RangeUpper,
+    /// `isempty`, `lower_inc`, `upper_inc`, `lower_inf`, `upper_inf`.
+    RangeIsEmpty,
+    RangeLowerInc,
+    RangeUpperInc,
+    RangeLowerInf,
+    RangeUpperInf,
+    /// `range_merge(a, b)`: the smallest range holding both.
+    RangeMerge,
+    /// `int4range(lo, hi [, bounds])` and its kin.
+    Int4Range,
+    Int8Range,
+    NumRange,
+    DateRange,
+    TsRange,
+    TstzRange,
+}
+
+/// The range type a constructor builds.
+fn constructed_range(func: PgFunc) -> Option<DbType> {
+    Some(match func {
+        PgFunc::Int4Range => DbType::INT4RANGE,
+        PgFunc::Int8Range => DbType::INT8RANGE,
+        PgFunc::NumRange => DbType::NUMRANGE,
+        PgFunc::DateRange => DbType::DATERANGE,
+        PgFunc::TsRange => DbType::TSRANGE,
+        PgFunc::TstzRange => DbType::TSTZRANGE,
+        _ => return None,
+    })
+}
+
+/// Whether a type is one of the built-in range types.
+pub fn is_range(db_type: &DbType) -> bool {
+    crate::core::pg_types::range_element(db_type).is_some()
+}
+
+/// The type `lower`/`upper` of a range type answers: its element, a
+/// `tsrange`'s as `timestamp` (no zone).
+fn range_bound_type(range: &DbType) -> DbType {
+    match range {
+        DbType::TSRANGE => DbType::TIMESTAMP,
+        other => crate::core::pg_types::range_element(other).unwrap_or(DbType::STRING),
+    }
 }
 
 /// Every name [`lookup`] answers, upper case: what routes a call to the
@@ -233,6 +280,8 @@ pub const NAMES: &[&str] = &[
     "ISFINITE", "GET_BYTE", "REGEXP_COUNT", "REGEXP_SUBSTR", "REGEXP_SPLIT_TO_ARRAY", "ARRAY_POSITION",
     "ARRAY_REMOVE", "ARRAY_REPLACE", "ARRAY_UPPER", "ARRAY_LOWER", "ARRAY_DIMS", "TRIM_ARRAY", "ARRAY_FILL",
     "SCALE", "MIN_SCALE", "TRIM_SCALE", "OVERLAY", "JSONB_PRETTY", "JSONB_INSERT",
+    "ISEMPTY", "LOWER_INC", "UPPER_INC", "LOWER_INF", "UPPER_INF", "RANGE_MERGE", "INT4RANGE", "INT8RANGE",
+    "NUMRANGE", "DATERANGE", "TSRANGE", "TSTZRANGE",
 ];
 
 /// `a ~ b`, `a ~* b`, `a !~ b`, `a !~* b` (one, at the top level) as the
@@ -412,6 +461,18 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "PG_RELATION_IS_PUBLISHABLE" => (RelationIsPublishable, &[1]),
         "PG_COLUMN_IS_UPDATABLE" => (ColumnIsUpdatable, &[3]),
         "__REGCLASS_NAME" => (RegclassName, &[1]),
+        "ISEMPTY" => (RangeIsEmpty, &[1]),
+        "LOWER_INC" => (RangeLowerInc, &[1]),
+        "UPPER_INC" => (RangeUpperInc, &[1]),
+        "LOWER_INF" => (RangeLowerInf, &[1]),
+        "UPPER_INF" => (RangeUpperInf, &[1]),
+        "RANGE_MERGE" => (RangeMerge, &[2]),
+        "INT4RANGE" => (Int4Range, &[2, 3]),
+        "INT8RANGE" => (Int8Range, &[2, 3]),
+        "NUMRANGE" => (NumRange, &[2, 3]),
+        "DATERANGE" => (DateRange, &[2, 3]),
+        "TSRANGE" => (TsRange, &[2, 3]),
+        "TSTZRANGE" => (TstzRange, &[2, 3]),
         _ => return None,
     };
     let variadic_ok = match func {
@@ -486,6 +547,10 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         StructOp => DbType::BOOL,
         QuantifiedCmp => DbType::BOOL,
         ArraySubscript => subscript_type(args),
+        RangeLower | RangeUpper => range_bound_type(&first()),
+        RangeIsEmpty | RangeLowerInc | RangeUpperInc | RangeLowerInf | RangeUpperInf => DbType::BOOL,
+        RangeMerge => first(),
+        Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange => constructed_range(func).expect("a constructor"),
         _ => DbType::STRING,
     }
 }
@@ -758,8 +823,8 @@ fn integer_width(t: &DbType) -> u8 {
 /// A bitwise operator's result type from its operands' static types.
 fn bitwise_type(func: PgFunc, args: &[Expr]) -> DbType {
     let types: Vec<DbType> = args.iter().map(crate::core::rql::expr::static_type).collect();
-    // `<<` / `>>` between networks: containment.
-    if types.iter().any(|t| *t == DbType::INET) {
+    // `<<` / `>>` between networks: containment; between ranges, position.
+    if types.iter().any(|t| *t == DbType::INET || is_range(t)) {
         return DbType::BOOL;
     }
     if types.iter().any(|t| matches!(t, DbType::BIT | DbType::VARBIT)) {
@@ -812,10 +877,119 @@ fn is_bit(v: &Value) -> bool {
     matches!(v, Value::Data { db_type: DbType::BIT | DbType::VARBIT, .. })
 }
 
+/// The range functions (`range_ops`); `None` for any other function. A
+/// constructor's NULL bound is infinite, its NULL flags an error; every
+/// other range function is strict, NULL already answered.
+fn range_call(func: PgFunc, args: &[Value]) -> Option<Result<Value, String>> {
+    use PgFunc::*;
+    use crate::core::range_ops;
+    if !matches!(
+        func,
+        RangeLower | RangeUpper | RangeIsEmpty | RangeLowerInc | RangeUpperInc | RangeLowerInf | RangeUpperInf | RangeMerge
+    ) && constructed_range(func).is_none()
+    {
+        return None;
+    }
+    let range_of = |v: &Value| -> Result<(DbType, Vec<u8>), String> {
+        match v {
+            Value::Data { bytes, db_type } if is_range(db_type) => Ok((db_type.clone(), bytes.clone())),
+            Value::Data { db_type, .. } => Err(format!(
+                "function {}({}) does not exist",
+                format!("{func:?}").to_ascii_lowercase(),
+                crate::core::value_codec::pg_input_type_name(db_type)
+            )),
+            Value::Null => Err("unexpected NULL".to_string()),
+        }
+    };
+    Some((|| -> Result<Value, String> {
+        Ok(match func {
+            RangeLower | RangeUpper => {
+                let (t, bytes) = range_of(&args[0])?;
+                let Some(text) = range_ops::bound_text(&t, &bytes, func == RangeUpper) else {
+                    return Ok(Value::Null);
+                };
+                let bound = range_bound_type(&t);
+                let malformed = || "malformed range bound".to_string();
+                match bound {
+                    DbType::DECIMAL => return Ok(numeric_value(pgn::parse_text(&text).ok_or_else(malformed)?)),
+                    DbType::I32 => return Ok(int_value(text.parse::<i32>().map_err(|_| malformed())?.into())),
+                    DbType::I64 => {
+                        let v = text.parse::<i64>().map_err(|_| malformed())?;
+                        return Ok(data(v.to_le_bytes().to_vec(), DbType::I64));
+                    }
+                    _ => {}
+                }
+                let bytes = crate::core::value_codec::encode_literal(&bound, &text).ok_or("malformed range bound")?;
+                data(bytes, bound)
+            }
+            RangeIsEmpty | RangeLowerInc | RangeUpperInc | RangeLowerInf | RangeUpperInf => {
+                let (t, bytes) = range_of(&args[0])?;
+                let name = match func {
+                    RangeIsEmpty => "isempty",
+                    RangeLowerInc => "lower_inc",
+                    RangeUpperInc => "upper_inc",
+                    RangeLowerInf => "lower_inf",
+                    _ => "upper_inf",
+                };
+                let answer = range_ops::bound_test(name, &t, &bytes).ok_or("malformed range value")?;
+                data(vec![u8::from(answer)], DbType::BOOL)
+            }
+            RangeMerge => {
+                let (t, a) = range_of(&args[0])?;
+                let (u, b) = range_of(&args[1])?;
+                if t != u {
+                    return Err(format!(
+                        "function range_merge({}, {}) does not exist",
+                        crate::core::value_codec::pg_input_type_name(&t),
+                        crate::core::value_codec::pg_input_type_name(&u)
+                    ));
+                }
+                data(range_ops::set_operation("range_merge", &t, &a, &b)?, t)
+            }
+            Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange => {
+                let t = constructed_range(func).expect("a constructor");
+                let flags = match args.get(2) {
+                    None => "[)".to_string(),
+                    Some(Value::Null) => return Err("range constructor flags argument must not be null".to_string()),
+                    Some(v) => text_of(v),
+                };
+                let bound = |v: &Value| (!v.is_null()).then(|| text_of(v));
+                let (lo, hi) = (bound(&args[0]), bound(&args[1]));
+                data(range_ops::construct(&t, lo.as_deref(), hi.as_deref(), &flags)?, t)
+            }
+            _ => unreachable!("checked above"),
+        })
+    })())
+}
+
 /// A structural operator (`PgFunc::StructOp`) over its evaluated operands.
 fn structural(args: &[Value]) -> Result<Value, String> {
     use crate::core::pg_ops::PgOp;
     let symbol = text_of(&args[2]);
+    // A range's position against another: `&<`, `&>`, `-|-`.
+    if matches!(symbol.as_str(), "&<" | "&>" | "-|-") {
+        let (Value::Data { bytes: l, db_type: t }, Value::Data { bytes: r, db_type: u }) = (&args[0], &args[1]) else {
+            return Ok(Value::Null);
+        };
+        // A text operand at the other's range type, as `@>` reads one.
+        let encode = |bytes: &Vec<u8>, from: &DbType, to: &DbType| -> Option<Vec<u8>> {
+            if from == to {
+                return Some(bytes.clone());
+            }
+            (*from == DbType::STRING).then(|| crate::core::value_codec::encode_literal(to, &String::from_utf8_lossy(bytes))).flatten()
+        };
+        let name = crate::core::value_codec::pg_input_type_name;
+        let missing = || format!("operator does not exist: {} {symbol} {}", name(t), name(u));
+        let range = if is_range(t) { t } else { u };
+        if !is_range(range) {
+            return Err(missing());
+        }
+        let (Some(l), Some(r)) = (encode(l, t, range), encode(r, u, range)) else {
+            return Err(missing());
+        };
+        let answer = crate::core::range_ops::position(&symbol, range, &l, &r).ok_or("malformed range value")?;
+        return Ok(data(vec![u8::from(answer)], DbType::BOOL));
+    }
     let op = PgOp::from_symbol(&symbol).ok_or_else(|| format!("operator {symbol} is not supported yet"))?;
     let (Value::Data { bytes: left, db_type: left_type }, Value::Data { bytes: right, db_type: right_type }) = (&args[0], &args[1])
     else {
@@ -886,6 +1060,18 @@ fn bitwise(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         return Ok(integer_of(!v, &t));
     }
     let (a, b) = (&args[0], &args[1]);
+    // `<<` / `>>` between ranges: strictly left of, strictly right of.
+    if let (Value::Data { bytes: l, db_type: t }, Value::Data { bytes: r, db_type: u }) = (a, b)
+        && is_range(t)
+        && matches!(func, ShiftLeft | ShiftRight)
+    {
+        if t != u {
+            let name = crate::core::value_codec::pg_input_type_name;
+            return Err(format!("operator does not exist: {} {symbol} {}", name(t), name(u)));
+        }
+        let answer = crate::core::range_ops::position(symbol, t, l, r).ok_or("malformed range value")?;
+        return Ok(data(vec![u8::from(answer)], DbType::BOOL));
+    }
     // `<<` / `>>` between networks are containment, the operators PostgreSQL
     // spells the same (a `WHERE` reads them as such between a column and a
     // value; a group reaches them here).
@@ -995,6 +1181,7 @@ fn text_of(v: &Value) -> String {
         }
         Value::Data { bytes, db_type: DbType::BYTEA } => crate::core::value_codec::format_bytea(bytes),
         Value::Data { bytes, db_type: DbType::ARRAY } => crate::core::value_codec::format_array(bytes).unwrap_or_default(),
+        Value::Data { bytes, db_type } if is_range(db_type) => crate::core::pg_types::format_range(db_type, bytes).unwrap_or_default(),
         // At the engine's nine places (no scale of its own): the places the
         // value needs. A NUMERIC whose expression has a display scale was
         // brought to it before the call (`shown_at`).
@@ -1115,7 +1302,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
+    let non_strict = matches!(func, Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
     // An element argument may be NULL (it finds, removes or replaces the
     // array's NULLs, as PostgreSQL's do); a NULL array is a NULL answer.
     if matches!(func, ArrayPosition | ArrayRemove | ArrayReplace) && (args[0].is_null() || args.get(2).is_some_and(|a| func == ArrayPosition && a.is_null())) {
@@ -1125,6 +1312,9 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         return Ok(Value::Null);
     }
     let s = |i: usize| text_of(&args[i]);
+    if let Some(range) = range_call(func, args) {
+        return range;
+    }
     Ok(match func {
         Left | Right => {
             let chars: Vec<char> = s(0).chars().collect();
@@ -2099,6 +2289,11 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
                 (Some(only), None) | (None, Some(only)) => data(only, DbType::ARRAY),
                 (Some(a), Some(b)) => data(crate::core::value_codec::array_cat(&a, &b)?, DbType::ARRAY),
             }
+        }
+        // Answered by `range_call` above.
+        RangeLower | RangeUpper | RangeIsEmpty | RangeLowerInc | RangeUpperInc | RangeLowerInf | RangeUpperInf
+        | RangeMerge | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange => {
+            unreachable!("range functions are answered by range_call")
         }
     })
 }

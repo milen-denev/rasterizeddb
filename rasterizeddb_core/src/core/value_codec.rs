@@ -3360,6 +3360,12 @@ pub fn refusal_message(db_type: &crate::core::db_type::DbType, literal: &str) ->
                 syntax()
             }
         }
+        // `[5,1)`: PostgreSQL's 22000, where the reader once stored `empty`.
+        DbType::INT4RANGE | DbType::INT8RANGE | DbType::NUMRANGE | DbType::TSRANGE | DbType::TSTZRANGE | DbType::DATERANGE
+            if crate::core::range_ops::literal_bounds_cross(db_type, text) =>
+        {
+            crate::core::range_ops::CROSSED_BOUNDS.to_string()
+        }
         _ => syntax(),
     }
 }

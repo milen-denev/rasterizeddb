@@ -1418,8 +1418,8 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
 `::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
 
 - **Types**: `CREATE TYPE` for composites and ranges (enums work, see
-  "Enum types" above), range types
-  (`int4range`, `daterange`), multidimensional array literals (`ARRAY[[1,2],[3,4]]`),
+  "Enum types" above), multirange types (`int4multirange`), multidimensional
+  array literals (`ARRAY[[1,2],[3,4]]`),
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
   PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
   PostgreSQL): a sequence's name is not known to the text pass that reads
@@ -1457,6 +1457,16 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   an ambiguous column, the literal an input error quotes. Its first use in
   the text is taken; where PostgreSQL points elsewhere (a syntax error, an
   expression the reader cannot take) there is no position.
+- **Range types** (`int4range`, `int8range`, `numrange`, `daterange`,
+  `tsrange`, `tstzrange`) read and print as PostgreSQL's, discrete ones
+  canonical (`[1,5]` is `[1,6)`), and take the constructors
+  (`int4range(1, 5, '[]')`), `lower`/`upper`, `isempty`, `lower_inc`,
+  `upper_inc`, `lower_inf`, `upper_inf`, `range_merge`, the set operators
+  `*`, `+`, `-` (a union or difference that is not one range is 22000), and
+  `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`. A lower bound above the
+  upper (`'[5,1)'`) is 22000, not `empty`. In a `WHERE`, a range operator
+  takes a column and a literal; one whose operand is computed
+  (`r && int4range(5, 25)`) is refused.
 - **Undefined names** are PostgreSQL's errors: a name that is no column is
   42703 `column "x" does not exist` (or `column t.x …`) wherever it is
   written — inside an expression, a `CASE`, `HAVING`, `ON`, a subquery — and

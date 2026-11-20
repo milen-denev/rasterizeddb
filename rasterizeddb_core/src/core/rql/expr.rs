@@ -1923,6 +1923,15 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                     if args.len() != 1 {
                         return Err(format!("{} takes exactly one argument", upper_name));
                     }
+                    // A range's bound, not its text lowercased (which was
+                    // the binary form's bytes: an empty string).
+                    if matches!(upper_name.as_str(), "LOWER" | "UPPER")
+                        && crate::core::rql::pg_functions::is_range(&static_type(&args[0]))
+                    {
+                        use crate::core::rql::pg_functions::PgFunc;
+                        let func = if upper_name == "LOWER" { PgFunc::RangeLower } else { PgFunc::RangeUpper };
+                        return Ok(Expr::Call(TextFunc::Pg(func), args));
+                    }
                     let func = match upper_name.as_str() {
                         "QUOTE_IDENT" => TextFunc::QuoteIdent,
                         "LOWER" => TextFunc::Lower,
@@ -3740,6 +3749,9 @@ pub fn static_type(expr: &Expr) -> DbType {
         // done in i64.
         Expr::Arith(lhs, op, rhs) => {
             let ty = |e: &Expr| static_type(e);
+            if crate::core::rql::pg_functions::is_range(&ty(lhs)) {
+                return ty(lhs);
+            }
             let timestamp = |e: &Expr| matches!(ty(e), DbType::DATETIME);
             // The same ranks as `wider_integer`, unsigned types one up.
             let rank = |e: &Expr| match ty(e) {
@@ -3912,6 +3924,21 @@ pub fn at_display_scale(value: Value, scale: Option<u32>) -> Result<Value, Strin
 /// because reading scaled cents as a plain `i64` would return a number that is
 /// wrong by a factor of the scale and report success.
 pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
+    // `*`, `+`, `-` of two ranges: their intersection, union, difference.
+    if let (Value::Data { bytes: x, db_type: t }, Value::Data { bytes: y, db_type: u }) = (a, b)
+        && (crate::core::rql::pg_functions::is_range(t) || crate::core::rql::pg_functions::is_range(u))
+    {
+        let symbol = op.symbol();
+        if t != u || !matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul) {
+            return Err(format!(
+                "operator does not exist: {} {symbol} {}",
+                crate::core::value_codec::pg_input_type_name(t),
+                crate::core::value_codec::pg_input_type_name(u)
+            ));
+        }
+        let bytes = crate::core::range_ops::set_operation(&symbol.to_string(), t, x, y)?;
+        return Ok(Value::Data { bytes, db_type: t.clone() });
+    }
     let float_operand = |v: &Value| {
         matches!(
             v,
@@ -4990,7 +5017,8 @@ pub(crate) fn top_level_structural(text: &str) -> Option<(usize, &'static str)> 
             continue;
         }
         let here = &bytes[i..];
-        let op: Option<&'static str> = ["<<=", ">>=", "@>", "<@", "&&", "?|", "?&"]
+        // `&<`, `&>`, `-|-`: a range's position against another.
+        let op: Option<&'static str> = ["<<=", ">>=", "-|-", "@>", "<@", "&&", "&<", "&>", "?|", "?&"]
             .into_iter()
             .find(|s| here.starts_with(s.as_bytes()))
             .or_else(|| (here.first() == Some(&b'?')).then_some("?"));

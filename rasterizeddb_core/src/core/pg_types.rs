@@ -1143,7 +1143,7 @@ pub fn range_element(db_type: &DbType) -> Option<DbType> {
 /// Canonicalising on input is not cosmetic: without it `int4range(1,10,'[]')`
 /// and `int4range(1,11,'[)')` would compare unequal and one would answer a
 /// containment test the other refused.
-fn range_is_discrete(db_type: &DbType) -> bool {
+pub(crate) fn range_is_discrete(db_type: &DbType) -> bool {
     matches!(
         db_type,
         DbType::INT4RANGE | DbType::INT8RANGE | DbType::DATERANGE
@@ -1151,7 +1151,7 @@ fn range_is_discrete(db_type: &DbType) -> bool {
 }
 
 /// One element of a range, in the element type's binary wire form.
-fn encode_range_element(element: &DbType, text: &str) -> Option<Vec<u8>> {
+pub(crate) fn encode_range_element(element: &DbType, text: &str) -> Option<Vec<u8>> {
     let text = strip_quotes(text.trim());
     match element {
         DbType::I32 => Some(text.parse::<i32>().ok()?.to_be_bytes().to_vec()),
@@ -1173,7 +1173,7 @@ fn encode_range_element(element: &DbType, text: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn format_range_element(element: &DbType, bytes: &[u8]) -> Option<String> {
+pub(crate) fn format_range_element(element: &DbType, bytes: &[u8]) -> Option<String> {
     match element {
         DbType::I32 => Some(be_i32(bytes, 0)?.to_string()),
         DbType::I64 => Some(be_i64(bytes, 0)?.to_string()),
@@ -1290,7 +1290,14 @@ pub fn decode_pg_numeric(bytes: &[u8]) -> Option<String> {
     Some(out)
 }
 
+/// A range literal's body (`1,10`) split at its top-level comma.
+pub(crate) fn split_range_body(body: &str) -> Vec<String> {
+    split_top_level(body, ',')
+}
+
 /// Parses a range literal — `[1,10)`, `(,5]`, `empty` — into the binary form.
+/// `None` for one PostgreSQL refuses, a lower bound above the upper among
+/// them (`range_ops::literal_bounds_cross` says which).
 pub fn parse_range(db_type: &DbType, text: &str) -> Option<Vec<u8>> {
     let element = range_element(db_type)?;
     let text = text.trim();
@@ -1336,6 +1343,13 @@ pub fn parse_range(db_type: &DbType, text: &str) -> Option<Vec<u8>> {
     }
     if upper.is_none() {
         upper_inclusive = false;
+    }
+    // Crossed as written (`[5,1)`) is PostgreSQL's error, not an empty range;
+    // equal bounds not both inclusive (`[5,5)`, `(5,5]`) are empty, below.
+    if let (Some(lo), Some(hi)) = (&lower, &upper)
+        && range_element_key(&element, lo)? > range_element_key(&element, hi)?
+    {
+        return None;
     }
 
     // A discrete range is stored `[)`, so two spellings of the same set of
@@ -1393,7 +1407,7 @@ pub fn parse_range(db_type: &DbType, text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn step_element(element: &DbType, bytes: &[u8], by: i64) -> Option<Vec<u8>> {
+pub(crate) fn step_element(element: &DbType, bytes: &[u8], by: i64) -> Option<Vec<u8>> {
     match element {
         DbType::I32 => Some(
             be_i32(bytes, 0)?

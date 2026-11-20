@@ -1154,7 +1154,7 @@ fn guard_null(column: &str, fragment: &str, schema: &SmallVec<[SchemaField; 20]>
 /// module's own lexer reads them in a dedicated arm (it has to canonicalise the
 /// key list), and emits them for the engine tokenizer, which lexes them here.
 pub const PG_OPERATORS: &[&str] = &[
-    "<<=", ">>=", "<->", "@>", "<@", "&&", "<<", ">>", "@@", "?|", "?&", "?",
+    "<<=", ">>=", "<->", "-|-", "@>", "<@", "&&", "&<", "&>", "<<", ">>", "@@", "?|", "?&", "?",
 ];
 
 #[derive(Debug, Clone, PartialEq)]

@@ -34,6 +34,7 @@ pub mod mock_table;
 pub mod mvcc;
 pub mod pg_ops;
 pub mod pg_types;
+pub mod range_ops;
 pub mod processor;
 /// What ran recently and what it cost, behind the `query_stats` feature.
 #[cfg(feature = "query_stats")]
