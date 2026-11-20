@@ -299,6 +299,35 @@ fn array_aggregate(query: &str) -> Option<String> {
     Some(format!("COALESCE((SELECT {aggregate} {}), '{{}}')", rest.trim()))
 }
 
+/// Whether `item` calls an aggregate (`max(…)`, `count(*)`, …) outside
+/// quotes: the item of a select list that makes it one aggregate row.
+fn contains_aggregate_call(item: &str) -> bool {
+    const AGGREGATES: &[&str] = &[
+        "count", "sum", "avg", "min", "max", "array_agg", "string_agg", "bool_and", "bool_or", "every",
+        "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg", "stddev", "stddev_pop", "stddev_samp",
+        "variance", "var_pop", "var_samp", "bit_and", "bit_or", "xmlagg",
+    ];
+    let bytes = item.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if (i == 0 || !is_identifier_byte(bytes[i - 1])) && is_identifier_byte(bytes[i]) {
+            let end = i + bytes[i..].iter().take_while(|b| is_identifier_byte(**b)).count();
+            let word = &item[i..end];
+            if item[end..].trim_start().starts_with('(') && AGGREGATES.iter().any(|a| word.eq_ignore_ascii_case(a)) {
+                return true;
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// An `UPDATE`'s row assignments as one assignment per column:
 /// `SET (a, b) = (x, y)` (or `= ROW(x, y)`) is `SET a = x, b = y`, and
 /// `SET (a, b) = (SELECT p, q FROM …)` is `SET a = (SELECT p FROM …), b =
@@ -359,6 +388,37 @@ pub fn row_assignments(sql: &str) -> Result<Option<String>, String> {
                 return Err("number of columns does not match number of values".to_string());
             }
             let tail = &inner[from..];
+            // A list mixing aggregates with plain values is one aggregate row
+            // (`SELECT max(n), 'z' FROM t`): split, the plain item was read
+            // once per row of t ("returned 2 rows") or not at all when t had
+            // none. Read through a derived table instead, still once per
+            // column, which keeps the row whole.
+            let aggregate = |item: &str| contains_aggregate_call(item);
+            let mixed = items.iter().any(|i| aggregate(i))
+                && items.iter().any(|i| !aggregate(i))
+                && find_keyword(tail, "GROUP", 0).is_none();
+            if mixed {
+                let named: Vec<String> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(n, item)| {
+                        let value = match find_keyword(item, "AS", 0) {
+                            Some(at) => item[..at].trim(),
+                            None => item.trim(),
+                        };
+                        format!("{value} AS __rdb_row{}", n + 1)
+                    })
+                    .collect();
+                for (n, column) in columns.iter().enumerate() {
+                    out_items.push(format!(
+                        "{column} = (SELECT __rdb_row{} FROM (SELECT {} {tail}) AS __rdb_row)",
+                        n + 1,
+                        named.join(", ")
+                    ));
+                }
+                changed = true;
+                continue;
+            }
             for (column, value) in columns.iter().zip(items) {
                 out_items.push(format!("{column} = (SELECT {value} {tail})"));
             }
@@ -3374,6 +3434,15 @@ mod row_assignment_tests {
             row_assignments("UPDATE d SET (a, b) = (1)").unwrap_err(),
             "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"
         );
+        // A list mixing an aggregate with a plain value stays one row.
+        assert_eq!(
+            row_assignments("UPDATE d SET (a, b) = (SELECT max(n) AS m, 'z' FROM e WHERE e.k > d.id) WHERE id = 1").unwrap().as_deref(),
+            Some(
+                "UPDATE d SET a = (SELECT __rdb_row1 FROM (SELECT max(n) AS __rdb_row1, 'z' AS __rdb_row2 FROM e WHERE e.k > d.id) AS __rdb_row), \
+                 b = (SELECT __rdb_row2 FROM (SELECT max(n) AS __rdb_row1, 'z' AS __rdb_row2 FROM e WHERE e.k > d.id) AS __rdb_row) WHERE id = 1"
+            )
+        );
+        assert!(super::contains_aggregate_call("COUNT (*) + 1") && !super::contains_aggregate_call("'max(x)'") && !super::contains_aggregate_call("maxim(x)"));
         assert_eq!(
             row_assignments("UPDATE oc SET (n, s) = 1 WHERE TRUE").unwrap_err(),
             "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression"

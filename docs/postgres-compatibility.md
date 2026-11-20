@@ -385,9 +385,9 @@ Rewritten to the statements they stand for before anything else reads them:
 logged, which an unlogged one is allowed to be); `ROW(a, b)`;
 `a [NOT] SIMILAR TO p`; `UPDATE … SET (a, b) = (x, y)` and `= (SELECT p, q
 …)` (one scalar subquery per column, so a volatile function in it runs once
-per column, and a list mixing an aggregate with a plain value, `(SELECT
-max(n), 'z' FROM t)`, reads the plain one per row and is refused), in
-`ON CONFLICT … DO UPDATE` too; `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
+per column; a list mixing an aggregate with a plain value, `(SELECT
+max(n), 'z' FROM t)`, is read through a derived table so it stays one
+row), in `ON CONFLICT … DO UPDATE` too; `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
 read as the left side's type either way); a derived table's column list,
 `FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
 
