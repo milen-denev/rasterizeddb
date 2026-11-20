@@ -727,6 +727,10 @@ async fn a_check_finds_rows_that_differ_between_two_nodes_that_report_in_step() 
             run_ok(&one, &format!("INSERT INTO {table} (id, name) VALUES ({id}, 'row {id}')")).await;
         }
     }
+    // Node two writes into a table node one created: not before that CREATE
+    // has reached it. Under load it had not, and the INSERT failed with
+    // "Table not found".
+    settled(&one, &two).await;
     run_ok(&two, "INSERT INTO repl_same (id, name) VALUES (1000, 'from two')").await;
     settled(&one, &two).await;
 
