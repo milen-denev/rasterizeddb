@@ -1220,3 +1220,36 @@ async fn schema_objects_alone_are_merged_by_their_statements() {
     assert_eq!(refused.0, "40001", "{refused:?}");
     assert!(prod.try_exec("SELECT id FROM dear").await.is_err(), "a rolled-back merge left its view");
 }
+
+/// Schema changes made through `DO`, `EXECUTE` of a prepared statement, and
+/// an enum type's and a domain's statements reach the branch's log and are
+/// replayed by a merge: the parent has the view, the table, the type with
+/// its added label (`pg_enum`, the column's constraint) and the domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ddl_by_do_execute_types_and_domains_is_merged() {
+    let fx = seeded("do-exec-types").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("CREATE TYPE grade AS ENUM ('low', 'high')").await;
+    dev.exec("CREATE DOMAIN posqty AS int CHECK (VALUE > 0)").await;
+    dev.exec("CREATE TABLE graded (id INT PRIMARY KEY, g grade, q posqty)").await;
+    dev.exec("ALTER TYPE grade ADD VALUE 'mid' BEFORE 'high'").await;
+    dev.exec("DO $$ BEGIN EXECUTE 'CREATE VIEW v_do AS SELECT id FROM items WHERE qty > 15'; END $$").await;
+    dev.exec("PREPARE mk AS CREATE TABLE t_exec (a INT)").await;
+    dev.exec("EXECUTE mk").await;
+
+    admin.exec("MERGE BRANCH dev").await;
+    let mut prod = fx.client("prod");
+    assert_eq!(prod.rows("SELECT id FROM v_do ORDER BY id").await, vec![row(&["2"]), row(&["3"])]);
+    assert_eq!(prod.scalar("SELECT count(*) FROM t_exec").await, "0");
+    assert_eq!(
+        prod.rows("SELECT enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid WHERE t.typname = 'grade' ORDER BY e.enumsortorder").await,
+        vec![row(&["low"]), row(&["mid"]), row(&["high"])]
+    );
+    // The column takes the added label, refuses others, and the domain holds.
+    prod.exec("INSERT INTO graded (id, g, q) VALUES (1, 'mid', 3)").await;
+    assert_eq!(prod.try_exec("INSERT INTO graded (id, g, q) VALUES (2, 'top', 3)").await.expect_err("no label").0, "22P02");
+    assert_eq!(prod.try_exec("INSERT INTO graded (id, g, q) VALUES (3, 'low', 0)").await.expect_err("domain").0, "23514");
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}
