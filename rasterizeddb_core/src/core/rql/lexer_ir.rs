@@ -2043,7 +2043,7 @@ mod tests {
                 typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO users (id, name) VALUES (1, "Alice")"#;
+        let sql = r#"INSERT INTO users (id, name) VALUES (1, 'Alice')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
@@ -2198,7 +2198,7 @@ mod tests {
             },
         ];
 
-        let sql = r#"INSERT INTO users (id, name, age, email, active, score, created_at, notes) VALUES (42, "Bob", 27, "bob@example.com", 1, 99.5, 1680000000, "Test user")"#;
+        let sql = r#"INSERT INTO users (id, name, age, email, active, score, created_at, notes) VALUES (42, 'Bob', 27, 'bob@example.com', 1, 99.5, 1680000000, 'Test user')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
@@ -2302,7 +2302,7 @@ mod tests {
                 typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, "Charlie")"#;
+        let sql = r#"INSERT INTO users (age, id, name) VALUES (30, 100, 'Charlie')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
@@ -2383,7 +2383,7 @@ mod tests {
                 typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, "Edge")"#;
+        let sql = r#"INSERT INTO users (id, flag, desc) VALUES (0, 255, 'Edge')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "users".to_string(),
@@ -2431,7 +2431,7 @@ mod tests {
                 typmod_packed: None,
             },
         ];
-        let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, "A")"#;
+        let sql = r#"INSERT INTO results (score, grade) VALUES (3.14, 'A')"#;
         let qp = QueryPurpose::InsertRow(InsertRowData {
             query: sql.to_string(),
             table_name: "results".to_string(),
@@ -2480,9 +2480,9 @@ mod tests {
         ];
         // Leading/trailing whitespace, tabs, newlines, and semicolon termination
         let sqls = [
-            "   \n\tINSERT INTO users (id, name) VALUES (123, \"Test\")\n\t  ",
-            "\r\nINSERT INTO users (id, name) VALUES (456, \"User\");\n",
-            "\t\n  INSERT INTO users (id, name) VALUES (789, \"Whitespace\")  ;  \n",
+            "   \n\tINSERT INTO users (id, name) VALUES (123, 'Test')\n\t  ",
+            "\r\nINSERT INTO users (id, name) VALUES (456, 'User');\n",
+            "\t\n  INSERT INTO users (id, name) VALUES (789, 'Whitespace')  ;  \n",
         ];
         let expected = [
             123i32.to_le_bytes(),
@@ -2556,7 +2556,7 @@ mod tests {
         assert_eq!(row_write.columns_writing_data[1].column_type, DbType::BOOL);
         assert_eq!(row_write.columns_writing_data[1].data.into_slice(), [0u8]);
 
-        let sql2 = r#"INSERT INTO t (ok, flag) VALUES (On, 0)"#;
+        let sql2 = r#"INSERT INTO t (ok, flag) VALUES ('On', 0)"#;
         let qp2 = QueryPurpose::InsertRow(InsertRowData {
             query: sql2.to_string(),
             table_name: "t".to_string(),
