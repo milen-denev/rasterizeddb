@@ -77,7 +77,97 @@ async fn a_domain_lives_its_life() {
     c.batch_execute("DROP DOMAIN IF EXISTS nosuchdom").await.expect("if exists");
     c.batch_execute("DROP TABLE gd2; DROP TABLE gd; DROP DOMAIN posint, email, five").await.expect("drop");
     assert_eq!(error(&c, "SELECT 1::posint").await.0.len(), 5);
-    assert_eq!(error(&c, "ALTER DOMAIN five ADD CHECK (VALUE < 9)").await.0, "0A000");
+    assert_eq!(error(&c, "ALTER DOMAIN five ADD CHECK (VALUE < 9)").await.0, "42704");
+}
+
+/// `ALTER DOMAIN`, on the domain and every column of it, each answer
+/// PostgreSQL 17's for the same sequence; refused before (0A000).
+#[tokio::test(flavor = "multi_thread")]
+async fn alter_domain_changes_every_column_of_it() {
+    let server = TestServer::start().await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute(
+        "CREATE DOMAIN pd AS int CHECK (VALUE > 0);
+         CREATE TABLE da1 (id int PRIMARY KEY, p pd);
+         CREATE TABLE da2 (id int PRIMARY KEY, r pd NOT NULL, q pd DEFAULT 7);
+         INSERT INTO da1 VALUES (1, 5), (2, NULL);
+         INSERT INTO da2 VALUES (1, 50, 1)",
+    )
+    .await
+    .expect("setup");
+
+    // A check: tested against every column's rows first, then enforced.
+    assert_eq!(
+        error(&c, "ALTER DOMAIN pd ADD CONSTRAINT small CHECK (VALUE < 10)").await,
+        ("23514".into(), "column \"r\" of table \"da2\" contains values that violate the new constraint".into())
+    );
+    c.batch_execute("ALTER DOMAIN pd ADD CHECK (VALUE < 100)").await.expect("add");
+    assert_eq!(
+        error(&c, "INSERT INTO da2 VALUES (2, 150, 1)").await,
+        ("23514".into(), "value for domain pd violates check constraint \"pd_check1\"".into())
+    );
+    assert_eq!(error(&c, "SELECT 150::pd").await.0, "23514");
+    assert_eq!(
+        error(&c, "ALTER DOMAIN pd ADD CONSTRAINT pd_check CHECK (VALUE < 3)").await,
+        ("42710".into(), "constraint \"pd_check\" for domain \"pd\" already exists".into())
+    );
+    c.batch_execute("ALTER DOMAIN pd RENAME CONSTRAINT pd_check1 TO lt100").await.expect("rename");
+    assert_eq!(
+        error(&c, "INSERT INTO da1 VALUES (3, 100)").await,
+        ("23514".into(), "value for domain pd violates check constraint \"lt100\"".into())
+    );
+    assert_eq!(
+        error(&c, "ALTER DOMAIN pd DROP CONSTRAINT nosuch").await,
+        ("42704".into(), "constraint \"nosuch\" of domain \"pd\" does not exist".into())
+    );
+    c.batch_execute("ALTER DOMAIN pd DROP CONSTRAINT IF EXISTS nosuch; ALTER DOMAIN pd VALIDATE CONSTRAINT lt100")
+        .await
+        .expect("if exists");
+    c.batch_execute("ALTER DOMAIN pd DROP CONSTRAINT lt100; ALTER DOMAIN pd DROP CONSTRAINT pd_check")
+        .await
+        .expect("drop checks");
+    c.batch_execute("INSERT INTO da1 VALUES (3, 200), (4, -5)").await.expect("no checks left");
+
+    // NOT NULL: refused while a NULL is stored; a column's own NOT NULL
+    // stays when the domain's goes.
+    assert_eq!(
+        error(&c, "ALTER DOMAIN pd SET NOT NULL").await,
+        ("23502".into(), "column \"p\" of table \"da1\" contains null values".into())
+    );
+    c.batch_execute("DELETE FROM da1 WHERE p IS NULL; ALTER DOMAIN pd SET NOT NULL").await.expect("set not null");
+    assert_eq!(error(&c, "INSERT INTO da1 VALUES (5, NULL)").await.0, "23502");
+    c.batch_execute("ALTER DOMAIN pd DROP NOT NULL; INSERT INTO da1 VALUES (5, NULL)").await.expect("drop not null");
+    assert_eq!(error(&c, "INSERT INTO da2 VALUES (3, NULL, 1)").await.0, "23502");
+
+    // A default: the columns with none take it; one's own stays.
+    c.batch_execute("ALTER DOMAIN pd SET DEFAULT 1; INSERT INTO da1 (id) VALUES (6); INSERT INTO da2 (id, r) VALUES (6, 2)")
+        .await
+        .expect("default");
+    c.batch_execute("ALTER DOMAIN pd DROP DEFAULT; INSERT INTO da1 (id) VALUES (7)").await.expect("drop default");
+    assert_eq!(rows(&c, "SELECT id, p FROM da1 WHERE id >= 5 ORDER BY id").await, ["5|NULL", "6|1", "7|NULL"]);
+    assert_eq!(rows(&c, "SELECT id, r, q FROM da2 WHERE id = 6").await, ["6|2|7"]);
+
+    // Taken back with the block that made it.
+    c.batch_execute("BEGIN; ALTER DOMAIN pd ADD CONSTRAINT lt CHECK (VALUE < 1000); ALTER DOMAIN pd RENAME TO pd9; ROLLBACK")
+        .await
+        .expect("rolled back");
+    c.batch_execute("INSERT INTO da1 VALUES (8, 1500)").await.expect("no lt");
+    assert_eq!(rows(&c, "SELECT 4::pd").await, ["4"]);
+
+    // A new name, for the domain and its columns; pg_dump's lines.
+    c.batch_execute("ALTER DOMAIN pd RENAME TO pd2; ALTER DOMAIN pd2 OWNER TO postgres; ALTER DOMAIN pd2 SET SCHEMA public")
+        .await
+        .expect("rename domain");
+    c.batch_execute("DELETE FROM da1 WHERE p <= 0; ALTER DOMAIN pd2 ADD CONSTRAINT pos CHECK (VALUE > 0)").await.expect("pos");
+    assert_eq!(
+        error(&c, "INSERT INTO da2 VALUES (9, 0, 1)").await,
+        ("23514".into(), "value for domain pd2 violates check constraint \"pos\"".into())
+    );
+    assert_eq!(error(&c, "ALTER DOMAIN nosuch SET NOT NULL").await.0, "42704");
+    assert_eq!(error(&c, "ALTER DOMAIN pd2 RENAME TO da1").await.0, "42710");
+    assert_eq!(error(&c, "ALTER DOMAIN pd2 ADD CHECK (VALUE < 9) NOT VALID").await.0, "0A000");
+    assert_eq!(error(&c, "DROP DOMAIN pd2").await.0, "2BP01");
+    c.batch_execute("DROP TABLE da1, da2; DROP DOMAIN pd2").await.expect("drop");
 }
 
 /// A domain created in a block that rolls back is gone with it.

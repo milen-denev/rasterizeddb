@@ -17,9 +17,13 @@
 //! violates check constraint "posint_check"`; a NULL cast to a `NOT NULL`
 //! domain its 23502, `domain d does not allow null values`.
 //!
-//! Not done (docs/postgres-compatibility.md): `ALTER DOMAIN`; `pg_type`
-//! lists no domain; a domain column's `NOT NULL` reports the column's 23502
-//! message.
+//! `ALTER DOMAIN` ([`DomainAlter`]) is answered by pgwire
+//! (`type_statements::alter_domain`) over the domain's row and its columns'
+//! constraints; a column that declared `NOT NULL` itself carries an
+//! [`OWN_NOT_NULL`] marker so the domain's `DROP NOT NULL` leaves it.
+//!
+//! Not done (docs/postgres-compatibility.md): `pg_type` lists no domain; a
+//! domain column's `NOT NULL` reports the column's 23502 message.
 
 use std::sync::atomic::Ordering;
 
@@ -35,6 +39,16 @@ const DOMAIN_TABLE_DDL: &str = "CREATE TABLE __rdb_domains (name TEXT PRIMARY KE
 
 /// The prefix of a domain column's constraints.
 pub const CONSTRAINT_PREFIX: &str = "__domain_";
+
+/// The check-name part of a domain column's marker that the column declared
+/// `NOT NULL` itself (`c d NOT NULL`): the domain's `DROP NOT NULL` leaves
+/// such a column's alone, as PostgreSQL keeps a column's own constraint.
+pub const OWN_NOT_NULL: &str = "__own_not_null";
+
+/// The marker constraint of [`OWN_NOT_NULL`] for `column` of `domain`.
+pub fn own_not_null_marker(domain: &str, column: &str) -> String {
+    format!("{CONSTRAINT_PREFIX}{domain}__{column}__{OWN_NOT_NULL}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Domain {
@@ -84,7 +98,7 @@ impl Domain {
 }
 
 /// `expr` with each `VALUE` (outside quotes) read as `column`.
-fn value_as(expr: &str, column: &str) -> String {
+pub(crate) fn value_as(expr: &str, column: &str) -> String {
     let bytes = expr.as_bytes();
     let mut out = String::with_capacity(expr.len() + 16);
     let mut i = 0;
@@ -116,7 +130,39 @@ fn value_as(expr: &str, column: &str) -> String {
 pub enum DomainStatement {
     Create(Domain),
     Drop { names: Vec<String>, if_exists: bool, cascade: bool },
-    Alter { name: String },
+    Alter { name: String, action: DomainAlter },
+}
+
+/// What an `ALTER DOMAIN` changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainAlter {
+    SetDefault(String),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
+    /// `ADD [CONSTRAINT name] CHECK (expr)`; the name PostgreSQL would give
+    /// when none is written is chosen against the domain's.
+    AddCheck { name: Option<String>, expr: String },
+    DropConstraint { name: String, if_exists: bool },
+    RenameConstraint { from: String, to: String },
+    /// Every constraint here is validated when added: naming one is enough.
+    ValidateConstraint(String),
+    RenameTo(String),
+    /// `OWNER TO`, `SET SCHEMA public`: nothing to change here.
+    Nothing,
+}
+
+impl Domain {
+    /// The name PostgreSQL gives an unnamed check: `<domain>_check`, then
+    /// `<domain>_check1`, … — the first free one.
+    pub fn next_check_name(&self) -> String {
+        let taken = |n: &str| self.checks.iter().any(|(c, _)| c == n);
+        let first = format!("{}_check", self.name);
+        if !taken(&first) {
+            return first;
+        }
+        (1..).map(|i| format!("{}_check{i}", self.name)).find(|n| !taken(n)).expect("unbounded")
+    }
 }
 
 fn starts_word(text: &str, word: &str) -> bool {
@@ -177,10 +223,123 @@ pub fn parse_domain_statement(sql: &str) -> Option<Result<DomainStatement, Refus
         "CREATE" => parse_create(rest),
         "DROP" => parse_drop(rest),
         _ => match name_at(rest) {
-            Some((name, _)) => Ok(DomainStatement::Alter { name }),
+            Some((name, rest)) => parse_alter(rest).map(|action| DomainStatement::Alter { name, action }),
             None => Err(refusal("42601", "syntax error at or near \"DOMAIN\"")),
         },
     })
+}
+
+/// The action of `ALTER DOMAIN name …`.
+fn parse_alter(rest: &str) -> Result<DomainAlter, Refusal> {
+    let syntax = |text: &str| refusal("42601", format!("syntax error at or near \"{}\"", text.split_whitespace().next().unwrap_or("")));
+    let end = |rest: &str, action: DomainAlter| -> Result<DomainAlter, Refusal> {
+        let rest = rest.trim();
+        if rest.is_empty() { Ok(action) } else { Err(syntax(rest)) }
+    };
+    fn name_then(text: &str) -> Result<(String, &str), Refusal> {
+        name_at(text).ok_or_else(|| refusal("42601", format!("syntax error at or near \"{}\"", text.split_whitespace().next().unwrap_or(""))))
+    }
+    if starts_word(rest, "SET") {
+        let after = after_word(rest, "SET");
+        if starts_word(after, "DEFAULT") {
+            let expr = after_word(after, "DEFAULT").trim();
+            if expr.is_empty() {
+                return Err(syntax(after));
+            }
+            return Ok(DomainAlter::SetDefault(expr.to_string()));
+        }
+        if starts_word(after, "NOT") && starts_word(after_word(after, "NOT"), "NULL") {
+            return end(after_word(after_word(after, "NOT"), "NULL"), DomainAlter::SetNotNull);
+        }
+        if starts_word(after, "SCHEMA") {
+            let (schema, r) = name_then(after_word(after, "SCHEMA"))?;
+            if schema != "public" {
+                return Err(refusal("0A000", "ALTER DOMAIN … SET SCHEMA is not supported: every domain is in the public schema"));
+            }
+            return end(r, DomainAlter::Nothing);
+        }
+        return Err(syntax(after));
+    }
+    if starts_word(rest, "DROP") {
+        let after = after_word(rest, "DROP");
+        if starts_word(after, "DEFAULT") {
+            return end(after_word(after, "DEFAULT"), DomainAlter::DropDefault);
+        }
+        if starts_word(after, "NOT") && starts_word(after_word(after, "NOT"), "NULL") {
+            return end(after_word(after_word(after, "NOT"), "NULL"), DomainAlter::DropNotNull);
+        }
+        if starts_word(after, "CONSTRAINT") {
+            let mut after = after_word(after, "CONSTRAINT");
+            let if_exists = starts_word(after, "IF") && starts_word(after_word(after, "IF"), "EXISTS");
+            if if_exists {
+                after = after_word(after_word(after, "IF"), "EXISTS");
+            }
+            let (name, rest) = name_then(after)?;
+            let rest = rest.trim();
+            // RESTRICT is the default; nothing depends on a domain's check.
+            if !(rest.is_empty() || starts_word(rest, "RESTRICT") || starts_word(rest, "CASCADE")) {
+                return Err(syntax(rest));
+            }
+            return Ok(DomainAlter::DropConstraint { name, if_exists });
+        }
+        return Err(syntax(after));
+    }
+    if starts_word(rest, "ADD") {
+        let mut after = after_word(rest, "ADD");
+        let mut name = None;
+        if starts_word(after, "CONSTRAINT") {
+            let (n, r) = name_then(after_word(after, "CONSTRAINT"))?;
+            name = Some(n);
+            after = r.trim_start();
+        }
+        if starts_word(after, "NOT") && starts_word(after_word(after, "NOT"), "NULL") {
+            return end(after_word(after_word(after, "NOT"), "NULL"), DomainAlter::SetNotNull);
+        }
+        if !starts_word(after, "CHECK") {
+            return Err(syntax(after));
+        }
+        let after = after_word(after, "CHECK");
+        if !after.starts_with('(') {
+            return Err(syntax(after));
+        }
+        let close = matching_close(after, 0).ok_or_else(|| syntax(after))?;
+        let expr = after[1..close].trim().to_string();
+        let tail = after[close + 1..].trim();
+        if starts_word(tail, "NOT") && starts_word(after_word(tail, "NOT"), "VALID") {
+            return Err(refusal(
+                "0A000",
+                "ALTER DOMAIN … ADD CONSTRAINT … NOT VALID is not supported: the rows already stored are checked as the constraint is added",
+            ));
+        }
+        return end(tail, DomainAlter::AddCheck { name, expr });
+    }
+    if starts_word(rest, "VALIDATE") && starts_word(after_word(rest, "VALIDATE"), "CONSTRAINT") {
+        let (name, r) = name_then(after_word(after_word(rest, "VALIDATE"), "CONSTRAINT"))?;
+        return end(r, DomainAlter::ValidateConstraint(name));
+    }
+    if starts_word(rest, "RENAME") {
+        let after = after_word(rest, "RENAME");
+        if starts_word(after, "CONSTRAINT") {
+            let (from, r) = name_then(after_word(after, "CONSTRAINT"))?;
+            if !starts_word(r, "TO") {
+                return Err(syntax(r));
+            }
+            let (to, r) = name_then(after_word(r, "TO"))?;
+            return end(r, DomainAlter::RenameConstraint { from, to });
+        }
+        if starts_word(after, "TO") {
+            let (to, r) = name_then(after_word(after, "TO"))?;
+            return end(r, DomainAlter::RenameTo(to));
+        }
+        return Err(syntax(after));
+    }
+    // What `pg_dump` writes after each domain: a domain has no owner here,
+    // so there is nothing to change.
+    if starts_word(rest, "OWNER") && starts_word(after_word(rest, "OWNER"), "TO") {
+        let (_, r) = name_then(after_word(after_word(rest, "OWNER"), "TO"))?;
+        return end(r, DomainAlter::Nothing);
+    }
+    Err(syntax(rest))
 }
 
 fn parse_drop(rest: &str) -> Result<DomainStatement, Refusal> {
@@ -461,7 +620,15 @@ pub fn rewrite_with(sql: &str, defs: &[Domain]) -> Result<Option<String>, Refusa
         for (start, end) in found.definitions {
             let Some((column, type_start)) = crate::core::rql::user_types::column_name_and_type(sql, start, end) else { continue };
             let Some((d, type_end)) = domain_at(sql, type_start, defs) else { continue };
-            edits.push((type_start, type_end, d.column_declaration(&column)));
+            let mut declaration = d.column_declaration(&column);
+            // The column's own `NOT NULL`, kept apart from the domain's.
+            if has_not_null(&sql[type_end..end]) {
+                declaration.push_str(&format!(
+                    " CONSTRAINT {} CHECK (TRUE)",
+                    crate::core::rql::views::quote_ident(&own_not_null_marker(&d.name, &column))
+                ));
+            }
+            edits.push((type_start, type_end, declaration));
             // The domain's default, unless the column has its own.
             if let Some(default) = &d.default
                 && crate::core::rql::join::find_keyword(&sql[type_end..end], "DEFAULT", 0).is_none()
@@ -522,6 +689,34 @@ pub fn rewrite_with(sql: &str, defs: &[Domain]) -> Result<Option<String>, Refusa
     }
     out.push_str(&sql[copied..]);
     Ok(Some(out))
+}
+
+/// Whether a column definition's text after its type says `NOT NULL` (outside
+/// quotes and parentheses: not a `CHECK (x IS NOT NULL)`).
+fn has_not_null(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]))
+            && starts_word(&text[i..], "NOT")
+            && starts_word(after_word(&text[i..], "NOT"), "NULL")
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// A cast to a domain with constraints as the checked call that answers it:
@@ -729,6 +924,61 @@ mod tests {
             DomainStatement::Drop { names: vec!["a".into(), "b".into()], if_exists: true, cascade: true }
         );
         assert!(parse_domain_statement("CREATE TABLE domain (x int)").is_none());
+    }
+
+    #[test]
+    fn alter_domain_actions_parse() {
+        let alter = |sql: &str| match parse_domain_statement(sql).unwrap() {
+            Ok(DomainStatement::Alter { name, action }) => Ok((name, action)),
+            Ok(other) => panic!("{other:?}"),
+            Err((code, _)) => Err(code),
+        };
+        let d = |a: DomainAlter| Ok(("posint".to_string(), a));
+        assert_eq!(alter("ALTER DOMAIN posint SET DEFAULT 1 + 1"), d(DomainAlter::SetDefault("1 + 1".into())));
+        assert_eq!(alter("ALTER DOMAIN public.posint DROP DEFAULT;"), d(DomainAlter::DropDefault));
+        assert_eq!(alter("ALTER DOMAIN posint SET NOT NULL"), d(DomainAlter::SetNotNull));
+        assert_eq!(alter("ALTER DOMAIN posint ADD CONSTRAINT nn NOT NULL"), d(DomainAlter::SetNotNull));
+        assert_eq!(alter("alter domain posint drop not null"), d(DomainAlter::DropNotNull));
+        assert_eq!(
+            alter("ALTER DOMAIN posint ADD CONSTRAINT \"Small\" CHECK (VALUE < (10))"),
+            d(DomainAlter::AddCheck { name: Some("Small".into()), expr: "VALUE < (10)".into() })
+        );
+        assert_eq!(alter("ALTER DOMAIN posint ADD CHECK (VALUE <> 3)"), d(DomainAlter::AddCheck { name: None, expr: "VALUE <> 3".into() }));
+        assert_eq!(
+            alter("ALTER DOMAIN posint DROP CONSTRAINT IF EXISTS small CASCADE"),
+            d(DomainAlter::DropConstraint { name: "small".into(), if_exists: true })
+        );
+        assert_eq!(
+            alter("ALTER DOMAIN posint RENAME CONSTRAINT a TO b"),
+            d(DomainAlter::RenameConstraint { from: "a".into(), to: "b".into() })
+        );
+        assert_eq!(alter("ALTER DOMAIN posint VALIDATE CONSTRAINT a"), d(DomainAlter::ValidateConstraint("a".into())));
+        assert_eq!(alter("ALTER DOMAIN posint RENAME TO pint"), d(DomainAlter::RenameTo("pint".into())));
+        // What pg_dump writes, and nothing to change here.
+        assert_eq!(alter("ALTER DOMAIN public.posint OWNER TO postgres"), d(DomainAlter::Nothing));
+        assert_eq!(alter("ALTER DOMAIN posint SET SCHEMA public"), d(DomainAlter::Nothing));
+        assert_eq!(alter("ALTER DOMAIN posint SET SCHEMA other"), Err("0A000"));
+        assert_eq!(alter("ALTER DOMAIN posint ADD CHECK (VALUE < 9) NOT VALID"), Err("0A000"));
+        assert_eq!(alter("ALTER DOMAIN posint FROBNICATE"), Err("42601"));
+        assert_eq!(alter("ALTER DOMAIN posint SET NOT NULL extra"), Err("42601"));
+        // The name an unnamed check takes: the first free one.
+        let mut p = posint();
+        assert_eq!(p.next_check_name(), "posint_check1");
+        p.checks.push(("posint_check1".into(), "TRUE".into()));
+        assert_eq!(p.next_check_name(), "posint_check2");
+    }
+
+    #[test]
+    fn a_columns_own_not_null_is_marked_apart_from_the_domains() {
+        let d = vec![posint()];
+        assert_eq!(
+            rewrite_with("CREATE TABLE t (id int, x posint NOT NULL, y posint CHECK (y IS NOT NULL))", &d).unwrap().as_deref(),
+            Some(
+                "CREATE TABLE t (id int, x int CONSTRAINT \"__domain_posint__x__posint_check\" CHECK (\"x\" > 0) \
+                 CONSTRAINT \"__domain_posint__x____own_not_null\" CHECK (TRUE) NOT NULL, \
+                 y int CONSTRAINT \"__domain_posint__y__posint_check\" CHECK (\"y\" > 0) CHECK (y IS NOT NULL))"
+            )
+        );
     }
 
     #[test]

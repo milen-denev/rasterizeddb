@@ -263,8 +263,7 @@ async fn apply_change(
     Ok(Ok(()))
 }
 
-/// `CREATE DOMAIN`, `DROP DOMAIN` (`core::rql::domains`); `ALTER DOMAIN` is
-/// refused (0A000).
+/// `CREATE DOMAIN`, `DROP DOMAIN`, `ALTER DOMAIN` (`core::rql::domains`).
 pub(super) async fn handle_domain_statement<S>(
     database: &Arc<Database>,
     state: &mut SessionState,
@@ -274,7 +273,7 @@ pub(super) async fn handle_domain_statement<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    use crate::core::rql::domains::{self, DomainStatement};
+    use crate::core::rql::domains::{self, DomainAlter, DomainStatement};
     let statement = match parsed {
         Ok(statement) => statement,
         Err((code, message)) => return fail_statement(state, stream, code, &message).await,
@@ -284,15 +283,6 @@ where
         DomainStatement::Drop { .. } => "DROP DOMAIN",
         DomainStatement::Alter { .. } => "ALTER DOMAIN",
     };
-    if let DomainStatement::Alter { name } = &statement {
-        return fail_statement(
-            state,
-            stream,
-            "0A000",
-            &format!("ALTER DOMAIN is not supported yet; drop domain {name} and create it again"),
-        )
-        .await;
-    }
     if read_only(state) {
         return fail_statement(state, stream, "25006", &read_only_message(verb)).await;
     }
@@ -367,6 +357,286 @@ where
             }
             send_command_complete(stream, verb).await
         }
-        DomainStatement::Alter { .. } => unreachable!("refused above"),
+        DomainStatement::Alter { name, action } => {
+            if let DomainAlter::RenameTo(to) = &action
+                && exists(to).await
+            {
+                return fail_statement(state, stream, "42710", &format!("type \"{to}\" already exists")).await;
+            }
+            let own_block = state.transaction.is_none();
+            if own_block {
+                open_implicit_block(database, state);
+            }
+            let outcome = alter_domain(database, state, &name, action).await?;
+            if own_block && let Some(t) = state.transaction.take() {
+                state.end_block_settings(&t);
+                if outcome.is_err() || t.failed {
+                    database.block_ddl_abort(t.id).await;
+                    t.abort_unless_aborted(database);
+                    t.owner.release();
+                } else if let Err((code, message)) = commit_block(database, state, t).await {
+                    return fail_statement(state, stream, code, &message).await;
+                }
+            }
+            match outcome {
+                Ok(()) => send_command_complete(stream, verb).await,
+                Err((code, message)) => fail_statement(state, stream, code, &message).await,
+            }
+        }
     }
+}
+
+/// `ALTER DOMAIN name action`, on the domain's row and on every column of
+/// it (`domains::domain_columns`), through the session's statement path so
+/// that one failure takes all of it back (the caller's block).
+///
+/// A new check or `NOT NULL` is tested against every column's rows before
+/// anything changes, with PostgreSQL's errors (23514 `column "c" of table
+/// "t" contains values that violate the new constraint`, 23502 `… contains
+/// null values`). A column's own `DEFAULT` is kept: only a column with none,
+/// or with the domain's, follows `SET`/`DROP DEFAULT`. `DROP NOT NULL`
+/// leaves a primary key's column alone, and a column's own `NOT NULL` (its
+/// [`domains::OWN_NOT_NULL`] marker).
+async fn alter_domain(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    name: &str,
+    action: crate::core::rql::domains::DomainAlter,
+) -> io::Result<Result<(), (&'static str, String)>> {
+    use crate::core::rql::domains::{self, DomainAlter, CONSTRAINT_PREFIX};
+    use crate::core::rql::views::quote_ident;
+    let tx = state.current_tx();
+    let Some(mut domain) = domains::load(database, Some(&[name.to_string()]), tx).await.ok().and_then(|mut v| v.pop()) else {
+        return Ok(Err(("42704", format!("type \"{name}\" does not exist"))));
+    };
+    let pending = state.transaction.as_ref().map(|t| database.block_drops_pending(t.id)).unwrap_or_default();
+    let columns: Vec<(String, String)> = domains::domain_columns(database)
+        .into_iter()
+        .filter(|(table, _, d)| d == name && !pending.iter().any(|p| p.eq_ignore_ascii_case(table)))
+        .map(|(table, column, _)| (table, column))
+        .collect();
+    let check_name = |column: &str, check: &str| format!("{CONSTRAINT_PREFIX}{}__{column}__{check}", domain.name);
+    let marker = |column: &str| format!("{CONSTRAINT_PREFIX}{}__{column}", domain.name);
+    let has_constraint = |table: &str, constraint: &str| {
+        database
+            .schema_view(table)
+            .is_some_and(|v| v.schema().checks.iter().any(|c| !c.is_deleted && c.name == constraint))
+    };
+    let mut statements: Vec<String> = Vec::new();
+    let has_check = |d: &domains::Domain, n: &str| d.checks.iter().any(|(c, _)| c == n);
+    let constraint_missing = |n: &str| ("42704", format!("constraint \"{n}\" of domain \"{name}\" does not exist"));
+
+    match &action {
+        DomainAlter::AddCheck { name: check, expr } => {
+            let check = check.clone().unwrap_or_else(|| domain.next_check_name());
+            if has_check(&domain, &check) {
+                return Ok(Err(("42710", format!("constraint \"{check}\" for domain \"{name}\" already exists"))));
+            }
+            for (table, column) in &columns {
+                let test = domains::value_as(expr, &quote_ident(column));
+                let probe = format!("SELECT 1 FROM {} WHERE NOT ({test}) LIMIT 1", quote_ident(table));
+                match view_statements::run_internal(database, state, &probe).await? {
+                    Ok(tag) if tag != "SELECT 0" => {
+                        return Ok(Err((
+                            "23514",
+                            format!("column \"{column}\" of table \"{table}\" contains values that violate the new constraint"),
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Ok(Err((sqlstate_for(&e), e))),
+                }
+                statements.push(format!(
+                    "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({test})",
+                    quote_ident(table),
+                    quote_ident(&check_name(column, &check))
+                ));
+                if has_constraint(table, &marker(column)) {
+                    statements.push(format!("ALTER TABLE {} DROP CONSTRAINT {}", quote_ident(table), quote_ident(&marker(column))));
+                }
+            }
+            domain.checks.push((check, expr.clone()));
+        }
+        DomainAlter::DropConstraint { name: check, if_exists } => {
+            if !has_check(&domain, check) {
+                if *if_exists {
+                    crate::core::notice::push(
+                        "NOTICE",
+                        "00000",
+                        format!("constraint \"{check}\" of domain \"{name}\" does not exist, skipping"),
+                    );
+                    return Ok(Ok(()));
+                }
+                return Ok(Err(constraint_missing(check)));
+            }
+            domain.checks.retain(|(c, _)| c != check);
+            for (table, column) in &columns {
+                // The last check gone, the marker keeps the column known.
+                if domain.checks.is_empty() && !has_constraint(table, &marker(column)) {
+                    statements.push(format!(
+                        "ALTER TABLE {} ADD CONSTRAINT {} CHECK (TRUE)",
+                        quote_ident(table),
+                        quote_ident(&marker(column))
+                    ));
+                }
+                if has_constraint(table, &check_name(column, check)) {
+                    statements.push(format!(
+                        "ALTER TABLE {} DROP CONSTRAINT {}",
+                        quote_ident(table),
+                        quote_ident(&check_name(column, check))
+                    ));
+                }
+            }
+        }
+        DomainAlter::RenameConstraint { from, to } => {
+            // PostgreSQL's own wording here (`for domain d`, unquoted).
+            let Some(expr) = domain.checks.iter().find(|(c, _)| c == from).map(|(_, e)| e.clone()) else {
+                return Ok(Err(("42704", format!("constraint \"{from}\" for domain {name} does not exist"))));
+            };
+            if has_check(&domain, to) {
+                return Ok(Err(("42710", format!("constraint \"{to}\" for domain {name} already exists"))));
+            }
+            for (table, column) in &columns {
+                statements.push(format!(
+                    "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({})",
+                    quote_ident(table),
+                    quote_ident(&check_name(column, to)),
+                    domains::value_as(&expr, &quote_ident(column))
+                ));
+                if has_constraint(table, &check_name(column, from)) {
+                    statements.push(format!(
+                        "ALTER TABLE {} DROP CONSTRAINT {}",
+                        quote_ident(table),
+                        quote_ident(&check_name(column, from))
+                    ));
+                }
+            }
+            for (c, _) in domain.checks.iter_mut().filter(|(c, _)| c == from) {
+                *c = to.clone();
+            }
+        }
+        DomainAlter::Nothing => return Ok(Ok(())),
+        DomainAlter::ValidateConstraint(check) => {
+            if !has_check(&domain, check) {
+                return Ok(Err(constraint_missing(check)));
+            }
+            return Ok(Ok(()));
+        }
+        DomainAlter::SetNotNull => {
+            if domain.not_null {
+                return Ok(Ok(()));
+            }
+            for (table, column) in &columns {
+                let probe = format!("SELECT 1 FROM {} WHERE {} IS NULL LIMIT 1", quote_ident(table), quote_ident(column));
+                match view_statements::run_internal(database, state, &probe).await? {
+                    Ok(tag) if tag != "SELECT 0" => {
+                        return Ok(Err(("23502", format!("column \"{column}\" of table \"{table}\" contains null values"))));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Ok(Err((sqlstate_for(&e), e))),
+                }
+                // Already NOT NULL, the column's own (or its key's): marked,
+                // so the domain's DROP NOT NULL leaves it.
+                let own = database.schema_view(table).is_some_and(|v| {
+                    let schema = v.schema();
+                    schema.fields.iter().any(|f| !f.is_deleted && f.name == *column)
+                        && crate::core::rql::nullable::flag_field(column, &schema.fields).is_none()
+                });
+                let marker = domains::own_not_null_marker(&domain.name, column);
+                if own && !has_constraint(table, &marker) {
+                    statements.push(format!("ALTER TABLE {} ADD CONSTRAINT {} CHECK (TRUE)", quote_ident(table), quote_ident(&marker)));
+                }
+                statements.push(format!(
+                    "ALTER TABLE {} ALTER COLUMN {} SET NOT NULL",
+                    quote_ident(table),
+                    quote_ident(column)
+                ));
+            }
+            domain.not_null = true;
+        }
+        DomainAlter::DropNotNull => {
+            if !domain.not_null {
+                return Ok(Ok(()));
+            }
+            for (table, column) in &columns {
+                let key = database.schema_view(table).is_some_and(|v| {
+                    v.schema()
+                        .primary_key
+                        .as_deref()
+                        .is_some_and(|k| k.split(',').any(|c| c.trim().trim_matches('"').eq_ignore_ascii_case(column)))
+                });
+                if !key && !has_constraint(table, &domains::own_not_null_marker(&domain.name, column)) {
+                    statements.push(format!(
+                        "ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL",
+                        quote_ident(table),
+                        quote_ident(column)
+                    ));
+                }
+            }
+            domain.not_null = false;
+        }
+        DomainAlter::SetDefault(_) | DomainAlter::DropDefault => {
+            let new = match &action {
+                DomainAlter::SetDefault(expr) => Some(expr.clone()),
+                _ => None,
+            };
+            for (table, column) in &columns {
+                let current = database.schema_view(table).and_then(|v| {
+                    crate::core::rql::column_default::expression_for(column, &v.schema().defaults).map(|d| d.trim().to_string())
+                });
+                // The column's own default stays.
+                let follows = match (&current, &domain.default) {
+                    (None, _) => true,
+                    (Some(c), Some(old)) => c == old.trim(),
+                    (Some(_), None) => false,
+                };
+                if !follows || current == new {
+                    continue;
+                }
+                statements.push(match &new {
+                    Some(expr) => format!("ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {expr}", quote_ident(table), quote_ident(column)),
+                    None if current.is_some() => {
+                        format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT", quote_ident(table), quote_ident(column))
+                    }
+                    None => continue,
+                });
+            }
+            domain.default = new;
+        }
+        DomainAlter::RenameTo(to) => {
+            let old = domain.name.clone();
+            for (table, column) in &columns {
+                let Some(view) = database.schema_view(table) else { continue };
+                let prefix = format!("{CONSTRAINT_PREFIX}{old}__{column}");
+                let owned: Vec<(String, String)> = view
+                    .schema()
+                    .checks
+                    .iter()
+                    .filter(|c| !c.is_deleted && (c.name == prefix || c.name.starts_with(&format!("{prefix}__"))))
+                    .map(|c| (c.name.clone(), c.expression.clone()))
+                    .collect();
+                for (constraint, expression) in owned {
+                    let renamed = format!("{CONSTRAINT_PREFIX}{to}__{column}{}", &constraint[prefix.len()..]);
+                    statements.push(format!(
+                        "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({expression})",
+                        quote_ident(table),
+                        quote_ident(&renamed)
+                    ));
+                    statements.push(format!("ALTER TABLE {} DROP CONSTRAINT {}", quote_ident(table), quote_ident(&constraint)));
+                }
+            }
+            domain.name = to.clone();
+        }
+    }
+    for sql in statements {
+        if let Err(e) = view_statements::run_internal_ddl(database, state, &sql).await? {
+            return Ok(Err((sqlstate_for(&e), e)));
+        }
+    }
+    if let Err(e) = domains::remove(database, name, tx).await {
+        return Ok(Err((sqlstate_for(&e), e)));
+    }
+    if let Err(e) = domains::store(database, &domain, tx).await {
+        return Ok(Err((sqlstate_for(&e), e)));
+    }
+    Ok(Ok(()))
 }

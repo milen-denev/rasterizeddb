@@ -436,13 +436,26 @@ checked against the domain's constraints, as PostgreSQL's: 23514 for a
 check, 23502 `domain d does not allow null values` for a NULL cast to a
 `NOT NULL` domain.
 
+`ALTER DOMAIN name` changes the domain and every column of it, in one
+statement that a failure (or a block's `ROLLBACK`) takes back whole: `ADD
+[CONSTRAINT n] CHECK (…)` and `SET NOT NULL` test every column's rows first
+(23514 `column "c" of table "t" contains values that violate the new
+constraint`, 23502 `… contains null values`); `DROP CONSTRAINT [IF EXISTS]`,
+`RENAME CONSTRAINT a TO b`, `VALIDATE CONSTRAINT`, `DROP NOT NULL` (a
+column's own `NOT NULL`, and a primary key's, stay), `SET DEFAULT` / `DROP
+DEFAULT` (a column's own default stays), `RENAME TO`; `OWNER TO` and `SET
+SCHEMA public`, which `pg_dump` writes, change nothing.
+
 Where it differs from PostgreSQL:
 
 - A cast to a domain is typed as its base (`pg_typeof(5::posint)` is
   `integer`), and one of an expression calling a volatile function
   (`random()::posint`) is refused (0A000).
-- `ALTER DOMAIN` is refused (0A000); `DROP DOMAIN … CASCADE` with columns of
-  the domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`.
+- `ALTER DOMAIN … ADD CONSTRAINT … NOT VALID` and `SET SCHEMA` another
+  schema are refused (0A000); `DROP DOMAIN … CASCADE` with columns of the
+  domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`. A column
+  whose own default is written the same as the domain's follows `SET
+  DEFAULT` as if it had none.
 - A domain's `NOT NULL` reports the column's 23502 message, not `domain d
   does not allow null values`.
 - `pg_type` lists no domain, so `psql`'s `\dD` shows none; domain statements
