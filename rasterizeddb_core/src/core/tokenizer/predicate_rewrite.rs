@@ -4148,7 +4148,7 @@ fn lift_term(
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
         || compares_a_computed_range(body, schema)
-        || in_over_non_column(body, schema)
+        || (plain && in_over_non_column(body, schema))
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
@@ -4191,10 +4191,6 @@ fn distinct_from_expression(body: &str, schema: &SmallVec<[SchemaField; 20]>) ->
     !(column_left && simple_right)
 }
 
-/// Whether `body` is a symbol comparison with a side the evaluator types
-/// `interval` (`ts - TIMESTAMP '2024-01-01' > interval '30 days'`): the scan
-/// compares only scalar types (`EvaluatedOperand::new`), and refused it; the
-/// evaluator orders intervals as PostgreSQL does, a day as 24 hours.
 /// Whether `text` holds `x [NOT] IN (…)` whose `x` is no bare column — a
 /// literal, a call, arithmetic (`1 IN (1, 3)`, `n + 0 IN (…)`, `excluded.id
 /// IN (SELECT …)` once its value is written in): the token before `IN` (past a
@@ -4231,7 +4227,10 @@ fn in_after_non_column(text: &str) -> bool {
 /// Whether `body` is `x [NOT] IN (…)` with an `x` that is no bare column: the
 /// predicate tokenizer reads only a column there ("syntax error at or near
 /// \"IN\""), the evaluator any value, with SQL's three values (`2 NOT IN
-/// (1, NULL)` is unknown).
+/// (1, NULL)` is unknown). Asked of a plain term only: an operand the scan
+/// lifts itself (`age % 3`, `b::float8`, `doc->'a'`) has its `IN` spelled out
+/// by [`lift_comparison`], which keeps the scan's type checks (`jsonb =
+/// integer` is refused).
 fn in_over_non_column(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     if !in_after_non_column(body) {
         return false;
@@ -4243,7 +4242,10 @@ fn in_over_non_column(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool 
     let is_in = word.eq_ignore_ascii_case("IN")
         || (word.eq_ignore_ascii_case("NOT") && body[end..].trim_start().get(..2).is_some_and(|w| w.eq_ignore_ascii_case("IN")));
     let left = body[..at].trim();
-    is_in && !left.is_empty() && resolve_column(left, schema).is_none()
+    // A document path (`doc->'a'`, `doc->>'a'`, `doc #> '{a}'`) the scan
+    // reads, type-checks (`jsonb = integer` is refused) and may index itself.
+    let document = || left.contains("->") || left.contains("#>");
+    is_in && !left.is_empty() && resolve_column(left, schema).is_none() && !document()
 }
 
 /// Whether `text` may hold a range operand: the word anywhere, outside
@@ -4283,6 +4285,10 @@ fn compares_a_computed_range(body: &str, schema: &SmallVec<[SchemaField; 20]>) -
     (is_range(&l) || is_range(&r)) && !(matches!(l, Expr::Column(_)) && literal(&r))
 }
 
+/// Whether `body` is a symbol comparison with a side the evaluator types
+/// `interval` (`ts - TIMESTAMP '2024-01-01' > interval '30 days'`): the scan
+/// compares only scalar types (`EvaluatedOperand::new`), and refused it; the
+/// evaluator orders intervals as PostgreSQL does, a day as 24 hours.
 fn compares_an_interval(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     let Some((at, end, false)) = comparison_operator(body) else {
         return false;
