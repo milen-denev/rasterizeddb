@@ -2136,6 +2136,15 @@ pub struct BranchInfo {
     /// 0 when it keeps no merge base, and so cannot be merged.
     pub base: u64,
     pub sessions: u64,
+    /// Branches between it and its tree's root: 1 for a branch of an
+    /// ordinary database. 0 from a server that predates the column.
+    pub depth: u64,
+    /// Its ancestry, root first: `prod/dev/feature`.
+    pub path: String,
+    /// Branches made from it.
+    pub children: u64,
+    /// Branches it was re-parented through when they were dropped.
+    pub via: String,
 }
 
 impl BranchInfo {

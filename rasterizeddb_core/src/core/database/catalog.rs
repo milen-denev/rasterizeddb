@@ -187,6 +187,9 @@ impl DatabaseCatalog {
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
         });
+        if let Some(root) = root {
+            sweep_dropped(std::path::Path::new(root));
+        }
         #[cfg(feature = "db_branching")]
         catalogue.sweep_branch_leftovers();
 
@@ -431,6 +434,39 @@ impl DatabaseCatalog {
         // never read them, so this only releases them.
         crate::core::rql::sequence::forget_database(database_id);
 
+        // Branches made from it move to its parent (docs/branching.md §8).
+        #[cfg(feature = "db_branching")]
+        {
+            let moved = self.reparent_children(name);
+            let (reparented, orphaned): (Vec<_>, Vec<_>) =
+                moved.into_iter().partition(|(_, to)| to.is_some());
+            if let Some((_, Some(to))) = reparented.first() {
+                crate::core::notice::push(
+                    "NOTICE",
+                    "00000",
+                    format!(
+                        "{} now branch{} from \"{to}\"; {} merge base{} still the copy taken from \"{name}\"",
+                        reparented.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", "),
+                        if reparented.len() == 1 { "es" } else { "" },
+                        if reparented.len() == 1 { "its" } else { "their" },
+                        if reparented.len() == 1 { " is" } else { "s are" },
+                    ),
+                );
+            }
+            if !orphaned.is_empty() {
+                crate::core::notice::push(
+                    "WARNING",
+                    "01000",
+                    format!(
+                        "{} {} made from \"{name}\", which was not a branch, so {} no parent to merge into now",
+                        orphaned.iter().map(|(c, _)| format!("\"{c}\"")).collect::<Vec<_>>().join(", "),
+                        if orphaned.len() == 1 { "was" } else { "were" },
+                        if orphaned.len() == 1 { "it has" } else { "they have" },
+                    ),
+                );
+            }
+        }
+
         if let Some(root) = &self.root {
             let path = std::path::Path::new(root).join(name);
 
@@ -448,21 +484,20 @@ impl DatabaseCatalog {
                 &path.to_string_lossy(),
             );
 
-            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
-                // The database is gone as far as clients are concerned, so this
-                // is a disk-space problem rather than a failed statement.
-                warn!(
-                    "Dropped database \"{}\" but could not remove {}: {}",
-                    name,
-                    path.display(),
-                    e
-                );
-            }
+            // Its files close from its own tasks, just after it is let go:
+            // removing them while open leaves `.fuse_hidden` files on
+            // ntfs-3g, and the directory behind.
+            #[cfg(feature = "db_branching")]
+            branch::released(&path).await;
+            // The database is gone as far as clients are concerned, so one
+            // that cannot be removed yet is a disk-space matter, not a failed
+            // statement: it is set aside and removed once it can be.
+            remove_eventually(&path);
         }
 
         // A branch's merge bases go with it.
         #[cfg(feature = "db_branching")]
-        self.remove_bases(name);
+        self.remove_bases(name).await;
 
         info!("Dropped database \"{}\"", name);
         Ok(())
@@ -528,6 +563,80 @@ async fn discover_databases(root: &str, default_name: &str) -> Vec<String> {
 /// Stricter than PostgreSQL, which allows anything inside double quotes: a name
 /// is also a directory name, so it is restricted to characters that mean the
 /// same thing on every filesystem and cannot escape the root.
+/// A directory removed while some of its files were still open, set aside
+/// under a name nothing reuses and removed once it can be: `.dropped-<name>-<n>`.
+pub(crate) const DROPPED_PREFIX: &str = ".dropped-";
+
+fn try_remove(path: &std::path::Path) -> bool {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => !path.exists(),
+    }
+}
+
+/// Removes the directory `path`. One that cannot be removed yet — on a FUSE
+/// filesystem (ntfs-3g) a file removed while open stays as `.fuse_hidden…`
+/// until it closes, and the directory with it — is renamed aside first, so
+/// its name is free at once (a database dropped and made again, a base
+/// generation reused), and removed in the background once it can be; what
+/// is still there at the next start is removed then ([`sweep_dropped`]).
+pub(crate) fn remove_eventually(path: &std::path::Path) {
+    if try_remove(path) {
+        return;
+    }
+    let (Some(parent), Some(base)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let aside = parent.join(format!(
+        "{DROPPED_PREFIX}{}-{nanos:x}",
+        base.to_string_lossy().trim_start_matches('.')
+    ));
+    if let Err(e) = std::fs::rename(path, &aside) {
+        warn!(
+            "could not remove {} ({e}), nor set it aside; it is left as it is",
+            path.display()
+        );
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    // What keeps it is usually a file still mapped by a worker thread's
+    // read cache (`file_sync`'s per-thread mmap), which lets go the next time
+    // that thread reads another file: soon on a busy server, maybe not until
+    // a restart on an idle one. So: often at first, then rarely, for a day.
+    runtime.spawn(async move {
+        for attempt in 0u32..(60 + 24 * 120) {
+            let wait = if attempt < 60 { 1 } else { 30 };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            if try_remove(&aside) {
+                return;
+            }
+        }
+        warn!(
+            "{} could not be removed; the next start removes it",
+            aside.display()
+        );
+    });
+}
+
+/// Removes what [`remove_eventually`] set aside and did not get to.
+fn sweep_dropped(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name().to_string_lossy().starts_with(DROPPED_PREFIX) && !try_remove(&e.path()) {
+            warn!("could not remove {}", e.path().display());
+        }
+    }
+}
+
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("database name is empty".to_string());

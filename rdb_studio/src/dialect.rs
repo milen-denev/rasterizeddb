@@ -3218,9 +3218,77 @@ pub fn parse_branches(grid: &Grid) -> Vec<BranchInfo> {
                 size: number("size_bytes"),
                 base: number("base_bytes"),
                 sessions: number("sessions"),
+                depth: number("depth"),
+                path: text("path"),
+                children: number("children"),
+                via: text("via"),
             }
         })
         .collect()
+}
+
+/// The branches as a tree, one line per database: each tree's root (the
+/// ordinary database it grows from, marked when it is gone) and every
+/// branch under its parent, siblings by name.
+///
+/// ```text
+/// prod
+/// ├─ dev
+/// │  └─ feature
+/// └─ hotfix
+/// ```
+pub fn branch_tree(branches: &[BranchInfo]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let names: BTreeSet<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    let mut children: BTreeMap<&str, Vec<&BranchInfo>> = BTreeMap::new();
+    for b in branches {
+        children.entry(b.parent.as_str()).or_default().push(b);
+    }
+    for list in children.values_mut() {
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    let roots: Vec<(&str, bool)> = branches
+        .iter()
+        .filter(|b| !names.contains(b.parent.as_str()))
+        .map(|b| (b.parent.as_str(), b.parent_exists))
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .collect();
+    fn walk<'a>(
+        at: &str,
+        prefix: &str,
+        children: &BTreeMap<&str, Vec<&'a BranchInfo>>,
+        seen: &mut BTreeSet<String>,
+        out: &mut String,
+    ) {
+        let Some(list) = children.get(at) else { return };
+        for (i, b) in list.iter().enumerate() {
+            let last = i + 1 == list.len();
+            if !seen.insert(b.name.clone()) {
+                continue;
+            }
+            out.push_str(prefix);
+            out.push_str(if last { "└─ " } else { "├─ " });
+            out.push_str(&b.name);
+            if !b.via.is_empty() {
+                out.push_str(&format!("  (via {})", b.via));
+            }
+            out.push('\n');
+            let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
+            walk(&b.name, &deeper, children, seen, out);
+        }
+    }
+    let mut out = String::new();
+    let mut seen = BTreeSet::new();
+    for (root, exists) in roots {
+        out.push_str(root);
+        if !exists {
+            out.push_str("  (dropped)");
+        }
+        out.push('\n');
+        walk(root, "", &children, &mut seen, &mut out);
+    }
+    out.trim_end().to_string()
 }
 
 pub fn parse_branch_diff(grid: &Grid) -> Vec<BranchDiffRow> {
@@ -3244,6 +3312,69 @@ pub fn parse_branch_diff(grid: &Grid) -> Vec<BranchDiffRow> {
 #[cfg(test)]
 mod branch_sql_tests {
     use super::*;
+
+    fn branch(name: &str, parent: &str, exists: bool, via: &str) -> BranchInfo {
+        BranchInfo {
+            name: name.into(),
+            parent: parent.into(),
+            parent_exists: exists,
+            point: "now".into(),
+            parent_lsn: 0,
+            method: "copy".into(),
+            created_at: String::new(),
+            merged_at: String::new(),
+            size: 0,
+            base: 1,
+            sessions: 0,
+            depth: 0,
+            path: String::new(),
+            children: 0,
+            via: via.into(),
+        }
+    }
+
+    #[test]
+    fn branches_draw_as_a_tree_under_their_roots() {
+        let list = vec![
+            branch("hotfix", "prod", true, ""),
+            branch("feature", "dev", true, ""),
+            branch("dev", "prod", true, ""),
+            branch("old", "staging", true, "mid"),
+            branch("orphan", "gone", false, ""),
+        ];
+        assert_eq!(
+            branch_tree(&list),
+            "gone  (dropped)\n└─ orphan\nprod\n├─ dev\n│  └─ feature\n└─ hotfix\nstaging\n└─ old  (via mid)"
+        );
+    }
+
+    #[test]
+    fn the_tree_columns_are_read_by_name_and_default_when_absent() {
+        let grid = Grid {
+            columns: ["branch", "parent", "parent_exists", "depth", "path", "children", "via"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            rows: vec![vec![
+                Some("feature".into()),
+                Some("dev".into()),
+                Some("t".into()),
+                Some("2".into()),
+                Some("prod/dev/feature".into()),
+                Some("0".into()),
+                Some("".into()),
+            ]],
+            ..Grid::default()
+        };
+        let parsed = parse_branches(&grid);
+        assert_eq!((parsed[0].depth, parsed[0].path.as_str()), (2, "prod/dev/feature"));
+        let old = Grid {
+            columns: vec!["branch".into(), "parent".into()],
+            rows: vec![vec![Some("dev".into()), Some("prod".into())]],
+            ..Grid::default()
+        };
+        assert_eq!(parse_branches(&old)[0].depth, 0);
+    }
 
     #[test]
     fn the_form_writes_the_statement_the_server_parses() {

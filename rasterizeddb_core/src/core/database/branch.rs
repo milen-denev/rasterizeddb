@@ -97,9 +97,30 @@ pub struct BranchMeta {
     /// committed.
     #[serde(default)]
     pub base_generation: u64,
+    /// Branches it was re-parented through, oldest first: each a branch it
+    /// was made from (directly or through another) that was dropped, so its
+    /// parent became that branch's parent. Its base is still the copy taken
+    /// from the first of them.
+    #[serde(default)]
+    pub via: Vec<String>,
+    /// Names this copy among every branch ever made under its name: what a
+    /// merge's renumbered keys are recorded against in the parent, so a
+    /// branch made again (or reset) never takes an old one's.
+    #[serde(default)]
+    pub id: String,
 }
 
 impl BranchMeta {
+    /// [`BranchMeta::id`], or for metadata written before it existed, the
+    /// name and creation time.
+    pub fn merge_id(&self, name: &str) -> String {
+        if self.id.is_empty() {
+            format!("{name}@{}", self.created_at)
+        } else {
+            self.id.clone()
+        }
+    }
+
     pub fn read(dir: &Path) -> Option<BranchMeta> {
         let text = std::fs::read_to_string(dir.join(META_FILE)).ok()?;
         serde_json::from_str(&text).ok()
@@ -155,6 +176,13 @@ pub struct BranchListing {
     pub sessions: u64,
     /// Bytes the base holds, when there is one.
     pub base_bytes: Option<u64>,
+    /// Branches between it and the first ancestor that is not a branch (or
+    /// no longer exists): 1 for a branch of an ordinary database.
+    pub depth: u64,
+    /// Its ancestry, root first, ending with its own name: `prod/dev/x`.
+    pub path: String,
+    /// Branches made from it.
+    pub children: u64,
 }
 
 /// What a copy did, for the branch's metadata and the operator.
@@ -242,6 +270,16 @@ fn excluded(name: &str) -> bool {
         || name.starts_with(".rdb_")
         || name == "RESTORED.json"
         || name == REPLAY_FILE
+        // What ntfs-3g (FUSE) keeps of a file removed while open: the parent's
+        // garbage, never its data.
+        || name.starts_with(".fuse_hidden")
+        // A branch never shares its parent's stores: their objects are the
+        // parent's, and a table the branch placed there would write among
+        // them. Their tables are copied out of them ([`copy_store_tables`]).
+        || name == "db_kv.cfg"
+        || name == "db_kv.cfg.tmp"
+        || name == "db_kv_secrets.cfg"
+        || name == "db_kv_secrets.cfg.tmp"
 }
 
 /// The files of a database directory to copy: flat, because a database's own
@@ -303,34 +341,6 @@ struct Stream {
     named: Vec<String>,
 }
 
-/// Tables of `dir`'s pool placed on a key/value store, which have no files to
-/// copy and no log to replay.
-#[cfg(feature = "storage_pools")]
-fn kv_tables(dir: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(dir.join(crate::core::storage::POOL_FILE)) else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = text
-        .lines()
-        .filter_map(
-            |line| match line.split('\t').collect::<Vec<_>>().as_slice() {
-                ["table", spec, table]
-                    if matches!(
-                        crate::core::storage::TableBackend::parse(spec),
-                        crate::core::storage::TableBackend::KeyValue(_)
-                    ) =>
-                {
-                    Some((*table).to_string())
-                }
-                _ => None,
-            },
-        )
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// The name a storage location outside the parent's directory is copied to
 /// inside the branch: what a restore elsewhere names it.
 fn location_dir_name(path: &str) -> String {
@@ -365,19 +375,7 @@ async fn copy_live(
     let mut moved: Vec<(String, String)> = Vec::new();
     #[cfg(feature = "storage_pools")]
     {
-        let kv = kv_tables(source);
-        if !kv.is_empty() {
-            return Err(io::Error::other(format!(
-                "cannot branch: {} kept on a key/value store, which a branch cannot copy yet: {}. \
-                 STORAGE MOVE TABLE moves a table back into a directory first.",
-                if kv.len() == 1 {
-                    "a table is"
-                } else {
-                    "tables are"
-                },
-                kv.join(", ")
-            )));
-        }
+        refuse_uncopyable(source)?;
         let source_norm = crate::core::storage::normalize(&source.to_string_lossy());
         for path in crate::core::storage::data_locations(source)? {
             let path_norm = crate::core::storage::normalize(&path);
@@ -586,10 +584,143 @@ async fn copy_live(
     .await
     .map_err(io::Error::other)??;
 
+    // After the replay: the log may still name a file a table had before it
+    // moved onto a store, and its records must not land on the copy.
+    copy_store_tables(source, staging).await?;
+
     crate::core::database::incompat::fence_restored_directory(staging)?;
     repoint(staging, final_dir, source, &moved)?;
 
     Ok((lsns.first().copied().unwrap_or(0), stats))
+}
+
+/// Refuses a database holding something a branch cannot copy: the partitions
+/// of a partitioned table placed on a key/value store (which a backup does
+/// not copy either, `backup::cold`). And says what a branch holds
+/// differently: in-memory tables come over empty.
+#[cfg(feature = "storage_pools")]
+fn refuse_uncopyable(source: &Path) -> io::Result<()> {
+    use crate::core::backup::cold;
+    use crate::core::storage::TableBackend;
+    let partitioned = cold::partitioned_on_stores(source);
+    if !partitioned.is_empty() {
+        let stores: std::collections::BTreeSet<&String> = partitioned.values().flatten().collect();
+        return Err(io::Error::other(format!(
+            "cannot branch: {} partitioned table(s) keep partitions on key/value store(s) {}, which a branch \
+             cannot copy yet; STORAGE MOVE moves them back into a directory first",
+            partitioned.len(),
+            stores
+                .iter()
+                .map(|s| format!("'{s}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let placements = cold::placements(source);
+    #[cfg(not(feature = "kv_storage"))]
+    {
+        let on_stores: Vec<&String> = placements
+            .iter()
+            .filter(|(_, spec)| matches!(TableBackend::parse(spec), TableBackend::KeyValue(_)))
+            .map(|(t, _)| t)
+            .collect();
+        if !on_stores.is_empty() {
+            return Err(io::Error::other(format!(
+                "cannot branch: this build has no key/value storage, so the tables on stores cannot be read: {}",
+                on_stores.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
+    let memory: Vec<&String> = placements
+        .iter()
+        .filter(|(_, spec)| matches!(TableBackend::parse(spec), TableBackend::Memory))
+        .map(|(t, _)| t)
+        .collect();
+    if !memory.is_empty() {
+        crate::core::notice::push(
+            "WARNING",
+            "01000",
+            format!(
+                "in-memory table(s) {} come over empty: nothing of them is on disk to copy",
+                memory.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "storage_pools"))]
+fn refuse_uncopyable(_source: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Copies the tables `source` keeps on key/value stores into `staging` as
+/// ordinary files, one crash-consistent cut per store (the backup's
+/// `kv::export`): on the branch they are tables of its own directory, the
+/// pool file's rewrite dropping their placements. Never onto the store
+/// itself, where the branch would write among the parent's objects; for the
+/// same reason the store definitions are not copied ([`excluded`]).
+///
+/// Each store is cut at its own moment, after the directories' copy: a
+/// transaction that wrote both a store's table and a directory's may be in
+/// one copy and not the other.
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+async fn copy_store_tables(source: &Path, staging: &Path) -> io::Result<()> {
+    use crate::core::backup::cold;
+    use crate::core::storage::TableBackend;
+    let mut on_store: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (table, spec) in cold::placements(source) {
+        if let TableBackend::KeyValue(store) = TableBackend::parse(&spec) {
+            on_store.entry(store).or_default().push(table);
+        }
+    }
+    if on_store.is_empty() {
+        return Ok(());
+    }
+    let stores = crate::core::storage::kv_registry::KvRegistry::open(&source.to_string_lossy());
+    let mut copied: Vec<String> = Vec::new();
+    for (store, tables) in on_store {
+        let scratch = staging.join(format!(".kv-export-{store}"));
+        remove_quietly(&scratch);
+        let (client, config) = stores
+            .connect(&store)
+            .map_err(|e| io::Error::other(format!("cannot branch: store '{store}': {e}")))?;
+        let owned = |file: &str| cold::owner(&tables, file).is_some();
+        let files = crate::core::storage_providers::kv::export::export(client, config, owned, &scratch)
+            .await
+            .map_err(|e| {
+                remove_quietly(&scratch);
+                io::Error::other(format!("cannot branch: the tables on store '{store}' could not be copied: {e}"))
+            })?;
+        for table in &tables {
+            if !files.iter().any(|f| cold::owner(&tables, &f.name) == Some(table)) {
+                remove_quietly(&scratch);
+                return Err(io::Error::other(format!(
+                    "cannot branch: store '{store}' holds no files for table {table}"
+                )));
+            }
+        }
+        for f in &files {
+            std::fs::rename(&f.path, staging.join(&f.name))?;
+        }
+        remove_quietly(&scratch);
+        copied.extend(tables);
+    }
+    crate::core::notice::push(
+        "NOTICE",
+        "00000",
+        format!(
+            "table(s) {} were copied out of their key/value store(s): on the branch they are ordinary tables \
+             in its own directory, and the stores are not part of it",
+            copied.join(", ")
+        ),
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "storage_pools", feature = "kv_storage")))]
+async fn copy_store_tables(_source: &Path, _staging: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Rewrites the pool file in `dir` from `from` to `to`.
@@ -661,6 +792,9 @@ fn copy_tree(from: &Path, to: &Path, stats: &mut CopyStats) -> io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)?.flatten() {
         let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with(".fuse_hidden") {
+            continue;
+        }
         let target = to.join(entry.file_name());
         let kind = entry.file_type()?;
         if kind.is_dir() {
@@ -701,11 +835,45 @@ fn human(bytes: u64) -> String {
     }
 }
 
+/// A new [`BranchMeta::id`] for a copy named `name`.
+fn fresh_id(name: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{name}@{nanos:x}.{:x}", std::process::id())
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Waits (up to a few seconds) until this process holds no file under
+/// `dir` open: a database just dropped closes its files from its own tasks,
+/// shortly after. Removing them while open works on most filesystems, but on
+/// a FUSE one (ntfs-3g) leaves `.fuse_hidden` files the removal then trips
+/// over.
+pub(super) async fn released(dir: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        for _ in 0..50 {
+            let open = std::fs::read_dir("/proc/self/fd").ok().is_some_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| std::fs::read_link(e.path()).is_ok_and(|t| t.starts_with(&dir)))
+            });
+            if !open {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = dir;
 }
 
 /// Removes a directory if it exists, logging rather than failing.
@@ -784,7 +952,7 @@ impl DatabaseCatalog {
     }
 
     /// Removes every base generation of `name`, and forgets an open one.
-    pub(super) fn remove_bases(&self, name: &str) {
+    pub(super) async fn remove_bases(&self, name: &str) {
         if let Some((_, (_, open))) = self.bases.remove(name) {
             drop(open);
         }
@@ -802,34 +970,104 @@ impl DatabaseCatalog {
                 !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) || rest == "building"
             }) {
                 forget_directory(&e.path());
-                remove_quietly(&e.path());
+                released(&e.path()).await;
+                super::remove_eventually(&e.path());
             }
         }
     }
 
-    /// Every branch, ordered by name.
+    /// Every branch, in tree order: each after its parent, siblings by name
+    /// (ordered by [`BranchListing::path`]).
     pub fn branches(&self) -> Vec<BranchListing> {
-        let mut out = Vec::new();
+        let mut metas: HashMap<String, BranchMeta> = HashMap::new();
+        let mut sessions: HashMap<String, u64> = HashMap::new();
         for entry in self.databases.iter() {
             let Some(dir) = self.directory_of(entry.key()) else {
                 continue;
             };
-            let Some(meta) = BranchMeta::read(&dir) else {
-                continue;
-            };
+            if let Some(meta) = BranchMeta::read(&dir) {
+                sessions.insert(
+                    entry.key().clone(),
+                    entry.sessions.load(Ordering::Acquire) as u64,
+                );
+                metas.insert(entry.key().clone(), meta);
+            }
+        }
+        let mut out = Vec::new();
+        for (name, meta) in &metas {
             let base_bytes = self
-                .base_path(entry.key(), meta.base_generation)
+                .base_path(name, meta.base_generation)
                 .filter(|d| meta.has_base && d.is_dir())
                 .map(|d| dir_bytes(&d));
+            let (ancestors, _) = ancestry(name, &metas);
+            let mut path: Vec<String> = ancestors.iter().rev().cloned().collect();
+            path.push(name.clone());
             out.push(BranchListing {
-                name: entry.key().clone(),
+                name: name.clone(),
                 parent_exists: self.databases.contains_key(&meta.parent),
-                meta,
-                sessions: entry.sessions.load(Ordering::Acquire) as u64,
+                sessions: sessions.get(name).copied().unwrap_or(0),
                 base_bytes,
+                depth: ancestors
+                    .iter()
+                    .filter(|a| metas.contains_key(*a))
+                    .count() as u64
+                    + 1,
+                path: path.join("/"),
+                children: metas.values().filter(|m| &m.parent == name).count() as u64,
+                meta: meta.clone(),
             });
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// `dropped` is going: each branch made from it is re-parented to
+    /// `dropped`'s own parent, when `dropped` was a branch, keeping its base
+    /// (docs/branching.md §8). Returns `(child, new parent)` per child; a
+    /// child of a database that was not a branch keeps naming it, and can no
+    /// longer be merged. Run while `dropped`'s directory still exists.
+    pub(super) fn reparent_children(&self, dropped: &str) -> Vec<(String, Option<String>)> {
+        let Some(dropped_dir) = self.directory_of(dropped) else {
+            return Vec::new();
+        };
+        let grandparent = BranchMeta::read(&dropped_dir).map(|m| m.parent);
+        let mut out = Vec::new();
+        for entry in self.databases.iter() {
+            if entry.key() == dropped {
+                continue;
+            }
+            let Some(dir) = self.directory_of(entry.key()) else {
+                continue;
+            };
+            let Some(mut meta) = BranchMeta::read(&dir) else {
+                continue;
+            };
+            if meta.parent != dropped {
+                continue;
+            }
+            if let Some(grandparent) = &grandparent {
+                meta.via.push(dropped.to_string());
+                meta.parent = grandparent.clone();
+                if let Err(e) = meta.write(&dir) {
+                    warn!(
+                        "branch \"{}\" could not be re-parented from \"{}\" to \"{}\": {}",
+                        entry.key(),
+                        dropped,
+                        grandparent,
+                        e
+                    );
+                    continue;
+                }
+                info!(
+                    "Branch \"{}\" re-parented from \"{}\" to \"{}\"",
+                    entry.key(),
+                    dropped,
+                    grandparent
+                );
+            }
+            out.push((entry.key().clone(), grandparent.clone()));
+        }
+        out.sort();
         out
     }
 
@@ -971,7 +1209,7 @@ impl DatabaseCatalog {
                 Err(e) => {
                     forget_directory(&final_dir);
                     remove_quietly(&final_dir);
-                    self.remove_bases(name);
+                    self.remove_bases(name).await;
                     return Err(format!(
                         "branch \"{name}\" was copied but would not open: {e}"
                     ));
@@ -1027,6 +1265,8 @@ impl DatabaseCatalog {
             bytes,
             merged_at: None,
             base_generation,
+            via: Vec::new(),
+            id: fresh_id(name),
         };
         if options.with_base {
             self.write_base(name, staging, final_dir, base_generation)
@@ -1270,14 +1510,16 @@ impl DatabaseCatalog {
         std::mem::forget(guard);
         match self.attach(name).await {
             Ok(_) => {
-                remove_quietly(&retiring);
+                released(&retiring).await;
+                super::remove_eventually(&retiring);
                 // The old base generation goes with what it described.
                 if let Some((_, (_, open))) = self.bases.remove(name) {
                     drop(open);
                 }
                 if let Some(old) = self.base_path(name, meta.base_generation) {
                     forget_directory(&old);
-                    remove_quietly(&old);
+                    released(&old).await;
+                    super::remove_eventually(&old);
                 }
                 info!("Reset branch \"{}\" from \"{}\"", name, meta.parent);
                 Ok(fresh)
@@ -1356,12 +1598,14 @@ impl DatabaseCatalog {
                 bytes: dir_bytes(&parent_dir),
                 merged_at: None,
                 base_generation: 0,
+                via: Vec::new(),
+                id: fresh_id(name),
             },
         };
         let swapped = intent
             .store(&root)
             .and_then(|_| finish_promote(&root, &mut intent));
-        self.remove_bases(name);
+        self.remove_bases(name).await;
         let reopened = (self.attach(&parent).await, self.attach(name).await);
         if let Err(e) = swapped {
             return Err(format!(
@@ -1432,7 +1676,7 @@ impl DatabaseCatalog {
     /// the branch's base after a merge committed, and records the merge. The
     /// DDL the merge replayed — the first `ddl_replayed` lines — is dropped
     /// from the branch's log.
-    pub fn adopt_base(
+    pub async fn adopt_base(
         &self,
         name: &str,
         generation: u64,
@@ -1454,16 +1698,18 @@ impl DatabaseCatalog {
         }
         if let Some(old) = self.base_path(name, old) {
             forget_directory(&old);
-            remove_quietly(&old);
+            released(&old).await;
+            super::remove_eventually(&old);
         }
         Ok(())
     }
 
     /// Drops a next generation a merge did not commit.
-    pub fn discard_base(&self, name: &str, generation: u64) {
+    pub async fn discard_base(&self, name: &str, generation: u64) {
         if let Some(next) = self.base_path(name, generation) {
             forget_directory(&next);
-            remove_quietly(&next);
+            released(&next).await;
+            super::remove_eventually(&next);
         }
     }
 
@@ -1510,6 +1756,47 @@ impl DatabaseCatalog {
     }
 }
 
+/// `name`'s ancestors, nearest first, through the branches in `metas`: each
+/// branch's parent, until one that is not a branch (included, it is the
+/// tree's root) — and whether the walk stopped at a cycle, which only a
+/// damaged metadata file can make.
+fn ancestry(name: &str, metas: &HashMap<String, BranchMeta>) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    let mut at = name;
+    while let Some(meta) = metas.get(at) {
+        if meta.parent == name || out.contains(&meta.parent) {
+            return (out, true);
+        }
+        out.push(meta.parent.clone());
+        at = &meta.parent;
+    }
+    (out, false)
+}
+
+/// Every branch directory under `root` whose metadata names `from` as its
+/// parent, other than those in `except`, now names `to`: what a `PROMOTE`
+/// does for the promoted branch's own branches, which follow its data to
+/// its new name. Idempotent, so a promote finished after a crash runs it
+/// again safely.
+fn repoint_children(root: &Path, from: &str, to: &str, except: &[&Path]) -> io::Result<()> {
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let dir = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+            || entry.file_name().to_string_lossy().starts_with('.')
+            || except.iter().any(|e| *e == dir.as_path())
+        {
+            continue;
+        }
+        if let Some(mut meta) = BranchMeta::read(&dir)
+            && meta.parent == from
+        {
+            meta.parent = to.to_string();
+            meta.write(&dir)?;
+        }
+    }
+    Ok(())
+}
+
 // ---- the DDL a branch records -------------------------------------------------
 
 /// DDL run inside a block, kept until the block ends: `(directory, block)`.
@@ -1530,6 +1817,11 @@ pub fn is_recorded_ddl(stmt: &str) -> bool {
         return false;
     }
     let second = second.unwrap_or("").to_ascii_uppercase();
+    // A merge's record of renumbered keys is the parent's own, never a
+    // schema change to carry further up.
+    if stmt.contains(crate::pgwire::KEYMAP_TABLE_NAME) {
+        return false;
+    }
     !matches!(
         second.as_str(),
         "DATABASE" | "BRANCH" | "ROLE" | "USER" | "TEMP" | "TEMPORARY" | "GROUP"
@@ -1729,6 +2021,9 @@ fn finish_promote(root: &Path, intent: &mut PromoteIntent) -> io::Result<()> {
         },
     }
     intent.branch_meta.write(&branch_dir)?;
+    // The promoted branch's own branches were copied from what is now the
+    // parent's name, and follow it there.
+    repoint_children(root, &intent.branch, &intent.parent, &[&parent_dir, &branch_dir])?;
     let _ = std::fs::remove_file(branch_dir.join(DDL_FILE));
     let _ = std::fs::remove_file(parent_dir.join(DDL_FILE));
     std::fs::remove_file(root.join(PROMOTE_INTENT))?;

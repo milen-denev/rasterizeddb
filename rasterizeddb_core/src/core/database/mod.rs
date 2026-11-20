@@ -1495,6 +1495,13 @@ pub struct Database {
     /// one failed with "No such file or directory".
     rename_serial: tokio::sync::Mutex<()>,
 
+    /// Ends the catalogue files' background service when the database is
+    /// dropped. The task holds the three providers, so without this a
+    /// dropped database (`DROP DATABASE`, a branch's RESET or merge
+    /// retiring a copy) kept its catalogue files open, and their landing
+    /// loop running, for the life of the process.
+    catalogue_services: StdArc<tokio::sync::Notify>,
+
     /// Tests only: create unconstrained NUMERIC columns in the sixteen-byte,
     /// nine-place slot every build before `numeric_own_scale_v1` wrote, so a
     /// test can hold such a column and convert it (`numeric_own_scale_tests`).
@@ -1505,6 +1512,13 @@ pub struct Database {
     /// port). Built lazily: a database that never uses it allocates nothing.
     #[cfg(feature = "kv_cache")]
     pub kv_cache: crate::core::kv_cache::KvCacheHandle,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // A stored permit if the task has not reached its wait yet.
+        self.catalogue_services.notify_one();
+    }
 }
 
 impl Database {
@@ -1635,12 +1649,19 @@ impl Database {
         let io_rows_clone = io_rows.clone();
         let io_schema_clone = io_schema.clone();
 
+        let catalogue_services = StdArc::new(tokio::sync::Notify::new());
+        let released = catalogue_services.clone();
         tokio::spawn(async move {
-            tokio::join!(
-                io_rows_clone.start_service(),
-                io_pointers_clone.start_service(),
-                io_schema_clone.start_service()
-            );
+            tokio::select! {
+                _ = async {
+                    tokio::join!(
+                        io_rows_clone.start_service(),
+                        io_pointers_clone.start_service(),
+                        io_schema_clone.start_service()
+                    )
+                } => {}
+                _ = released.notified() => {}
+            }
         });
 
         let schema = match load_db_data_schema(io_schema.clone()).await {
@@ -1960,6 +1981,7 @@ impl Database {
             held_names: parking_lot::Mutex::new(held.into_iter().collect()),
             block_ddl: DashMap::with_hasher(ahash::RandomState::new()),
             rename_serial: tokio::sync::Mutex::new(()),
+            catalogue_services,
             #[cfg(feature = "kv_cache")]
             kv_cache: {
                 let handle = crate::core::kv_cache::KvCacheHandle::new((!in_memory).then_some(location));

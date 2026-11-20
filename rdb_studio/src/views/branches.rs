@@ -204,6 +204,9 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
         _ => super::SortKey::text(&b.name),
     });
 
+    // Unsorted, the rows are in tree order (the server's), and each name
+    // sits under its parent.
+    let tree_order = layout.client_sort().is_none();
     let rows = list.len();
     let mut body = column![].spacing(0);
     for (index, b) in list.into_iter().enumerate() {
@@ -240,7 +243,11 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
             &widths,
             vec![
                 super::grid_cell(
-                    b.name.clone(),
+                    if tree_order && b.depth > 1 {
+                        format!("{}└ {}", "  ".repeat(b.depth as usize - 1), b.name)
+                    } else {
+                        b.name.clone()
+                    },
                     false,
                     if selected {
                         theme::RUST_BRIGHT
@@ -250,10 +257,10 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
                 ),
                 container(actions).padding([2, 6]).into(),
                 super::grid_cell(
-                    if b.parent_exists {
-                        b.parent.clone()
-                    } else {
-                        format!("{} (dropped)", b.parent)
+                    match (b.parent_exists, b.via.is_empty()) {
+                        (true, true) => b.parent.clone(),
+                        (true, false) => format!("{} (via {})", b.parent, b.via),
+                        (false, _) => format!("{} (dropped)", b.parent),
                     },
                     false,
                     if b.parent_exists {
@@ -299,6 +306,13 @@ fn branches<'a>(studio: &'a Studio, snapshot: &'a BranchesSnapshot) -> Element<'
     container(
         column![
             section_label("BRANCHES"),
+            container(
+                text(dialect::branch_tree(&snapshot.branches))
+                    .size(12)
+                    .font(theme::MONO)
+                    .color(theme::TEXT_DIM),
+            )
+            .padding([4, 8]),
             // Sized to its rows: a `Fill` grid inside the page's scrollable
             // is squeezed to a row and a half, and the button rows are
             // taller than text ones.

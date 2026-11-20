@@ -72,6 +72,9 @@ mod fixed_rows;
 mod native_session;
 #[cfg(feature = "db_branching")]
 mod branch_merge;
+/// The parent's record of keys a branch merge renumbered (`branch_merge`).
+#[cfg(feature = "db_branching")]
+pub const KEYMAP_TABLE_NAME: &str = branch_merge::KEYMAP_TABLE;
 #[cfg(all(test, feature = "db_branching"))]
 mod branch_tests;
 #[cfg(any(feature = "mysql_wire", feature = "mssql_wire"))]
@@ -6335,8 +6338,16 @@ where
             if if_exists && state.catalog.get(&name).is_none() {
                 return send_command_complete(stream, "DROP BRANCH").await;
             }
+            let meta = state.catalog.branch_meta(&name);
             match state.catalog.drop_branch(&name, &current).await {
-                Ok(()) => send_command_complete(stream, "DROP BRANCH").await,
+                Ok(()) => {
+                    if let Some(meta) = meta
+                        && let Some(parent) = state.catalog.get(&meta.parent)
+                    {
+                        branch_merge::forget_keys(parent, &meta.merge_id(&name)).await;
+                    }
+                    send_command_complete(stream, "DROP BRANCH").await
+                }
                 Err(e) => fail_statement(state, stream, not_branch_code(&e), &e).await,
             }
         }
@@ -6380,6 +6391,10 @@ where
                         CatalogCell::Number(b.meta.bytes),
                         CatalogCell::Number(b.base_bytes.unwrap_or(0)),
                         CatalogCell::Number(b.sessions),
+                        CatalogCell::Number(b.depth),
+                        CatalogCell::Text(b.path.clone()),
+                        CatalogCell::Number(b.children),
+                        CatalogCell::Text(b.meta.via.join(", ")),
                     ])
                 })
                 .collect();
@@ -6388,7 +6403,7 @@ where
         }
         DatabaseStatement::DiffBranch { name, into } => {
             let catalog = state.catalog.clone();
-            match branch_merge::run(&catalog, &name, into.as_deref(), None).await {
+            match branch_merge::run(&catalog, &name, into.as_deref(), None, &state.principal.name).await {
                 Ok(diff) => send_diff(stream, &diff, omit_description).await,
                 Err((code, e)) => fail_statement(state, stream, code, &e).await,
             }
@@ -6400,7 +6415,7 @@ where
             allow_drop,
         } => {
             let catalog = state.catalog.clone();
-            match branch_merge::run(&catalog, &name, into.as_deref(), Some((policy, allow_drop))).await {
+            match branch_merge::run(&catalog, &name, into.as_deref(), Some((policy, allow_drop)), &state.principal.name).await {
                 Ok(diff) => send_diff(stream, &diff, omit_description).await,
                 Err((code, e)) => fail_statement(state, stream, code, &e).await,
             }

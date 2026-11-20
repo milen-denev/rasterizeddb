@@ -451,6 +451,13 @@ async fn a_merge_applies_what_the_branch_did() {
         prod.scalar("SELECT label FROM tags WHERE id = 1").await,
         "fresh"
     );
+    // The table the merge created is the merging role's, not an internal
+    // session's that no role is.
+    assert_eq!(
+        prod.rows("SELECT grantee FROM __rdb_acl WHERE relation = 'tags' AND privilege = 'OWNER'")
+            .await,
+        vec![vec!["tester".to_string()]]
+    );
 
     // Merged once: nothing is offered again.
     let again = admin.rows("SHOW BRANCH DIFF dev").await;
@@ -701,4 +708,515 @@ async fn a_branch_at_a_past_point_is_restored_from_the_backup() {
         .lock()
         .remove(&crate::core::wal::dir_key(&root));
     drop(service);
+}
+
+/// Open descriptors of this process under `dir`.
+fn open_under(dir: &std::path::Path) -> Vec<String> {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+        for e in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(e.path())
+                && target.starts_with(&dir)
+            {
+                out.push(target.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_database_lets_go_of_everything() {
+    let fx = seeded("letgo").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE INDEX items_qty ON items (qty)").await;
+    prod.exec("CREATE TABLE parts (id INT PRIMARY KEY, item INT REFERENCES items(id)) PARTITION BY HASH (id) PARTITIONS 2").await;
+    prod.exec("INSERT INTO parts (id, item) VALUES (1, 1), (2, 2)").await;
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM parts").await, "2");
+    drop(prod);
+    let dir = fx.root.join("prod");
+    let held = fx.catalog.get("prod").unwrap();
+    let mut admin = fx.client("postgres");
+    admin.exec("DROP DATABASE prod").await;
+    let mut others = usize::MAX;
+    for _ in 0..100 {
+        others = Arc::strong_count(&held) - 1;
+        if others == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    drop(held);
+    let mut fds = Vec::new();
+    for _ in 0..100 {
+        fds = open_under(&dir);
+        if fds.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let left = (others != 0, fds);
+    assert!(!left.0 && left.1.is_empty(), "the dropped database is still held: {left:?}");
+
+    // A branch's RESET and MERGE retire copies of it too: none is held
+    // open once they return.
+    let fx = seeded("letgo2").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("INSERT INTO items (id, name, qty) VALUES (5, 'x', 1)").await;
+    admin.exec("MERGE BRANCH dev").await;
+    admin.exec("RESET BRANCH dev").await;
+    admin.exec("MERGE BRANCH dev").await;
+    drop(dev);
+    let deleted = |root: &std::path::Path| -> Vec<String> {
+        open_under(root).into_iter().filter(|p| p.ends_with("(deleted)")).collect()
+    };
+    let mut held = deleted(&fx.root);
+    for _ in 0..50 {
+        if held.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        held = deleted(&fx.root);
+    }
+    assert!(held.is_empty(), "retired copies still open: {held:?}");
+    assert!(!fx.root.join(".retiring-dev").exists());
+}
+
+/// `SHOW BRANCHES` as `(branch, parent, depth, path, children, via)`.
+async fn tree(admin: &mut Client) -> Vec<(String, String, String, String, String, String)> {
+    admin
+        .rows("SHOW BRANCHES")
+        .await
+        .into_iter()
+        .map(|r| {
+            (
+                r[0].clone(),
+                r[1].clone(),
+                r[11].clone(),
+                r[12].clone(),
+                r[13].clone(),
+                r[14].clone(),
+            )
+        })
+        .collect()
+}
+
+fn row(cells: &[&str]) -> Vec<String> {
+    cells.iter().map(|c| c.to_string()).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_branch_of_a_branch_merges_up_the_chain_and_outlives_its_middle() {
+    let fx = seeded("nested").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("ALTER TABLE items ADD COLUMN note TEXT").await;
+    dev.exec("UPDATE items SET note = 'd' WHERE id = 1").await;
+    dev.exec("INSERT INTO items (id, name, qty, note) VALUES (4, 'fig', 40, NULL)")
+        .await;
+
+    admin.exec("CREATE BRANCH feature FROM dev").await;
+    let mut feature = fx.client("feature");
+    // The copy carries the middle branch's data, not its record of DDL.
+    assert_eq!(feature.scalar("SELECT note FROM items WHERE id = 1").await, "d");
+    feature
+        .exec("CREATE TABLE tags (id INT PRIMARY KEY, label TEXT)")
+        .await;
+    feature.exec("INSERT INTO tags (id, label) VALUES (1, 'x')").await;
+    feature.exec("UPDATE items SET qty = 99 WHERE id = 2").await;
+    feature
+        .exec("INSERT INTO items (id, name, qty, note) VALUES (5, 'kiwi', 50, 'f')")
+        .await;
+
+    let listed = tree(&mut admin).await;
+    assert_eq!(
+        listed,
+        vec![
+            ("dev".into(), "prod".into(), "1".into(), "prod/dev".into(), "1".into(), String::new()),
+            ("feature".into(), "dev".into(), "2".into(), "prod/dev/feature".into(), "0".into(), String::new()),
+        ]
+    );
+
+    // Up one level: into dev, which records the replayed DDL as its own.
+    admin.exec("MERGE BRANCH feature").await;
+    let mut dev = fx.client("dev");
+    assert_eq!(dev.scalar("SELECT qty FROM items WHERE id = 2").await, "99");
+    assert_eq!(dev.scalar("SELECT label FROM tags WHERE id = 1").await, "x");
+    // And up the next: prod takes dev's own changes and feature's, schema
+    // included.
+    admin.exec("MERGE BRANCH dev").await;
+    let mut prod = fx.client("prod");
+    assert_eq!(
+        prod.rows("SELECT id, qty, note FROM items ORDER BY id").await,
+        vec![
+            row(&["1", "10", "d"]),
+            row(&["2", "99", "NULL"]),
+            row(&["3", "30", "NULL"]),
+            row(&["4", "40", "NULL"]),
+            row(&["5", "50", "f"]),
+        ]
+    );
+    assert_eq!(prod.scalar("SELECT label FROM tags WHERE id = 1").await, "x");
+
+    // The middle goes: its branch moves to prod, keeping the base it was
+    // made with — including a column only dev had.
+    let mut dev = fx.client("dev");
+    dev.exec("ALTER TABLE items ADD COLUMN extra INT").await;
+    admin.exec("CREATE BRANCH feature2 FROM dev").await;
+    let mut feature2 = fx.client("feature2");
+    feature2.exec("UPDATE items SET qty = 33 WHERE id = 3").await;
+    feature2.exec("UPDATE items SET extra = 7 WHERE id = 1").await;
+    feature2
+        .exec("INSERT INTO items (id, name, qty) VALUES (6, 'lime', 60)")
+        .await;
+    drop((dev, feature, feature2));
+    let said = admin.exec("DROP BRANCH dev").await;
+    assert!(
+        said.notices.iter().any(|n| n.contains("\"feature\", \"feature2\" now branch from \"prod\"")),
+        "{:?}",
+        said.notices
+    );
+    let listed = tree(&mut admin).await;
+    assert_eq!(
+        listed,
+        vec![
+            ("feature".into(), "prod".into(), "1".into(), "prod/feature".into(), "0".into(), "dev".into()),
+            ("feature2".into(), "prod".into(), "1".into(), "prod/feature2".into(), "0".into(), "dev".into()),
+        ]
+    );
+    let diff = admin.rows("SHOW BRANCH DIFF feature2").await;
+    let items = diff
+        .iter()
+        .find(|r| r[0] == "items" && r[1] == "data")
+        .unwrap_or_else(|| panic!("{diff:?}"));
+    // Only feature2's own changes: dev's column is not prod's to take.
+    assert_eq!(&items[2..6], &["1", "1", "0", "0"], "{diff:?}");
+    assert!(items[6].contains("extra"), "{diff:?}");
+    admin.exec("MERGE BRANCH feature2").await;
+    assert_eq!(
+        prod.rows("SELECT id, qty FROM items WHERE id IN (3, 6) ORDER BY id").await,
+        vec![row(&["3", "33"]), row(&["6", "60"])]
+    );
+    assert!(prod.try_exec("SELECT extra FROM items").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_middle_takes_its_branches_with_it() {
+    let fx = seeded("promote_mid").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    admin.exec("CREATE BRANCH sibling FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("UPDATE items SET name = 'dev' WHERE id = 1").await;
+    admin.exec("CREATE BRANCH feature FROM dev").await;
+    let mut feature = fx.client("feature");
+    feature.exec("UPDATE items SET qty = 77 WHERE id = 1").await;
+
+    admin.exec("PROMOTE BRANCH dev").await;
+    let listed = tree(&mut admin).await;
+    let parent_of = |b: &str| {
+        listed
+            .iter()
+            .find(|r| r.0 == b)
+            .map(|r| r.1.clone())
+            .unwrap_or_else(|| panic!("{b} missing: {listed:?}"))
+    };
+    // dev's data is prod now, and its branch follows it; prod's other
+    // branch stays with the name; the old prod is a branch of the new.
+    assert_eq!(parent_of("feature"), "prod");
+    assert_eq!(parent_of("sibling"), "prod");
+    assert_eq!(parent_of("dev"), "prod");
+    admin.exec("MERGE BRANCH feature").await;
+    let mut prod = fx.client("prod");
+    assert_eq!(
+        prod.rows("SELECT name, qty FROM items WHERE id = 1").await,
+        vec![row(&["dev", "77"])]
+    );
+}
+
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_on_a_store_comes_over_as_the_branchs_own() {
+    let fx = seeded("kv").await;
+    let kv = fx.root.join("kvstore");
+    let mut prod = fx.client("prod");
+    prod.exec(&format!(
+        "STORAGE ADD STORE scratch DIRECTORY WITH (PATH = '{}', PREFIX = 'scratch', CHUNK_SIZE = '16KiB', PAGE_SIZE = '4KiB')",
+        kv.display()
+    ))
+    .await;
+    prod.exec("STORAGE PLACE TABLE events AT 'kv:scratch'").await;
+    prod.exec("CREATE TABLE events (id INT PRIMARY KEY, what TEXT)").await;
+    for i in 0..50 {
+        prod.exec(&format!("INSERT INTO events (id, what) VALUES ({i}, 'e{i}')"))
+            .await;
+    }
+    prod.exec("UPDATE events SET what = 'changed' WHERE id = 7").await;
+
+    let mut admin = fx.client("postgres");
+    let said = admin.exec("CREATE BRANCH dev FROM prod").await;
+    assert!(
+        said.notices.iter().any(|n| n.contains("events") && n.contains("key/value")),
+        "{:?}",
+        said.notices
+    );
+    let dev_dir = fx.root.join("dev");
+    assert!(!dev_dir.join("db_kv.cfg").exists(), "the branch shares the parent's stores");
+    let mut dev = fx.client("dev");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM events").await, "50");
+    assert_eq!(dev.scalar("SELECT what FROM events WHERE id = 7").await, "changed");
+
+    // Each side's writes are its own.
+    dev.exec("DELETE FROM events WHERE id < 10").await;
+    dev.exec("INSERT INTO events (id, what) VALUES (100, 'dev')").await;
+    prod.exec("INSERT INTO events (id, what) VALUES (200, 'prod')").await;
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM events").await, "41");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM events").await, "51");
+
+    // And a restart reads both back the same.
+    drop((dev, prod, admin));
+    let mut fx = fx;
+    fx.reopen().await;
+    let mut dev = fx.client("dev");
+    let mut prod = fx.client("prod");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM events").await, "41");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM events").await, "51");
+
+    // The branch merges back onto the store's table.
+    let mut admin = fx.client("postgres");
+    admin.exec("MERGE BRANCH dev").await;
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM events").await, "42");
+    assert_eq!(prod.scalar("SELECT what FROM events WHERE id = 100").await, "dev");
+
+    // Partitions on a store are refused, by name of the store.
+    prod.exec("STORAGE PLACE TABLE logs AT 'kv:scratch'").await;
+    prod.exec("CREATE TABLE logs (id INT PRIMARY KEY, n INT) PARTITION BY HASH (id) PARTITIONS 2")
+        .await;
+    prod.exec("INSERT INTO logs (id, n) VALUES (1, 1), (2, 2)").await;
+    let refused = admin
+        .try_exec("CREATE BRANCH other FROM prod")
+        .await
+        .expect_err("branched partitions on a store");
+    assert!(refused.1.contains("'scratch'"), "{refused:?}");
+    assert!(fx.catalog.get("other").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merge_pages_through_a_table_and_a_late_conflict_undoes_it_all() {
+    // Pages are three rows in tests: thirty rows on a composite key take
+    // a dozen rounds, with the sides' changes in different pages.
+    let fx = Fixture::new("paged").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE DATABASE prod").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE TABLE grid (a INT, b TEXT, v INT, w TEXT, PRIMARY KEY (a, b))")
+        .await;
+    let values: Vec<String> = (1..=30)
+        .map(|i| format!("({}, '{}', {i}, 'w{i}')", i % 10, ["x", "y", "z"][i / 10 % 3]))
+        .collect();
+    prod.exec(&format!("INSERT INTO grid (a, b, v, w) VALUES {}", values.join(", ")))
+        .await;
+    let before = prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await;
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+
+    let mut dev = fx.client("dev");
+    dev.exec("DELETE FROM grid WHERE a = 1").await; // early pages
+    dev.exec("UPDATE grid SET v = v + 100 WHERE a = 5").await; // middle
+    dev.exec("INSERT INTO grid (a, b, v, w) VALUES (9, 'q', 900, 'new'), (0, 'a', 0, 'first')")
+        .await;
+    prod.exec("UPDATE grid SET w = 'parent' WHERE a = 7").await;
+    prod.exec("INSERT INTO grid (a, b, v, w) VALUES (8, 'p', 800, 'p')").await;
+    // Denser on the parent than on either other side: its pages end the
+    // rounds' ranges there.
+    prod.exec("INSERT INTO grid (a, b, v, w) VALUES (3, 'a', 1, 'p'), (3, 'b', 2, 'p'), (3, 'c', 3, 'p'), (3, 'd', 4, 'p')")
+        .await;
+
+    // A conflict in the last page fails the whole merge: the early pages'
+    // deletes are undone with it.
+    dev.exec("UPDATE grid SET w = 'branch' WHERE a = 9 AND b = 'z'").await;
+    prod.exec("UPDATE grid SET w = 'theirs' WHERE a = 9 AND b = 'z'").await;
+    let parent_before = prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await;
+    let refused = admin
+        .try_exec("MERGE BRANCH dev")
+        .await
+        .expect_err("a conflict merged");
+    assert_eq!(refused.0, "40001", "{refused:?}");
+    assert!(refused.1.contains("a=9, b=z"), "{refused:?}");
+    assert_eq!(
+        prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await,
+        parent_before,
+        "a failed merge left writes behind"
+    );
+
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    let grid = diff.iter().find(|r| r[0] == "grid").unwrap_or_else(|| panic!("{diff:?}"));
+    assert_eq!(&grid[2..6], &["2", "3", "3", "1"], "{diff:?}");
+
+    admin.exec("MERGE BRANCH dev ON CONFLICT PARENT WINS").await;
+    // What the merge should have made, worked out row by row.
+    let mut expected: Vec<Vec<String>> = before
+        .into_iter()
+        .filter(|r| r[0] != "1")
+        .map(|mut r| {
+            if r[0] == "5" {
+                r[2] = (r[2].parse::<i64>().unwrap() + 100).to_string();
+            }
+            if r[0] == "7" {
+                r[3] = "parent".into();
+            }
+            if r[0] == "9" && r[1] == "z" {
+                r[3] = "theirs".into();
+            }
+            r
+        })
+        .collect();
+    expected.push(row(&["9", "q", "900", "new"]));
+    expected.push(row(&["0", "a", "0", "first"]));
+    expected.push(row(&["8", "p", "800", "p"]));
+    for (b, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        expected.push(row(&["3", b, v, "p"]));
+    }
+    expected.sort_by(|x, y| {
+        (x[0].parse::<i64>().unwrap(), x[1].clone()).cmp(&(y[0].parse::<i64>().unwrap(), y[1].clone()))
+    });
+    assert_eq!(prod.rows("SELECT a, b, v, w FROM grid ORDER BY a, b").await, expected);
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rows_both_sides_numbered_alike_are_renumbered_with_their_references() {
+    let fx = Fixture::new("serial").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE DATABASE prod").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE TABLE orders (id SERIAL PRIMARY KEY, what TEXT)").await;
+    prod.exec("CREATE TABLE lines (id SERIAL PRIMARY KEY, order_id INT REFERENCES orders(id), qty INT)")
+        .await;
+    prod.exec("INSERT INTO orders (what) VALUES ('one'), ('two')").await;
+    prod.exec("INSERT INTO lines (order_id, qty) VALUES (1, 1)").await;
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+
+    // Both sides take the next numbers for different rows.
+    let mut dev = fx.client("dev");
+    dev.exec("INSERT INTO orders (what) VALUES ('dev-a'), ('dev-b')").await; // 3, 4
+    dev.exec("INSERT INTO lines (order_id, qty) VALUES (3, 5), (4, 6)").await; // 2, 3
+    dev.exec("UPDATE lines SET order_id = 4 WHERE id = 1").await;
+    prod.exec("INSERT INTO orders (what) VALUES ('prod-x')").await; // 3
+    prod.exec("INSERT INTO lines (order_id, qty) VALUES (3, 9)").await; // 2
+
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    for t in ["orders", "lines"] {
+        let r = diff.iter().find(|r| r[0] == t).unwrap_or_else(|| panic!("{diff:?}"));
+        assert_eq!(r[5], "0", "{t} would conflict: {diff:?}");
+    }
+    admin.exec("MERGE BRANCH dev").await;
+    let joined = "SELECT l.qty, o.what FROM lines l JOIN orders o ON o.id = l.order_id ORDER BY l.qty";
+    assert_eq!(
+        prod.rows(joined).await,
+        vec![
+            row(&["1", "dev-b"]),
+            row(&["5", "dev-a"]),
+            row(&["6", "dev-b"]),
+            row(&["9", "prod-x"]),
+        ]
+    );
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM orders").await, "5");
+    // The parent's sequence moved past every row it holds.
+    prod.exec("INSERT INTO orders (what) VALUES ('after')").await;
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM orders").await, "6");
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+
+    // Later, the branch changes rows it knows by their old numbers.
+    let mut dev = fx.client("dev");
+    dev.exec("UPDATE orders SET what = 'dev-a2' WHERE id = 3").await;
+    dev.exec("UPDATE lines SET qty = 50 WHERE id = 2").await;
+    dev.exec("DELETE FROM lines WHERE id = 3").await;
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    let orders = diff.iter().find(|r| r[0] == "orders").unwrap_or_else(|| panic!("{diff:?}"));
+    assert_eq!(&orders[2..6], &["0", "1", "0", "0"], "{diff:?}");
+    let lines = diff.iter().find(|r| r[0] == "lines").unwrap_or_else(|| panic!("{diff:?}"));
+    assert_eq!(&lines[2..6], &["0", "1", "1", "0"], "{diff:?}");
+    admin.exec("MERGE BRANCH dev").await;
+    assert_eq!(
+        prod.rows(joined).await,
+        vec![row(&["1", "dev-b"]), row(&["9", "prod-x"]), row(&["50", "dev-a2"])]
+    );
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rows_referencing_each_other_are_renumbered_in_order() {
+    let fx = Fixture::new("serial_tree").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE DATABASE prod").await;
+    let mut prod = fx.client("prod");
+    prod.exec("CREATE TABLE cats (id SERIAL PRIMARY KEY, parent_id INT REFERENCES cats(id), name TEXT)")
+        .await;
+    prod.exec("INSERT INTO cats (parent_id, name) VALUES (NULL, 'root')").await; // 1
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    dev.exec("INSERT INTO cats (parent_id, name) VALUES (1, 'fruit')").await; // 2
+    dev.exec("INSERT INTO cats (parent_id, name) VALUES (2, 'apple')").await; // 3
+    // An older row moved under a new one: inserted after it on the parent.
+    dev.exec("INSERT INTO cats (parent_id, name) VALUES (NULL, 'pear')").await; // 4
+    dev.exec("UPDATE cats SET parent_id = 4 WHERE id = 3").await;
+    dev.exec("UPDATE cats SET parent_id = 2 WHERE id = 4").await;
+    prod.exec("INSERT INTO cats (parent_id, name) VALUES (1, 'veg'), (1, 'nuts')").await; // 2, 3
+
+    admin.exec("MERGE BRANCH dev").await;
+    let tree = "SELECT c.name, p.name FROM cats c LEFT JOIN cats p ON p.id = c.parent_id ORDER BY c.name";
+    assert_eq!(
+        prod.rows(tree).await,
+        vec![
+            row(&["apple", "pear"]),
+            row(&["fruit", "root"]),
+            row(&["nuts", "root"]),
+            row(&["pear", "fruit"]),
+            row(&["root", "NULL"]),
+            row(&["veg", "root"]),
+        ]
+    );
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_objects_alone_are_merged_by_their_statements() {
+    let fx = seeded("objects").await;
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    let mut dev = fx.client("dev");
+    // No table changes shape: only objects the comparison of tables does
+    // not see.
+    dev.exec("CREATE VIEW cheap AS SELECT id, name FROM items WHERE qty < 25").await;
+    dev.exec("CREATE SEQUENCE tickets START 100").await;
+
+    let diff = admin.rows("SHOW BRANCH DIFF dev").await;
+    let objects: Vec<&String> = diff.iter().filter(|r| r[0] == "(schema objects)").map(|r| &r[6]).collect();
+    assert_eq!(objects.len(), 2, "{diff:?}");
+    assert!(objects[0].starts_with("CREATE VIEW cheap"), "{diff:?}");
+
+    admin.exec("MERGE BRANCH dev").await;
+    let mut prod = fx.client("prod");
+    assert_eq!(
+        prod.rows("SELECT name FROM cheap ORDER BY id").await,
+        vec![row(&["apple"]), row(&["pear"])]
+    );
+    assert_eq!(prod.scalar("SELECT nextval('tickets')").await, "100");
+    // Replayed once: a second merge offers nothing.
+    assert!(admin.rows("SHOW BRANCH DIFF dev").await.is_empty());
+
+    // A merge that fails after replaying one takes it back with the rest.
+    admin.exec("CREATE BRANCH dev2 FROM prod").await;
+    let mut dev2 = fx.client("dev2");
+    dev2.exec("CREATE VIEW dear AS SELECT id FROM items WHERE qty > 25").await;
+    dev2.exec("UPDATE items SET qty = 31 WHERE id = 3").await;
+    prod.exec("UPDATE items SET qty = 32 WHERE id = 3").await;
+    let refused = admin.try_exec("MERGE BRANCH dev2").await.expect_err("merged a conflict");
+    assert_eq!(refused.0, "40001", "{refused:?}");
+    assert!(prod.try_exec("SELECT id FROM dear").await.is_err(), "a rolled-back merge left its view");
 }
