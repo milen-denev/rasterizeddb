@@ -553,6 +553,7 @@ pub fn rewrite_with(sql: &str, defs: &[EnumType], columns: &[(String, String, St
     if is("CREATE") || is("ALTER") {
         column_types(sql, defs, &mut edits)?;
     }
+    enum_functions(sql, defs, &mut edits)?;
     casts(sql, defs, &mut edits)?;
     if is("SELECT") || is("WITH") {
         order_by(sql, defs, columns, &mut edits);
@@ -608,6 +609,104 @@ fn type_at<'d>(sql: &str, at: usize, defs: &'d [EnumType]) -> Option<(&'d EnumTy
         return Some((def, true, close));
     }
     Some((def, false, end))
+}
+
+/// `enum_first(NULL::mood)`, `enum_last(…)`, `enum_range(…)` and
+/// `enum_range(a, b)`, answered from the labels: their argument only says
+/// which type (PostgreSQL ignores its value, except `enum_range(a, b)`'s
+/// bounds, NULL meaning the first or last). They were refused ("function
+/// 'enum_range' is not supported yet"). Written before [`casts`], whose
+/// edits inside the call are then dropped as overlapping.
+fn enum_functions(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, String)>) -> Result<(), Refusal> {
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"enum_") {
+        return Ok(());
+    }
+    let bytes = sql.as_bytes();
+    // `NULL::mood` or `'ok'::mood`: the type, and the label (None for NULL).
+    let argument = |arg: &str| -> Result<Option<(&EnumType, Option<String>)>, Refusal> {
+        let arg = arg.trim();
+        let Some(colons) = arg.rfind("::") else { return Ok(None) };
+        let value = arg[..colons].trim();
+        let ty_text = arg[colons + 2..].trim_start();
+        let ty_at = arg.len() - ty_text.len();
+        let Some((def, false, end)) = type_at(arg, ty_at, defs) else { return Ok(None) };
+        if !arg[end..].trim().is_empty() {
+            return Ok(None);
+        }
+        if value.eq_ignore_ascii_case("NULL") {
+            return Ok(Some((def, None)));
+        }
+        let Some(label) = literal(value) else { return Ok(None) };
+        if !def.labels.contains(&label) {
+            return Err(refusal("22P02", format!("invalid input value for enum {}: \"{label}\"", display_name(&def.name))));
+        }
+        Ok(Some((def, Some(label))))
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let boundary = i == 0 || !(is_identifier_byte(bytes[i - 1]) || bytes[i - 1] == b'.');
+        let name = ["enum_range", "enum_first", "enum_last"]
+            .into_iter()
+            .find(|f| boundary && bytes.len() > i + f.len() && bytes[i..i + f.len()].eq_ignore_ascii_case(f.as_bytes()));
+        let Some(name) = name else {
+            i += 1;
+            continue;
+        };
+        let open = i + name.len() + (sql[i + name.len()..].len() - sql[i + name.len()..].trim_start().len());
+        if bytes.get(open) != Some(&b'(') {
+            i += name.len();
+            continue;
+        }
+        let Some(close) = matching_close(sql, open) else { break };
+        let args = split_top_level(&sql[open + 1..close], b',');
+        let quoted = |labels: &[String]| labels.iter().map(|l| crate::auth::quote(l)).collect::<Vec<_>>().join(", ");
+        let value = match (name, args.as_slice()) {
+            ("enum_first" | "enum_last", [a]) => match argument(a)? {
+                Some((def, _)) => {
+                    let label = if name == "enum_first" { def.labels.first() } else { def.labels.last() };
+                    label.map(|l| crate::auth::quote(l)).unwrap_or_else(|| "NULL".to_string())
+                }
+                None => {
+                    i = close + 1;
+                    continue;
+                }
+            },
+            ("enum_range", [a]) => match argument(a)? {
+                Some((def, _)) => format!("ARRAY[{}]::text[]", quoted(&def.labels)),
+                None => {
+                    i = close + 1;
+                    continue;
+                }
+            },
+            ("enum_range", [a, b]) => match (argument(a)?, argument(b)?) {
+                (Some((def, low)), Some((other, high))) if def.name == other.name => {
+                    let from = low.as_ref().and_then(|l| def.labels.iter().position(|x| x == l)).unwrap_or(0);
+                    let to = high.as_ref().and_then(|l| def.labels.iter().position(|x| x == l)).map_or(def.labels.len(), |p| p + 1);
+                    if from >= to {
+                        "'{}'::text[]".to_string()
+                    } else {
+                        format!("ARRAY[{}]::text[]", quoted(&def.labels[from..to]))
+                    }
+                }
+                _ => {
+                    i = close + 1;
+                    continue;
+                }
+            },
+            _ => {
+                i = close + 1;
+                continue;
+            }
+        };
+        let alias = if crate::core::sql_scan::whole_select_item(sql, i, close + 1) { format!(" AS {name}") } else { String::new() };
+        edits.push((i, close + 1, format!("{value}{alias}")));
+        i = close + 1;
+    }
+    Ok(())
 }
 
 /// `x::mood`, `CAST(x AS mood)`: the cast to `text` (`text[]` for an
@@ -1252,6 +1351,22 @@ mod tests {
         // Not a use of the type: an alias, a column, a quoted text.
         assert_eq!(r("SELECT x AS mood, mood FROM t WHERE note = '::mood'"), None);
         assert_eq!(r("SELECT (SELECT 1 AS mood)"), None);
+    }
+
+    #[test]
+    fn enum_functions_answer_from_the_labels() {
+        let d = mood();
+        let r = |sql: &str| rewrite_with(sql, &d, &[]).unwrap();
+        assert_eq!(
+            r("SELECT enum_first(NULL::mood), enum_last(null::mood), enum_range(NULL::mood)").as_deref(),
+            Some("SELECT 'sad' AS enum_first, 'happy' AS enum_last, ARRAY['sad', 'ok', 'happy']::text[] AS enum_range")
+        );
+        assert_eq!(
+            r("SELECT enum_range('ok'::mood, NULL::mood), enum_range(NULL::mood, 'ok'::mood), enum_range('happy'::mood, 'sad'::mood)").as_deref(),
+            Some("SELECT ARRAY['ok', 'happy']::text[] AS enum_range, ARRAY['sad', 'ok']::text[] AS enum_range, '{}'::text[] AS enum_range")
+        );
+        assert_eq!(rewrite_with("SELECT enum_first('glad'::mood)", &d, &[]).unwrap_err().0, "22P02");
+        assert_eq!(r("SELECT enum_first(x)"), None);
     }
 
     #[test]

@@ -121,3 +121,24 @@ async fn a_failed_alter_type_changes_nothing() {
     );
     assert_eq!(error(&c, "INSERT INTO at1 VALUES (2, 'c', NULL)").await.0, "22P02");
 }
+
+/// `enum_first`, `enum_last` and `enum_range`, answered from the labels as
+/// PostgreSQL 17 answers them. They were refused ("function 'enum_range' is
+/// not supported yet").
+#[tokio::test(flavor = "multi_thread")]
+async fn enum_support_functions() {
+    let server = TestServer::start().await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute("CREATE TYPE ef AS ENUM ('lo', 'mid', 'hi')").await.expect("setup");
+    let cases: &[(&str, &[&str])] = &[
+        ("SELECT enum_first(NULL::ef), enum_last(NULL::ef)", &["lo|hi"]),
+        ("SELECT enum_range(NULL::ef)", &["{lo,mid,hi}"]),
+        ("SELECT enum_range('mid'::ef, NULL::ef), enum_range(NULL::ef, 'mid'::ef)", &["{mid,hi}|{lo,mid}"]),
+        ("SELECT enum_range('hi'::ef, 'lo'::ef)", &["{}"]),
+        ("SELECT array_length(enum_range(NULL::ef), 1)", &["3"]),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(rows(&c, sql).await, *want, "{sql}");
+    }
+    assert_eq!(error(&c, "SELECT enum_first('x'::ef)").await.0, "22P02");
+}
