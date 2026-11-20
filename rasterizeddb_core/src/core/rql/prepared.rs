@@ -519,18 +519,27 @@ pub struct WhereTemplate {
 impl WhereTemplate {
     /// Splits `where_clause` at each literal. `None` unless every literal
     /// occurs exactly once, none inside another, so each place is certain.
+    ///
+    /// An occurrence is a whole literal token of the clause
+    /// ([`literal_tokens`]): a number not part of a longer number or name, a
+    /// quoted string from its opening quote to its closing one. Matched as
+    /// text, `5` was found inside `2025` and `10000` inside `100000`, so a
+    /// statement over a composite key of small numbers (`year = 2025 AND
+    /// month = 5`) never had a template, and was watched on every execution
+    /// for nothing.
     pub fn derive(where_clause: &str, literals: &[String]) -> Option<Self> {
+        let tokens = literal_tokens(where_clause)?;
         let mut spots: Vec<(usize, usize)> = Vec::with_capacity(literals.len());
         for (i, lit) in literals.iter().enumerate() {
             if lit.is_empty() {
                 return None;
             }
-            let mut found = where_clause.match_indices(lit.as_str());
+            let mut found = tokens.iter().filter(|(start, end)| &where_clause[*start..*end] == lit.as_str());
             let (at, _) = found.next()?;
             if found.next().is_some() {
                 return None;
             }
-            spots.push((at, i));
+            spots.push((*at, i));
         }
         spots.sort_unstable();
         let mut pieces = Vec::with_capacity(spots.len() * 2 + 1);
@@ -565,6 +574,69 @@ impl WhereTemplate {
         }
         out
     }
+}
+
+/// The literal tokens of a `WHERE` clause, as byte spans: each single-quoted
+/// string (doubled quotes inside it included), and each number (digits, at
+/// most one point) that no letter, digit, `_` or `.` touches. A double-quoted
+/// name is skipped whole. `None` when a quote is not closed, or the clause
+/// holds a backslash (an escape string's quote could not be told from its
+/// end): no place is certain then.
+fn literal_tokens(clause: &str) -> Option<Vec<(usize, usize)>> {
+    let b = clause.as_bytes();
+    if b.contains(&b'\\') {
+        return None;
+    }
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                let start = i;
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return None,
+                        Some(&c) if c == q && b.get(i + 1) == Some(&q) => i += 2,
+                        Some(&c) if c == q => break,
+                        Some(_) => i += 1,
+                    }
+                }
+                i += 1;
+                if q == b'\'' {
+                    out.push((start, i));
+                }
+            }
+            c if c.is_ascii_digit() => {
+                let start = i;
+                let touched = start > 0 && (word(b[start - 1]) || b[start - 1] == b'.');
+                let mut points = 0;
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                    if b[i] == b'.' {
+                        points += 1;
+                    }
+                    i += 1;
+                }
+                let touching = i < b.len() && word(b[i]);
+                if !touched && !touching && points <= 1 && b[i - 1] != b'.' {
+                    out.push((start, i));
+                }
+                // A number inside a name (`t1`) or an exponent (`1e5`):
+                // the rest of it is part of the same word.
+                while i < b.len() && word(b[i]) {
+                    i += 1;
+                }
+            }
+            c if word(c) => {
+                while i < b.len() && word(b[i]) {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Some(out)
 }
 
 /// `query_row` with its `WHERE` clause blanked, for comparing the rest.
@@ -633,11 +705,36 @@ mod tests {
     fn an_uncertain_place_is_refused() {
         // Twice, so which one is the value is a guess.
         assert!(WhereTemplate::derive("k = 5 AND j = 5", &lits(&["5"])).is_none());
-        assert!(WhereTemplate::derive("k = 15 AND j = 5", &lits(&["5"])).is_none());
+        assert!(WhereTemplate::derive("k = 'x' AND j = 'x'", &lits(&["'x'"])).is_none());
         // Not there at all: something rewrote it.
         assert!(WhereTemplate::derive("k IS NULL", &lits(&["NULL2"])).is_none());
         // Two values on the same text.
         assert!(WhereTemplate::derive("k = 3", &lits(&["3", "3"])).is_none());
+    }
+
+    #[test]
+    fn a_value_inside_another_token_is_not_its_place() {
+        // A composite key of small numbers: `5` is inside `2025`, `10000`
+        // inside `100000`, `3` inside `100037`. Matched as text, none of
+        // these had a template.
+        let clause = "tenant_id = 100000 AND year = 2025 AND month = 5 AND event_id = 10000";
+        let t = WhereTemplate::derive(clause, &lits(&["100000", "2025", "5", "10000"])).unwrap();
+        assert_eq!(
+            t.render(&lits(&["100037", "2024", "3", "28"])),
+            "tenant_id = 100037 AND year = 2024 AND month = 3 AND event_id = 28"
+        );
+        // Not inside a fraction, a name, an exponent or a string either.
+        let t = WhereTemplate::derive("a = 1.5 AND t1 = 'v5' AND e = 5e3 AND n = 5", &lits(&["5"])).unwrap();
+        assert_eq!(t.render(&lits(&["9"])), "a = 1.5 AND t1 = 'v5' AND e = 5e3 AND n = 9");
+        // A string's place is the whole quoted token, doubled quotes and all.
+        let t = WhereTemplate::derive("a = 'it''s x' AND b = 'x'", &lits(&["'x'"])).unwrap();
+        assert_eq!(t.render(&lits(&["'y'"])), "a = 'it''s x' AND b = 'y'");
+        // Inside a quoted name: not a value.
+        let t = WhereTemplate::derive("\"c5\" = 5", &lits(&["5"])).unwrap();
+        assert_eq!(t.render(&lits(&["6"])), "\"c5\" = 6");
+        // What the scan cannot read for certain is refused.
+        assert!(WhereTemplate::derive("a = 'open AND b = 5", &lits(&["5"])).is_none());
+        assert!(WhereTemplate::derive("a = E'x\\'' AND b = 5", &lits(&["5"])).is_none());
     }
 
     #[test]
