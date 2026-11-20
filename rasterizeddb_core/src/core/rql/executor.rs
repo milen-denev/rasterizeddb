@@ -22866,14 +22866,20 @@ async fn execute_query_rows_body(
                 )
                 .await
             {
-                Ok(count) => {
-                    let mut result = vec![2u8];
-                    for row in &crate::core::rql::aggregate::row_count_result(&plan, count)
-                    {
-                        row.extend_serialized(&mut result);
+                Ok(count) => match crate::core::rql::aggregate::counted_rows(&plan, count) {
+                    Ok(rows) => {
+                        let mut result = vec![2u8];
+                        for row in &rows {
+                            row.extend_serialized(&mut result);
+                        }
+                        return result;
                     }
-                    return result;
-                }
+                    Err(e) => {
+                        let mut result = vec![3u8];
+                        result.extend_from_slice(e.as_bytes());
+                        return result;
+                    }
+                },
                 Err(e) => {
                     error!("Failed to execute count query: {}", e);
                     let mut result = vec![3u8];

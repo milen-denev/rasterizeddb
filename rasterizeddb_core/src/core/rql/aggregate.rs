@@ -1054,8 +1054,8 @@ pub fn is_row_count_only(plan: &AggregatePlan) -> bool {
         && plan.limit.is_none()
         && plan.offset.is_none()
         && !plan.items.is_empty()
-        && plan.items.iter().all(|item| {
-            matches!(
+        && plan.items.iter().all(|item| match item {
+            SelectItem::Aggregate { .. } => matches!(
                 item,
                 SelectItem::Aggregate {
                     func: AggFunc::Count,
@@ -1064,8 +1064,49 @@ pub fn is_row_count_only(plan: &AggregatePlan) -> bool {
                     arg_expr: None,
                     ..
                 }
-            )
+            ),
+            // An expression over bare counts only (`COUNT(*)::integer`, the
+            // SQL Server front end's every COUNT): its inputs are the one
+            // number the scan counts, and [`counted_rows`] evaluates it. The
+            // same conditions hold for each input as for an item: a FILTER
+            // or an argument would need the rows.
+            SelectItem::Computed { inputs, .. } => {
+                !inputs.is_empty()
+                    && inputs.iter().all(|input| {
+                        input.func == AggFunc::Count && input.arg.is_none() && input.filter.is_none() && input.arg_expr.is_none()
+                    })
+            }
+            SelectItem::Column { .. }
+            | SelectItem::Literal { .. }
+            | SelectItem::Scalar { .. }
+            | SelectItem::Window { .. }
+            | SelectItem::RowExpr { .. } => false,
         })
+}
+
+/// The answer to a plan [`is_row_count_only`] admits, given how many rows
+/// matched: [`row_count_result`] when every item is a bare count, and
+/// otherwise the fold's own emit over accumulators that each hold the
+/// count, so an expression over the counts is evaluated, typed and shown as
+/// the fold shows it.
+pub fn counted_rows(plan: &AggregatePlan, count: u64) -> Result<Vec<Row>, String> {
+    if plan.items.iter().all(|item| matches!(item, SelectItem::Aggregate { .. })) {
+        return Ok(row_count_result(plan, count));
+    }
+    let count = i64::try_from(count).map_err(|_| "row count out of range".to_string())?;
+    let mut folder = Folder::new(plan);
+    folder.key.clear();
+    folder.plain.clear();
+    let at = folder.group_for_key(None);
+    let stride = folder.stride;
+    for acc in &mut folder.accs[at * stride..(at + 1) * stride] {
+        match acc {
+            Acc::Count(n) => *n = count,
+            // `is_row_count_only` admits no other accumulator.
+            _ => return Err("a counted plan holds an aggregate other than COUNT(*)".to_string()),
+        }
+    }
+    folder.finish()
 }
 
 /// A running accumulator for one aggregate within one group.
@@ -2543,8 +2584,9 @@ fn fold_with(plan: &AggregatePlan, rows: &[Row], byte_table: bool) -> Result<Vec
 /// that are not computed are plain columns; `order_by`, `limit` and `offset`
 /// shape the folded output and read no row; `distinct` is the accumulator's
 /// own business (`Acc::Distinct` is fed bytes); a `call` matters only to the
-/// collecting functions, which are refused. A select item of any other kind
-/// than a grouping column or a literal is refused.
+/// collecting functions, which are refused. A computed item is admitted when
+/// each of its inputs would be as an aggregate of its own. A select item of
+/// any other kind than those, a grouping column or a literal is refused.
 fn reads_only_cells(plan: &AggregatePlan) -> bool {
     let plain = |item: &SelectItem| {
         matches!(
@@ -2552,14 +2594,17 @@ fn reads_only_cells(plan: &AggregatePlan) -> bool {
             SelectItem::Aggregate { func, filter: None, arg_expr: None, .. } if !func.collects()
         )
     };
+    // An expression over finished aggregates (`COUNT(*)::integer`, which
+    // every SQL Server `COUNT` becomes, or `SUM(a) / COUNT(*)`) reads no row
+    // itself: it runs once per group on the results. Only its inputs read
+    // rows, and they read them as an aggregate does.
+    let plain_input = |input: &ComputedInput| input.filter.is_none() && input.arg_expr.is_none() && !input.func.collects();
     plan.computed_keys.is_empty()
         && plan.items.iter().all(|item| match item {
             SelectItem::Aggregate { .. } => plain(item),
+            SelectItem::Computed { inputs, .. } => inputs.iter().all(plain_input),
             SelectItem::Column { .. } | SelectItem::Literal { .. } => true,
-            SelectItem::Scalar { .. }
-            | SelectItem::Window { .. }
-            | SelectItem::RowExpr { .. }
-            | SelectItem::Computed { .. } => false,
+            SelectItem::Scalar { .. } | SelectItem::Window { .. } | SelectItem::RowExpr { .. } => false,
         })
         && plan.having.as_ref().is_none_or(|h| h.aggregates.iter().all(plain))
 }
@@ -2793,6 +2838,9 @@ pub struct Folder<'p> {
     n_having: usize,
     /// For select item `i`, where its computed inputs start in a group's run.
     computed_at: Vec<usize>,
+    /// For select item `i`, the column slot each of its computed inputs
+    /// reads (empty for any other item); `None` for `COUNT(*)`.
+    computed_slots: Vec<Vec<Option<usize>>>,
     key_sources: Vec<KeySource<'p>>,
     item_slots: Vec<Option<usize>>,
     having_slots: Vec<Option<usize>>,
@@ -2941,6 +2989,23 @@ impl<'p> Folder<'p> {
                     .collect()
             })
             .unwrap_or_default();
+        // The column each computed item's inputs read, for the cell fold
+        // (the row fold reads them from the row by write order). An input
+        // with a computed argument has no column of its own here.
+        let computed_slots: Vec<Vec<Option<usize>>> = plan
+            .items
+            .iter()
+            .map(|item| match item {
+                SelectItem::Computed { inputs, .. } => inputs
+                    .iter()
+                    .map(|input| match (&input.arg, &input.arg_expr) {
+                        (Some(f), None) => Some(slot_of(f.write_order)),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
         let positions = ColumnPositions::new(wanted);
 
         let byte_slot = match (key_sources.as_slice(), plan.group_by.first()) {
@@ -2996,6 +3061,7 @@ impl<'p> Folder<'p> {
             n_items,
             n_having,
             computed_at,
+            computed_slots,
             key_sources,
             item_slots,
             having_slots,
@@ -3223,8 +3289,14 @@ impl<'p> Folder<'p> {
                 }
             };
             for (i, item) in plan.items.iter().enumerate() {
-                if let SelectItem::Aggregate { arg, .. } = item {
-                    fold(&mut run[i], arg, self.item_slots[i]);
+                match item {
+                    SelectItem::Aggregate { arg, .. } => fold(&mut run[i], arg, self.item_slots[i]),
+                    SelectItem::Computed { inputs, .. } => {
+                        for (j, input) in inputs.iter().enumerate() {
+                            fold(&mut run[self.computed_at[i] + j], &input.arg, self.computed_slots[i][j]);
+                        }
+                    }
+                    _ => {}
                 }
             }
             if let Some(h) = plan.having.as_ref() {
@@ -3248,12 +3320,26 @@ impl<'p> Folder<'p> {
             // the column's bytes under its declared type, `None` for a NULL,
             // and neither bytes nor type for `COUNT(*)`.
             for (i, item) in plan.items.iter().enumerate() {
-                if let SelectItem::Aggregate { arg, .. } = item {
-                    let (bytes, ty) = match arg {
-                        Some(f) => (self.item_slots[i].and_then(cell), Some(&f.db_type)),
-                        None => (None, None),
-                    };
-                    run[i].accumulate(bytes, ty);
+                match item {
+                    SelectItem::Aggregate { arg, .. } => {
+                        let (bytes, ty) = match arg {
+                            Some(f) => (self.item_slots[i].and_then(cell), Some(&f.db_type)),
+                            None => (None, None),
+                        };
+                        run[i].accumulate(bytes, ty);
+                    }
+                    // Each input as `ComputedInput::fold` folds it, which for
+                    // an input `cell_sources` admits is the same call.
+                    SelectItem::Computed { inputs, .. } => {
+                        for (j, input) in inputs.iter().enumerate() {
+                            let (bytes, ty) = match &input.arg {
+                                Some(f) => (self.computed_slots[i][j].and_then(cell), Some(&f.db_type)),
+                                None => (None, None),
+                            };
+                            run[self.computed_at[i] + j].accumulate(bytes, ty);
+                        }
+                    }
+                    _ => {}
                 }
             }
             if let Some(h) = plan.having.as_ref() {
@@ -3381,8 +3467,17 @@ impl<'p> Folder<'p> {
             }
         }
         for (i, item) in plan.items.iter().enumerate() {
-            if let SelectItem::Aggregate { arg, .. } = item {
-                fold_by_groups(&mut self.accs, self.stride, i, &gids, arg, self.item_slots[i], sources, chunk);
+            match item {
+                SelectItem::Aggregate { arg, .. } => {
+                    fold_by_groups(&mut self.accs, self.stride, i, &gids, arg, self.item_slots[i], sources, chunk)
+                }
+                SelectItem::Computed { inputs, .. } => {
+                    for (j, input) in inputs.iter().enumerate() {
+                        let at = self.computed_at[i] + j;
+                        fold_by_groups(&mut self.accs, self.stride, at, &gids, &input.arg, self.computed_slots[i][j], sources, chunk);
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(h) = plan.having.as_ref() {
@@ -5106,6 +5201,51 @@ mod tests {
             db_type: DbType::I64,
             label: "next".to_string(),
         }
+    }
+
+    /// `<func>(<arg>) + 1` over one input, built the way the parser builds it.
+    fn input_plus_one(input: ComputedInput) -> SelectItem {
+        use crate::core::rql::expr::{ArithOp, Expr};
+        let ty = input.func.result_type(input.arg.as_ref().map(|f| &f.db_type));
+        let slot = SchemaField::new(format!("{}0", COMPUTED_INPUT_PREFIX), ty.clone(), ty.get_size(), 0, 0, false);
+        SelectItem::Computed {
+            expr: Expr::Arith(
+                Box::new(Expr::Column(slot)),
+                ArithOp::Add,
+                Box::new(Expr::Literal { bytes: 1i64.to_le_bytes().to_vec(), db_type: DbType::I64 }),
+            ),
+            inputs: vec![input],
+            db_type: DbType::I64,
+            label: "plus_one".to_string(),
+        }
+    }
+
+    fn count_input(arg: Option<SchemaField>) -> ComputedInput {
+        ComputedInput { func: AggFunc::Count, arg, arg_expr: None, filter: None, call: None }
+    }
+
+    /// An expression over bare counts takes the counting scan, and answers
+    /// what the fold answers over the same number of rows, byte for byte:
+    /// for none, one and several.
+    #[test]
+    fn a_counted_expression_matches_what_the_fold_would_emit() {
+        let p = plan(vec![input_plus_one(count_input(None)), agg(AggFunc::Count, None)], vec![]);
+        assert!(is_row_count_only(&p));
+        for n in [0usize, 1, 7] {
+            let rows: Vec<Row> = (0..n).map(|i| row(&[(0, DbType::I64, (i as i64).to_le_bytes().to_vec())])).collect();
+            let folded = fold(&p, &rows).unwrap();
+            let counted = counted_rows(&p, n as u64).unwrap();
+            assert_eq!(counted.len(), folded.len(), "{n} rows");
+            for (c, f) in counted[0].columns.iter().zip(folded[0].columns.iter()) {
+                assert_eq!((c.schema_id, &c.column_type, c.data.into_slice()), (f.schema_id, &f.column_type, f.data.into_slice()), "{n} rows");
+            }
+            assert_eq!(counted[0].columns[0].data.into_slice(), &(n as i64 + 1).to_le_bytes());
+        }
+        // An input that reads a column, or is not a count, needs the rows.
+        let f = field("v", DbType::I64, 0);
+        assert!(!is_row_count_only(&plan(vec![input_plus_one(count_input(Some(f.clone())))], vec![])));
+        let max = ComputedInput { func: AggFunc::Max, arg: Some(f), arg_expr: None, filter: None, call: None };
+        assert!(!is_row_count_only(&plan(vec![input_plus_one(max)], vec![])));
     }
 
     #[test]
