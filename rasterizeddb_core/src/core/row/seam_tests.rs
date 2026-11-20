@@ -100,6 +100,8 @@ const CALLED_ON_SHELL: &[&str] = &[
     "backfill_filters_from",
     "checkpoint_filters",
     "build_candidates",
+    "candidates_for_key",
+    "point_indexes",
     "insert_row",
     "insert_row_in_txn",
     "insert_version",
@@ -470,6 +472,8 @@ async fn a_shell_refuses_every_data_method() {
     expect("backfill_filters_from", unit(shell.backfill_filters_from(0).await));
     expect("checkpoint_filters", unit(shell.checkpoint_filters().await));
     expect("build_candidates", unit(shell.build_candidates("id = 1", None).await));
+    expect("candidates_for_key", unit(shell.candidates_for_key(&[(0, DbType::I64, &[1, 0, 0, 0, 0, 0, 0, 0])], &["id"]).await));
+    expect("point_indexes", unit(shell.point_indexes()));
     expect("insert_row", unit(shell.insert_row(row(1)).await));
     expect("insert_row_in_txn", unit(shell.insert_row_in_txn(row(1), FROZEN_TX).await));
     expect("insert_version", unit(shell.insert_version(row(1), FROZEN_TX, crate::core::mvcc::transaction::NO_TX).await));
