@@ -75,9 +75,7 @@ impl Login {
                 }) as Arc<dyn ClientAuthenticator>));
             }
             Login::Peer => current_os_user().ok_or_else(|| {
-                RastcpError::AuthenticationError(
-                    "this process's user has no name in the password database".to_string(),
-                )
+                RastcpError::AuthenticationError(NO_OS_USER.to_string())
             })?,
             Login::PeerAs(user) => user.clone(),
         };
@@ -252,7 +250,21 @@ impl ClientAuthenticator for PeerLogin {
     }
 }
 
+#[cfg(unix)]
+const NO_OS_USER: &str = "this process's user has no name in the password database";
+#[cfg(not(unix))]
+const NO_OS_USER: &str =
+    "peer login needs a unix socket, which this platform does not have; log in with a password";
+
+/// The name of the operating-system user this process runs as. Only a unix
+/// socket carries the peer's credentials, so elsewhere there is none to give.
+#[cfg(not(unix))]
+pub(crate) fn current_os_user() -> Option<String> {
+    None
+}
+
 /// The name of the operating-system user this process runs as.
+#[cfg(unix)]
 pub(crate) fn current_os_user() -> Option<String> {
     // SAFETY: getuid cannot fail and has no preconditions.
     let uid = unsafe { libc::getuid() };

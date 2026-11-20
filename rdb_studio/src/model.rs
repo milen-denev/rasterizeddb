@@ -45,12 +45,17 @@ pub struct Connection {
     pub port: u16,
     pub database: String,
     pub user: String,
-    /// Kept in the profile only when the user asks for it. A console that
-    /// silently persists passwords is a credential store nobody audited.
+    /// Kept only when the user asks for it, and then where
+    /// [`Connection::password_store`] says. A console that silently persists
+    /// passwords is a credential store nobody audited.
     #[serde(default)]
     pub password: String,
     #[serde(default)]
     pub save_password: bool,
+    /// Where a saved password goes. `None` is a profile saved before there
+    /// was a choice; see [`Connection::password_store`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_store: Option<PasswordStore>,
     pub tls: TlsMode,
     /// Which protocol carries the statements. A profile saved before there
     /// was a choice has none written, and was the PostgreSQL wire protocol on
@@ -83,6 +88,7 @@ impl Default for Connection {
             user: "rasterized".to_string(),
             password: String::new(),
             save_password: false,
+            password_store: Some(PasswordStore::Keyring),
             tls: TlsMode::Prefer,
             transport: Transport::Native,
             login: NativeLogin::Password,
@@ -93,6 +99,24 @@ impl Default for Connection {
 }
 
 impl Connection {
+    /// Where this profile's saved password is kept. A profile saved before
+    /// there was a choice kept it in the file, and keeps doing so until the
+    /// user moves it: reading it from the keyring instead would find nothing
+    /// and connect without it. One with no password in the file has nothing
+    /// to lose and takes the keyring.
+    pub fn password_store(&self) -> PasswordStore {
+        match self.password_store {
+            Some(store) => store,
+            None if !self.password.is_empty() => PasswordStore::File,
+            None => PasswordStore::Keyring,
+        }
+    }
+
+    /// Whether this profile's password is kept in the OS keyring.
+    pub fn password_in_keyring(&self) -> bool {
+        self.save_password && self.password_store() == PasswordStore::Keyring
+    }
+
     /// The transport this profile actually uses: the native protocol is
     /// RasterizedDB's own, so a PostgreSQL profile always speaks the wire
     /// protocol whatever was picked.
@@ -101,6 +125,38 @@ impl Connection {
             Flavor::Postgres => Transport::Wire,
             Flavor::Rasterized => self.transport,
         }
+    }
+}
+
+/// Where a saved password is kept.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum PasswordStore {
+    /// The operating system's credential store: Keychain on macOS, Credential
+    /// Manager on Windows, the Secret Service (GNOME Keyring, KWallet)
+    /// elsewhere. The profile file holds no password.
+    #[default]
+    Keyring,
+    /// The profile file itself, readable by its owner only: for a machine
+    /// with no credential store, such as a desktop without a Secret Service.
+    File,
+}
+
+impl PasswordStore {
+    pub const ALL: [PasswordStore; 2] = [PasswordStore::Keyring, PasswordStore::File];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PasswordStore::Keyring => "OS keyring",
+            PasswordStore::File => "profile file (plain text)",
+        }
+    }
+}
+
+impl std::fmt::Display for PasswordStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 

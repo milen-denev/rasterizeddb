@@ -66,6 +66,7 @@ fn profile() -> Option<Connection> {
         user: if user.is_empty() { "postgres".to_string() } else { user.to_string() },
         password: password.to_string(),
         save_password: false,
+        password_store: None,
         tls: TlsMode::Disable,
         transport: rdb_studio::model::Transport::Wire,
         login: rdb_studio::model::NativeLogin::Password,

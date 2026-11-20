@@ -6,6 +6,9 @@
 //! `RDB_SERVER_BIN` to it. Without it each test says so and passes, so the
 //! crate's own `cargo test` stays cheap; CI and anyone changing the wire format
 //! must set it.
+// The server it starts is unix-only, and it waits on the server's unix
+// socket, so on other platforms there is nothing to run against.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Stdio;

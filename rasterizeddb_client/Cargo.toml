@@ -30,6 +30,10 @@ cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 rastcp = { path = "../rastcp" }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 libc = "0.2"
+# The operating system's random generator on every platform (Linux's
+# getrandom(2), macOS's getentropy, Windows' ProcessPrng): SCRAM nonces,
+# UUIDs. Already in the tree through rustls.
+getrandom = "0.3"
 # Login::Password's SCRAM-SHA-256 exchange (the versions the server uses).
 sha2 = "0.11"
 hmac = "0.13"

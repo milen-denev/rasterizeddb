@@ -23,4 +23,8 @@ rustls-pki-types = "1.16.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 dirs = "7"
+# Saved passwords go to the OS credential store: Keychain on macOS, Credential
+# Manager on Windows, the Secret Service (over the zbus already in the tree)
+# elsewhere.
+keyring = "4.2.0"
 rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }

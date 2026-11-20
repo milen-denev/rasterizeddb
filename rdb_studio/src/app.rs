@@ -741,9 +741,16 @@ pub enum Message {
     FormVerify(bool),
     FormCaFile(String),
     FormSavePassword(bool),
+    FormPasswordStore(PasswordStore),
     LoadProfile(usize),
+    /// A saved profile's password, read from the OS keyring for the form.
+    SavedPasswordRead(String, Result<Option<String>, String>),
     SaveProfile,
+    /// The keyring's part of saving a profile is done (or refused).
+    ProfileSaved(Connection, Result<(), String>),
     DeleteProfile(usize),
+    /// A deleted profile's password is out of the OS keyring (or is not).
+    ProfileForgotten(String, Result<(), String>),
     Connect,
     Connected(Result<Session, String>),
     FlavorDetected(Flavor),
@@ -1162,6 +1169,33 @@ pub enum ModalField {
     Superuser,
 }
 
+/// Connects with the profile's saved password read from the OS keyring first,
+/// when it keeps one there and none was typed.
+async fn connect_saved(profile: Connection) -> Result<Session, String> {
+    let profile = if profile.password.is_empty() && profile.password_in_keyring() {
+        profiles::blocking(move || profiles::with_saved_password(profile, &profiles::OsKeyring))
+            .await?
+    } else {
+        profile
+    };
+    conn::connect(profile).await
+}
+
+/// Reads a profile's saved password from the OS keyring into the form, so
+/// that it shows as filled in and goes with the profile if it is saved under
+/// another name.
+fn read_saved_password(profile: &Connection) -> Task<Message> {
+    if !profile.password.is_empty() || !profile.password_in_keyring() {
+        return Task::none();
+    }
+    let name = profile.name.clone();
+    let lookup = name.clone();
+    Task::perform(
+        profiles::blocking(move || profiles::Vault::get(&profiles::OsKeyring, &lookup)),
+        move |read| Message::SavedPasswordRead(name, read),
+    )
+}
+
 impl Studio {
     pub fn new(opening: Option<String>) -> (Self, Task<Message>) {
         let saved = profiles::load();
@@ -1287,9 +1321,9 @@ impl Studio {
 
         let boot = if opening {
             let profile = studio.form.clone();
-            Task::perform(conn::connect(profile), Message::Connected)
+            Task::perform(connect_saved(profile), Message::Connected)
         } else {
-            Task::none()
+            read_saved_password(&studio.form)
         };
 
         (studio, boot)
@@ -1462,28 +1496,86 @@ impl Studio {
             Message::FormVerify(v) => { self.form.verify_server = v; Task::none() }
             Message::FormCaFile(v) => { self.form.ca_file = v; Task::none() }
             Message::FormSavePassword(v) => { self.form.save_password = v; Task::none() }
+            Message::FormPasswordStore(v) => { self.form.password_store = Some(v); Task::none() }
 
             Message::LoadProfile(index) => {
                 if let Some(profile) = self.profiles.get(index) {
                     self.form = profile.clone();
                 }
+                read_saved_password(&self.form)
+            }
+            Message::SavedPasswordRead(name, read) => {
+                match read {
+                    // Only into the profile it was read for, and never over
+                    // one typed while the keyring was being asked.
+                    Ok(Some(password)) => {
+                        if self.form.name == name && self.form.password.is_empty() {
+                            self.form.password = password;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.status = Status::Failed(format!(
+                            "could not read the saved password of `{name}`: {e}"
+                        ))
+                    }
+                }
                 Task::none()
             }
             Message::SaveProfile => {
-                match self.profiles.iter().position(|p| p.name == self.form.name) {
-                    Some(index) => self.profiles[index] = self.form.clone(),
-                    None => self.profiles.push(self.form.clone()),
+                let form = self.form.clone();
+                let previous = self.profiles.iter().find(|p| p.name == form.name).cloned();
+                if !profiles::keeping_touches_keyring(&form, previous.as_ref()) {
+                    return self.update(Message::ProfileSaved(form, Ok(())));
+                }
+                self.status = Status::Busy(format!("saving the password of `{}`", form.name));
+                let keeping = form.clone();
+                Task::perform(
+                    profiles::blocking(move || {
+                        profiles::keep_password(&keeping, previous.as_ref(), &profiles::OsKeyring)
+                    }),
+                    move |kept| Message::ProfileSaved(form, kept),
+                )
+            }
+            Message::ProfileSaved(form, kept) => {
+                if let Err(e) = kept {
+                    self.status = Status::Failed(format!("profile `{}` was not saved: {e}", form.name));
+                    return Task::none();
+                }
+                match self.profiles.iter().position(|p| p.name == form.name) {
+                    Some(index) => self.profiles[index] = form.clone(),
+                    None => self.profiles.push(form.clone()),
                 }
                 self.status = match profiles::save(&self.profiles) {
-                    Ok(()) => Status::Done(format!("saved profile `{}`", self.form.name)),
+                    Ok(()) => Status::Done(format!("saved profile `{}`", form.name)),
                     Err(e) => Status::Failed(e),
                 };
                 Task::none()
             }
             Message::DeleteProfile(index) => {
-                if index < self.profiles.len() {
-                    self.profiles.remove(index);
-                    let _ = profiles::save(&self.profiles);
+                if index >= self.profiles.len() {
+                    return Task::none();
+                }
+                let removed = self.profiles.remove(index);
+                if let Err(e) = profiles::save(&self.profiles) {
+                    self.status = Status::Failed(e);
+                }
+                if !removed.password_in_keyring() {
+                    return Task::none();
+                }
+                let name = removed.name.clone();
+                Task::perform(
+                    profiles::blocking(move || {
+                        profiles::forget_password(&removed, &profiles::OsKeyring)
+                    }),
+                    move |forgotten| Message::ProfileForgotten(name, forgotten),
+                )
+            }
+            Message::ProfileForgotten(name, forgotten) => {
+                if let Err(e) = forgotten {
+                    self.status = Status::Failed(format!(
+                        "deleted profile `{name}`, but its password is still in the OS keyring: {e}"
+                    ));
                 }
                 Task::none()
             }
@@ -1493,7 +1585,7 @@ impl Studio {
                 self.connect_error = None;
                 self.status = Status::Busy(format!("connecting to {}", self.form.host));
                 let profile = self.form.clone();
-                Task::perform(conn::connect(profile), Message::Connected)
+                Task::perform(connect_saved(profile), Message::Connected)
             }
             Message::Connected(Ok(session)) => {
                 self.connecting = false;

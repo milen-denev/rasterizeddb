@@ -488,6 +488,8 @@ it only when the map moves or the schema changes.
 
 ```sh
 cargo test -p rdb_studio                       # unit tests
+# The OS keyring itself, on a desktop that has one (writes and removes an entry):
+cargo test -p rdb_studio --lib the_os_keyring_round_trips -- --ignored
 
 # Everything the dialect layer sends, against real servers. Each is optional.
 RDB_STUDIO_TEST_PG=postgresql://user:pw@host:5432/db?sslmode=disable \
@@ -514,8 +516,32 @@ while another lists them all.
 
 ## Connections on disk
 
-`~/.config/rdb_studio/connections.json`, owner-readable only. A password is
-written only when the profile asks for it.
+The profiles are one JSON file in the user's config directory, readable by its
+owner only:
+
+| Platform | Profiles | Saved passwords (default) |
+|---|---|---|
+| Linux, BSD | `~/.config/rdb_studio/connections.json` | the Secret Service (GNOME Keyring, KWallet) |
+| Windows | `%APPDATA%\rdb_studio\connections.json` | Credential Manager |
+| macOS | `~/Library/Application Support/rdb_studio/connections.json` | Keychain |
+
+A password is kept only when **Save password** is on, and then where **Keep it
+in** says: the **OS keyring** (the default; the file holds no password), or the
+**profile file** in plain text, for a machine with no credential store — a
+Linux desktop without a Secret Service says so when the profile is saved. Each
+keyring entry is filed under the service `rdb_studio`, with the profile's name
+as its account, so it shows up as such in Seahorse, KWallet Manager, Credential
+Manager or Keychain Access.
+
+The keyring is read when a profile is picked (the password field then fills
+in) and when it connects, written when the profile is saved, and cleared when
+**Save password** is turned off, the password moves to the file, or the profile
+is deleted. A keyring that refuses the password fails the save rather than
+saving the profile without it. A profile saved before the keyring existed keeps
+its password in the file until it is moved.
+
+The native protocol's unix socket and peer login are not available on Windows;
+connect over TCP with a password or trust login there.
 
 ## What TLS does here
 
