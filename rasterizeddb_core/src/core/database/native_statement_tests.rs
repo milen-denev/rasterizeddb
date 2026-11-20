@@ -1005,3 +1005,62 @@ async fn a_native_connection_counts_among_its_database_s_sessions() {
     let _three = native_session_for(&alone, &principal, false);
     assert_eq!(sessions(), 0);
 }
+
+/// One request with the connection's session, which learns a parse for an
+/// autocommit SELECT's template (`NativeSession::text_step`), and without
+/// one, which learns nothing: the two answers, byte for byte.
+async fn learned_and_plain(context: &NativeContext, session: &crate::pgwire::NativeSession, sql: &str) -> Vec<u8> {
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let learned = process_native_request(context.clone(), principal.clone(), Some(session), sql.as_bytes().to_vec()).await;
+    let plain = process_native_request(context.clone(), principal, None, sql.as_bytes().to_vec()).await;
+    assert_eq!(learned, plain, "{sql}: the learned answer differs from the plain one ({})", text(&learned));
+    learned
+}
+
+/// A native connection's learned SELECT answers exactly as the plain path:
+/// while it is learned, from the learned parse, for a key that matches
+/// nothing, after rows are added, after a NUMERIC column is added (its
+/// scale typed by the plain path's retag), and for statements that never
+/// learn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learned_native_select_answers_as_the_plain_path() {
+    use std::sync::atomic::Ordering;
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    ok(&context, "CREATE TABLE lt (id BIGINT PRIMARY KEY, v BIGINT, s TEXT)").await;
+    for id in 1..=40 {
+        ok(&context, &format!("INSERT INTO lt (id, v, s) VALUES ({id}, {}, 'n{id}')", id * 10)).await;
+    }
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let before = crate::pgwire::TEXT_RUNS.load(Ordering::Relaxed);
+    for round in 0..3 {
+        for id in [1, 2, 3, 5, 8, 13, 999] {
+            learned_and_plain(&context, &session, &format!("SELECT id, v, s FROM lt WHERE id = {id}")).await;
+        }
+        for (a, b) in [(3, 9), (30, 45), (7, 7)] {
+            learned_and_plain(&context, &session, &format!("SELECT id FROM lt WHERE id >= {a} AND id < {b} ORDER BY id")).await;
+        }
+        // Never learned: a LIKE, a NULL, a quote inside a string.
+        learned_and_plain(&context, &session, "SELECT id FROM lt WHERE s LIKE 'n1%' ORDER BY id").await;
+        learned_and_plain(&context, &session, "SELECT id FROM lt WHERE v = NULL").await;
+        learned_and_plain(&context, &session, "SELECT id FROM lt WHERE s = 'it''s'").await;
+        if round == 0 {
+            for id in 41..=45 {
+                ok(&context, &format!("INSERT INTO lt (id, v, s) VALUES ({id}, {}, 'n{id}')", id * 10)).await;
+            }
+        }
+    }
+    assert!(
+        crate::pgwire::TEXT_RUNS.load(Ordering::Relaxed) > before,
+        "nothing ran from a learned parse, so nothing was compared"
+    );
+    // A column added after the template was learned, with a scale of its own.
+    ok(&context, "ALTER TABLE lt ADD COLUMN price NUMERIC(10, 2)").await;
+    ok(&context, "UPDATE lt SET price = 1.25").await;
+    for id in [7, 9, 44, 999] {
+        let answer = learned_and_plain(&context, &session, &format!("SELECT id, v, s FROM lt WHERE id = {id}")).await;
+        assert_ne!(answer.first(), Some(&3), "{}", text(&answer));
+        learned_and_plain(&context, &session, &format!("SELECT * FROM lt WHERE id = {id}")).await;
+        learned_and_plain(&context, &session, &format!("SELECT price, id FROM lt WHERE id = {id}")).await;
+    }
+}

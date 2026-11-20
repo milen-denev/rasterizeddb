@@ -232,3 +232,86 @@ async fn a_temporary_table_hides_a_table_a_prepared_statement_learned() {
     let rows: Vec<String> = read(6).fetch_all(&mut conn).await.expect("real read").iter().map(render).collect();
     assert_eq!(rows, vec!["Some(6)|Some(\"name 006\")"]);
 }
+
+/// A number written as a decimal against an integer column (`2.0`, `1.5`,
+/// `07`, `0.0`) has the class a template learned from plain integers, so it
+/// runs from the learned parse. Whatever the text path makes of it (`2.0`
+/// equal to 2, `1.5` equal to no integer) it must make the same there: the
+/// values a parse was verified with are not the ones that differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decimal_values_against_integers_answer_as_the_text_path() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let (_server, mut conn) = setup().await;
+    let before = runs();
+    same_both_ways(
+        &mut conn,
+        &[
+            (
+                "SELECT k FROM items WHERE n = $1 ORDER BY k",
+                vec![vec!["3"], vec!["5"], vec!["2.0"], vec!["1.5"], vec!["07"], vec!["0.0"], vec!["12.00"], vec!["12.5"]],
+            ),
+            ("SELECT k, n FROM items WHERE k = $1", vec![vec!["4"], vec!["9"], vec!["4.0"], vec!["4.5"], vec!["004"], vec!["200.000"]]),
+            (
+                "SELECT k FROM items WHERE k >= $1 AND k < $2 ORDER BY k",
+                vec![vec!["10", "13"], vec!["20", "22"], vec!["10.5", "13.5"], vec!["0.5", "2"], vec!["019", "21.0"]],
+            ),
+        ],
+    )
+    .await;
+    assert!(runs() > before, "nothing ran from a learned parse, so nothing was compared");
+}
+
+/// The same statement sent again and again (a dashboard's) is answered from
+/// its parse once a repeat has reproduced it, without a second value ever
+/// being sent, and still reads the rows as they are now. A different value
+/// afterwards is checked as any other before it is reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identical_statement_repeated_runs_from_its_parse() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let (_server, mut conn) = setup().await;
+    let sql = "SELECT k, s, n FROM items WHERE k = 77";
+    set_text_shapes(false);
+    let want = simple(&mut conn, sql).await.unwrap();
+    set_text_shapes(true);
+    let before = runs();
+    for _ in 0..12 {
+        assert_eq!(simple(&mut conn, sql).await.unwrap(), want, "{sql}");
+    }
+    assert!(runs() > before, "an identical statement never ran from its parse");
+    // Rows written since are read: the parse is reused, not the answer.
+    conn.execute("UPDATE items SET n = 4242 WHERE k = 77").await.expect("update");
+    let now = simple(&mut conn, sql).await.unwrap();
+    assert!(now[0].ends_with("|Some(4242)"), "{now:?}");
+    // Another value: the text path's answer.
+    set_text_shapes(false);
+    let other = simple(&mut conn, "SELECT k, s, n FROM items WHERE k = 78").await.unwrap();
+    set_text_shapes(true);
+    for _ in 0..3 {
+        assert_eq!(simple(&mut conn, "SELECT k, s, n FROM items WHERE k = 78").await.unwrap(), other);
+    }
+}
+
+/// Values that occur inside one another (`5` in `25`, `1` in `100`) give no
+/// template while each also occurs elsewhere in the clause; the statement is
+/// tried a bounded number of times and answers as the text path every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn values_inside_one_another_still_answer_as_the_text_path() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let (_server, mut conn) = setup().await;
+    let mut cases = Vec::new();
+    for (a, b) in [(5, 25), (1, 100), (2, 12), (5, 125), (3, 33), (25, 5), (7, 77), (9, 99), (1, 11), (4, 44), (6, 66), (8, 88)] {
+        cases.push((a, b));
+    }
+    let sql = |a: i32, b: i32| format!("SELECT k FROM items WHERE n = {a} AND k < {b} ORDER BY k");
+    set_text_shapes(false);
+    let mut want = Vec::new();
+    for (a, b) in &cases {
+        want.push(simple(&mut conn, &sql(*a, *b)).await.unwrap());
+    }
+    set_text_shapes(true);
+    for _round in 0..2 {
+        for ((a, b), want) in cases.iter().zip(&want) {
+            assert_eq!(&simple(&mut conn, &sql(*a, *b)).await.unwrap(), want, "{}", sql(*a, *b));
+        }
+    }
+}
