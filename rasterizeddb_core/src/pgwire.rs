@@ -6008,6 +6008,15 @@ where
         }
         None => (sqlstate, message),
     };
+    // A domain's check, in PostgreSQL's words (`domains`): 23514.
+    let domain_message;
+    let (sqlstate, message) = match crate::core::rql::domains::violation(message) {
+        Some(m) => {
+            domain_message = m;
+            ("23514", domain_message.as_str())
+        }
+        None => (sqlstate, message),
+    };
     state.statement_failed = true;
     state.error_in_batch = true;
     state.statement_error = Some(message.to_string());
@@ -7756,6 +7765,9 @@ where
     }
     if let Some(parsed) = crate::core::rql::user_types::parse_type_statement(stmt) {
         return type_statements::handle_type_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::domains::parse_domain_statement(stmt) {
+        return type_statements::handle_domain_statement(database, state, stream, parsed).await;
     }
     if let Some(parsed) = crate::core::rql::functions::parse_routine_statement(stmt) {
         return routine_statements::handle_routine_statement(database, state, stream, parsed).await;

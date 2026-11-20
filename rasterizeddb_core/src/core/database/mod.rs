@@ -1373,6 +1373,8 @@ pub struct Database {
     /// The names of the views this database may hold (`rql::views`).
     pub(crate) views: crate::core::rql::views::ViewRegistry,
     pub(crate) types: crate::core::rql::user_types::TypeRegistry,
+    /// The domains' names (`rql::domains`).
+    pub(crate) domains: crate::core::rql::user_types::TypeRegistry,
     /// The names of the routines this database may hold (`rql::functions`).
     pub(crate) functions: crate::core::rql::functions::FunctionRegistry,
     /// The tables that may have triggers (`rql::triggers`).
@@ -1950,6 +1952,7 @@ impl Database {
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
             views: crate::core::rql::views::ViewRegistry::default(),
             types: crate::core::rql::user_types::TypeRegistry::default(),
+            domains: crate::core::rql::user_types::TypeRegistry::default(),
             functions: crate::core::rql::functions::FunctionRegistry::default(),
             triggers: crate::core::rql::triggers::TriggerRegistry::default(),
             id,
@@ -6277,7 +6280,9 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
     let stmt = rewritten.as_ref();
     // Enum types in their stored form (`rql::user_types`); their own
     // statements are the PostgreSQL protocol's.
-    if crate::core::rql::user_types::parse_type_statement(stmt).is_some() {
+    if crate::core::rql::user_types::parse_type_statement(stmt).is_some()
+        || crate::core::rql::domains::parse_domain_statement(stmt).is_some()
+    {
         return error_response(
             "type statements are not supported over the native protocol yet; use the PostgreSQL protocol for this \
              statement",

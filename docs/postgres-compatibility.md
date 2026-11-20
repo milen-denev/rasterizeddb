@@ -418,6 +418,28 @@ Where it differs from PostgreSQL:
   columns of the type are refused (0A000); type statements are refused over
   the native protocol.
 
+### Domains
+
+`CREATE DOMAIN name [AS] base [COLLATE c] [DEFAULT expr] [NOT NULL | NULL]
+[[CONSTRAINT n] CHECK (expr over VALUE)]…` and `DROP DOMAIN [IF EXISTS] …
+[RESTRICT]`, in a transaction block as well. A column of a domain is its base
+type with the domain's `NOT NULL`, its checks (named as PostgreSQL names them:
+`<domain>_check`, `<domain>_check1`, …, or the `CONSTRAINT` name) and its
+default where the column has none. A violated check is PostgreSQL's 23514,
+`value for domain posint violates check constraint "posint_check"`. A cast to
+a domain is a cast to its base type.
+
+Where it differs from PostgreSQL:
+
+- A cast to a domain does not check the domain's constraints; only a
+  column's value is checked.
+- `ALTER DOMAIN` is refused (0A000); `DROP DOMAIN … CASCADE` with columns of
+  the domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`.
+- A domain's `NOT NULL` reports the column's 23502 message, not `domain d
+  does not allow null values`.
+- `pg_type` lists no domain, so `psql`'s `\dD` shows none; domain statements
+  are refused over the native protocol.
+
 ### Subqueries reading outer columns
 
 A subquery may name an outer column without its qualifier, `EXISTS (SELECT 1
@@ -1396,7 +1418,7 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
 `::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
 
 - **Types**: `CREATE TYPE` for composites and ranges (enums work, see
-  "Enum types" above), `CREATE DOMAIN`, range types
+  "Enum types" above), range types
   (`int4range`, `daterange`), multidimensional array literals (`ARRAY[[1,2],[3,4]]`),
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
   PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in

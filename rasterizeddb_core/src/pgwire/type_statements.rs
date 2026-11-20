@@ -262,3 +262,111 @@ async fn apply_change(
     }
     Ok(Ok(()))
 }
+
+/// `CREATE DOMAIN`, `DROP DOMAIN` (`core::rql::domains`); `ALTER DOMAIN` is
+/// refused (0A000).
+pub(super) async fn handle_domain_statement<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    parsed: Result<crate::core::rql::domains::DomainStatement, user_types::Refusal>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::core::rql::domains::{self, DomainStatement};
+    let statement = match parsed {
+        Ok(statement) => statement,
+        Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+    };
+    let verb = match &statement {
+        DomainStatement::Create(_) => "CREATE DOMAIN",
+        DomainStatement::Drop { .. } => "DROP DOMAIN",
+        DomainStatement::Alter { .. } => "ALTER DOMAIN",
+    };
+    if let DomainStatement::Alter { name } = &statement {
+        return fail_statement(
+            state,
+            stream,
+            "0A000",
+            &format!("ALTER DOMAIN is not supported yet; drop domain {name} and create it again"),
+        )
+        .await;
+    }
+    if read_only(state) {
+        return fail_statement(state, stream, "25006", &read_only_message(verb)).await;
+    }
+    if let Some(t) = state.transaction.as_mut() {
+        t.queried = true;
+    }
+    domains::ensure_loaded(database).await;
+    user_types::ensure_loaded(database).await;
+    let tx = state.current_tx();
+    let exists = |name: &str| {
+        let name = name.to_string();
+        let database = database.clone();
+        async move {
+            let names = [name];
+            domains::load(&database, Some(&names), tx).await.is_ok_and(|v| !v.is_empty())
+                || user_types::load(&database, Some(&names), tx).await.is_ok_and(|v| !v.is_empty())
+                || database.has_table(&names[0])
+        }
+    };
+    match statement {
+        DomainStatement::Create(domain) => {
+            if exists(&domain.name).await {
+                return fail_statement(state, stream, "42710", &format!("type \"{}\" already exists", domain.name)).await;
+            }
+            if let Err(e) = domains::store(database, &domain, tx).await {
+                return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+            }
+            send_command_complete(stream, verb).await
+        }
+        DomainStatement::Drop { names, if_exists, cascade } => {
+            let pending = state.transaction.as_ref().map(|t| database.block_drops_pending(t.id)).unwrap_or_default();
+            let columns: Vec<(String, String, String)> = domains::domain_columns(database)
+                .into_iter()
+                .filter(|(table, _, _)| !pending.iter().any(|p| p.eq_ignore_ascii_case(table)))
+                .collect();
+            let mut dropping = Vec::new();
+            for name in &names {
+                let found = domains::load(database, Some(std::slice::from_ref(name)), tx).await.is_ok_and(|v| !v.is_empty());
+                if !found {
+                    if if_exists {
+                        crate::core::notice::push("NOTICE", "00000", format!("type \"{name}\" does not exist, skipping"));
+                        continue;
+                    }
+                    return fail_statement(state, stream, "42704", &format!("type \"{name}\" does not exist")).await;
+                }
+                if let Some((table, column, _)) = columns.iter().find(|(_, _, d)| d == name) {
+                    if cascade {
+                        return fail_statement(
+                            state,
+                            stream,
+                            "0A000",
+                            &format!("DROP DOMAIN … CASCADE would drop column {column} of table {table}; drop the columns of domain {name} first"),
+                        )
+                        .await;
+                    }
+                    return fail_statement(
+                        state,
+                        stream,
+                        "2BP01",
+                        &format!(
+                            "cannot drop type {name} because other objects depend on it: column {column} of table {table} depends on type {name}"
+                        ),
+                    )
+                    .await;
+                }
+                dropping.push(name.clone());
+            }
+            for name in dropping {
+                if let Err(e) = domains::remove(database, &name, tx).await {
+                    return fail_statement(state, stream, sqlstate_for(&e), &e).await;
+                }
+            }
+            send_command_complete(stream, verb).await
+        }
+        DomainStatement::Alter { .. } => unreachable!("refused above"),
+    }
+}

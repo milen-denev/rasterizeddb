@@ -52,7 +52,7 @@ pub const CONSTRAINT_PREFIX: &str = "__enum_";
 
 pub type Refusal = (&'static str, String);
 
-fn refusal(code: &'static str, message: impl Into<String>) -> Refusal {
+pub(crate) fn refusal(code: &'static str, message: impl Into<String>) -> Refusal {
     (code, message.into())
 }
 
@@ -89,15 +89,15 @@ pub fn oid_of(name: &str) -> i64 {
 #[derive(Default)]
 pub struct TypeRegistry {
     names: dashmap::DashMap<String, ()>,
-    loaded: AtomicBool,
+    pub(crate) loaded: AtomicBool,
 }
 
 impl TypeRegistry {
-    fn note(&self, name: &str) {
+    pub(crate) fn note(&self, name: &str) {
         self.names.insert(name.to_string(), ());
     }
 
-    fn mentioned_in(&self, sql: &str) -> Vec<String> {
+    pub(crate) fn mentioned_in(&self, sql: &str) -> Vec<String> {
         self.names
             .iter()
             .filter(|e| crate::core::sql_scan::contains_ignore_ascii_case(sql, e.key().as_bytes()))
@@ -314,7 +314,7 @@ pub fn place_label(labels: &[String], label: &str, place: &Option<(bool, String)
 // ---------------------------------------------------------------------------
 // Storage
 
-fn run(
+pub(crate) fn run(
     database: &Arc<Database>,
     sql: &str,
     tx: Option<TxId>,
@@ -511,6 +511,13 @@ pub fn column_constraint(def: &EnumType, column: &str, array: bool) -> String {
 /// stored form; `None` when it names none. `tx` is the statement's, so a
 /// type created earlier in the block is seen.
 pub async fn rewrite(database: &Arc<Database>, sql: &str, tx: Option<TxId>) -> Result<Option<String>, Refusal> {
+    // Domains first (`domains`): a domain over an enum is then the enum.
+    let with_domains = crate::core::rql::domains::rewrite(database, sql, tx).await?;
+    let sql_now = with_domains.as_deref().unwrap_or(sql);
+    Ok(rewrite_enums(database, sql_now, tx).await?.or(with_domains))
+}
+
+async fn rewrite_enums(database: &Arc<Database>, sql: &str, tx: Option<TxId>) -> Result<Option<String>, Refusal> {
     ensure_loaded(database).await;
     if database.types.names.is_empty() {
         return Ok(None);
@@ -784,31 +791,38 @@ fn casts(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, String)>) 
 /// A column declared with an enum type in `CREATE TABLE … (…)` or `ALTER
 /// TABLE … ADD [COLUMN]`: `text` with the constraint keeping it to the
 /// labels. `ALTER COLUMN … TYPE mood` is refused (0A000).
-fn column_types(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, String)>) -> Result<(), Refusal> {
+/// Where each column definition of a `CREATE TABLE` (or each `ADD [COLUMN]`
+/// of an `ALTER TABLE`) starts and ends, and each `ALTER COLUMN … TYPE`'s
+/// type; `None` for any other statement. Shared with `domains`.
+pub(crate) struct ColumnDefinitions {
+    pub definitions: Vec<(usize, usize)>,
+    pub type_changes: Vec<usize>,
+}
+
+pub(crate) fn column_definitions(sql: &str) -> Option<ColumnDefinitions> {
     use crate::core::rql::join::find_keyword;
     let head_at = sql.len() - sql.trim_start().len();
-    let after_first = &sql[head_at + 6..];
+    let after_first = sql.get(head_at + 6..)?;
     let word = after_first.trim_start();
     let is_table = word.len() > 5 && word.as_bytes()[..5].eq_ignore_ascii_case(b"TABLE") && !is_identifier_byte(word.as_bytes()[5]);
     let temp_table = ["TEMP", "TEMPORARY", "UNLOGGED"].iter().any(|k| {
         word.len() > k.len() && word.as_bytes()[..k.len()].eq_ignore_ascii_case(k.as_bytes()) && !is_identifier_byte(word.as_bytes()[k.len()])
     });
     if !(is_table || temp_table) {
-        return Ok(());
+        return None;
     }
     let create = sql.trim_start().as_bytes()[..6].eq_ignore_ascii_case(b"CREATE");
-    // Each column definition: `name type …`.
-    let mut definitions: Vec<(usize, usize)> = Vec::new();
+    let mut out = ColumnDefinitions { definitions: Vec::new(), type_changes: Vec::new() };
     if create {
-        let Some(open) = sql.find('(') else { return Ok(()) };
+        let open = sql.find('(')?;
         if find_keyword(&sql[..open], "AS", 0).is_some() {
-            return Ok(());
+            return None;
         }
-        let Some(close) = matching_close(sql, open) else { return Ok(()) };
+        let close = matching_close(sql, open)?;
         let list = &sql[open + 1..close];
         for item in split_top_level(list, b',') {
             let at = open + 1 + (item.as_ptr() as usize - list.as_ptr() as usize);
-            definitions.push((at, at + item.len()));
+            out.definitions.push((at, at + item.len()));
         }
     } else {
         // ALTER TABLE t ADD [COLUMN] [IF NOT EXISTS] c mood, ALTER COLUMN c TYPE mood
@@ -818,12 +832,7 @@ fn column_types(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, Str
             while at < sql.len() && sql.as_bytes()[at].is_ascii_whitespace() {
                 at += 1;
             }
-            if let Some((def, _, _)) = type_at(sql, at, defs) {
-                return Err(refusal(
-                    "0A000",
-                    format!("changing a column's type to the enum {} is not supported; add a new column of it instead", def.name),
-                ));
-            }
+            out.type_changes.push(at);
             from = p + 4;
         }
         let mut from = 0;
@@ -841,31 +850,52 @@ fn column_types(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, Str
                 .flatten()
                 .min()
                 .unwrap_or(sql.trim_end().trim_end_matches(';').len());
-            definitions.push((at, end));
+            out.definitions.push((at, end));
             from = p + 3;
         }
     }
+    Some(out)
+}
+
+/// A column definition's name (folded) and where its type starts; `None`
+/// for a table constraint (`CONSTRAINT`, `PRIMARY KEY`, …).
+pub(crate) fn column_name_and_type(sql: &str, start: usize, end: usize) -> Option<(String, usize)> {
+    let item = &sql[start..end];
+    let lead = item.len() - item.trim_start().len();
+    let name_at = start + lead;
+    let bytes = sql.as_bytes();
+    let name_end = if bytes.get(name_at) == Some(&b'"') {
+        crate::core::sql_scan::quoted_end(bytes, name_at, b'"')
+    } else {
+        name_at + bytes[name_at..end].iter().take_while(|b| is_identifier_byte(**b)).count()
+    };
+    if name_end == name_at {
+        return None;
+    }
+    let column = fold(&sql[name_at..name_end]);
+    if ["constraint", "primary", "unique", "check", "foreign", "exclude"].contains(&column.as_str()) {
+        return None;
+    }
+    let mut type_start = name_end;
+    while type_start < end && bytes[type_start].is_ascii_whitespace() {
+        type_start += 1;
+    }
+    Some((column, type_start))
+}
+
+fn column_types(sql: &str, defs: &[EnumType], edits: &mut Vec<(usize, usize, String)>) -> Result<(), Refusal> {
+    let Some(found) = column_definitions(sql) else { return Ok(()) };
+    for at in &found.type_changes {
+        if let Some((def, _, _)) = type_at(sql, *at, defs) {
+            return Err(refusal(
+                "0A000",
+                format!("changing a column's type to the enum {} is not supported; add a new column of it instead", def.name),
+            ));
+        }
+    }
+    let definitions = found.definitions;
     for (start, end) in definitions {
-        let item = &sql[start..end];
-        let lead = item.len() - item.trim_start().len();
-        let name_at = start + lead;
-        let bytes = sql.as_bytes();
-        let name_end = if bytes.get(name_at) == Some(&b'"') {
-            crate::core::sql_scan::quoted_end(bytes, name_at, b'"')
-        } else {
-            name_at + bytes[name_at..end].iter().take_while(|b| is_identifier_byte(**b)).count()
-        };
-        if name_end == name_at {
-            continue;
-        }
-        let column = fold(&sql[name_at..name_end]);
-        if ["constraint", "primary", "unique", "check", "foreign", "exclude"].contains(&column.as_str()) {
-            continue;
-        }
-        let mut type_start = name_end;
-        while type_start < end && bytes[type_start].is_ascii_whitespace() {
-            type_start += 1;
-        }
+        let Some((column, type_start)) = column_name_and_type(sql, start, end) else { continue };
         if let Some((def, array, type_end)) = type_at(sql, type_start, defs) {
             edits.push((
                 type_start,
