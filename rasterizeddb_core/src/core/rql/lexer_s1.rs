@@ -138,6 +138,21 @@ pub struct ConflictUpdate {
     pub where_clause: Option<String>,
 }
 
+/// Where an `INSERT`'s `ON CONFLICT … DO UPDATE` clause starts, when it has
+/// one. Its subqueries read `excluded` and the row that conflicted, so they
+/// are the conflict's to run, per conflict, never flattened with the rows
+/// (`pgwire`'s subquery pass took `WHERE EXISTS (… excluded.id)` for an
+/// uncorrelated one and ran it alone: "missing FROM-clause entry for table
+/// \"excluded\"").
+pub(crate) fn conflict_update_at(query: &str) -> Option<usize> {
+    if !crate::core::sql_scan::contains_ignore_ascii_case(query, b"ON CONFLICT") {
+        return None;
+    }
+    let upper = query.to_ascii_uppercase();
+    let at = find_top_level(&upper, "ON CONFLICT")?;
+    upper[at..].contains("DO UPDATE").then_some(at)
+}
+
 /// Splits a trailing `ON CONFLICT …` clause off an `INSERT`.
 ///
 /// Returns the statement without the clause, whether it was `DO NOTHING`, the

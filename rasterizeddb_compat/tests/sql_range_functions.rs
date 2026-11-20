@@ -134,3 +134,54 @@ async fn a_range_column_with_nulls_is_read_by_every_operator() {
         vec!["1|1|10|f|f|[5,10)", "2|20|30|f|f|[20,25)", "3|NULL|NULL|NULL|NULL|NULL", "4|NULL|NULL|t|f|empty"]
     );
 }
+
+/// A range the row computes, compared in a `WHERE`: refused before ("yields
+/// a INT4RANGE value, which a WHERE clause cannot compare yet"), and `NOT
+/// (range @> x)` read as a document ("invalid input syntax for type json").
+/// Each answer is PostgreSQL 17's for the same rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_computed_range_is_compared_in_a_where_clause() {
+    let server = TestServer::start().await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute(
+        "CREATE TABLE rw (id int PRIMARY KEY, lo int, hi int, r int4range, d date); \
+         INSERT INTO rw VALUES (1, 1, 10, '[1,10)', '2024-01-05'), (2, 20, 30, '[20,30)', '2024-02-01'), \
+         (3, NULL, 5, NULL, NULL), (4, 5, 5, 'empty', '2024-03-01')",
+    )
+    .await
+    .expect("setup");
+    for (predicate, want) in [
+        ("int4range(lo, hi) @> 5", vec![1]),
+        ("r * '[5,25)'::int4range = '[5,10)'::int4range", vec![1]),
+        ("int4range(lo, hi) && '[8,22)'", vec![1, 2]),
+        ("r + '[10,20)'::int4range = '[1,20)'::int4range", vec![1]),
+        ("'[0,100)'::int4range @> r", vec![1, 2, 4]),
+        ("int4range(lo, hi, '[]') @> hi", vec![1, 2, 3, 4]),
+        ("daterange(d, d + 7) @> '2024-01-08'::date", vec![1, 3]),
+        ("upper(r * '[5,25)') > 8", vec![1, 2]),
+        ("int4range(lo, hi) = r", vec![1, 2, 4]),
+        ("NOT (int4range(lo, hi) @> 3)", vec![2, 4]),
+        ("int4range(lo, hi) << int4range(15, 16)", vec![1, 3]),
+        ("5 <@ int4range(lo, hi)", vec![1]),
+        ("int4range(lo, hi) <> r", vec![]),
+        ("(id = 2 OR int4range(lo, hi) @> 5) AND hi > 0", vec![1, 2]),
+        ("NOT (int4range(lo, hi) && '[8,22)') OR id = 3", vec![3, 4]),
+        ("r -|- int4range(hi, 40)", vec![1, 2]),
+        ("NOT (r && int4range(lo + 5, hi + 5))", vec![4]),
+        ("range_merge(r, '[40,50)') @> 35", vec![1, 2]),
+        ("CASE WHEN int4range(lo, hi) @> 5 THEN true ELSE false END", vec![1]),
+        // A column against a literal stays the scan's own comparison.
+        ("r @> 5", vec![1]),
+        ("NOT (r @> 5)", vec![2, 4]),
+    ] {
+        assert_eq!(ids(&c, &format!("SELECT id FROM rw WHERE {predicate} ORDER BY id")).await, want, "{predicate}");
+    }
+    assert_eq!(
+        code(&c, "SELECT id FROM rw WHERE r -|- int4range(lo, 1)").await,
+        ("22000".to_string(), "range lower bound must be less than or equal to range upper bound".to_string())
+    );
+    assert_eq!(
+        row(&c, "SELECT range_merge(r, '[40,50)'), NOT (int4range(lo, hi) @> 3) FROM rw WHERE id = 2").await,
+        "[20,50)|t"
+    );
+}

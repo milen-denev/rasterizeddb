@@ -96,6 +96,14 @@ async fn unknown_functions_and_columns_in_expressions_have_postgresql_codes() {
         ("SELECT public.nosuchfn(1)", "42883", "function public.nosuchfn(integer) does not exist", 8),
         ("SELECT abs('x'::text) FROM fx", "42883", "function abs(text) does not exist", 8),
         ("SELECT length(1, 2)", "42883", "function length(integer, integer) does not exist", 8),
+        // A value that does not cast to text implicitly has no lower/upper.
+        ("SELECT lower(a) FROM fx", "42883", "function lower(integer) does not exist", 8),
+        ("SELECT id FROM fx WHERE upper(a) = '2'", "42883", "function upper(integer) does not exist", 25),
+        ("SELECT lower(1.5)", "42883", "function lower(numeric) does not exist", 8),
+        ("SELECT upper(true)", "42883", "function upper(boolean) does not exist", 8),
+        ("SELECT lower(now())", "42883", "function lower(timestamp with time zone) does not exist", 8),
+        ("SELECT lower(interval '1 day')", "42883", "function lower(interval) does not exist", 8),
+        ("SELECT upper(date '2024-01-01')", "42883", "function upper(date) does not exist", 8),
         // An argument's unknown column is found before its function.
         ("SELECT nosuchfn(nosuch) FROM fx", "42703", "column \"nosuch\" does not exist", 17),
         ("SELECT nosuch + 1 FROM fx", "42703", "column \"nosuch\" does not exist", 8),
@@ -128,4 +136,89 @@ async fn unknown_functions_and_columns_in_expressions_have_postgresql_codes() {
         let (got, message, _) = error(&c, sql).await;
         assert_eq!(got, code, "{sql}: {message}");
     }
+    let row = c
+        .query_one("SELECT lower(s), upper(a::text), lower('AB'), upper(NULL::text) FROM fx", &[])
+        .await
+        .expect("text lowercases");
+    let got: (String, String, String, Option<String>) = (row.get(0), row.get(1), row.get(2), row.get(3));
+    assert_eq!(got, ("x".to_string(), "2".to_string(), "ab".to_string(), None));
+}
+
+/// `ON CONFLICT … DO UPDATE` is read with the statement, as PostgreSQL reads
+/// it: a name in its `SET` or `WHERE` that names nothing was refused only
+/// when a row conflicted, so the first run inserted and reported success.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_conflict_do_update_names_nothing_before_any_row_is_written() {
+    let server = TestServer::start().await.expect("server");
+    let c = connect(&server).await;
+    c.batch_execute("CREATE TABLE oc (id int PRIMARY KEY, n int, s text, b bool); INSERT INTO oc VALUES (1, 1, 'a', true)")
+        .await
+        .expect("setup");
+    let cases: &[(&str, &str, &str)] = &[
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET s = nosuch", "42703", "column \"nosuch\" does not exist"),
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = nosuch + 1", "42703", "column \"nosuch\" does not exist"),
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET s = upper(nosuch)", "42703", "column \"nosuch\" does not exist"),
+        (
+            "INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET nosuch = 1",
+            "42703",
+            "column \"nosuch\" of relation \"oc\" does not exist",
+        ),
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = excluded.nosuch", "42703", "column excluded.nosuch does not exist"),
+        ("INSERT INTO oc AS o (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = o.nosuch + 1", "42703", "column o.nosuch does not exist"),
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = x.n", "42P01", "missing FROM-clause entry for table \"x\""),
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = 1 WHERE oc.nosuch > 1", "42703", "column oc.nosuch does not exist"),
+        ("INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = 1 WHERE nosuch", "42703", "column \"nosuch\" does not exist"),
+        (
+            "INSERT INTO oc (id, n) VALUES (2, 1), (3, 1) ON CONFLICT (id) DO UPDATE SET s = nosuch",
+            "42703",
+            "column \"nosuch\" does not exist",
+        ),
+        (
+            "INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET (n, s) = (1)",
+            "42601",
+            "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression",
+        ),
+        (
+            "INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET (n, s) = (1, 2, 3)",
+            "42601",
+            "number of columns does not match number of values",
+        ),
+    ];
+    for (sql, code, message) in cases {
+        let (got_code, got_message, _) = error(&c, sql).await;
+        assert_eq!((got_code.as_str(), got_message.as_str()), (*code, *message), "{sql}");
+    }
+    // In a transaction block too, and nothing was written by any of them.
+    let err = c
+        .batch_execute("BEGIN; INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET s = nosuch; COMMIT")
+        .await
+        .expect_err("in a block");
+    assert_eq!(err.as_db_error().expect("db error").code().code(), "42703");
+    c.batch_execute("ROLLBACK").await.expect("rollback");
+    let count: i64 = c.query_one("SELECT count(*) FROM oc", &[]).await.expect("count").get(0);
+    assert_eq!(count, 1);
+
+    // What names something still runs, conflicting or not; a row-form SET
+    // too, which reached the conflict's UPDATE whole and failed there.
+    for sql in [
+        "INSERT INTO oc VALUES (1, 5, 'y', false) ON CONFLICT (id) DO UPDATE SET n = oc.n + excluded.n, s = excluded.s || oc.s, b = NOT excluded.b",
+        "INSERT INTO oc AS o (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = o.n + 1 WHERE o.b IS FALSE AND excluded.n > 0",
+        "INSERT INTO oc (id, n) VALUES (2, 1) ON CONFLICT (id) DO UPDATE SET n = (SELECT max(n) FROM oc) + 1",
+        "INSERT INTO oc (id, n, s) VALUES (2, 9, 'k') ON CONFLICT (id) DO UPDATE SET (n, s) = (excluded.n, excluded.s)",
+        "INSERT INTO oc (id, n) VALUES (3, 4) ON CONFLICT (id) DO UPDATE SET (n) = ROW(excluded.n + 1)",
+        "INSERT INTO oc (id, n) VALUES (3, 4) ON CONFLICT (id) DO UPDATE SET (n) = ROW(excluded.n + 1)",
+    ] {
+        c.batch_execute(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let rows: Vec<(i32, Option<i32>, Option<String>)> = c
+        .query("SELECT id, n, s FROM oc ORDER BY id", &[])
+        .await
+        .expect("rows")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, Some(6), Some("ya".to_string())), (2, Some(9), Some("k".to_string())), (3, Some(5), None)]
+    );
 }

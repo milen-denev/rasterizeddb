@@ -272,11 +272,33 @@ fn expand_truth_tests<'c>(
     if !maybe {
         return Ok(std::borrow::Cow::Borrowed(clause));
     }
-    let toks = lex(clause)?;
+    let (toks, grouped) = group_compared_truth_operands(lex(clause)?);
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
-    let mut changed = false;
+    let mut changed = grouped;
     let mut i = 0usize;
     while i < toks.len() {
+        // A constant's truth, `false IS NOT TRUE`, `NULL IS UNKNOWN`: the
+        // test of a literal is a literal (a syntax error, where only a column
+        // or a parenthesised condition was read). Only as a whole operand —
+        // after `a = true` the operand is the comparison, which binds tighter.
+        if let Some(value) = ["TRUE", "FALSE", "NULL"].iter().position(|k| toks[i].is_keyword(k))
+            && i.checked_sub(1).is_none_or(|p| {
+                matches!(toks[p], Tok::LPar) || ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| toks[p].is_keyword(k))
+            })
+            && toks.get(i + 1).is_some_and(|t| t.is_keyword("IS"))
+        {
+            let negated = toks.get(i + 2).is_some_and(|t| t.is_keyword("NOT"));
+            let at = i + 2 + usize::from(negated);
+            if let Some(truth) = ["TRUE", "FALSE", "UNKNOWN"].iter().position(|k| toks.get(at).is_some_and(|t| t.is_keyword(k)))
+            {
+                // value: 0 true, 1 false, 2 NULL; truth: 0 TRUE, 1 FALSE, 2 UNKNOWN.
+                let holds = (value == truth) != negated;
+                out.push(if holds { CONSTANT_TRUE } else { CONSTANT_FALSE }.to_string());
+                i = at + 1;
+                changed = true;
+                continue;
+            }
+        }
         if matches!(toks[i], Tok::LPar) {
             if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema, scan)? {
                 out.push(text);
@@ -293,6 +315,97 @@ fn expand_truth_tests<'c>(
     } else {
         std::borrow::Cow::Borrowed(clause)
     })
+}
+
+/// `b = true IS TRUE` as `(b = true) IS TRUE`: a comparison binds tighter
+/// than `IS`, so the truth test's operand is the whole comparison back to the
+/// term's start (`AND`, `OR`, `NOT`, `WHERE` or an open parenthesis). It was a
+/// syntax error; parenthesised, [`parenthesised_truth_test`] reads it. The
+/// tokens and whether any were grouped.
+fn group_compared_truth_operands(mut toks: Vec<Tok>) -> (Vec<Tok>, bool) {
+    const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
+    let mut grouped = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        let is_test = toks[i].is_keyword("IS") && {
+            let at = i + 1 + usize::from(toks.get(i + 1).is_some_and(|t| t.is_keyword("NOT")));
+            toks.get(at).is_some_and(|t| t.is_keyword("TRUE") || t.is_keyword("FALSE") || t.is_keyword("UNKNOWN"))
+        };
+        if !is_test || i == 0 || matches!(toks[i - 1], Tok::RPar) && toks_open_at(&toks, i - 1).is_some_and(|o| group_starts_term(&toks, o)) {
+            i += 1;
+            continue;
+        }
+        // Back to the term's start, at depth zero.
+        let mut depth = 0i32;
+        let mut start = i;
+        let mut compared = false;
+        while start > 0 {
+            let t = &toks[start - 1];
+            match t {
+                Tok::RPar => depth += 1,
+                Tok::LPar if depth == 0 => break,
+                Tok::LPar => depth -= 1,
+                // The `AND` of a `BETWEEN a AND b` is the comparison's own.
+                _ if depth == 0 && t.is_keyword("AND") && between_before(&toks, start - 1) => {}
+                _ if depth == 0 && t.is_keyword("BETWEEN") => compared = true,
+                _ if depth == 0 && ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| t.is_keyword(k)) => break,
+                Tok::Sym(sym) if depth == 0 && COMPARISONS.contains(&sym.as_str()) => compared = true,
+                _ => {}
+            }
+            start -= 1;
+        }
+        if compared && start < i {
+            toks.insert(i, Tok::RPar);
+            toks.insert(start, Tok::LPar);
+            grouped = true;
+            i += 2;
+        }
+        i += 1;
+    }
+    (toks, grouped)
+}
+
+/// Whether the `AND` at `and` closes a `BETWEEN`: one stands before it, at
+/// the same depth, with no other `AND`/`OR` between them.
+fn between_before(toks: &[Tok], and: usize) -> bool {
+    let mut depth = 0i32;
+    for j in (0..and).rev() {
+        match &toks[j] {
+            Tok::RPar => depth += 1,
+            Tok::LPar if depth == 0 => return false,
+            Tok::LPar => depth -= 1,
+            t if depth == 0 && t.is_keyword("BETWEEN") => return true,
+            t if depth == 0 && (t.is_keyword("AND") || t.is_keyword("OR")) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The index of the parenthesis that the one closing at `close` opened.
+fn toks_open_at(toks: &[Tok], close: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for j in (0..=close).rev() {
+        match toks[j] {
+            Tok::RPar => depth += 1,
+            Tok::LPar => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a group opening at `open` is a term's whole operand: nothing but
+/// a term boundary before it.
+fn group_starts_term(toks: &[Tok], open: usize) -> bool {
+    open == 0
+        || matches!(toks[open - 1], Tok::LPar)
+        || ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| toks[open - 1].is_keyword(k))
 }
 
 /// `( <boolean expression> ) IS [NOT] TRUE | FALSE | UNKNOWN` starting at the
@@ -3605,6 +3718,8 @@ pub fn lift_evaluated_operands(
         && !char_lift_needed(clause, schema)
         && !reads_legacy_char(clause, schema)
         && !mentions_distinct_from(clause)
+        && !mentions_range(clause)
+        && !in_after_non_column(clause)
     {
         return Ok(clause.to_string());
     }
@@ -4012,7 +4127,7 @@ fn lift_term(
     depth: usize,
 ) -> Result<String, String> {
     let plain = !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema);
-    if plain && !mentions_distinct_from(term) {
+    if plain && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -4032,6 +4147,8 @@ fn lift_term(
         || quantified_over_expression(body)
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
+        || compares_a_computed_range(body, schema)
+        || (plain && in_over_non_column(body, schema))
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
@@ -4072,6 +4189,100 @@ fn distinct_from_expression(body: &str, schema: &SmallVec<[SchemaField; 20]>) ->
     let column_left = one_word(left) && resolve_column(left, schema).is_some();
     let simple_right = one_word(right) || right.starts_with('-') && one_word(right[1..].trim_start());
     !(column_left && simple_right)
+}
+
+/// Whether `text` holds `x [NOT] IN (…)` whose `x` is no bare column — a
+/// literal, a call, arithmetic (`1 IN (1, 3)`, `n + 0 IN (…)`, `excluded.id
+/// IN (SELECT …)` once its value is written in): the token before `IN` (past a
+/// `NOT`) ends in a digit, a quote or a parenthesis. Only the gate;
+/// [`in_over_non_column`] decides each term.
+fn in_after_non_column(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let word = bytes[i..i + 2].eq_ignore_ascii_case(b"IN")
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && bytes.get(i + 2).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if word && text[i + 2..].trim_start().starts_with('(') {
+            let mut before = text[..i].trim_end();
+            if before.len() >= 3
+                && before.as_bytes()[before.len() - 3..].eq_ignore_ascii_case(b"NOT")
+                && before.as_bytes().get(before.len().wrapping_sub(4)).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            {
+                before = before[..before.len() - 3].trim_end();
+            }
+            if before.ends_with(|c: char| c.is_ascii_digit() || c == '\'' || c == ')') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether `body` is `x [NOT] IN (…)` with an `x` that is no bare column: the
+/// predicate tokenizer reads only a column there ("syntax error at or near
+/// \"IN\""), the evaluator any value, with SQL's three values (`2 NOT IN
+/// (1, NULL)` is unknown). Asked of a plain term only: an operand the scan
+/// lifts itself (`age % 3`, `b::float8`, `doc->'a'`) has its `IN` spelled out
+/// by [`lift_comparison`], which keeps the scan's type checks (`jsonb =
+/// integer` is refused).
+fn in_over_non_column(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    if !in_after_non_column(body) {
+        return false;
+    }
+    let Some((at, end, true)) = comparison_operator(body) else {
+        return false;
+    };
+    let word = body[at..end].trim();
+    let is_in = word.eq_ignore_ascii_case("IN")
+        || (word.eq_ignore_ascii_case("NOT") && body[end..].trim_start().get(..2).is_some_and(|w| w.eq_ignore_ascii_case("IN")));
+    let left = body[..at].trim();
+    // A document path (`doc->'a'`, `doc->>'a'`, `doc #> '{a}'`) the scan
+    // reads, type-checks (`jsonb = integer` is refused) and may index itself.
+    let document = || left.contains("->") || left.contains("#>");
+    is_in && !left.is_empty() && resolve_column(left, schema).is_none() && !document()
+}
+
+/// Whether `text` may hold a range operand: the word anywhere, outside
+/// quotes or not (`int4range(…)`, `::daterange`, `range_merge`). Only the
+/// gate; [`compares_a_computed_range`] decides each term.
+fn mentions_range(text: &str) -> bool {
+    text.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"range"))
+}
+
+/// Whether `body` compares a range the row computes — `int4range(lo, hi) @>
+/// 5`, `r * '[5,25)'::int4range = '[5,10)'`, `'[0,100)'::int4range @> r` —
+/// which only the evaluator reads (`range_ops`): the scan's operand was
+/// refused ("yields a INT4RANGE value, which a WHERE clause cannot compare
+/// yet"). A range column on the left of a literal stays the scan's own,
+/// sargable comparison (`pg_ops`).
+fn compares_a_computed_range(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::expr::{parse, static_type, Expr};
+    if !mentions_range(body) {
+        return false;
+    }
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    let (left, right) = (body[..at].trim(), body[end..].trim());
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let (Ok(l), Ok(r)) = (parse(left, schema), parse(right, schema)) else {
+        return false;
+    };
+    let is_range = |e: &Expr| crate::core::rql::pg_functions::is_range(&static_type(e));
+    let literal = |e: &Expr| match e {
+        Expr::Literal { .. } | Expr::Null => true,
+        Expr::Cast(inner, _) => matches!(**inner, Expr::Literal { .. } | Expr::Null),
+        _ => false,
+    };
+    (is_range(&l) || is_range(&r)) && !(matches!(l, Expr::Column(_)) && literal(&r))
 }
 
 /// Whether `body` is a symbol comparison with a side the evaluator types

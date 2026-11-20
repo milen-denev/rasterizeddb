@@ -385,7 +385,9 @@ Rewritten to the statements they stand for before anything else reads them:
 logged, which an unlogged one is allowed to be); `ROW(a, b)`;
 `a [NOT] SIMILAR TO p`; `UPDATE … SET (a, b) = (x, y)` and `= (SELECT p, q
 …)` (one scalar subquery per column, so a volatile function in it runs once
-per column); `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
+per column; a list mixing an aggregate with a plain value, `(SELECT
+max(n), 'z' FROM t)`, is read through a derived table so it stays one
+row), in `ON CONFLICT … DO UPDATE` too; `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
 read as the left side's type either way); a derived table's column list,
 `FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
 
@@ -434,13 +436,26 @@ checked against the domain's constraints, as PostgreSQL's: 23514 for a
 check, 23502 `domain d does not allow null values` for a NULL cast to a
 `NOT NULL` domain.
 
+`ALTER DOMAIN name` changes the domain and every column of it, in one
+statement that a failure (or a block's `ROLLBACK`) takes back whole: `ADD
+[CONSTRAINT n] CHECK (…)` and `SET NOT NULL` test every column's rows first
+(23514 `column "c" of table "t" contains values that violate the new
+constraint`, 23502 `… contains null values`); `DROP CONSTRAINT [IF EXISTS]`,
+`RENAME CONSTRAINT a TO b`, `VALIDATE CONSTRAINT`, `DROP NOT NULL` (a
+column's own `NOT NULL`, and a primary key's, stay), `SET DEFAULT` / `DROP
+DEFAULT` (a column's own default stays), `RENAME TO`; `OWNER TO` and `SET
+SCHEMA public`, which `pg_dump` writes, change nothing.
+
 Where it differs from PostgreSQL:
 
 - A cast to a domain is typed as its base (`pg_typeof(5::posint)` is
   `integer`), and one of an expression calling a volatile function
   (`random()::posint`) is refused (0A000).
-- `ALTER DOMAIN` is refused (0A000); `DROP DOMAIN … CASCADE` with columns of
-  the domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`.
+- `ALTER DOMAIN … ADD CONSTRAINT … NOT VALID` and `SET SCHEMA` another
+  schema are refused (0A000); `DROP DOMAIN … CASCADE` with columns of the
+  domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`. A column
+  whose own default is written the same as the domain's follows `SET
+  DEFAULT` as if it had none.
 - A domain's `NOT NULL` reports the column's 23502 message, not `domain d
   does not allow null values`.
 - `pg_type` lists no domain, so `psql`'s `\dD` shows none; domain statements
@@ -1468,22 +1483,28 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   `upper_inc`, `lower_inf`, `upper_inf`, `range_merge`, the set operators
   `*`, `+`, `-` (a union or difference that is not one range is 22000), and
   `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`. A lower bound above the
-  upper (`'[5,1)'`) is 22000, not `empty`. In a `WHERE`, a range operator
-  takes a column and a literal; one whose operand is computed
-  (`r && int4range(5, 25)`) is refused.
+  upper (`'[5,1)'`) is 22000, not `empty`. In a `WHERE`, a range column
+  against a literal is the scan's own comparison; any other range operand
+  (`int4range(lo, hi) @> 5`, `r * '[5,25)' = …`, `'[0,9)'::int4range @> r`)
+  is read by the select list's evaluator, NULLs unknown under `NOT`. An
+  untyped literal beside a range is that range type (`r * '[5,25)'`,
+  `range_merge(r, '[4,5)')`).
 - **Undefined names** are PostgreSQL's errors: a name that is no column is
   42703 `column "x" does not exist` (or `column t.x …`) wherever it is
   written — inside an expression, a `CASE`, `HAVING`, `ON`, a subquery — and
   a function PostgreSQL has no such name for, or none taking those
-  arguments, is 42883 `function f(integer, unknown) does not exist`. The
+  arguments, is 42883 `function f(integer, unknown) does not exist` —
+  `lower(1)` and `upper(now())` among them, since only text has a case. The
   first one in PostgreSQL's reading order is reported (`FROM` and `ON`, the
   select list, `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY`); text its parser
   would refuse first stays a syntax error. A function PostgreSQL has that
   the engine does not is 0A000. Behind a CTE, a derived table, a view or a
   function in `FROM` the engine's own message is kept. A bare name where a
   value belongs — `SET s = nosuch`, `VALUES (…, nosuch)` — is 42703 too; it
-  used to be stored as its own text. An `ON CONFLICT … DO UPDATE SET`
-  naming nothing is refused only when a row conflicts.
+  used to be stored as its own text. An `ON CONFLICT … DO UPDATE` is read
+  with the statement, conflict or not: a name in its `SET` or `WHERE` that
+  names nothing (a column, `excluded.x`, a qualifier) is refused before any
+  row is written, where the first run used to insert and succeed.
 
 ## Statements over the native protocol
 

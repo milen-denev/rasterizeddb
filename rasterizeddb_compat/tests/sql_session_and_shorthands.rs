@@ -157,6 +157,16 @@ async fn shorthands_are_what_they_stand_for() {
     c.batch_execute("UPDATE sh SET (g, v) = (g + 10, upper(v)) WHERE id = 1").await.expect("row assign");
     c.batch_execute("UPDATE sh SET (g, v) = (SELECT 99, 'q') WHERE id = 2").await.expect("row subquery");
     assert_eq!(rows(&c, "SELECT g, v FROM sh WHERE id < 3 ORDER BY id").await, ["11|A", "99|q"]);
+    // An aggregate beside a plain value is one row, even over no rows: split
+    // per column, the plain one was read per row ("returned 2 rows").
+    c.batch_execute(
+        "CREATE TABLE sha (id INT PRIMARY KEY, g INT, v TEXT); INSERT INTO sha VALUES (1, 11, 'A'), (2, 99, 'q'), (3, 2, 'c'); \
+         UPDATE sha SET (g, v) = (SELECT max(g), 'm' || count(*) FROM sha WHERE id > 100) WHERE id = 2; \
+         UPDATE sha SET (g, v) = (SELECT max(g) AS top, 'top' FROM sha) WHERE id = 3",
+    )
+    .await
+    .expect("aggregate row");
+    assert_eq!(rows(&c, "SELECT g, v FROM sha WHERE id > 1 ORDER BY id").await, ["NULL|m0", "11|top"]);
     let e = c.simple_query("UPDATE sh SET (g, v) = (1)").await.expect_err("count");
     assert_eq!(e.code().map(|s| s.code()), Some("42601"));
     c.batch_execute("CREATE TABLE shd (id SERIAL, v TEXT DEFAULT 'z'); INSERT INTO shd DEFAULT VALUES").await.expect("default values");

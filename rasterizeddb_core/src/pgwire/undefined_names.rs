@@ -298,10 +298,11 @@ pub(super) fn subject(message: &str) -> Option<Option<NamedFunction>> {
     if COLUMN_WORDINGS.iter().any(|w| message.contains(w)) {
         return Some(None);
     }
-    // A qualified name quoted whole: `column "f.nosuch" does not exist`.
-    if let Some(name) = message.strip_prefix("column \"").and_then(|r| r.strip_suffix("\" does not exist"))
-        && name.contains('.')
-    {
+    // A name quoted whole: `column "f.nosuch" does not exist`, or a bare
+    // one whose qualifier a rewrite took off (`ON CONFLICT … WHERE
+    // t.nosuch`, read as `nosuch`): read again, the name PostgreSQL reports
+    // first, as it spells it.
+    if message.strip_prefix("column \"").and_then(|r| r.strip_suffix("\" does not exist")).is_some() {
         return Some(None);
     }
     None
@@ -690,12 +691,60 @@ impl Reader<'_> {
             .copied()
             .unwrap_or(toks.len());
         if let Some(&at) = self.top_level(0, end, |_, t| t.is_word("values")).first() {
-            return self.expression(at + 1, end, &[], false);
+            self.expression(at + 1, end, &[], false)?;
+        } else if let Some(&at) = self.top_level(0, end, |_, t| t.is_word("select")).first() {
+            self.select(at, end, &[])?;
+        } else {
+            return Err(Stop::Unsure);
         }
-        if let Some(&at) = self.top_level(0, end, |_, t| t.is_word("select")).first() {
-            return self.select(at, end, &[]);
+        self.conflict_update(end)
+    }
+
+    /// The `ON CONFLICT … DO UPDATE SET … [WHERE …]` of an `INSERT` whose
+    /// rows were read: its names are the target's (by its alias when it has
+    /// one) and `excluded`'s, the same columns.
+    fn conflict_update(&self, from: usize) -> Result<(), Stop> {
+        let toks = self.toks;
+        let end = toks.len();
+        let Some(&update) = self
+            .top_level(from, end, |i, t| t.is_word("update") && i > 0 && toks[i - 1].is_word("do"))
+            .first()
+        else {
+            return Ok(());
+        };
+        if !toks.get(update + 1).is_some_and(|t| t.is_word("set")) {
+            return Err(Stop::Unsure);
         }
-        Err(Stop::Unsure)
+        // `INSERT INTO [public.]t [AS a]`.
+        let mut i = 2;
+        let mut table = toks.get(i).filter(|t| t.is_name()).ok_or(Stop::Unsure)?.text.clone();
+        i += 1;
+        if toks.get(i).is_some_and(|t| t.kind == Kind::Dot) {
+            if table != "public" {
+                return Err(Stop::Unsure);
+            }
+            table = toks.get(i + 1).filter(|t| t.is_name()).ok_or(Stop::Unsure)?.text.clone();
+            i += 2;
+        }
+        let qualifier = if toks.get(i).is_some_and(|t| t.is_word("as")) {
+            toks.get(i + 1).filter(|t| t.is_name()).ok_or(Stop::Unsure)?.text.clone()
+        } else {
+            table.clone()
+        };
+        let mut scope = vec![self.relation(&table, qualifier)?];
+        scope.push(self.relation(&table, "excluded".to_string())?);
+        let scopes: Vec<&Scope> = vec![&scope];
+        let marks = self.top_level(update + 2, end, |_, t| t.is_word("where") || t.is_word("returning"));
+        let set_end = marks.first().copied().unwrap_or(end);
+        for (a, b) in self.items(update + 2, set_end) {
+            let eq = (a..b).find(|&k| toks[k].kind == Kind::Op && toks[k].text == "=").ok_or(Stop::Unsure)?;
+            self.expression(eq + 1, b, &scopes, false)?;
+        }
+        if let Some(&at) = marks.first().filter(|&&m| toks[m].is_word("where")) {
+            let stop = marks.get(1).copied().unwrap_or(end);
+            self.expression(at + 1, stop, &scopes, false)?;
+        }
+        Ok(())
     }
 
     /// The type PostgreSQL gives an argument, `None` when this cannot say.
@@ -731,6 +780,22 @@ impl Reader<'_> {
             [t] if t.kind == Kind::Str => Some("unknown".to_string()),
             [t] if t.is_word("true") || t.is_word("false") => Some("boolean".to_string()),
             [t] if t.is_word("null") => Some("unknown".to_string()),
+            [t] if t.is_word("current_timestamp") => Some("timestamp with time zone".to_string()),
+            [t] if t.is_word("current_date") => Some("date".to_string()),
+            [f, o, c] if f.is_word("now") && o.kind == Kind::Open && c.kind == Kind::Close => {
+                Some("timestamp with time zone".to_string())
+            }
+            // A typed literal: `interval '1 day'`, `date '2024-01-01'`.
+            [words @ .., s] if s.kind == Kind::Str && !words.is_empty() && words.iter().all(|w| w.kind == Kind::Word) => {
+                let written = words.iter().map(|w| w.text.to_ascii_lowercase()).collect::<Vec<_>>().join(" ");
+                matches!(
+                    written.as_str(),
+                    "interval" | "date" | "time" | "timestamp" | "timestamptz" | "timestamp with time zone"
+                        | "timestamp without time zone" | "time with time zone" | "time without time zone" | "uuid"
+                        | "numeric" | "boolean" | "bool" | "integer" | "int" | "bigint" | "text"
+                )
+                .then(|| canonical_type(&written))
+            }
             [t] if t.is_name() => lookup(scopes, None, &t.text).map(str::to_string),
             [q, d, c] if q.is_name() && d.kind == Kind::Dot && c.is_name() => {
                 lookup(scopes, Some(&q.text), &c.text).map(str::to_string)
@@ -1041,6 +1106,17 @@ mod tests {
             f("SELECT length(1,2)", "length takes exactly one argument").as_deref(),
             Some("42883 function length(integer, integer) does not exist")
         );
+        for (sql, want) in [
+            ("SELECT lower(interval '1 day')", "42883 function lower(interval) does not exist"),
+            ("SELECT lower(timestamp with time zone '2024-01-01')", "42883 function lower(timestamp with time zone) does not exist"),
+            ("SELECT lower(now())", "42883 function lower(timestamp with time zone) does not exist"),
+            ("SELECT lower(current_date)", "42883 function lower(date) does not exist"),
+        ] {
+            assert_eq!(f(sql, "lower is not defined for DATETIME").as_deref(), Some(want), "{sql}");
+        }
+        // A word before a string that names no type is not this reader's
+        // (PostgreSQL's 42704): the engine's own error stands.
+        assert_eq!(f("SELECT lower(nosuchtype 'x')", "lower is not defined for DATETIME"), None);
         assert_eq!(
             f("SELECT abs('x'::text) FROM fx", "abs is not defined for STRING").as_deref(),
             Some("42883 function abs(text) does not exist")

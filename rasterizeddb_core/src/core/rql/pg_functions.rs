@@ -941,8 +941,21 @@ fn range_call(func: PgFunc, args: &[Value]) -> Option<Result<Value, String>> {
                 data(vec![u8::from(answer)], DbType::BOOL)
             }
             RangeMerge => {
-                let (t, a) = range_of(&args[0])?;
-                let (u, b) = range_of(&args[1])?;
+                // An untyped literal beside a range is that range type
+                // (`range_merge(r, '[40,50)')`).
+                let typed = |v: &Value, other: &Value| -> Result<(DbType, Vec<u8>), String> {
+                    match (v, other) {
+                        (Value::Data { bytes, db_type: DbType::STRING }, Value::Data { db_type: range, .. }) if is_range(range) => {
+                            let text = String::from_utf8_lossy(bytes);
+                            crate::core::pg_types::parse_range(range, &text)
+                                .map(|b| (range.clone(), b))
+                                .ok_or_else(|| format!("malformed range literal: \"{text}\""))
+                        }
+                        _ => range_of(v),
+                    }
+                };
+                let (t, a) = typed(&args[0], &args[1])?;
+                let (u, b) = typed(&args[1], &args[0])?;
                 if t != u {
                     return Err(format!(
                         "function range_merge({}, {}) does not exist",
