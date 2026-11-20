@@ -1006,6 +1006,47 @@ async fn a_native_connection_counts_among_its_database_s_sessions() {
     assert_eq!(sessions(), 0);
 }
 
+/// A row of a native answer comes out the same whichever rows come before
+/// it. A first row holding NULL in a NUMERIC, `jsonb`, `bytea` or
+/// `timestamp` column made the retag read the answer as needing nothing, so
+/// the rows after it went out under their storage types (the document as
+/// engine bytes, the NUMERIC without its scale), while `ORDER BY … DESC`,
+/// putting the value first, answered right. On the plain path and on a
+/// learned parse, which decide that separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_null_first_row_does_not_leave_later_rows_untyped_over_native() {
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    ok(&context, "CREATE TABLE rt_null (id BIGINT PRIMARY KEY, n NUMERIC(10, 2), j JSONB, b BYTEA, ts TIMESTAMP)").await;
+    ok(&context, "INSERT INTO rt_null (id, n, j, b, ts) VALUES (1, NULL, NULL, NULL, NULL)").await;
+    ok(&context, "INSERT INTO rt_null (id, n, j, b, ts) VALUES (2, 1.5, '{\"a\": 1}', '\\x0102', '2026-01-02 03:04:05')").await;
+    let rows = |answer: &[u8]| -> Vec<Vec<u8>> {
+        assert_eq!(answer.first(), Some(&2), "{}", text(answer));
+        crate::core::row::row::serialized_rows(&answer[1..]).map(|r| r.expect("a row").to_vec()).collect()
+    };
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    for columns in ["n, j, b, ts", "id, n", "id, j", "id, b", "id, ts"] {
+        for learned in [false, true] {
+            let send = |sql: String| {
+                let session = learned.then_some(&session);
+                process_native_request(context.clone(), principal.clone(), session, sql.into_bytes())
+            };
+            // Twice each, so a learned parse has run by the last of them.
+            let mut asc = Vec::new();
+            let mut desc = Vec::new();
+            for _ in 0..3 {
+                asc = send(format!("SELECT {columns} FROM rt_null WHERE id >= 1 ORDER BY id")).await;
+                desc = send(format!("SELECT {columns} FROM rt_null WHERE id >= 1 ORDER BY id DESC")).await;
+            }
+            let (asc, desc) = (rows(&asc), rows(&desc));
+            assert_eq!(asc.len(), 2);
+            assert_eq!(asc[1], desc[0], "{columns} (learned {learned}): the value row differs behind the NULL row");
+            assert_eq!(asc[0], desc[1], "{columns} (learned {learned}): the NULL row");
+        }
+    }
+}
+
 /// One request with the connection's session, which learns a parse for an
 /// autocommit SELECT's template (`NativeSession::text_step`), and without
 /// one, which learns nothing: the two answers, byte for byte.
