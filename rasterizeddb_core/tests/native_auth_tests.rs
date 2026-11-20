@@ -638,7 +638,6 @@ mod unix_socket {
             // server bound TCP anyway it would fail to start on it, and if it
             // did not, the port is still ours afterwards.
             let (held, port) = loopback();
-            drop(held);
 
             let path = socket_path("notcp");
             let mut socket = NativeSocket::new(&path);
@@ -669,7 +668,13 @@ mod unix_socket {
             }
             assert!(!server.is_finished(), "a socket-only listener did not start");
             tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!server.is_finished(), "a socket-only listener stopped, as one that tried the held port would");
 
+            // Let go of the port only now, and ask at once. Released before
+            // the server started, as it used to be, it was any process's to
+            // take for the quarter of a second and more until this line, and
+            // on a box running other suites one did: "something answers".
+            drop(held);
             assert!(
                 std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
                 "something answers on the TCP port with --rdb-tcp off"
