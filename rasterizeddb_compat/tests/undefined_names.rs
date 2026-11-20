@@ -96,6 +96,14 @@ async fn unknown_functions_and_columns_in_expressions_have_postgresql_codes() {
         ("SELECT public.nosuchfn(1)", "42883", "function public.nosuchfn(integer) does not exist", 8),
         ("SELECT abs('x'::text) FROM fx", "42883", "function abs(text) does not exist", 8),
         ("SELECT length(1, 2)", "42883", "function length(integer, integer) does not exist", 8),
+        // A value that does not cast to text implicitly has no lower/upper.
+        ("SELECT lower(a) FROM fx", "42883", "function lower(integer) does not exist", 8),
+        ("SELECT id FROM fx WHERE upper(a) = '2'", "42883", "function upper(integer) does not exist", 25),
+        ("SELECT lower(1.5)", "42883", "function lower(numeric) does not exist", 8),
+        ("SELECT upper(true)", "42883", "function upper(boolean) does not exist", 8),
+        ("SELECT lower(now())", "42883", "function lower(timestamp with time zone) does not exist", 8),
+        ("SELECT lower(interval '1 day')", "42883", "function lower(interval) does not exist", 8),
+        ("SELECT upper(date '2024-01-01')", "42883", "function upper(date) does not exist", 8),
         // An argument's unknown column is found before its function.
         ("SELECT nosuchfn(nosuch) FROM fx", "42703", "column \"nosuch\" does not exist", 17),
         ("SELECT nosuch + 1 FROM fx", "42703", "column \"nosuch\" does not exist", 8),
@@ -128,4 +136,10 @@ async fn unknown_functions_and_columns_in_expressions_have_postgresql_codes() {
         let (got, message, _) = error(&c, sql).await;
         assert_eq!(got, code, "{sql}: {message}");
     }
+    let row = c
+        .query_one("SELECT lower(s), upper(a::text), lower('AB'), upper(NULL::text) FROM fx", &[])
+        .await
+        .expect("text lowercases");
+    let got: (String, String, String, Option<String>) = (row.get(0), row.get(1), row.get(2), row.get(3));
+    assert_eq!(got, ("x".to_string(), "2".to_string(), "ab".to_string(), None));
 }

@@ -731,6 +731,22 @@ impl Reader<'_> {
             [t] if t.kind == Kind::Str => Some("unknown".to_string()),
             [t] if t.is_word("true") || t.is_word("false") => Some("boolean".to_string()),
             [t] if t.is_word("null") => Some("unknown".to_string()),
+            [t] if t.is_word("current_timestamp") => Some("timestamp with time zone".to_string()),
+            [t] if t.is_word("current_date") => Some("date".to_string()),
+            [f, o, c] if f.is_word("now") && o.kind == Kind::Open && c.kind == Kind::Close => {
+                Some("timestamp with time zone".to_string())
+            }
+            // A typed literal: `interval '1 day'`, `date '2024-01-01'`.
+            [words @ .., s] if s.kind == Kind::Str && !words.is_empty() && words.iter().all(|w| w.kind == Kind::Word) => {
+                let written = words.iter().map(|w| w.text.to_ascii_lowercase()).collect::<Vec<_>>().join(" ");
+                matches!(
+                    written.as_str(),
+                    "interval" | "date" | "time" | "timestamp" | "timestamptz" | "timestamp with time zone"
+                        | "timestamp without time zone" | "time with time zone" | "time without time zone" | "uuid"
+                        | "numeric" | "boolean" | "bool" | "integer" | "int" | "bigint" | "text"
+                )
+                .then(|| canonical_type(&written))
+            }
             [t] if t.is_name() => lookup(scopes, None, &t.text).map(str::to_string),
             [q, d, c] if q.is_name() && d.kind == Kind::Dot && c.is_name() => {
                 lookup(scopes, Some(&q.text), &c.text).map(str::to_string)
@@ -1041,6 +1057,17 @@ mod tests {
             f("SELECT length(1,2)", "length takes exactly one argument").as_deref(),
             Some("42883 function length(integer, integer) does not exist")
         );
+        for (sql, want) in [
+            ("SELECT lower(interval '1 day')", "42883 function lower(interval) does not exist"),
+            ("SELECT lower(timestamp with time zone '2024-01-01')", "42883 function lower(timestamp with time zone) does not exist"),
+            ("SELECT lower(now())", "42883 function lower(timestamp with time zone) does not exist"),
+            ("SELECT lower(current_date)", "42883 function lower(date) does not exist"),
+        ] {
+            assert_eq!(f(sql, "lower is not defined for DATETIME").as_deref(), Some(want), "{sql}");
+        }
+        // A word before a string that names no type is not this reader's
+        // (PostgreSQL's 42704): the engine's own error stands.
+        assert_eq!(f("SELECT lower(nosuchtype 'x')", "lower is not defined for DATETIME"), None);
         assert_eq!(
             f("SELECT abs('x'::text) FROM fx", "abs is not defined for STRING").as_deref(),
             Some("42883 function abs(text) does not exist")

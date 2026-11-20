@@ -1475,7 +1475,8 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   42703 `column "x" does not exist` (or `column t.x …`) wherever it is
   written — inside an expression, a `CASE`, `HAVING`, `ON`, a subquery — and
   a function PostgreSQL has no such name for, or none taking those
-  arguments, is 42883 `function f(integer, unknown) does not exist`. The
+  arguments, is 42883 `function f(integer, unknown) does not exist` —
+  `lower(1)` and `upper(now())` among them, since only text has a case. The
   first one in PostgreSQL's reading order is reported (`FROM` and `ON`, the
   select list, `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY`); text its parser
   would refuse first stays a syntax error. A function PostgreSQL has that

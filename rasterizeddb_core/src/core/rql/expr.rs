@@ -1932,6 +1932,39 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
                         let func = if upper_name == "LOWER" { PgFunc::RangeLower } else { PgFunc::RangeUpper };
                         return Ok(Expr::Call(TextFunc::Pg(func), args));
                     }
+                    // PostgreSQL has no `lower(integer)`: a value of a type
+                    // that does not cast to text implicitly is 42883 there,
+                    // where the engine lowercased its text. Only a value whose
+                    // type is certain (a literal, a column, a cast).
+                    if matches!(upper_name.as_str(), "LOWER" | "UPPER")
+                        && matches!(args[0], Expr::Literal { .. } | Expr::Column(_) | Expr::Cast(..) | Expr::NumericCast { .. } | Expr::Scalar(_))
+                        && matches!(
+                            static_type(&args[0]),
+                            DbType::I8
+                                | DbType::I16
+                                | DbType::I32
+                                | DbType::I64
+                                | DbType::I128
+                                | DbType::U8
+                                | DbType::U16
+                                | DbType::U32
+                                | DbType::U64
+                                | DbType::U128
+                                | DbType::F32
+                                | DbType::F64
+                                | DbType::DECIMAL
+                                | DbType::BOOL
+                                | DbType::DATETIME
+                                | DbType::TIMESTAMP
+                                | DbType::DATE
+                                | DbType::TIME
+                                | DbType::TIMETZ
+                                | DbType::INTERVAL
+                                | DbType::UUID
+                        )
+                    {
+                        return Err(format!("{} is not defined for {}", upper_name.to_lowercase(), static_type(&args[0])));
+                    }
                     let func = match upper_name.as_str() {
                         "QUOTE_IDENT" => TextFunc::QuoteIdent,
                         "LOWER" => TextFunc::Lower,
