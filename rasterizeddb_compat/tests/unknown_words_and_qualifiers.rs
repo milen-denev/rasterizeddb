@@ -154,8 +154,8 @@ async fn every_qualifier_postgres_accepts_is_accepted() {
         ("SELECT id FROM t WHERE x = 0 GROUP BY id HAVNG id > 1", "42601"),
         ("SELECT id FROM t WHERE x = 1 0x10", "42601"),
         ("SELECT id FROM t WHERE t.nosuch = 1", "42703"),
-        // INTERSECT and EXCEPT are answered now (`set_ops::Combined::push_set_ops`).
-        ("SELECT id FROM t TABLESAMPLE SYSTEM (10)", "0A000"),
+        // INTERSECT and EXCEPT are answered now (`set_ops::Combined::push_set_ops`),
+        // and TABLESAMPLE too (`sql_scan::tablesample`).
         ("SELECT id FROM t WINDOW w AS (ORDER BY id)", "0A000"),
     ] {
         let simple = pool.fetch_all(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await;
