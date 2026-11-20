@@ -4,6 +4,9 @@
 //!
 //! Needs `RDB_SERVER_BIN`, as `live.rs` does; without it each test says so and
 //! passes.
+// The server it starts is unix-only, and it waits on the server's unix
+// socket, so on other platforms there is nothing to run against.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Stdio;

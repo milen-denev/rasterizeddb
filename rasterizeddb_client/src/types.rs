@@ -177,21 +177,7 @@ fn fill_random(out: &mut [u8]) -> Result<()> {
 
 /// Fills `out` from the operating system's generator.
 pub(crate) fn random_bytes(out: &mut [u8]) -> std::io::Result<()> {
-    let mut filled = 0;
-    while filled < out.len() {
-        // SAFETY: the pointer and length describe the unfilled tail of `out`.
-        let n =
-            unsafe { libc::getrandom(out[filled..].as_mut_ptr().cast(), out.len() - filled, 0) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(e);
-        }
-        filled += n as usize;
-    }
-    Ok(())
+    getrandom::fill(out).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 impl FromStr for Uuid {

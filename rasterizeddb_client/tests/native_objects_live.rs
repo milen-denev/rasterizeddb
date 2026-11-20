@@ -6,6 +6,9 @@
 //! connection's sequence values and temporary tables carried across.
 //!
 //! Needs `RDB_SERVER_BIN` (a server binary); skipped without it.
+// The server it starts is unix-only, and it waits on the server's unix
+// socket, so on other platforms there is nothing to run against.
+#![cfg(unix)]
 
 use std::process::Stdio;
 use std::time::Duration;
