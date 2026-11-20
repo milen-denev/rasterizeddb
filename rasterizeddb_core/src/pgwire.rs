@@ -86,7 +86,7 @@ mod branch_tests;
 pub(crate) mod proxied;
 mod wire_out;
 
-pub(crate) use native_session::NativeSession;
+pub(crate) use native_session::{NativeSession, NativeTextStep};
 pub(crate) use native_session::is_transaction_control as native_session_is_transaction_control;
 #[cfg(test)]
 pub(crate) use native_session::{
@@ -2791,6 +2791,10 @@ struct SessionState {
     principal: Principal,
     // statement name -> info
     statements: HashMap<String, StatementInfo>,
+    /// Learned parses of simple-query `SELECT`s, by their text with the
+    /// compared values taken out ([`text_template`]): what a prepared
+    /// statement learns, for a client that sends text.
+    text_shapes: HashMap<StdArc<str>, TextShape>,
     // portal name -> info
     portals: HashMap<String, PortalInfo>,
     /// The explicit transaction this session is inside, if any.
@@ -3291,6 +3295,7 @@ impl SessionState {
             auth,
             principal,
             statements: HashMap::new(),
+            text_shapes: HashMap::new(),
             portals: HashMap::new(),
             transaction: None,
             default_isolation: IsolationLevel::default(),
@@ -4396,7 +4401,9 @@ where
         let untyped = crate::pg_params::untyped_number_texts(&params);
         let run = crate::core::value_codec::with_untyped_params(untyped, async {
             if !is_copy {
-                execute_watched(database, state, stream, &stmt_name, &query, &params, &result_formats, true).await
+                // Each value as `inline_params` wrote it into `query`.
+                let literals = params.iter().map(|p| crate::pg_params::param_literal(p).ok()).collect();
+                execute_watched(database, state, stream, Watched::Named(&stmt_name), &query, literals, &result_formats, true).await
             } else {
                 execute_recorded(database, state, stream, &query, &result_formats, true, None).await
             }
@@ -6891,13 +6898,310 @@ where
 /// Runs a prepared statement's execution from its cached parse when it has
 /// one, and otherwise by its text, watching the text path while it learns
 /// whether it can have one. See [`PreparedSelect`].
+/// Whose learned parse a watched execution reads and teaches.
+enum Watched<'k> {
+    /// A prepared statement, by name; its text has `$n` placeholders.
+    Named(&'k str),
+    /// A simple-query statement, by its template ([`text_template`]).
+    Text(StdArc<str>),
+}
+
+/// A simple-query statement's learned parse, and the schema-generation
+/// counter of the database it was learned in: a session can change database
+/// (MySQL's `USE`, SQL Server's `USE`), and two databases' generations are
+/// counters that can coincide. Held weakly, so the counter's allocation
+/// outlives a dropped database while this names it, and no later database's
+/// counter can take its address.
+struct TextShape {
+    generations: std::sync::Weak<cacheguard::CacheGuard<std::sync::atomic::AtomicU64>>,
+    prepared: PreparedSelect,
+}
+
+/// Most simple-query templates a session keeps learned parses for; past it
+/// they are forgotten together, and learned again as they recur.
+const TEXT_SHAPES: usize = 128;
+
+/// The learned-parse state `key` names, and the text its rules read (the
+/// statement with its values as `$n`). `create` makes a text entry that
+/// does not exist yet.
+fn watched_slot<'s>(
+    state: &'s mut SessionState,
+    database: &Arc<Database>,
+    key: &Watched<'_>,
+    create: bool,
+) -> Option<(&'s mut PreparedSelect, StdArc<str>)> {
+    match key {
+        Watched::Named(name) => state.statements.get_mut(*name).map(|info| (&mut info.prepared, info.sql.clone())),
+        Watched::Text(template) if create => {
+            Some((text_shape_slot(&mut state.text_shapes, database, template), template.clone()))
+        }
+        Watched::Text(template) => {
+            let shape = state.text_shapes.get_mut(template)?;
+            if !std::ptr::eq(shape.generations.as_ptr(), StdArc::as_ptr(&database.schema_generation)) {
+                *shape = TextShape {
+                    generations: StdArc::downgrade(&database.schema_generation),
+                    prepared: PreparedSelect::Unknown,
+                };
+            }
+            Some((&mut shape.prepared, template.clone()))
+        }
+    }
+}
+
+/// `template`'s learned state in `shapes`, made if it is new, and started
+/// over if it was learned in another database. Past [`TEXT_SHAPES`]
+/// templates, every one is forgotten.
+fn text_shape_slot<'m>(
+    shapes: &'m mut HashMap<StdArc<str>, TextShape>,
+    database: &Arc<Database>,
+    template: &StdArc<str>,
+) -> &'m mut PreparedSelect {
+    if !shapes.contains_key(template) && shapes.len() >= TEXT_SHAPES {
+        shapes.clear();
+    }
+    let shape = shapes.entry(template.clone()).or_insert_with(|| TextShape {
+        generations: StdArc::downgrade(&database.schema_generation),
+        prepared: PreparedSelect::Unknown,
+    });
+    if !std::ptr::eq(shape.generations.as_ptr(), StdArc::as_ptr(&database.schema_generation)) {
+        *shape = TextShape {
+            generations: StdArc::downgrade(&database.schema_generation),
+            prepared: PreparedSelect::Unknown,
+        };
+    }
+    &mut shape.prepared
+}
+
+/// A simple-query `SELECT` as a template and its values: each number or
+/// string literal of the `WHERE` clause that a prepared statement's value
+/// could stand for (an unsigned number of digits and one point, or a
+/// single-quoted string with no quote or backslash in it,
+/// `prepared::literal_class`) becomes `$1`, `$2`, … in order, and the rest
+/// of the text is kept as written. `None` for anything else, which runs as
+/// text with nothing learned.
+///
+/// What may be learned from the template is decided as for a prepared
+/// statement, by the same rules on the same text (`compared_columns`, the
+/// two verifying executions): this only says which literals are the values.
+/// A literal outside the `WHERE` clause (a select list's, a `LIMIT`) stays
+/// in the template, so another value is another template.
+fn text_template(stmt: &str) -> Option<(String, Vec<String>)> {
+    let text = stmt.trim();
+    let first = text.split(|c: char| !c.is_ascii_alphabetic()).next()?;
+    if !first.eq_ignore_ascii_case("SELECT") || text.contains('$') {
+        return None;
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut literals = Vec::new();
+    let mut i = 0usize;
+    let mut copied = 0usize;
+    let mut depth = 0i32;
+    // Inside the top-level `WHERE` clause.
+    let mut in_where = false;
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    while i < b.len() {
+        match b[i] {
+            // Comments: an engine reading the text strips them, and a quote
+            // in one must not start a string here.
+            b'-' if b.get(i + 1) == Some(&b'-') => return None,
+            b'/' if b.get(i + 1) == Some(&b'*') => return None,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' => {
+                let start = i;
+                i += 1;
+                let mut plain = true;
+                loop {
+                    match b.get(i) {
+                        None => return None,
+                        Some(b'\'') if b.get(i + 1) == Some(&b'\'') => {
+                            plain = false;
+                            i += 2;
+                        }
+                        Some(b'\'') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(b'\\') => {
+                            plain = false;
+                            i += 1;
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                // A prefix letter (`E'…'`, `B'…'`) makes it another literal.
+                let prefixed = start > 0 && ident(b[start - 1]);
+                if in_where && depth == 0 && plain && !prefixed {
+                    out.push_str(&text[copied..start]);
+                    literals.push(text[start..i].to_string());
+                    out.push('$');
+                    out.push_str(&literals.len().to_string());
+                    copied = i;
+                }
+            }
+            c if c.is_ascii_digit() && (i == 0 || !(ident(b[i - 1]) || b[i - 1] == b'.')) => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                    i += 1;
+                }
+                // `1e5`, `2x`: not a plain number, and part of something else.
+                if i < b.len() && (ident(b[i]) || b[i] == b'.') {
+                    while i < b.len() && ident(b[i]) {
+                        i += 1;
+                    }
+                    continue;
+                }
+                let literal = &text[start..i];
+                // A signed number is rewritten by the text path (`k = -1`
+                // becomes `k = - 1`), so it is no value a template can carry.
+                let signed = text[..start].trim_end().ends_with(['-', '+']);
+                if in_where && depth == 0 && !signed && crate::core::rql::prepared::literal_class(literal) == Some(0) {
+                    out.push_str(&text[copied..start]);
+                    literals.push(literal.to_string());
+                    out.push('$');
+                    out.push_str(&literals.len().to_string());
+                    copied = i;
+                }
+            }
+            c if ident(c) => {
+                let start = i;
+                while i < b.len() && ident(b[i]) {
+                    i += 1;
+                }
+                if depth == 0 {
+                    let word = &text[start..i];
+                    if word.eq_ignore_ascii_case("WHERE") {
+                        in_where = true;
+                    } else if [
+                        "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "FETCH", "FOR", "WINDOW", "UNION", "INTERSECT",
+                        "EXCEPT", "RETURNING",
+                    ]
+                    .iter()
+                    .any(|k| word.eq_ignore_ascii_case(k))
+                    {
+                        in_where = false;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    if literals.is_empty() {
+        return None;
+    }
+    out.push_str(&text[copied..]);
+    Some((out, literals))
+}
+
+/// One simple-query statement: from a learned parse when its template has
+/// one, watched while one is being learned, as text otherwise.
+async fn execute_text_statement<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    stmt: &str,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let template = match text_shapes_on().load(std::sync::atomic::Ordering::Relaxed) {
+        true => text_template(stmt),
+        false => None,
+    };
+    match template {
+        Some((template, literals)) => {
+            Box::pin(execute_watched(database, state, stream, Watched::Text(template.into()), stmt, Some(literals), &[], false)).await
+        }
+        None => execute_recorded(database, state, stream, stmt, &[], false, None).await,
+    }
+}
+
+/// What a watched statement does this time.
+enum WatchStep {
+    /// Run from the learned parse, with this execution's values.
+    Run(PreparedRun),
+    /// Run as text, and learn from what the text path does.
+    Watch,
+    /// Run as text.
+    Text,
+}
+
+/// Decides [`WatchStep`] for a statement whose learned state is `prepared`
+/// and whose text, values as `$n`, is `sql`; `literals` are this
+/// execution's values as written and `classes` their literal classes.
+fn watch_step(
+    prepared: &mut PreparedSelect,
+    sql: &str,
+    generation: u64,
+    literals: &Option<Vec<String>>,
+    classes: &Option<Vec<u8>>,
+) -> WatchStep {
+    use crate::core::rql::prepared as pr;
+    if let PreparedSelect::Ready(l) | PreparedSelect::Candidate(l) = &*prepared {
+        if l.generation != generation {
+            *prepared = PreparedSelect::Unknown;
+        }
+    }
+    match &*prepared {
+        PreparedSelect::Ineligible => WatchStep::Text,
+        PreparedSelect::Ready(l) => match (literals, classes) {
+            (Some(lits), Some(cls)) if *cls == l.classes => {
+                let mut query_row = l.query_row.clone();
+                query_row.where_clause = l.template.render(lits);
+                WatchStep::Run(PreparedRun {
+                    rows: Box::new(pr::PreparedRows {
+                        table_name: l.table_name.clone(),
+                        query_row,
+                        // This execution's own values, through the cached
+                        // derivation (I11).
+                        key: l.route.as_ref().and_then(|plan| plan.bind(lits)),
+                        shape_epoch: l.shape_epoch,
+                    }),
+                    fields: l.fields.clone(),
+                    scales: l.scales.clone(),
+                })
+            }
+            _ => WatchStep::Text,
+        },
+        PreparedSelect::Candidate(_) => {
+            if classes.is_some() { WatchStep::Watch } else { WatchStep::Text }
+        }
+        PreparedSelect::Unknown => {
+            let shaped = value_free_shape(sql) == Some(ValueFreeShape::SameShape)
+                && pr::compared_columns(sql).is_some_and(|c| Some(c.len()) == literals.as_ref().map(Vec::len));
+            if !shaped {
+                *prepared = PreparedSelect::Ineligible;
+                WatchStep::Text
+            } else if classes.is_some() {
+                WatchStep::Watch
+            } else {
+                WatchStep::Text
+            }
+        }
+    }
+}
+
 async fn execute_watched<S>(
     database: &Arc<Database>,
     state: &mut SessionState,
     stream: &mut S,
-    stmt_name: &str,
+    key: Watched<'_>,
     query: &str,
-    params: &[BoundParam],
+    literals: Option<Vec<String>>,
     result_formats: &[i16],
     omit_description: bool,
 ) -> io::Result<()>
@@ -6906,75 +7210,36 @@ where
 {
     use crate::core::rql::prepared as pr;
 
-    enum Step {
-        Run(PreparedRun),
-        Watch,
-        Text,
-    }
-
     let generation = database
         .schema_generation
         .load(std::sync::atomic::Ordering::Acquire);
-    // Each value as `inline_params` wrote it into `query`, and its class.
-    let literals: Option<Vec<String>> = params
-        .iter()
-        .map(|p| crate::pg_params::param_literal(p).ok())
-        .collect();
+    // Each value's literal as it stands in `query`, and its class.
     let classes: Option<Vec<u8>> = literals
         .as_ref()
         .and_then(|l| l.iter().map(|x| pr::literal_class(x)).collect());
 
-    let step = match state.statements.get_mut(stmt_name) {
-        None => Step::Text,
-        Some(info) => {
-            if let PreparedSelect::Ready(l) | PreparedSelect::Candidate(l) = &info.prepared {
-                if l.generation != generation {
-                    info.prepared = PreparedSelect::Unknown;
-                }
-            }
-            match &info.prepared {
-                PreparedSelect::Ineligible => Step::Text,
-                PreparedSelect::Ready(l) => match (&literals, &classes) {
-                    (Some(lits), Some(cls)) if *cls == l.classes => {
-                        let mut query_row = l.query_row.clone();
-                        query_row.where_clause = l.template.render(lits);
-                        Step::Run(PreparedRun {
-                            rows: Box::new(pr::PreparedRows {
-                                table_name: l.table_name.clone(),
-                                query_row,
-                                // This execution's own values, through the
-                                // cached derivation (I11).
-                                key: l.route.as_ref().and_then(|plan| plan.bind(lits)),
-                                shape_epoch: l.shape_epoch,
-                            }),
-                            fields: l.fields.clone(),
-                            scales: l.scales.clone(),
-                        })
-                    }
-                    _ => Step::Text,
-                },
-                PreparedSelect::Candidate(_) => {
-                    if classes.is_some() { Step::Watch } else { Step::Text }
-                }
-                PreparedSelect::Unknown => {
-                    let sql = info.sql.clone();
-                    let shaped = value_free_shape(&sql) == Some(ValueFreeShape::SameShape)
-                        && pr::compared_columns(&sql).is_some_and(|c| c.len() == params.len());
-                    if !shaped {
-                        info.prepared = PreparedSelect::Ineligible;
-                        Step::Text
-                    } else if classes.is_some() {
-                        Step::Watch
-                    } else {
-                        Step::Text
-                    }
-                }
-            }
-        }
+    // A temporary table hides the table of its name for this session
+    // (`temp_tables`), and only the text path's rewrite knows it: a parse
+    // learned before the temporary table was made names the real one. Such a
+    // statement runs as text, and nothing is learned or forgotten for it.
+    let names_a_temporary = !state.temp_tables.is_empty() && temp_tables::rewrite(&state.temp_tables, query).is_some();
+    let step = match watched_slot(state, database, &key, true) {
+        _ if names_a_temporary => WatchStep::Text,
+        None => WatchStep::Text,
+        Some((prepared, sql)) => watch_step(prepared, &sql, generation, &literals, &classes),
+    };
+    // A non-superuser's privileges are checked on the text path
+    // (`privilege_statements::check`), which a learned parse skips, and a
+    // REVOKE changes no schema: without this a role kept reading through a
+    // parse learned before it lost the privilege. A refusal runs the text,
+    // which answers it.
+    let step = match step {
+        WatchStep::Run(_) if privilege_statements::check(database, state, query).await.is_some() => WatchStep::Text,
+        other => other,
     };
 
     match step {
-        Step::Run(run) => {
+        WatchStep::Run(run) => {
             state.stale_plan = false;
             let result =
                 execute_recorded(database, state, stream, query, result_formats, omit_description, Some(run)).await;
@@ -6982,16 +7247,19 @@ where
                 // The executor found the table reshaped after this parse was
                 // learned, once it held the lock, and the text path answered
                 // instead (§7 `shape_epoch`): the parse is learned again.
-                if let Some(info) = state.statements.get_mut(stmt_name) {
-                    info.prepared = PreparedSelect::Unknown;
+                if let Some((prepared, _)) = watched_slot(state, database, &key, false) {
+                    *prepared = PreparedSelect::Unknown;
                 }
             } else {
-                PREPARED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match key {
+                    Watched::Named(_) => PREPARED_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    Watched::Text(_) => TEXT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                };
             }
             result
         }
-        Step::Text => execute_recorded(database, state, stream, query, result_formats, omit_description, None).await,
-        Step::Watch => {
+        WatchStep::Text => execute_recorded(database, state, stream, query, result_formats, omit_description, None).await,
+        WatchStep::Watch => {
             // Boxed: a statement is watched only while its parse is learned,
             // twice, and held inline this arm tripled the future of every
             // execution, which each layer above copies whole as it moves it.
@@ -7007,7 +7275,7 @@ where
             .await;
             if result.is_ok() && !state.statement_failed {
                 if let (Some(literals), Some(classes)) = (literals, classes) {
-                    learn_prepared(database, state, stmt_name, generation, literals, classes, capture);
+                    learn_prepared(database, state, &key, generation, literals, classes, capture);
                 }
             }
             result
@@ -7019,23 +7287,57 @@ where
 /// and diagnostics: it is how a test tells the fast path ran at all.
 pub static PREPARED_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Executions of a simple-query `SELECT` that ran from a parse learned for
+/// its template ([`text_template`]). Counted apart from [`PREPARED_RUNS`], so
+/// a test of either reads only its own.
+pub static TEXT_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether simple-query `SELECT`s learn and use a parse for their template.
+/// On unless `RDB_TEXT_SHAPES=0` at start (for A/B) or a test turns it off,
+/// as the tests whose oracle is the plain text path do.
+static TEXT_SHAPES_ON: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+fn text_shapes_on() -> &'static std::sync::atomic::AtomicBool {
+    TEXT_SHAPES_ON.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(std::env::var("RDB_TEXT_SHAPES").map_or(true, |v| v != "0"))
+    })
+}
+
+/// Turns the simple-query template cache on or off for the whole process.
+pub fn set_text_shapes(on: bool) {
+    text_shapes_on().store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// What a watched execution teaches. The first yields a candidate; the next
 /// with different values either confirms it, exactly, or rules the statement
 /// out for good.
 fn learn_prepared(
     database: &Arc<Database>,
     state: &mut SessionState,
-    stmt_name: &str,
+    key: &Watched<'_>,
+    generation: u64,
+    literals: Vec<String>,
+    classes: Vec<u8>,
+    capture: crate::core::rql::prepared::Capture,
+) {
+    let Some((prepared, sql)) = watched_slot(state, database, key, false) else {
+        return;
+    };
+    learn_into(database, prepared, &sql, generation, literals, classes, capture);
+}
+
+/// [`learn_prepared`] for a statement whose learned state is `prepared` and
+/// whose text, values as `$n`, is `sql`.
+fn learn_into(
+    database: &Arc<Database>,
+    prepared: &mut PreparedSelect,
+    sql: &str,
     generation: u64,
     literals: Vec<String>,
     classes: Vec<u8>,
     capture: crate::core::rql::prepared::Capture,
 ) {
     use crate::core::rql::prepared as pr;
-
-    let Some(info) = state.statements.get_mut(stmt_name) else {
-        return;
-    };
     // A schema change while it ran: what it saw may describe neither shape.
     if database.schema_generation.load(std::sync::atomic::Ordering::Acquire) != generation {
         return;
@@ -7048,13 +7350,13 @@ fn learn_prepared(
         shape_epoch,
     }) = capture.plain_only()
     else {
-        info.prepared = PreparedSelect::Ineligible;
+        *prepared = PreparedSelect::Ineligible;
         return;
     };
     // Every value is compared with a column whose literals no rewrite
     // reinterprets, and has that column's class.
-    let Some(columns) = pr::compared_columns(&info.sql) else {
-        info.prepared = PreparedSelect::Ineligible;
+    let Some(columns) = pr::compared_columns(sql) else {
+        *prepared = PreparedSelect::Ineligible;
         return;
     };
     let Some(table) = database.schema_view(&table_name) else {
@@ -7071,7 +7373,7 @@ fn learn_prepared(
         match class {
             Some(k) => wanted.push(k),
             None => {
-                info.prepared = PreparedSelect::Ineligible;
+                *prepared = PreparedSelect::Ineligible;
                 return;
             }
         }
@@ -7082,7 +7384,7 @@ fn learn_prepared(
         return;
     }
     let shape = pr::shape_of(&query_row);
-    info.prepared = match std::mem::take(&mut info.prepared) {
+    *prepared = match std::mem::take(prepared) {
         PreparedSelect::Unknown => match pr::WhereTemplate::derive(&query_row.where_clause, &literals) {
             Some(template) => PreparedSelect::Candidate(Box::new(PreparedLearned {
                 generation,
@@ -8222,7 +8524,9 @@ where
             state.statement_tx = Some(tx);
         }
     }
-    let result = Box::pin(execute_single_statement_inner(
+    // One parse memo per statement: its describe, its scales and its run
+    // read the same SELECT (`lexer_query::parse_memo_scope`).
+    let result = Box::pin(crate::core::rql::lexer_query::parse_memo_scope(execute_single_statement_inner(
         database,
         state,
         stream,
@@ -8230,7 +8534,7 @@ where
         result_formats,
         omit_description,
         unique_index,
-    ))
+    )))
     .await;
 
     state.statement_tx = restore_tx;
@@ -10317,7 +10621,7 @@ where
             }
             _ => None,
         };
-        let ran = execute_recorded(database, state, stream, &stmt, &[], false, None).await;
+        let ran = execute_text_statement(database, state, stream, &stmt).await;
         state.error_base = Some(0);
         ran?;
         // PostgreSQL stops a multi-statement string at the first failure.
@@ -16403,5 +16707,86 @@ mod index_store_wire_tests {
         drop(probe);
         drop(db);
         crate::core::wal::remove_for(&dir.path().to_string_lossy());
+    }
+}
+
+#[cfg(test)]
+mod text_template_tests {
+    use super::text_template;
+
+    fn t(sql: &str) -> Option<(String, Vec<String>)> {
+        text_template(sql)
+    }
+
+    #[test]
+    fn the_where_clauses_plain_values_become_placeholders() {
+        assert_eq!(
+            t("SELECT id, name FROM bench WHERE id = 123"),
+            Some(("SELECT id, name FROM bench WHERE id = $1".into(), vec!["123".into()]))
+        );
+        assert_eq!(
+            t("SELECT * FROM t WHERE a >= 10 AND b < 2.5 AND s = 'x y'"),
+            Some(("SELECT * FROM t WHERE a >= $1 AND b < $2 AND s = $3".into(), vec!["10".into(), "2.5".into(), "'x y'".into()]))
+        );
+        // Kept as written outside the WHERE clause, so another value there
+        // is another template.
+        assert_eq!(
+            t("SELECT 7, 'k' FROM t WHERE a = 1 ORDER BY a LIMIT 10"),
+            Some(("SELECT 7, 'k' FROM t WHERE a = $1 ORDER BY a LIMIT 10".into(), vec!["1".into()]))
+        );
+    }
+
+    #[test]
+    fn what_a_value_could_not_be_stays_in_the_text() {
+        for (sql, template) in [
+            // Signed, exponent, prefixed, quoted inside, escaped.
+            ("SELECT * FROM t WHERE a = -5 AND b = 1", "SELECT * FROM t WHERE a = -5 AND b = $1"),
+            ("SELECT * FROM t WHERE a = 1e5 AND b = 1", "SELECT * FROM t WHERE a = 1e5 AND b = $1"),
+            ("SELECT * FROM t WHERE a = E'x' AND b = 1", "SELECT * FROM t WHERE a = E'x' AND b = $1"),
+            ("SELECT * FROM t WHERE a = 'it''s' AND b = 1", "SELECT * FROM t WHERE a = 'it''s' AND b = $1"),
+            ("SELECT * FROM t WHERE a = 'c:\\x' AND b = 1", "SELECT * FROM t WHERE a = 'c:\\x' AND b = $1"),
+            // Inside parentheses: a subquery's, a function's, an IN list's.
+            ("SELECT * FROM t WHERE a IN (1, 2) AND b = 3", "SELECT * FROM t WHERE a IN (1, 2) AND b = $1"),
+            ("SELECT * FROM t WHERE a = (SELECT 1) AND b = 3", "SELECT * FROM t WHERE a = (SELECT 1) AND b = $1"),
+            // Names holding digits, quoted names, a qualified name.
+            ("SELECT * FROM t2 WHERE \"c 1\" = 4 AND x.col9 = 5", "SELECT * FROM t2 WHERE \"c 1\" = $1 AND x.col9 = $2"),
+        ] {
+            assert_eq!(t(sql).map(|(s, _)| s).as_deref(), Some(template), "{sql}");
+        }
+    }
+
+    #[test]
+    fn statements_it_does_not_read_run_as_text() {
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT * FROM t WHERE a = b",
+            "UPDATE t SET a = 1 WHERE b = 2",
+            "INSERT INTO t VALUES (1)",
+            "WITH x AS (SELECT 1) SELECT * FROM x WHERE a = 1",
+            "SELECT * FROM t WHERE a = $1",
+            "SELECT * FROM t WHERE a = $$x$$",
+            "SELECT * FROM t WHERE a = 1 -- note",
+            "SELECT * FROM t /* c */ WHERE a = 1",
+            "SELECT * FROM t WHERE a = 'unterminated",
+        ] {
+            assert_eq!(t(sql), None, "{sql}");
+        }
+    }
+
+    /// Put back, the values make the statement that was sent.
+    #[test]
+    fn rendering_the_values_back_gives_the_statement() {
+        for sql in [
+            "SELECT id, name FROM bench WHERE id = 123",
+            "select * from t where a >= 10 and b<2.5 and s='x y' order by a limit 4",
+            "SELECT * FROM t WHERE a = -5 AND b = 1 AND c = 'q'",
+        ] {
+            let (template, values) = t(sql).unwrap();
+            let mut back = template.clone();
+            for (i, v) in values.iter().enumerate().rev() {
+                back = back.replacen(&format!("${}", i + 1), v, 1);
+            }
+            assert_eq!(back, sql.trim());
+        }
     }
 }

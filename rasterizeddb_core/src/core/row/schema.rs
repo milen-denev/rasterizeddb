@@ -89,7 +89,7 @@ pub fn mint_incarnation() -> u128 {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SchemaField {
     pub name: String,
     pub db_type: DbType,

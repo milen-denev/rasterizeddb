@@ -248,6 +248,21 @@ const FROM_CELLS: &[&str] = &[
     "SELECT s, COUNT(*) FROM t WHERE s <> 'x5' GROUP BY s HAVING MAX(s2) > 'w' ORDER BY s",
     "SELECT s2, COUNT(*), MIN(s), COUNT(DISTINCT s) FROM t GROUP BY s2 ORDER BY s2 LIMIT 30",
     "SELECT COUNT(s2), MAX(s2), MIN(s2) FROM t WHERE k > 1000",
+    // Expressions over finished aggregates: only their inputs read rows.
+    // None may overflow: the table holds each type's extremes, and an
+    // error on both sides compares equal but proves nothing.
+    // The first is what the SQL Server front end makes of every COUNT.
+    "SELECT ((count(*))::integer) AS \"n\", SUM(i32c) AS \"s\" FROM t",
+    "SELECT COUNT(*) + 1, MAX(i8c) FROM t",
+    "SELECT COUNT(*)::integer, SUM(i16c)::bigint, COUNT(u8c) * 2 FROM t WHERE i32c > 0",
+    "SELECT SUM(i64c) / (COUNT(*) + 1), COALESCE(MAX(i32c), 0) / 2, AVG(u16c) + SUM(r) FROM t",
+    "SELECT COUNT(*)::integer, SUM(i32c) + 1, MAX(n) * 2 FROM t WHERE k > 1000",
+    "SELECT COUNT(s)::integer, MAX(s) || '!', MIN(i16c) / 2 FROM t",
+    "SELECT k, COUNT(*)::integer, SUM(u8c) * 2, MAX(i32c) / 2 - MIN(i32c) / 2 FROM t GROUP BY k ORDER BY k",
+    "SELECT i8c, COUNT(i16c)::integer, SUM(f) + SUM(r) FROM t GROUP BY i8c ORDER BY i8c",
+    "SELECT u8c, COUNT(*)::integer AS c FROM t GROUP BY u8c HAVING COUNT(*) > 1 ORDER BY u8c",
+    "SELECT k, SUM(i32c) + 1 AS s FROM t GROUP BY k ORDER BY s, k LIMIT 5",
+    "SELECT s, COUNT(*)::integer, MIN(i8c) + 0, COUNT(DISTINCT i8c) FROM t GROUP BY s ORDER BY s",
 ];
 
 /// Aggregates that read more of a row than cells, and so fold from rows
@@ -257,7 +272,11 @@ const FROM_ROWS: &[&str] = &[
     "SELECT MAX(s || 'z'), MIN(i32c) FROM t",
     "SELECT COUNT(*) FILTER (WHERE i32c > 0), SUM(i8c) FROM t",
     "SELECT SUM(i8c + 1), COUNT(*) FROM t",
-    "SELECT COUNT(*) + 1, MAX(i8c) FROM t",
+    // A computed item whose input filters, computes its argument, or keeps
+    // its values in order.
+    "SELECT COUNT(*) FILTER (WHERE i32c > 0) + 1, SUM(i8c) FROM t",
+    "SELECT SUM(i8c + 1) * 2, COUNT(*) FROM t",
+    "SELECT COALESCE(string_agg(s, ',' ORDER BY id), '') FROM t WHERE id < 40",
     "SELECT k + 1 AS g, COUNT(*) FROM t GROUP BY k + 1 ORDER BY g",
     // A computed key the statement does not return, and aggregates only its
     // HAVING reads that are more than a column.
@@ -321,8 +340,9 @@ async fn differential(in_memory: bool) {
     if in_memory {
         assert_eq!(together, 0, "a database in memory copied cells from a mapping");
     } else {
-        // All but the statements whose WHERE matches nothing.
-        assert!(together >= FROM_CELLS.len() - 3, "only {together} statements read their cells in batches");
+        // All but the statements whose WHERE matches nothing (`k > 1000`).
+        let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
+        assert!(together >= FROM_CELLS.len() - empty, "only {together} statements read their cells in batches");
     }
     // And the same once the table is opened anew, as any table of an age is.
     if !in_memory {
@@ -343,8 +363,9 @@ async fn differential(in_memory: bool) {
             assert!(again == reply, "reopened, {sql}: two runs differ");
             copied += usize::from(batches > 0);
         }
-        // All but the statements whose WHERE matches nothing.
-        assert!(copied >= FROM_CELLS.len() - 3, "only {copied} statements read their cells in batches from the mapping");
+        // All but the statements whose WHERE matches nothing (`k > 1000`).
+        let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
+        assert!(copied >= FROM_CELLS.len() - empty, "only {copied} statements read their cells in batches from the mapping");
     }
     column_scan::set_enabled(true);
 }
@@ -411,6 +432,9 @@ async fn a_large_input_folds_in_parts_to_the_same_answer() {
             // More keys than are remembered, each met twice: the last of
             // them come after the memory is given up.
             "SELECT d, COUNT(*), SUM(v), MIN(id), MAX(id) FROM {t} GROUP BY d ORDER BY d LIMIT 60 OFFSET 69900",
+            // Expressions over the merged aggregates, ungrouped and grouped.
+            "SELECT COUNT(*)::integer, SUM(v) + 1, MAX(v) - MIN(v) FROM {t}",
+            "SELECT g, COUNT(*)::integer, SUM(v) * 2, COUNT(v) + COUNT(h) FROM {t} GROUP BY g ORDER BY g",
         ] {
             let sql = sql.replace("{t}", table);
             let reply = same_both_ways(&db, None, &sql, true, "").await;

@@ -94,3 +94,53 @@ async fn the_two_paths_agree() {
         }
     }
 }
+
+/// An expression over bare counts (`COUNT(*)::integer`, which the SQL Server
+/// front end makes of every `COUNT`) is answered by counting too. Each answer
+/// is checked against the number it must be, not against another path: a
+/// `FILTER` on a count inside an expression taking the counting scan would
+/// have both paths agree on the unfiltered count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expressions_over_counts_answer_the_count() {
+    let (_server, mut conn) = seeded().await;
+    let one = |sql: &'static str| sql;
+    for (sql, want) in [
+        (one("SELECT COUNT(*)::integer AS n FROM c WHERE age > 3"), 7i64),
+        (one("SELECT ((count(*))::integer) AS n FROM c"), 10),
+        (one("SELECT COUNT(*)::integer AS n FROM c WHERE age > 100"), 0),
+        (one("SELECT COUNT(*) + 1 AS n FROM c"), 11),
+        (one("SELECT COUNT(*) * 2 - COUNT(*) AS n FROM c WHERE age <= 4"), 4),
+        (one("SELECT COUNT(*) FILTER (WHERE age > 5) + 1 AS n FROM c"), 6),
+        (one("SELECT COUNT(*) FILTER (WHERE age > 5) + COUNT(*) AS n FROM c WHERE age > 2"), 13),
+        (one("SELECT COUNT(age) + 0 AS n FROM c WHERE age > 8"), 2),
+    ] {
+        let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut conn).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(rows.len(), 1, "{sql}");
+        let got = match rows[0].try_get::<i32, _>("n") {
+            Ok(v) => v as i64,
+            Err(_) => rows[0].try_get::<i64, _>("n").unwrap_or_else(|e| panic!("{sql}: {e}")),
+        };
+        assert_eq!(got, want, "{sql}");
+    }
+    // The cast is the column's type: int4, as SQL Server's COUNT is int.
+    let row = sqlx::query("SELECT COUNT(*)::integer AS n, COUNT(*) AS m FROM c").fetch_one(&mut conn).await.expect("typed");
+    assert_eq!(row.try_get::<i32, _>("n").expect("n is int4"), 10);
+    assert_eq!(row.try_get::<i64, _>("m").expect("m is int8"), 10);
+    // Paging still applies to the one counted row.
+    for (sql, want_rows) in [
+        ("SELECT COUNT(*)::integer AS n FROM c LIMIT 0", 0usize),
+        ("SELECT COUNT(*) + 1 AS n FROM c OFFSET 1", 0),
+        ("SELECT COUNT(*) + 1 AS n FROM c LIMIT 1", 1),
+    ] {
+        let rows = sqlx::query(AssertSqlSafe(sql)).fetch_all(&mut conn).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(rows.len(), want_rows, "{sql}");
+    }
+    // Beside other aggregates the cell fold answers it.
+    let row = sqlx::query("SELECT ((count(*))::integer) AS n, SUM(age) AS s, MAX(age) - MIN(age) AS r FROM c WHERE age > 2")
+        .fetch_one(&mut conn)
+        .await
+        .expect("folded");
+    assert_eq!(row.try_get::<i32, _>("n").expect("n"), 8);
+    assert_eq!(row.try_get::<i64, _>("s").expect("s"), 52);
+    assert_eq!(row.try_get::<i32, _>("r").expect("r"), 7);
+}

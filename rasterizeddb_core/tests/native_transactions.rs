@@ -1138,3 +1138,77 @@ async fn a_correlated_scalar_subquery_runs_over_native() {
     })
     .await
 }
+
+/// An autocommit `SELECT` over native learns a parse for its template, as a
+/// pgwire simple query does, and then runs from it. Its answers must be the
+/// plain path's for every value, learned with or not, and a schema change
+/// after it was learned must be seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learned_native_select_answers_as_the_plain_path() {
+    use rasterizeddb_core::pgwire::{TEXT_RUNS, set_text_shapes};
+    use std::sync::atomic::Ordering;
+    bounded(async {
+        let h = Harness::start(Duration::from_secs(30)).await;
+        table(&h, "lt", 60).await;
+        let mut c = h.conn().await;
+        ok(&mut c, "UPDATE lt SET v = id * 10").await;
+
+        let shapes: [(&str, &[&[&str]]); 4] = [
+            ("SELECT id, v FROM lt WHERE id = $1", &[&["3"], &["41"], &["60"], &["999"]]),
+            ("SELECT id FROM lt WHERE id >= $1 AND id < $2 ORDER BY id", &[&["5", "9"], &["55", "70"], &["9", "9"]]),
+            ("SELECT COUNT(*) FROM lt WHERE v > $1", &[&["100"], &["590"], &["0"]]),
+            ("SELECT id FROM lt WHERE id = $1 OR id = 2 ORDER BY id", &[&["7"], &["8"]]),
+        ];
+        let render = |shape: &str, values: &[&str]| {
+            let mut sql = shape.to_string();
+            for (i, v) in values.iter().enumerate().rev() {
+                sql = sql.replace(&format!("${}", i + 1), v);
+            }
+            sql
+        };
+        set_text_shapes(false);
+        let mut expected = Vec::new();
+        for (shape, sets) in &shapes {
+            for values in *sets {
+                expected.push(send(&mut c, &render(shape, values)).await);
+            }
+        }
+        set_text_shapes(true);
+        let before = TEXT_RUNS.load(Ordering::Relaxed);
+        for _round in 0..3 {
+            let mut want = expected.iter();
+            for (shape, sets) in &shapes {
+                for values in *sets {
+                    let sql = render(shape, values);
+                    assert_eq!(&send(&mut c, &sql).await, want.next().unwrap(), "{sql}");
+                }
+            }
+        }
+        assert!(TEXT_RUNS.load(Ordering::Relaxed) > before, "no native statement ran from a learned parse");
+
+        // A column added after the template was learned is read.
+        for id in [1, 2, 3] {
+            ok(&mut c, &format!("SELECT * FROM lt WHERE id = {id}")).await;
+        }
+        ok(&mut c, "ALTER TABLE lt ADD COLUMN w BIGINT").await;
+        ok(&mut c, "UPDATE lt SET w = id + 1000").await;
+        match ok(&mut c, "SELECT * FROM lt WHERE id = 4").await {
+            Answer::Rows(rows) => assert_eq!(rows, vec![vec![Cell::Int(4), Cell::Int(40), Cell::Int(1004)]]),
+            other => panic!("{other:?}"),
+        }
+
+        // In a block a learned template reads the block's own rows.
+        for id in [5, 6, 7] {
+            ok(&mut c, &format!("SELECT id, v FROM lt WHERE id = {id}")).await;
+        }
+        ok(&mut c, "BEGIN").await;
+        ok(&mut c, "INSERT INTO lt (id, v) VALUES (5000, 1)").await;
+        assert_eq!(int(&mut c, "SELECT v FROM lt WHERE id = 5000").await, 1);
+        ok(&mut c, "ROLLBACK").await;
+        match ok(&mut c, "SELECT id, v FROM lt WHERE id = 5000").await {
+            Answer::Rows(rows) => assert!(rows.is_empty(), "{rows:?}"),
+            other => panic!("{other:?}"),
+        }
+    })
+    .await;
+}

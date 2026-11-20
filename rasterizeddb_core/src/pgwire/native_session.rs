@@ -288,6 +288,30 @@ pub(crate) struct NativeSession {
     /// and taken back after it (`temp_tables`).
     temp_tables: std::sync::Mutex<Vec<super::temp_tables::TempTable>>,
     temp_session: u64,
+    /// Learned parses of this connection's autocommit `SELECT`s, by template
+    /// (`pgwire::text_template`), as a pgwire session keeps them for simple
+    /// queries. A lock held only to decide and to learn, never across a
+    /// statement: a multiplexed connection's requests run at once.
+    text_shapes: std::sync::Mutex<std::collections::HashMap<StdArc<str>, super::TextShape>>,
+}
+
+/// What [`NativeSession::text_step`] decided for an autocommit statement.
+pub(crate) enum NativeTextStep {
+    /// The plain native path, with nothing learned.
+    Plain,
+    /// The learned parse, with this statement's values.
+    Run { template: StdArc<str>, rows: Box<crate::core::rql::prepared::PreparedRows> },
+    /// The plain native path, watched: hand its capture to
+    /// [`NativeSession::text_learn`].
+    Watch(NativeWatch),
+}
+
+/// A watched statement's template and values, for [`NativeSession::text_learn`].
+pub(crate) struct NativeWatch {
+    template: StdArc<str>,
+    literals: Vec<String>,
+    classes: Vec<u8>,
+    generation: u64,
 }
 
 impl NativeSession {
@@ -312,6 +336,67 @@ impl NativeSession {
             sequence_values: StdArc::default(),
             temp_tables: std::sync::Mutex::new(Vec::new()),
             temp_session: fastrand::u64(..),
+            text_shapes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// How an autocommit statement on the native path runs: from a parse
+    /// learned for its template, watched while one is learned, or plainly.
+    /// The same rules as a pgwire session's simple query (`watch_step`).
+    pub(crate) fn text_step(&self, query: &str) -> NativeTextStep {
+        use crate::core::rql::prepared as pr;
+        if !super::text_shapes_on().load(Ordering::Relaxed) {
+            return NativeTextStep::Plain;
+        }
+        let Some((template, literals)) = super::text_template(query) else {
+            return NativeTextStep::Plain;
+        };
+        let template: StdArc<str> = template.into();
+        let generation = self.database.schema_generation.load(Ordering::Acquire);
+        let classes: Option<Vec<u8>> = literals.iter().map(|x| pr::literal_class(x)).collect();
+        let literals = Some(literals);
+        let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
+        let prepared = super::text_shape_slot(&mut shapes, &self.database, &template);
+        match super::watch_step(prepared, &template, generation, &literals, &classes) {
+            super::WatchStep::Text => NativeTextStep::Plain,
+            super::WatchStep::Run(run) => NativeTextStep::Run { template, rows: run.rows },
+            super::WatchStep::Watch => match (literals, classes) {
+                (Some(literals), Some(classes)) => {
+                    NativeTextStep::Watch(NativeWatch { template, literals, classes, generation })
+                }
+                _ => NativeTextStep::Plain,
+            },
+        }
+    }
+
+    /// What a watched statement's plain run teaches its template. Its rows
+    /// are typed by the native path itself, so no description is recorded.
+    pub(crate) fn text_learn(&self, watch: NativeWatch, mut capture: crate::core::rql::prepared::Capture) {
+        capture.description.get_or_insert((None, None));
+        let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(shape) = shapes.get_mut(&watch.template) else {
+            return;
+        };
+        if !std::ptr::eq(shape.generations.as_ptr(), StdArc::as_ptr(&self.database.schema_generation)) {
+            return;
+        }
+        super::learn_into(
+            &self.database,
+            &mut shape.prepared,
+            &watch.template,
+            watch.generation,
+            watch.literals,
+            watch.classes,
+            capture,
+        );
+    }
+
+    /// A learned parse met a table reshaped since (`prepared::STALE_PLAN`):
+    /// its template is learned again.
+    pub(crate) fn text_forget(&self, template: &str) {
+        let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shape) = shapes.get_mut(template) {
+            shape.prepared = super::PreparedSelect::Unknown;
         }
     }
 
@@ -340,15 +425,23 @@ impl NativeSession {
     pub(crate) async fn needs_session_path(&self, query: &str) -> bool {
         let database = &self.database;
         let stmt = query.trim();
+        // The schema-object statements below each begin with CREATE, DROP,
+        // ALTER, CALL, MERGE, GRANT or REVOKE, so a statement that begins
+        // with a reading or writing verb is none of them. Each parser
+        // tokenized or uppercased the whole text before it looked at its
+        // first word: an eighth of a native point query.
+        let schema_object = || {
+            crate::core::rql::views::parse_view_statement(stmt).is_some()
+                || crate::core::rql::sequence_catalog::parse_sequence_statement(stmt).is_some()
+                || crate::core::rql::functions::parse_routine_statement(stmt).is_some()
+                || crate::core::rql::triggers::parse_trigger_statement(stmt).is_some()
+                || crate::core::rql::merge::parse_merge(stmt).is_some()
+                || crate::core::rql::privileges::parse_privilege_statement(stmt).is_some()
+        };
         if crate::core::rql::correlated::rewrite_select(stmt).is_some()
             || crate::core::rql::cte::has_with_clause(stmt)
             || crate::core::rql::cte::next_derived_table(stmt).is_some()
-            || crate::core::rql::views::parse_view_statement(stmt).is_some()
-            || crate::core::rql::sequence_catalog::parse_sequence_statement(stmt).is_some()
-            || crate::core::rql::functions::parse_routine_statement(stmt).is_some()
-            || crate::core::rql::triggers::parse_trigger_statement(stmt).is_some()
-            || crate::core::rql::merge::parse_merge(stmt).is_some()
-            || crate::core::rql::privileges::parse_privilege_statement(stmt).is_some()
+            || (!begins_with_data_verb(stmt) && schema_object())
             // `current_database()`, `current_user`, `current_setting(…)`:
             // read from the session, which the native path has none of.
             || super::session_values::names_any(stmt)
@@ -1135,9 +1228,77 @@ fn text_rows(columns: &[i32], rows: &[Vec<Option<Vec<u8>>>]) -> Vec<u8> {
     answer
 }
 
+/// Whether `stmt`'s first word is a verb that reads or writes rows
+/// (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH`, `VALUES`, `TABLE`), which
+/// no schema-object statement begins with. Anything else, a leading comment
+/// or parenthesis included, answers false and is looked at in full.
+fn begins_with_data_verb(stmt: &str) -> bool {
+    let word = stmt
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("");
+    ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "VALUES", "TABLE"]
+        .iter()
+        .any(|verb| word.eq_ignore_ascii_case(verb))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What lets `needs_session_path` skip the schema-object parsers: none
+    /// of them recognises a statement that begins with a data verb, and
+    /// every statement one of them recognises is looked at in full.
+    #[test]
+    fn no_schema_object_statement_begins_with_a_data_verb() {
+        let recognised = |sql: &str| {
+            crate::core::rql::views::parse_view_statement(sql).is_some()
+                || crate::core::rql::sequence_catalog::parse_sequence_statement(sql).is_some()
+                || crate::core::rql::functions::parse_routine_statement(sql).is_some()
+                || crate::core::rql::triggers::parse_trigger_statement(sql).is_some()
+                || crate::core::rql::merge::parse_merge(sql).is_some()
+                || crate::core::rql::privileges::parse_privilege_statement(sql).is_some()
+        };
+        for sql in [
+            "CREATE VIEW v AS SELECT 1",
+            "create or replace view v as select a from t",
+            "DROP MATERIALIZED VIEW IF EXISTS v",
+            "CREATE SEQUENCE s START 5",
+            "ALTER SEQUENCE s RESTART",
+            "DROP SEQUENCE s",
+            "CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql",
+            "DROP PROCEDURE p",
+            "CALL p(1)",
+            "CREATE TRIGGER x BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+            "DROP TRIGGER IF EXISTS x ON t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "GRANT SELECT ON t TO r",
+            "REVOKE ALL ON t FROM r",
+            "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO r",
+        ] {
+            assert!(recognised(sql), "the list is stale: {sql} is not a schema-object statement");
+            assert!(!begins_with_data_verb(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t WHERE id = 1",
+            "select merge, grant from t",
+            "  Select(1)",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "VALUES (1), (2)",
+            "TABLE t",
+        ] {
+            assert!(begins_with_data_verb(sql), "{sql}");
+            assert!(!recognised(sql), "{sql} is a schema-object statement after all");
+        }
+        // Anything not plainly a verb is looked at in full.
+        for sql in ["/* note */ CREATE VIEW v AS SELECT 1", "(SELECT 1)", "", "SELECTED"] {
+            assert!(!begins_with_data_verb(sql), "{sql}");
+        }
+    }
 
     #[test]
     fn transaction_control_is_recognised_by_its_first_word() {

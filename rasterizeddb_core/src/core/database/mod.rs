@@ -6294,13 +6294,89 @@ async fn run_native_query_in(
 ) -> Vec<u8> {
     let response = match session {
         Some(session) => {
-            crate::core::rql::sequence::session::scoped(session.sequence_scope(), run_native_query(query, database.clone()))
-                .await
+            crate::core::rql::sequence::session::scoped(
+                session.sequence_scope(),
+                Box::pin(run_native_query_learning(query, database.clone(), session)),
+            )
+            .await
         }
         None => run_native_query(query, database.clone()).await,
     };
     crate::core::rql::sequence_catalog::flush(&database).await;
     response
+}
+
+/// An autocommit statement on a connection: from a parse learned for its
+/// template when it has one (`NativeSession::text_step`), the plain native
+/// path otherwise, watched while a parse is learned. What a learned parse
+/// skips is the statement text's rewriting and parsing; the rows, their
+/// types and the statement's transaction are the plain path's.
+async fn run_native_query_learning(
+    query: &str,
+    database: Arc<Database>,
+    session: &crate::pgwire::NativeSession,
+) -> Vec<u8> {
+    use crate::pgwire::NativeTextStep;
+    match session.text_step(query) {
+        NativeTextStep::Plain => run_native_query(query, database).await,
+        NativeTextStep::Run { template, rows } => match run_native_learned(query, rows, database.clone()).await {
+            Some(response) => {
+                crate::pgwire::TEXT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                response
+            }
+            // The table changed shape since the parse was learned: nothing
+            // was read, and the text runs instead.
+            None => {
+                session.text_forget(&template);
+                run_native_query(query, database).await
+            }
+        },
+        NativeTextStep::Watch(watch) => {
+            let (response, capture) =
+                crate::core::rql::prepared::capturing(run_native_query(query, database)).await;
+            if response.first() != Some(&3) {
+                session.text_learn(watch, capture);
+            }
+            response
+        }
+    }
+}
+
+/// A learned parse with this statement's values, run as the plain path runs
+/// its `SELECT`: in a statement clock, as a native owner, its rows retagged
+/// from the description when a cell needs it. Read under one snapshot unless
+/// it locks rows, as pgwire runs a learned parse. `None` when the table was
+/// reshaped since the parse was learned.
+async fn run_native_learned(
+    query: &str,
+    rows: Box<crate::core::rql::prepared::PreparedRows>,
+    database: Arc<Database>,
+) -> Option<Vec<u8>> {
+    let locking = rows.query_row.row_lock.is_some();
+    let purpose = crate::core::rql::lexer_s1::QueryPurpose::PreparedRows(rows);
+    // Boxed where it is made: the executor's future is tens of kilobytes,
+    // and the scopes below each move it, a copy of the whole of it per move
+    // (15% of a learned point query, unboxed).
+    let run = Box::pin(execute_as(crate::core::mvcc::owner::OwnerKind::Native, purpose, database.clone()));
+    let run = async move {
+        if locking { run.await } else { crate::core::rql::statement_snapshot::scope(run).await }
+    };
+    let response = if crate::core::statement_clock::current().is_some() {
+        run.await
+    } else {
+        let clock = crate::core::statement_clock::StatementClock::starting(None);
+        crate::core::statement_clock::scope(clock, run).await
+    };
+    if response.first() == Some(&3) && response[1..] == *crate::core::rql::prepared::STALE_PLAN.as_bytes() {
+        return None;
+    }
+    if crate::pgwire::native_answer_needs_retag(&response, &database, query)
+        && let Some(purpose) = recognize_query_purpose(query)
+    {
+        let (fields, scales) = crate::pgwire::result_description(&database, &purpose).unwrap_or((None, None));
+        return Some(crate::pgwire::native_retag(response, fields.as_deref(), scales.as_deref()));
+    }
+    Some(response)
 }
 
 async fn run_native_query(query: &str, database: Arc<Database>) -> Vec<u8> {

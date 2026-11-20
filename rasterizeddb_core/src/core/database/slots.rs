@@ -370,6 +370,21 @@ impl SchemaStats<'_> {
     }
 }
 
+/// The catalogue tables the engine makes for itself, each always under this
+/// exact name ([`Database::folded_key`] does not look for other spellings).
+const ENGINE_CATALOGUE_TABLES: &[&str] = &[
+    crate::auth::ROLE_TABLE,
+    crate::core::rql::functions::FUNCTION_TABLE,
+    crate::core::rql::domains::DOMAIN_TABLE,
+    crate::core::rql::triggers::TRIGGER_TABLE,
+    crate::core::rql::privileges::ACL_TABLE,
+    crate::core::rql::sequence_catalog::SEQUENCE_TABLE,
+    crate::core::rql::user_types::TYPE_TABLE,
+    crate::core::rql::views::VIEW_TABLE,
+    "__rdb_routines",
+    "__rdb_mysql_on_update",
+];
+
 impl Database {
     /// The one place a table name is resolved to a map key: `find` is asked
     /// with the key `name` means. Every lookup by name in this file goes
@@ -404,18 +419,32 @@ impl Database {
         if self.is_exact_key(name) {
             return None;
         }
+        // The engine's own catalogue tables are made under these names
+        // exactly, so a miss on one is an answer, not a reason to scan.
+        // Statements ask after them several times each (has a view, a
+        // routine, a sequence been made yet?), and the scan below walks every
+        // shard of both maps: 5% of a native point query.
+        if ENGINE_CATALOGUE_TABLES.contains(&name) {
+            return None;
+        }
         let mut found: Option<String> = None;
-        let keys = self
-            .table_slots
-            .iter()
-            .map(|e| e.key().clone())
-            .chain(self.partitioned_tables.iter().map(|e| e.key().clone()));
-        for key in keys {
+        let mut consider = |key: &String| -> bool {
             if key != name && key.eq_ignore_ascii_case(name) {
                 match &found {
-                    Some(other) if *other != key => return None,
-                    _ => found = Some(key),
+                    Some(other) if other != key => return false,
+                    _ => found = Some(key.clone()),
                 }
+            }
+            true
+        };
+        for entry in self.table_slots.iter() {
+            if !consider(entry.key()) {
+                return None;
+            }
+        }
+        for entry in self.partitioned_tables.iter() {
+            if !consider(entry.key()) {
+                return None;
             }
         }
         found

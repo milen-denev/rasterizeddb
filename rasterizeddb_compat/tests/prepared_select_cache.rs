@@ -105,6 +105,9 @@ async fn same(conn: &mut PgConnection, sql: &str, values: &[Value]) {
 }
 
 async fn setup() -> (TestServer, PgConnection) {
+    // The oracle here is the plain text path, so simple queries must not be
+    // answered from a parse learned for their template (`text_template`).
+    rasterizeddb_core::pgwire::set_text_shapes(false);
     let server = TestServer::start().await.expect("server should start");
     let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
     conn.execute(
@@ -342,6 +345,7 @@ async fn a_partitioned_table_learns_its_parse_and_routes_each_execution() {
     }
     let root = Root(std::env::temp_dir().join(format!("prepared_select_cache_part_{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&root.0);
+    rasterizeddb_core::pgwire::set_text_shapes(false);
     let server = TestServer::start_file_backed(&root.0.to_string_lossy()).await.expect("server should start");
     let mut conn = PgConnection::connect(&server.url()).await.expect("connect");
     let columns = "(tenant_id BIGINT NOT NULL, id BIGINT NOT NULL, s TEXT NOT NULL, n INT, PRIMARY KEY (tenant_id, id))";

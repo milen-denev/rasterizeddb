@@ -1678,10 +1678,82 @@ fn relation_alias(from_text: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The last parse made inside a [`parse_memo_scope`]: its statement, the
+/// fields it was read against, and what it answered.
+pub struct ParseMemo {
+    sql: String,
+    fields: SmallVec<[SchemaField; 20]>,
+    parsed: Result<QueryRows, String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Parses actually made on this thread, for the memo's tests.
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+tokio::task_local! {
+    /// Boxed so the scope adds a pointer, not a parse, to the future it wraps.
+    static PARSE_MEMO: std::cell::RefCell<Option<Box<ParseMemo>>>;
+}
+
+/// Runs `fut` with a memo of [`row_fetch_from_select_query`]: within it, a
+/// statement read again against the same fields is answered from the last
+/// read instead of parsed again.
+///
+/// The PostgreSQL protocol reads one SELECT three times: to describe its
+/// columns, to find their scales, and to run it. That was a third of a
+/// point query's cost over pgwire, and the reason a simple query cost twice
+/// what the native protocol's did. The parse reads nothing but its two
+/// arguments, so a read with equal arguments has the same answer; a DDL that
+/// changes the table between the describe and the run changes its fields, and
+/// the run parses afresh. One memo per statement: wrap a statement, never a
+/// session.
+///
+/// A plain function returning the scope, not an `async fn` around it, which
+/// would hold `fut` twice.
+pub fn parse_memo_scope<F: std::future::Future>(fut: F) -> tokio::task::futures::TaskLocalFuture<std::cell::RefCell<Option<Box<ParseMemo>>>, F> {
+    PARSE_MEMO.scope(std::cell::RefCell::new(None), fut)
+}
+
+/// Parses a SELECT against `schema`'s fields. See [`parse_memo_scope`].
 pub fn row_fetch_from_select_query(
     query_purpose: &QueryPurpose,
     schema: &SmallVec<[SchemaField; 20]>,
 ) -> Result<QueryRows, String> {
+    let QueryPurpose::QueryRows(qr_data) = query_purpose else {
+        return parse_select_query(query_purpose, schema);
+    };
+    let sql = qr_data.query.as_str();
+    let hit = PARSE_MEMO
+        .try_with(|memo| {
+            memo.borrow()
+                .as_ref()
+                .filter(|m| m.sql == sql && m.fields == *schema)
+                .map(|m| m.parsed.clone())
+        })
+        .ok()
+        .flatten();
+    if let Some(parsed) = hit {
+        return parsed;
+    }
+    let parsed = parse_select_query(query_purpose, schema);
+    let _ = PARSE_MEMO.try_with(|memo| {
+        *memo.borrow_mut() = Some(Box::new(ParseMemo {
+            sql: sql.to_string(),
+            fields: schema.clone(),
+            parsed: parsed.clone(),
+        }));
+    });
+    parsed
+}
+
+fn parse_select_query(
+    query_purpose: &QueryPurpose,
+    schema: &SmallVec<[SchemaField; 20]>,
+) -> Result<QueryRows, String> {
+    #[cfg(test)]
+    PARSES.with(|n| n.set(n.get() + 1));
     let sql = match query_purpose {
         QueryPurpose::QueryRows(qr_data) => qr_data.query.trim(),
         _ => return Err("Not a SELECT/QueryRows query".to_string()),
@@ -3082,6 +3154,55 @@ mod tests {
         let (expr, alias) = split_alias("'plain literal'");
         assert_eq!(expr, "'plain literal'");
         assert_eq!(alias, None);
+    }
+
+    /// Inside a memo scope a statement read again against the same fields
+    /// is not parsed again, and against other fields (a DDL between a
+    /// describe and a run) it is, and answers for those fields.
+    #[test]
+    fn a_memo_parses_a_statement_once_per_set_of_fields() {
+        let schema = make_schema();
+        let purpose = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+            table_name: "users".to_string(),
+            query: "SELECT id, name FROM users WHERE id = 1".to_string(),
+        });
+        let parses = || PARSES.with(std::cell::Cell::get);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(parse_memo_scope(async {
+            let before = parses();
+            let first = row_fetch_from_select_query(&purpose, &schema).unwrap();
+            let again = row_fetch_from_select_query(&purpose, &schema).unwrap();
+            assert_eq!(parses() - before, 1, "the second read was parsed again");
+            assert_eq!(format!("{first:?}"), format!("{again:?}"));
+
+            let mut changed = schema.clone();
+            changed[0].db_type = DbType::I32;
+            changed[0].size = 4;
+            let other = row_fetch_from_select_query(&purpose, &changed).unwrap();
+            assert_eq!(parses() - before, 2, "other fields must be parsed against");
+            assert_eq!(format!("{other:?}"), format!("{:?}", parse_select_query(&purpose, &changed).unwrap()));
+            assert_ne!(format!("{other:?}"), format!("{first:?}"), "the fields did not reach the parse");
+
+            // Another statement, then a failing one: each answered for itself.
+            let names = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: "SELECT name FROM users".to_string(),
+            });
+            let read = row_fetch_from_select_query(&names, &changed).unwrap();
+            assert_eq!(format!("{read:?}"), format!("{:?}", parse_select_query(&names, &changed).unwrap()));
+            let broken = QueryPurpose::QueryRows(crate::core::rql::lexer_s1::QueryRowsData {
+                table_name: "users".to_string(),
+                query: "SELECT nope FROM users".to_string(),
+            });
+            let e1 = row_fetch_from_select_query(&broken, &changed).unwrap_err();
+            let e2 = row_fetch_from_select_query(&broken, &changed).unwrap_err();
+            assert_eq!(e1, e2);
+        }));
+        // Outside a scope every read parses.
+        let before = parses();
+        row_fetch_from_select_query(&purpose, &schema).unwrap();
+        row_fetch_from_select_query(&purpose, &schema).unwrap();
+        assert_eq!(parses() - before, 2);
     }
 
     #[test]
