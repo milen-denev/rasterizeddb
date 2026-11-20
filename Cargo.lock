@@ -4778,6 +4778,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rasterizeddb_embedded"
+version = "0.2.0"
+dependencies = [
+ "log",
+ "rasterizeddb_client",
+ "rasterizeddb_core",
+ "rclite",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rasterizeddb_filter_tests"
 version = "0.1.0"
 dependencies = [

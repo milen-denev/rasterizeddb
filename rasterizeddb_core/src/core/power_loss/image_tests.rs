@@ -30,7 +30,7 @@ fn sync_dir_of(path: &Path) {
 }
 
 fn write_at(path: &Path, at: u64, bytes: &[u8]) {
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     let f = std::fs::File::options().write(true).create(true).truncate(false).open(path).unwrap();
     f.write_all_at(bytes, at).unwrap();
 }

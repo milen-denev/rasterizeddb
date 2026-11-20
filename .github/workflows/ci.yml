@@ -1,0 +1,146 @@
+name: CI
+
+# Every push and pull request: the four release targets build, and the crates
+# that ship (rastcp, the client, the embedded SDK) pass their tests on each.
+# The engine's own suites are long (the core library alone is ~10 minutes on
+# 16 cores); they run on every target in the `full` job: weekly, on demand
+# (Actions -> CI -> Run workflow, full = true), and on pushes to the
+# release branch.
+
+on:
+  push:
+    branches: [main, feat/secondary-indexes]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "Also run the engine's full test suites on every target"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # The engine's futures run on 32 MiB stacks in production; tests match.
+  # (.cargo/config.toml sets this too; repeated so a cached cargo sees it.)
+  RUST_MIN_STACK: "33554432"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build the server
+        run: cargo build --locked --target ${{ matrix.target }} -p rasterizeddb_core --bin rasterizeddb_core
+
+      - name: Every target compiles (tests, examples, benches)
+        run: cargo check --locked --target ${{ matrix.target }} --workspace --all-targets
+
+      - name: Test rastcp, the client and the embedded SDK
+        run: >
+          cargo test --locked --target ${{ matrix.target }}
+          -p rastcp -p rasterizeddb_client -p rasterizeddb_client_derive -p rasterizeddb_embedded
+
+      - name: Client live tests against this build's server (unix only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export RDB_SERVER_BIN="$PWD/target/${{ matrix.target }}/debug/rasterizeddb_core"
+          cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_client --all-features
+
+      - name: Server smoke test (start, write, kill -9, restart, read)
+        shell: bash
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p rasterizeddb_client --example quickstart
+          ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          bash .github/scripts/smoke.sh \
+            "target/${{ matrix.target }}/debug/rasterizeddb_core$ext" \
+            "target/${{ matrix.target }}/debug/examples/quickstart$ext"
+
+  full:
+    name: full suites ${{ matrix.name }}
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.full) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/feat/secondary-indexes')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Core library tests
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib --no-fail-fast
+
+      - name: Core integration tests
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --tests --no-fail-fast
+
+      - name: Compatibility suite (PostgreSQL / MySQL / SQL Server drivers)
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast
+
+  package:
+    name: crates package and verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: x86_64-unknown-linux-gnu
+      # One invocation, so the crates that depend on each other verify
+      # against the packaged versions of each other (cargo >= 1.90), exactly
+      # as crates.io would build them.
+      - name: cargo package (the five published crates)
+        run: >
+          cargo package --locked
+          -p rastcp -p rasterizeddb_client_derive -p rasterizeddb_client
+          -p rasterizeddb_core -p rasterizeddb_embedded

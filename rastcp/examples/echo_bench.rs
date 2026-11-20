@@ -15,6 +15,21 @@
 //! each connection between `callers` tasks, each sending one request at a
 //! time, which is how an application with many concurrent queries uses it.
 
+// Unix sockets and SO_REUSEPORT: a unix-only benchmark.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("echo_bench needs unix sockets and SO_REUSEPORT; it runs on unix only");
+}
+
+#[cfg(unix)]
+fn main() {
+    bench::main()
+}
+
+#[cfg(unix)]
+mod bench {
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -36,7 +51,7 @@ fn arg<T: std::str::FromStr>(args: &[String], index: usize, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn main() {
+pub fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(String::as_str) {
@@ -355,4 +370,5 @@ fn mux(
             percentile(&histogram, rounds, 0.999),
         );
     });
+}
 }

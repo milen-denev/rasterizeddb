@@ -30,7 +30,6 @@
 //! drive is detected and the scenario rerun.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread::ThreadId;
 
@@ -172,7 +171,7 @@ fn durable_baseline(dir: &Path) -> Baseline {
     for path in regular_files(dir) {
         let f = std::fs::File::options().read(true).write(true).open(&path).unwrap();
         f.sync_all().unwrap();
-        let ino = f.metadata().unwrap().ino();
+        let ino = crate::core::power_loss::image::file_identity(&f).unwrap();
         out.insert(path.clone(), (ino, crate::core::wal::read_records(&path)));
     }
     if let Ok(d) = std::fs::File::open(dir) {
@@ -184,7 +183,7 @@ fn durable_baseline(dir: &Path) -> Baseline {
 /// Each page as it is now or as it was at the baseline, for a file the
 /// baseline saw; a file created since is taken whole.
 fn mixed_pages(path: &Path, current: &[u8], baseline: &Baseline, rng: &mut Rng) -> Vec<u8> {
-    let ino = std::fs::metadata(path).unwrap().ino();
+    let ino = crate::core::power_loss::image::path_identity(path).unwrap();
     let Some((base_ino, base)) = baseline.get(path) else {
         return current.to_vec();
     };

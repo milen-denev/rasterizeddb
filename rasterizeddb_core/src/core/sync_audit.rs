@@ -165,6 +165,26 @@ pub fn completion(event: &SyncEvent) -> Completion {
     calls::completion(event)
 }
 
+/// This thread's id: the kernel's on Linux (what `/proc/self/task/<id>` is
+/// named by), a process-wide counter elsewhere.
+#[cfg(any(test, feature = "index_store_failpoints"))]
+pub fn thread_id() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid takes no arguments and cannot fail.
+        (unsafe { libc::syscall(libc::SYS_gettid) }) as i32
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::sync::atomic::AtomicI32;
+        static NEXT: AtomicI32 = AtomicI32::new(1);
+        thread_local! {
+            static ID: i32 = NEXT.fetch_add(1, Ordering::Relaxed);
+        }
+        ID.with(|id| *id)
+    }
+}
+
 /// Per thread: how many calls to [`note`] it has entered, and whether it is
 /// inside one, readable from another thread.
 #[cfg(any(test, feature = "index_store_failpoints"))]
@@ -190,7 +210,7 @@ mod calls {
 
     thread_local! {
         static MINE: (i32, StdArc<Calls>) = {
-            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            let tid = super::thread_id();
             let calls = StdArc::new(Calls::default());
             let mut threads = THREADS.lock();
             threads.retain(|(t, _)| *t != tid);
@@ -225,7 +245,16 @@ mod calls {
         })
     }
 
+    /// Without `/proc` a thread past `note` cannot be told apart from one
+    /// still inside its sync, so it counts as in flight: what a cut also
+    /// decides on Linux once its probe rounds run out.
+    #[cfg(not(target_os = "linux"))]
+    fn probe(_event: &SyncEvent) -> Completion {
+        Completion::InFlight
+    }
+
     /// Kernel numbers of the calls that flush a file.
+    #[cfg(target_os = "linux")]
     fn is_sync_call(nr: i64) -> bool {
         [
             libc::SYS_fsync,
@@ -241,6 +270,7 @@ mod calls {
     /// The files `event`'s sync may have open: the file named, its
     /// directory (a directory sync names a file in it), and the temporary
     /// file that sites syncing before a rename name by its final path.
+    #[cfg(target_os = "linux")]
     fn synced_paths(event: &SyncEvent) -> Vec<std::path::PathBuf> {
         let mut out = vec![event.path.clone()];
         if let Some(parent) = event.path.parent() {
@@ -270,6 +300,12 @@ mod calls {
         if calls.inside.load(Ordering::Acquire) {
             return Completion::InFlight;
         }
+        probe(event)
+    }
+
+    /// Where the thread stands, read from `/proc/self/task/<tid>/syscall`.
+    #[cfg(target_os = "linux")]
+    fn probe(event: &SyncEvent) -> Completion {
         let task = format!("/proc/self/task/{}/syscall", event.tid);
         let Ok(text) = std::fs::read_to_string(&task) else {
             // The thread is gone, and a thread does not exit inside a sync.

@@ -1,8 +1,8 @@
-use std::{
-    arch::{asm, x86_64::*},
-    ptr,
-};
+use std::ptr;
+#[cfg(target_arch = "x86_64")]
+use std::arch::{asm, x86_64::*};
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn compare_raw_vecs(
     vec_a: *mut u8,
@@ -27,6 +27,25 @@ pub unsafe fn compare_raw_vecs(
     }
 
     result == 0
+}
+
+/// Hints that the cache line at `p` will be read soon and should be kept in
+/// L1: `prefetcht0` on x86_64, `prfm pldl1keep` on aarch64, nothing
+/// elsewhere. A hint only, so any address is safe, mapped or not.
+#[inline(always)]
+pub fn prefetch_read_l1(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetch never faults.
+    unsafe {
+        _mm_prefetch::<_MM_HINT_T0>(p as *const i8)
+    };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: prfm never faults and touches no register but its operand.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly))
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
 }
 
 #[inline(always)]
@@ -97,6 +116,7 @@ pub unsafe fn copy_ptr_to_ptr(heap_data_1: *mut u8, heap_data_2: *mut u8, len: u
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[allow(dead_code)]
 pub unsafe fn simd_memcpy(dst: &mut [u8], src: &[u8]) {
@@ -170,6 +190,7 @@ pub unsafe fn simd_memcpy(dst: &mut [u8], src: &[u8]) {
 //     }
 // }
 
+#[cfg(target_arch = "x86_64")]
 /// SIMD-accelerated memcpy using multiple AVX2 stores per iteration (128 bytes at a time).
 ///
 /// # Safety
@@ -214,6 +235,7 @@ pub unsafe fn simd_memcpy_avx2_multi(dst: &mut [u8], src: &[u8]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// SIMD-accelerated memcpy with loop unrolling and prefetching.
 /// This may outperform std::slice::copy_from_slice for large buffers on AVX2 CPUs.
 ///
@@ -260,6 +282,32 @@ pub unsafe fn simd_memcpy_aggressive(dst: &mut [u8], src: &[u8]) {
     if i < len {
         ptr::copy_nonoverlapping(src.as_ptr().add(i), dst.as_mut_ptr().add(i), len - i);
     }
+}
+
+/// `compare_raw_vecs` off x86_64 (no `repe cmpsb`): the same byte equality.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn compare_raw_vecs(vec_a: *mut u8, vec_b: *mut u8, vec_a_len: usize, vec_b_len: usize) -> bool {
+    vec_a_len == vec_b_len
+        && unsafe { std::slice::from_raw_parts(vec_a, vec_a_len) == std::slice::from_raw_parts(vec_b, vec_b_len) }
+}
+
+/// The AVX2 copies off x86_64: `copy_from_slice`, which is `memcpy`.
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
+pub unsafe fn simd_memcpy(dst: &mut [u8], src: &[u8]) {
+    dst.copy_from_slice(&src[..dst.len()]);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn simd_memcpy_avx2_multi(dst: &mut [u8], src: &[u8]) {
+    dst.copy_from_slice(&src[..dst.len()]);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub unsafe fn simd_memcpy_aggressive(dst: &mut [u8], src: &[u8]) {
+    dst.copy_from_slice(&src[..dst.len()]);
 }
 
 #[cfg(test)]

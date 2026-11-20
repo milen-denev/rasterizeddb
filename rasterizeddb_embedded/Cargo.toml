@@ -1,0 +1,27 @@
+[package]
+name = "rasterizeddb_embedded"
+version = "0.2.0"
+edition = "2024"
+description = "Run RasterizedDB inside a Rust application: the engine in-process, used through rasterizeddb_client"
+repository = "https://github.com/milen-denev/rasterizeddb"
+documentation = "https://docs.rs/rasterizeddb_embedded"
+readme = "README.md"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["database", "embedded-database", "sql", "rasterizeddb"]
+categories = ["database-implementations", "database"]
+
+# The engine and the client SDK, at the versions released together on the
+# `server-v*` / `client-v*` channels. The engine keeps its default features:
+# it does not build with them off (see rasterizeddb_core's Cargo.toml).
+[dependencies]
+rasterizeddb_core = { path = "../rasterizeddb_core", version = "0.2.0" }
+rasterizeddb_client = { path = "../rasterizeddb_client", version = "0.2.0" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+# The engine's catalogue handle is an rclite::Arc.
+rclite = "0.4.2"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tempfile = "3"

@@ -2,6 +2,12 @@
 name = "rastcp"
 version = "0.1.0"
 edition = "2024"
+description = "RasterizedDB's native transport: framed, multiplexed requests over TLS or unix sockets, with pluggable authentication"
+repository = "https://github.com/milen-denev/rasterizeddb"
+license = "GPL-3.0-only"
+authors = ["Milen Denev"]
+keywords = ["tcp", "tls", "protocol", "rasterizeddb"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 tokio = { version = "1.54", features = ["full"] }

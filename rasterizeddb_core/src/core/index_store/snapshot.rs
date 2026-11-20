@@ -426,7 +426,7 @@ impl SnapshotSource {
 }
 
 pub fn read_section(path: &std::path::Path, entry: &SectionEntry) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     let file = std::fs::File::open(path)?;
     let mut bytes = vec![0u8; entry.len as usize];
     file.read_exact_at(&mut bytes, entry.offset)?;

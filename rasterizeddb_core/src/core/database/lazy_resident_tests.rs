@@ -430,7 +430,11 @@ fn cpu_time() -> Duration {
     let ticks: u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0)
         + fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
     // SAFETY: sysconf has no preconditions.
+    #[cfg(unix)]
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    // No /proc either: the ticks above read 0.
+    #[cfg(not(unix))]
+    let hz = 100u64;
     Duration::from_millis(ticks * 1000 / hz)
 }
 

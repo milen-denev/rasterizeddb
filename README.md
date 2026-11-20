@@ -39,7 +39,18 @@ deliberately not built.
 
 ### Guide on how to run
 
-rasterizeddb_server-PLATFORM-x64.exe --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
+Download the archive for your platform from the [releases](https://github.com/milen-denev/rasterizeddb/releases) (tags `v*`):
+
+| Platform | Archive | CPU |
+|---|---|---|
+| Linux x86-64 | `rasterizeddb-server-<version>-linux-x86_64.tar.gz` | x86-64-v3 (AVX2: Intel Haswell / AMD Excavator or later) |
+| Linux ARM64 | `rasterizeddb-server-<version>-linux-arm64.tar.gz` | any ARMv8-A (Graviton, Ampere, Raspberry Pi 4/5, ...) |
+| Windows x86-64 | `rasterizeddb-server-<version>-windows-x86_64.zip` | x86-64-v3 (AVX2) |
+| Windows ARM64 | `rasterizeddb-server-<version>-windows-arm64.zip` | any ARMv8-A (Snapdragon X, ...) |
+
+Linux builds need glibc 2.39 or newer. Unix sockets (`--rdb-socket`, `--pg-socket`, peer authentication) exist on Linux only; on Windows use TCP.
+
+rasterizeddb --location /your-location/bla-bla --concurrent_threads 16 --batch_size 16000
 
 *batch_size*: recommended value is 16K, but you can play around with more or less depending on your case. The lesser the number of rows, the lower the batch size must be.
 *concurrent_threads*: must equal to the number of CPU threads of lower.
@@ -929,7 +940,7 @@ full grammar, and what it does not do.
 
 ### Guide on how to run the client-side
 
-Refer to *test_client/src/main.rs* for examples! 
+The native-protocol client SDK is [`rasterizeddb_client`](rasterizeddb_client/README.md) on crates.io: typed queries, transactions, an ORM, migrations and the key/value API. Any PostgreSQL, MySQL or SQL Server driver works against the matching listener too.
 
 ### Vision
 
@@ -979,12 +990,18 @@ An official Rust ORM is in development, with a C# ORM planned afterward. These t
 #### Stability
 Currently, Rasterized DB is not stable. Table formats, storage engines, and query processing internals are likely to change until version 1.0.0. Use it at your own risk in production environments.
 
-### How to use the current API?
+### Running the database inside a Rust application
+
+[`rasterizeddb_embedded`](rasterizeddb_embedded/README.md) runs the whole engine in-process and hands you a `rasterizeddb_client::Client` for it:
 
 ```rust
-// COMING SOON
-// Please refer to the main.rs and core/mock_table.rs and core/mock_helpers.rs to see API in use.
+let db = rasterizeddb_embedded::Builder::open("./data").start().await?;
+let client = db.connect().await?;
+client.execute("CREATE TABLE IF NOT EXISTS notes (id BIGINT, body TEXT)", &[]).await?;
+db.shutdown().await?;
 ```
+
+How releases are cut (crates and executables): [docs/releasing.md](docs/releasing.md).
 
 ##### Sponsor
 

@@ -2,7 +2,6 @@
 //! instant. See the module notes in [`super`] for the model.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc as StdArc, Weak};
 
@@ -17,7 +16,65 @@ pub const PAGE: usize = 4096;
 const PROBE_ROUNDS: usize = 200;
 
 pub fn current_tid() -> i32 {
-    (unsafe { libc::syscall(libc::SYS_gettid) }) as i32
+    sync_audit::thread_id()
+}
+
+/// A file's identity, which a rename keeps: the inode on unix, the volume
+/// file index on Windows.
+#[cfg(unix)]
+pub fn file_identity(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.ino())
+}
+
+#[cfg(windows)]
+pub fn file_identity(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ByHandleFileInformation {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut ByHandleFileInformation) -> i32;
+    }
+    // SAFETY: the handle is open for the call and `info` is a plain struct
+    // the call fills.
+    let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+}
+
+/// [`file_identity`] of the file or directory at `path`, not following a
+/// final symlink.
+pub fn path_identity(path: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::symlink_metadata(path)?.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // No access rights asked: identity only. BACKUP_SEMANTICS opens a
+        // directory, OPEN_REPARSE_POINT the link itself.
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(path)?;
+        file_identity(&file)
+    }
 }
 
 /// xorshift64*, so a failing seed reproduces without a dependency.
@@ -116,7 +173,7 @@ pub fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn ino_of(path: &Path) -> Option<u64> {
-    std::fs::symlink_metadata(path).ok().map(|m| m.ino())
+    path_identity(path).ok()
 }
 
 impl State {
@@ -271,7 +328,7 @@ impl Recorder {
                 continue;
             };
             f.sync_all().unwrap();
-            let ino = f.metadata().unwrap().ino();
+            let ino = file_identity(&f).unwrap();
             let Ok(bytes) = std::fs::read(&path) else { continue };
             baseline.insert(ino, bytes);
         }

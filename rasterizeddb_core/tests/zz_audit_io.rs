@@ -201,10 +201,14 @@ fn capping() -> std::sync::RwLockWriteGuard<'static, ()> {
     FSIZE_GATE.write().unwrap_or_else(|e| e.into_inner())
 }
 
+// RLIMIT_FSIZE: unix only.
+#[cfg(unix)]
 struct FsizeCap {
     prev: libc::rlimit,
 }
 
+// RLIMIT_FSIZE: unix only.
+#[cfg(unix)]
 impl FsizeCap {
     fn set(limit: u64) -> Self {
         unsafe {
@@ -218,6 +222,8 @@ impl FsizeCap {
     }
 }
 
+// RLIMIT_FSIZE: unix only.
+#[cfg(unix)]
 impl Drop for FsizeCap {
     fn drop(&mut self) {
         unsafe {
@@ -232,6 +238,8 @@ const HEADER_LEN: u64 = 4 + 1 + 1 + 2 + 8 + 8 + 8 + 4 + 4;
 //    the next in-place commit read its payload from the wrong offset and
 //    applied foreign bytes to the data file. Now a failed write is cut back to
 //    `write_pos`: no partial record survives and the next apply is correct.
+// RLIMIT_FSIZE: unix only.
+#[cfg(unix)]
 #[test]
 fn audit_b_a_short_wal_write_leaves_no_partial_record() {
     let _capping = capping();
@@ -277,6 +285,8 @@ fn audit_b_a_short_wal_write_leaves_no_partial_record() {
 //    append reported an offset that did not describe its bytes. Now the failed
 //    append rolls the file back to `file_len` without panicking, and the next
 //    append lands where it says.
+// RLIMIT_FSIZE: unix only.
+#[cfg(unix)]
 #[test]
 fn audit_c_a_short_append_rolls_back_and_keeps_offsets_true() {
     let _capping = capping();

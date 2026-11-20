@@ -909,7 +909,7 @@ fn append_dirty(files: &GateFiles) -> io::Result<()> {
 }
 
 fn try_append_dirty(files: &GateFiles) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     let path = files.ixm();
     let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
         Ok(f) => f,

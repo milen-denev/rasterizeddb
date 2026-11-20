@@ -1,12 +1,9 @@
-use std::{
-    arch::x86_64::{_MM_HINT_T0, _mm_prefetch},
-    fmt,
-};
+use std::fmt;
 
 #[cfg(feature = "memory_pool_reuse")]
 use std::cell::UnsafeCell;
 
-use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr};
+use crate::instructions::{copy_ptr_to_ptr, copy_vec_to_ptr, prefetch_read_l1};
 
 pub static MEMORY_POOL: MemoryPool = MemoryPool::new();
 
@@ -477,10 +474,10 @@ impl MemoryBlock {
     pub fn prefetch_to_lcache(&self) {
         if self.is_heap() {
             // Prefetch the heap data to the L1 cache
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.heap_ptr as *const i8) };
+            prefetch_read_l1(unsafe { self.data.heap_ptr } as *const u8);
         } else {
             // Prefetch the inline data to the L1 cache
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.data.inline_data.as_ptr() as *const i8) };
+            prefetch_read_l1(unsafe { self.data.inline_data.as_ptr() } as *const u8);
         }
     }
 

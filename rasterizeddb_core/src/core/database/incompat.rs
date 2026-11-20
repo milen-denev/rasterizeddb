@@ -303,11 +303,10 @@ mod tests {
         assert_eq!(flags(dir.path()), Ok(vec![INDEX_STORE_V1.to_string()]));
         // Every write renames a new file into place, so a new inode is a write
         // (timestamps are too coarse to tell two writes a moment apart).
-        use std::os::unix::fs::MetadataExt;
-        let written = std::fs::metadata(dir.path().join(FILE_NAME)).unwrap().ino();
+        let written = crate::core::power_loss::image::path_identity(&dir.path().join(FILE_NAME)).unwrap();
         require(dir.path(), INDEX_STORE_V1).unwrap();
         assert_eq!(
-            std::fs::metadata(dir.path().join(FILE_NAME)).unwrap().ino(),
+            crate::core::power_loss::image::path_identity(&dir.path().join(FILE_NAME)).unwrap(),
             written,
             "a flag already set was written again"
         );

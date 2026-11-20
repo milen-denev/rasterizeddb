@@ -36,6 +36,7 @@ pub mod pg_ops;
 pub mod pg_types;
 pub mod range_ops;
 pub mod processor;
+pub mod pos_io;
 /// What ran recently and what it cost, behind the `query_stats` feature.
 #[cfg(feature = "query_stats")]
 pub mod query_stats;

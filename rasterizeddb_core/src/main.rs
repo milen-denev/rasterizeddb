@@ -2219,6 +2219,7 @@ mod storage_flag_tests {
     /// A flag naming a location that is already there is the service unit's
     /// every-start case and passes; one that cannot be added stops startup
     /// instead of starting without it.
+    #[cfg(unix)]
     #[test]
     fn a_location_flag_refuses_unless_already_present() {
         use rasterizeddb_core::core::storage::StorageManager;

@@ -1,5 +1,7 @@
 use smallvec::SmallVec;
-use std::{arch::x86_64::*, borrow::Cow};
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+use std::borrow::Cow;
 
 use crate::core::row::schema::SchemaField;
 use crate::memory_pool::MEMORY_POOL;
@@ -138,6 +140,7 @@ fn is_id_part_fast(c: u8) -> bool {
 }
 
 // SIMD-optimized whitespace skipping
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
@@ -185,6 +188,7 @@ unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 // SIMD-optimized digit scanning
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
     if pos >= bytes.len() {
@@ -225,6 +229,7 @@ unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
 }
 
 // SIMD-optimized identifier scanning
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(non_snake_case)]
 unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
@@ -280,6 +285,36 @@ unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
         pos += 1;
     }
 
+    pos
+}
+
+// Off x86_64 the scanners are their scalar tails: each AVX2 loop above only
+// advances over bytes its scalar loop would also have taken, so the
+// positions they return are the same.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn skip_whitespace_simd(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_whitespace_fast(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn scan_digits_simd(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_digit_fast(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn scan_identifier_simd(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_id_part_fast(bytes[pos]) {
+        pos += 1;
+    }
     pos
 }
 

@@ -558,7 +558,7 @@ fn prepare_marker(gate: &FileGate, ixm: &Path, dir: &Path, root: Option<&Path>) 
 /// followed, ftruncate and fdatasync, nothing issued in between. The error
 /// says whether any of the record's write was issued.
 fn append_clean(ixm: &Path, scan: &MarkerScan, record: CleanRecord) -> Result<(), (bool, io::Error)> {
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

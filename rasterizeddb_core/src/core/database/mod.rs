@@ -4631,6 +4631,38 @@ impl Database {
         auth: crate::native_auth::NativeAuthConfig,
         listen: NativeListen,
     ) -> io::Result<()> {
+        Self::bind_native(database, catalog, auth, listen, true).await?.run().await
+    }
+
+    /// Binds the native listener(s) `listen` describes for the catalogue's
+    /// default database, as [`Database::start_db_with_auth_in`] does, and
+    /// hands them back unstarted: [`NativeServer::run`] serves them.
+    ///
+    /// For a process that embeds the engine. Unlike the `start_db_*`
+    /// functions it installs no termination-signal handler (the host owns
+    /// Ctrl+C and SIGTERM; stop through [`NativeServer::shutdown_handles`]),
+    /// and it reports the address actually bound, so `listen.port` may be 0.
+    pub async fn bind_native_in(
+        catalog: Arc<catalog::DatabaseCatalog>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+    ) -> io::Result<NativeServer> {
+        let database = catalog
+            .get(catalog.default_name())
+            .expect("the catalogue always holds its default database");
+        Self::bind_native(database, Some(catalog), auth, listen, false).await
+    }
+
+    /// Everything `start_native` does before it serves. `on_signals` hooks
+    /// each listener's shutdown to Ctrl+C / SIGTERM, as the server binary
+    /// wants and an embedding process does not.
+    async fn bind_native(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+        on_signals: bool,
+    ) -> io::Result<NativeServer> {
         use crate::native_auth::RoleAuthenticator;
 
         info!("Starting database");
@@ -4718,8 +4750,10 @@ impl Database {
 
             // Ctrl+C and SIGTERM stop the accept loop and let in-flight queries
             // finish, rather than dropping every connection where it stands.
-            let shutdown = server.shutdown_handle();
-            crate::shutdown::on_termination(move || shutdown.shutdown());
+            if on_signals {
+                let shutdown = server.shutdown_handle();
+                crate::shutdown::on_termination(move || shutdown.shutdown());
+            }
             Some(server)
         } else {
             info!("Native protocol TCP listener is off; serving the unix socket only");
@@ -4732,16 +4766,71 @@ impl Database {
             catalog,
         };
 
-        let socket_task = socket_server.map(|(socket_server, socket_requires_auth)| {
+        let socket = socket_server.map(|(socket_server, socket_requires_auth)| {
             let socket_server = Arc::new(socket_server);
-            let shutdown = socket_server.shutdown_handle();
-            crate::shutdown::on_termination(move || shutdown.shutdown());
+            if on_signals {
+                let shutdown = socket_server.shutdown_handle();
+                crate::shutdown::on_termination(move || shutdown.shutdown());
+            }
 
-            let context = NativeContext {
+            let socket_context = NativeContext {
                 database: context.database.clone(),
                 authentication_required: socket_requires_auth,
                 catalog: context.catalog.clone(),
             };
+            (socket_server, socket_context)
+        });
+
+        Ok(NativeServer {
+            tcp: server,
+            socket,
+            context,
+            listen,
+        })
+    }
+}
+
+/// The native listener(s) [`Database::bind_native_in`] bound, not yet
+/// serving.
+pub struct NativeServer {
+    tcp: Option<Arc<TcpServer>>,
+    socket: Option<(Arc<TcpServer>, NativeContext)>,
+    context: NativeContext,
+    listen: NativeListen,
+}
+
+impl NativeServer {
+    /// The TCP address bound (`127.0.0.1:61170`), when TCP is served: the
+    /// real port when `listen.port` was 0.
+    pub fn tcp_endpoint(&self) -> Option<String> {
+        self.tcp.as_ref().map(|s| s.local_endpoint())
+    }
+
+    /// The unix socket served (`unix:/path`), when one is.
+    pub fn socket_endpoint(&self) -> Option<String> {
+        self.socket.as_ref().map(|(s, _)| s.local_endpoint())
+    }
+
+    /// Triggers that stop each listener: it stops accepting, drains the
+    /// requests in flight and ends, and [`NativeServer::run`] returns once
+    /// all have.
+    pub fn shutdown_handles(&self) -> Vec<rastcp::server::ShutdownHandle> {
+        self.tcp
+            .iter()
+            .map(|s| s.shutdown_handle())
+            .chain(self.socket.iter().map(|(s, _)| s.shutdown_handle()))
+            .collect()
+    }
+
+    /// Serves until every listener has been shut down.
+    pub async fn run(self) -> io::Result<()> {
+        let NativeServer {
+            tcp: server,
+            socket,
+            context,
+            listen,
+        } = self;
+        let socket_task = socket.map(|(socket_server, context)| {
             tokio::spawn(async move {
                 info!("Also listening on {}", socket_server.local_endpoint());
                 if let Err(e) = socket_server

@@ -3086,6 +3086,7 @@ mod test {
     /// Each round closes the database, `fdatasync`s and evicts every file with
     /// `POSIX_FADV_DONTNEED` — per file, so other processes' caches are left
     /// alone — reopens it and scans. Delete the directory when done.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn cold_scan_readahead() {

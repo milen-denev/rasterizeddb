@@ -7464,7 +7464,7 @@ mod prealloc_tests {
     /// committed, after one that was.
     #[test]
     fn a_record_past_a_gap_of_zeros_is_a_torn_tail_and_the_log_is_discarded() {
-        use std::os::unix::fs::FileExt;
+        use crate::core::pos_io::FileExt;
         let dir = temp_dir();
         let dir_str = dir.path().to_string_lossy().to_string();
         let path = dir.path().join(DEFAULT_WAL_NAME);
@@ -7500,7 +7500,7 @@ mod prealloc_tests {
     /// Any bytes at all in the padding, not only a whole record.
     #[test]
     fn one_stray_byte_in_the_padding_is_a_torn_tail() {
-        use std::os::unix::fs::FileExt;
+        use crate::core::pos_io::FileExt;
         let dir = temp_dir();
         let path = dir.path().join(DEFAULT_WAL_NAME);
         {

@@ -376,6 +376,7 @@ async fn tiberius_end_to_end() {
     assert_eq!(n, 5);
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tiberius_socket_and_refusals() {
     let s = start();

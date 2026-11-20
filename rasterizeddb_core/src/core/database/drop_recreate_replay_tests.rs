@@ -44,7 +44,6 @@
 //! anything.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rclite::Arc;
@@ -213,7 +212,7 @@ fn durable_baseline(dir: &Path) -> HashMap<PathBuf, Baseline> {
     for path in regular_files(dir) {
         let f = std::fs::File::options().read(true).write(true).open(&path).unwrap();
         f.sync_all().unwrap();
-        let ino = f.metadata().unwrap().ino();
+        let ino = crate::core::power_loss::image::file_identity(&f).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         out.insert(path.clone(), Baseline { _held: f, ino, bytes });
     }
@@ -226,7 +225,7 @@ fn durable_baseline(dir: &Path) -> HashMap<PathBuf, Baseline> {
 /// The baseline's bytes for `path` when the file there now is the one the
 /// baseline saw, `None` for a file created since.
 fn baseline_of<'a>(path: &Path, baseline: &'a HashMap<PathBuf, Baseline>) -> Option<&'a [u8]> {
-    let ino = std::fs::metadata(path).unwrap().ino();
+    let ino = crate::core::power_loss::image::path_identity(path).unwrap();
     baseline
         .get(path)
         .filter(|b| b.ino == ino)

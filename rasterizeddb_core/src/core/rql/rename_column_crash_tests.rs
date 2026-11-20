@@ -19,7 +19,6 @@
 //! done completely.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -131,7 +130,7 @@ fn durable_baseline(dir: &Path) -> HashMap<PathBuf, Baseline> {
     for path in regular_files(dir) {
         let f = std::fs::File::options().read(true).write(true).open(&path).unwrap();
         f.sync_all().unwrap();
-        let ino = f.metadata().unwrap().ino();
+        let ino = crate::core::power_loss::image::file_identity(&f).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         out.insert(path.clone(), Baseline { _held: f, ino, bytes });
     }
@@ -260,7 +259,7 @@ impl Harness {
                     continue;
                 }
                 let synced = synced_prefix(&path, &self.events);
-                let ino = std::fs::metadata(&path).unwrap().ino();
+                let ino = crate::core::power_loss::image::path_identity(&path).unwrap();
                 let base = self
                     .baseline
                     .get(&path)

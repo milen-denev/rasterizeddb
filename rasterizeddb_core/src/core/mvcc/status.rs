@@ -1152,7 +1152,7 @@ impl IdReservation {
         }
         let bytes = encode_reservation(mark);
         if let Some(wal) = log {
-            use std::os::unix::fs::FileExt;
+            use crate::core::pos_io::FileExt;
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())

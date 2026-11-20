@@ -8,6 +8,9 @@
 //!
 //! Every wait is bounded, and every test's directory is a `TempDir`.
 
+// The native listener runs on a unix socket.
+#![cfg(unix)]
+
 use std::future::Future;
 use std::time::Duration;
 

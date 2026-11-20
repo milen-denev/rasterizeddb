@@ -268,7 +268,7 @@ fn a_clean_appended_to_a_clean_ending_log_is_proven() {
 #[test]
 fn an_append_round_trips_through_a_real_file() {
     use std::io::Write;
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.ixm");
     {

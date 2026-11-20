@@ -169,7 +169,7 @@ async fn a_create_whose_schema_cannot_be_written_creates_nothing() {
 /// store cannot be made read-only (running as root).
 ///
 /// Mutation: the same as above, the saves' failure only logged.
-#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
+#[cfg(all(unix, feature = "storage_pools", feature = "kv_storage"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_create_on_a_store_that_refuses_its_puts_creates_nothing() {
     use crate::core::storage::TableBackend;

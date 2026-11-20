@@ -22,9 +22,16 @@ const S_SASL: u8 = 0x01;
 const S_CONTINUE: u8 = 0x02;
 
 /// The login name of the user this process runs as.
+#[cfg(unix)]
 pub fn current_os_user() -> Option<String> {
     // SAFETY: getuid cannot fail and has no preconditions.
     rasterizeddb_core::native_auth::os_user_name(unsafe { libc::getuid() })
+}
+
+/// The login name of the user this process runs as.
+#[cfg(not(unix))]
+pub fn current_os_user() -> Option<String> {
+    std::env::var("USERNAME").ok().filter(|name| !name.is_empty())
 }
 
 /// Presents a user name and password.

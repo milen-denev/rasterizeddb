@@ -769,7 +769,7 @@ impl ReplicationLog {
                 let generation = *log.segments.keys().next_back().expect("a log has a file");
                 let segment = log.active();
                 let offset = segment.len;
-                std::os::unix::fs::FileExt::write_all_at(&segment.handle, &framed, offset)?;
+                crate::core::pos_io::FileExt::write_all_at(&segment.handle, &framed, offset)?;
                 // The file first, then the log: a checkpoint syncs the files
                 // its records name and drops the log, so every record must
                 // already be in its file by the time it is logged.
@@ -1166,7 +1166,7 @@ impl ReplicationLog {
             let handle = &handles.iter().find(|(held, _)| *held == generation).expect("cloned above").1;
             payload.clear();
             payload.resize(loc.len as usize, 0);
-            std::os::unix::fs::FileExt::read_exact_at(handle, &mut payload, offset)?;
+            crate::core::pos_io::FileExt::read_exact_at(handle, &mut payload, offset)?;
 
             match TxnRecord::decode(&mut Reader::new(&payload)) {
                 Ok(record) if record.origin == origin && record.seq == seq => {
@@ -1390,7 +1390,7 @@ impl StateFile {
         };
         let offset = STATE_SLOT + slot * STATE_SLOT;
         let bytes = Position { origin, seq, epoch }.encode();
-        std::os::unix::fs::FileExt::write_all_at(&self.handle, &bytes, offset)?;
+        crate::core::pos_io::FileExt::write_all_at(&self.handle, &bytes, offset)?;
         if let Some(logged) = &self.logged {
             logged.wal.log_and_commit_deferred(logged.file_id, offset, &bytes)?;
         }
@@ -1401,7 +1401,7 @@ impl StateFile {
     fn write_intent(&mut self, intent: Intent) -> io::Result<()> {
         let bytes = intent.encode();
         let offset = self.intents_end;
-        std::os::unix::fs::FileExt::write_all_at(&self.intents, &bytes, offset)?;
+        crate::core::pos_io::FileExt::write_all_at(&self.intents, &bytes, offset)?;
         match &self.intents_logged {
             Some(logged) => {
                 logged.wal.log_and_commit_deferred(logged.file_id, offset, &bytes)?;
@@ -1512,7 +1512,7 @@ impl AppliedState {
         if bytes.is_empty() {
             let mut header = [0u8; STATE_SLOT as usize];
             header[..16].copy_from_slice(&STATE_MAGIC);
-            std::os::unix::fs::FileExt::write_all_at(&handle, &header, 0)?;
+            crate::core::pos_io::FileExt::write_all_at(&handle, &header, 0)?;
             handle.sync_data()?;
             crate::core::wal::sync_parent_dir(&path)?;
         } else if bytes.len() >= 16 && bytes[..16] == STATE_MAGIC {

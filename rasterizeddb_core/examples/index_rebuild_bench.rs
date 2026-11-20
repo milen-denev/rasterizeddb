@@ -178,9 +178,17 @@ fn main() {
         .unwrap();
 }
 
+/// Cold-cache eviction needs syncfs/fadvise/mincore: off Linux the cache
+/// stays warm and nothing is reported resident.
+#[cfg(not(target_os = "linux"))]
+fn evict(_dir: &Path) -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 /// syncfs, then DONTNEED on every file under `dir`; the bytes `mincore`
 /// still finds resident afterwards (0 on a real disk, all of it on tmpfs,
 /// whose pages are the storage).
+#[cfg(target_os = "linux")]
 fn evict(dir: &Path) -> (u64, u64, u64) {
     use std::os::fd::AsRawFd;
     if let Ok(d) = std::fs::File::open(dir) {
@@ -208,6 +216,7 @@ fn evict(dir: &Path) -> (u64, u64, u64) {
     (files, bytes, resident)
 }
 
+#[cfg(target_os = "linux")]
 fn resident_bytes(f: &std::fs::File, len: u64) -> u64 {
     use std::os::fd::AsRawFd;
     let page = 4096u64;

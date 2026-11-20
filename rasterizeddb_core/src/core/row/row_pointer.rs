@@ -24,7 +24,6 @@ use crate::{
     memory_pool::{MEMORY_POOL, MemoryBlock},
 };
 use branches::unlikely;
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 #[cfg(feature = "enable_long_row")]
 const TOTAL_LENGTH : usize = 
@@ -703,7 +702,8 @@ impl<S: StorageIO> RowPointerIterator<S> {
                             // an index clamped to the end of the chunk is safe:
                             // the read never happens if nothing follows.
                             //
-                            // `_mm_prefetch` directly rather than
+                            // `_mm_prefetch` (through `prefetch_read_l1`,
+                            // `prfm pldl1keep` on aarch64) rather than
                             // `branches::prefetch_read_data`, which looks like
                             // the natural choice and is a trap. That crate
                             // numbers LOCALITY backwards from LLVM on stable
@@ -714,16 +714,14 @@ impl<S: StorageIO> RowPointerIterator<S> {
                             // numbering — the same source silently emitting the
                             // opposite instruction depending on the toolchain,
                             // with no diagnostic either way. `_MM_HINT_T0` has
-                            // one meaning on both. This crate already depends on
-                            // `std::arch::x86_64` unconditionally in
-                            // `memory_pool.rs`, so nothing portable is given up.
+                            // one meaning on both.
                             //
                             // T0 is the hint we want and non-temporal is the one
                             // we must not give: the landing address begins the
                             // ~2.3 KB this loop walks immediately and in order.
                             if self.buffer_index + TOTAL_LENGTH <= self.buffer_valid_length {
                                 let landing = unsafe { buf_ptr.add(self.buffer_index) };
-                                unsafe { _mm_prefetch::<_MM_HINT_T0>(landing as *const i8) };
+                                crate::instructions::prefetch_read_l1(landing as *const u8);
                             }
                         } else {
                             self.buffer_index += TOTAL_LENGTH;

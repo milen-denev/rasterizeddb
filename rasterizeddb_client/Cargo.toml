@@ -27,7 +27,7 @@ cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 # the tests in `tests/` run them against a real server so the
 # copies cannot drift unnoticed.
 [dependencies]
-rastcp = { path = "../rastcp" }
+rastcp = { path = "../rastcp", version = "0.1.0" }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 libc = "0.2"
 # The operating system's random generator on every platform (Linux's

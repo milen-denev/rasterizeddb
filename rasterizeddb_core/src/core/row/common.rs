@@ -1,3 +1,4 @@
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
 use smallvec::SmallVec;
@@ -523,12 +524,16 @@ pub(crate) fn anchor_find<const FOLD: bool>(haystack: &[u8], needle: &[u8]) -> O
         m <= 2 || anchor_eq::<FOLD>(&haystack[pos + 1..pos + m - 1], inner)
     };
 
-    let hp = haystack.as_ptr();
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut i = 0usize;
 
+    // Off x86_64 the scalar loop below does all of it.
+    #[cfg(target_arch = "x86_64")]
+    let hp = haystack.as_ptr();
     // SAFETY: the guards keep both loads — 32 (or 16) bytes at `i` and at
     // `i + m - 1` — inside the haystack, exactly as in `contains_small`. AVX2
     // is assumed, as everywhere in this module (target-cpu=x86-64-v3).
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         if n_minus_m >= 31 {
             let v_or_first = _mm256_set1_epi8(or_first as i8);
@@ -601,6 +606,7 @@ pub(crate) fn anchor_find<const FOLD: bool>(haystack: &[u8], needle: &[u8]) -> O
     None
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn simd_greater_or_equal(input1: &[u8], input2: &[u8]) -> bool {
@@ -693,6 +699,30 @@ unsafe fn simd_greater_or_equal(input1: &[u8], input2: &[u8]) -> bool {
     return len1 >= len2;
 }
 
+/// `simd_greater_or_equal` off x86_64: the same total lexicographic `>=`
+/// (bytes unsigned, then the longer of two equal prefixes is greater).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn simd_greater_or_equal(input1: &[u8], input2: &[u8]) -> bool {
+    input1 >= input2
+}
+
+/// `compare_medium` / `compare_large` off x86_64: plain slice equality,
+/// which the compiler lowers to `memcmp` (NEON on aarch64).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn compare_medium(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
+    std::slice::from_raw_parts(ptr1, len) == std::slice::from_raw_parts(ptr2, len)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn compare_large(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
+    compare_medium(ptr1, ptr2, len)
+}
+
 /// SIMD-based implementation of string equality (`==`) for `&[u8]`.
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -783,6 +813,7 @@ unsafe fn compare_small(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
 /// Same overlapping-load idea as `compare_small`, one size class up: a pair of
 /// vector loads per side covers the whole value, so there is no loop and no
 /// scalar tail to clean up.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn compare_medium(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
@@ -807,6 +838,7 @@ unsafe fn compare_medium(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
     _mm256_testz_si256(diff, diff) != 0
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn compare_large(ptr1: *const u8, ptr2: *const u8, len: usize) -> bool {
@@ -883,14 +915,19 @@ unsafe fn simd_contains(haystack: &[u8], needle: &[u8]) -> bool {
         return false; // Needle larger than haystack
     }
 
-    match m {
+    #[cfg(target_arch = "x86_64")]
+    return match m {
         1 => contains_single_byte(haystack, needle[0]),
         2..=8 => contains_small(haystack, needle),
         _ => contains_big(haystack, needle),
-    }
+    };
+    // memchr's searcher, NEON-vectorised on aarch64.
+    #[cfg(not(target_arch = "x86_64"))]
+    return memchr::memmem::find(haystack, needle).is_some();
 }
 
 /// Optimized search for single-byte needles
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn contains_single_byte(haystack: &[u8], needle_byte: u8) -> bool {
@@ -937,6 +974,7 @@ unsafe fn contains_single_byte(haystack: &[u8], needle_byte: u8) -> bool {
 ///
 /// # Safety
 /// `h` must point at `m` readable bytes and `n` at the `m`-byte needle.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn middle_matches(h: *const u8, n: *const u8, m: usize) -> bool {
@@ -957,6 +995,7 @@ unsafe fn middle_matches(h: *const u8, n: *const u8, m: usize) -> bool {
 /// `i` and another against the block starting at `i + m - 1`, ANDed together.
 /// Only positions where *both* bytes line up reach the interior comparison,
 /// which for a 2-byte needle is already an exact answer.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn contains_small(haystack: &[u8], needle: &[u8]) -> bool {
@@ -1054,6 +1093,7 @@ unsafe fn contains_small(haystack: &[u8], needle: &[u8]) -> bool {
 /// Both size classes share this: the only thing that differed between the old
 /// medium and large versions was the vector width of the first-byte scan, and
 /// this walks 32 positions at a time for both.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn contains_big(haystack: &[u8], needle: &[u8]) -> bool {
