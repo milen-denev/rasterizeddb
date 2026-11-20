@@ -390,6 +390,36 @@ pub(crate) static SHAPES_SERVED: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
+/// The thread of the test holding [`exclusive`], whose statements alone
+/// reach the log while it does.
+#[cfg(test)]
+static EXCLUSIVE_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// Held by a test that counts what the log holds exactly. Every other
+/// thread's statements are dropped while it is held: a test elsewhere that
+/// runs SQL through a measured path (any native request, any pgwire
+/// statement) records into the same process-wide log, and filled the map
+/// past the count the test was checking. Those tests do not read the log, so
+/// losing their records costs them nothing; serialising them all on
+/// [`TEST_SERIAL`] instead would cost the suite its parallelism.
+#[cfg(test)]
+pub(crate) struct Exclusive(#[allow(dead_code)] parking_lot::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+pub(crate) fn exclusive() -> Exclusive {
+    let serial = TEST_SERIAL.lock();
+    *EXCLUSIVE_OWNER.lock() = Some(std::thread::current().id());
+    Exclusive(serial)
+}
+
+#[cfg(test)]
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        // Before the serial lock this holds is released, with the field.
+        *EXCLUSIVE_OWNER.lock() = None;
+    }
+}
+
 /// One execution in this many of a learned statement is checked against its
 /// text: chosen by the statement's start time, so the check needs no counter
 /// shared across connections.
@@ -529,6 +559,10 @@ pub fn finish(
     username: &str,
     error: Option<&str>,
 ) {
+    #[cfg(test)]
+    if EXCLUSIVE_OWNER.lock().is_some_and(|owner| owner != std::thread::current().id()) {
+        return;
+    }
     // A console asking the server about itself is not what this log is for.
     // Dropped here rather than before the statement ran, because that is the
     // one place the text is known and the cost of having timed it is an
@@ -1120,7 +1154,6 @@ fn is_internal_name(word: &str) -> bool {
 mod tests {
     use super::*;
 
-    use super::TEST_SERIAL as SERIAL;
 
     // --- what the log refuses to hold
 
@@ -1274,7 +1307,7 @@ mod tests {
     /// read zero however well they were counted.
     #[test]
     fn what_was_materialised_reaches_the_record_and_the_aggregate() {
-        let _guard = SERIAL.lock();
+        let _guard = super::exclusive();
         reset();
         set_enabled(true);
 
@@ -1307,7 +1340,7 @@ mod tests {
     /// failed is rare by construction.
     #[test]
     fn an_introspection_statement_that_failed_is_kept() {
-        let _guard = SERIAL.lock();
+        let _guard = super::exclusive();
         reset();
         set_enabled(true);
 
@@ -1338,7 +1371,7 @@ mod tests {
     /// not a call on an existing shape.
     #[test]
     fn a_dropped_statement_reaches_neither_half_of_the_log() {
-        let _guard = SERIAL.lock();
+        let _guard = super::exclusive();
         reset();
         set_enabled(true);
 
@@ -1480,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_statement_records_what_it_did() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         set_capacity(8);
         let recording = begin().expect("enabled by default");
@@ -1528,7 +1561,7 @@ mod tests {
     #[test]
     #[ignore]
     fn query_stats_finish_bench() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let texts: Vec<String> = (0..MAX_DISTINCT * 5)
             .map(|i| format!("SELECT c{i} FROM some_table WHERE x = 1"))
@@ -1562,7 +1595,7 @@ mod tests {
 
     #[test]
     fn a_full_map_evicts_a_batch_of_the_coldest() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         for i in 0..MAX_DISTINCT {
             let r = begin().unwrap();
@@ -1592,7 +1625,7 @@ mod tests {
     /// secret beyond the cut is not kept either.
     #[test]
     fn a_huge_statement_is_kept_bounded() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let mut sql = String::from("INSERT INTO t VALUES ");
         while sql.len() < 1 << 20 {
@@ -1609,7 +1642,7 @@ mod tests {
 
     #[test]
     fn the_ring_and_the_map_are_bounded() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         set_capacity(4);
         for i in 0..20 {
@@ -1626,7 +1659,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_recorded_as_one() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let r = begin().unwrap();
         finish(r, "SELECT * FROM nope", "db", "u", Some("table not found"));
@@ -1692,7 +1725,7 @@ mod tests {
     /// each carried and whether or not it was a checked one.
     #[test]
     fn a_learned_statement_is_recorded_as_its_text_would_be() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let shape = Arc::new(ShapeStats::default());
         let texts: Vec<String> = (0..200)
@@ -1716,7 +1749,7 @@ mod tests {
     /// good: what follows is recorded as its text says.
     #[test]
     fn a_checked_execution_that_disagrees_turns_the_cache_off() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let sql = "SELECT * FROM t WHERE id = 7";
         let truth = hash_query(&normalize(sql));
@@ -1739,7 +1772,7 @@ mod tests {
     /// statement's answer was for its text as written.
     #[test]
     fn a_statement_kept_otherwise_than_written_is_normalised_as_kept() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let shape = seeded(42, "a stale answer");
         let sql = "SELECT * FROM t WHERE a = 1 AND note = 'x' PASSWORD 'hunter2'";
@@ -1756,7 +1789,7 @@ mod tests {
     /// outside one it goes nowhere.
     #[tokio::test]
     async fn a_noted_shape_reaches_the_record() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let shape = seeded(42, "SELECT * FROM t WHERE id = $1");
         note_shape(&shape);
