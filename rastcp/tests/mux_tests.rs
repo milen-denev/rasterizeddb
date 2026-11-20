@@ -843,3 +843,110 @@ async fn a_request_that_was_begun_is_finished_though_its_connection_is_lost() {
     })
     .await
 }
+
+// ---------------------------------------------------------------------------
+// A request alone on its connection (`TcpServerBuilder::drive_alone`, on by
+// default): driven by the connection's own task until another arrives.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_request_does_not_hold_back_one_that_arrives_while_it_waits() {
+    bounded(async {
+        let running = serve().await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+
+        // Alone on the connection: the connection drives it.
+        let slow_client = client.clone();
+        let slow = tokio::spawn(async move {
+            let request = request(SLOW, 3, 64);
+            let started = Instant::now();
+            let response = slow_client.send(&request).await.unwrap();
+            (response == request, started.elapsed())
+        });
+        sleep(SLOW_FOR / 8).await;
+
+        // Arrives while it waits: answered at once, not after it.
+        let started = Instant::now();
+        let echo = request(ECHO, 4, 64);
+        assert_eq!(client.send(&echo).await.unwrap(), echo);
+        let took = started.elapsed();
+        assert!(took < SLOW_FOR / 2, "the second request waited {took:?} behind the first");
+
+        let (same, slow_took) = slow.await.unwrap();
+        assert!(same, "the lone request got another's response");
+        assert!(slow_took >= SLOW_FOR, "the lone request ended early, after {slow_took:?}");
+
+        // And alone again afterwards, many times over.
+        for seed in 0..200usize {
+            let echo = request(ECHO, seed, seed * 7);
+            assert_eq!(client.send(&echo).await.unwrap(), echo);
+        }
+        running.task.abort();
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_request_that_panics_is_answered_and_the_connection_goes_on() {
+    bounded(async {
+        let running = serve().await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+        for round in 0..3usize {
+            let outcome = client.send(&request(PANIC, round, 16)).await;
+            assert!(matches!(outcome, Err(RastcpError::ProtocolError(_))), "got {outcome:?}");
+            let echo = request(ECHO, round, 16);
+            assert_eq!(client.send(&echo).await.unwrap(), echo);
+        }
+        assert_eq!(running.server.active_connections(), 1);
+        running.task.abort();
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_request_times_out_as_a_task_does() {
+    bounded(async {
+        let running = serve_with(|builder| builder.request_timeout(SLOW_FOR / 4), respond).await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+        let started = Instant::now();
+        let outcome = client.send(&request(SLOW, 1, 16)).await;
+        assert!(matches!(outcome, Err(RastcpError::HandlerTimeout)), "got {outcome:?}");
+        assert!(started.elapsed() < SLOW_FOR, "the timeout did not cut it short");
+        let echo = request(ECHO, 2, 16);
+        assert_eq!(client.send(&echo).await.unwrap(), echo);
+        running.task.abort();
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_request_is_finished_when_its_peer_goes() {
+    bounded(async {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let counted = finished.clone();
+        let running = serve_with(
+            |builder| builder,
+            move |data: Vec<u8>| {
+                let counted = counted.clone();
+                async move {
+                    sleep(SLOW_FOR / 2).await;
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    data
+                }
+            },
+        )
+        .await;
+        let client = mux(&running.addr, Duration::from_secs(30)).await;
+        let sender = client.clone();
+        let sent = tokio::spawn(async move { sender.send(&request(ECHO, 1, 16)).await });
+        until("the request reached the server", || running.server.active_connections() == 1).await;
+        sleep(SLOW_FOR / 8).await;
+        // The peer goes while the request waits: it is finished anyway.
+        sent.abort();
+        drop(client);
+        until("the connection closed", || running.server.active_connections() == 0).await;
+        until("the request finished", || finished.load(Ordering::SeqCst) == 1).await;
+        running.task.abort();
+    })
+    .await
+}

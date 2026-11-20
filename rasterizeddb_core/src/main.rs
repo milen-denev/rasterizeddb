@@ -1,3 +1,8 @@
+// The library's limit (`lib.rs`): the native listener's server is
+// instantiated here with the database's handler, and proving its futures
+// `Send` runs as deep as the library's own.
+#![recursion_limit = "256"]
+
 use std::env;
 
 use clap::Parser;

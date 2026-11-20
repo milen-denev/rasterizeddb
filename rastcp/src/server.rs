@@ -128,6 +128,7 @@ pub struct TcpServerBuilder {
     max_message_size: usize,
     max_in_flight: usize,
     inline_handlers: bool,
+    drive_alone: bool,
     shutdown_grace: Duration,
     client_auth: ClientAuth,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -168,6 +169,7 @@ pub struct TcpServer {
     max_message_size: usize,
     max_in_flight: usize,
     inline_handlers: bool,
+    drive_alone: bool,
     shutdown_grace: Duration,
     auth_timeout: Duration,
     authenticator: Option<Arc<dyn ServerAuthenticator>>,
@@ -192,6 +194,7 @@ impl TcpServerBuilder {
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             inline_handlers: false,
+            drive_alone: true,
             shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             client_auth: ClientAuth::None,
             authenticator: None,
@@ -428,6 +431,31 @@ impl TcpServerBuilder {
         self
     }
 
+    /// Whether a multiplexed connection runs a request itself while it is
+    /// the only one the connection has. On by default.
+    ///
+    /// A request that arrives when nothing else is in flight and nothing is
+    /// queued behind it is driven by the connection's own task, across its
+    /// waits, while the connection goes on reading. The moment another frame
+    /// arrives, that request is handed to the runtime like any other, and
+    /// the new one is too: requests that overlap run on every core at once,
+    /// as with this off. What it saves is the task each request otherwise
+    /// costs (a spawn, a join, a wake-up of another worker): about a sixth of
+    /// a point query on the database, for every client that sends one
+    /// request at a time on a connection, which is how a pool of connections
+    /// is used.
+    ///
+    /// The cost is bounded by one stretch of computing: a frame that arrives
+    /// while the connection's request is computing between two waits is read
+    /// when that stretch ends. A request driven this way keeps the request
+    /// timeout, and one that panics is answered as failed, as a task's is.
+    /// Ignored with [`Self::inline_handlers`], which polls every handler
+    /// first.
+    pub fn drive_alone(mut self, drive: bool) -> Self {
+        self.drive_alone = drive;
+        self
+    }
+
     /// How long a shutdown waits for in-flight connections before closing them
     /// anyway. Past this point a stuck handler would keep the process alive.
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
@@ -499,6 +527,7 @@ impl TcpServerBuilder {
                 max_message_size: self.max_message_size,
                 max_in_flight: self.max_in_flight,
                 inline_handlers: self.inline_handlers,
+                drive_alone: self.drive_alone,
                 shutdown_grace: self.shutdown_grace,
                 auth_timeout: self.auth_timeout,
                 authenticator: self.authenticator,
@@ -582,6 +611,7 @@ impl TcpServerBuilder {
             max_message_size: self.max_message_size,
             max_in_flight: self.max_in_flight,
             inline_handlers: self.inline_handlers,
+            drive_alone: self.drive_alone,
             shutdown_grace: self.shutdown_grace,
             auth_timeout: self.auth_timeout,
             authenticator: self.authenticator,
@@ -882,6 +912,7 @@ impl TcpServer {
         let max_message_size = self.max_message_size;
         let max_in_flight = self.max_in_flight;
         let inline_handlers = self.inline_handlers;
+        let drive_alone = self.drive_alone;
         let authenticator = self.authenticator.clone();
 
         self.accept_loop(move |stream, peer, connection_shutdown| {
@@ -900,6 +931,7 @@ impl TcpServer {
                     max_message_size,
                     max_in_flight,
                     inline_handlers,
+                    drive_alone,
                     authenticator,
                     connection_shutdown,
                     open,
@@ -1271,6 +1303,7 @@ impl TcpServer {
         reader: &mut FrameReader,
         tls_stream: &mut ServerStream,
         in_flight: &mut InFlight,
+        local: &mut Option<Local>,
         cx: &mut std::task::Context<'_>,
         reading: bool,
         max_message_size: usize,
@@ -1278,6 +1311,24 @@ impl TcpServer {
         if !in_flight.is_empty() {
             if let std::task::Poll::Ready(Some(done)) = in_flight.poll_join_next_with_id(cx) {
                 return std::task::Poll::Ready(Event::Done(done));
+            }
+        }
+
+        if let Some(running) = local.as_mut() {
+            let id = running.id;
+            // Caught as a task's panic is caught by the runtime: the request
+            // is answered as failed and the connection goes on.
+            let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| running.call.as_mut().poll(cx)));
+            match polled {
+                Ok(std::task::Poll::Pending) => {}
+                Ok(std::task::Poll::Ready(answer)) => {
+                    *local = None;
+                    return std::task::Poll::Ready(Event::Local(id, Some(answer.ok())));
+                }
+                Err(_) => {
+                    *local = None;
+                    return std::task::Poll::Ready(Event::Local(id, None));
+                }
             }
         }
 
@@ -1313,6 +1364,7 @@ impl TcpServer {
         request_timeout: Duration,
         max_in_flight: usize,
         inline_handlers: bool,
+        drive_alone: bool,
     ) where
         H: Fn(Vec<u8>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = Vec<u8>> + Send + 'static,
@@ -1329,20 +1381,25 @@ impl TcpServer {
         // it costs no allocation; one that does not takes the cell with it to
         // its task.
         let mut cell: std::pin::Pin<Box<Option<Fut>>> = Box::pin(None);
+        // With `drive_alone`, the one request this task is driving itself:
+        // taken only when it arrived to a connection with nothing else in
+        // flight or queued, and handed to `in_flight` when another frame
+        // arrives (see [`TcpServerBuilder::drive_alone`]).
+        let mut local = LocalSlot(None);
         // Set once the server is stopping: no more requests are read, the
         // ones being handled are answered, and then the connection closes.
         let mut draining = false;
 
         'connection: loop {
-            if draining && in_flight.is_empty() {
+            if draining && in_flight.is_empty() && local.0.is_none() {
                 debug!("Shutting down, closing connection to {}", peer_addr);
                 break;
             }
 
             let reading = !draining && in_flight.len() < max_in_flight;
-            let idle = in_flight.is_empty();
+            let idle = in_flight.is_empty() && local.0.is_none();
             let wait = std::future::poll_fn(|cx| {
-                Self::poll_event(&mut reader, tls_stream, &mut in_flight, cx, reading, max_message_size)
+                Self::poll_event(&mut reader, tls_stream, &mut in_flight, &mut local.0, cx, reading, max_message_size)
             });
 
             // An idle connection is closed after the timeout, as a plain one
@@ -1390,6 +1447,26 @@ impl TcpServer {
                     Event::Frame(Ok((tag, data))) if !inline_handlers => {
                         debug!("Received {} bytes from {}", data.len(), peer_addr);
 
+                        // Another request: the one this task was driving
+                        // is no longer alone, and goes to the runtime.
+                        if let Some(Local { id, call }) = local.0.take() {
+                            let task = in_flight.spawn(async move { (id, call.await.ok()) });
+                            ids.insert(task.id(), id);
+                        }
+                        if drive_alone && in_flight.is_empty() && !reader.has_buffered() {
+                            local.0 = Some(Local {
+                                id: tag.id,
+                                // Erased first, then timed: the handler's own
+                                // future is proven `Send` at the coercion, as
+                                // shallow as it can be (see [`Local`]).
+                                call: {
+                                    let erased: std::pin::Pin<Box<dyn Future<Output = Vec<u8>> + Send>> =
+                                        Box::pin(handler(data));
+                                    Box::pin(tokio::time::timeout(request_timeout, erased))
+                                },
+                            });
+                            Ok(())
+                        } else {
                         let handler = handler.clone();
                         let id = tag.id;
                         let task = in_flight.spawn(async move {
@@ -1402,6 +1479,20 @@ impl TcpServer {
                         });
                         ids.insert(task.id(), id);
                         Ok(())
+                        }
+                    }
+                    Event::Local(id, Some(Some(response))) => {
+                        debug!("Replying with {} bytes to {}", response.len(), peer_addr);
+                        Self::reply(guard, &mut writer, tls_stream, Tag::data(id), &response).await
+                    }
+                    Event::Local(id, Some(None)) => {
+                        error!("Handler timed out for {}", peer_addr);
+                        Self::reply(guard, &mut writer, tls_stream, Tag { id, kind: KIND_TIMED_OUT }, &[]).await
+                    }
+                    Event::Local(id, None) => {
+                        error!("Handler failed for {}: it panicked", peer_addr);
+                        let tag = Tag { id, kind: KIND_FAILED };
+                        Self::reply(guard, &mut writer, tls_stream, tag, b"the handler panicked").await
                     }
                     Event::Frame(Ok((tag, data))) => {
                         debug!("Received {} bytes from {}", data.len(), peer_addr);
@@ -1607,6 +1698,7 @@ impl TcpServer {
         max_message_size: usize,
         max_in_flight: usize,
         inline_handlers: bool,
+        drive_alone: bool,
         authenticator: Option<Arc<dyn ServerAuthenticator>>,
         shutdown: StopListener,
         open: M,
@@ -1671,6 +1763,7 @@ impl TcpServer {
                 request_timeout,
                 max_in_flight,
                 inline_handlers,
+                drive_alone,
             )
             .await;
         } else {
@@ -1761,6 +1854,45 @@ enum Event {
     Frame(Result<(Tag, Vec<u8>), RastcpError>),
     /// A handler finished, or panicked.
     Done(Result<(tokio::task::Id, (u32, Option<Vec<u8>>)), tokio::task::JoinError>),
+    /// The request the connection was driving itself (`drive_alone`)
+    /// finished: its id, and `Some(answer)` (`None` inside when it timed
+    /// out), or `None` when it panicked.
+    Local(u32, Option<Option<Vec<u8>>>),
+}
+
+/// The one request a multiplexed connection drives on its own task
+/// ([`TcpServerBuilder::drive_alone`]), under the request timeout. Boxed, so
+/// it moves to a task of its own without being copied.
+///
+/// Held as a trait object rather than as `Fut`: the connection's own future
+/// then does not carry the handler's whole future type inside it, which
+/// took the compiler past its recursion limit proving that the database
+/// server's future is `Send`.
+struct Local {
+    id: u32,
+    call: LocalCall,
+}
+
+type LocalCall = std::pin::Pin<
+    Box<dyn Future<Output = Result<Vec<u8>, tokio::time::error::Elapsed>> + Send + 'static>,
+>;
+
+/// Where a connection keeps its [`Local`] request. Dropped with one still in
+/// it (a lost peer, an error, a panic of the connection's task), it lets the
+/// request finish as a task rather than cancelling it wherever it waits, as
+/// [`InFlight`] lets its tasks go.
+struct LocalSlot(Option<Local>);
+
+impl Drop for LocalSlot {
+    fn drop(&mut self) {
+        if let Some(Local { call, .. }) = self.0.take() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                drop(runtime.spawn(async move {
+                    let _ = call.await;
+                }));
+            }
+        }
+    }
 }
 
 /// Polls `future` once: its output if it had one ready, `None` if it has to
