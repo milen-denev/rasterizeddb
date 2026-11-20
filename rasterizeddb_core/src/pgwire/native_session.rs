@@ -302,10 +302,10 @@ pub(crate) enum NativeTextStep {
     /// The learned parse, with this statement's values, and the description
     /// its rows were learned under (what a retag reads).
     Run {
-        template: StdArc<str>,
+        template: String,
         rows: Box<crate::core::rql::prepared::PreparedRows>,
-        fields: Option<Vec<(String, DbType)>>,
-        scales: Option<Vec<u32>>,
+        fields: Option<super::LearnedFields>,
+        scales: Option<super::LearnedScales>,
     },
     /// The plain native path, watched: hand its capture to
     /// [`NativeSession::text_learn`].
@@ -316,7 +316,7 @@ pub(crate) enum NativeTextStep {
 pub(crate) struct NativeWatch {
     /// The statement itself, described while it is learned.
     query: String,
-    template: StdArc<str>,
+    template: String,
     literals: Vec<String>,
     classes: Vec<u8>,
     generation: u64,
@@ -359,7 +359,6 @@ impl NativeSession {
         let Some((template, literals)) = super::text_template(query) else {
             return NativeTextStep::Plain;
         };
-        let template: StdArc<str> = template.into();
         let generation = self.database.schema_generation.load(Ordering::Acquire);
         let classes: Option<Vec<u8>> = literals.iter().map(|x| pr::literal_class(x)).collect();
         let literals = Some(literals);
@@ -395,7 +394,7 @@ impl NativeSession {
         };
         capture.description = Some(description);
         let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(shape) = shapes.get_mut(&watch.template) else {
+        let Some(shape) = shapes.get_mut(watch.template.as_str()) else {
             return;
         };
         if !std::ptr::eq(shape.generations.as_ptr(), StdArc::as_ptr(&self.database.schema_generation)) {

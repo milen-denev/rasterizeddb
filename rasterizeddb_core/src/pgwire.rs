@@ -3476,8 +3476,8 @@ struct PreparedLearned {
     /// ones, and the class every value must keep.
     literals: Vec<String>,
     classes: Vec<u8>,
-    fields: Option<Vec<(String, DbType)>>,
-    scales: Option<Vec<u32>>,
+    fields: Option<LearnedFields>,
+    scales: Option<LearnedScales>,
     /// Watched executions that could not teach anything (repeated values, a
     /// literal seen twice). Past a few, the statement stops being watched.
     misses: u8,
@@ -3502,9 +3502,15 @@ struct PreparedLearned {
 /// the text path sent its rows under.
 struct PreparedRun {
     rows: Box<crate::core::rql::prepared::PreparedRows>,
-    fields: Option<Vec<(String, DbType)>>,
-    scales: Option<Vec<u32>>,
+    fields: Option<LearnedFields>,
+    scales: Option<LearnedScales>,
 }
+
+/// A learned statement's result description, shared by every run it answers
+/// rather than copied into each (one `String` per column).
+pub(crate) type LearnedFields = StdArc<[(String, DbType)]>;
+/// A learned statement's result scales; see [`LearnedFields`].
+pub(crate) type LearnedScales = StdArc<[u32]>;
 
 struct StatementInfo {
     /// Shared rather than owned: every `Execute` and `Describe` needs the text
@@ -6969,15 +6975,21 @@ fn watched_slot<'s>(
 fn text_shape_slot<'m>(
     shapes: &'m mut HashMap<StdArc<str>, TextShape>,
     database: &Arc<Database>,
-    template: &StdArc<str>,
+    template: &str,
 ) -> &'m mut PreparedSelect {
-    if !shapes.contains_key(template) && shapes.len() >= TEXT_SHAPES {
-        shapes.clear();
+    // Looked up by the text, so the key is made only for a template not seen
+    // before: the native path runs a learned template without copying its
+    // text into a key every time.
+    if !shapes.contains_key(template) {
+        if shapes.len() >= TEXT_SHAPES {
+            shapes.clear();
+        }
+        shapes.insert(
+            template.into(),
+            TextShape { generations: StdArc::downgrade(&database.schema_generation), prepared: PreparedSelect::Unknown },
+        );
     }
-    let shape = shapes.entry(template.clone()).or_insert_with(|| TextShape {
-        generations: StdArc::downgrade(&database.schema_generation),
-        prepared: PreparedSelect::Unknown,
-    });
+    let shape = shapes.get_mut(template).expect("the template's entry was made above");
     if !std::ptr::eq(shape.generations.as_ptr(), StdArc::as_ptr(&database.schema_generation)) {
         *shape = TextShape {
             generations: StdArc::downgrade(&database.schema_generation),
@@ -7434,8 +7446,8 @@ fn learn_into(
                 template,
                 literals,
                 classes,
-                fields,
-                scales,
+                fields: fields.map(Into::into),
+                scales: scales.map(Into::into),
                 misses: 0,
                 exact: false,
                 route: None,
@@ -7456,8 +7468,8 @@ fn learn_into(
             if l.table_name == table_name
                 && l.shape_epoch == shape_epoch
                 && l.shape == shape
-                && l.fields == fields
-                && l.scales == scales
+                && l.fields.as_deref() == fields.as_deref()
+                && l.scales.as_deref() == scales.as_deref()
                 && l.classes == classes
                 && l.template.render(&literals) == query_row.where_clause
             {
@@ -7480,8 +7492,8 @@ fn learn_into(
             } else if l.table_name == table_name
                 && l.shape_epoch == shape_epoch
                 && l.shape == shape
-                && l.fields == fields
-                && l.scales == scales
+                && l.fields.as_deref() == fields.as_deref()
+                && l.scales.as_deref() == scales.as_deref()
                 && l.classes == classes
                 && l.template.render(&literals) == query_row.where_clause
             {
@@ -7697,8 +7709,8 @@ where
         stmt,
         resp,
         PurposeKind::QueryRows,
-        run.fields,
-        run.scales,
+        run.fields.as_deref().map(std::borrow::Cow::Borrowed),
+        run.scales.as_deref(),
         result_formats,
         omit_description,
     )
@@ -9157,8 +9169,8 @@ where
         stmt,
         resp,
         purpose_kind,
-        select_fields,
-        select_scales,
+        select_fields.map(std::borrow::Cow::Owned),
+        select_scales.as_deref(),
         result_formats,
         omit_description,
     )
@@ -9738,8 +9750,8 @@ async fn send_engine_response<S>(
     stmt: &str,
     resp: Vec<u8>,
     purpose_kind: PurposeKind,
-    select_fields: Option<Vec<(String, DbType)>>,
-    select_scales: Option<Vec<u32>>,
+    select_fields: Option<std::borrow::Cow<'_, [(String, DbType)]>>,
+    select_scales: Option<&[u32]>,
     result_formats: &[i16],
     omit_description: bool,
 ) -> io::Result<()>
@@ -9766,7 +9778,7 @@ where
             };
             #[cfg(feature = "query_stats")]
             crate::core::query_stats::note_rows(rows as u64);
-            state.native_result = Some(native_retag(resp, select_fields.as_deref(), select_scales.as_deref()));
+            state.native_result = Some(native_retag(resp, select_fields.as_deref(), select_scales));
             return send_command_complete(stream, &format!("SELECT {}", rows)).await;
         }
         state.native_result = Some(resp.clone());
@@ -9852,7 +9864,7 @@ where
             if let Err(e) = send_serialized_query_result(
                 stream,
                 Some(&built),
-                select_scales.as_deref(),
+                select_scales,
                 rows_bytes,
                 result_formats,
                 &tag,
@@ -13573,7 +13585,10 @@ fn from_less_first_branch(query: &str) -> Option<Vec<(String, DbType)>> {
 /// statement has them, otherwise one per cell of the first row, named
 /// `columnN` and typed as stored (no rows, no columns). Shared by the sender
 /// and by the shape check, so the description compared is the one sent.
-fn result_columns(fields: Option<Vec<(String, DbType)>>, rows_bytes: &[u8]) -> io::Result<Vec<(String, DbType)>> {
+fn result_columns<'a>(
+    fields: Option<std::borrow::Cow<'a, [(String, DbType)]>>,
+    rows_bytes: &[u8],
+) -> io::Result<std::borrow::Cow<'a, [(String, DbType)]>> {
     if let Some(f) = fields {
         return Ok(f);
     }
@@ -13587,7 +13602,7 @@ fn result_columns(fields: Option<Vec<(String, DbType)>>, rows_bytes: &[u8]) -> i
             meta.push((format!("column{}", i + 1), cell.map_err(invalid)?.column_type));
         }
     }
-    Ok(meta)
+    Ok(std::borrow::Cow::Owned(meta))
 }
 
 /// [`send_query_result`] over the engine's serialized rows, encoding each
