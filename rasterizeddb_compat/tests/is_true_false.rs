@@ -50,6 +50,15 @@ async fn truth_tests_follow_three_valued_logic() {
         ("NULL IS NOT FALSE AND (true IS NOT FALSE) AND flag", vec![1, 4]),
         ("NOT (false IS TRUE) AND id > 3", vec![4]),
         ("true IS UNKNOWN", vec![]),
+        // A comparison binds tighter than IS: `n > 4 IS TRUE` tests
+        // `(n > 4)` (a syntax error before).
+        ("n > 4 IS TRUE", vec![1, 2]),
+        ("n > 4 IS NOT TRUE", vec![3, 4]),
+        ("flag = true IS NOT TRUE", vec![2, 3]),
+        ("n = 5 IS UNKNOWN", vec![3]),
+        ("n BETWEEN 1 AND 5 IS TRUE", vec![1, 4]),
+        ("id > 1 AND n + 1 > 5 IS NOT FALSE", vec![2, 3]),
+        ("NOT n > 4 IS TRUE", vec![3, 4]),
         // An untyped NULL where a condition stands is unknown.
         ("NOT NULL", vec![]),
         ("flag OR NULL", vec![1, 4]),

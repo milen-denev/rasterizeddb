@@ -272,9 +272,9 @@ fn expand_truth_tests<'c>(
     if !maybe {
         return Ok(std::borrow::Cow::Borrowed(clause));
     }
-    let toks = lex(clause)?;
+    let (toks, grouped) = group_compared_truth_operands(lex(clause)?);
     let mut out: Vec<String> = Vec::with_capacity(toks.len());
-    let mut changed = false;
+    let mut changed = grouped;
     let mut i = 0usize;
     while i < toks.len() {
         // A constant's truth, `false IS NOT TRUE`, `NULL IS UNKNOWN`: the
@@ -315,6 +315,97 @@ fn expand_truth_tests<'c>(
     } else {
         std::borrow::Cow::Borrowed(clause)
     })
+}
+
+/// `b = true IS TRUE` as `(b = true) IS TRUE`: a comparison binds tighter
+/// than `IS`, so the truth test's operand is the whole comparison back to the
+/// term's start (`AND`, `OR`, `NOT`, `WHERE` or an open parenthesis). It was a
+/// syntax error; parenthesised, [`parenthesised_truth_test`] reads it. The
+/// tokens and whether any were grouped.
+fn group_compared_truth_operands(mut toks: Vec<Tok>) -> (Vec<Tok>, bool) {
+    const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
+    let mut grouped = false;
+    let mut i = 0usize;
+    while i < toks.len() {
+        let is_test = toks[i].is_keyword("IS") && {
+            let at = i + 1 + usize::from(toks.get(i + 1).is_some_and(|t| t.is_keyword("NOT")));
+            toks.get(at).is_some_and(|t| t.is_keyword("TRUE") || t.is_keyword("FALSE") || t.is_keyword("UNKNOWN"))
+        };
+        if !is_test || i == 0 || matches!(toks[i - 1], Tok::RPar) && toks_open_at(&toks, i - 1).is_some_and(|o| group_starts_term(&toks, o)) {
+            i += 1;
+            continue;
+        }
+        // Back to the term's start, at depth zero.
+        let mut depth = 0i32;
+        let mut start = i;
+        let mut compared = false;
+        while start > 0 {
+            let t = &toks[start - 1];
+            match t {
+                Tok::RPar => depth += 1,
+                Tok::LPar if depth == 0 => break,
+                Tok::LPar => depth -= 1,
+                // The `AND` of a `BETWEEN a AND b` is the comparison's own.
+                _ if depth == 0 && t.is_keyword("AND") && between_before(&toks, start - 1) => {}
+                _ if depth == 0 && t.is_keyword("BETWEEN") => compared = true,
+                _ if depth == 0 && ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| t.is_keyword(k)) => break,
+                Tok::Sym(sym) if depth == 0 && COMPARISONS.contains(&sym.as_str()) => compared = true,
+                _ => {}
+            }
+            start -= 1;
+        }
+        if compared && start < i {
+            toks.insert(i, Tok::RPar);
+            toks.insert(start, Tok::LPar);
+            grouped = true;
+            i += 2;
+        }
+        i += 1;
+    }
+    (toks, grouped)
+}
+
+/// Whether the `AND` at `and` closes a `BETWEEN`: one stands before it, at
+/// the same depth, with no other `AND`/`OR` between them.
+fn between_before(toks: &[Tok], and: usize) -> bool {
+    let mut depth = 0i32;
+    for j in (0..and).rev() {
+        match &toks[j] {
+            Tok::RPar => depth += 1,
+            Tok::LPar if depth == 0 => return false,
+            Tok::LPar => depth -= 1,
+            t if depth == 0 && t.is_keyword("BETWEEN") => return true,
+            t if depth == 0 && (t.is_keyword("AND") || t.is_keyword("OR")) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The index of the parenthesis that the one closing at `close` opened.
+fn toks_open_at(toks: &[Tok], close: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for j in (0..=close).rev() {
+        match toks[j] {
+            Tok::RPar => depth += 1,
+            Tok::LPar => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a group opening at `open` is a term's whole operand: nothing but
+/// a term boundary before it.
+fn group_starts_term(toks: &[Tok], open: usize) -> bool {
+    open == 0
+        || matches!(toks[open - 1], Tok::LPar)
+        || ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| toks[open - 1].is_keyword(k))
 }
 
 /// `( <boolean expression> ) IS [NOT] TRUE | FALSE | UNKNOWN` starting at the
