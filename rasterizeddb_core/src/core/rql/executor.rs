@@ -1161,6 +1161,17 @@ pub async fn substitute_in_subqueries(
     crate::owner_probe!(crate::core::mvcc::owner::probe::Site::Subquery, tx, database);
     const MAX_SUBQUERIES: usize = 8;
 
+    // An `INSERT … ON CONFLICT … DO UPDATE`'s clause is the conflict's own,
+    // run per conflict over `excluded` and the row that conflicted
+    // (`lexer_s1::conflict_update_at`): only the rows' part is flattened.
+    let head = sql.trim_start();
+    if head.len() > 6 && head.as_bytes()[..6].eq_ignore_ascii_case(b"INSERT")
+        && let Some(at) = crate::core::rql::lexer_s1::conflict_update_at(sql)
+    {
+        let rows = Box::pin(substitute_in_subqueries(&sql[..at], database, tx)).await?;
+        return Ok(format!("{} {}", rows.trim_end(), &sql[at..]));
+    }
+
     let mut current = sql.to_string();
     let write_statement = {
         let head = sql.trim_start();
@@ -8089,6 +8100,14 @@ async fn apply_conflict_update(
         let text = crate::core::sql_scan::resolve_qualifiers(text, &allowed, "excluded", "EXCLUDED", &known)
             .map_err(|q| crate::core::sql_scan::missing_from_entry(&q))?;
         let text = substitute_excluded(&text, &inserted)?;
+        // A subquery is the UPDATE's to flatten, inside its attempt, as a
+        // written UPDATE's is: folded here, `(SELECT max(n) FROM t) + 1`
+        // lost its parentheses and read as a name ("is neither a column nor
+        // a value"). Before, the INSERT's own pass had flattened it, under
+        // a snapshot taken before the conflict.
+        if has_subquery(&text) {
+            return Ok(text);
+        }
         Ok(fold_constants_in_predicate(&text))
     };
 
@@ -8223,7 +8242,10 @@ fn conflict_update_refusal(
         ((message.starts_with("column \"") || message.starts_with("column excluded."))
             && message.ends_with(" does not exist"))
             || message.starts_with("missing FROM-clause entry for table ")
-            || (message.starts_with('\'') && message.ends_with("' is neither a column nor a value"))
+            || message
+                .strip_prefix('\'')
+                .and_then(|m| m.strip_suffix("' is neither a column nor a value"))
+                .is_some_and(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.'))
     };
     let resolve = |text: &str| -> Result<String, Option<String>> {
         let text = crate::core::sql_scan::resolve_qualifiers(text, &allowed, "excluded", "EXCLUDED", &known)
