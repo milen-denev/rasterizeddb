@@ -1483,9 +1483,12 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   `upper_inc`, `lower_inf`, `upper_inf`, `range_merge`, the set operators
   `*`, `+`, `-` (a union or difference that is not one range is 22000), and
   `@>`, `<@`, `&&`, `<<`, `>>`, `&<`, `&>`, `-|-`. A lower bound above the
-  upper (`'[5,1)'`) is 22000, not `empty`. In a `WHERE`, a range operator
-  takes a column and a literal; one whose operand is computed
-  (`r && int4range(5, 25)`) is refused.
+  upper (`'[5,1)'`) is 22000, not `empty`. In a `WHERE`, a range column
+  against a literal is the scan's own comparison; any other range operand
+  (`int4range(lo, hi) @> 5`, `r * '[5,25)' = …`, `'[0,9)'::int4range @> r`)
+  is read by the select list's evaluator, NULLs unknown under `NOT`. An
+  untyped literal beside a range is that range type (`r * '[5,25)'`,
+  `range_merge(r, '[4,5)')`).
 - **Undefined names** are PostgreSQL's errors: a name that is no column is
   42703 `column "x" does not exist` (or `column t.x …`) wherever it is
   written — inside an expression, a `CASE`, `HAVING`, `ON`, a subquery — and

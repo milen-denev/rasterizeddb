@@ -2739,6 +2739,14 @@ fn jsonb_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>, S
         return Ok(None);
     }
     let (left, right) = (parse(left, schema)?, parse(right, schema)?);
+    // A range's containment, not a document's: the expression the select
+    // list reads (`structural`), as a bare boolean. `NOT (int4range(a, b)
+    // @> 3)` was "invalid input syntax for type json".
+    if crate::core::rql::pg_functions::is_range(&static_type(&left))
+        || crate::core::rql::pg_functions::is_range(&static_type(&right))
+    {
+        return Ok(None);
+    }
     let call = if len == 1 {
         Expr::Call(TextFunc::JsonbHasKey, vec![left, right])
     } else if swapped {
@@ -3964,6 +3972,21 @@ pub(crate) fn arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> 
         && (crate::core::rql::pg_functions::is_range(t) || crate::core::rql::pg_functions::is_range(u))
     {
         let symbol = op.symbol();
+        // An untyped literal beside a range is that range type, as
+        // PostgreSQL resolves `r * '[5,25)'`.
+        let coerce = |bytes: &[u8], range: &DbType| -> Result<Vec<u8>, String> {
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|text| crate::core::pg_types::parse_range(range, text))
+                .ok_or_else(|| format!("malformed range literal: \"{}\"", String::from_utf8_lossy(bytes)))
+        };
+        let is_range = crate::core::rql::pg_functions::is_range;
+        let (x, y, t, u): (Vec<u8>, Vec<u8>, &DbType, &DbType) = match (t, u) {
+            (DbType::STRING, range) if is_range(range) => (coerce(x, range)?, y.to_vec(), range, u),
+            (range, DbType::STRING) if is_range(range) => (x.to_vec(), coerce(y, range)?, t, range),
+            _ => (x.to_vec(), y.to_vec(), t, u),
+        };
+        let (x, y) = (&x, &y);
         if t != u || !matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul) {
             return Err(format!(
                 "operator does not exist: {} {symbol} {}",

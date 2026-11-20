@@ -3627,6 +3627,7 @@ pub fn lift_evaluated_operands(
         && !char_lift_needed(clause, schema)
         && !reads_legacy_char(clause, schema)
         && !mentions_distinct_from(clause)
+        && !mentions_range(clause)
     {
         return Ok(clause.to_string());
     }
@@ -4034,7 +4035,7 @@ fn lift_term(
     depth: usize,
 ) -> Result<String, String> {
     let plain = !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema);
-    if plain && !mentions_distinct_from(term) {
+    if plain && !mentions_distinct_from(term) && !mentions_range(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -4054,6 +4055,7 @@ fn lift_term(
         || quantified_over_expression(body)
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
+        || compares_a_computed_range(body, schema)
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
@@ -4100,6 +4102,43 @@ fn distinct_from_expression(body: &str, schema: &SmallVec<[SchemaField; 20]>) ->
 /// `interval` (`ts - TIMESTAMP '2024-01-01' > interval '30 days'`): the scan
 /// compares only scalar types (`EvaluatedOperand::new`), and refused it; the
 /// evaluator orders intervals as PostgreSQL does, a day as 24 hours.
+/// Whether `text` may hold a range operand: the word anywhere, outside
+/// quotes or not (`int4range(…)`, `::daterange`, `range_merge`). Only the
+/// gate; [`compares_a_computed_range`] decides each term.
+fn mentions_range(text: &str) -> bool {
+    text.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"range"))
+}
+
+/// Whether `body` compares a range the row computes — `int4range(lo, hi) @>
+/// 5`, `r * '[5,25)'::int4range = '[5,10)'`, `'[0,100)'::int4range @> r` —
+/// which only the evaluator reads (`range_ops`): the scan's operand was
+/// refused ("yields a INT4RANGE value, which a WHERE clause cannot compare
+/// yet"). A range column on the left of a literal stays the scan's own,
+/// sargable comparison (`pg_ops`).
+fn compares_a_computed_range(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::rql::expr::{parse, static_type, Expr};
+    if !mentions_range(body) {
+        return false;
+    }
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    let (left, right) = (body[..at].trim(), body[end..].trim());
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    let (Ok(l), Ok(r)) = (parse(left, schema), parse(right, schema)) else {
+        return false;
+    };
+    let is_range = |e: &Expr| crate::core::rql::pg_functions::is_range(&static_type(e));
+    let literal = |e: &Expr| match e {
+        Expr::Literal { .. } | Expr::Null => true,
+        Expr::Cast(inner, _) => matches!(**inner, Expr::Literal { .. } | Expr::Null),
+        _ => false,
+    };
+    (is_range(&l) || is_range(&r)) && !(matches!(l, Expr::Column(_)) && literal(&r))
+}
+
 fn compares_an_interval(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
     let Some((at, end, false)) = comparison_operator(body) else {
         return false;
