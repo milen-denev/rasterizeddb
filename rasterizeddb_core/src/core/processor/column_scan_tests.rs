@@ -1077,3 +1077,190 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
     let writes = writer.await.expect("the writer");
     assert!(reads > 100 && writes > 100, "{reads} reads beside {writes} writes: too few to have overlapped");
 }
+
+/// `ORDER BY … LIMIT` statements the scan answers with a bounded top-N. Every
+/// one ends its keys with `id`, so no two rows tie and the page is one page
+/// whichever worker met which row first.
+const TOP_N: &[&str] = &[
+    "SELECT id, i32c FROM t ORDER BY i32c, id LIMIT 25",
+    "SELECT id, i32c FROM t ORDER BY i32c DESC, id LIMIT 25",
+    "SELECT id, s FROM t ORDER BY s DESC, id LIMIT 40",
+    "SELECT id, s2, n FROM t WHERE i32c > 0 ORDER BY s2, id DESC LIMIT 15",
+    "SELECT id, f, ts FROM t ORDER BY f DESC, ts, id LIMIT 30",
+    "SELECT id, u64c FROM t WHERE s = 'x5' ORDER BY u64c DESC, id LIMIT 10",
+    "SELECT id, n FROM t ORDER BY n, id LIMIT 20 OFFSET 30",
+    "SELECT id, i8c, flag FROM t ORDER BY flag DESC, i8c, id LIMIT 12",
+    "SELECT id, r, i16c, u8c FROM t ORDER BY r, i16c DESC, u8c, id LIMIT 33",
+    "SELECT id FROM t ORDER BY id DESC LIMIT 5",
+    "SELECT id, s, s2 FROM t ORDER BY s2 DESC, s, id LIMIT 60",
+    "SELECT id, i64c, u16c FROM t WHERE u8c < 200 ORDER BY i64c, u16c DESC, id LIMIT 1",
+    "SELECT id, ts FROM t ORDER BY ts DESC, id LIMIT 200",
+    // Nothing matches; and more asked for than there is.
+    "SELECT id, k FROM t WHERE k > 1000 ORDER BY k, id LIMIT 5",
+    "SELECT id, u32c FROM t WHERE i8c = 7 ORDER BY u32c, id LIMIT 5000",
+];
+
+/// A top-N scan that reads its keys as cells keeps the rows the scan that
+/// fetches every row's keys keeps: the same page, byte for byte, for keys of
+/// every kind, ascending and descending, with NULLs, before and after
+/// updates and deletes have left other versions behind.
+async fn top_n_differential(in_memory: bool) {
+    let _g = SWITCH.lock().await;
+    let (dir, _cleanup) = scratch(if in_memory { "topn_memory" } else { "topn_files" });
+    let db = Arc::new(Database::new_with_backend(&dir, in_memory).await);
+    must(&db, &format!("CREATE TABLE t ({COLUMNS})")).await;
+    fill(&db, "t", 12_000).await;
+    for round in 0..2 {
+        let mut pages = 0;
+        for sql in TOP_N {
+            column_scan::set_top_cells(false);
+            let fetched = run(&db, sql).await;
+            column_scan::set_top_cells(true);
+            let from_cells = run(&db, sql).await;
+            assert!(fetched.first() != Some(&3), "round {round}, {sql}: {}", String::from_utf8_lossy(&fetched));
+            assert!(
+                from_cells == fetched,
+                "round {round}, {sql}: keys as cells {:?}, keys fetched {:?}",
+                String::from_utf8_lossy(&from_cells),
+                String::from_utf8_lossy(&fetched)
+            );
+            pages += usize::from(fetched.len() > 16);
+        }
+        assert!(pages >= TOP_N.len() - 1, "round {round}: only {pages} statements returned rows");
+        if round != 0 {
+            break;
+        }
+        for change in [
+            "UPDATE t SET i32c = 11, f = 2.5, s = 'x0' WHERE u8c < 60",
+            "DELETE FROM t WHERE i16c > 40",
+            "UPDATE t SET i32c = NULL, n = NULL, s2 = NULL WHERE i8c = 3",
+            "UPDATE t SET s2 = 'a much longer value than any the table began with', ts = NULL WHERE u8c BETWEEN 60 AND 70",
+            "INSERT INTO t (id, i32c, i64c, f, k) VALUES (900001, -2147483648, -1, 0.25, 3), (900002, NULL, 5, 0, 4)",
+        ] {
+            must(&db, change).await;
+        }
+    }
+    column_scan::set_top_cells(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_top_n_by_key_cells_keeps_the_same_rows_file_backed() {
+    top_n_differential(false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_top_n_by_key_cells_keeps_the_same_rows_in_memory() {
+    top_n_differential(true).await
+}
+
+const TOP_CHILD_ENV: &str = "RDB_COLUMN_SCAN_TOP_CHILD";
+
+/// That the pages above were compared between two different scans: with the
+/// key cells on, rows are turned away unfetched, most of them; with them
+/// off, none is. The count is the process's, so this runs in a child, where
+/// no other test scans.
+#[test]
+#[cfg(unix)]
+fn a_top_n_turns_most_rows_away_on_their_cells() {
+    if std::env::var(TOP_CHILD_ENV).is_ok() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test binary");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", "core::processor::column_scan_tests::top_child", "--nocapture", "--test-threads=1"])
+        .env(TOP_CHILD_ENV, "1")
+        .output()
+        .expect("spawn the top-N child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the top-N child failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("1 passed"), "the top-N child did not run:\n{stdout}\n{stderr}");
+}
+
+/// The child half of [`a_top_n_turns_most_rows_away_on_their_cells`]. A
+/// no-op unless the parent set the environment variable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn top_child() {
+    if std::env::var(TOP_CHILD_ENV).is_err() {
+        return;
+    }
+    let (dir, _cleanup) = scratch("topn_child");
+    let db = Arc::new(Database::new_with_backend(&dir, false).await);
+    must(&db, &format!("CREATE TABLE t ({COLUMNS})")).await;
+    fill(&db, "t", 12_000).await;
+    let turned_away = column_scan::top_rows_turned_away;
+    // Without a WHERE, with one the interpreter evaluates, and with one the
+    // prefilter's mask decides: the three places a matched row is met.
+    for sql in [
+        "SELECT id, i32c FROM t ORDER BY i32c, id LIMIT 25",
+        "SELECT id, s2 FROM t ORDER BY s2 DESC, id LIMIT 40",
+        "SELECT id, i16c FROM t WHERE k + 1 > 0 ORDER BY i16c, id LIMIT 30",
+        "SELECT id, u8c FROM t WHERE k >= 0 ORDER BY u8c DESC, id LIMIT 30",
+    ] {
+        column_scan::set_top_cells(false);
+        let before = turned_away();
+        let fetched = run(&db, sql).await;
+        assert_eq!(turned_away(), before, "{sql}: rows turned away on cells while that is off");
+        column_scan::set_top_cells(true);
+        let from_cells = run(&db, sql).await;
+        let away = turned_away() - before;
+        assert!(from_cells == fetched, "{sql}: the pages differ");
+        // Twelve thousand rows, a page of a few dozen: all but the rows met
+        // before each worker held its page, and the few that then beat it.
+        assert!(away > 9_000 && away < 12_000, "{sql}: {away} rows turned away on their cells");
+    }
+}
+
+/// A batch taken from a gather is that batch's rows and no other's: a
+/// reader that looks at one batch at a time numbers each batch's rows from
+/// nothing, and a batch that cannot be read hands over nothing and leaves
+/// nothing behind for the next.
+#[tokio::test]
+async fn a_batch_taken_holds_only_its_own_rows() {
+    use crate::core::storage_providers::memory::MemoryStorageProvider;
+    use crate::core::storage_providers::traits::StorageIO;
+    use column_scan::{CellColumn, CellLayout, Gather};
+
+    // Six rows of twelve bytes: an eight-byte value, then four bytes.
+    let io = MemoryStorageProvider::new("column_scan_take_batch");
+    let mut data = Vec::new();
+    for row in 0u64..6 {
+        data.extend_from_slice(&(row * 100 + 1).to_le_bytes());
+        data.extend_from_slice(&[row as u8; 4]);
+    }
+    io.append_data(&data, true).await;
+    let layout = CellLayout {
+        columns: vec![
+            CellColumn { schema_id: 1, offset: 0, width: 8, text: false },
+            CellColumn { schema_id: 2, offset: 8, width: 4, text: false },
+        ],
+    };
+    let values = |chunk: &column_scan::ColumnChunk| -> Vec<u64> {
+        (0..chunk.rows).map(|r| u64::from_le_bytes(chunk.cell(0, 8, r).try_into().expect("eight bytes"))).collect()
+    };
+    let mut gather = Gather::new(&layout);
+    for row in [4u64, 1, 5] {
+        gather.note(row * 12, 12);
+    }
+    let first = gather.take_batch(&io).await.expect("three rows inside the file");
+    assert_eq!(values(&first), [401, 101, 501]);
+    assert_eq!(first.cols[1], [4, 4, 4, 4, 1, 1, 1, 1, 5, 5, 5, 5]);
+    // The next batch starts from nothing.
+    for row in [0u64, 3] {
+        gather.note(row * 12, 12);
+    }
+    let second = gather.take_batch(&io).await.expect("two rows inside the file");
+    assert_eq!(values(&second), [1, 301]);
+    assert_eq!(second.cols[1].len(), 8);
+    // A batch with a row past the end is no batch, and the one after it is
+    // whole and its own.
+    for row in [2u64, 4000] {
+        gather.note(row * 12, 12);
+    }
+    assert!(gather.take_batch(&io).await.is_err(), "a read past the end succeeded");
+    gather.note(2 * 12, 12);
+    let third = gather.take_batch(&io).await.expect("one row inside the file");
+    assert_eq!(values(&third), [201]);
+    // Nothing noted: an empty batch.
+    assert_eq!(gather.take_batch(&io).await.expect("nothing to read").rows, 0);
+}

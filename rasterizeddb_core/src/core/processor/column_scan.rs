@@ -92,6 +92,44 @@ pub fn set_whole_columns(on: bool) {
     WHOLE_COLUMNS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
 }
 
+/// 0 = not read yet, 1 = on, 2 = off.
+static TOP_CELLS: AtomicU8 = AtomicU8::new(0);
+
+/// Whether an `ORDER BY … LIMIT` scan reads a batch's sort keys as cells and
+/// fetches only the rows that could displace one it already holds. On unless
+/// `RDB_TOPN_CELLS=0`, which fetches every row's keys as before, for A/B
+/// measurement and for the tests that hold the two to the same answers.
+pub fn top_cells() -> bool {
+    match TOP_CELLS.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("RDB_TOPN_CELLS").is_none_or(|v| v != "0");
+            TOP_CELLS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Turns the top-N key cells on or off for the whole process.
+pub fn set_top_cells(on: bool) {
+    TOP_CELLS.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Rows a top-N scan turned away on their key cells without fetching them,
+/// since the process started.
+static TOP_ROWS_TURNED_AWAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn top_rows_turned_away() -> u64 {
+    TOP_ROWS_TURNED_AWAY.load(Ordering::Relaxed)
+}
+
+pub(crate) fn note_top_rows_turned_away(rows: u64) {
+    if rows != 0 {
+        TOP_ROWS_TURNED_AWAY.fetch_add(rows, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 tokio::task_local! {
     /// How many folds from cells the statement running on this task made.
@@ -422,5 +460,20 @@ impl<'l> Gather<'l> {
     /// Everything read. Rows noted and not flushed are not in it.
     pub(crate) fn finish(self) -> ColumnChunk {
         self.chunk
+    }
+
+    /// [`Self::flush`], handing over what it read: the noted rows' cells
+    /// and nothing else, row `r` of the chunk being the `r`-th row noted.
+    /// The gather is left holding nothing either way, so the next batch's
+    /// rows are numbered from nothing again. For a reader that looks at one
+    /// batch's cells at a time and never calls [`Self::finish`].
+    pub(crate) async fn take_batch<S: StorageIO>(&mut self, io: &S) -> std::io::Result<ColumnChunk> {
+        let n = self.layout.columns.len();
+        let read = self.flush(io).await;
+        let chunk = std::mem::replace(
+            &mut self.chunk,
+            ColumnChunk { rows: 0, cols: vec![Vec::new(); n], ends: vec![Vec::new(); n], together: 0 },
+        );
+        read.map(|()| chunk)
     }
 }
