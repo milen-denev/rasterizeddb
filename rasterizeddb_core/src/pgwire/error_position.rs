@@ -111,7 +111,11 @@ fn locate(text: &str, message: &str) -> Option<usize> {
         && rest.ends_with(" does not exist")
         && let Some(open) = rest.find('(')
     {
-        return word(text, &rest[..open], Some(true));
+        return match rest[..open].split_once('.') {
+            // `public.f(1)`: at the qualifier, where PostgreSQL points.
+            Some((qualifier, name)) => qualified(text, qualifier, name),
+            None => word(text, &rest[..open], Some(true)),
+        };
     }
     None
 }
@@ -188,7 +192,17 @@ fn word(text: &str, name: &str, call: Option<bool>) -> Option<usize> {
         }
         let Some((found, end)) = name_at(text, i) else { return false };
         let same = if bytes[i] == b'"' { found == name } else { found == name.to_ascii_lowercase() };
-        same && bytes.get(end) != Some(&b'.') && call.is_none_or(|c| c == text[end..].trim_start().starts_with('('))
+        // `… AS b` names an output column; a reference to `b` is elsewhere.
+        let output_name = || {
+            // By bytes: a multi-byte character may end the text before.
+            let before = text[..i].trim_end().as_bytes();
+            before.len() >= 2
+                && before[before.len() - 2..].eq_ignore_ascii_case(b"as")
+                && !before[..before.len() - 2].last().is_some_and(|b| is_identifier_byte(*b))
+        };
+        same && bytes.get(end) != Some(&b'.')
+            && call.is_none_or(|c| c == text[end..].trim_start().starts_with('('))
+            && !(call == Some(false) && output_name())
     })
 }
 
@@ -249,6 +263,10 @@ mod tests {
         assert_eq!(find("SELECT nofn(1)", "function nofn(integer) does not exist"), Some(8));
         // Counted in characters, not bytes.
         assert_eq!(find("SELECT 'é', nosuch FROM t", "column \"nosuch\" does not exist"), Some(13));
+        // An output name is no reference; a qualified call is at its qualifier.
+        assert_eq!(find("SELECT a + 1 AS b FROM fx ORDER BY b + nosuch", "column \"b\" does not exist"), Some(36));
+        assert_eq!(find("SELECT a AS é, b FROM fx", "column \"b\" does not exist"), Some(16));
+        assert_eq!(find("SELECT public.nofn(1)", "function public.nofn(integer) does not exist"), Some(8));
     }
 
     #[test]

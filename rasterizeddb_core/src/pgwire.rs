@@ -40,6 +40,7 @@ mod view_statements;
 mod sequence_statements;
 mod column_origins;
 mod error_position;
+mod undefined_names;
 mod type_statements;
 mod routine_statements;
 mod trigger_exec;
@@ -6015,6 +6016,31 @@ where
             domain_message = m;
             ("23514", domain_message.as_str())
         }
+        None => (sqlstate, message),
+    };
+    // A name that is no column or function, which the engine's readers word
+    // their own way: PostgreSQL's 42703 or 42883 (`undefined_names`).
+    let diagnosed = undefined_names::subject(message).and_then(|function| {
+        let database = state.catalog.get(&state.database_name)?;
+        let columns_of = |table: &str| -> Option<Vec<(String, String)>> {
+            let view = database.schema_view(table)?;
+            let schema = view.schema();
+            Some(
+                schema
+                    .fields
+                    .iter()
+                    .filter(|f| !f.is_deleted && !crate::core::rql::nullable::is_hidden(&f.name))
+                    .map(|f| {
+                        let oid = crate::core::rql::catalog_model::column_type_oid(f, schema);
+                        (f.name.clone(), crate::core::rql::catalog_model::format_type(oid, None).unwrap_or_default())
+                    })
+                    .collect(),
+            )
+        };
+        undefined_names::diagnose(&state.error_text, function.as_ref(), &columns_of)
+    });
+    let (sqlstate, message) = match &diagnosed {
+        Some((code, worded)) => (*code, worded.as_str()),
         None => (sqlstate, message),
     };
     state.statement_failed = true;

@@ -1456,9 +1456,20 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   relation, type, function or `TABLESAMPLE` method, a missing `FROM` entry,
   an ambiguous column, the literal an input error quotes. Its first use in
   the text is taken; where PostgreSQL points elsewhere (a syntax error, an
-  expression the reader cannot take) there is no position. An unknown column
-  inside an expression in a select list (`nosuch + 1`) is still reported as
-  `Column 'nosuch + 1' not found in schema`, not 42703.
+  expression the reader cannot take) there is no position.
+- **Undefined names** are PostgreSQL's errors: a name that is no column is
+  42703 `column "x" does not exist` (or `column t.x …`) wherever it is
+  written — inside an expression, a `CASE`, `HAVING`, `ON`, a subquery — and
+  a function PostgreSQL has no such name for, or none taking those
+  arguments, is 42883 `function f(integer, unknown) does not exist`. The
+  first one in PostgreSQL's reading order is reported (`FROM` and `ON`, the
+  select list, `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY`); text its parser
+  would refuse first stays a syntax error. A function PostgreSQL has that
+  the engine does not is 0A000. Behind a CTE, a derived table, a view or a
+  function in `FROM` the engine's own message is kept. A bare name where a
+  value belongs — `SET s = nosuch`, `VALUES (…, nosuch)` — is 42703 too; it
+  used to be stored as its own text. An `ON CONFLICT … DO UPDATE SET`
+  naming nothing is refused only when a row conflicts.
 
 ## Statements over the native protocol
 
