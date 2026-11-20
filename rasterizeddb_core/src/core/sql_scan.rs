@@ -882,8 +882,13 @@ pub fn statement_shorthands(sql: &str) -> Cow<'_, str> {
     if let Some(t) = text_operators(&text) {
         text = Cow::Owned(t);
     }
+    // Only in a select list: a `WHERE`'s, `ON`'s or `HAVING`'s `SIMILAR TO`
+    // is the predicate matcher's, which pads a `char(n)` value and refuses
+    // a pattern too deep (2201B) or too costly (54001) as PostgreSQL does;
+    // lowered, those went to the regular-expression reader and answered
+    // differently.
     if contains_ignore_ascii_case(&text, b"similar") {
-        let lowered = crate::core::rql::check::lower_similar_to(&text);
+        let lowered = crate::core::rql::check::lower_similar_to_where(&text, &in_select_list);
         if lowered != *text {
             text = Cow::Owned(lowered);
         }
@@ -1751,6 +1756,65 @@ pub fn find_quantified_subquery(sql: &str) -> Option<Result<QuantifiedSubquery, 
         }));
     }
     None
+}
+
+/// Whether `sql[at..]` stands in a select list: the nearest clause keyword
+/// before it, at its own query level, is `SELECT` (not `FROM`, `WHERE`,
+/// `ON`, `HAVING`, …). Parentheses that are no subquery (a call, a CASE's
+/// group) are looked through; a subquery's own opening ends the search.
+pub(crate) fn in_select_list(sql: &str, at: usize) -> bool {
+    const ENDS: &[&str] = &[
+        "FROM", "WHERE", "ON", "HAVING", "GROUP", "ORDER", "LIMIT", "OFFSET", "SET", "VALUES", "RETURNING", "USING",
+        "JOIN", "CHECK", "WINDOW", "FETCH", "INTO",
+    ];
+    let bytes = sql.as_bytes();
+    // Which bytes are inside a quoted run or a comment.
+    let mut quoted = vec![false; bytes.len()];
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            let end = end.max(i + 1).min(bytes.len());
+            quoted[i..end].iter_mut().for_each(|q| *q = true);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    let mut depth = 0i32;
+    let mut k = at.min(bytes.len());
+    while k > 0 {
+        k -= 1;
+        if quoted[k] {
+            continue;
+        }
+        match bytes[k] {
+            b')' => depth += 1,
+            b'(' => {
+                if depth > 0 {
+                    depth -= 1;
+                } else {
+                    // An enclosing parenthesis: a subquery's ends the level.
+                    let inner = sql[k + 1..].trim_start();
+                    let head: String = inner.bytes().take_while(|b| is_identifier_byte(*b)).map(|b| b as char).collect();
+                    if head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH") {
+                        return false;
+                    }
+                }
+            }
+            b if depth == 0 && is_identifier_byte(b) && (k == 0 || !is_identifier_byte(bytes[k - 1])) => {
+                let end = k + bytes[k..].iter().take_while(|b| is_identifier_byte(**b)).count();
+                let word = &sql[k..end];
+                if word.eq_ignore_ascii_case("SELECT") {
+                    return true;
+                }
+                if ENDS.iter().any(|e| word.eq_ignore_ascii_case(e)) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// PostgreSQL's `text ^@ prefix` and `(s1, e1) OVERLAPS (s2, e2)`, written
@@ -2868,6 +2932,22 @@ mod tests {
         assert_eq!(tablesample("SELECT * FROM t TABLESAMPLE foo (1)").unwrap_err().0, "42704");
         assert_eq!(tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI (101)").unwrap_err().0, "2202H");
         assert_eq!(tablesample("SELECT * FROM t TABLESAMPLE BERNOULLI (1) REPEATABLE (7)").unwrap_err().0, "0A000");
+    }
+
+    #[test]
+    fn similar_to_is_lowered_only_in_a_select_list() {
+        let s = |sql: &str| statement_shorthands(sql).into_owned();
+        assert_eq!(s("SELECT 'abc' SIMILAR TO 'a%'"), "SELECT 'abc'  ~ similar_to_escape('a%') ");
+        assert_eq!(
+            s("SELECT coalesce(v SIMILAR TO 'x', false) FROM t WHERE k SIMILAR TO 'a  '"),
+            "SELECT coalesce(v  ~ similar_to_escape('x') , false) FROM t WHERE k SIMILAR TO 'a  '"
+        );
+        assert_eq!(s("SELECT 1 FROM t JOIN u ON u.a SIMILAR TO t.b"), "SELECT 1 FROM t JOIN u ON u.a SIMILAR TO t.b");
+        assert_eq!(
+            s("SELECT (SELECT 1 FROM u WHERE u.a SIMILAR TO 'q') FROM t"),
+            "SELECT (SELECT 1 FROM u WHERE u.a SIMILAR TO 'q') FROM t"
+        );
+        assert!(in_select_list("SELECT CASE WHEN a SIMILAR TO 'x' THEN 1 END FROM t", 21));
     }
 
     #[test]
