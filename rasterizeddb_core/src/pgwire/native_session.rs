@@ -299,8 +299,14 @@ pub(crate) struct NativeSession {
 pub(crate) enum NativeTextStep {
     /// The plain native path, with nothing learned.
     Plain,
-    /// The learned parse, with this statement's values.
-    Run { template: StdArc<str>, rows: Box<crate::core::rql::prepared::PreparedRows> },
+    /// The learned parse, with this statement's values, and the description
+    /// its rows were learned under (what a retag reads).
+    Run {
+        template: StdArc<str>,
+        rows: Box<crate::core::rql::prepared::PreparedRows>,
+        fields: Option<Vec<(String, DbType)>>,
+        scales: Option<Vec<u32>>,
+    },
     /// The plain native path, watched: hand its capture to
     /// [`NativeSession::text_learn`].
     Watch(NativeWatch),
@@ -308,6 +314,8 @@ pub(crate) enum NativeTextStep {
 
 /// A watched statement's template and values, for [`NativeSession::text_learn`].
 pub(crate) struct NativeWatch {
+    /// The statement itself, described while it is learned.
+    query: String,
     template: StdArc<str>,
     literals: Vec<String>,
     classes: Vec<u8>,
@@ -359,20 +367,33 @@ impl NativeSession {
         let prepared = super::text_shape_slot(&mut shapes, &self.database, &template);
         match super::watch_step(prepared, &template, generation, &literals, &classes) {
             super::WatchStep::Text => NativeTextStep::Plain,
-            super::WatchStep::Run(run) => NativeTextStep::Run { template, rows: run.rows },
+            super::WatchStep::Run(run) => {
+                NativeTextStep::Run { template, rows: run.rows, fields: run.fields, scales: run.scales }
+            }
             super::WatchStep::Watch => match (literals, classes) {
                 (Some(literals), Some(classes)) => {
-                    NativeTextStep::Watch(NativeWatch { template, literals, classes, generation })
+                    NativeTextStep::Watch(NativeWatch { query: query.to_string(), template, literals, classes, generation })
                 }
                 _ => NativeTextStep::Plain,
             },
         }
     }
 
-    /// What a watched statement's plain run teaches its template. Its rows
-    /// are typed by the native path itself, so no description is recorded.
+    /// What a watched statement's plain run teaches its template. The
+    /// native path types its rows from the statement's description only
+    /// when a cell needs it, so the description is worked out here, once
+    /// per watched run, and learned with the parse: a learned run retags
+    /// from it rather than describing the statement again every time (a
+    /// table with a NUMERIC, a document or a timestamp needs a retag on every
+    /// answer). The verifying run compares it as it compares the rest.
     pub(crate) fn text_learn(&self, watch: NativeWatch, mut capture: crate::core::rql::prepared::Capture) {
-        capture.description.get_or_insert((None, None));
+        let Some(purpose) = crate::core::rql::lexer_s1::recognize_query_purpose(&watch.query) else {
+            return;
+        };
+        let Ok(description) = super::result_description(&self.database, &purpose) else {
+            return;
+        };
+        capture.description = Some(description);
         let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
         let Some(shape) = shapes.get_mut(&watch.template) else {
             return;
@@ -438,9 +459,13 @@ impl NativeSession {
                 || crate::core::rql::merge::parse_merge(stmt).is_some()
                 || crate::core::rql::privileges::parse_privilege_statement(stmt).is_some()
         };
-        if crate::core::rql::correlated::rewrite_select(stmt).is_some()
+        // A correlated scalar subquery and a derived table are both written
+        // in parentheses: a statement with none has neither, and is not
+        // searched for them keyword by keyword.
+        let parenthesised = stmt.contains('(');
+        if (parenthesised && crate::core::rql::correlated::rewrite_select(stmt).is_some())
             || crate::core::rql::cte::has_with_clause(stmt)
-            || crate::core::rql::cte::next_derived_table(stmt).is_some()
+            || (parenthesised && crate::core::rql::cte::next_derived_table(stmt).is_some())
             || (!begins_with_data_verb(stmt) && schema_object())
             // `current_database()`, `current_user`, `current_setting(…)`:
             // read from the session, which the native path has none of.
@@ -448,11 +473,13 @@ impl NativeSession {
         {
             return true;
         }
-        let upper_head: String = stmt
-            .chars()
-            .take(40)
-            .collect::<String>()
-            .to_ascii_uppercase();
+        // The first forty bytes, cut back to a character boundary: only its
+        // first word and short ASCII prefixes (`CREATE TEMP`) are read.
+        let mut head_end = stmt.len().min(40);
+        while !stmt.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let upper_head = stmt[..head_end].to_ascii_uppercase();
         if upper_head.starts_with("CREATE TEMP")
             || upper_head.starts_with("CREATE LOCAL TEMP")
             || upper_head.starts_with("CREATE GLOBAL TEMP")
@@ -460,10 +487,9 @@ impl NativeSession {
             return true;
         }
         let has = |needle: &[u8]| crate::core::sql_scan::contains_ignore_ascii_case(stmt, needle);
-        if has(b"nextval")
-            || has(b"currval")
-            || has(b"setval")
-            || has(b"lastval")
+        // The four sequence functions all hold `val`: one scan of a statement
+        // that names none of them, where there were five.
+        if (has(b"val") && (has(b"nextval") || has(b"currval") || has(b"setval") || has(b"lastval")))
             || has(b"pg_get_serial_sequence")
         {
             return true;
@@ -1232,7 +1258,7 @@ fn text_rows(columns: &[i32], rows: &[Vec<Option<Vec<u8>>>]) -> Vec<u8> {
 /// (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH`, `VALUES`, `TABLE`), which
 /// no schema-object statement begins with. Anything else, a leading comment
 /// or parenthesis included, answers false and is looked at in full.
-fn begins_with_data_verb(stmt: &str) -> bool {
+pub(crate) fn begins_with_data_verb(stmt: &str) -> bool {
     let word = stmt
         .trim_start()
         .split(|c: char| !c.is_ascii_alphabetic())

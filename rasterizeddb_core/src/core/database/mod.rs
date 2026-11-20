@@ -6068,7 +6068,15 @@ async fn process_native_request(
         return crate::pgwire::native_answer_marked(session, &principal.user, &request_vec).await;
     }
 
-    let query = String::from_utf8_lossy(&request_vec);
+    // Valid UTF-8 (every request a client sends) is borrowed after the fast
+    // check; `from_utf8_lossy` walked it chunk by chunk even then.
+    let query = match std::str::from_utf8(&request_vec) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(&request_vec),
+    };
+    // What no data statement can be (`pgwire::native_begins_with_data_verb`):
+    // a role statement. Asked once, for the checks below.
+    let data_verb = crate::pgwire::native_begins_with_data_verb(&query);
 
     // One statement per request: the native protocol answers each request
     // with one response, and nothing here ran the second statement of
@@ -6076,7 +6084,9 @@ async fn process_native_request(
     // row was never written; `UPDATE …; DELETE …` failed with a parser error
     // about `;`. Refused before anything else reads the text, the role
     // statements included, and without echoing it: it may hold a password.
-    if crate::pgwire::split_statements(&query).len() > 1 {
+    // Only a `;` separates statements, so a request without one is a single
+    // statement and is not split to find that out.
+    if query.contains(';') && crate::pgwire::split_statements(&query).len() > 1 {
         return error_response(
             "the native protocol runs one statement per request: send each statement on its own \
              (a request holding several, separated by ';', is refused rather than partly run)",
@@ -6102,7 +6112,7 @@ async fn process_native_request(
     //
     // Recognised before anything is logged, because the text of one of these
     // contains a password in the clear and the log does not need it.
-    if let Some(parsed) = crate::auth::parse_role_statement(&query) {
+    if let Some(parsed) = (!data_verb).then(|| crate::auth::parse_role_statement(&query)).flatten() {
         return match parsed {
             Err(e) => error_response(&e),
             Ok(statement) => {
@@ -6319,7 +6329,7 @@ async fn run_native_query_learning(
     use crate::pgwire::NativeTextStep;
     match session.text_step(query) {
         NativeTextStep::Plain => run_native_query(query, database).await,
-        NativeTextStep::Run { template, rows } => match run_native_learned(query, rows, database.clone()).await {
+        NativeTextStep::Run { template, rows, fields, scales } => match run_native_learned(rows, fields, scales, database.clone()).await {
             Some(response) => {
                 crate::pgwire::TEXT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 response
@@ -6344,15 +6354,18 @@ async fn run_native_query_learning(
 
 /// A learned parse with this statement's values, run as the plain path runs
 /// its `SELECT`: in a statement clock, as a native owner, its rows retagged
-/// from the description when a cell needs it. Read under one snapshot unless
+/// when a cell needs it from the description learned with the parse. Read
+/// under one snapshot unless
 /// it locks rows, as pgwire runs a learned parse. `None` when the table was
 /// reshaped since the parse was learned.
 async fn run_native_learned(
-    query: &str,
     rows: Box<crate::core::rql::prepared::PreparedRows>,
+    fields: Option<Vec<(String, crate::core::db_type::DbType)>>,
+    scales: Option<Vec<u32>>,
     database: Arc<Database>,
 ) -> Option<Vec<u8>> {
     let locking = rows.query_row.row_lock.is_some();
+    let table = rows.table_name.clone();
     let purpose = crate::core::rql::lexer_s1::QueryPurpose::PreparedRows(rows);
     // Boxed where it is made: the executor's future is tens of kilobytes,
     // and the scopes below each move it, a copy of the whole of it per move
@@ -6370,10 +6383,11 @@ async fn run_native_learned(
     if response.first() == Some(&3) && response[1..] == *crate::core::rql::prepared::STALE_PLAN.as_bytes() {
         return None;
     }
-    if crate::pgwire::native_answer_needs_retag(&response, &database, query)
-        && let Some(purpose) = recognize_query_purpose(query)
-    {
-        let (fields, scales) = crate::pgwire::result_description(&database, &purpose).unwrap_or((None, None));
+    // A learned parse reads one table, its own: that is the table the retag
+    // check asks about, rather than every relation the text names. The
+    // description it retags from was learned with the parse
+    // (`NativeSession::text_learn`), so the statement is not described again.
+    if crate::pgwire::native_answer_needs_retag_in(&response, &database, &table) {
         return Some(crate::pgwire::native_retag(response, fields.as_deref(), scales.as_deref()));
     }
     Some(response)

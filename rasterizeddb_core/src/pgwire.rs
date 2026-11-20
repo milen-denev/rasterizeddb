@@ -86,7 +86,7 @@ mod branch_tests;
 pub(crate) mod proxied;
 mod wire_out;
 
-pub(crate) use native_session::{NativeSession, NativeTextStep};
+pub(crate) use native_session::{NativeSession, NativeTextStep, begins_with_data_verb as native_begins_with_data_verb};
 pub(crate) use native_session::is_transaction_control as native_session_is_transaction_control;
 #[cfg(test)]
 pub(crate) use native_session::{
@@ -3452,6 +3452,10 @@ enum PreparedSelect {
     Unknown,
     /// Watched once; the next execution with different values checks it.
     Candidate(Box<PreparedLearned>),
+    /// Watched this many times without a template: each value occurred
+    /// more than once in the clause. Past [`DERIVE_TRIES`], the text path for
+    /// good, so a statement that cannot teach stops paying for the watch.
+    Retry(u8),
     /// Checked: executions with values of the same classes use the parse.
     Ready(Box<PreparedLearned>),
     /// The text path is the only path for this statement.
@@ -3475,6 +3479,12 @@ struct PreparedLearned {
     /// Watched executions that could not teach anything (repeated values, a
     /// literal seen twice). Past a few, the statement stops being watched.
     misses: u8,
+    /// A run with exactly these literals made exactly this parse again: the
+    /// same statement text, so its parse is the same function of the same
+    /// schema, as a statement with no values at all is cached on. A
+    /// candidate so marked answers those literals, and only those, from its
+    /// parse; other values still need the verifying run.
+    exact: bool,
     /// On a partitioned table, the full-key point shape's route derivation,
     /// learned with the parse and checked against `route_where` on both
     /// verifying executions (S16b). Reset with everything else on a schema
@@ -6917,6 +6927,9 @@ struct TextShape {
     prepared: PreparedSelect,
 }
 
+/// Watched executions a statement gets to yield a template (`Retry`).
+const DERIVE_TRIES: u8 = 8;
+
 /// Most simple-query templates a session keeps learned parses for; past it
 /// they are forgotten together, and learned again as they recur.
 const TEXT_SHAPES: usize = 128;
@@ -7084,16 +7097,23 @@ fn text_template(stmt: &str) -> Option<(String, Vec<String>)> {
                 }
                 if depth == 0 {
                     let word = &text[start..i];
-                    if word.eq_ignore_ascii_case("WHERE") {
-                        in_where = true;
-                    } else if [
-                        "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "FETCH", "FOR", "WINDOW", "UNION", "INTERSECT",
-                        "EXCEPT", "RETURNING",
-                    ]
-                    .iter()
-                    .any(|k| word.eq_ignore_ascii_case(k))
-                    {
-                        in_where = false;
+                    // Clause keywords are 3 to 9 letters; anything else is a
+                    // name and is not compared with them.
+                    let candidates: &[&str] = match (word.len(), word.as_bytes()[0].to_ascii_uppercase()) {
+                        (3..=9, b'W') => &["WHERE", "WINDOW"],
+                        (3..=9, b'G') => &["GROUP"],
+                        (3..=9, b'O') => &["ORDER", "OFFSET"],
+                        (3..=9, b'L') => &["LIMIT"],
+                        (3..=9, b'H') => &["HAVING"],
+                        (3..=9, b'F') => &["FETCH", "FOR"],
+                        (3..=9, b'U') => &["UNION"],
+                        (3..=9, b'I') => &["INTERSECT"],
+                        (3..=9, b'E') => &["EXCEPT"],
+                        (3..=9, b'R') => &["RETURNING"],
+                        _ => &[],
+                    };
+                    if let Some(k) = candidates.iter().find(|k| word.eq_ignore_ascii_case(k)) {
+                        in_where = *k == "WHERE";
                     }
                 }
             }
@@ -7177,7 +7197,25 @@ fn watch_step(
             }
             _ => WatchStep::Text,
         },
-        PreparedSelect::Candidate(_) => {
+        PreparedSelect::Candidate(l) => match (literals, classes) {
+            (Some(lits), Some(cls)) if l.exact && *lits == l.literals && *cls == l.classes => {
+                let mut query_row = l.query_row.clone();
+                query_row.where_clause = l.template.render(lits);
+                WatchStep::Run(PreparedRun {
+                    rows: Box::new(pr::PreparedRows {
+                        table_name: l.table_name.clone(),
+                        query_row,
+                        key: None,
+                        shape_epoch: l.shape_epoch,
+                    }),
+                    fields: l.fields.clone(),
+                    scales: l.scales.clone(),
+                })
+            }
+            (_, Some(_)) => WatchStep::Watch,
+            _ => WatchStep::Text,
+        },
+        PreparedSelect::Retry(_) => {
             if classes.is_some() { WatchStep::Watch } else { WatchStep::Text }
         }
         PreparedSelect::Unknown => {
@@ -7385,7 +7423,7 @@ fn learn_into(
     }
     let shape = pr::shape_of(&query_row);
     *prepared = match std::mem::take(prepared) {
-        PreparedSelect::Unknown => match pr::WhereTemplate::derive(&query_row.where_clause, &literals) {
+        state @ (PreparedSelect::Unknown | PreparedSelect::Retry(_)) => match pr::WhereTemplate::derive(&query_row.where_clause, &literals) {
             Some(template) => PreparedSelect::Candidate(Box::new(PreparedLearned {
                 generation,
                 table_name,
@@ -7397,13 +7435,36 @@ fn learn_into(
                 fields,
                 scales,
                 misses: 0,
+                exact: false,
                 route: None,
                 shape_epoch,
             })),
             // A value that also occurs elsewhere in the clause; another
-            // execution may place it unambiguously.
-            None => PreparedSelect::Unknown,
+            // execution may place it unambiguously, a few more may not.
+            None => match state {
+                PreparedSelect::Retry(n) if n >= DERIVE_TRIES => PreparedSelect::Ineligible,
+                PreparedSelect::Retry(n) => PreparedSelect::Retry(n + 1),
+                _ => PreparedSelect::Retry(1),
+            },
         },
+        PreparedSelect::Candidate(mut l) if literals == l.literals => {
+            // The same statement again: it must make the same parse, and then
+            // that parse answers these literals (`exact`). Anything else from
+            // identical text is not a parse to keep.
+            if l.table_name == table_name
+                && l.shape_epoch == shape_epoch
+                && l.shape == shape
+                && l.fields == fields
+                && l.scales == scales
+                && l.classes == classes
+                && l.template.render(&literals) == query_row.where_clause
+            {
+                l.exact = true;
+                PreparedSelect::Candidate(l)
+            } else {
+                PreparedSelect::Ineligible
+            }
+        }
         PreparedSelect::Candidate(mut l) => {
             if literals.iter().zip(&l.literals).any(|(a, b)| a == b) {
                 // A value the same as last time checks nothing about where it
@@ -9474,29 +9535,62 @@ pub(crate) fn native_retag(answer: Vec<u8>, fields: Option<&[(String, DbType)]>,
 /// The check that keeps a second parse of the statement and of its rows off
 /// every other answer.
 pub(crate) fn native_answer_needs_retag(answer: &[u8], database: &Database, query: &str) -> bool {
+    match first_row_retag(answer) {
+        Retag::No => false,
+        Retag::Yes => true,
+        Retag::IfTextTyped => crate::core::rql::lock_set::relation_references(query)
+            .iter()
+            .any(|r| declares_text_typed(database, &r.name)),
+    }
+}
+
+/// [`native_answer_needs_retag`] for an answer read from `table` alone, a
+/// learned parse's: the table is known, so the statement is not read again
+/// to find it.
+pub(crate) fn native_answer_needs_retag_in(answer: &[u8], database: &Database, table: &str) -> bool {
+    match first_row_retag(answer) {
+        Retag::No => false,
+        Retag::Yes => true,
+        Retag::IfTextTyped => declares_text_typed(database, table),
+    }
+}
+
+/// What a native answer's first row says about a retag.
+enum Retag {
+    No,
+    Yes,
+    /// A text cell: a retag only if a table declares a type stored as text.
+    IfTextTyped,
+}
+
+fn first_row_retag(answer: &[u8]) -> Retag {
     if answer.first() != Some(&2) {
-        return false;
+        return Retag::No;
     }
     let Some(Ok(first)) = crate::core::row::row::serialized_rows(&answer[1..]).next() else {
-        return false;
+        return Retag::No;
     };
     let Ok(row) = crate::core::row::row::Row::decode(first) else {
-        return false;
+        return Retag::No;
     };
     let mut text = false;
     for c in &row.columns {
         match c.column_type {
-            DbType::DECIMAL | DbType::DATETIME | DbType::JSONB => return true,
+            DbType::DECIMAL | DbType::DATETIME | DbType::JSONB => return Retag::Yes,
             DbType::STRING => text = true,
             _ => {}
         }
     }
-    text && crate::core::rql::lock_set::relation_references(query).iter().any(|r| {
-        database.schema_view(&r.name).is_some_and(|t| {
-            t.schema().fields.iter().any(|f| {
-                matches!(f.db_type, DbType::JSONB | DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_))
-            })
-        })
+    if text { Retag::IfTextTyped } else { Retag::No }
+}
+
+/// Whether `table` declares a column stored as text but typed otherwise.
+fn declares_text_typed(database: &Database, table: &str) -> bool {
+    database.schema_view(table).is_some_and(|t| {
+        t.schema()
+            .fields
+            .iter()
+            .any(|f| matches!(f.db_type, DbType::JSONB | DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_)))
     })
 }
 

@@ -549,6 +549,12 @@ impl Database {
     /// Whether a table, or a partitioned table's shell, is registered under
     /// `name` (what `tables.contains_key` answered).
     pub fn has_table(&self, name: &str) -> bool {
+        // The engine's own catalogue tables are only ever registered under
+        // their own names: one lookup answers, where the resolver made three
+        // (exact, exact again, the other map) on the miss that is usual.
+        if ENGINE_CATALOGUE_TABLES.contains(&name) {
+            return self.table_slots.contains_key(name);
+        }
         self.resolve(name, |key| self.table_slots.contains_key(key).then_some(()))
             .is_some()
     }
