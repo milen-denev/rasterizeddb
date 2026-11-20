@@ -399,7 +399,8 @@ type and its labels. Enum values order by the labels' declared order, as
 PostgreSQL orders them: `ORDER BY` the column, its output name or position
 (in a `DISTINCT` or grouped query too), `<`, `<=`, `>` and `>=` against a
 label, a parameter or another column of the type, `[NOT] BETWEEN` two
-labels, and `min`/`max`. A parameter that is no label matches nothing,
+labels, and `min`/`max`. `enum_first`, `enum_last` and `enum_range` (one
+or two arguments) answer from the labels. A parameter that is no label matches nothing,
 where PostgreSQL refuses it (22P02). A column holds the label as `text`, kept to the labels by a hidden
 constraint the type's `ALTER`s replace.
 
@@ -1428,7 +1429,14 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   fails (write `x.value`). A lateral `jsonb_each(t.j)` runs for every row of
   `t` before the `WHERE`, so a row whose document is not an object fails the
   statement even where the `WHERE` would have excluded it.
-- **Errors** carry no position (PostgreSQL's `at character N`).
+- **Errors** carry PostgreSQL's position (`at character N`, the `P` field)
+  where the message names something in the statement: an undefined column,
+  relation, type, function or `TABLESAMPLE` method, a missing `FROM` entry,
+  an ambiguous column, the literal an input error quotes. Its first use in
+  the text is taken; where PostgreSQL points elsewhere (a syntax error, an
+  expression the reader cannot take) there is no position. An unknown column
+  inside an expression in a select list (`nosuch + 1`) is still reported as
+  `Column 'nosuch + 1' not found in schema`, not 42703.
 
 ## Statements over the native protocol
 

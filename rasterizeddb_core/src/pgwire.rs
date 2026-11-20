@@ -39,6 +39,7 @@ mod param_infer;
 mod view_statements;
 mod sequence_statements;
 mod column_origins;
+mod error_position;
 mod type_statements;
 mod routine_statements;
 mod trigger_exec;
@@ -2916,6 +2917,12 @@ struct SessionState {
     /// (`branch::note_ddl`): the client statement itself (`DO …`, `EXECUTE
     /// q`) is no DDL to the log. Drained at the end of `execute_recorded`.
     branch_ddl: Vec<String>,
+    /// The client statement running, and how many characters precede it in
+    /// the text the client sent (`None`: its positions cannot be told, as
+    /// for a string rewritten before it was split). An error's position
+    /// (`error_position`) counts from the start of that text.
+    error_text: String,
+    error_base: Option<usize>,
     /// The channels this session listens on and its notifications' queue
     /// (`notify`), from its first `LISTEN`.
     listener: Option<notify::Listener>,
@@ -3309,6 +3316,8 @@ impl SessionState {
             settings: HashMap::new(),
             sql_prepared: HashMap::new(),
             branch_ddl: Vec::new(),
+            error_text: String::new(),
+            error_base: Some(0),
             listener: None,
             backend_pid: 0,
             shape_change: ShapeChangeMode::default(),
@@ -6092,7 +6101,11 @@ where
     } else {
         sqlstate
     };
-    send_error_response(stream, sqlstate, message).await
+    // An undefined column in PostgreSQL's words (`error_position::pg_wording`).
+    let worded = if sqlstate == "42703" { error_position::pg_wording(&state.error_text, message) } else { None };
+    let message = worded.as_deref().unwrap_or(message);
+    let position = state.error_base.and_then(|base| error_position::find(&state.error_text, message).map(|p| p + base));
+    send_error_response_at(stream, sqlstate, message, position).await
 }
 
 /// Whether a select item the reader could not resolve (`Column
@@ -6582,6 +6595,9 @@ where
     // statements dropped without a reply.
     state.statement_failed = false;
     state.statement_error = None;
+    // What an error's position counts in (`error_position`).
+    state.error_text.clear();
+    state.error_text.push_str(stmt);
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -6823,6 +6839,9 @@ where
     }
     #[cfg(not(feature = "db_branching"))]
     drop(ran_for_it);
+    // An error reported outside a statement (a Parse's) has no text here to
+    // point into, rather than the last statement's.
+    state.error_text.clear();
     result
 }
 
@@ -8811,7 +8830,7 @@ pub(crate) fn result_description(
             // lock, so parked writers do not queue readers behind them.)
             let table = database.schema_view(&qr.table_name);
             let Some(table) = table else {
-                return Err(("42P01", "relation does not exist".to_string()));
+                return Err(("42P01", format!("relation \"{}\" does not exist", qr.table_name)));
             };
             // The type a select item is *advertised* as. Same rule as the
             // describe path: a shredded JSON column is stored as a `UUID` and
@@ -10218,8 +10237,26 @@ where
         open_implicit_block(database, state);
     }
 
+    // Where each statement starts in the client's text, for an error's
+    // position: only where the text was not rewritten before the split.
+    let positioned = *normalized == *query;
+    let mut cursor = 0usize;
     for stmt in statements {
-        execute_recorded(database, state, stream, &stmt, &[], false, None).await?;
+        let trimmed = stmt.trim_start();
+        let lead = stmt.len() - trimmed.len();
+        state.error_base = match query.get(cursor..).and_then(|rest| rest.find(trimmed)) {
+            Some(at) if positioned => {
+                let start = cursor + at;
+                cursor = start + trimmed.len();
+                // The recorded statement keeps its leading blanks, which
+                // its own positions count.
+                Some(query[..start].chars().count().saturating_sub(stmt[..lead].chars().count()))
+            }
+            _ => None,
+        };
+        let ran = execute_recorded(database, state, stream, &stmt, &[], false, None).await;
+        state.error_base = Some(0);
+        ran?;
         // PostgreSQL stops a multi-statement string at the first failure.
         // Inside a block the poisoning refuses the rest; outside one nothing
         // did, so a migration sent as one string had its first statement fail
@@ -14396,6 +14433,15 @@ async fn send_error_response<S>(stream: &mut S, sqlstate: &str, message: &str) -
 where
     S: AsyncWrite + Unpin,
 {
+    send_error_response_at(stream, sqlstate, message, None).await
+}
+
+/// [`send_error_response`] with the statement position the error points at
+/// (the `P` field: 1-based, in characters), as PostgreSQL sends it.
+async fn send_error_response_at<S>(stream: &mut S, sqlstate: &str, message: &str, position: Option<usize>) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     // ErrorResponse fields: (type_byte, cstring)..., terminated by 0.
     // Minimal set: Severity (S), SQLSTATE (C), Message (M)
     let mut payload = Vec::new();
@@ -14411,6 +14457,12 @@ where
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
+
+    if let Some(position) = position {
+        payload.push(b'P');
+        payload.extend_from_slice(position.to_string().as_bytes());
+        payload.push(0);
+    }
 
     // The constraint an integrity error names, as its own field: what an ORM
     // maps the error to a key or a check by (node-postgres's `constraint`,
