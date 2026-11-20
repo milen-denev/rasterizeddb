@@ -75,6 +75,8 @@ mod engine_bug_tests;
 mod shape_repair_tests;
 mod fixed_rows;
 mod native_session;
+#[cfg(test)]
+mod native_retag_tests;
 #[cfg(feature = "db_branching")]
 mod branch_merge;
 /// The parent's record of keys a branch merge renumbered (`branch_merge`).
@@ -9431,6 +9433,139 @@ pub(crate) fn result_description(
 /// storage type: a document as engine bytes a client refused, an array or a
 /// `bytea` as text, a NUMERIC with no point.
 pub(crate) fn native_retag(answer: Vec<u8>, fields: Option<&[(String, DbType)]>, scales: Option<&[u32]>) -> Vec<u8> {
+    use crate::core::row::row::{serialized_cells, serialized_rows};
+    #[cfg(feature = "enable_long_row")]
+    const LEN_HEADER: usize = 8;
+    #[cfg(not(feature = "enable_long_row"))]
+    const LEN_HEADER: usize = 4;
+
+    if answer.first() != Some(&2) {
+        return answer;
+    }
+    let declared = |at: usize| fields.and_then(|f| f.get(at)).map(|(_, t)| t);
+    // Read from the first row: a column's cells share its type, and an
+    // answer nothing retypes is left as it is, unparsed.
+    let applies = |stored: &DbType, declared: Option<&DbType>| {
+        matches!(
+            (stored, declared),
+            (DbType::DECIMAL, _)
+                | (DbType::STRING | DbType::JSONB, Some(DbType::JSONB))
+                | (DbType::STRING, Some(DbType::JSONTEXT | DbType::BYTEA | DbType::ARRAY | DbType::ARRAYOF(_)))
+                | (DbType::DATETIME, Some(DbType::TIMESTAMP))
+        )
+    };
+    let needed = match serialized_rows(&answer[1..]).next() {
+        Some(Ok(row)) => match serialized_cells(row) {
+            Ok(cells) => {
+                let mut needed = false;
+                for (at, cell) in cells.enumerate() {
+                    match cell {
+                        Ok(cell) if applies(&cell.column_type, declared(at)) => needed = true,
+                        Ok(_) => {}
+                        Err(_) => return answer,
+                    }
+                }
+                needed
+            }
+            Err(_) => return answer,
+        },
+        _ => return answer,
+    };
+    if !needed {
+        return answer;
+    }
+    // Rewritten cell by cell from the answer's own bytes, straight into the
+    // reply (`Row::extend_serialized`'s layout: a payload-length header,
+    // then per cell its size, schema id, bytes and type tag). Decoding every
+    // row into pooled cells and serializing them again cost more than the
+    // retyping, on every answer with a NUMERIC or a document in it.
+    fn cell(out: &mut Vec<u8>, schema_id: u32, data: &[u8], tag: &DbType) {
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&u64::from(schema_id).to_le_bytes());
+        out.extend_from_slice(data);
+        out.push(tag.to_byte());
+    }
+    let mut out = Vec::with_capacity(answer.len() + answer.len() / 4 + 16);
+    out.push(2u8);
+    let mut changed = false;
+    let mut text = Vec::new();
+    for row in serialized_rows(&answer[1..]) {
+        let Ok(row) = row else {
+            return answer;
+        };
+        let Ok(cells) = serialized_cells(row) else {
+            return answer;
+        };
+        let start = out.len();
+        out.extend_from_slice(&[0u8; LEN_HEADER]);
+        for (at, c) in cells.enumerate() {
+            let Ok(c) = c else {
+                return answer;
+            };
+            match (&c.column_type, declared(at)) {
+                (DbType::DECIMAL, _) if c.data.len() == 16 => {
+                    let mut mantissa = i128::from_le_bytes(c.data.try_into().expect("sixteen bytes"));
+                    let scale = match scales.and_then(|s| s.get(at)).copied() {
+                        Some(scale) => scale,
+                        None => {
+                            let mut scale = crate::core::value_codec::DECIMAL_SCALE;
+                            while scale > 0 && mantissa % 10 == 0 {
+                                mantissa /= 10;
+                                scale -= 1;
+                            }
+                            scale
+                        }
+                    };
+                    let bytes = crate::core::value_codec::decimal_cell_with_scale(mantissa, scale);
+                    cell(&mut out, c.schema_id, &bytes, &c.column_type);
+                    changed = true;
+                }
+                (DbType::STRING | DbType::JSONB, Some(DbType::JSONB)) => {
+                    text.clear();
+                    if crate::core::jsonb::render_text_into(c.data, &mut text).is_ok() {
+                        cell(&mut out, c.schema_id, &text, &DbType::JSON);
+                        changed = true;
+                    } else {
+                        cell(&mut out, c.schema_id, c.data, &c.column_type);
+                    }
+                }
+                (DbType::STRING, Some(DbType::JSONTEXT)) => {
+                    cell(&mut out, c.schema_id, c.data, &DbType::JSONTEXT);
+                    changed = true;
+                }
+                (DbType::STRING, Some(DbType::BYTEA)) => {
+                    cell(&mut out, c.schema_id, c.data, &DbType::BYTEA);
+                    changed = true;
+                }
+                (DbType::STRING, Some(DbType::ARRAY | DbType::ARRAYOF(_))) => {
+                    cell(&mut out, c.schema_id, c.data, &DbType::ARRAY);
+                    changed = true;
+                }
+                (DbType::DATETIME, Some(DbType::TIMESTAMP)) => {
+                    cell(&mut out, c.schema_id, c.data, &DbType::TIMESTAMP);
+                    changed = true;
+                }
+                _ => cell(&mut out, c.schema_id, c.data, &c.column_type),
+            }
+        }
+        let payload = out.len() - start - LEN_HEADER;
+        #[cfg(feature = "enable_long_row")]
+        let header = (payload as u64).to_le_bytes();
+        #[cfg(not(feature = "enable_long_row"))]
+        let header = (payload as u32).to_le_bytes();
+        out[start..start + LEN_HEADER].copy_from_slice(&header);
+    }
+    if !changed {
+        return answer;
+    }
+    out
+}
+
+/// [`native_retag`] as it was written first: every row decoded into a `Row`,
+/// retyped, and serialized again. The oracle its byte-level rewrite is
+/// compared with.
+#[cfg(test)]
+fn native_retag_by_rows(answer: Vec<u8>, fields: Option<&[(String, DbType)]>, scales: Option<&[u32]>) -> Vec<u8> {
     if answer.first() != Some(&2) {
         return answer;
     }
