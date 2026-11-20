@@ -2906,7 +2906,9 @@ fn distinct_condition(text: &str, schema: &[SchemaField]) -> Result<Option<Cond>
 
 fn bare_boolean(text: &str, schema: &[SchemaField]) -> Option<Condition> {
     let expr = parse(text, schema).ok()?;
-    (static_type(&expr) == DbType::BOOL).then(|| Condition {
+    // An untyped NULL is an unknown boolean where a condition stands: `NOT
+    // NULL` is NULL, where it was "column \"NOT NULL\" does not exist".
+    (static_type(&expr) == DbType::BOOL || matches!(expr, Expr::Null)).then(|| Condition {
         left: Box::new(expr),
         cmp: Cmp::Eq,
         right: Some(Box::new(Expr::Literal { bytes: vec![1], db_type: DbType::BOOL })),

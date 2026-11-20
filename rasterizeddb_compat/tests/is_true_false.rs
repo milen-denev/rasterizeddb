@@ -42,6 +42,18 @@ async fn truth_tests_follow_three_valued_logic() {
         ("(n = 5) IS NOT TRUE", vec![2, 3, 4]),
         ("flag IS NOT TRUE AND id > 2", vec![3]),
         ("flag IS TRUE OR nn IS FALSE", vec![1, 2, 4]),
+        // A literal's truth is a constant (a syntax error, where only a
+        // column or a parenthesised condition was read).
+        ("false IS NOT TRUE", vec![1, 2, 3, 4]),
+        ("true IS TRUE AND id = 1", vec![1]),
+        ("NULL IS UNKNOWN AND id < 3", vec![1, 2]),
+        ("NULL IS NOT FALSE AND (true IS NOT FALSE) AND flag", vec![1, 4]),
+        ("NOT (false IS TRUE) AND id > 3", vec![4]),
+        ("true IS UNKNOWN", vec![]),
+        // An untyped NULL where a condition stands is unknown.
+        ("NOT NULL", vec![]),
+        ("flag OR NULL", vec![1, 4]),
+        ("NOT (flag AND NULL)", vec![2]),
     ] {
         let got = sqlx::query(AssertSqlSafe(format!("SELECT id FROM b WHERE {predicate} ORDER BY id")))
             .fetch_all(&pool)
@@ -57,6 +69,27 @@ async fn truth_tests_follow_three_valued_logic() {
 
     // Not a boolean: refused, as PostgreSQL refuses it.
     assert!(sqlx::query("SELECT id FROM b WHERE n IS TRUE").fetch_all(&pool).await.is_err());
+
+    // `NOT NULL` as a value is NULL ("column \"NOT NULL\" does not exist"
+    // in a select list; text refused by a boolean column in a SET).
+    let row = sqlx::query("SELECT NOT NULL, NOT (NULL), NOT (1 > 2)").fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        (row.get::<Option<bool>, _>(0), row.get::<Option<bool>, _>(1), row.get::<Option<bool>, _>(2)),
+        (None, None, Some(true))
+    );
+    pool.execute("CREATE TABLE nn (id INT NOT NULL, flag BOOLEAN); INSERT INTO nn VALUES (1, true), (2, false)")
+        .await
+        .unwrap();
+    pool.execute("UPDATE nn SET flag = NOT NULL WHERE id = 1").await.unwrap();
+    pool.execute("UPDATE nn SET flag = NOT (NULL) WHERE id = 2").await.unwrap();
+    let flags: Vec<Option<bool>> = sqlx::query("SELECT flag FROM nn ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(flags, vec![None, None]);
 
     // In a CASE, through the expression evaluator.
     let mut rows: Vec<(i32, i64)> = sqlx::query(

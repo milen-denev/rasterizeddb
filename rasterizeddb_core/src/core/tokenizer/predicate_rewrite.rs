@@ -277,6 +277,28 @@ fn expand_truth_tests<'c>(
     let mut changed = false;
     let mut i = 0usize;
     while i < toks.len() {
+        // A constant's truth, `false IS NOT TRUE`, `NULL IS UNKNOWN`: the
+        // test of a literal is a literal (a syntax error, where only a column
+        // or a parenthesised condition was read). Only as a whole operand —
+        // after `a = true` the operand is the comparison, which binds tighter.
+        if let Some(value) = ["TRUE", "FALSE", "NULL"].iter().position(|k| toks[i].is_keyword(k))
+            && i.checked_sub(1).is_none_or(|p| {
+                matches!(toks[p], Tok::LPar) || ["AND", "OR", "NOT", "WHERE", "WHEN", "ON", "HAVING"].iter().any(|k| toks[p].is_keyword(k))
+            })
+            && toks.get(i + 1).is_some_and(|t| t.is_keyword("IS"))
+        {
+            let negated = toks.get(i + 2).is_some_and(|t| t.is_keyword("NOT"));
+            let at = i + 2 + usize::from(negated);
+            if let Some(truth) = ["TRUE", "FALSE", "UNKNOWN"].iter().position(|k| toks.get(at).is_some_and(|t| t.is_keyword(k)))
+            {
+                // value: 0 true, 1 false, 2 NULL; truth: 0 TRUE, 1 FALSE, 2 UNKNOWN.
+                let holds = (value == truth) != negated;
+                out.push(if holds { CONSTANT_TRUE } else { CONSTANT_FALSE }.to_string());
+                i = at + 1;
+                changed = true;
+                continue;
+            }
+        }
         if matches!(toks[i], Tok::LPar) {
             if let Some((text, after)) = parenthesised_truth_test(&toks, i, schema, scan)? {
                 out.push(text);
