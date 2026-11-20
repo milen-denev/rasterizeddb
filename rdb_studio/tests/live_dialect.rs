@@ -132,6 +132,16 @@ async fn exercise(session: &Session) {
         databases.iter().any(|d| d.is_current),
         "{flavor}: nothing marked as the current database"
     );
+    // The connection asking is one of the current database's sessions, over
+    // the native protocol as over the wire one (native connections were not
+    // counted: `sessions` 0 while one asked).
+    let current = databases.iter().find(|d| d.is_current).expect("a current database");
+    assert!(
+        current.sessions >= 1,
+        "{flavor} over {:?}: the asking connection is not among `{}`'s sessions",
+        session.transport,
+        current.name
+    );
 
     let stats = session
         .query(dialect::database_stats_sql(flavor))
@@ -1784,4 +1794,101 @@ async fn keyset_pages_hold_the_offset_pages_rows() {
             exercise_keyset(&session).await;
         }
     }
+}
+
+/// Forwards connections to `target` until [`Proxy::cut`] closes every one
+/// open, as a server restart or a firewall's idle cut would; new ones are
+/// still accepted after.
+struct Proxy {
+    port: u16,
+    open: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Proxy {
+    async fn start(target: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let open = std::sync::Arc::new(std::sync::Mutex::new(Vec::<tokio::task::AbortHandle>::new()));
+        let kept = open.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let target = target.clone();
+                let task = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                kept.lock().unwrap().push(task.abort_handle());
+            }
+        });
+        Self { port, open }
+    }
+
+    fn cut(&self) {
+        for task in self.open.lock().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// A wire session whose connection the server closed opens a new one on its
+/// next call, for the panels and the editor alike; the editor is told that a
+/// transaction open on the old one is gone. Before, every call failed with
+/// "connection closed" until the profile was opened again.
+async fn exercise_reopen(variable: &str, flavor: Flavor) {
+    let Ok(url) = std::env::var(variable) else {
+        eprintln!("{variable} is unset; skipping");
+        return;
+    };
+    let mut profile = profile(&url, flavor);
+    if profile.transport != rdb_studio::model::Transport::Wire || conn::is_socket_dir(&profile.host) {
+        eprintln!("{variable} is not a wire profile over TCP; skipping");
+        return;
+    }
+    let proxy = Proxy::start(format!("{}:{}", profile.host, profile.port)).await;
+    profile.host = "127.0.0.1".to_string();
+    profile.port = proxy.port;
+    profile.tls = TlsMode::Disable;
+    profile.verify_server = false;
+    let session = conn::connect(profile).await.unwrap_or_else(|e| panic!("{variable}: {e}"));
+    let one = |grid: &rdb_studio::model::Grid| grid.rows.first().and_then(|r| r.first().cloned().flatten());
+
+    let grid = session.query("SELECT 1 AS n").await.unwrap_or_else(|e| panic!("{variable}: {e}"));
+    assert_eq!(one(&grid).as_deref(), Some("1"), "{variable}");
+
+    for round in 0..2 {
+        proxy.cut();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !session.client().expect("a wire session").is_closed() {
+            assert!(std::time::Instant::now() < deadline, "{variable}: the cut connection never closed");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if round == 0 {
+            let grid = session
+                .query("SELECT 2 AS n")
+                .await
+                .unwrap_or_else(|e| panic!("{variable}: a panel's query after the cut: {e}"));
+            assert_eq!(one(&grid).as_deref(), Some("2"), "{variable}");
+        } else {
+            let canceller = session.canceller();
+            let answer = session.run_editor("SELECT 3 AS n", None, &canceller).await;
+            let outcomes = answer.result.unwrap_or_else(|e| panic!("{variable}: the editor after the cut: {e}"));
+            match &outcomes[0] {
+                rdb_studio::model::Outcome::Rows(grid) => assert_eq!(one(grid).as_deref(), Some("3"), "{variable}"),
+                other => panic!("{variable}: {other:?}"),
+            }
+            assert_eq!(answer.notices.first().map(String::as_str), Some(conn::WIRE_REOPENED_NOTICE), "{variable}");
+        }
+    }
+    // Opened once per cut, and the next run says nothing of it.
+    let canceller = session.canceller();
+    let answer = session.run_editor("SELECT 4 AS n", None, &canceller).await;
+    assert!(answer.result.is_ok(), "{variable}: {:?}", answer.result);
+    assert!(answer.notices.is_empty(), "{variable}: {:?}", answer.notices);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wire_session_reopens_a_connection_the_server_closed() {
+    exercise_reopen("RDB_STUDIO_TEST_PG", Flavor::Postgres).await;
+    exercise_reopen("RDB_STUDIO_TEST_RDB", Flavor::Rasterized).await;
 }

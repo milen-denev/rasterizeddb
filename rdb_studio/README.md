@@ -94,6 +94,7 @@ What differs over native:
 | Link | TLS over TCP, always, the certificate verified when the profile asks (`--rdb-cert`); none on a socket | per the TLS setting |
 | Transaction blocks | the editor's own connection keeps one open across runs; the panels' shared one does not see into it | may span runs (and the panels share the editor's connection) |
 | Long statements | cut off at the server's `--rdb-request-timeout` (30 s by default) | no limit |
+| A connection the server closed | opened again by the next statement | opened again by the next statement, before it is sent; the editor is told that a transaction open on the old one was rolled back |
 | BENCH | `native` (the engine's binary answer, what applications send) and `simple` | `simple` and `prepared` |
 
 ## The two dialects

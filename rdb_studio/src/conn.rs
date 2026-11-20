@@ -67,8 +67,27 @@ use crate::model::{Connection, Flavor, Grid, NativeLogin, Outcome, TlsMode, Tran
 /// The client underneath a session.
 #[derive(Clone)]
 enum Backend {
-    Wire(Arc<Client>),
+    Wire(Arc<WireLink>),
     Native(Arc<rasterizeddb_client::Client>),
+}
+
+/// A wire session's connection, reopened when the server has closed it.
+///
+/// A `tokio_postgres::Client` whose connection ended answers every call with
+/// "connection closed", so one restart of the server (or an idle connection
+/// cut by a firewall) left every panel failing until the profile was opened
+/// again. A call that finds the connection closed opens a new one first. The
+/// statement had not been sent on the old one, so nothing runs twice; one
+/// that was in flight when the connection died fails as it did, and the next
+/// call reopens.
+struct WireLink {
+    client: std::sync::RwLock<Arc<Client>>,
+    /// Held while a new connection is opened, so callers that all found the
+    /// connection closed open one between them, not one each.
+    reopening: tokio::sync::Mutex<()>,
+    profile: Connection,
+    /// The session's notices, which a reopened connection's go to as well.
+    notices: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// A live connection, and what the console learned about it while opening one.
@@ -255,8 +274,9 @@ async fn connect_native(profile: Connection) -> Result<Session, String> {
     };
 
     // `SHOW DATABASES`, the sidebar's own statement: its current row is the
-    // database this listener serves. (`current_database()` is not a function
-    // the engine answers.)
+    // database this listener serves. (`current_database()` answers too since
+    // the server read session values over native, but a server from before
+    // that does not, and every server answers this.)
     let database = match client
         .simple_query(crate::dialect::databases_sql(Flavor::Rasterized))
         .await
@@ -358,6 +378,32 @@ pub(crate) fn native_error(error: &rasterizeddb_client::Error) -> String {
 }
 
 async fn connect_wire(profile: Connection) -> Result<Session, String> {
+    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (client, encrypted, verified) = open_wire(&profile, notices.clone()).await?;
+    Ok(Session {
+        transport: Transport::Wire,
+        flavor: profile.flavor,
+        database: profile.database.clone(),
+        server: endpoint(&profile.host, profile.port),
+        encrypted,
+        verified,
+        backend: Backend::Wire(Arc::new(WireLink {
+            client: std::sync::RwLock::new(Arc::new(client)),
+            reopening: tokio::sync::Mutex::new(()),
+            profile,
+            notices: notices.clone(),
+        })),
+        notices,
+        editor: Arc::default(),
+    })
+}
+
+/// One wire connection for `profile`: the client, whether the link is
+/// encrypted, and whether the server's certificate was verified.
+async fn open_wire(
+    profile: &Connection,
+    notices: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Result<(Client, bool, bool), String> {
     let mut config = tokio_postgres::Config::new();
     config
         .host(&profile.host)
@@ -369,8 +415,6 @@ async fn connect_wire(profile: Connection) -> Result<Session, String> {
         config.password(&profile.password);
     }
 
-    let server = endpoint(&profile.host, profile.port);
-
     let socket = is_socket_dir(&profile.host);
     let verify = profile.verify_server && !socket;
     if verify && profile.tls == TlsMode::Disable {
@@ -380,7 +424,6 @@ async fn connect_wire(profile: Connection) -> Result<Session, String> {
         );
     }
     let attempt_tls = !socket && matches!(profile.tls, TlsMode::Prefer | TlsMode::Require);
-    let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
     if attempt_tls {
         let connector = if verify {
             verifying_connector(profile.ca_file.trim())?
@@ -388,19 +431,7 @@ async fn connect_wire(profile: Connection) -> Result<Session, String> {
             tls_connector()
         };
         match connect_tls(&config, connector, notices.clone()).await {
-            Ok(client) => {
-                return Ok(Session {
-                    backend: Backend::Wire(Arc::new(client)),
-                    transport: Transport::Wire,
-                    flavor: profile.flavor,
-                    database: profile.database,
-                    server,
-                    encrypted: true,
-                    verified: verify,
-                    notices,
-                    editor: Arc::default(),
-                });
-            }
+            Ok(client) => return Ok((client, true, verify)),
             // A verifying profile never falls back to cleartext: the point
             // of it is that nobody in between can read or answer for the
             // server.
@@ -414,21 +445,16 @@ async fn connect_wire(profile: Connection) -> Result<Session, String> {
     let (client, connection) = config
         .connect(NoTls)
         .await
-        .map_err(|e| describe(&e.to_string(), &profile))?;
-    drive(connection, notices.clone());
-
-    Ok(Session {
-        backend: Backend::Wire(Arc::new(client)),
-        transport: Transport::Wire,
-        flavor: profile.flavor,
-        database: profile.database,
-        server,
-        encrypted: false,
-        verified: false,
-        notices,
-        editor: Arc::default(),
-    })
+        .map_err(|e| describe(&e.to_string(), profile))?;
+    drive(connection, notices);
+    Ok((client, false, false))
 }
+
+/// What the editor is told when its connection had to be opened again: the
+/// server ends a closed connection's transaction, so a block the editor had
+/// open is gone.
+pub const WIRE_REOPENED_NOTICE: &str = "the connection to the server was lost and has been opened \
+     again; a transaction that was open on it was rolled back by the server";
 
 async fn connect_tls(
     config: &tokio_postgres::Config,
@@ -573,15 +599,44 @@ fn describe(error: &str, profile: &Connection) -> String {
     error.to_string()
 }
 
+impl WireLink {
+    /// The connection as it stands, open or not.
+    fn current(&self) -> Arc<Client> {
+        self.client.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// An open connection, and whether it had to be opened again for this
+    /// call. The new one's notices go where the old one's did.
+    async fn open(&self) -> Result<(Arc<Client>, bool), String> {
+        let current = self.current();
+        if !current.is_closed() {
+            return Ok((current, false));
+        }
+        let _reopening = self.reopening.lock().await;
+        // Another caller may have opened it while this one waited.
+        let current = self.current();
+        if !current.is_closed() {
+            return Ok((current, false));
+        }
+        let (client, _, _) = open_wire(&self.profile, self.notices.clone()).await.map_err(|e| {
+            format!("the connection to the server was lost, and opening it again failed: {e}")
+        })?;
+        let client = Arc::new(client);
+        *self.client.write().unwrap_or_else(|e| e.into_inner()) = client.clone();
+        log_line("connection reopened");
+        Ok((client, true))
+    }
+}
+
 impl Session {
     /// The driver underneath, for the benchmark, which has to send a statement
     /// without building a grid of its answer each time — that would be
     /// measuring this console's allocator rather than the server.
     ///
     /// `None` for a native session; see [`native`](Self::native).
-    pub fn client(&self) -> Option<&Client> {
+    pub fn client(&self) -> Option<Arc<Client>> {
         match &self.backend {
-            Backend::Wire(client) => Some(client),
+            Backend::Wire(link) => Some(link.current()),
             Backend::Native(_) => None,
         }
     }
@@ -632,7 +687,7 @@ impl Session {
     /// `INSERT`s should still show its rows.
     pub async fn run(&self, sql: &str) -> Result<Vec<Outcome>, String> {
         let client = match &self.backend {
-            Backend::Wire(client) => client,
+            Backend::Wire(link) => link.open().await?.0,
             Backend::Native(client) => return run_native(client, sql).await,
         };
         let messages = client.simple_query(sql).await.map_err(|e| sql_error(&e))?;
@@ -813,8 +868,8 @@ impl Session {
     /// the run can be stopped while it waits.
     pub fn canceller(&self) -> Canceller {
         match &self.backend {
-            Backend::Wire(client) => Canceller::Wire {
-                token: client.cancel_token(),
+            Backend::Wire(link) => Canceller::Wire {
+                token: link.current().cancel_token(),
                 tls: self.encrypted,
             },
             Backend::Native(client) => Canceller::Native {
@@ -873,11 +928,20 @@ impl Session {
                     },
                 }
             }
-            (Backend::Wire(client), _) => {
+            (Backend::Wire(link), _) => {
                 self.notices.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                let result = run_wire_capped(client, sql, max_rows).await;
-                let notices =
+                let (client, reopened) = match link.open().await {
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        return EditorAnswer { result: Err(e), notices: Vec::new(), transaction: None };
+                    }
+                };
+                let result = run_wire_capped(&client, sql, max_rows).await;
+                let mut notices =
                     std::mem::take(&mut *self.notices.lock().unwrap_or_else(|e| e.into_inner()));
+                if reopened {
+                    notices.insert(0, WIRE_REOPENED_NOTICE.to_string());
+                }
                 EditorAnswer { result, notices, transaction: None }
             }
             (Backend::Native(_), Canceller::Wire { .. }) => EditorAnswer {

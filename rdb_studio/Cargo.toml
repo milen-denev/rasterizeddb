@@ -7,7 +7,7 @@ license = "GPL-3.0"
 
 [dependencies]
 iced = { version = "0.14.0", features = ["tokio", "canvas", "advanced"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util"] }
 tokio-postgres = "0.7.18"
 # The native protocol (rastcp), the default for a RasterizedDB profile.
 rasterizeddb_client = { path = "../rasterizeddb_client", default-features = false }
