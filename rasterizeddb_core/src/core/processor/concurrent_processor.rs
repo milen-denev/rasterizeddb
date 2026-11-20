@@ -181,6 +181,49 @@ impl PreparedSort {
         Ordering::Equal
     }
 
+    /// [`Self::compare`] with the left row given as cells: `left(schema_id)`
+    /// is that row's cell of the column and the column's stored type, or
+    /// `None` where the cells do not hold the column. The same order, key by
+    /// key: a set NULL flag above every value, then the values as their type
+    /// orders them, a descending key reversed.
+    #[inline]
+    pub(crate) fn compare_cells<'c>(
+        &self,
+        left: impl Fn(usize) -> Option<(&'c [u8], &'c crate::core::db_type::DbType)>,
+        b: &Row,
+    ) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        for key in self.keys.iter() {
+            let values = || match (left(key.schema_id), Self::column(b, key.schema_id, key.pos)) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some((cell, stored)), Some(bc)) => compare_bytes_as_type(
+                    key.db_type.clone().unwrap_or_else(|| stored.clone()),
+                    cell,
+                    bc.data.into_slice(),
+                ),
+            };
+            let ord = match key.null_flag {
+                Some(flag) => match (
+                    left(flag).and_then(|(cell, _)| cell.first().copied()).is_some_and(|byte| byte != 0),
+                    Self::is_null(b, flag, key.flag_pos),
+                ) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
+                    (false, false) => values(),
+                },
+                None => values(),
+            };
+            let ord = if key.descending { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+
     #[inline(always)]
     fn compare_values(&self, a: &Row, b: &Row, key: &PreparedKey) -> std::cmp::Ordering {
         match (
@@ -1029,6 +1072,18 @@ impl ConcurrentProcessor {
             }
             _ => None,
         };
+        // The keys such a scan fetches, as cells: a batch's are read together
+        // and a row is fetched only if its keys could displace one the worker
+        // holds (see the batch's end, below). With each column's stored type,
+        // which a comparison falls back to.
+        let top_keys: Option<StdArc<(CellLayout, Vec<crate::core::db_type::DbType>)>> = deferred_payload
+            .as_ref()
+            .filter(|_| column_scan::top_cells())
+            .and_then(|fetch| {
+                CellLayout::of(fetch).map(|layout| {
+                    StdArc::new((layout, fetch.columns_fetching_data.iter().map(|c| c.column_type.clone()).collect()))
+                })
+            });
 
         let mut worker_handles = Vec::with_capacity(n_workers);
 
@@ -1051,6 +1106,7 @@ impl ConcurrentProcessor {
             let deferred_ref = deferred_payload.as_ref().map(Arc::clone);
             let count_only_ref = count_only.as_ref().map(Arc::clone);
             let cells_ref = cells.clone();
+            let top_keys_ref = top_keys.clone();
             // Kept per worker and added once on exit. The shared counter is one
             // cache line every worker would otherwise write to per row, which is
             // the contention the `rows_scanned` counter is batched to avoid.
@@ -1091,6 +1147,11 @@ impl ConcurrentProcessor {
 
                 let mut prefilter_scratch = prefilter::Scratch::default();
                 let mut gather = cells_ref.as_ref().map(|sink| column_scan::Gather::new(&sink.layout));
+                // A top-N scan's key cells of the batch in hand, and the rows
+                // they are of.
+                let mut top_cells = top_keys_ref.as_ref().map(|keys| column_scan::Gather::new(&keys.0));
+                let mut top_noted: Vec<RowPointer> = Vec::new();
+                let mut top_turned_away = 0u64;
                 // The mask is the `WHERE`'s answer, not only a superset of it.
                 let mask_decides = prefilter_ref.as_deref().is_some_and(BatchPrefilter::decides);
                 // And nothing is emitted or cached, so the mask is all this
@@ -1200,6 +1261,16 @@ impl ConcurrentProcessor {
                             // a full table read into a pointer walk.
                             if count_only_ref.is_some() {
                                 counted += 1;
+                                continue;
+                            }
+
+                            // A top-N scan decides at the batch's end, on
+                            // its keys' cells, whether this row is fetched.
+                            if let Some(keys) = top_cells.as_mut() {
+                                if likely(pointer.check_column_range().is_ok()) {
+                                    keys.note(pointer.position, pointer.length as u64);
+                                    top_noted.push(pointer.clone());
+                                }
                                 continue;
                             }
 
@@ -1451,6 +1522,16 @@ impl ConcurrentProcessor {
                                     continue;
                                 }
 
+                                // As in the unfiltered branch: a top-N
+                                // scan decides at the batch's end.
+                                if let Some(keys) = top_cells.as_mut() {
+                                    if likely(pointer.check_column_range().is_ok()) {
+                                        keys.note(pointer.position, pointer.length as u64);
+                                        top_noted.push(pointer.clone());
+                                    }
+                                    continue;
+                                }
+
                                 // As in the unfiltered branch: its cells are
                                 // read with the rest of the batch's.
                                 if let Some(gather) = gather.as_mut() {
@@ -1534,6 +1615,63 @@ impl ConcurrentProcessor {
                     // left it out of the rows.
                     if let Some(gather) = gather.as_mut() {
                         gather.flush_readable(io_rows_ref).await;
+                    }
+
+                    // A top-N scan's matched rows of this batch, in the order
+                    // the scan met them. Each used to have its keys fetched
+                    // and compared with the worker's `cap`-th best
+                    // (`keep_for_top_n`), nearly always to be dropped. The
+                    // batch's key cells are read together instead, and a row
+                    // whose cells already lose that comparison is turned
+                    // away unfetched; one that wins it, and every row until
+                    // the worker holds `cap`, goes through the fetch and
+                    // `keep_for_top_n` exactly as before. The comparison is
+                    // the same one, against the same row, in the same order,
+                    // so the same rows are kept. A batch whose cells cannot
+                    // be read together is fetched row by row as before.
+                    if let (Some(keys), Some(top), Some(key_fetch), Some(layout)) =
+                        (top_cells.as_mut(), top_n_ref.as_ref(), deferred_ref.as_deref(), top_keys_ref.as_ref())
+                    {
+                        let cells = keys.take_batch(io_rows_ref).await.ok();
+                        for (r, pointer) in top_noted.drain(..).enumerate() {
+                            let pointer = &pointer;
+                            if let (Some(chunk), true) = (cells.as_ref(), top_bounded) {
+                                if let Some(sort) = top_sort.as_ref() {
+                                    let cell = |schema_id: usize| {
+                                        layout.0.position(schema_id as u64).map(|c| {
+                                            let column = &layout.0.columns[c];
+                                            let cell = if column.text {
+                                                chunk.text(c, r)
+                                            } else {
+                                                chunk.cell(c, column.width as usize, r)
+                                            };
+                                            (cell, &layout.1[c])
+                                        })
+                                    };
+                                    if sort.compare_cells(cell, &acc_pairs[top.cap - 1].0) != std::cmp::Ordering::Less {
+                                        top_turned_away += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if unlikely(
+                                pointer
+                                    .fetch_row_reuse_async(io_rows_ref, key_fetch, &mut buffer.row)
+                                    .await
+                                    .is_err(),
+                            ) {
+                                continue;
+                            }
+                            Self::keep_for_top_n(
+                                top,
+                                schema_ref.as_slice(),
+                                &mut top_sort,
+                                &mut top_bounded,
+                                &mut acc_pairs,
+                                &mut buffer.row,
+                                pointer,
+                            );
+                        }
                     }
 
                     // Keep only this worker's best `cap` rows.
@@ -1641,6 +1779,7 @@ impl ConcurrentProcessor {
                         let _ = tx_rp.send(acc_ptrs).await;
                     }
                 }
+                column_scan::note_top_rows_turned_away(top_turned_away);
                 if let (Some(gather), Some(sink)) = (gather, cells_ref.as_ref()) {
                     let chunk = gather.finish();
                     if chunk.rows > 0 {
