@@ -140,3 +140,34 @@ async fn a_dropped_relations_grants_go_with_it() {
     o.batch_execute("ALTER TABLE t RENAME TO t2; GRANT SELECT ON t2 TO app").await.expect("rename");
     assert_eq!(rows(&app, "SELECT count(*) FROM t2").await, ["0"]);
 }
+
+/// A REVOKE reaches a statement whose parse was learned while the role still
+/// held the privilege: a prepared statement run again, and a simple query
+/// whose template was learned. Both read through a learned parse, which skips
+/// the text path where privileges are checked, and a REVOKE changes no schema.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_reaches_a_learned_statement() {
+    let server = TestServer::start_with(TlsMode::Disable, AuthMethod::ScramSha256, Some("boot")).await.expect("server");
+    let admin = as_user(&server, "rasterized", "boot").await;
+    admin.batch_execute("CREATE USER owner_role PASSWORD 'o'; CREATE USER app PASSWORD 'a'").await.expect("roles");
+    let owner = as_user(&server, "owner_role", "o").await;
+    let app = as_user(&server, "app", "a").await;
+    owner
+        .batch_execute(
+            "CREATE TABLE lt (id BIGINT PRIMARY KEY, v TEXT); \
+             INSERT INTO lt VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'); \
+             GRANT SELECT ON lt TO app",
+        )
+        .await
+        .expect("owner sets up");
+    let prepared = app.prepare("SELECT v FROM lt WHERE id = $1").await.expect("prepare");
+    for id in 1..=4i64 {
+        let got = app.query(&prepared, &[&id]).await.expect("granted prepared read");
+        assert_eq!(got.len(), 1);
+        assert_eq!(rows(&app, &format!("SELECT v FROM lt WHERE id = {id}")).await.len(), 1);
+    }
+    owner.batch_execute("REVOKE SELECT ON lt FROM app").await.expect("revoke");
+    let e = app.query(&prepared, &[&5i64]).await.expect_err("a revoked prepared read");
+    assert_eq!(e.code().map(|c| c.code()), Some("42501"), "{e}");
+    assert_eq!(code(&app, "SELECT v FROM lt WHERE id = 5").await, "42501");
+}

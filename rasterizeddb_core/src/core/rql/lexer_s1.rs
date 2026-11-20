@@ -370,7 +370,14 @@ pub fn strip_sql_comments(sql: &str) -> String {
     // Only a `--` or a `/*` starts what this removes, so text holding neither,
     // quoted or not, comes back as it is: one copy, where a 125 KB bulk
     // `INSERT` was pushed byte by byte, twice per statement.
-    if memchr::memmem::find(bytes, b"--").is_none() && memchr::memmem::find(bytes, b"/*").is_none() {
+    // A short statement is scanned directly: building two `memmem`
+    // searchers cost more than the whole scan of a point query's text.
+    let commented = if bytes.len() <= 4096 {
+        bytes.windows(2).any(|w| matches!(w, [b'-', b'-'] | [b'/', b'*']))
+    } else {
+        memchr::memmem::find(bytes, b"--").is_some() || memchr::memmem::find(bytes, b"/*").is_some()
+    };
+    if !commented {
         return sql.to_string();
     }
     // Bytes, not chars. `push(byte as char)` re-encoded every byte above 0x7F

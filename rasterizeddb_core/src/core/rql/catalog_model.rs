@@ -575,6 +575,39 @@ fn collation_of(type_oid: i64) -> i64 {
 }
 
 /// A table's live columns in order, numbered from one.
+/// What [`column_origins`] reads of a column: its number, name and declared
+/// type, as [`table_columns`] gives them.
+#[derive(Debug, Clone, PartialEq)]
+struct OriginColumn {
+    attnum: i64,
+    name: String,
+    type_oid: i64,
+    typmod: i64,
+}
+
+/// [`table_columns`]' numbering, names and types alone. Every
+/// `RowDescription` of a SELECT reads them, and the rest of
+/// `table_columns` (defaults, identity, generated expressions, a search
+/// of every field for each one's NULL flag) was most of what describing a
+/// point query cost.
+fn origin_columns(schema: &TableSchema) -> Vec<OriginColumn> {
+    use crate::core::rql::nullable;
+    let mut fields: Vec<&SchemaField> = schema
+        .fields
+        .iter()
+        .filter(|f| !f.is_deleted && !nullable::is_hidden(&f.name))
+        .collect();
+    fields.sort_by_key(|f| f.write_order);
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let (type_oid, typmod, _) = column_type(field, schema);
+            OriginColumn { attnum: i as i64 + 1, name: field.name.clone(), type_oid, typmod }
+        })
+        .collect()
+}
+
 fn table_columns(schema: &TableSchema) -> Vec<Column> {
     use crate::core::rql::nullable;
     let mut fields: Vec<&SchemaField> = schema
@@ -663,13 +696,13 @@ pub(crate) fn column_origins(database: &Database, sql: &str) -> Option<Vec<Optio
     }
     let relations = crate::core::rql::join::parse_from_clause(from_text).ok()?;
     // Each relation's columns, numbered as `pg_attribute` numbers them.
-    let mut tables: Vec<(String, i64, Vec<Column>)> = Vec::with_capacity(relations.len());
+    let mut tables: Vec<(String, i64, Vec<OriginColumn>)> = Vec::with_capacity(relations.len());
     for r in &relations {
         let relation = database.relation(&r.table)?;
         let schema = relation.schema();
-        tables.push((r.label.clone(), oid_of(&r.table), table_columns(&schema)));
+        tables.push((r.label.clone(), oid_of(&r.table), origin_columns(&schema)));
     }
-    let origin = |oid: i64, c: &Column| ColumnOrigin {
+    let origin = |oid: i64, c: &OriginColumn| ColumnOrigin {
         table_oid: oid as i32,
         attnum: c.attnum as i16,
         type_oid: c.type_oid as i32,
@@ -2093,6 +2126,37 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `origin_columns` is `table_columns` cut to what a RowDescription
+    /// reads: the same numbers, names, types and modifiers, column for
+    /// column, over NULL flags, a dropped column, typmods, defaults, an
+    /// identity and a generated column.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn origin_columns_are_table_columns_cut_down() {
+        use crate::core::rql::lexer_s1::recognize_query_purpose;
+        let dir = std::env::temp_dir().join(format!("origin_columns_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = rclite::Arc::new(crate::core::database::Database::new_with_backend(&dir.to_string_lossy(), true).await);
+        for sql in [
+            "CREATE TABLE oc (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name VARCHAR(20), \
+             price NUMERIC(10, 2) NOT NULL DEFAULT 0, at TIMESTAMP(3), gone INT, note TEXT, \
+             doubled BIGINT GENERATED ALWAYS AS (id * 2) STORED, flag BOOLEAN)",
+            "ALTER TABLE oc DROP COLUMN gone",
+            "ALTER TABLE oc ADD COLUMN later CHAR(4)",
+        ] {
+            let reply = crate::core::rql::executor::execute(recognize_query_purpose(sql).unwrap(), db.clone()).await;
+            assert!(reply.first() != Some(&3), "{sql}: {}", String::from_utf8_lossy(&reply));
+        }
+        let relation = db.relation("oc").unwrap();
+        let schema = relation.schema();
+        let full: Vec<OriginColumn> = table_columns(&schema)
+            .into_iter()
+            .map(|c| OriginColumn { attnum: c.attnum, name: c.name, type_oid: c.type_oid, typmod: c.typmod })
+            .collect();
+        assert_eq!(origin_columns(&schema), full);
+        assert_eq!(full.len(), 8, "{full:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn format_type_writes_modifiers_as_postgresql_does() {
