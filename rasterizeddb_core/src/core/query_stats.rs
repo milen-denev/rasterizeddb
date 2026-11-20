@@ -342,6 +342,131 @@ pub struct Probe {
     rows_scanned: AtomicU64,
     materialised: AtomicU64,
     materialised_us: AtomicU64,
+    /// The learned statement this is an execution of, when one is: see
+    /// [`note_shape`].
+    shape: OnceLock<Arc<ShapeStats>>,
+}
+
+/// What [`finish`] reads from a statement's text that is the same for every
+/// execution of one learned statement: its `queryid`, its normalised text and
+/// whether it is introspection.
+///
+/// A learned statement (a prepared `SELECT`, or a text one matched to a
+/// template) differs between executions only in its values, and normalising
+/// turns every value into a placeholder. So the scan, the normalising pass and
+/// the hash `finish` makes over each statement's text give one answer per
+/// learned statement, and were most of what recording a point query cost.
+/// The answer is kept here, held by the learned statement, and the text is
+/// not read again.
+///
+/// Not trusted blindly. About one execution in [`SHAPE_CHECK_EVERY`] still
+/// works its answer out from the text, and a single disagreement turns this
+/// off for good, so a statement whose values do change its shape (a value
+/// that is sometimes negative, a string that sometimes carries a comment
+/// marker) is recorded as the text says. A wrong answer here would group a
+/// statement under the wrong entry of `SHOW QUERY STATS`. It can never change
+/// a query's result.
+#[derive(Default)]
+pub struct ShapeStats {
+    known: OnceLock<KnownShape>,
+    disagreed: AtomicBool,
+}
+
+struct KnownShape {
+    queryid: u64,
+    normalized: Box<str>,
+    introspection: bool,
+}
+
+/// Executions recorded from a learned statement's answer rather than from
+/// their text. For tests: it is how one tells that what supplies the answer
+/// (`note_shape`) is reached at all.
+#[cfg(test)]
+pub(crate) static SHAPES_SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// The log is process-wide, so the tests that read it back cannot run at the
+/// same time as each other, nor as a test elsewhere that records statements
+/// on purpose. Taken by every test that calls `reset` and by those.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+/// The thread of the test holding [`exclusive`], whose statements alone
+/// reach the log while it does.
+#[cfg(test)]
+static EXCLUSIVE_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// Held by a test that counts what the log holds exactly. Every other
+/// thread's statements are dropped while it is held: a test elsewhere that
+/// runs SQL through a measured path (any native request, any pgwire
+/// statement) records into the same process-wide log, and filled the map
+/// past the count the test was checking. Those tests do not read the log, so
+/// losing their records costs them nothing; serialising them all on
+/// [`TEST_SERIAL`] instead would cost the suite its parallelism.
+#[cfg(test)]
+pub(crate) struct Exclusive(#[allow(dead_code)] parking_lot::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+pub(crate) fn exclusive() -> Exclusive {
+    let serial = TEST_SERIAL.lock();
+    *EXCLUSIVE_OWNER.lock() = Some(std::thread::current().id());
+    Exclusive(serial)
+}
+
+#[cfg(test)]
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        // Before the serial lock this holds is released, with the field.
+        *EXCLUSIVE_OWNER.lock() = None;
+    }
+}
+
+/// One execution in this many of a learned statement is checked against its
+/// text: chosen by the statement's start time, so the check needs no counter
+/// shared across connections.
+const SHAPE_CHECK_EVERY: i64 = 64;
+
+impl ShapeStats {
+    /// The cached answer, unless there is none yet, it was found wrong once,
+    /// or this execution is one of those checked against its text.
+    fn known(&self, started_unix_us: i64) -> Option<&KnownShape> {
+        if self.disagreed.load(Ordering::Relaxed) || started_unix_us.rem_euclid(SHAPE_CHECK_EVERY) == 0 {
+            return None;
+        }
+        self.known.get()
+    }
+
+    /// Records what this execution's text gave: the answer, if there is none
+    /// yet; otherwise a check of it.
+    fn learn(&self, normalized: &str, queryid: u64, introspection: bool) {
+        if self.disagreed.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.known.get() {
+            None => {
+                let _ = self.known.set(KnownShape {
+                    queryid,
+                    normalized: normalized.into(),
+                    introspection,
+                });
+            }
+            Some(k) => {
+                if k.queryid != queryid || k.introspection != introspection || *k.normalized != *normalized {
+                    self.disagreed.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Tells the running statement that it is an execution of the learned
+/// statement `shape` stands for, so [`finish`] can take its `queryid` and
+/// normalised text from there rather than from the text. A no-op outside a
+/// measured statement, and for every call after the first in one.
+#[inline]
+pub fn note_shape(shape: &Arc<ShapeStats>) {
+    let _ = PROBE.try_with(|p| {
+        let _ = p.shape.set(shape.clone());
+    });
 }
 
 tokio::task_local! {
@@ -434,6 +559,10 @@ pub fn finish(
     username: &str,
     error: Option<&str>,
 ) {
+    #[cfg(test)]
+    if EXCLUSIVE_OWNER.lock().is_some_and(|owner| owner != std::thread::current().id()) {
+        return;
+    }
     // A console asking the server about itself is not what this log is for.
     // Dropped here rather than before the statement ran, because that is the
     // one place the text is known and the cost of having timed it is an
@@ -446,7 +575,13 @@ pub fn finish(
     // failing introspection statement is rare by construction, and a console
     // that produced them at the rate it polls would be a console reporting an
     // error on every refresh.
-    if error.is_none() && is_introspection(sql) {
+    let shape = recording.probe.shape.get();
+    let known = shape.and_then(|s| s.known(recording.started_unix_us));
+    let introspection = match known {
+        Some(k) => k.introspection,
+        None => is_introspection(sql),
+    };
+    if error.is_none() && introspection {
         return;
     }
 
@@ -463,16 +598,33 @@ pub fn finish(
     // Redacted and cut in one bounded pass: a multi-megabyte bulk `INSERT`
     // costs a copy of its first `MAX_SQL_CHARS` characters, not of itself.
     let text = crate::core::redact::statement_bounded(sql, MAX_SQL_CHARS);
-    let normalized = normalize(&text);
-    let queryid = hash_query(&normalized);
+    // A learned statement's answer stands only for its text as written: one
+    // that redaction or the length cut changed is normalised as it is kept.
+    let as_written = text.len() == sql.len() && text == sql;
+    let (normalized, queryid) = match known {
+        Some(k) if as_written => {
+            #[cfg(test)]
+            SHAPES_SERVED.fetch_add(1, Ordering::Relaxed);
+            (None, k.queryid)
+        }
+        _ => {
+            let normalized = normalize(&text);
+            let queryid = hash_query(&normalized);
+            if as_written && let Some(s) = shape {
+                s.learn(&normalized, queryid, introspection);
+            }
+            (Some(normalized), queryid)
+        }
+    };
 
     // Exactly sized: `statement_bounded` and `normalize` both reserve for the
     // worst case, and the ring and the map keep these for a long time.
     let sql_text = text.into_boxed_str();
     let error_text = error.map(|e| bounded(e).into_boxed_str());
     // Only a new shape keeps its normalised text; for the rest it is dropped
-    // after the lock, below.
-    let mut normalized = Some(normalized);
+    // after the lock, below. `None` when a learned statement's answer stood in
+    // for it, which then supplies the text if the shape is new.
+    let mut normalized = normalized;
 
     let capacity = capacity();
     // What leaves the ring and the map is freed after the lock is released:
@@ -528,6 +680,7 @@ pub fn finish(
         query: normalized
             .take()
             .map(|n| n.into_boxed_str().into_string())
+            .or_else(|| known.map(|k| k.normalized.to_string()))
             .unwrap_or_default(),
         calls: 0,
         errors: 0,
@@ -1001,9 +1154,6 @@ fn is_internal_name(word: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The log is process-wide, so the tests that read it back cannot run at
-    /// the same time as each other. Taken by every test that calls `reset`.
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     // --- what the log refuses to hold
 
@@ -1157,7 +1307,7 @@ mod tests {
     /// read zero however well they were counted.
     #[test]
     fn what_was_materialised_reaches_the_record_and_the_aggregate() {
-        let _guard = SERIAL.lock();
+        let _guard = super::exclusive();
         reset();
         set_enabled(true);
 
@@ -1190,7 +1340,7 @@ mod tests {
     /// failed is rare by construction.
     #[test]
     fn an_introspection_statement_that_failed_is_kept() {
-        let _guard = SERIAL.lock();
+        let _guard = super::exclusive();
         reset();
         set_enabled(true);
 
@@ -1221,7 +1371,7 @@ mod tests {
     /// not a call on an existing shape.
     #[test]
     fn a_dropped_statement_reaches_neither_half_of_the_log() {
-        let _guard = SERIAL.lock();
+        let _guard = super::exclusive();
         reset();
         set_enabled(true);
 
@@ -1363,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_statement_records_what_it_did() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         set_capacity(8);
         let recording = begin().expect("enabled by default");
@@ -1411,7 +1561,7 @@ mod tests {
     #[test]
     #[ignore]
     fn query_stats_finish_bench() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let texts: Vec<String> = (0..MAX_DISTINCT * 5)
             .map(|i| format!("SELECT c{i} FROM some_table WHERE x = 1"))
@@ -1445,7 +1595,7 @@ mod tests {
 
     #[test]
     fn a_full_map_evicts_a_batch_of_the_coldest() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         for i in 0..MAX_DISTINCT {
             let r = begin().unwrap();
@@ -1475,7 +1625,7 @@ mod tests {
     /// secret beyond the cut is not kept either.
     #[test]
     fn a_huge_statement_is_kept_bounded() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let mut sql = String::from("INSERT INTO t VALUES ");
         while sql.len() < 1 << 20 {
@@ -1492,7 +1642,7 @@ mod tests {
 
     #[test]
     fn the_ring_and_the_map_are_bounded() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         set_capacity(4);
         for i in 0..20 {
@@ -1509,7 +1659,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_recorded_as_one() {
-        let _serial = SERIAL.lock();
+        let _serial = super::exclusive();
         reset();
         let r = begin().unwrap();
         finish(r, "SELECT * FROM nope", "db", "u", Some("table not found"));
@@ -1546,5 +1696,108 @@ mod tests {
         assert_eq!(agg.mean_us(), 20.0);
         // Population standard deviation of 10/20/30 is sqrt(200/3).
         assert!((agg.stddev_us() - (200.0f64 / 3.0).sqrt()).abs() < 1e-9);
+    }
+
+    // --- learned statements
+
+    /// A statement run as an execution of the learned `shape`, started at
+    /// `started_unix_us` (a multiple of [`SHAPE_CHECK_EVERY`] is a checked
+    /// execution).
+    fn run_learned(shape: &Arc<ShapeStats>, sql: &str, started_unix_us: i64) {
+        let mut recording = begin().unwrap();
+        recording.started_unix_us = started_unix_us;
+        let _ = recording.probe.shape.set(shape.clone());
+        finish(recording, sql, "db", "u", None);
+    }
+
+    fn seeded(queryid: u64, normalized: &str) -> Arc<ShapeStats> {
+        let shape = Arc::new(ShapeStats::default());
+        let _ = shape.known.set(KnownShape {
+            queryid,
+            normalized: normalized.into(),
+            introspection: false,
+        });
+        shape
+    }
+
+    /// Executions of one learned statement land in one entry, under the
+    /// `queryid` and text its statement's own text gives, whichever values
+    /// each carried and whether or not it was a checked one.
+    #[test]
+    fn a_learned_statement_is_recorded_as_its_text_would_be() {
+        let _serial = super::exclusive();
+        reset();
+        let shape = Arc::new(ShapeStats::default());
+        let texts: Vec<String> = (0..200)
+            .map(|i| format!("SELECT * FROM t WHERE a = {i} AND b = 'v{i}' AND c = {}.5", i * 3))
+            .collect();
+        for (i, sql) in texts.iter().enumerate() {
+            run_learned(&shape, sql, 1_000 + i as i64);
+        }
+        let normalized = normalize(&texts[0]);
+        let mine: Vec<Aggregate> = aggregated().into_iter().filter(|a| a.query.contains("FROM t WHERE a =")).collect();
+        assert_eq!(mine.len(), 1, "one learned statement, one entry");
+        assert_eq!(mine[0].query, normalized);
+        assert_eq!(mine[0].queryid, hash_query(&normalized));
+        assert_eq!(mine[0].calls, 200);
+        assert!(!shape.disagreed.load(Ordering::Relaxed), "the checked executions agreed");
+        reset();
+    }
+
+    /// The cached answer is what an unchecked execution is recorded under,
+    /// and a checked execution whose text disagrees with it ends that for
+    /// good: what follows is recorded as its text says.
+    #[test]
+    fn a_checked_execution_that_disagrees_turns_the_cache_off() {
+        let _serial = super::exclusive();
+        reset();
+        let sql = "SELECT * FROM t WHERE id = 7";
+        let truth = hash_query(&normalize(sql));
+        let shape = seeded(42, "a stale answer");
+        run_learned(&shape, sql, 1);
+        let cached = aggregated().into_iter().find(|a| a.queryid == 42).expect("served from the cache");
+        assert_eq!(cached.query, "a stale answer", "a new entry takes the cached text too");
+        assert!(aggregated().iter().all(|a| a.queryid != truth), "not from the text");
+
+        run_learned(&shape, sql, SHAPE_CHECK_EVERY * 3);
+        assert!(shape.disagreed.load(Ordering::Relaxed), "the check found it wrong");
+        run_learned(&shape, sql, 5);
+        let truthful = aggregated().into_iter().find(|a| a.queryid == truth).expect("recorded as its text says");
+        assert_eq!(truthful.calls, 2, "the checked execution and the one after it");
+        reset();
+    }
+
+    /// A statement whose kept text is not its text as written (a secret cut
+    /// out of it, or a length cut) is normalised as it is kept: the learned
+    /// statement's answer was for its text as written.
+    #[test]
+    fn a_statement_kept_otherwise_than_written_is_normalised_as_kept() {
+        let _serial = super::exclusive();
+        reset();
+        let shape = seeded(42, "a stale answer");
+        let sql = "SELECT * FROM t WHERE a = 1 AND note = 'x' PASSWORD 'hunter2'";
+        run_learned(&shape, sql, 1);
+        let agg = aggregated();
+        assert!(agg.iter().all(|a| a.queryid != 42), "not from the cache");
+        let kept = agg.iter().find(|a| a.query.contains("note = $2")).expect("recorded as kept");
+        assert!(!kept.query.contains("hunter2"));
+        assert_eq!(kept.queryid, hash_query(&kept.query));
+        reset();
+    }
+
+    /// `note_shape` inside a measured statement is what reaches `finish`;
+    /// outside one it goes nowhere.
+    #[tokio::test]
+    async fn a_noted_shape_reaches_the_record() {
+        let _serial = super::exclusive();
+        reset();
+        let shape = seeded(42, "SELECT * FROM t WHERE id = $1");
+        note_shape(&shape);
+        let mut recording = begin().unwrap();
+        recording.started_unix_us = 1;
+        observe(recording.probe(), async { note_shape(&shape) }).await;
+        finish(recording, "SELECT * FROM t WHERE id = 7", "db", "u", None);
+        assert!(aggregated().iter().any(|a| a.queryid == 42), "the noted shape's answer");
+        reset();
     }
 }

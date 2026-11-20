@@ -306,6 +306,9 @@ pub(crate) enum NativeTextStep {
         rows: Box<crate::core::rql::prepared::PreparedRows>,
         fields: Option<super::LearnedFields>,
         scales: Option<super::LearnedScales>,
+        /// What the statement is recorded under (`query_stats::note_shape`).
+        #[cfg(feature = "query_stats")]
+        stats: StdArc<crate::core::query_stats::ShapeStats>,
     },
     /// The plain native path, watched: hand its capture to
     /// [`NativeSession::text_learn`].
@@ -367,7 +370,14 @@ impl NativeSession {
         match super::watch_step(prepared, &template, generation, &literals, &classes) {
             super::WatchStep::Text => NativeTextStep::Plain,
             super::WatchStep::Run(run) => {
-                NativeTextStep::Run { template, rows: run.rows, fields: run.fields, scales: run.scales }
+                NativeTextStep::Run {
+                    template,
+                    rows: run.rows,
+                    fields: run.fields,
+                    scales: run.scales,
+                    #[cfg(feature = "query_stats")]
+                    stats: run.stats,
+                }
             }
             super::WatchStep::Watch => match (literals, classes) {
                 (Some(literals), Some(classes)) => {

@@ -1105,3 +1105,36 @@ async fn a_learned_native_select_answers_as_the_plain_path() {
         learned_and_plain(&context, &session, &format!("SELECT price, id FROM lt WHERE id = {id}")).await;
     }
 }
+
+/// A learned native SELECT is recorded for `SHOW QUERY STATS` from its
+/// learned statement's answer (`query_stats::note_shape`), not by reading
+/// each execution's text again; the entry is the one its text gives.
+#[cfg(feature = "query_stats")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_learned_native_select_is_recorded_from_its_learned_shape() {
+    use crate::core::query_stats;
+    use std::sync::atomic::Ordering;
+    // Records statements into the process-wide log the query_stats tests
+    // count exactly.
+    let _serial = query_stats::TEST_SERIAL.lock();
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    ok(&context, "CREATE TABLE qs_shape (id BIGINT PRIMARY KEY, v BIGINT)").await;
+    for id in 1..=10 {
+        ok(&context, &format!("INSERT INTO qs_shape (id, v) VALUES ({id}, {id})")).await;
+    }
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let served = query_stats::SHAPES_SERVED.load(Ordering::Relaxed);
+    let runs = crate::pgwire::TEXT_RUNS.load(Ordering::Relaxed);
+    for id in 1..=40 {
+        let sql = format!("SELECT id, v FROM qs_shape WHERE id = {id}");
+        let answer = process_native_request(context.clone(), principal.clone(), Some(&session), sql.into_bytes()).await;
+        assert_ne!(answer.first(), Some(&3), "{}", text(&answer));
+    }
+    assert!(crate::pgwire::TEXT_RUNS.load(Ordering::Relaxed) > runs, "nothing ran from a learned parse");
+    assert!(
+        query_stats::SHAPES_SERVED.load(Ordering::Relaxed) > served,
+        "no learned execution was recorded from its learned shape"
+    );
+}

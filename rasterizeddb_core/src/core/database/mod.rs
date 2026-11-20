@@ -6329,18 +6329,29 @@ async fn run_native_query_learning(
     use crate::pgwire::NativeTextStep;
     match session.text_step(query) {
         NativeTextStep::Plain => run_native_query(query, database).await,
-        NativeTextStep::Run { template, rows, fields, scales } => match run_native_learned(rows, fields, scales, database.clone()).await {
-            Some(response) => {
-                crate::pgwire::TEXT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                response
+        NativeTextStep::Run {
+            template,
+            rows,
+            fields,
+            scales,
+            #[cfg(feature = "query_stats")]
+            stats,
+        } => {
+            #[cfg(feature = "query_stats")]
+            crate::core::query_stats::note_shape(&stats);
+            match run_native_learned(rows, fields, scales, database.clone()).await {
+                Some(response) => {
+                    crate::pgwire::TEXT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    response
+                }
+                // The table changed shape since the parse was learned:
+                // nothing was read, and the text runs instead.
+                None => {
+                    session.text_forget(&template);
+                    run_native_query(query, database).await
+                }
             }
-            // The table changed shape since the parse was learned: nothing
-            // was read, and the text runs instead.
-            None => {
-                session.text_forget(&template);
-                run_native_query(query, database).await
-            }
-        },
+        }
         NativeTextStep::Watch(watch) => {
             let (response, capture) =
                 crate::core::rql::prepared::capturing(run_native_query(query, database)).await;

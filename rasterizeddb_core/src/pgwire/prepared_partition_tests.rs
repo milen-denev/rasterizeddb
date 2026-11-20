@@ -1334,3 +1334,38 @@ async fn keyed_range_refuses_a_key_bound_for_another_table_or_key() {
     drop((ga, gb, gc));
     close(db, dir.path());
 }
+
+/// A prepared `SELECT` run from its cached parse is recorded for `SHOW QUERY
+/// STATS` from its learned statement's answer (`query_stats::note_shape`),
+/// which has to be noted inside the statement's measured scope to reach it.
+///
+/// Mutation: note the shape where the run is chosen (`execute_watched`),
+/// outside that scope: nothing is served from it.
+#[cfg(feature = "query_stats")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_parse_is_recorded_from_its_learned_shape() {
+    // Records statements into the process-wide log the query_stats tests
+    // count exactly.
+    let _serial = crate::core::query_stats::TEST_SERIAL.lock();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "prep_qs").await;
+    exec_ok(&db, "CREATE TABLE pr_qs (id BIGINT PRIMARY KEY, n BIGINT)").await;
+    let values: Vec<String> = (1..=30i64).map(|i| format!("({i}, {})", i * 10)).collect();
+    exec_ok(&db, &format!("INSERT INTO pr_qs (id, n) VALUES {}", values.join(", "))).await;
+    let served = crate::core::query_stats::SHAPES_SERVED.load(Ordering::Relaxed);
+    let runs_before = PREPARED_RUNS.load(Ordering::Relaxed);
+    with_session(&db, async |w: &mut Wire| {
+        w.prepare("q", "SELECT id, n FROM pr_qs WHERE id = $1", &[]).await;
+        for id in 1..=30i64 {
+            let got = w.run("q", &[t(id)]).await;
+            assert_eq!(got.rows, vec![row(&[&id.to_string(), &(id * 10).to_string()])]);
+        }
+    })
+    .await;
+    assert!(PREPARED_RUNS.load(Ordering::Relaxed) - runs_before >= 20, "the fast path never ran");
+    assert!(
+        crate::core::query_stats::SHAPES_SERVED.load(Ordering::Relaxed) > served,
+        "no cached-parse execution was recorded from its learned shape"
+    );
+    close(db, dir.path());
+}
