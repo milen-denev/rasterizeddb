@@ -6360,8 +6360,8 @@ async fn run_native_query_learning(
 /// reshaped since the parse was learned.
 async fn run_native_learned(
     rows: Box<crate::core::rql::prepared::PreparedRows>,
-    fields: Option<Vec<(String, crate::core::db_type::DbType)>>,
-    scales: Option<Vec<u32>>,
+    fields: Option<crate::pgwire::LearnedFields>,
+    scales: Option<crate::pgwire::LearnedScales>,
     database: Arc<Database>,
 ) -> Option<Vec<u8>> {
     let locking = rows.query_row.row_lock.is_some();

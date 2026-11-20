@@ -73,7 +73,12 @@ pub struct QueryRows {
         crate::core::db_type::DbType,
     )>,
     /// The `SELECT` list as written, in output order.
-    pub select_items: Vec<crate::core::rql::aggregate::SelectItem>,
+    ///
+    /// Shared, not owned: a learned prepared parse is copied for every run
+    /// it answers, and copying the list item by item cost each run at least
+    /// two allocations per selected column (its field's name and its label).
+    /// Nothing changes it after the parse.
+    pub select_items: std::sync::Arc<[crate::core::rql::aggregate::SelectItem]>,
     /// For each visible output column, where its nullability companion sits in
     /// the fetched row — or `None` when the column cannot be `NULL`.
     ///
@@ -3075,7 +3080,7 @@ fn parse_select_query(
         window_slots,
         predicate_needs_extra_columns,
         row_lock,
-        select_items,
+        select_items: select_items.into(),
     };
 
     // A row lock names table rows, and these produce rows that are not one
