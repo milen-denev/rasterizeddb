@@ -700,9 +700,9 @@ fn second_statement(at: usize) -> Error {
     ))
 }
 
-/// The first word of the statement, upper-cased, past leading whitespace and
+/// The first word of the statement, as written, past leading whitespace and
 /// comments.
-fn first_word(sql: &str) -> String {
+fn first_word(sql: &str) -> &str {
     let bytes = sql.as_bytes();
     let mut i = 0;
     loop {
@@ -713,11 +713,12 @@ fn first_word(sql: &str) -> String {
             _ => break,
         }
     }
-    let word: String = sql[i..]
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect();
-    word.to_ascii_uppercase()
+    // As written; compared without regard to case, and uppercased only for
+    // an error's message. Every statement passes through here, and the
+    // copy it made each time was most of its cost.
+    let rest = &sql[i..];
+    let len = rest.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    &rest[..len]
 }
 
 /// Refuses what is not sent as a statement, before it is sent: a second
@@ -729,11 +730,15 @@ fn first_word(sql: &str) -> String {
 /// other tasks' statements.
 pub fn check_statement(sql: &str) -> Result<()> {
     let bytes = sql.as_bytes();
-    for event in scan(sql) {
-        if let Event::Semicolon(at) = event
-            && !only_trivia_after(bytes, at + 1)
-        {
-            return Err(second_statement(at));
+    // A second statement starts after a `;`, so text without one has none
+    // to find, and the scan (quotes, comments, dollar tags) is skipped.
+    if bytes.contains(&b';') {
+        for event in scan(sql) {
+            if let Event::Semicolon(at) = event
+                && !only_trivia_after(bytes, at + 1)
+            {
+                return Err(second_statement(at));
+            }
         }
     }
     check_not_transaction_control(sql)
@@ -741,10 +746,11 @@ pub fn check_statement(sql: &str) -> Result<()> {
 
 fn check_not_transaction_control(sql: &str) -> Result<()> {
     let word = first_word(sql);
-    if matches!(
-        word.as_str(),
-        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE"
-    ) {
+    if ["BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE"]
+        .iter()
+        .any(|k| word.eq_ignore_ascii_case(k))
+    {
+        let word = word.to_ascii_uppercase();
         return Err(Error::Unsupported(format!(
             "{word}: transaction control is not sent as a statement. Open a transaction with \
              client.begin() (or client.transaction(|tx| …)), end it with tx.commit() or \
