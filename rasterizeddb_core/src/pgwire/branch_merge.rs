@@ -378,7 +378,7 @@ fn written_in_the_transaction(stmt: &str) -> bool {
     matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER" | "DROP"))
         && matches!(
             words.get(i).map(String::as_str),
-            Some("VIEW" | "FUNCTION" | "PROCEDURE" | "TRIGGER" | "SEQUENCE" | "TYPE")
+            Some("VIEW" | "FUNCTION" | "PROCEDURE" | "TRIGGER" | "SEQUENCE" | "TYPE" | "DOMAIN")
         )
 }
 

@@ -2178,6 +2178,134 @@ fn set_at(doc: &[u8], path: &[String], at: usize, value: &[u8], create: bool) ->
     }
 }
 
+/// `jsonb_insert(doc, path, value, insert_after)`, PostgreSQL's: `value`
+/// added where `path` ends. In an array it goes before the element the last
+/// step names (after it when `insert_after`); an index past either end
+/// appends or prepends. In an object the last step is a new key, and an
+/// existing one is refused. A path that runs out before its end leaves the
+/// document as it was, as [`set_path`]'s does; a scalar document is refused.
+pub fn insert_path(doc: &[u8], path: &[String], value: &[u8], after: bool) -> Result<Vec<u8>, String> {
+    if !matches!(doc.first(), Some(&TAG_OBJ) | Some(&TAG_ARR)) {
+        return Err("cannot set path in scalar".to_string());
+    }
+    if path.is_empty() {
+        return Ok(doc.to_vec());
+    }
+    insert_at(doc, path, 0, value, after)
+}
+
+fn insert_at(doc: &[u8], path: &[String], at: usize, value: &[u8], after: bool) -> Result<Vec<u8>, String> {
+    use std::borrow::Cow;
+    let step = &path[at];
+    let last = at + 1 == path.len();
+    match doc.first() {
+        Some(&TAG_OBJ) => {
+            let o = Composite::of(doc, OBJ_ENTRY).ok_or(UNREADABLE)?;
+            let mut entries: Vec<(&[u8], Cow<'_, [u8]>)> = Vec::with_capacity(o.count + 1);
+            let mut found = false;
+            for i in 0..o.count {
+                let (key, member) = o.entry(doc, i).ok_or(UNREADABLE)?;
+                if key == step.as_bytes() {
+                    if last {
+                        return Err("cannot replace existing key".to_string());
+                    }
+                    found = true;
+                    entries.push((key, Cow::Owned(insert_at(member, path, at + 1, value, after)?)));
+                } else {
+                    entries.push((key, Cow::Borrowed(member)));
+                }
+            }
+            if !found && last {
+                let at = entries.partition_point(|(k, _)| *k < step.as_bytes());
+                entries.insert(at, (step.as_bytes(), Cow::Borrowed(value)));
+            }
+            Ok(build_object(&entries))
+        }
+        Some(&TAG_ARR) => {
+            let a = Composite::of(doc, ARR_ENTRY).ok_or(UNREADABLE)?;
+            let index: i64 = step
+                .trim()
+                .parse()
+                .map_err(|_| format!("path element at position {} is not an integer: \"{}\"", at + 1, step))?;
+            let mut items: Vec<Cow<'_, [u8]>> =
+                (0..a.count).map(|i| a.element(doc, i).map(Cow::Borrowed).ok_or(UNREADABLE)).collect::<Result<_, _>>()?;
+            let n = items.len() as i64;
+            let position = if index < 0 { index + n } else { index };
+            if last {
+                let slot = if position < 0 {
+                    0
+                } else if position >= n {
+                    n
+                } else {
+                    position + i64::from(after)
+                };
+                items.insert(slot as usize, Cow::Borrowed(value));
+            } else if (0..n).contains(&position) {
+                let p = position as usize;
+                items[p] = Cow::Owned(insert_at(&items[p], path, at + 1, value, after)?);
+            }
+            Ok(build_array(&items))
+        }
+        _ => Ok(doc.to_vec()),
+    }
+}
+
+/// `jsonb_pretty(doc)`: the document as PostgreSQL lays it out, one member
+/// or element to a line, four spaces to a level, an empty container's
+/// brackets on two lines (`{` and `}`). Built over the text rendering, so
+/// key order and numbers are the ones `doc::text` shows.
+pub fn pretty(doc: &[u8]) -> Result<String, String> {
+    let mut text = Vec::with_capacity(doc.len() * 2);
+    render_text_into(doc, &mut text)?;
+    let mut out = Vec::with_capacity(text.len() * 2);
+    let mut depth = 0usize;
+    let newline = |out: &mut Vec<u8>, depth: usize| {
+        out.push(b'\n');
+        out.resize(out.len() + depth * 4, b' ');
+    };
+    let mut i = 0usize;
+    while i < text.len() {
+        let c = text[i];
+        match c {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < text.len() && text[i] != b'"' {
+                    i += if text[i] == b'\\' { 2 } else { 1 };
+                }
+                out.extend_from_slice(&text[start..(i + 1).min(text.len())]);
+            }
+            b'{' | b'[' => {
+                out.push(c);
+                let close = if c == b'{' { b'}' } else { b']' };
+                if text.get(i + 1) == Some(&close) {
+                    newline(&mut out, depth);
+                    out.push(close);
+                    i += 1;
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            b',' => {
+                out.push(b',');
+                newline(&mut out, depth);
+                if text.get(i + 1) == Some(&b' ') {
+                    i += 1;
+                }
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).map_err(|_| "a document could not be rendered as text".to_string())
+}
+
 /// `jsonb_strip_nulls(doc)`: every object member whose value is `null`
 /// removed, at any depth; a `null` array element stays, as PostgreSQL keeps
 /// it. Members are copied as stored, as [`set_path`] copies them.

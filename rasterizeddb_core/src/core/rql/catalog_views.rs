@@ -579,7 +579,7 @@ const ALWAYS_EMPTY: &[&str] = &[
     "pg_depend",
     "pg_extension",
     "pg_description",
-    "pg_enum",
+    // Not `pg_enum`: it holds the enum types' labels (`user_types`).
 ];
 
 /// A SELECT whose every branch is driven by an [`ALWAYS_EMPTY`] relation,

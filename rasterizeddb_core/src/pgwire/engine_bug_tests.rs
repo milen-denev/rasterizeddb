@@ -554,11 +554,12 @@ async fn an_unknown_column_under_an_alias_is_undefined_column() {
     let mut s = session(&db);
     ok(&db, &mut s, "CREATE TABLE ua (id INT PRIMARY KEY)").await;
     for (sql, name) in [
-        ("SELECT nope AS \"Nope\" FROM ua", "'nope'"),
-        ("SELECT id, nope AS x FROM ua", "'nope'"),
-        ("SELECT nope x FROM ua", "'nope'"),
-        ("SELECT ua.nope AS x FROM ua", "'ua.nope'"),
-        ("SELECT nope FROM ua", "'nope'"),
+        // In PostgreSQL's words (`error_position::pg_wording`).
+        ("SELECT nope AS \"Nope\" FROM ua", "column \"nope\" does not exist"),
+        ("SELECT id, nope AS x FROM ua", "column \"nope\" does not exist"),
+        ("SELECT nope x FROM ua", "column \"nope\" does not exist"),
+        ("SELECT ua.nope AS x FROM ua", "column ua.nope does not exist"),
+        ("SELECT nope FROM ua", "column \"nope\" does not exist"),
     ] {
         let e = rows(&db, &mut s, sql).await.expect_err(sql);
         assert_eq!(sqlstate_of(&e), "42703", "{sql}: {e}");

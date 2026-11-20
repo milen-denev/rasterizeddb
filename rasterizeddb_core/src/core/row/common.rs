@@ -391,7 +391,7 @@ fn classify_pattern(p: &[u8]) -> (bool, bool, bool) {
 ///
 /// PostgreSQL defines `ILIKE` for a multi-byte encoding as `lower(value) LIKE
 /// lower(pattern)`, so that is what this does, with the lowering `lower()`
-/// itself uses here (`str::to_lowercase`) — `'É' ILIKE 'é'` and
+/// itself uses here (`pg_functions::pg_lower`) — `'É' ILIKE 'é'` and
 /// `lower('É') = lower('é')` cannot disagree. The ASCII folders cannot be used
 /// for this even when one side is ASCII: lowering changes lengths (`'K'`, the
 /// Kelvin sign, is three bytes and lowers to an ASCII `k`), so their
@@ -411,7 +411,9 @@ fn ci_compare_unicode(input1: &[u8], input2: &[u8], operation: &ComparerOperatio
             _ => like_match(input1, input2, true),
         };
     };
-    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    // Lowered one character at a time, as PostgreSQL's `ILIKE` and `lower`
+    // do (`pg_functions::pg_lower`).
+    let (a, b) = (crate::core::rql::pg_functions::pg_lower(a), crate::core::rql::pg_functions::pg_lower(b));
     match operation {
         ComparerOperation::EqualsCaseInsensitive => a == b,
         ComparerOperation::ContainsCaseInsensitive => a.contains(b.as_str()),
@@ -3095,9 +3097,10 @@ mod unicode_fold_tests {
     }
 
     /// For text, every case-insensitive operator must equal its case-sensitive
-    /// counterpart applied to `to_lowercase` of both sides — what `ILIKE` is in
-    /// PostgreSQL and what `lower()` computes here. ASCII inputs included, so
-    /// the fast path is held to the same definition.
+    /// counterpart applied to `lower()` of both sides (`pg_lower`, one
+    /// character at a time: PostgreSQL 17's `lower('İ')` is `i`, where
+    /// `str::to_lowercase` gives `i̇`) — what `ILIKE` is in PostgreSQL. ASCII
+    /// inputs included, so the fast path is held to the same definition.
     #[test]
     fn every_operator_matches_lowered_comparison() {
         use ComparerOperation::*;
@@ -3119,7 +3122,8 @@ mod unicode_fold_tests {
             };
             let a = make(12);
             let b = make(3);
-            let (la, lb) = (a.to_lowercase(), b.to_lowercase());
+            let lower = crate::core::rql::pg_functions::pg_lower;
+            let (la, lb) = (lower(&a), lower(&b));
             let cases = [
                 (EqualsCaseInsensitive, la == lb),
                 (ContainsCaseInsensitive, la.contains(lb.as_str())),

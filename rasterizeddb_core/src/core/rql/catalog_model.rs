@@ -239,6 +239,7 @@ struct TypeRow {
     array: i64,
     receive: i64,
     collation: i64,
+    namespace: i64,
 }
 
 fn type_rows() -> Vec<TypeRow> {
@@ -260,6 +261,7 @@ fn type_rows() -> Vec<TypeRow> {
             array: b.5,
             receive,
             collation: b.6,
+            namespace: NS_CATALOG,
         });
         if b.5 != 0 {
             out.push(TypeRow {
@@ -272,8 +274,43 @@ fn type_rows() -> Vec<TypeRow> {
                 array: 0,
                 receive: 2400,
                 collation: b.6,
+                namespace: NS_CATALOG,
             });
         }
+    }
+    out
+}
+
+/// [`type_rows`] and an enum type's two (itself and its array) for each of
+/// `enums`, in `public`.
+fn type_rows_with(enums: &[crate::core::rql::user_types::EnumType]) -> Vec<TypeRow> {
+    let mut out = type_rows();
+    for e in enums {
+        let oid = e.oid();
+        out.push(TypeRow {
+            oid,
+            name: e.name.clone(),
+            len: 4,
+            typtype: 'e',
+            category: 'E',
+            elem: 0,
+            array: oid + 1,
+            receive: 3532,
+            collation: 0,
+            namespace: NS_PUBLIC,
+        });
+        out.push(TypeRow {
+            oid: oid + 1,
+            name: format!("_{}", e.name),
+            len: -1,
+            typtype: 'b',
+            category: 'A',
+            elem: oid,
+            array: 0,
+            receive: 2400,
+            collation: 0,
+            namespace: NS_PUBLIC,
+        });
     }
     out
 }
@@ -429,6 +466,8 @@ pub(crate) struct Model {
     pub rels: Vec<Rel>,
     pub roles: Vec<RoleRow>,
     pub procs: Vec<ProcRow>,
+    /// The enum types (`user_types`).
+    pub enums: Vec<crate::core::rql::user_types::EnumType>,
 }
 
 impl Model {
@@ -1068,7 +1107,8 @@ pub(crate) async fn build_model(
         });
     }
     let procs = procs(database, tx).await;
-    Model { rels, roles, procs }
+    let enums = crate::core::rql::user_types::load(database, None, tx).await.unwrap_or_default();
+    Model { rels, roles, procs, enums }
 }
 
 /// The roles `rdb_roles` holds, with the bootstrap superuser's oid given to
@@ -1638,13 +1678,13 @@ fn am_oid(method: &str) -> i64 {
 /// The rows of a relation this module builds, `None` for one it does not.
 pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
     Some(match view {
-        "pg_type" => type_rows()
+        "pg_type" => type_rows_with(&model.enums)
             .into_iter()
             .map(|r| {
                 vec![
                     V::I(r.oid),
                     t(&r.name),
-                    V::I(NS_CATALOG),
+                    V::I(r.namespace),
                     V::I(BOOTSTRAP_ROLE),
                     V::I(r.len),
                     V::B(r.len > 0 && r.len <= 8),
@@ -2022,12 +2062,21 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                 })
             })
             .collect(),
-        // Nothing of these exists here: no enum types, comments,
-        // row-security policies, extended statistics, publications,
-        // rewrite rules, dependencies or extensions. Present so a query that
-        // joins them gets its answer rather than an error.
-        "pg_enum"
-        | "pg_description"
+        "pg_enum" => model
+            .enums
+            .iter()
+            .flat_map(|e| {
+                let base = 2_000_000_000 + ((e.oid() - 900_000_000) / 2 % 30_000_000) * 64;
+                e.labels.iter().enumerate().map(move |(i, label)| {
+                    vec![V::I(base + i as i64), V::I(e.oid()), V::I((i + 1) as i64), t(label)]
+                })
+            })
+            .collect(),
+        // Nothing of these exists here: no comments, row-security policies,
+        // extended statistics, publications, rewrite rules, dependencies or
+        // extensions. Present so a query that joins them gets its answer
+        // rather than an error.
+        "pg_description"
         | "pg_policy"
         | "pg_statistic_ext"
         | "pg_publication"

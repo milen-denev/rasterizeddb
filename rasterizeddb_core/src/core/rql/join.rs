@@ -5298,10 +5298,12 @@ fn build_aggregate_stage(
             }
             rewritten.push_str(&expr[cursor..]);
 
-            let parsed = crate::core::rql::expr::parse(&rewritten, &synth_schema)?;
-            let db_type = crate::core::rql::expr::static_type(&parsed);
+            // A condition over aggregates (`count(*) > 0`) as its CASE
+            // (`lexer_query::parse_over_aggregates`); the text that parsed is
+            // what is parsed again once the types are known.
+            let (parsed, db_type, parsed_text) = crate::core::rql::lexer_query::parse_over_aggregates(&rewritten, &synth_schema)?;
             if computed_argument {
-                deferred_computed.push((fold_items.len(), rewritten.clone()));
+                deferred_computed.push((fold_items.len(), parsed_text));
             }
             fold_items.push(SelectItem::Computed {
                 expr: parsed,

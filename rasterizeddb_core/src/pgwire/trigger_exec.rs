@@ -451,17 +451,133 @@ async fn run_statements(
                 crate::core::notice::push(severity, "00000", message);
             }
             PlStmt::Perform(sql) | PlStmt::Sql(sql) => {
-                let text = match substitute(sql, ctx, new.as_ref(), old.as_ref(), vars) {
+                let mut text = match substitute(sql, ctx, new.as_ref(), old.as_ref(), vars) {
                     Ok(text) => text,
                     Err(e) => return Ok(Err(e)),
                 };
+                // `EXECUTE expr`: PL/pgSQL's dynamic statement, the text the
+                // expression computes (`EXECUTE format('…', x)`). Its `INTO`
+                // and `USING` are refused rather than dropped.
+                if matches!(stmt, PlStmt::Sql(_)) && let Some(expr) = dynamic_execute(&text) {
+                    if crate::core::rql::join::find_keyword(expr, "INTO", 0).is_some()
+                        || crate::core::rql::join::find_keyword(expr, "USING", 0).is_some()
+                    {
+                        return Ok(Err(("0A000".into(), "EXECUTE … INTO and EXECUTE … USING are not supported yet".into())));
+                    }
+                    match Box::pin(value_of(database, state, expr)).await? {
+                        Ok(Some(sql)) => text = sql,
+                        Ok(None) => return Ok(Err(("22004".into(), "query string argument of EXECUTE is null".into()))),
+                        Err(e) => return Ok(Err(e)),
+                    }
+                }
                 if let Err(e) = Box::pin(super::view_statements::run_internal(database, state, &text)).await? {
                     return Ok(Err(failure(e)));
+                }
+                // A `DO` block's schema changes, for a branch's DDL log
+                // (`branch_ddl`); a trigger's are its statement's business.
+                if ctx.trigger.function == "inline_code_block" && super::schema_verb(&text) {
+                    state.branch_ddl.push(text);
                 }
             }
         }
     }
     Ok(Ok(None))
+}
+
+/// The expression of PL/pgSQL's `EXECUTE expr`, `None` for any other
+/// statement.
+fn dynamic_execute(text: &str) -> Option<&str> {
+    let t = text.trim();
+    (t.len() > 8 && t.as_bytes()[..7].eq_ignore_ascii_case(b"EXECUTE") && !crate::core::sql_scan::is_identifier_byte(t.as_bytes()[7]))
+        .then(|| t[7..].trim())
+}
+
+/// The body of a `DO [LANGUAGE plpgsql] '…'` block (a dollar-quoted or
+/// plain string); `None` for any other statement, 0A000 for another
+/// language.
+pub(super) fn parse_do(stmt: &str) -> Option<Result<String, Failure>> {
+    let s = stmt.trim().trim_end_matches(';').trim_end();
+    if !(s.len() > 3 && s.as_bytes()[..2].eq_ignore_ascii_case(b"DO") && s.as_bytes()[2].is_ascii_whitespace()) {
+        return None;
+    }
+    let mut rest = s[2..].trim_start();
+    let mut language: Option<String> = None;
+    let mut take_language = |rest: &mut &str| {
+        let r = rest.trim_start();
+        if r.len() > 8 && r.as_bytes()[..8].eq_ignore_ascii_case(b"LANGUAGE") {
+            let after = r[8..].trim_start();
+            let len = after.bytes().take_while(|b| crate::core::sql_scan::is_identifier_byte(*b) || *b == b'\'').count();
+            language = Some(after[..len].trim_matches('\'').to_ascii_lowercase());
+            *rest = after[len..].trim_start();
+        }
+    };
+    take_language(&mut rest);
+    let bytes = rest.as_bytes();
+    let (body, end) = if bytes.first() == Some(&b'$') {
+        let tag = crate::core::sql_scan::dollar_tag_len(bytes, 0)?;
+        let end = crate::core::sql_scan::dollar_quote_end(bytes, 0)?;
+        (rest[tag..end - tag].to_string(), end)
+    } else if bytes.first() == Some(&b'\'') {
+        let end = crate::core::sql_scan::string_literal_end(bytes, 0, false);
+        (rest[1..end - 1].replace("''", "'"), end)
+    } else {
+        return Some(Err(("42601".into(), "DO needs its code as a string".into())));
+    };
+    let mut tail = &rest[end..];
+    take_language(&mut tail);
+    if !tail.trim().is_empty() {
+        return Some(Err(("42601".into(), format!("syntax error at or near \"{}\"", tail.trim()))));
+    }
+    match language.as_deref() {
+        None | Some("plpgsql") => Some(Ok(body)),
+        Some(other) => Some(Err(("0A000".into(), format!("language \"{other}\" is not supported in DO; only plpgsql is")))),
+    }
+}
+
+/// Runs a `DO` block's PL/pgSQL, as an anonymous function with no
+/// arguments: its `DECLARE`d variables, then its statements.
+pub(super) async fn run_do(database: &Arc<Database>, state: &mut SessionState, body: &str) -> io::Result<Result<(), Failure>> {
+    let block = match triggers::parse_plpgsql(body) {
+        Ok(block) => block,
+        Err((code, message)) => return Ok(Err((code.to_string(), message))),
+    };
+    // No trigger: nothing reads these but the `TG_` variables, which a
+    // `DO` block has no use for.
+    let anonymous = TriggerDef {
+        name: String::new(),
+        table: String::new(),
+        timing: Timing::After,
+        events: Vec::new(),
+        update_columns: Vec::new(),
+        row_level: false,
+        when: String::new(),
+        function: "inline_code_block".to_string(),
+        args: Vec::new(),
+    };
+    let ctx = Context { trigger: &anonymous, event: Event::Insert, row_level: false, timing: Timing::After, fields: &[] };
+    let mut vars: Vec<(String, String, Option<String>)> = Vec::new();
+    for (name, ty, init) in &block.declarations {
+        let value = match init {
+            Some(expr) => {
+                let text = match substitute(expr, &ctx, None, None, &vars) {
+                    Ok(text) => text,
+                    Err(e) => return Ok(Err(e)),
+                };
+                match Box::pin(value_of(database, state, &text)).await? {
+                    Ok(v) => v,
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
+            None => None,
+        };
+        vars.push((name.clone(), ty.clone(), value));
+    }
+    let mut new_row = None;
+    match Box::pin(run_statements(database, state, &ctx, &block.body, &mut new_row, &None, &mut vars)).await? {
+        Ok(Some(Returned::Row(Some(_)))) => Ok(Err(("42804".into(), "RETURN cannot have a parameter in a DO block".into()))),
+        Ok(_) => Ok(Ok(())),
+        Err(e) => Ok(Err(e)),
+    }
 }
 
 /// Runs `trigger`'s function over a row: the `NEW` it returns (`None` to

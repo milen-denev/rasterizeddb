@@ -573,14 +573,24 @@ fn drop_collations(text: &str) -> String {
 
 /// `a [NOT] SIMILAR TO b [ESCAPE e]` as `a [!]~ similar_to_escape(b [, e])`,
 /// what it means in PostgreSQL, so one regular-expression reader decides it.
-fn lower_similar_to(text: &str) -> String {
+pub(crate) fn lower_similar_to(text: &str) -> String {
+    lower_similar_to_where(text, &|_, _| true)
+}
+
+/// [`lower_similar_to`] of only the occurrences `keep` accepts (given the
+/// text and where its `SIMILAR` stands); the others are left as written.
+pub(crate) fn lower_similar_to_where(text: &str, keep: &dyn Fn(&str, usize) -> bool) -> String {
     let mut out = text.to_string();
+    let mut from = 0usize;
     for _ in 0..64 {
         let upper = out.to_ascii_uppercase();
-        let Some(at) = find_word_outside_quotes(&upper, "SIMILAR") else { break };
-        let after_similar = upper[at + 7..].trim_start();
-        if !after_similar.starts_with("TO") {
+        let Some(at) = upper.get(from..).and_then(|rest| find_word_outside_quotes(rest, "SIMILAR")).map(|a| from + a) else {
             break;
+        };
+        let after_similar = upper[at + 7..].trim_start();
+        if !after_similar.starts_with("TO") || !keep(&out, at) {
+            from = at + 7;
+            continue;
         }
         let to_end = out.len() - after_similar.len() + 2;
         // `NOT` directly before.
@@ -604,6 +614,7 @@ fn lower_similar_to(text: &str) -> String {
         }
         let op = if negated { "!~" } else { "~" };
         out = format!("{} {} similar_to_escape({}{}) {}", &out[..op_start], op, pattern, escape, &out[end..]);
+        from = op_start;
     }
     out
 }

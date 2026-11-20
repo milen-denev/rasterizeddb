@@ -89,6 +89,22 @@ impl PgRegex {
         Some(self.re.is_match(text))
     }
 
+    /// Every match in `text` from byte `from`, leftmost first and not
+    /// overlapping, each as its groups' byte spans (group 0 the whole
+    /// match). `None` when the answer cannot be vouched for (as
+    /// [`Self::matches`]).
+    pub fn spans(&self, text: &str, from: usize) -> Option<Vec<Vec<Option<(usize, usize)>>>> {
+        if self.ascii_only && !text.is_ascii() {
+            return None;
+        }
+        Some(
+            self.re
+                .captures_iter(&text[from..])
+                .map(|caps| caps.iter().map(|g| g.map(|m| (from + m.start(), from + m.end()))).collect())
+                .collect(),
+        )
+    }
+
     /// `regexp_replace`: the first match (every one when `global`)
     /// replaced, `\1`…`\9` in `replacement` naming a group, `\&` the whole
     /// match and `\\` a backslash, as PostgreSQL's replacement reads them.

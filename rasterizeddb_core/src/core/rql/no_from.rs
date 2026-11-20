@@ -87,9 +87,17 @@ fn build(list: &str, condition: Option<&str>, limit: Option<&str>, offset: Optio
         let text = typed_literals(text);
         // A comparison is a boolean value, which the expression grammar does
         // not read; tried once that has failed, as the select list does.
+        // And a regular-expression match (`'abc' ~ 'a'`, what `SIMILAR TO`
+        // is read as), as the CASE that is its value, as the select list
+        // with a FROM reads it (`lexer_query`).
         let parsed = match expr::parse(&text, &[]) {
             Ok(parsed) => parsed,
-            Err(e) => crate::core::rql::join::comparison_value(&text, &[])?.ok_or_else(|| no_column(e, &text))?,
+            Err(e) => match crate::core::rql::join::comparison_value(&text, &[])? {
+                Some(parsed) => parsed,
+                None => crate::core::rql::pg_functions::regex_operator_as_call(&text)
+                    .and_then(|c| expr::parse(&format!("CASE WHEN {c} THEN true WHEN NOT ({c}) THEN false END"), &[]).ok())
+                    .ok_or_else(|| no_column(e, &text))?,
+            },
         };
         if !expr::columns_of(&parsed).is_empty() {
             return Err(format!("column \"{}\" does not exist", text.trim()));

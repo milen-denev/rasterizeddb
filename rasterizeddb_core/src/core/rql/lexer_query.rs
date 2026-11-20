@@ -197,8 +197,7 @@ fn parse_computed_item(
     }
     rewritten.push_str(&expr[cursor..]);
 
-    let parsed = crate::core::rql::expr::parse(&rewritten, &synth_schema)?;
-    let db_type = crate::core::rql::expr::static_type(&parsed);
+    let (parsed, db_type, _) = parse_over_aggregates(&rewritten, &synth_schema)?;
 
     Ok(Some(SelectItem::Computed {
         expr: parsed,
@@ -210,6 +209,33 @@ fn parse_computed_item(
             .map(|a| a.to_string())
             .unwrap_or_else(|| crate::core::rql::join::pg_column_name(expr)),
     }))
+}
+
+/// An expression over aggregate placeholders (`__agg_0 * 2`), parsed, with
+/// its type and the text that parsed. A condition (`__agg_0 > 0`, `__agg_0
+/// IS NULL`) is read as the CASE that is its value, as a condition over
+/// columns is: the expression grammar has no boolean outside CASE, and the
+/// item failed as "'__agg_0 > 0' is neither a column nor a value". Shared by
+/// the single-table and the join aggregate paths.
+pub(crate) fn parse_over_aggregates(
+    rewritten: &str,
+    synth_schema: &[SchemaField],
+) -> Result<(crate::core::rql::expr::Expr, crate::core::db_type::DbType, String), String> {
+    match crate::core::rql::expr::parse(rewritten, synth_schema) {
+        Ok(parsed) => {
+            let db_type = crate::core::rql::expr::static_type(&parsed);
+            Ok((parsed, db_type, rewritten.to_string()))
+        }
+        Err(e) => {
+            let condition =
+                crate::core::rql::pg_functions::regex_operator_as_call(rewritten).unwrap_or_else(|| rewritten.to_string());
+            let as_value = format!("CASE WHEN {condition} THEN true WHEN NOT ({condition}) THEN false END");
+            match crate::core::rql::expr::parse(&as_value, synth_schema) {
+                Ok(parsed) => Ok((parsed, crate::core::db_type::DbType::BOOL, as_value)),
+                Err(_) => Err(e),
+            }
+        }
+    }
 }
 
 /// Splits `FUNC(args)` into the aggregate and its column argument.
@@ -559,7 +585,8 @@ fn parse_select_items(
         // as an alias, so `doc->>'a' IS NULL` came back as the extracted text
         // in a column named `IS`. It is answered as the CASE it means, by the
         // expression evaluator, which reads a path's NULL as PostgreSQL does.
-        if let Some((test, alias)) = null_test_item(item) {
+        // Over an aggregate (`sum(v) IS NULL`) the computed path reads it.
+        if let Some((test, alias)) = null_test_item(item).filter(|(test, _)| find_aggregate_calls(test).is_empty()) {
             let parsed = crate::core::rql::expr::parse(
                 &format!("CASE WHEN {} THEN TRUE ELSE FALSE END", test),
                 schema,
@@ -3206,6 +3233,20 @@ mod tests {
         assert_eq!(split_alias("flag \"like\""), ("flag", Some("like".to_string())));
         assert_eq!(split_alias("'lit' x"), ("'lit'", Some("x".to_string())));
         assert_eq!(split_alias("COUNT(x) total"), ("COUNT(x)", Some("total".to_string())));
+    }
+
+    #[test]
+    fn a_condition_over_aggregates_is_a_boolean_item() {
+        let schema: SmallVec<[SchemaField; 20]> = SmallVec::new();
+        for (expr, label) in [("COUNT(*) > 0", "?column?"), ("count(*) = 2", "?column?")] {
+            match parse_computed_item(expr, &schema, None).expect("parses").expect("computed") {
+                SelectItem::Computed { db_type, label: l, .. } => {
+                    assert_eq!(db_type, crate::core::db_type::DbType::BOOL, "{expr}");
+                    assert_eq!(l, label);
+                }
+                _ => panic!("{expr}: not computed"),
+            }
+        }
     }
 
     #[test]

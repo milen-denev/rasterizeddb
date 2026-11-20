@@ -1372,6 +1372,9 @@ fn pool_has_placement(_pool: &StoragePool, _table_name: &str) -> bool {
 pub struct Database {
     /// The names of the views this database may hold (`rql::views`).
     pub(crate) views: crate::core::rql::views::ViewRegistry,
+    pub(crate) types: crate::core::rql::user_types::TypeRegistry,
+    /// The domains' names (`rql::domains`).
+    pub(crate) domains: crate::core::rql::user_types::TypeRegistry,
     /// The names of the routines this database may hold (`rql::functions`).
     pub(crate) functions: crate::core::rql::functions::FunctionRegistry,
     /// The tables that may have triggers (`rql::triggers`).
@@ -1948,6 +1951,8 @@ impl Database {
             #[cfg(test)]
             legacy_numeric_slot: std::sync::atomic::AtomicBool::new(false),
             views: crate::core::rql::views::ViewRegistry::default(),
+            types: crate::core::rql::user_types::TypeRegistry::default(),
+            domains: crate::core::rql::user_types::TypeRegistry::default(),
             functions: crate::core::rql::functions::FunctionRegistry::default(),
             triggers: crate::core::rql::triggers::TriggerRegistry::default(),
             id,
@@ -6273,6 +6278,21 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
         Err((_, message)) => return error_response(&message),
     };
     let stmt = rewritten.as_ref();
+    // Enum types in their stored form (`rql::user_types`); their own
+    // statements are the PostgreSQL protocol's.
+    if crate::core::rql::user_types::parse_type_statement(stmt).is_some()
+        || crate::core::rql::domains::parse_domain_statement(stmt).is_some()
+    {
+        return error_response(
+            "type statements are not supported over the native protocol yet; use the PostgreSQL protocol for this \
+             statement",
+        );
+    }
+    let with_types = match crate::core::rql::user_types::rewrite(&database, stmt, None).await {
+        Ok(text) => text,
+        Err((_, message)) => return error_response(&message),
+    };
+    let stmt = with_types.as_deref().unwrap_or(stmt);
 
     // Views (`rql::views`) are read as derived tables and kept in a catalogue
     // written in a session's transaction; neither is open to a native
@@ -6339,6 +6359,17 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
     }
     let stmt = folded.as_str();
 
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(&database, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
+    };
     // A correlated scalar subquery, as the LATERAL join it means.
     let correlated;
     let stmt = match crate::core::rql::correlated::rewrite_select(stmt) {

@@ -2838,12 +2838,16 @@ mod tests {
                 let mut rng = 0xD1B5_4A32_D192_ED03u64 ^ (r + 7) * 0x9876_5431;
                 let mut n = 0u64;
                 while !stop.load(Ordering::Relaxed) {
+                    // The horizon before the next id: an id settles only once
+                    // it is allocated, so `below <= next`. Read the other way
+                    // round, the horizon could pass the `next` read before it
+                    // and `next - lo` underflowed (a panic in this thread).
+                    let below = m.status().settled_below();
                     let next = m.next_id();
                     if next <= 2 {
                         continue;
                     }
                     // Mostly near the moving horizon, where the races are.
-                    let below = m.status().settled_below();
                     let id = if xorshift(&mut rng) % 2 == 0 {
                         let lo = below.saturating_sub(8192).max(2);
                         lo + xorshift(&mut rng) % (next - lo).max(1)

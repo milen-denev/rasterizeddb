@@ -756,7 +756,7 @@ async fn an_unsupported_expression_names_itself_rather_than_blaming_the_schema()
     // A genuinely missing column must still say so — the check must not swallow
     // the ordinary case it sits in front of.
     let err = run(&pool, "SELECT nosuch FROM ue").await.expect_err("missing column");
-    assert!(err.contains("not found in schema"), "{}", err);
+    assert!(err.contains("column \"nosuch\" does not exist"), "{}", err);
 
     // ...and ordinary select items still work, including aliases, which share
     // the whitespace-splitting the check had to reason about.

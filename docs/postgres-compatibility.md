@@ -357,6 +357,106 @@ grammar before evaluation (`core/tokenizer/predicate_rewrite.rs`), so `IN`
 becomes several indexable equality probes rather than one predicate the filter
 would have to skip.
 
+### Session values, settings and shorthands
+
+`current_user`, `session_user`, `current_role`, `current_catalog`,
+`current_database()`, `current_schemas(…)`, `pg_backend_pid()` and
+`current_setting(name [, missing_ok])` are read from the session as the
+statement starts. A bare `user` is left as a column name: a table here may
+have a column created as `user`, and reading the session's user in its place
+would be a wrong answer. Statements that store an expression for later
+(`DEFAULT current_user`, a view's or a function's body) keep it unevaluated.
+
+`SET` of a parameter nothing here acts on (`application_name`,
+`search_path`, a custom `myapp.x`) is kept per session, so `SHOW`,
+`current_setting` and `set_config(name, value, is_local)` read back what was
+set; `SET LOCAL` lasts its block, and `RESET` and `DISCARD ALL` clear it.
+`search_path` is reported, not followed: an unqualified name still resolves
+as it always does. A parameter whose value decides how values are read and
+written (`TimeZone`, `DateStyle`, `IntervalStyle`, `client_encoding`,
+`extra_float_digits`, `bytea_output`) reports what this server does, whatever
+a `SET` asked for.
+
+Rewritten to the statements they stand for before anything else reads them:
+`TABLE t`; a CTE's `AS [NOT] MATERIALIZED`; `INSERT … DEFAULT VALUES`;
+`SELECT … INTO [TEMP] t`; `CREATE UNLOGGED TABLE` (a table here is always
+logged, which an unlogged one is allowed to be); `ROW(a, b)`;
+`a [NOT] SIMILAR TO p`; `UPDATE … SET (a, b) = (x, y)` and `= (SELECT p, q
+…)` (one scalar subquery per column, so a volatile function in it runs once
+per column); `x = ANY('{1,2}'::int[])` (the cast dropped: the elements are
+read as the left side's type either way); a derived table's column list,
+`FROM (SELECT a, b …) AS s(x, y)`, as the names of its first select list.
+
+### Enum types
+
+`CREATE TYPE name AS ENUM ('a', 'b')`, `DROP TYPE [IF EXISTS] … [RESTRICT]`,
+`ALTER TYPE … ADD VALUE [IF NOT EXISTS] 'c' [BEFORE | AFTER 'b']`,
+`ALTER TYPE … RENAME VALUE 'a' TO 'z'` and `ALTER TYPE … RENAME TO`, in a
+transaction block as well (a type and a table using it in one migration).
+A column of the type, or of an array of it, takes only its labels (22P02
+otherwise, as a cast of a non-label does); `pg_type` and `pg_enum` list the
+type and its labels. Enum values order by the labels' declared order, as
+PostgreSQL orders them: `ORDER BY` the column, its output name or position
+(in a `DISTINCT` or grouped query too), `<`, `<=`, `>` and `>=` against a
+label, a parameter or another column of the type, `[NOT] BETWEEN` two
+labels, and `min`/`max`. `enum_first`, `enum_last` and `enum_range` (one
+or two arguments) answer from the labels. A parameter that is no label matches nothing,
+where PostgreSQL refuses it (22P02). A column holds the label as `text`, kept to the labels by a hidden
+constraint the type's `ALTER`s replace.
+
+Where it differs from PostgreSQL:
+
+- The declared order applies where the column is certain from the text: a
+  comparison with a text expression (`m > note`, `m > $1::text`) compares
+  the labels' text, and so does an enum value inside an
+  expression (`ORDER BY coalesce(m, 'ok')`), a CTE's or a subquery's
+  output, or a column two of the statement's tables have.
+- The 22P02 a column reports does not name the value (`invalid input value
+  for enum "Status"`); a cast's does.
+- A row's column is typed `text` on the wire and in `information_schema`.
+- `ALTER TABLE … ALTER COLUMN … TYPE <enum>` and `DROP TYPE … CASCADE` with
+  columns of the type are refused (0A000); type statements are refused over
+  the native protocol.
+
+### Domains
+
+`CREATE DOMAIN name [AS] base [COLLATE c] [DEFAULT expr] [NOT NULL | NULL]
+[[CONSTRAINT n] CHECK (expr over VALUE)]…` and `DROP DOMAIN [IF EXISTS] …
+[RESTRICT]`, in a transaction block as well. A column of a domain is its base
+type with the domain's `NOT NULL`, its checks (named as PostgreSQL names them:
+`<domain>_check`, `<domain>_check1`, …, or the `CONSTRAINT` name) and its
+default where the column has none. A violated check is PostgreSQL's 23514,
+`value for domain posint violates check constraint "posint_check"`. A cast to
+a domain is a cast to its base type.
+
+Where it differs from PostgreSQL:
+
+- A cast to a domain does not check the domain's constraints; only a
+  column's value is checked.
+- `ALTER DOMAIN` is refused (0A000); `DROP DOMAIN … CASCADE` with columns of
+  the domain is refused (0A000), as is `ALTER COLUMN … TYPE <domain>`.
+- A domain's `NOT NULL` reports the column's 23502 message, not `domain d
+  does not allow null values`.
+- `pg_type` lists no domain, so `psql`'s `\dD` shows none; domain statements
+  are refused over the native protocol.
+
+### Subqueries reading outer columns
+
+A subquery may name an outer column without its qualifier, `EXISTS (SELECT 1
+FROM ord WHERE customer_id = id)`, as PostgreSQL scopes it: the subquery's own
+relations first, then each enclosing query's, nearest first. The name is
+qualified with the relation it is found in before the correlated subquery is
+planned. Where that cannot be decided for certain (a level whose relations'
+columns are not all known, or two relations of one level with the column) the
+name is left as written and the statement fails as before, never with
+another relation's column.
+
+`(a, b) [NOT] IN (SELECT x, y …)` with an uncorrelated subquery runs the
+subquery once and compares the row with each of its rows three-valued: a NULL
+on either side makes that comparison unknown, so `NOT IN` keeps only the rows
+that differ for certain, as in PostgreSQL. A subquery with no rows makes `IN`
+false and `NOT IN` true, whatever the row holds.
+
 ### `LIKE` and `ILIKE`
 
 `LIKE` and `ILIKE` support the full pattern language. Patterns that reduce to a
@@ -1308,53 +1408,80 @@ in-place-update path all have to agree about it:
 
 ### 2. Smaller gaps
 
-- Correlated subqueries: `EXISTS (… WHERE inner.x = outer.y)`, and scalar
-  subqueries in the select list. Only the uncorrelated `IN` form works, because
-  it can be executed once; a correlated one would have to run per outer row.
-- `ON CONFLICT … DO UPDATE`, `DISTINCT ON`, `UPDATE … FROM other_table`,
-  window functions, `CREATE SEQUENCE`, table partitioning, and `DO $$ … $$`
-  plpgsql blocks. All confirmed present in a real application's migrations, so
-  these are gaps rather than hypotheticals.
-- `NOT` over a parenthesised group — needs the evaluator to negate a subtree
-- `CASE WHEN`, `::type` casts, and `WITH RECURSIVE`. The last is refused **by
-  keyword**: treating a recursive CTE as non-recursive computes the base case,
-  stops, and returns a shorter answer with no error.
-- `RIGHT`/`FULL`/`CROSS JOIN`, and `WHERE` terms spanning two relations. Refused
-  by name rather than mis-evaluated. An `ON` term spanning two relations is only
-  accepted when it is a further **equality**, which makes it part of a composite
-  join key; anything else there would have to be evaluated after the join.
-- On the null-supplying side of a `LEFT JOIN`, only `<column> IS NULL` is
-  supported in a `WHERE`, and only when that column is `NOT NULL`. Anything else
-  is refused, because a `WHERE` term pushed down there changes *which left rows
-  appear* — it would return rows PostgreSQL excludes. An `ON` term is different
-  and **is** pushed down: it changes which right rows are candidates, leaving
-  unmatched left rows to survive with `NULL`s exactly as they should.
+Checked against PostgreSQL 17 on 2026-11-19 with the differential harness
+(`.claude/reviews/pgdiff`). Correlated subqueries, `ON CONFLICT … DO UPDATE`,
+`DISTINCT ON`, `UPDATE … FROM`, window functions (with a `WINDOW` clause),
+sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
+`RIGHT`/`FULL`/`CROSS JOIN`, `JOIN … USING`, `NATURAL JOIN`,
+`ROLLUP`/`CUBE`/`GROUPING SETS`, `WITH RECURSIVE`, a column list on a table
+alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
+`::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
 
-  The `NOT NULL` requirement is subtle and is a property of the *column*, not of
-  the query: on a nullable column `IS NULL` cannot distinguish "no matching row"
-  from "matched, with a NULL value there", so it is refused rather than answered
-  as an anti-join.
+- **Types**: `CREATE TYPE` for composites and ranges (enums work, see
+  "Enum types" above), range types
+  (`int4range`, `daterange`), multidimensional array literals (`ARRAY[[1,2],[3,4]]`),
+  NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
+  PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
+  PostgreSQL): a sequence's name is not known to the text pass that reads
+  the cast.
+- **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
+  `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
+  `UPDATE … SET a[1] = …`.
+- **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
+  WHERE u.k = t.k)`; an uncorrelated one works), an outer column
+  named bare where the subquery's relations are not all known (a CTE, a
+  function in `FROM`, `SELECT *` in a derived table) or two outer relations
+  have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on
+  every run; `TABLESAMPLE BERNOULLI|SYSTEM (p)` itself works, `SYSTEM`
+  sampling rows rather than pages),
+  the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
+  on a table with no unique column, and a `WINDOW` clause inside a subquery
+  (the outermost one works).
+- **Functions**: the ordered-set aggregates (`percentile_cont`,
+  `percentile_disc`, `mode`), `json_object_agg`/`jsonb_object_agg`,
+  `regexp_matches` and `regexp_split_to_table` in a select list, the
+  `jsonb_path_*` functions, `row_to_json`, `to_number`, `date_bin`, the XML
+  functions, and
+  the `json_*` (not `jsonb_*`) table functions.
+- **Operators**: the prefix `|/` and `@`. In a `WHERE`, a
+  `jsonb` operator over a function's result (`jsonb_set(doc, '{d}', '1') ? 'd'`)
+  is refused (0A000); over a column, and in a select list, it works.
+- **Table functions**: a `jsonb_array_elements` item's alias names the item,
+  not its column, so `SELECT x FROM t, jsonb_array_elements_text(t.tags) x`
+  fails (write `x.value`). A lateral `jsonb_each(t.j)` runs for every row of
+  `t` before the `WHERE`, so a row whose document is not an object fails the
+  statement even where the `WHERE` would have excluded it.
+- **Errors** carry PostgreSQL's position (`at character N`, the `P` field)
+  where the message names something in the statement: an undefined column,
+  relation, type, function or `TABLESAMPLE` method, a missing `FROM` entry,
+  an ambiguous column, the literal an input error quotes. Its first use in
+  the text is taken; where PostgreSQL points elsewhere (a syntax error, an
+  expression the reader cannot take) there is no position. An unknown column
+  inside an expression in a select list (`nosuch + 1`) is still reported as
+  `Column 'nosuch + 1' not found in schema`, not 42703.
 
 ## Statements over the native protocol
 
 A statement sent over the native protocol (`rasterizeddb_client`)
 gets the same preparation as an autocommit statement over pgwire: comments,
 typed literals (`DATE '…'`), `CREATE UNIQUE INDEX` as a unique constraint,
-constant folding, `IN`/`EXISTS`/scalar subqueries, a `SELECT` with no `FROM`
-(`SELECT 1`, `SELECT now()`), and the catalogue views (`pg_tables`,
-`pg_indexes`, `information_schema.*`). The statements that administer the
-server (`BACKUP`, `RESTORE`, `STORAGE`, `REPLICATION`, `SET CONFIG`,
-`KV FLUSHALL`, databases, roles) need a superuser when the listener requires
-authentication, as on pgwire.
+constant folding, `IN`/`EXISTS`/scalar subqueries, `WITH` and derived tables
+(`FROM (SELECT …)`), views, sequences and the other schema objects, a
+`SELECT` with no `FROM` (`SELECT 1`, `SELECT now()`), and the catalogue views
+(`pg_tables`, `pg_indexes`, `information_schema.*`). A cell arrives typed by
+its column: `jsonb`, arrays, `bytea` and a NUMERIC's scale are kept. The
+statements that administer the server (`BACKUP`, `RESTORE`, `STORAGE`,
+`REPLICATION`, `SET CONFIG`, `KV FLUSHALL`, databases, roles) need a
+superuser when the listener requires authentication, as on pgwire.
 
-What needs a session it does not have is refused by name rather than run in
-part:
+A transaction block (`BEGIN` … `COMMIT`, `SAVEPOINT`, `LOCK TABLE`) runs on a
+`rastcp/1` connection, which holds one session, as a pgwire connection does;
+the client gives each transaction a connection of its own. A multiplexed
+`rastcp/2` connection carries requests from unrelated callers at once, so it
+refuses transaction control (0A000).
+
+Refused by name rather than run in part:
 
 - **One statement per request.** `INSERT …; INSERT …` is refused whole. Before
   2026-11-16 the first statement ran and the second was dropped with a success
   reply.
-- **No transaction block.** `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and
-  `LOCK TABLE` are refused; each statement commits on its own.
-- **No `WITH` or `FROM (SELECT …)`.** A CTE or a derived table runs its parts
-  and the outer statement in one statement transaction that only the pgwire
-  listener sets up. Use pgwire for those.

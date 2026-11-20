@@ -39,6 +39,8 @@ mod param_infer;
 mod view_statements;
 mod sequence_statements;
 mod column_origins;
+mod error_position;
+mod type_statements;
 mod routine_statements;
 mod trigger_exec;
 mod merge_exec;
@@ -46,6 +48,8 @@ mod copy;
 mod notify;
 mod explain;
 mod temp_tables;
+mod session_values;
+mod sql_prepare;
 mod privilege_statements;
 #[cfg(test)]
 mod prepared_partition_tests;
@@ -2900,6 +2904,25 @@ struct SessionState {
     /// second `ReadyForQuery` the client did not expect, and the connection
     /// broke on its next statement.
     copy_in_ran: bool,
+    /// The run-time parameters nothing here acts on (`application_name`,
+    /// `search_path`, a custom `myapp.x`), as `SET` gave them: `SHOW` and
+    /// `current_setting` read back what was set, as in PostgreSQL. They were
+    /// acknowledged and dropped, so `SHOW application_name` was empty after
+    /// a `SET` of it.
+    settings: HashMap<String, String>,
+    /// `PREPARE`d statements by name (`sql_prepare`).
+    sql_prepared: HashMap<String, sql_prepare::Prepared>,
+    /// The schema changes a `DO` block or an `EXECUTE` of a prepared
+    /// statement ran on this statement's behalf, for a branch's DDL log
+    /// (`branch::note_ddl`): the client statement itself (`DO …`, `EXECUTE
+    /// q`) is no DDL to the log. Drained at the end of `execute_recorded`.
+    branch_ddl: Vec<String>,
+    /// The client statement running, and how many characters precede it in
+    /// the text the client sent (`None`: its positions cannot be told, as
+    /// for a string rewritten before it was split). An error's position
+    /// (`error_position`) counts from the start of that text.
+    error_text: String,
+    error_base: Option<usize>,
     /// The channels this session listens on and its notifications' queue
     /// (`notify`), from its first `LISTEN`.
     listener: Option<notify::Listener>,
@@ -3158,6 +3181,9 @@ struct SessionTransaction {
     local_default_isolation: Option<IsolationLevel>,
     /// The same for `default_transaction_read_only`.
     local_default_read_only: Option<bool>,
+    /// The plain run-time parameters `SET LOCAL` set in this block
+    /// (`SessionState::settings`), gone with it.
+    local_settings: HashMap<String, String>,
     /// Whether a statement has run in this block (anything past the SET,
     /// SHOW and transaction-control statements answered above the engine).
     /// After it the level is fixed: PostgreSQL refuses a change with 25001
@@ -3287,6 +3313,11 @@ impl SessionState {
             temp_tables: Vec::new(),
             temp_session: fastrand::u64(..),
             copy_in_ran: false,
+            settings: HashMap::new(),
+            sql_prepared: HashMap::new(),
+            branch_ddl: Vec::new(),
+            error_text: String::new(),
+            error_base: Some(0),
             listener: None,
             backend_pid: 0,
             shape_change: ShapeChangeMode::default(),
@@ -3317,7 +3348,9 @@ impl SessionState {
         self.idle_in_transaction_timeout = self.limits.idle_in_transaction_session_timeout;
         self.idle_session_timeout = self.limits.idle_session_timeout;
         self.shape_change = shape_change.unwrap_or_default();
+        self.settings.clear();
         if let Some(t) = self.transaction.as_mut() {
+            t.local_settings.clear();
             t.local_synchronous_commit = None;
             t.local_idle_in_transaction = None;
             t.local_idle_session = None;
@@ -4121,6 +4154,19 @@ async fn description_now(
         // Nothing to describe: the reply is `NoData` whatever the tables hold.
         None if value_free == Some(ValueFreeShape::NoRows) => None,
         None => {
+            // The session's values as it runs them (`session_values`); one
+            // that fails is left for `Execute` to report.
+            let with_session = session_rewrite(state, query).ok().flatten();
+            let query = with_session.as_deref().unwrap_or(query);
+            // `EXECUTE p(…)` is described as the statement it runs.
+            let bound = match sql_prepare::parse(query) {
+                Some(Ok(sql_prepare::SqlPrepare::Execute { name, args })) => state
+                    .sql_prepared
+                    .get(&name)
+                    .and_then(|p| sql_prepare::bind(&name, p, &args).ok()),
+                _ => None,
+            };
+            let query = bound.as_deref().unwrap_or(query);
             // A temporary table is described under its real name, as it runs.
             let temp_rewritten = temp_tables::rewrite(&state.temp_tables, query);
             describe_for_wire(database, temp_rewritten.as_deref().unwrap_or(query))
@@ -4910,6 +4956,38 @@ pub(crate) async fn describe_query(
     if stmt.is_empty() {
         return Ok(None);
     }
+    // The text-only passes `rewrite_statement_text` opens with, so what is
+    // described is the statement that runs: a statement laid out over lines,
+    // catalogue syntax, `ARRAY(SELECT …)` and the shorthands.
+    let uncommented = if stmt.contains("--") || stmt.contains("/*") {
+        std::borrow::Cow::Owned(crate::core::rql::lexer_s1::strip_sql_comments(stmt))
+    } else {
+        std::borrow::Cow::Borrowed(stmt)
+    };
+    let flat = crate::core::sql_scan::flatten_whitespace(&uncommented).into_owned();
+    let mut catalog = crate::core::sql_scan::catalog_syntax(&flat).into_owned();
+    // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
+    if let Some(text) = crate::core::rql::reg_casts::rewrite(&catalog, &|name: &str| {
+        database.schema_view(name).is_some() || database.views.contains(name)
+    }) {
+        catalog = text;
+    }
+    let arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
+    let mut shorthands = crate::core::sql_scan::statement_shorthands(&arrays).into_owned();
+    if let Ok(Some(text)) = crate::core::sql_scan::tablesample(&shorthands) {
+        shorthands = text;
+    }
+    if let Ok(Some(text)) = crate::core::sql_scan::row_assignments(&shorthands) {
+        shorthands = text;
+    }
+    if let Ok(Some(text)) = crate::core::sql_scan::named_windows(&shorthands) {
+        shorthands = text;
+    }
+    // Enum types in their stored form, as the statement runs (`user_types`).
+    if let Ok(Some(text)) = crate::core::rql::user_types::rewrite(database, &shorthands, None).await {
+        shorthands = text;
+    }
+    let stmt = shorthands.trim();
     // Folded as it runs (`execute_single_statement`).
     let folded = crate::core::sql_scan::fold_core_statement(stmt);
     let stmt = folded.as_ref();
@@ -4937,6 +5015,16 @@ pub(crate) async fn describe_query(
             expanded_views.as_str()
         }
         _ => stmt,
+    };
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(database, stmt) {
+        Some(text) => {
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
     };
     // And a correlated scalar subquery as the `LATERAL` join it runs as.
     let correlated;
@@ -5565,6 +5653,9 @@ async fn describe_resolved(
     {
         return Ok(Some((vec![("pg_notify".to_string(), DbType::STRING)], true)));
     }
+    if set_config_call(stmt).is_some() {
+        return Ok(Some((vec![("set_config".to_string(), DbType::STRING)], true)));
+    }
 
     let purpose = match recognize_query_purpose(stmt) {
         Some(p) => p,
@@ -5907,6 +5998,25 @@ async fn fail_statement<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    // A value no label of its enum type, which the column's constraint
+    // caught: PostgreSQL's 22P02, as a cast of it reports (`user_types`).
+    let enum_message;
+    let (sqlstate, message) = match crate::core::rql::user_types::violation(message) {
+        Some(m) => {
+            enum_message = m;
+            ("22P02", enum_message.as_str())
+        }
+        None => (sqlstate, message),
+    };
+    // A domain's check, in PostgreSQL's words (`domains`): 23514.
+    let domain_message;
+    let (sqlstate, message) = match crate::core::rql::domains::violation(message) {
+        Some(m) => {
+            domain_message = m;
+            ("23514", domain_message.as_str())
+        }
+        None => (sqlstate, message),
+    };
     state.statement_failed = true;
     state.error_in_batch = true;
     state.statement_error = Some(message.to_string());
@@ -6000,7 +6110,11 @@ where
     } else {
         sqlstate
     };
-    send_error_response(stream, sqlstate, message).await
+    // An undefined column in PostgreSQL's words (`error_position::pg_wording`).
+    let worded = if sqlstate == "42703" { error_position::pg_wording(&state.error_text, message) } else { None };
+    let message = worded.as_deref().unwrap_or(message);
+    let position = state.error_base.and_then(|base| error_position::find(&state.error_text, message).map(|p| p + base));
+    send_error_response_at(stream, sqlstate, message, position).await
 }
 
 /// Whether a select item the reader could not resolve (`Column
@@ -6482,6 +6596,17 @@ async fn execute_recorded<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Whether this statement failed belongs to this statement, from its
+    // first step: a `DROP TABLE` deferred to its block's end answers before
+    // `execute_recorded_inner` (which resets it too), so a flag left by the
+    // previous statement stood, and a batch after any failed statement
+    // (`DROP TABLE t; SELECT 1`) stopped after the drop, its later
+    // statements dropped without a reply.
+    state.statement_failed = false;
+    state.statement_error = None;
+    // What an error's position counts in (`error_position`).
+    state.error_text.clear();
+    state.error_text.push_str(stmt);
     // Counted as running until it returns, so the idle trimmer
     // (`idle_trim`) never walks the heap under a statement.
     let _running = crate::idle_trim::statement();
@@ -6706,14 +6831,26 @@ where
     }
     // A branch records the schema changes it makes, for a merge to replay
     // (`branch::note_ddl`). Inside a block, kept until the block commits.
+    // What a `DO` block or an `EXECUTE` ran is recorded in its place.
+    let ran_for_it = std::mem::take(&mut state.branch_ddl);
     #[cfg(feature = "db_branching")]
     if result.is_ok()
         && !state.statement_failed
         && let Some(dir) = &database.location
-        && crate::core::database::catalog::branch::is_recorded_ddl(stmt)
     {
-        crate::core::database::catalog::branch::note_ddl(dir, state.transaction.as_ref().map(|t| t.id), stmt);
+        let block = state.transaction.as_ref().map(|t| t.id);
+        if crate::core::database::catalog::branch::is_recorded_ddl(stmt) {
+            crate::core::database::catalog::branch::note_ddl(dir, block, stmt);
+        }
+        for ddl in &ran_for_it {
+            crate::core::database::catalog::branch::note_ddl(dir, block, ddl);
+        }
     }
+    #[cfg(not(feature = "db_branching"))]
+    drop(ran_for_it);
+    // An error reported outside a statement (a Parse's) has no text here to
+    // point into, rather than the last statement's.
+    state.error_text.clear();
     result
 }
 
@@ -7305,8 +7442,33 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `'t'::regclass`, `'int4'::regtype` and `to_regclass('t')` as the name
+    // or oid they stand for (`rql::reg_casts`).
+    let reg = crate::core::rql::reg_casts::rewrite(&stmt, &|name: &str| {
+        database.schema_view(name).is_some() || database.views.contains(name)
+    });
+    take(&mut stmt, reg);
     // `ARRAY(SELECT …)` as the aggregate it is (`sql_scan::array_subqueries`).
     if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `TABLE t` and `AS [NOT] MATERIALIZED` (`sql_scan::statement_shorthands`).
+    if let Cow::Owned(text) = crate::core::sql_scan::statement_shorthands(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `t TABLESAMPLE BERNOULLI (p)` as a sampled derived table
+    // (`sql_scan::tablesample`).
+    if let Some(text) = crate::core::sql_scan::tablesample(&stmt)? {
+        stmt = Cow::Owned(text);
+    }
+    // `UPDATE … SET (a, b) = (…)` as one assignment per column
+    // (`sql_scan::row_assignments`).
+    if let Some(text) = crate::core::sql_scan::row_assignments(&stmt).map_err(|e| ("42601", e))? {
+        stmt = Cow::Owned(text);
+    }
+    // A `WINDOW` clause's names written into each `OVER`
+    // (`sql_scan::named_windows`).
+    if let Some(text) = crate::core::sql_scan::named_windows(&stmt).map_err(|e| ("42P20", e))? {
         stmt = Cow::Owned(text);
     }
     // Unquoted names folded to lowercase, as PostgreSQL's lexer folds them,
@@ -7514,6 +7676,23 @@ where
     if let Some(pairs) = column_origins::sqlx_origin_pairs(stmt) {
         return column_origins::answer(database, stream, &pairs, omit_description).await;
     }
+    // `PREPARE`, `EXECUTE`, `DEALLOCATE` (`sql_prepare`): before any
+    // rewrite, which would act on a `PREPARE`'s statement as if it ran now.
+    if let Some(parsed) = sql_prepare::parse(stmt) {
+        return run_sql_prepare(database, state, stream, parsed, result_formats, omit_description).await;
+    }
+    // `DO $$ … $$`: a PL/pgSQL block run once (`trigger_exec::run_do`).
+    if let Some(parsed) = trigger_exec::parse_do(stmt) {
+        let outcome = match parsed {
+            Ok(body) => trigger_exec::run_do(database, state, &body).await?,
+            Err(e) => Err(e),
+        };
+        return match outcome {
+            Ok(()) => send_command_complete(stream, "DO").await,
+            Err((code, message)) => fail_statement(state, stream, &code, &message).await,
+        };
+    }
+
     // The text-only rewrites, shared with the native protocol
     // (`rewrite_statement_text`).
     let rewritten = match rewrite_statement_text(database, stmt) {
@@ -7524,6 +7703,27 @@ where
         }
     };
     let stmt = rewritten.as_ref();
+    // `current_user`, `current_setting(…)` and the other values of this
+    // session, as literals (`session_values`).
+    let with_session = match session_rewrite(state, stmt) {
+        Ok(text) => text,
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    let stmt = with_session.as_deref().unwrap_or(stmt);
+    // Enum types (`user_types`): a column, a cast and an `ORDER BY` of one
+    // in their stored form, read in this statement's transaction so a type
+    // the block created is seen.
+    let with_types = match crate::core::rql::user_types::rewrite(database, stmt, state.current_tx()).await {
+        Ok(text) => text,
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    let stmt = with_types.as_deref().unwrap_or(stmt);
 
     // Temporary tables (`temp_tables`): created here, and every reference to
     // one written as its real name before anything else reads the text.
@@ -7562,6 +7762,12 @@ where
     }
     if let Some(parsed) = crate::core::rql::sequence_catalog::parse_sequence_statement(stmt) {
         return sequence_statements::handle_sequence_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::user_types::parse_type_statement(stmt) {
+        return type_statements::handle_type_statement(database, state, stream, parsed).await;
+    }
+    if let Some(parsed) = crate::core::rql::domains::parse_domain_statement(stmt) {
+        return type_statements::handle_domain_statement(database, state, stream, parsed).await;
     }
     if let Some(parsed) = crate::core::rql::functions::parse_routine_statement(stmt) {
         return routine_statements::handle_routine_statement(database, state, stream, parsed).await;
@@ -7873,6 +8079,17 @@ where
     };
     let stmt = catalog.as_ref().map(|c| c.rewritten.as_str()).unwrap_or(stmt);
 
+    // An outer column a subquery names bare, qualified by its relation
+    // (`rql::outer_columns`), so the correlated passes below find it.
+    let qualified_outer;
+    let stmt = match crate::core::rql::outer_columns::qualify_in(database, stmt) {
+        Some(text) => {
+            crate::core::rql::prepared::note_rewritten();
+            qualified_outer = text;
+            qualified_outer.as_str()
+        }
+        None => stmt,
+    };
     // A correlated scalar subquery (`(SELECT max(v) FROM u WHERE u.k =
     // t.k)`), as the `LATERAL` join it means (`rql::correlated`), before the
     // passes that materialise such joins.
@@ -8625,7 +8842,7 @@ pub(crate) fn result_description(
             // lock, so parked writers do not queue readers behind them.)
             let table = database.schema_view(&qr.table_name);
             let Some(table) = table else {
-                return Err(("42P01", "relation does not exist".to_string()));
+                return Err(("42P01", format!("relation \"{}\" does not exist", qr.table_name)));
             };
             // The type a select item is *advertised* as. Same rule as the
             // describe path: a shredded JSON column is stored as a `UUID` and
@@ -10032,8 +10249,26 @@ where
         open_implicit_block(database, state);
     }
 
+    // Where each statement starts in the client's text, for an error's
+    // position: only where the text was not rewritten before the split.
+    let positioned = *normalized == *query;
+    let mut cursor = 0usize;
     for stmt in statements {
-        execute_recorded(database, state, stream, &stmt, &[], false, None).await?;
+        let trimmed = stmt.trim_start();
+        let lead = stmt.len() - trimmed.len();
+        state.error_base = match query.get(cursor..).and_then(|rest| rest.find(trimmed)) {
+            Some(at) if positioned => {
+                let start = cursor + at;
+                cursor = start + trimmed.len();
+                // The recorded statement keeps its leading blanks, which
+                // its own positions count.
+                Some(query[..start].chars().count().saturating_sub(stmt[..lead].chars().count()))
+            }
+            _ => None,
+        };
+        let ran = execute_recorded(database, state, stream, &stmt, &[], false, None).await;
+        state.error_base = Some(0);
+        ran?;
         // PostgreSQL stops a multi-statement string at the first failure.
         // Inside a block the poisoning refuses the rest; outside one nothing
         // did, so a migration sent as one string had its first statement fail
@@ -10179,6 +10414,7 @@ fn open_block(
         local_idle_session: None,
         local_default_isolation: None,
         local_default_read_only: None,
+        local_settings: HashMap::new(),
         queried: false,
         level,
         read_only,
@@ -11075,6 +11311,225 @@ fn strip_setting(lower: &str, key: &str) -> Option<Option<String>> {
     Some(Some(value.to_string()))
 }
 
+/// `SELECT set_config('name', 'value', is_local)` as the whole statement:
+/// the name, the value and whether it is local. `None` for anything else,
+/// which the engine reports.
+fn set_config_call(stmt: &str) -> Option<(String, String, bool)> {
+    let s = stmt.trim().trim_end_matches(';').trim();
+    let rest = s.get(..6).filter(|w| w.eq_ignore_ascii_case("SELECT")).map(|_| s[6..].trim_start())?;
+    let rest = rest.get(..10).filter(|w| w.eq_ignore_ascii_case("set_config")).map(|_| rest[10..].trim_start())?;
+    if !rest.starts_with('(') || crate::core::sql_scan::matching_close(rest, 0)? != rest.len() - 1 {
+        return None;
+    }
+    let args = crate::core::sql_scan::split_top_level(&rest[1..rest.len() - 1], b',');
+    let [name, value, local] = args.as_slice() else { return None };
+    let text = |arg: &str| {
+        let arg = arg.trim();
+        let inner = arg.strip_prefix('\'')?.strip_suffix('\'')?;
+        (!inner.replace("''", "").contains('\'')).then(|| inner.replace("''", "'"))
+    };
+    let name = text(name)?;
+    if !is_plain_setting_name(&name.to_ascii_lowercase()) {
+        return None;
+    }
+    let local = match local.trim().to_ascii_lowercase().as_str() {
+        "true" | "'t'" | "'true'" => true,
+        "false" | "'f'" | "'false'" => false,
+        _ => return None,
+    };
+    Some((name, text(value)?, local))
+}
+
+/// Runs a `PREPARE`, `EXECUTE` or `DEALLOCATE` (`sql_prepare`).
+async fn run_sql_prepare<S>(
+    database: &Arc<Database>,
+    state: &mut SessionState,
+    stream: &mut S,
+    parsed: Result<sql_prepare::SqlPrepare, String>,
+    result_formats: &[i16],
+    omit_description: bool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use sql_prepare::SqlPrepare;
+    let parsed = match parsed {
+        Ok(p) => p,
+        Err(e) => return fail_statement(state, stream, "42601", &e).await,
+    };
+    match parsed {
+        SqlPrepare::Prepare { name, types, body } => {
+            if state.sql_prepared.contains_key(&name) {
+                return fail_statement(state, stream, "42P05", &format!("prepared statement \"{name}\" already exists")).await;
+            }
+            state.sql_prepared.insert(name, sql_prepare::Prepared { types, body });
+            send_command_complete(stream, "PREPARE").await
+        }
+        SqlPrepare::Deallocate { name: None } => {
+            state.sql_prepared.clear();
+            send_command_complete(stream, "DEALLOCATE ALL").await
+        }
+        SqlPrepare::Deallocate { name: Some(name) } => {
+            if state.sql_prepared.remove(&name).is_none() {
+                return fail_statement(state, stream, "26000", &format!("prepared statement \"{name}\" does not exist")).await;
+            }
+            send_command_complete(stream, "DEALLOCATE").await
+        }
+        SqlPrepare::Execute { name, args } => {
+            let Some(prepared) = state.sql_prepared.get(&name).cloned() else {
+                return fail_statement(state, stream, "26000", &format!("prepared statement \"{name}\" does not exist")).await;
+            };
+            let text = match sql_prepare::bind(&name, &prepared, &args) {
+                Ok(text) => text,
+                Err((code, message)) => return fail_statement(state, stream, code, &message).await,
+            };
+            let ran = Box::pin(execute_single_statement(database, state, stream, &text, result_formats, omit_description)).await;
+            // A prepared schema change is the branch log's as its bound text.
+            if ran.is_ok() && !state.statement_failed && schema_verb(&text) {
+                state.branch_ddl.push(text);
+            }
+            ran
+        }
+    }
+}
+
+/// Whether `stmt` starts with a schema-changing verb (`CREATE`, `ALTER`,
+/// `DROP`, `COMMENT`): what `branch_ddl` keeps, so a `DO` loop of writes
+/// collects nothing. `branch::is_recorded_ddl` decides the rest.
+pub(super) fn schema_verb(stmt: &str) -> bool {
+    let verb = stmt.split_whitespace().next().unwrap_or("");
+    ["CREATE", "ALTER", "DROP", "COMMENT"].iter().any(|v| verb.eq_ignore_ascii_case(v))
+}
+
+/// `sql` with this session's values in it (`session_values::rewrite`).
+fn session_rewrite(state: &SessionState, sql: &str) -> Result<Option<String>, (&'static str, String)> {
+    let setting = |key: &str| show_parameter(state, key);
+    session_values::rewrite(
+        sql,
+        &session_values::Session {
+            user: &state.principal.name,
+            database: &state.database_name,
+            backend_pid: state.backend_pid,
+            setting: &setting,
+        },
+    )
+}
+
+/// A `SET [SESSION | LOCAL] name {TO | =} value` or `RESET name` of a
+/// parameter `SessionState::settings` keeps: whether it is `LOCAL`, the name
+/// lowercased, and the value (`None` for `RESET` and `DEFAULT`). A quoted
+/// value is unquoted and a bare word lowercased, as PostgreSQL reads them; a
+/// list (`search_path = "$user", public`) is kept as written.
+///
+/// `None` for one whose value decides how this server reads and writes
+/// values (`TimeZone`, `DateStyle`, …): `SHOW` reports those as they are,
+/// whatever a `SET` asked for, rather than claim a behaviour nothing here
+/// has. And for what is not this shape (`SET TIME ZONE …`, `SET ROLE …`).
+fn plain_setting(stmt: &str) -> Option<(bool, String, Option<String>)> {
+    let s = stmt.trim().trim_end_matches(';').trim();
+    let lower = s.to_ascii_lowercase();
+    let (local, rest_at) = if let Some(r) = lower.strip_prefix("reset ") {
+        let key = r.trim();
+        if key == "all" || !is_plain_setting_name(key) || !plain_setting_kept(key) {
+            return None;
+        }
+        return Some((false, key.to_string(), None));
+    } else if let Some(r) = lower.strip_prefix("set ") {
+        let r_trim = r.trim_start();
+        let base = s.len() - r_trim.len();
+        if let Some(x) = r_trim.strip_prefix("local ") {
+            (true, s.len() - x.trim_start().len())
+        } else if let Some(x) = r_trim.strip_prefix("session ") {
+            (false, s.len() - x.trim_start().len())
+        } else {
+            (false, base)
+        }
+    } else {
+        return None;
+    };
+    let rest = &s[rest_at..];
+    let name_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+        .count();
+    let key = rest[..name_len].to_ascii_lowercase();
+    if !is_plain_setting_name(&key) || !plain_setting_kept(&key) {
+        return None;
+    }
+    let after = rest[name_len..].trim_start();
+    let value = if let Some(v) = after.strip_prefix('=') {
+        v.trim()
+    } else if after.len() >= 3 && after.as_bytes()[..3].eq_ignore_ascii_case(b"to ") {
+        after[3..].trim()
+    } else {
+        return None;
+    };
+    if value.is_empty() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("default") {
+        return Some((local, key, None));
+    }
+    let single_quoted = value.len() >= 2
+        && value.starts_with('\'')
+        && value.ends_with('\'')
+        && !value[1..value.len() - 1].replace("''", "").contains('\'');
+    let value = if single_quoted {
+        value[1..value.len() - 1].replace("''", "'")
+    } else if value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-') {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    };
+    Some((local, key, Some(value)))
+}
+
+fn is_plain_setting_name(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        && !key.starts_with('.')
+        && !key.ends_with('.')
+}
+
+/// Whether `SessionState::settings` keeps `key`: not one this server answers
+/// from what it does (`show_parameter`'s fixed and session-backed ones).
+fn plain_setting_kept(key: &str) -> bool {
+    !matches!(
+        key,
+        "timezone"
+            | "log_timezone"
+            | "datestyle"
+            | "intervalstyle"
+            | "client_encoding"
+            | "server_encoding"
+            | "server_version"
+            | "server_version_num"
+            | "standard_conforming_strings"
+            | "integer_datetimes"
+            | "max_identifier_length"
+            | "lc_collate"
+            | "lc_ctype"
+            | "is_superuser"
+            | "session_authorization"
+            | "role"
+            | "transaction_isolation"
+            | "transaction_read_only"
+            | "default_transaction_isolation"
+            | "default_transaction_read_only"
+            | "synchronous_commit"
+            | "wal_writer_delay"
+            | "statement_timeout"
+            | "lock_timeout"
+            | "partition_trace"
+            | "idle_in_transaction_session_timeout"
+            | "idle_session_timeout"
+            | "max_connections"
+            | "authentication_timeout"
+            | "extra_float_digits"
+            | "bytea_output"
+    ) && key != ShapeChangeMode::SETTING
+}
+
 /// Why the open block `t` may not change its level to `level` now, or
 /// `None` when it may.
 ///
@@ -11286,6 +11741,7 @@ where
             state.reset_all();
             state.statements.clear();
             state.portals.clear();
+            state.sql_prepared.clear();
             "DISCARD ALL"
         }
         ["discard", "plans"] => {
@@ -11742,9 +12198,60 @@ where
         return Ok(false);
     }
 
-    // SET statements (psql uses these on connect).
-    if s_lower.starts_with("set ") {
-        send_command_complete(stream, "SET").await?;
+    // SET statements (psql uses these on connect). A plain parameter is kept
+    // for `SHOW` and `current_setting` to read back (`plain_setting`); one
+    // whose value decides how this server behaves is acknowledged and
+    // reported as the server has it, as before.
+    if s_lower.starts_with("set ") || s_lower.starts_with("reset ") {
+        let Some((local, key, value)) = plain_setting(s) else {
+            // `RESET TimeZone` and the like: back to what it always is here.
+            if let Some(key) = s_lower.trim().trim_end_matches(';').strip_prefix("reset ") {
+                if !is_plain_setting_name(key.trim()) {
+                    return Ok(false);
+                }
+                send_command_complete(stream, "RESET").await?;
+                return Ok(true);
+            }
+            send_command_complete(stream, "SET").await?;
+            return Ok(true);
+        };
+        if local && state.transaction.is_none() {
+            send_notice(stream, "25P01", "SET LOCAL can only be used in transaction blocks").await?;
+        } else if local {
+            // A custom parameter (`myapp.x`) set only for the block is
+            // still defined after it, as the empty string, as PostgreSQL's
+            // placeholder is.
+            if key.contains('.') {
+                state.settings.entry(key.clone()).or_default();
+            }
+            if let Some(t) = state.transaction.as_mut() {
+                match value {
+                    Some(v) => {
+                        t.local_settings.insert(key, v);
+                    }
+                    None => {
+                        t.local_settings.remove(&key);
+                    }
+                }
+            }
+        } else {
+            if let Some(t) = state.transaction.as_mut() {
+                t.local_settings.remove(&key);
+            }
+            match value {
+                Some(v) => {
+                    state.settings.insert(key, v);
+                }
+                // A custom parameter's default is the empty string.
+                None if key.contains('.') => {
+                    state.settings.insert(key, String::new());
+                }
+                None => {
+                    state.settings.remove(&key);
+                }
+            }
+        }
+        send_command_complete(stream, if s_lower.starts_with("reset ") { "RESET" } else { "SET" }).await?;
         return Ok(true);
     }
 
@@ -11807,6 +12314,43 @@ where
                 .await?;
         }
         send_data_row(stream, &[Some(b"")]).await?;
+        send_command_complete(stream, "SELECT 1").await?;
+        return Ok(true);
+    }
+
+    // `SELECT set_config(name, value, is_local)`: the `SET` it is, run by the
+    // branches here, answering the value it leaves. Its error, when the
+    // `SET` has one, is the statement's.
+    if let Some((name, value, local)) = set_config_call(s) {
+        let set = format!(
+            "SET {}{} = '{}'",
+            if local { "LOCAL " } else { "" },
+            name,
+            value.replace('\'', "''")
+        );
+        let mut replies: Vec<u8> = Vec::new();
+        // Its replies are this one's to read, not the client's
+        // (`internal_run`): held, its `CommandComplete` ended this reply.
+        let handled = internal_run(Box::pin(handle_builtin_query(state, &mut replies, &set, true))).await?;
+        if replies.first() == Some(&b'E') {
+            stream.write_all(&replies).await?;
+            return Ok(true);
+        }
+        if !handled {
+            fail_statement(state, stream, "0A000", &format!("set_config of \"{name}\" is not supported")).await?;
+            return Ok(true);
+        }
+        // The value it set. A local one outside a block lasts only this
+        // statement, but is still what it answers, as PostgreSQL's does.
+        let now = if local && state.transaction.is_none() {
+            value
+        } else {
+            show_parameter(state, &name.to_ascii_lowercase()).unwrap_or(value)
+        };
+        if !omit_description {
+            send_row_description(stream, &[("set_config", DbType::STRING)], &[]).await?;
+        }
+        send_data_row(stream, &[Some(now.as_bytes())]).await?;
         send_command_complete(stream, "SELECT 1").await?;
         return Ok(true);
     }
@@ -12034,6 +12578,16 @@ where
 /// level and access mode a client set are what it reads back, and
 /// `is_superuser` is what the client was authenticated as.
 fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
+    // A plain parameter as this session set it, its block's `SET LOCAL`
+    // first (`SessionState::settings`).
+    if let Some(value) = state
+        .transaction
+        .as_ref()
+        .and_then(|t| t.local_settings.get(key))
+        .or_else(|| state.settings.get(key))
+    {
+        return Some(value.clone());
+    }
     let level_name = |level: IsolationLevel| match level {
         IsolationLevel::ReadCommitted => "read committed",
         IsolationLevel::RepeatableRead => "repeatable read",
@@ -12079,15 +12633,17 @@ fn show_parameter(state: &SessionState, key: &str) -> Option<String> {
         // whatever had been set, which reads as "no timeout configured" — so a
         // client that set one, and an operator checking whether statements were
         // bounded, were both told the opposite of the truth.
+        // In the largest unit that divides it exactly, as PostgreSQL prints
+        // it (`5s`, not `5000ms`).
         "statement_timeout" => match state.statement_timeout_ms {
-            Some(ms) => format!("{}ms", ms),
+            Some(ms) => format_time_setting(Duration::from_millis(ms)),
             None => "0".to_string(),
         },
         "partition_trace" => on_off(state.partition_trace).to_string(),
         // Enforced on every table-lock wait, and reported as this session set
         // it: `0` (no bound) unless it set one.
         "lock_timeout" => match state.lock_timeout_ms {
-            Some(ms) if ms > 0 => format!("{}ms", ms),
+            Some(ms) if ms > 0 => format_time_setting(Duration::from_millis(ms)),
             _ => "0".to_string(),
         },
         // Enforced per session (see `idle_limit`), and reported as this
@@ -13889,6 +14445,15 @@ async fn send_error_response<S>(stream: &mut S, sqlstate: &str, message: &str) -
 where
     S: AsyncWrite + Unpin,
 {
+    send_error_response_at(stream, sqlstate, message, None).await
+}
+
+/// [`send_error_response`] with the statement position the error points at
+/// (the `P` field: 1-based, in characters), as PostgreSQL sends it.
+async fn send_error_response_at<S>(stream: &mut S, sqlstate: &str, message: &str, position: Option<usize>) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     // ErrorResponse fields: (type_byte, cstring)..., terminated by 0.
     // Minimal set: Severity (S), SQLSTATE (C), Message (M)
     let mut payload = Vec::new();
@@ -13904,6 +14469,12 @@ where
     payload.push(b'M');
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
+
+    if let Some(position) = position {
+        payload.push(b'P');
+        payload.extend_from_slice(position.to_string().as_bytes());
+        payload.push(0);
+    }
 
     // The constraint an integrity error names, as its own field: what an ORM
     // maps the error to a key or a check by (node-postgres's `constraint`,
