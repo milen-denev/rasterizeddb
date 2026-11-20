@@ -9443,8 +9443,8 @@ pub(crate) fn native_retag(answer: Vec<u8>, fields: Option<&[(String, DbType)]>,
         return answer;
     }
     let declared = |at: usize| fields.and_then(|f| f.get(at)).map(|(_, t)| t);
-    // Read from the first row: a column's cells share its type, and an
-    // answer nothing retypes is left as it is, unparsed.
+    // An answer nothing retypes is left as it is, not rewritten. Every row is
+    // read for that, not the first alone (`any_cell`).
     let applies = |stored: &DbType, declared: Option<&DbType>| {
         matches!(
             (stored, declared),
@@ -9454,22 +9454,9 @@ pub(crate) fn native_retag(answer: Vec<u8>, fields: Option<&[(String, DbType)]>,
                 | (DbType::DATETIME, Some(DbType::TIMESTAMP))
         )
     };
-    let needed = match serialized_rows(&answer[1..]).next() {
-        Some(Ok(row)) => match serialized_cells(row) {
-            Ok(cells) => {
-                let mut needed = false;
-                for (at, cell) in cells.enumerate() {
-                    match cell {
-                        Ok(cell) if applies(&cell.column_type, declared(at)) => needed = true,
-                        Ok(_) => {}
-                        Err(_) => return answer,
-                    }
-                }
-                needed
-            }
-            Err(_) => return answer,
-        },
-        _ => return answer,
+    let needed = match any_cell(&answer[1..], |at, stored| applies(stored, declared(at))) {
+        Some(needed) => needed,
+        None => return answer,
     };
     if !needed {
         return answer;
@@ -9580,25 +9567,19 @@ fn native_retag_by_rows(answer: Vec<u8>, fields: Option<&[(String, DbType)]>, sc
                 | (DbType::DATETIME, Some(DbType::TIMESTAMP))
         )
     };
-    let first = crate::core::row::row::serialized_rows(&answer[1..])
-        .next()
-        .and_then(|r| r.ok())
-        .and_then(|r| crate::core::row::row::Row::decode(r).ok());
-    let Some(first) = first else {
-        return answer;
-    };
-    if !first
-        .columns
-        .iter()
-        .enumerate()
-        .any(|(at, c)| applies(&c.column_type, fields.and_then(|f| f.get(at)).map(|(_, t)| t)))
-    {
-        return answer;
-    }
-    drop(first);
     let Ok(mut rows) = crate::core::row::row::vec_into_rows(&answer[1..]) else {
         return answer;
     };
+    // Every row, as `native_retag` reads them (`any_cell`), decided here on
+    // the decoded rows instead.
+    if !rows.iter().any(|row| {
+        row.columns
+            .iter()
+            .enumerate()
+            .any(|(at, c)| applies(&c.column_type, fields.and_then(|f| f.get(at)).map(|(_, t)| t)))
+    }) {
+        return answer;
+    }
     let mut changed = false;
     let block = |bytes: &[u8]| {
         let mut b = crate::memory_pool::MEMORY_POOL.acquire(bytes.len());
@@ -9664,13 +9645,13 @@ fn native_retag_by_rows(answer: Vec<u8>, fields: Option<&[(String, DbType)]>, sc
 }
 
 /// Whether a native answer to `query` holds a cell [`native_retag`] may
-/// retype, read from its first row alone: a NUMERIC, a document or a
+/// retype, in any of its rows: a NUMERIC, a document or a
 /// timestamp, or a text cell when a table `query` names declares a column
 /// stored as text but typed otherwise (`jsonb`, `json`, `bytea`, an array).
 /// The check that keeps a second parse of the statement and of its rows off
 /// every other answer.
 pub(crate) fn native_answer_needs_retag(answer: &[u8], database: &Database, query: &str) -> bool {
-    match first_row_retag(answer) {
+    match answer_retag(answer) {
         Retag::No => false,
         Retag::Yes => true,
         Retag::IfTextTyped => crate::core::rql::lock_set::relation_references(query)
@@ -9683,14 +9664,41 @@ pub(crate) fn native_answer_needs_retag(answer: &[u8], database: &Database, quer
 /// learned parse's: the table is known, so the statement is not read again
 /// to find it.
 pub(crate) fn native_answer_needs_retag_in(answer: &[u8], database: &Database, table: &str) -> bool {
-    match first_row_retag(answer) {
+    match answer_retag(answer) {
         Retag::No => false,
         Retag::Yes => true,
         Retag::IfTextTyped => declares_text_typed(database, table),
     }
 }
 
-/// What a native answer's first row says about a retag.
+/// Whether any cell of a native answer's rows (`rows`, the answer past its
+/// kind byte) satisfies `wanted(column, stored type)`, or `None` when the
+/// rows cannot be read.
+///
+/// Every row is read, stopping at the first cell that does. Reading the first
+/// row alone assumed a column's cells share its type, and they do not: a
+/// NULL is typed NULL, so an answer whose first row held a NULL where later
+/// rows held a NUMERIC, a document, a `bytea` or a timestamp was judged to
+/// need nothing, and those later rows went out under their storage types (a
+/// document as engine bytes, a NUMERIC without its scale), while the same
+/// rows in another order came out right. An expression's cells may also be
+/// typed row by row (`CASE … THEN 1 ELSE 1.5 END`), so the first cell that
+/// is not NULL does not speak for its column either. Walking the cell
+/// headers costs little beside having made the rows, and a point query's
+/// one row is read as before.
+fn any_cell(rows: &[u8], mut wanted: impl FnMut(usize, &DbType) -> bool) -> Option<bool> {
+    use crate::core::row::row::{serialized_cells, serialized_rows};
+    for row in serialized_rows(rows) {
+        for (at, cell) in serialized_cells(row.ok()?).ok()?.enumerate() {
+            if wanted(at, &cell.ok()?.column_type) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// What a native answer's rows say about a retag.
 enum Retag {
     No,
     Yes,
@@ -9698,25 +9706,27 @@ enum Retag {
     IfTextTyped,
 }
 
-fn first_row_retag(answer: &[u8]) -> Retag {
+/// Read from every row, not the first alone ([`any_cell`]).
+fn answer_retag(answer: &[u8]) -> Retag {
     if answer.first() != Some(&2) {
         return Retag::No;
     }
-    let Some(Ok(first)) = crate::core::row::row::serialized_rows(&answer[1..]).next() else {
-        return Retag::No;
-    };
-    let Ok(row) = crate::core::row::row::Row::decode(first) else {
-        return Retag::No;
-    };
     let mut text = false;
-    for c in &row.columns {
-        match c.column_type {
-            DbType::DECIMAL | DbType::DATETIME | DbType::JSONB => return Retag::Yes,
-            DbType::STRING => text = true,
-            _ => {}
+    let found = any_cell(&answer[1..], |_, stored| match stored {
+        DbType::DECIMAL | DbType::DATETIME | DbType::JSONB => true,
+        DbType::STRING => {
+            text = true;
+            false
         }
+        _ => false,
+    });
+    match found {
+        // Unreadable rows are passed on as they are, as `native_retag` does.
+        None => Retag::No,
+        Some(true) => Retag::Yes,
+        Some(false) if text => Retag::IfTextTyped,
+        Some(false) => Retag::No,
     }
-    if text { Retag::IfTextTyped } else { Retag::No }
 }
 
 /// Whether `table` declares a column stored as text but typed otherwise.

@@ -4,7 +4,7 @@
 //! type the retag reads, under every declared type it acts on, with scales
 //! and without, both must give the same bytes.
 
-use super::{native_retag, native_retag_by_rows};
+use super::{Retag, answer_retag, native_retag, native_retag_by_rows};
 use crate::core::db_type::DbType;
 use crate::core::row::row::{Column, Row};
 
@@ -105,4 +105,76 @@ fn answers_it_does_not_read_are_left_alone() {
         assert_eq!(native_retag(answer.clone(), Some(&fields), None), answer);
         assert_eq!(native_retag(answer.clone(), Some(&fields), None), native_retag_by_rows(answer, Some(&fields), None));
     }
+}
+
+/// The rows of a native answer, each as its serialized bytes.
+fn rows_of(answer: &[u8]) -> Vec<Vec<u8>> {
+    crate::core::row::row::serialized_rows(&answer[1..]).map(|r| r.expect("a row").to_vec()).collect()
+}
+
+/// A row the retag acts on is retyped whatever comes before it. Reading the
+/// first row alone, a first row holding NULL where the later ones hold a
+/// NUMERIC, a document, a `bytea` or a timestamp made the whole answer go
+/// out under its storage types; the same rows the other way round came out
+/// right.
+///
+/// Mutation: decide from the first row again (`any_cell` reading one row):
+/// the value row behind the NULL one is left as stored.
+#[test]
+fn a_null_in_the_first_row_does_not_leave_later_rows_untyped() {
+    let fields: Vec<(String, DbType)> = [DbType::DECIMAL, DbType::JSONB, DbType::BYTEA, DbType::TIMESTAMP, DbType::ARRAY]
+        .into_iter()
+        .enumerate()
+        .map(|(at, t)| (format!("c{at}"), t))
+        .collect();
+    let values: Vec<(DbType, Vec<u8>)> = vec![
+        (DbType::DECIMAL, (15i128 * 100_000_000_000_000_000).to_le_bytes().to_vec()),
+        (DbType::JSONB, crate::core::jsonb::encode_text("{\"a\": 1}").expect("json")),
+        (DbType::STRING, vec![1, 2]),
+        (DbType::DATETIME, 1_700_000_000_000i64.to_le_bytes().to_vec()),
+        (DbType::STRING, b"{1,2}".to_vec()),
+    ];
+    let scales = [2u32, 0, 0, 0, 0];
+    for column in 0..fields.len() {
+        // One column at a time NULL in the first row, the others as plain
+        // integers, so it alone decides.
+        let first: Vec<(DbType, Vec<u8>)> = (0..fields.len())
+            .map(|c| if c == column { (DbType::NULL, Vec::new()) } else { (DbType::I64, 7i64.to_le_bytes().to_vec()) })
+            .collect();
+        let second: Vec<(DbType, Vec<u8>)> = (0..fields.len())
+            .map(|c| if c == column { values[c].clone() } else { (DbType::I64, 7i64.to_le_bytes().to_vec()) })
+            .collect();
+        for (f, s) in [(Some(fields.as_slice()), Some(scales.as_slice())), (Some(fields.as_slice()), None)] {
+            let alone = native_retag(answer(std::slice::from_ref(&second)), f, s);
+            assert_ne!(alone, answer(std::slice::from_ref(&second)), "column {column}: the value row is one the retag acts on");
+            let behind = native_retag(answer(&[first.clone(), second.clone()]), f, s);
+            assert_eq!(rows_of(&behind)[1], rows_of(&alone)[0], "column {column}: retyped alone but not behind a NULL");
+            assert_eq!(rows_of(&behind)[0], rows_of(&answer(std::slice::from_ref(&first)))[0], "column {column}: the NULL row");
+            assert_eq!(behind, native_retag_by_rows(answer(&[first.clone(), second.clone()]), f, s), "column {column}: oracle");
+        }
+    }
+}
+
+/// Whether an answer may need a retag is read from every row, as the retag
+/// itself is.
+#[test]
+fn whether_an_answer_needs_a_retag_is_read_from_every_row() {
+    let int = (DbType::I64, 1i64.to_le_bytes().to_vec());
+    let null = (DbType::NULL, Vec::new());
+    for (later, wanted) in [
+        ((DbType::DECIMAL, 5i128.to_le_bytes().to_vec()), "yes"),
+        ((DbType::JSONB, crate::core::jsonb::encode_text("[1]").expect("json")), "yes"),
+        ((DbType::DATETIME, 9i64.to_le_bytes().to_vec()), "yes"),
+        ((DbType::STRING, b"x".to_vec()), "text"),
+        (int.clone(), "no"),
+    ] {
+        let got = match answer_retag(&answer(&[vec![int.clone(), null.clone()], vec![int.clone(), later.clone()]])) {
+            Retag::Yes => "yes",
+            Retag::IfTextTyped => "text",
+            Retag::No => "no",
+        };
+        assert_eq!(got, wanted, "{:?} behind a NULL", later.0);
+    }
+    assert!(matches!(answer_retag(&[2u8]), Retag::No));
+    assert!(matches!(answer_retag(&[3u8, b'x']), Retag::No));
 }
