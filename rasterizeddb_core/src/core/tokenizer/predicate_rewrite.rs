@@ -3719,6 +3719,7 @@ pub fn lift_evaluated_operands(
         && !reads_legacy_char(clause, schema)
         && !mentions_distinct_from(clause)
         && !mentions_range(clause)
+        && !in_after_non_column(clause)
     {
         return Ok(clause.to_string());
     }
@@ -4126,7 +4127,7 @@ fn lift_term(
     depth: usize,
 ) -> Result<String, String> {
     let plain = !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema);
-    if plain && !mentions_distinct_from(term) && !mentions_range(term) {
+    if plain && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -4147,6 +4148,7 @@ fn lift_term(
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
         || compares_a_computed_range(body, schema)
+        || in_over_non_column(body, schema)
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
@@ -4193,6 +4195,57 @@ fn distinct_from_expression(body: &str, schema: &SmallVec<[SchemaField; 20]>) ->
 /// `interval` (`ts - TIMESTAMP '2024-01-01' > interval '30 days'`): the scan
 /// compares only scalar types (`EvaluatedOperand::new`), and refused it; the
 /// evaluator orders intervals as PostgreSQL does, a day as 24 hours.
+/// Whether `text` holds `x [NOT] IN (…)` whose `x` is no bare column — a
+/// literal, a call, arithmetic (`1 IN (1, 3)`, `n + 0 IN (…)`, `excluded.id
+/// IN (SELECT …)` once its value is written in): the token before `IN` (past a
+/// `NOT`) ends in a digit, a quote or a parenthesis. Only the gate;
+/// [`in_over_non_column`] decides each term.
+fn in_after_non_column(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        if let Some(end) = crate::core::sql_scan::skip_quoted(bytes, i) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let word = bytes[i..i + 2].eq_ignore_ascii_case(b"IN")
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && bytes.get(i + 2).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if word && text[i + 2..].trim_start().starts_with('(') {
+            let mut before = text[..i].trim_end();
+            if before.len() >= 3
+                && before.as_bytes()[before.len() - 3..].eq_ignore_ascii_case(b"NOT")
+                && before.as_bytes().get(before.len().wrapping_sub(4)).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            {
+                before = before[..before.len() - 3].trim_end();
+            }
+            if before.ends_with(|c: char| c.is_ascii_digit() || c == '\'' || c == ')') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether `body` is `x [NOT] IN (…)` with an `x` that is no bare column: the
+/// predicate tokenizer reads only a column there ("syntax error at or near
+/// \"IN\""), the evaluator any value, with SQL's three values (`2 NOT IN
+/// (1, NULL)` is unknown).
+fn in_over_non_column(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    if !in_after_non_column(body) {
+        return false;
+    }
+    let Some((at, end, true)) = comparison_operator(body) else {
+        return false;
+    };
+    let word = body[at..end].trim();
+    let is_in = word.eq_ignore_ascii_case("IN")
+        || (word.eq_ignore_ascii_case("NOT") && body[end..].trim_start().get(..2).is_some_and(|w| w.eq_ignore_ascii_case("IN")));
+    let left = body[..at].trim();
+    is_in && !left.is_empty() && resolve_column(left, schema).is_none()
+}
+
 /// Whether `text` may hold a range operand: the word anywhere, outside
 /// quotes or not (`int4range(…)`, `::daterange`, `range_merge`). Only the
 /// gate; [`compares_a_computed_range`] decides each term.
