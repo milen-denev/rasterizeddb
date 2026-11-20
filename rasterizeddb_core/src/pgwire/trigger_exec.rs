@@ -473,6 +473,11 @@ async fn run_statements(
                 if let Err(e) = Box::pin(super::view_statements::run_internal(database, state, &text)).await? {
                     return Ok(Err(failure(e)));
                 }
+                // A `DO` block's schema changes, for a branch's DDL log
+                // (`branch_ddl`); a trigger's are its statement's business.
+                if ctx.trigger.function == "inline_code_block" && super::schema_verb(&text) {
+                    state.branch_ddl.push(text);
+                }
             }
         }
     }

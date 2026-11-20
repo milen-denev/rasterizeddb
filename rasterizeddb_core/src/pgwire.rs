@@ -2911,6 +2911,11 @@ struct SessionState {
     settings: HashMap<String, String>,
     /// `PREPARE`d statements by name (`sql_prepare`).
     sql_prepared: HashMap<String, sql_prepare::Prepared>,
+    /// The schema changes a `DO` block or an `EXECUTE` of a prepared
+    /// statement ran on this statement's behalf, for a branch's DDL log
+    /// (`branch::note_ddl`): the client statement itself (`DO …`, `EXECUTE
+    /// q`) is no DDL to the log. Drained at the end of `execute_recorded`.
+    branch_ddl: Vec<String>,
     /// The channels this session listens on and its notifications' queue
     /// (`notify`), from its first `LISTEN`.
     listener: Option<notify::Listener>,
@@ -3303,6 +3308,7 @@ impl SessionState {
             copy_in_ran: false,
             settings: HashMap::new(),
             sql_prepared: HashMap::new(),
+            branch_ddl: Vec::new(),
             listener: None,
             backend_pid: 0,
             shape_change: ShapeChangeMode::default(),
@@ -6800,14 +6806,23 @@ where
     }
     // A branch records the schema changes it makes, for a merge to replay
     // (`branch::note_ddl`). Inside a block, kept until the block commits.
+    // What a `DO` block or an `EXECUTE` ran is recorded in its place.
+    let ran_for_it = std::mem::take(&mut state.branch_ddl);
     #[cfg(feature = "db_branching")]
     if result.is_ok()
         && !state.statement_failed
         && let Some(dir) = &database.location
-        && crate::core::database::catalog::branch::is_recorded_ddl(stmt)
     {
-        crate::core::database::catalog::branch::note_ddl(dir, state.transaction.as_ref().map(|t| t.id), stmt);
+        let block = state.transaction.as_ref().map(|t| t.id);
+        if crate::core::database::catalog::branch::is_recorded_ddl(stmt) {
+            crate::core::database::catalog::branch::note_ddl(dir, block, stmt);
+        }
+        for ddl in &ran_for_it {
+            crate::core::database::catalog::branch::note_ddl(dir, block, ddl);
+        }
     }
+    #[cfg(not(feature = "db_branching"))]
+    drop(ran_for_it);
     result
 }
 
@@ -11319,9 +11334,22 @@ where
                 Ok(text) => text,
                 Err((code, message)) => return fail_statement(state, stream, code, &message).await,
             };
-            Box::pin(execute_single_statement(database, state, stream, &text, result_formats, omit_description)).await
+            let ran = Box::pin(execute_single_statement(database, state, stream, &text, result_formats, omit_description)).await;
+            // A prepared schema change is the branch log's as its bound text.
+            if ran.is_ok() && !state.statement_failed && schema_verb(&text) {
+                state.branch_ddl.push(text);
+            }
+            ran
         }
     }
+}
+
+/// Whether `stmt` starts with a schema-changing verb (`CREATE`, `ALTER`,
+/// `DROP`, `COMMENT`): what `branch_ddl` keeps, so a `DO` loop of writes
+/// collects nothing. `branch::is_recorded_ddl` decides the rest.
+pub(super) fn schema_verb(stmt: &str) -> bool {
+    let verb = stmt.split_whitespace().next().unwrap_or("");
+    ["CREATE", "ALTER", "DROP", "COMMENT"].iter().any(|v| verb.eq_ignore_ascii_case(v))
 }
 
 /// `sql` with this session's values in it (`session_values::rewrite`).
