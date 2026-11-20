@@ -366,6 +366,8 @@ statement starts. A bare `user` is left as a column name: a table here may
 have a column created as `user`, and reading the session's user in its place
 would be a wrong answer. Statements that store an expression for later
 (`DEFAULT current_user`, a view's or a function's body) keep it unevaluated.
+A native-protocol statement that names one runs through the same path, in a
+session made for it, so `SELECT current_database()` answers there too.
 
 `SET` of a parameter nothing here acts on (`application_name`,
 `search_path`, a custom `myapp.x`) is kept per session, so `SHOW`,
@@ -1119,8 +1121,6 @@ has. A catalogue file could disagree with the directories it lists; this cannot.
   checkpointing run until the process exits, writing to files that have already
   been unlinked. Their work is discarded, but the space is not reclaimed until
   then.
-- **No `current_database()`, `pg_database` or `\l`.** Connecting works; tooling
-  that introspects the database list does not.
 - **No schemas.** `search_path` is not honoured, and a schema-qualified name has
   its qualifier stripped.
 

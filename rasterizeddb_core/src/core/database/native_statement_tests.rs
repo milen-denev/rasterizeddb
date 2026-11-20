@@ -12,7 +12,7 @@ use rclite::Arc;
 use super::*;
 
 fn context(database: &Arc<Database>, authentication_required: bool) -> NativeContext {
-    NativeContext { database: database.clone(), authentication_required }
+    NativeContext { database: database.clone(), authentication_required, catalog: None }
 }
 
 async fn send(context: &NativeContext, superuser: bool, sql: &str) -> Vec<u8> {
@@ -913,4 +913,95 @@ async fn show_columns_reports_the_declared_type_with_its_modifiers() {
     let said = simple(&context, Some(&session), &format!("CREATE TABLE typmod_back ({ddl})")).await;
     assert!(said.errors.is_empty(), "{ddl}: {said:?}");
     assert_eq!(types(&context, &session, "typmod_back").await, expect);
+}
+
+/// The session's own values (`current_database()`, `current_user`,
+/// `current_setting(…)`) answer over the plain native path as they do over
+/// pgwire, where `session_values` puts them in the text. The native path did
+/// not, so a native client could not ask which database it is connected to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_values_answer_over_the_plain_native_path() {
+    let (_dir, database) = database().await;
+    let context = context(&database, true);
+    let session = crate::pgwire::NativeSession::new(database.clone(), "native_alice", true, true, true);
+    let ask = |sql: &'static str| {
+        let context = context.clone();
+        let session = &session;
+        async move {
+            process_native_request(
+                context,
+                std::sync::Arc::new(rastcp::session::Principal::new("native_alice", true)),
+                Some(session),
+                sql.as_bytes().to_vec(),
+            )
+            .await
+        }
+    };
+    let contains = |answer: &[u8], needle: &str| answer.windows(needle.len()).any(|w| w == needle.as_bytes());
+
+    let answer = ask("SELECT current_database()").await;
+    assert_eq!(answer.first(), Some(&2), "{}", text(&answer));
+    assert!(contains(&answer, &database.name), "{} not in {:?}", database.name, text(&answer));
+
+    let answer = ask("SELECT current_user, current_setting('server_version_num')").await;
+    assert_eq!(answer.first(), Some(&2), "{}", text(&answer));
+    assert!(contains(&answer, "native_alice"), "{:?}", text(&answer));
+    assert!(contains(&answer, "160003"), "{:?}", text(&answer));
+
+    // A parameter this server does not have is refused, not read as NULL.
+    let answer = ask("SELECT current_setting('no_such_parameter')").await;
+    assert_eq!(answer.first(), Some(&3), "{:?}", answer.first());
+}
+
+/// A native connection counts among its database's sessions in the server's
+/// catalogue for as long as it is open, as a pgwire one does: `SHOW
+/// DATABASES` said `sessions` 0 over either protocol while native clients
+/// were connected, and `DROP DATABASE` did not wait for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_connection_counts_among_its_database_s_sessions() {
+    let catalog = super::catalog::DatabaseCatalog::open(None, super::DEFAULT_DATABASE_NAME)
+        .await
+        .expect("a catalogue");
+    let database = catalog.get(super::DEFAULT_DATABASE_NAME).expect("its default database");
+    let context = NativeContext {
+        database: database.clone(),
+        authentication_required: false,
+        catalog: Some(catalog.clone()),
+    };
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let sessions = || {
+        catalog
+            .listing()
+            .into_iter()
+            .find(|d| d.name == super::DEFAULT_DATABASE_NAME)
+            .expect("listed")
+            .sessions
+    };
+    assert_eq!(sessions(), 0);
+
+    let one = native_session_for(&context, &principal, false);
+    let two = native_session_for(&context, &principal, true);
+    assert_eq!(sessions(), 2, "two native connections open");
+
+    // Over native too, read through the connection's own session.
+    let said = simple(&context, Some(&one), "SHOW DATABASES").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    let (columns, rows, _) = &said.results[0];
+    let at = |name: &str| columns.iter().position(|c| c == name).expect(name);
+    let row = rows
+        .iter()
+        .find(|r| r[at("database_name")].as_deref() == Some(super::DEFAULT_DATABASE_NAME))
+        .expect("the database listed");
+    assert_eq!(row[at("sessions")].as_deref(), Some("2"), "{said:?}");
+    assert_eq!(row[at("is_current")].as_deref(), Some("t"), "{said:?}");
+
+    drop(one);
+    assert_eq!(sessions(), 1, "a closed connection is let go");
+    drop(two);
+    assert_eq!(sessions(), 0);
+
+    // A listener serving a database of its own counts nothing anywhere.
+    let alone = NativeContext { catalog: None, ..context.clone() };
+    let _three = native_session_for(&alone, &principal, false);
+    assert_eq!(sessions(), 0);
 }

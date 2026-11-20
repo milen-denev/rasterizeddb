@@ -2147,10 +2147,11 @@ fn main() -> std::io::Result<()> {
         };
 
         let sealing = catalog.clone();
+        let native_catalog = catalog.clone();
         let native_side = async move {
             match native {
                 Some((auth, listen)) => {
-                    Database::start_db_with_auth_on(arc_database, auth, listen)
+                    Database::start_db_with_auth_in(native_catalog, auth, listen)
                         .await
                         .map_err(|e| e.to_string())
                 }

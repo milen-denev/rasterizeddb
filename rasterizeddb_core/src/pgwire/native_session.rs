@@ -275,8 +275,11 @@ pub(crate) struct NativeSession {
     /// closes. Only ever taken with `try_lock`.
     state: tokio::sync::Mutex<Option<SessionState>>,
     /// The one-database catalogue a block's statements resolve against,
-    /// made the first time a block opens.
+    /// made the first time a block opens, or given by [`Self::attach`].
     catalog: std::sync::OnceLock<Arc<DatabaseCatalog>>,
+    /// The connection counted among its database's sessions in the server's
+    /// catalogue, as a pgwire connection is, until it closes.
+    attached: Option<crate::core::database::catalog::SessionGuard>,
     /// The connection's `nextval` results, for `currval` and `lastval`,
     /// across its statements (each statement's session reads them).
     sequence_values:
@@ -305,10 +308,26 @@ impl NativeSession {
             poisoned: AtomicBool::new(false),
             state: tokio::sync::Mutex::new(None),
             catalog: std::sync::OnceLock::new(),
+            attached: None,
             sequence_values: StdArc::default(),
             temp_tables: std::sync::Mutex::new(Vec::new()),
             temp_session: fastrand::u64(..),
         }
+    }
+
+    /// This connection, counted in `catalog` (the server's) among its
+    /// database's sessions for as long as it is open, and resolving its
+    /// statements against a view of that database which shares the count.
+    /// Without it a native connection was never counted: `SHOW DATABASES`
+    /// said `sessions` 0 for a database native clients were using, and
+    /// `DROP DATABASE` did not see them.
+    pub(crate) fn attach(mut self, catalog: &DatabaseCatalog) -> Self {
+        let name = self.database.name.clone();
+        if let (Some(guard), Some(view)) = (catalog.connect(&name), catalog.view_of(&name)) {
+            self.attached = Some(guard);
+            let _ = self.catalog.set(view);
+        }
+        self
     }
 
     /// Whether `query` needs pgwire's statement path, not the native
@@ -330,6 +349,9 @@ impl NativeSession {
             || crate::core::rql::triggers::parse_trigger_statement(stmt).is_some()
             || crate::core::rql::merge::parse_merge(stmt).is_some()
             || crate::core::rql::privileges::parse_privilege_statement(stmt).is_some()
+            // `current_database()`, `current_user`, `current_setting(…)`:
+            // read from the session, which the native path has none of.
+            || super::session_values::names_any(stmt)
         {
             return true;
         }

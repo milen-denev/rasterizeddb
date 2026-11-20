@@ -29,6 +29,16 @@ pub(crate) struct Session<'a> {
     pub setting: &'a dyn Fn(&str) -> Option<String>,
 }
 
+/// Whether `sql` names a session value that [`rewrite`] would put in it, or
+/// asks `current_setting` for a parameter: what the native protocol hands to
+/// a pgwire session rather than run without one (`NativeSession::
+/// needs_session_path`).
+pub(crate) fn names_any(sql: &str) -> bool {
+    let nothing = |_: &str| None;
+    let session = Session { user: "", database: "", backend_pid: 0, setting: &nothing };
+    !matches!(rewrite(sql, &session), Ok(None))
+}
+
 /// `sql` with each session value replaced; `None` when it names none, an
 /// error for `current_setting` of a parameter that does not exist.
 pub(crate) fn rewrite(sql: &str, session: &Session) -> Result<Option<String>, (&'static str, String)> {

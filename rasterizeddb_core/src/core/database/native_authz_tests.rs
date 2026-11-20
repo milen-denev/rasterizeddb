@@ -32,6 +32,7 @@ async fn an_ordinary_user_cannot_create_a_role() {
     let context = NativeContext {
         database: in_memory_db().await,
         authentication_required: true,
+        catalog: None,
     };
 
     let response = process_incoming_queries(
@@ -67,6 +68,7 @@ async fn a_superuser_can_create_a_role_and_its_password_is_stored_as_a_verifier(
     let context = NativeContext {
         database: in_memory_db().await,
         authentication_required: true,
+        catalog: None,
     };
 
     let response = process_incoming_queries(
@@ -97,6 +99,7 @@ async fn the_gate_does_not_fire_when_nobody_was_asked_to_authenticate() {
     let context = NativeContext {
         database: in_memory_db().await,
         authentication_required: false,
+        catalog: None,
     };
 
     let response = process_incoming_queries(
@@ -120,6 +123,7 @@ async fn creating_an_account_is_what_makes_authentication_required_next_time() {
     let context = NativeContext {
         database: in_memory_db().await,
         authentication_required: false,
+        catalog: None,
     };
 
     assert!(
@@ -148,6 +152,7 @@ async fn a_role_that_cannot_log_in_does_not_make_authentication_required() {
     let context = NativeContext {
         database: in_memory_db().await,
         authentication_required: false,
+        catalog: None,
     };
 
     let response = process_incoming_queries(
@@ -167,6 +172,7 @@ async fn an_ordinary_query_from_an_ordinary_user_still_runs() {
     let context = NativeContext {
         database: in_memory_db().await,
         authentication_required: true,
+        catalog: None,
     };
 
     let response = process_incoming_queries(

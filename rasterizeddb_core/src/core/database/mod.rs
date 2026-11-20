@@ -4606,6 +4606,31 @@ impl Database {
         auth: crate::native_auth::NativeAuthConfig,
         listen: NativeListen,
     ) -> io::Result<()> {
+        Self::start_native(database, None, auth, listen).await
+    }
+
+    /// As [`Database::start_db_with_auth_on`], for the catalogue's default
+    /// database, with each native connection counted among that database's
+    /// sessions in `catalog` as a PostgreSQL connection is: what
+    /// `SHOW DATABASES` reports as `sessions` on either protocol, and what
+    /// `DROP DATABASE` waits for.
+    pub async fn start_db_with_auth_in(
+        catalog: Arc<catalog::DatabaseCatalog>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+    ) -> io::Result<()> {
+        let database = catalog
+            .get(catalog.default_name())
+            .expect("the catalogue always holds its default database");
+        Self::start_native(database, Some(catalog), auth, listen).await
+    }
+
+    async fn start_native(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+        auth: crate::native_auth::NativeAuthConfig,
+        listen: NativeListen,
+    ) -> io::Result<()> {
         use crate::native_auth::RoleAuthenticator;
 
         info!("Starting database");
@@ -4704,6 +4729,7 @@ impl Database {
         let context = NativeContext {
             database,
             authentication_required,
+            catalog,
         };
 
         let socket_task = socket_server.map(|(socket_server, socket_requires_auth)| {
@@ -4714,6 +4740,7 @@ impl Database {
             let context = NativeContext {
                 database: context.database.clone(),
                 authentication_required: socket_requires_auth,
+                catalog: context.catalog.clone(),
             };
             tokio::spawn(async move {
                 info!("Also listening on {}", socket_server.local_endpoint());
@@ -5936,6 +5963,10 @@ pub(crate) struct NativeContext {
     /// `superuser` would refuse the very statement that creates the first
     /// account — so the gate is applied only where it means something.
     authentication_required: bool,
+    /// The server's catalogue, which each connection is counted in
+    /// ([`crate::pgwire::NativeSession::attach`]); `None` for a listener
+    /// serving a database of its own.
+    catalog: Option<Arc<catalog::DatabaseCatalog>>,
 }
 
 /// Encodes an error the way the executor does, so a caller needs no special
@@ -5963,6 +5994,7 @@ pub async fn serve_native(
     let context = NativeContext {
         database,
         authentication_required,
+        catalog: None,
     };
     server
         .run_with_session(context, open_native_session, serve_native_request)
@@ -5977,13 +6009,26 @@ fn open_native_session(
     principal: &StdArc<rastcp::session::Principal>,
     connection: &rastcp::server::ConnectionInfo,
 ) -> crate::pgwire::NativeSession {
-    crate::pgwire::NativeSession::new(
+    native_session_for(context, principal, connection.multiplexed)
+}
+
+/// [`open_native_session`], for a connection that is `multiplexed` or not.
+fn native_session_for(
+    context: &NativeContext,
+    principal: &StdArc<rastcp::session::Principal>,
+    multiplexed: bool,
+) -> crate::pgwire::NativeSession {
+    let session = crate::pgwire::NativeSession::new(
         context.database.clone(),
         &principal.user,
         principal.superuser,
         context.authentication_required,
-        connection.multiplexed,
-    )
+        multiplexed,
+    );
+    match &context.catalog {
+        Some(catalog) => session.attach(catalog),
+        None => session,
+    }
 }
 
 /// One request on a connection that has a session.

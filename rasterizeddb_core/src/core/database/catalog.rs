@@ -247,6 +247,31 @@ impl DatabaseCatalog {
         })
     }
 
+    /// [`DatabaseCatalog::single_unmanaged`] for the named database of this
+    /// catalogue, sharing its session count: what a native connection's
+    /// session resolves against, so `SHOW DATABASES` over native counts the
+    /// connections attached here, every protocol's. `None` for a name this
+    /// catalogue does not hold.
+    pub(crate) fn view_of(&self, name: &str) -> Option<Arc<Self>> {
+        let entry = self.databases.get(name)?;
+        let databases = DashMap::with_hasher(ahash::RandomState::new());
+        databases.insert(
+            name.to_string(),
+            Entry {
+                database: entry.database.clone(),
+                loading: entry.loading.clone(),
+                sessions: entry.sessions.clone(),
+            },
+        );
+        Some(Arc::new(Self {
+            databases: StdArc::new(databases),
+            root: None,
+            default_name: name.to_string(),
+            #[cfg(feature = "db_branching")]
+            bases: DashMap::with_hasher(ahash::RandomState::new()),
+        }))
+    }
+
     /// What `SHOW DATABASES` reports, ordered by name.
     pub fn listing(&self) -> Vec<DatabaseListing> {
         let mut out: Vec<DatabaseListing> = self
