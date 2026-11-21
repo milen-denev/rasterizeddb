@@ -1358,6 +1358,20 @@ fn pool_location_of(_pool: &StoragePool, _table_name: &str) -> Option<String> {
     None
 }
 
+/// Where a partition directory a map recorded at `recorded` is now, after a
+/// restore moved it; `None` refuses the table.
+#[cfg(feature = "storage_pools")]
+fn pool_partition_dir_now(pool: &StoragePool, recorded: &str) -> Option<String> {
+    pool.partition_dir_now(recorded)
+}
+
+/// Without storage pools there are no other locations to have moved to.
+#[cfg(not(feature = "storage_pools"))]
+fn pool_partition_dir_now(_pool: &StoragePool, recorded: &str) -> Option<String> {
+    Some(recorded.to_string())
+}
+
+
 /// Whether a placement is recorded for `table_name`: a `STORAGE PLACE TABLE`
 /// pin (applied before the table exists, and the only way onto a key/value
 /// store), or what an earlier `CREATE` of the name chose.

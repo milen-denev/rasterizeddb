@@ -285,6 +285,7 @@ async fn a_crash_on_either_side_of_the_commit_resolves_at_the_next_open() {
 
 /// `STORAGE MOVE PARTITION` to a second storage location, and back; a
 /// directory the pool does not hold is refused.
+#[cfg(feature = "storage_pools")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn move_partition_follows_the_storage_locations() {
     let tmp = tempfile::tempdir().unwrap();
@@ -325,6 +326,7 @@ async fn move_partition_follows_the_storage_locations() {
 ///
 /// Mutation: the planner's round-robin step skipped; nothing moves and the
 /// disk holds no partition.
+#[cfg(feature = "storage_pools")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rebalance_partitions_spreads_them_and_evacuates_a_disabled_location() {
     let tmp = tempfile::tempdir().unwrap();

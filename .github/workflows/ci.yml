@@ -66,6 +66,25 @@ jobs:
       - name: Every target compiles (tests, examples, benches)
         run: cargo check --locked --target ${{ matrix.target }} --workspace --all-targets
 
+      # The workspace check above unifies features: another member asks for
+      # the engine's defaults, so a feature-less engine is never compiled
+      # there. Checked on its own here, then with each default feature alone,
+      # so a module that uses another feature's code without declaring it
+      # fails CI instead of the next crate that turns the defaults off (it
+      # went unseen from 2026-11-09 to 2026-11-21).
+      - name: The engine builds without its optional features, and with each alone
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --target ${{ matrix.target }} -p rasterizeddb_core --no-default-features --all-targets
+          for feature in $(cargo metadata --locked --format-version 1 --no-deps \
+              | jq -r '.packages[] | select(.name == "rasterizeddb_core") | .features.default[]'); do
+            echo "::group::rasterizeddb_core with only $feature"
+            cargo check --locked --target ${{ matrix.target }} -p rasterizeddb_core --no-default-features --features "$feature" --lib
+            echo "::endgroup::"
+          done
+
       - name: Test rastcp, the client and the embedded SDK
         run: >
           cargo test --locked --target ${{ matrix.target }}

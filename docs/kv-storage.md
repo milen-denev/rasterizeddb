@@ -2,8 +2,8 @@
 
 Status: **implemented and selectable per table, off by default.** Build with
 `--features kv_storage` (in-process and local-directory stores) or
-`--features kv_storage_s3` (adds the S3 backing store). Per-table placement also
-needs `storage_pools`, which is on by default.
+`--features kv_storage_s3` (adds the S3 backing store). Per-table placement is a
+`storage_pools` location, so `kv_storage` turns that feature on too.
 Target: `rasterizeddb_core::core::storage_providers::kv`, edition 2024.
 
 ## 0. What exists
