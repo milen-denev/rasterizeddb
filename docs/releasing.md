@@ -23,6 +23,20 @@ The executables and the CI matrix cover the same four targets, each built and te
 
 The per-target compiler flags live in `.cargo/config.toml`: a 32 MiB main-thread stack everywhere, and `target-cpu=x86-64-v3` on x86-64. The workflows never set `RUSTFLAGS`, because doing so would replace those flags instead of adding to them.
 
+## Profile-guided optimisation
+
+Every release executable is built by `.github/scripts/pgo-build.sh`:
+
+1. The server is built instrumented and driven by `pgo_train`, a workspace crate that is never published. It starts the server with both protocols on a fresh directory, runs a mixed workload, checks the row counts, and stops the server gracefully, which is when the profile is written. The workload covers bulk loads, point reads and writes, scans, sorts, aggregates, joins, subqueries, JSONB, upserts, transactions and concurrent clients, over the native protocol and over pgwire, both simple and prepared.
+2. The server is built again from the merged profile.
+3. On Linux only, `llvm-bolt` instruments that binary, the same workload runs again, and BOLT rewrites the binary's code layout from what it recorded. BOLT handles only ELF, so the Windows binaries stop after step 2.
+
+The flags reach rustc through `cargo --config target.<triple>.rustflags=[…]`, which cargo appends to the flags in `.cargo/config.toml`.
+
+A graceful stop is SIGTERM on Linux and Ctrl+Break on Windows. `pgo_train` starts the server in its own process group, so the Ctrl+Break reaches the server alone.
+
+To build a release binary locally the same way, run `rustup component add llvm-tools`, then `bash .github/scripts/pgo-build.sh x86_64-unknown-linux-gnu`. Add `--no-bolt` if `llvm-bolt` is not installed. A manual run of "Release - server executables" can switch PGO off with its `pgo` input. A pull request that changes the build files runs the whole build as a check, without making a release.
+
 ## Order
 
 1. Bump the versions in the `Cargo.toml` files and merge.

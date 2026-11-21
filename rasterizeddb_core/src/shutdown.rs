@@ -8,6 +8,9 @@ use log::{error, info, warn};
 
 /// Resolves on Ctrl+C, and on SIGTERM where the platform has it, so a `kill`
 /// from a service manager drains the same way an interactive Ctrl+C does.
+/// On Windows it also resolves on Ctrl+Break: unlike Ctrl+C, that event can
+/// be sent to one process group (`GenerateConsoleCtrlEvent`), so a supervisor
+/// that started the server in its own group can stop just the server.
 pub async fn termination_signal() {
     #[cfg(unix)]
     {
@@ -28,7 +31,23 @@ pub async fn termination_signal() {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut ctrl_break) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = ctrl_break.recv() => {}
+                }
+            }
+            Err(e) => {
+                error!("Could not install the Ctrl+Break handler ({e}); watching Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }

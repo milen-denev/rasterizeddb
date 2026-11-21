@@ -87,6 +87,17 @@ jobs:
             "target/${{ matrix.target }}/debug/rasterizeddb_core$ext" \
             "target/${{ matrix.target }}/debug/examples/quickstart$ext"
 
+      # The release build's PGO training run, here against the debug server:
+      # a mixed workload over both protocols with its row counts checked,
+      # then a graceful stop (SIGTERM; Ctrl+Break on Windows) that must exit 0.
+      - name: Workload over both protocols, then a graceful stop
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          cargo build --locked --target ${{ matrix.target }} -p pgo_train
+          ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
+          "target/${{ matrix.target }}/debug/pgo_train$ext" "target/${{ matrix.target }}/debug/rasterizeddb_core$ext"
+
   full:
     name: full suites ${{ matrix.name }}
     if: >

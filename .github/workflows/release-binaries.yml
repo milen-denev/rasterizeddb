@@ -10,14 +10,32 @@ name: Release - server executables
 #   rasterizeddb-server-<version>-windows-x86_64.zip      (x86-64-v3: AVX2 CPUs)
 #   rasterizeddb-server-<version>-windows-arm64.zip       (armv8-a)
 #
+# Every binary is built with profile-guided optimisation: an instrumented
+# build runs pgo_train's workload (both protocols, loads, point reads and
+# writes, scans, aggregates, joins, transactions), and the release build uses
+# that profile. Linux binaries are then BOLTed, trained the same way
+# (.github/scripts/pgo-build.sh).
+#
 # Linux builds link glibc dynamically and run on glibc 2.39 or newer
 # (Ubuntu 24.04, Debian 13, RHEL 10). Run it by hand to build and test
-# the binaries without making a release.
+# the binaries without making a release; a pull request that changes the
+# build runs it too, also without a release.
 
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release-binaries.yml"
+      - ".github/scripts/pgo-build.sh"
+      - ".github/scripts/smoke.sh"
+      - "pgo_train/**"
   workflow_dispatch:
+    inputs:
+      pgo:
+        description: "Build with PGO (and BOLT on Linux); off builds a plain release binary"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -30,7 +48,9 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
+    # Three release builds with fat LTO (instrumented, optimised, plus the
+    # training driver) and two training runs.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
@@ -51,8 +71,26 @@ jobs:
         run: .github/scripts/check-version.sh v rasterizeddb_core
 
       # Per-target rustflags (32 MiB main-thread stack; x86-64-v3 on x86-64)
-      # come from .cargo/config.toml, so RUSTFLAGS must stay unset here.
-      - name: Build (release profile, fat LTO)
+      # come from .cargo/config.toml, so RUSTFLAGS must stay unset here;
+      # pgo-build.sh adds its flags with --config, which appends to them.
+      - name: PGO and BOLT tools
+        if: github.event_name != 'workflow_dispatch' || inputs.pgo
+        shell: bash
+        run: |
+          rustup component add llvm-tools
+          if [ "${{ runner.os }}" = Linux ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q bolt-20
+            echo "LLVM_BOLT=$(command -v llvm-bolt-20 || echo /usr/lib/llvm-20/bin/llvm-bolt)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (release profile, fat LTO, PGO; BOLT on Linux)
+        if: github.event_name != 'workflow_dispatch' || inputs.pgo
+        shell: bash
+        run: bash .github/scripts/pgo-build.sh ${{ matrix.target }}
+
+      - name: Build (release profile, fat LTO, no PGO)
+        if: github.event_name == 'workflow_dispatch' && !inputs.pgo
         run: cargo build --locked --release --target ${{ matrix.target }} -p rasterizeddb_core --bin rasterizeddb_core
 
       - name: Smoke test the release binary
@@ -118,4 +156,4 @@ jobs:
             | Windows x86-64 | `windows-x86_64.zip` | x86-64-v3 (AVX2) |
             | Windows ARM64 | `windows-arm64.zip` | any ARMv8-A |
 
-            Linux binaries need glibc 2.39+. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
+            Built with fat LTO and profile-guided optimisation; the Linux binaries are also optimised with BOLT. Linux binaries need glibc 2.39+. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
