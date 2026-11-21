@@ -4425,10 +4425,7 @@ pub fn plan(
 /// Whole-word so a column named `distinctive` is not mistaken for the keyword.
 fn strip_keyword_prefix<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     let trimmed = text.trim_start();
-    if trimmed.len() < keyword.len() {
-        return None;
-    }
-    if !trimmed[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    if !trimmed.get(..keyword.len())?.eq_ignore_ascii_case(keyword) {
         return None;
     }
     let rest = &trimmed[keyword.len()..];

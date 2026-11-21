@@ -842,7 +842,7 @@ pub fn expand_multi_drop(sql: &str) -> Option<Vec<String>> {
         return None;
     }
     let mut prefix = String::from("DROP TABLE ");
-    if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("IF EXISTS") && rest[9..].starts_with(char::is_whitespace) {
+    if rest.get(..9).is_some_and(|h| h.eq_ignore_ascii_case("IF EXISTS")) && rest[9..].starts_with(char::is_whitespace) {
         prefix.push_str("IF EXISTS ");
         rest = rest[9..].trim_start();
     }

@@ -488,9 +488,10 @@ fn in_operand_is_real(text: &str, before: usize, sql: &str, database: &Arc<Datab
         Some(w) if w.eq_ignore_ascii_case("IN") => head[..head.len() - 2].trim_end(),
         _ => head,
     };
+    // Past the whole character found: `+ 1` cut a multi-byte one.
     let start = head
         .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"'))
-        .map_or(0, |at| at + 1);
+        .map_or(0, |at| at + head[at..].chars().next().map_or(1, char::len_utf8));
     let operand = &head[start..];
     let name = operand.rsplit('.').next().unwrap_or(operand).trim_matches('"');
     if name.is_empty() {
@@ -9750,7 +9751,7 @@ fn split_boolean_terms(text: &str) -> Vec<BooleanPiece<'_>> {
             },
         }
         if depth == 0
-            && let Some(keyword) = [" AND ", " OR "].into_iter().find(|k| upper[i..].starts_with(k))
+            && let Some(keyword) = [" AND ", " OR "].into_iter().find(|k| upper.as_bytes()[i..].starts_with(k.as_bytes()))
         {
             out.push(BooleanPiece::Term(&text[start..i]));
             out.push(BooleanPiece::Separator(&text[i..i + keyword.len()]));

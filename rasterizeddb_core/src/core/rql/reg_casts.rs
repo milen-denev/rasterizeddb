@@ -260,7 +260,7 @@ fn cast_call(sql: &str, lit_start: usize, lit_end: usize) -> Option<(String, usi
     }
     let word_end = sql[..open].trim_end().len();
     let word_start = word_end.checked_sub(4)?;
-    if !sql[word_start..word_end].eq_ignore_ascii_case("CAST") || (word_start > 0 && is_identifier_byte(sql.as_bytes()[word_start - 1])) {
+    if !sql.as_bytes()[word_start..word_end].eq_ignore_ascii_case(b"CAST") || (word_start > 0 && is_identifier_byte(sql.as_bytes()[word_start - 1])) {
         return None;
     }
     let close = matching_close(sql, open)?;
