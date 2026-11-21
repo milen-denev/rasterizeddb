@@ -88,7 +88,7 @@ mod branch_tests;
 pub(crate) mod proxied;
 mod wire_out;
 
-pub(crate) use native_session::{NativeSession, NativeTextStep, begins_with_data_verb as native_begins_with_data_verb};
+pub(crate) use native_session::{NativeSession, NativeTemplate, NativeTextStep, begins_with_data_verb as native_begins_with_data_verb};
 pub(crate) use native_session::is_transaction_control as native_session_is_transaction_control;
 #[cfg(test)]
 pub(crate) use native_session::{
