@@ -3,12 +3,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// A loopback listener on a port of the kernel's choosing, and its address.
+///
+/// The server is handed the listener itself, never a port number to bind
+/// again: a fixed port can be held by anything else on the machine, and a
+/// port that is let go can be handed to a test running in parallel first.
+fn loopback() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("a bound address").to_string();
+    (listener, addr)
+}
+
 #[tokio::test]
 async fn test_client_server_communication() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // Start a server
-    let server = TcpServerBuilder::new("127.0.0.1", 8081)
+    let (listener, server_addr) = loopback();
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .max_connections(10)
         .build()
         .await
@@ -38,7 +51,7 @@ async fn test_client_server_communication() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new("127.0.0.1:8081")
+    let mut client = TcpClientBuilder::new(&server_addr)
         .timeout(Duration::from_secs(5))
         .verify_certificate(false)
         .build()
@@ -75,7 +88,9 @@ async fn test_multiple_clients() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // Start a server
-    let server = TcpServerBuilder::new("127.0.0.1", 8082)
+    let (listener, server_addr) = loopback();
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .max_connections(10)
         .build()
         .await
@@ -117,8 +132,9 @@ async fn test_multiple_clients() {
     let mut handles = vec![];
 
     for i in 0..client_count {
+        let server_addr = server_addr.clone();
         let handle = tokio::spawn(async move {
-            let mut client = TcpClientBuilder::new("127.0.0.1:8082")
+            let mut client = TcpClientBuilder::new(&server_addr)
                 .timeout(Duration::from_secs(5))
                 .build()
                 .await

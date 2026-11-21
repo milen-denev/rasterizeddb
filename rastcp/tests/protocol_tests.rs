@@ -11,14 +11,26 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
+/// A loopback listener on a port of the kernel's choosing, and its address.
+///
+/// The server is handed the listener itself, never a port number to bind
+/// again: a fixed port can be held by anything else on the machine, and a
+/// port that is let go can be handed to a test running in parallel first.
+fn loopback() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("a bound address").to_string();
+    (listener, addr)
+}
+
 // Test custom message protocol
 #[tokio::test]
 async fn test_custom_protocol_handler() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
+    let (listener, server_addr) = loopback();
 
     // Create a server that expects JSON protocol
-    let server = TcpServerBuilder::new(server_addr, 8097)
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .build()
         .await
         .unwrap();
@@ -71,7 +83,7 @@ async fn test_custom_protocol_handler() {
     sleep(Duration::from_millis(100)).await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new(&format!("{}:8097", server_addr))
+    let mut client = TcpClientBuilder::new(&server_addr)
         .build()
         .await
         .unwrap();
@@ -120,14 +132,15 @@ async fn test_custom_protocol_handler() {
 #[tokio::test]
 async fn test_client_disconnect_handling() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
+    let (listener, server_addr) = loopback();
 
     // Message tracking
     let message_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let message_count_clone = message_count.clone();
 
     // Create server
-    let server = TcpServerBuilder::new(server_addr, 8098)
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .build()
         .await
         .unwrap();
@@ -152,7 +165,7 @@ async fn test_client_disconnect_handling() {
 
     // Create multiple clients and test abrupt disconnection
     for i in 0..5 {
-        let mut client = TcpClientBuilder::new(&format!("{}:8098", server_addr))
+        let mut client = TcpClientBuilder::new(&server_addr)
             .build()
             .await
             .unwrap();
@@ -182,7 +195,8 @@ async fn test_custom_protocol_implementation() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     // For this test, we'll use a simple TCP server without TLS to test the protocol logic
-    let listener = TcpListener::bind("127.0.0.1:8099").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
 
     // Spawn a server that uses our message protocol directly
     let server_handle = tokio::spawn(async move {
@@ -206,7 +220,7 @@ async fn test_custom_protocol_implementation() {
     sleep(Duration::from_millis(100)).await;
 
     // Connect as a client
-    let mut stream = TcpStream::connect("127.0.0.1:8099").await.unwrap();
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
 
     // Send valid message
     write_message(&mut stream, b"test message").await.unwrap();
@@ -248,7 +262,9 @@ async fn test_read_message_rejects_oversized_frame() {
 async fn test_client_send_returns_timeout_instead_of_panicking() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    let server = TcpServerBuilder::new("127.0.0.1", 8100)
+    let (listener, server_addr) = loopback();
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .request_timeout(Duration::from_secs(1))
         .build()
         .await
@@ -266,7 +282,7 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
 
     sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpClientBuilder::new("127.0.0.1:8100")
+    let mut client = TcpClientBuilder::new(&server_addr)
         .timeout(Duration::from_millis(50))
         .build()
         .await
@@ -284,8 +300,16 @@ async fn test_client_send_returns_timeout_instead_of_panicking() {
 async fn test_graceful_shutdown_drains_and_frees_the_port() {
     let _ = env_logger::builder().is_test(true).try_init();
 
+    // Find a free port, then let go of it: the server has to bind it itself,
+    // and bind it again after the shutdown, for the release to be under test.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+
     let server = Arc::new(
-        TcpServerBuilder::new("127.0.0.1", 8101)
+        TcpServerBuilder::new("127.0.0.1", port)
             .shutdown_grace(Duration::from_secs(5))
             .build()
             .await
@@ -299,7 +323,7 @@ async fn test_graceful_shutdown_drains_and_frees_the_port() {
 
     sleep(Duration::from_millis(100)).await;
 
-    let mut client = TcpClientBuilder::new("127.0.0.1:8101").build().await.unwrap();
+    let mut client = TcpClientBuilder::new(&format!("127.0.0.1:{port}")).build().await.unwrap();
     let echoed = client.send(b"ping".to_vec()).await.unwrap();
     assert_eq!(echoed, b"ping".to_vec());
 
@@ -320,7 +344,7 @@ async fn test_graceful_shutdown_drains_and_frees_the_port() {
     // which is what a restart right after Ctrl+C does.
     drop(server);
 
-    TcpServerBuilder::new("127.0.0.1", 8101)
+    TcpServerBuilder::new("127.0.0.1", port)
         .build()
         .await
         .expect("port should be free immediately after a graceful shutdown");

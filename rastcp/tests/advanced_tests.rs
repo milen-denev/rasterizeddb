@@ -6,15 +6,26 @@ use std::sync::{
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
-// Helper function to create a test server
-async fn create_test_server(
-    addr: &str,
-    port: u16,
-) -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+/// A loopback listener on a port of the kernel's choosing, and its address.
+///
+/// The server is handed the listener itself, never a port number to bind
+/// again: a fixed port can be held by anything else on the machine (these
+/// tests failed whenever another program had 8090 or 8095), and a port that
+/// is let go can be handed to a test running in parallel before it is bound.
+fn loopback() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let addr = listener.local_addr().expect("a bound address").to_string();
+    (listener, addr)
+}
+
+// Helper function to create a test server, and the address it serves
+async fn create_test_server() -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>, String) {
     let message_count = Arc::new(AtomicUsize::new(0));
     let message_count_clone = message_count.clone();
 
-    let server = TcpServerBuilder::new(addr, port)
+    let (listener, addr) = loopback();
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .max_connections(20)
         .build()
         .await
@@ -33,18 +44,16 @@ async fn create_test_server(
     // Allow server to start
     sleep(Duration::from_millis(100)).await;
 
-    (handle, message_count)
+    (handle, message_count, addr)
 }
 
 #[tokio::test]
 async fn test_client_reconnection() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
-
-    let (server_handle, message_count) = create_test_server(server_addr, 8090).await;
+    let (server_handle, message_count, server_addr) = create_test_server().await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new(&format!("{}:8090", server_addr))
+    let mut client = TcpClientBuilder::new(&server_addr)
         .timeout(Duration::from_secs(5))
         .build()
         .await
@@ -89,12 +98,10 @@ async fn test_client_reconnection() {
 #[tokio::test]
 async fn test_large_messages() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
-
-    let (server_handle, _) = create_test_server(server_addr, 8091).await;
+    let (server_handle, _, server_addr) = create_test_server().await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new(&format!("{}:8091", server_addr))
+    let mut client = TcpClientBuilder::new(&server_addr)
         .timeout(Duration::from_secs(5))
         .build()
         .await
@@ -123,9 +130,7 @@ async fn test_large_messages() {
 #[tokio::test]
 async fn test_concurrent_connections() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
-
-    let (server_handle, message_count) = create_test_server(server_addr, 8092).await;
+    let (server_handle, message_count, server_addr) = create_test_server().await;
 
     // Number of concurrent clients
     let client_count = 50;
@@ -136,9 +141,10 @@ async fn test_concurrent_connections() {
 
     // Start concurrent clients
     for client_id in 0..client_count {
+        let server_addr = server_addr.clone();
         let handle = tokio::spawn(async move {
             // Create a client
-            let mut client = TcpClientBuilder::new(&format!("{}:8092", server_addr))
+            let mut client = TcpClientBuilder::new(&server_addr)
                 .timeout(Duration::from_secs(10))
                 .build()
                 .await
@@ -185,8 +191,15 @@ async fn test_concurrent_connections() {
 async fn test_connection_timeout() {
     let _ = env_logger::builder().is_test(true).try_init();
 
-    // Try to connect to a non-existent server with short timeout
-    let result = TcpClientBuilder::new("127.0.0.1:9999")
+    // Try to connect to a non-existent server with short timeout. The port is
+    // bound but never listened on, and held for the whole test, so nothing can
+    // answer on it (a fixed port such as 9999 may be another program's).
+    let unheard = tokio::net::TcpSocket::new_v4().expect("a socket");
+    unheard
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("a loopback port");
+    let unheard_addr = unheard.local_addr().expect("a bound address").to_string();
+    let result = TcpClientBuilder::new(&unheard_addr)
         .timeout(Duration::from_millis(100))
         .build()
         .await
@@ -211,10 +224,11 @@ async fn test_connection_timeout() {
 #[tokio::test]
 async fn test_client_handler_errors() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
+    let (listener, server_addr) = loopback();
 
     // Create a server with an "echo uppercase" handler
-    let server = TcpServerBuilder::new(server_addr, 8094)
+    let server = TcpServerBuilder::from_listener(listener)
+        .unwrap()
         .build()
         .await
         .unwrap();
@@ -236,7 +250,7 @@ async fn test_client_handler_errors() {
     sleep(Duration::from_millis(100)).await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new(&format!("{}:8094", server_addr))
+    let mut client = TcpClientBuilder::new(&server_addr)
         .build()
         .await
         .unwrap();
@@ -260,12 +274,10 @@ async fn test_client_handler_errors() {
 #[tokio::test]
 async fn test_throughput_benchmark() {
     let _ = env_logger::builder().is_test(true).try_init();
-    let server_addr = "127.0.0.1";
-
-    let (server_handle, _) = create_test_server(server_addr, 8095).await;
+    let (server_handle, _, server_addr) = create_test_server().await;
 
     // Create a client
-    let mut client = TcpClientBuilder::new(&format!("{}:8095", server_addr))
+    let mut client = TcpClientBuilder::new(&server_addr)
         .build()
         .await
         .unwrap();
