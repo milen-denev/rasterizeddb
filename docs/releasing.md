@@ -12,6 +12,35 @@ There are three release channels. Each is started by pushing a tag, and each mak
 
 The executables channel also takes a pre-release tag, such as `v1.0.0-rc.1`. The suffix is set aside for the version check, and the GitHub release is marked as a pre-release, so "latest" still points at the last full release. The crate channels take no suffix, because crates.io would receive the version in `Cargo.toml`, not the tag's.
 
+## One command: `push_release.sh`
+
+`./push_release.sh` at the repository root runs a whole release:
+
+```sh
+./push_release.sh client minor        # client crates 1.0.0 -> 1.1.0, tag client-v1.1.0
+./push_release.sh server patch        # server crates and executables, tags server-vX.Y.Z and vX.Y.Z
+./push_release.sh all current         # first release: both channels at the version in Cargo.toml
+./push_release.sh binaries --rc       # executables only, as a pre-release v<core>-rc.N
+./push_release.sh client minor --dry-run   # show the version commit, change nothing
+```
+
+It releases what is on `origin/feat/secondary-indexes` (`--from` for another branch), working in a scratch worktree so the local checkout is left alone:
+
+1. It bumps the channel's crate versions, every `{ path, version }` requirement on them, and README pins such as `rasterizeddb_embedded = "1"`, then refreshes `Cargo.lock`.
+2. It commits on `release/<tag>` and opens a pull request into `main`.
+3. It waits for every check. If one fails, it stops and leaves the pull request open.
+4. It merges with a merge commit, and only if the head is still the commit that was tested.
+5. It brings the version commit back to the source branch: a fast-forward when that branch has not moved, a merge commit otherwise.
+6. It tags the merge commit on `main` and pushes the tags. `all` waits for the client release first, because the server crates need it on crates.io. Then it waits for the release workflows and prints the release links.
+
+Each channel has its own version: the client channel owns `rasterizeddb_client` and `rasterizeddb_client_derive`, and the server channel owns `rasterizeddb_core` and `rasterizeddb_embedded`. The executables carry the core version.
+
+`rastcp` is shared. When its code changed since the last crate release and its current version is already on crates.io, the script bumps it a patch; `--rastcp keep|minor|major|X.Y.Z` overrides that.
+
+A version that is already tagged or on crates.io is always refused, and so is a server release whose client version is not on crates.io yet.
+
+It needs `git`, `gh` (logged in), `cargo`, `python3` and `curl`.
+
 ## Targets
 
 The executables and the CI matrix cover the same four targets, each built and tested on a native GitHub runner (no cross-compiling):
