@@ -274,8 +274,15 @@ if [ -n "$SERVER_VER" ]; then
   done
 fi
 BRANCH="release/${TAGS[0]}"
-git ls-remote --exit-code --heads "$REMOTE" "$BRANCH" >/dev/null 2>&1 \
-  && die "branch $BRANCH already exists on $REMOTE (a release in progress? delete it if not)"
+# A run that stopped (a failed check, Ctrl+C) leaves its branch and pull
+# request behind. A rerun takes both over: the branch is this script's own,
+# so it is moved to the new head (with a lease on the commit seen here), and
+# an open pull request from it is reused rather than opened again.
+OLD_BRANCH_SHA="$(git ls-remote --heads "$REMOTE" "$BRANCH" | cut -f1)"
+OPEN_PR=""
+if [ -n "$OLD_BRANCH_SHA" ]; then
+  OPEN_PR="$(gh pr list -R "$GH_REPO" --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')"
+fi
 
 step "Plan"
 if [ ${#NEW[@]} -gt 0 ]; then
@@ -289,6 +296,9 @@ fi
 true
 note "tags:   ${TAGS[*]}"
 note "flow:   $BRANCH -> pull request into $BASE -> checks -> merge -> tags on $BASE -> back into $SOURCE"
+if [ -n "$OLD_BRANCH_SHA" ]; then
+  note "rerun:  $BRANCH exists on $REMOTE at ${OLD_BRANCH_SHA:0:8}; it is moved to the new head${OPEN_PR:+ and pull request #$OPEN_PR is reused}"
+fi
 if [ "$CHANNEL" = binaries ] && [ "$RC" = 1 ]; then note "        (published as a GitHub pre-release)"; fi
 
 if [ "$DRY_RUN" = 0 ] && [ "$YES" = 0 ]; then
@@ -391,7 +401,8 @@ fi
 # ---------------------------------------------------------------- pull request
 
 step "Pull request into $BASE"
-git -C "$WT" push --quiet "$REMOTE" "HEAD:refs/heads/$BRANCH"
+git -C "$WT" push --quiet --force-with-lease="refs/heads/$BRANCH:$OLD_BRANCH_SHA" "$REMOTE" "HEAD:refs/heads/$BRANCH" \
+  || die "could not push $BRANCH (did it move on $REMOTE since the check? rerun)"
 if [ "$(git rev-list --count "$REMOTE/$BASE..$HEAD_SHA")" = 0 ]; then
   note "$BASE already contains $SOURCE; no pull request needed"
   MERGE_SHA="$HEAD_SHA"
@@ -399,24 +410,76 @@ else
   body="Release ${TAGS[*]} from \`$SOURCE\` at $(git rev-parse --short "$SRC_SHA"), opened by push_release.sh.
 
 Once every check passes, the script merges this, tags the merge commit (${TAGS[*]}), and brings the version commit back to \`$SOURCE\`."
-  PR_URL="$(gh pr create -R "$GH_REPO" --base "$BASE" --head "$BRANCH" --title "Release ${TAGS[*]}" --body "$body")"
-  PR="${PR_URL##*/}"
-  note "$PR_URL"
+  if [ -n "$OPEN_PR" ]; then
+    PR="$OPEN_PR"
+    PR_URL="$(gh pr view "$PR" -R "$GH_REPO" --json url --jq .url)"
+    gh pr edit "$PR" -R "$GH_REPO" --title "Release ${TAGS[*]}" --body "$body" >/dev/null || true
+    note "$PR_URL (reused)"
+  else
+    PR_URL="$(gh pr create -R "$GH_REPO" --base "$BASE" --head "$BRANCH" --title "Release ${TAGS[*]}" --body "$body")"
+    PR="${PR_URL##*/}"
+    note "$PR_URL"
+  fi
 
-  note "waiting for the checks to start"
-  started=0
+  # The gate is this pull request's own runs: pull_request events from
+  # $BRANCH at exactly $HEAD_SHA. Not `gh pr checks`, which lists every check
+  # on the head commit: when the head is a tip CI already ran on (a release
+  # with no version change), that includes the push runs and their full
+  # suites, which a pull request never runs, and an old failure there stopped
+  # the release while the pull request's own checks were still going.
+  pr_runs() {
+    gh run list -R "$GH_REPO" --event pull_request --commit "$HEAD_SHA" --branch "$BRANCH" --limit 50 \
+      --json databaseId,workflowName,status,conclusion,url \
+      --jq 'group_by(.workflowName) | map(max_by(.databaseId)) | .[] | [.databaseId, .status, (if .conclusion == "" then "-" else .conclusion end), .workflowName, .url] | @tsv'
+  }
+
+  note "waiting for the pull request's runs to start"
+  runs=""
   for _ in $(seq 1 60); do
-    n="$(gh pr checks "$PR" -R "$GH_REPO" --json name --jq length 2>/dev/null || echo 0)"
-    if [ "${n:-0}" -gt 0 ]; then started=1; break; fi
+    runs="$(pr_runs 2>/dev/null || true)"
+    [ -n "$runs" ] && break
     sleep 10
   done
-  [ "$started" = 1 ] || die "no checks started on $PR_URL within 10 minutes; the pull request is left open"
-
-  note "waiting for the checks to finish (the PGO executable build takes about 40 minutes)"
-  if ! gh pr checks "$PR" -R "$GH_REPO" --watch --fail-fast --interval 60 >/dev/null; then
-    gh pr checks "$PR" -R "$GH_REPO" || true
-    die "a check failed; nothing was merged or tagged. The pull request stays open: $PR_URL"
+  [ -n "$runs" ] || die "no pull_request runs started for $HEAD_SHA within 10 minutes; the pull request is left open: $PR_URL"
+  # Workflows register a little apart; give the slower ones a moment.
+  sleep 30
+  # A rerun on the same head pushes nothing, so no run starts: the runs at
+  # that commit are the ones that stopped the last attempt. Re-run their
+  # failed jobs once, rather than stopping again on the same failure.
+  if [ "$OLD_BRANCH_SHA" = "$HEAD_SHA" ]; then
+    rerun=0
+    while IFS=$'\t' read -r id status conclusion name _; do
+      [ -n "$id" ] && [ "$status" = completed ] || continue
+      case "$conclusion" in
+        success|skipped|neutral) ;;
+        *) note "re-running the failed jobs of $name ($conclusion), from the last attempt"
+           gh run rerun "$id" -R "$GH_REPO" --failed >/dev/null || die "could not re-run $name: gh run rerun $id --failed"
+           rerun=1 ;;
+      esac
+    done <<<"$(pr_runs)"
+    if [ "$rerun" = 1 ]; then sleep 30; fi
   fi
+
+  note "waiting for them to finish (the PGO executable build takes about 40 minutes)"
+  while :; do
+    runs="$(pr_runs)" || die "could not list the runs for $PR_URL"
+    pending=0 failed=""
+    while IFS=$'\t' read -r id status conclusion name url; do
+      [ -n "$id" ] || continue
+      if [ "$status" != completed ]; then pending=1; continue; fi
+      case "$conclusion" in
+        success|skipped|neutral) ;;
+        *) failed+="$name ($conclusion): $url  (gh run rerun $id --failed)"$'\n' ;;
+      esac
+    done <<<"$runs"
+    if [ -n "$failed" ]; then
+      printf '%s' "$failed" | sed 's/^/    /' >&2
+      die "a check failed; nothing was merged or tagged. The pull request stays open: $PR_URL. Fix and run the script again; with the head unchanged, it re-runs the failed jobs itself."
+    fi
+    [ "$pending" = 0 ] && break
+    sleep 60
+  done
+  while IFS=$'\t' read -r _ _ _ name _; do note "passed: $name"; done <<<"$runs"
   note "all checks passed"
 
   gh pr merge "$PR" -R "$GH_REPO" --merge --match-head-commit "$HEAD_SHA" \

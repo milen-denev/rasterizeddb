@@ -28,7 +28,7 @@ It releases what is on `origin/feat/secondary-indexes` (`--from` for another bra
 
 1. It bumps the channel's crate versions, every `{ path, version }` requirement on them, and README pins such as `rasterizeddb_embedded = "1"`, then refreshes `Cargo.lock`.
 2. It commits on `release/<tag>` and opens a pull request into `main`.
-3. It waits for every check. If one fails, it stops and leaves the pull request open.
+3. It waits for the pull request's own runs: the `pull_request` runs of that branch at that commit. It does not wait for every check on the commit, because a release with no version change has the source tip as its head, and that tip also carries the push runs and their full suites, which a pull request never runs. If a run fails, it stops and leaves the pull request open.
 4. It merges with a merge commit, and only if the head is still the commit that was tested.
 5. It brings the version commit back to the source branch: a fast-forward when that branch has not moved, a merge commit otherwise.
 6. It tags the merge commit on `main` and pushes the tags. `all` waits for the client release first, because the server crates need it on crates.io. Then it waits for the release workflows and prints the release links.
@@ -36,6 +36,8 @@ It releases what is on `origin/feat/secondary-indexes` (`--from` for another bra
 Each channel has its own version: the client channel owns `rasterizeddb_client` and `rasterizeddb_client_derive`, and the server channel owns `rasterizeddb_core` and `rasterizeddb_embedded`. The executables carry the core version.
 
 `rastcp` is shared. When its code changed since the last crate release and its current version is already on crates.io, the script bumps it a patch; `--rastcp keep|minor|major|X.Y.Z` overrides that.
+
+To rerun after a stop, run the same command again. The script moves the `release/<tag>` branch it left to the new head and reuses the pull request that is still open from it. When the head has not changed (a flaky check), no new run starts, so the script re-runs the failed jobs of the last attempt once before it waits. Nothing is tagged before the merge, so a stopped run leaves only that branch and pull request.
 
 A version that is already tagged or on crates.io is always refused, and so is a server release whose client version is not on crates.io yet.
 
