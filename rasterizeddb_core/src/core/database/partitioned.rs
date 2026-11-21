@@ -245,7 +245,7 @@ pub(super) fn reap_at_startup(
         if files::dir_key(&dir) == root_key {
             continue;
         }
-        let now = |recorded: &str| pool.partition_dir_now(recorded).unwrap_or_else(|| recorded.to_string());
+        let now = |recorded: &str| super::pool_partition_dir_now(pool, recorded).unwrap_or_else(|| recorded.to_string());
         let at = files::reap_at(Path::new(&dir), &live, &now, |names| {
             let Some(wal) = crate::core::wal::wal_for(&dir) else {
                 return Ok(());

@@ -113,6 +113,7 @@ async fn a_crash_after_a_recorded_commit_keeps_the_blocks_ddl() {
 ///
 /// Guards against the copy's provider resolved before its placement is
 /// recorded (the copy written to the root, then looked for beside the table).
+#[cfg(feature = "storage_pools")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_table_on_a_second_location_rolls_back_and_recovers() {
     for crash in [false, true] {
@@ -357,6 +358,7 @@ async fn a_partitioned_tables_ddl_in_a_block_rolls_back_recovers_and_commits() {
 /// the store, through a seed that refuses rather than copy an unreachable
 /// store's empty stand-in, and put back by a ROLLBACK or the next open.
 /// Before, a block's DDL on one applied at once, with a warning.
+#[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_value_tables_ddl_in_a_block_rolls_back_recovers_and_commits() {
     for end in [End::Rollback, End::Crash, End::Commit] {

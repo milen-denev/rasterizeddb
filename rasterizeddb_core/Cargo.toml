@@ -171,8 +171,9 @@ enable_long_row = []
 
 # Database branches: `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`,
 # `MERGE BRANCH` and `SHOW BRANCH DIFF` (docs/branching.md). No crate of its
-# own; a past point (`AS OF`) also needs `s3_backup`.
-db_branching = []
+# own, but it copies a database with `s3_backup`'s copy machinery (its copy
+# gates, the files a copy leaves out, its timestamps), so it needs that feature.
+db_branching = ["s3_backup"]
 
 # Indexes and the filter persisted as snapshots taken at clean points, loaded
 # at open instead of rebuilt (docs/persistent-indexes.md).
@@ -234,8 +235,10 @@ storage_pools = []
 # delta log, a page cache and a compactor — and a build that only ever writes
 # files should not carry it or the extra match arm on every storage call. It
 # adds no crate of its own: the backing store is a trait, and the two
-# implementations it ships with (a map, a directory) need nothing new.
-kv_storage = []
+# implementations it ships with (a map, a directory) need nothing new. A key/value
+# store is a storage-pool location (`STORAGE ADD STORE`), so it needs
+# `storage_pools`.
+kv_storage = ["storage_pools"]
 
 # The S3 backing store for `kv_storage`.
 #
@@ -281,5 +284,6 @@ mssql_wire = []
 #
 # Off by default: it is the only feature that opens an outbound network
 # connection, and a build that never backs up should not carry a compressor,
-# a root certificate bundle, or the code that signs requests.
-s3_backup = ["dep:zstd", "dep:webpki-roots"]
+# a root certificate bundle, or the code that signs requests. A backup covers
+# every storage location a database has, so it needs `storage_pools`.
+s3_backup = ["dep:zstd", "dep:webpki-roots", "storage_pools"]

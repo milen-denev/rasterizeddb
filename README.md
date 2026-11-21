@@ -64,21 +64,22 @@ default set turns most of them on:
 ```toml
 default = ["memory_pool_reuse", "replication_compression", "s3_backup",
            "pg_import", "storage_pools", "kv_storage", "kv_storage_s3",
-           "query_stats", "kv_cache"]
+           "query_stats", "kv_cache", "persistent_indexes", "mysql_wire",
+           "mssql_wire", "db_branching"]
 ```
 
 | Feature | Default | What it adds |
 |---|---|---|
-| `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements |
+| `s3_backup` | on | Backup, restore and PITR to an object store, and the `BACKUP`/`RESTORE` statements. Implies `storage_pools` |
 | `pg_import` | on | The PostgreSQL frontend client and `IMPORT DATABASE FROM POSTGRES` |
 | `storage_pools` | on | Multi-directory placement, mirroring, and the `STORAGE` statements |
-| `kv_storage` | on | A table kept in a key/value store rather than in files, and the `kv:` placement spec |
+| `kv_storage` | on | A table kept in a key/value store rather than in files, and the `kv:` placement spec. Implies `storage_pools` |
 | `kv_storage_s3` | on | The S3 backing store for `kv_storage`. Implies `kv_storage` and `s3_backup` |
 | `kv_cache` | on | A Redis-compatible key/value store: `KV …` statements, and the Redis protocol on `--kv-port` |
 | `mysql_wire` | on | The MySQL / MariaDB client protocol on `--mysql-port` / `--mysql-socket` |
 | `mssql_wire` | on | The SQL Server (TDS) client protocol on `--mssql-port` / `--mssql-socket` |
 | `query_stats` | on | `SHOW QUERIES`, `SHOW QUERY STATS` and `pg_stat_statements` |
-| `db_branching` | on | `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`, `SHOW BRANCH DIFF`, `MERGE BRANCH`; `AS OF` also needs `s3_backup` |
+| `db_branching` | on | `CREATE BRANCH`, `RESET`/`PROMOTE`/`DROP BRANCH`, `SHOW BRANCH DIFF`, `MERGE BRANCH`, `AS OF`. Implies `s3_backup` |
 | `replication_compression` | on | Zstd on replication links; a node without it still interoperates, uncompressed |
 | `memory_pool_reuse` | on | Thread-local free lists in the buffer pool |
 | `enable_long_row` | off | Rows above the standard width cap |

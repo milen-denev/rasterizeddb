@@ -227,6 +227,7 @@ impl std::fmt::Debug for StoreCredentials {
 }
 
 impl StoreCredentials {
+    #[cfg(feature = "kv_storage_s3")]
     fn into_client(self) -> crate::core::backup::s3::Credentials {
         crate::core::backup::s3::Credentials {
             access_key: self.access_key,
