@@ -7234,12 +7234,17 @@ fn watch_step(
             (Some(lits), Some(cls)) if l.exact && *lits == l.literals && *cls == l.classes => {
                 let mut query_row = l.query_row.clone();
                 query_row.where_clause = l.template.render(lits);
+                // Checked for exactly these literals (`settle_index`).
+                let point = match &l.index {
+                    LearnedIndex::Ready(plan) => plan.bind(lits, query_row.where_clause.as_str().into()),
+                    _ => None,
+                };
                 WatchStep::Run(PreparedRun {
                     rows: Box::new(pr::PreparedRows {
                         table_name: l.table_name.clone(),
                         query_row,
                         key: None,
-                        point: None,
+                        point,
                         shape_epoch: l.shape_epoch,
                     }),
                     fields: l.fields.clone(),
@@ -7506,6 +7511,13 @@ fn learn_into(
                 && l.template.render(&literals) == query_row.where_clause
             {
                 l.exact = true;
+                // Exact runs answer only these literals, so a key derived
+                // now is checked, and used, for these literals only. A run
+                // with other values later verifies the template, and its
+                // plan is derived and checked again for both.
+                if matches!(l.index, LearnedIndex::None) && l.route.is_none() {
+                    l.index = derive_index(database, &l, &columns, &literals);
+                }
                 PreparedSelect::Candidate(l)
             } else {
                 PreparedSelect::Ineligible
@@ -7636,8 +7648,10 @@ pub(crate) struct IndexCheck {
 
 /// `prepared`'s pending index derivation, if it has one.
 fn pending_index(prepared: &PreparedSelect) -> Option<IndexCheck> {
-    let PreparedSelect::Ready(l) = prepared else {
-        return None;
+    let l = match prepared {
+        PreparedSelect::Ready(l) => l,
+        PreparedSelect::Candidate(l) if l.exact => l,
+        _ => return None,
     };
     let LearnedIndex::Pending { plan, second } = &l.index else {
         return None;
@@ -7690,8 +7704,10 @@ async fn check_index(database: &Arc<Database>, check: &IndexCheck) -> bool {
 /// instance, same derivation still pending. A failed check keeps the
 /// statement ready without an index derivation, for good.
 fn settle_index(database: &Arc<Database>, prepared: &mut PreparedSelect, check: &IndexCheck, ok: bool) {
-    let PreparedSelect::Ready(l) = prepared else {
-        return;
+    let l = match prepared {
+        PreparedSelect::Ready(l) => l,
+        PreparedSelect::Candidate(l) if l.exact => l,
+        _ => return,
     };
     if l.generation != check.generation
         || l.shape_epoch != check.shape_epoch

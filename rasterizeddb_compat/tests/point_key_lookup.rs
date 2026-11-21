@@ -199,3 +199,35 @@ async fn a_key_follows_the_table_through_constraint_changes() {
     )
     .await;
 }
+
+/// One statement repeated with the same key, as a benchmark repeats it,
+/// learns exactly (`exact`) and finds its row by the key checked for that
+/// key alone; repeated with an `OR`, its key is refused and every answer
+/// keeps the rows the `OR` adds. Rows change between rounds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_statement_finds_its_row_by_the_key_checked_for_it() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let (_server, mut conn) = setup().await;
+    let fixed = [
+        "SELECT k, s, n FROM items WHERE k = 77",
+        "SELECT k, n FROM items WHERE k = 57 AND s = 'name 007'",
+        "SELECT k FROM items WHERE k = 13 OR n = 1 ORDER BY k",
+    ];
+    let changes = ["SELECT 1", "UPDATE items SET n = 1 WHERE k = 77", "DELETE FROM items WHERE k = 57", "INSERT INTO items (k, s, n) VALUES (57, 'name 007', 2)"];
+    let before = hits();
+    for change in changes {
+        conn.execute(change).await.expect(change);
+        set_text_shapes(false);
+        let mut want = Vec::new();
+        for sql in fixed {
+            want.push(simple(&mut conn, sql).await);
+        }
+        set_text_shapes(true);
+        for _ in 0..4 {
+            for (sql, want) in fixed.iter().zip(&want) {
+                assert_eq!(&simple(&mut conn, sql).await, want, "{sql}");
+            }
+        }
+    }
+    assert!(hits() > before, "no repeated statement found its row by the key");
+}
