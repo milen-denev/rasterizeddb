@@ -848,6 +848,13 @@ fn encode_f64s(values: &[f64]) -> Vec<u8> {
 }
 
 fn decode_f64s(bytes: &[u8], at: usize, count: usize) -> Option<Vec<f64>> {
+    // PATH and POLYGON carry their own point count, so check that the bytes
+    // are there before reserving room for them: a corrupt count of two billion
+    // points reserved 30 GB, which aborts the process where the memory is not
+    // there to overcommit.
+    if bytes.len() < count.checked_mul(8)?.checked_add(at)? {
+        return None;
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         out.push(be_f64(bytes, at + i * 8)?);
@@ -1560,5 +1567,27 @@ mod interval_unit_tests {
         assert_eq!(micros("1 m"), Some((0, 0, 60_000_000)));
         assert_eq!(micros("3 mons 2 days"), Some((3, 2, 0)));
         assert_eq!(micros("1 centuries"), Some((1_200, 0, 0)));
+    }
+}
+
+#[cfg(test)]
+mod geometry_count_tests {
+    use super::{format_path, format_polygon};
+
+    /// A PATH or POLYGON carries its own point count. One larger than its
+    /// bytes is refused before anything is reserved for it: a count of two
+    /// billion reserved 30 GB and aborted the lib suite on a 16 GB CI runner,
+    /// while it passed on a machine with the memory to overcommit.
+    #[test]
+    fn a_point_count_beyond_the_bytes_is_refused_without_reserving_it() {
+        assert_eq!(format_path(&[0, 0x7F, 0xFF, 0xFF, 0xFF]), None);
+        assert_eq!(format_polygon(&[0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]), None);
+
+        let mut one_point = vec![0, 0, 0, 0, 1];
+        one_point.extend_from_slice(&1.0f64.to_be_bytes());
+        one_point.extend_from_slice(&2.0f64.to_be_bytes());
+        assert_eq!(format_path(&one_point).as_deref(), Some("[(1,2)]"));
+        one_point.pop();
+        assert_eq!(format_path(&one_point), None, "a point cut short");
     }
 }
