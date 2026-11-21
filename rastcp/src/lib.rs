@@ -3,6 +3,7 @@ pub mod client;
 pub mod common;
 pub mod config;
 pub mod error;
+pub mod exec;
 mod frame;
 mod interrupt;
 pub mod mux;
