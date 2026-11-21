@@ -33,7 +33,7 @@ pub(crate) struct Explain {
 pub(crate) fn parse_explain(sql: &str) -> Option<Result<Explain, (&'static str, String)>> {
     let t = sql.trim().trim_end_matches(';').trim_end();
     if !(t.len() > 7
-        && t[..7].eq_ignore_ascii_case("EXPLAIN")
+        && t.get(..7).is_some_and(|h| h.eq_ignore_ascii_case("EXPLAIN"))
         && t.as_bytes()[7].is_ascii_whitespace())
     {
         return None;

@@ -498,10 +498,12 @@ pub fn named_windows(sql: &str) -> Result<Option<String>, String> {
             i = end.max(i + 1);
             continue;
         }
-        // `OVER` after a call's `)`: a column may be named `over`.
-        let after_call = body[..i].trim_end().ends_with(')');
+        // `OVER` after a call's `)`: a column may be named `over`. Read as
+        // bytes: `i` steps through every byte, and slicing the text there
+        // panicked inside a multi-byte character.
+        let after_call = || bytes[..i].iter().rposition(|b| !b.is_ascii_whitespace()).is_some_and(|p| bytes[p] == b')');
         let at_word = i == 0 || !is_identifier_byte(bytes[i - 1]);
-        if at_word && after_call && bytes.len() - i > 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"OVER") && !is_identifier_byte(bytes[i + 4]) {
+        if at_word && bytes.len() - i > 4 && bytes[i..i + 4].eq_ignore_ascii_case(b"OVER") && !is_identifier_byte(bytes[i + 4]) && after_call() {
             let after = &body[i + 4..];
             let gap = after.len() - after.trim_start().len();
             let start = i + 4 + gap;
@@ -576,11 +578,15 @@ fn quantified_array_casts(sql: &str) -> Option<String> {
             continue;
         }
         let at_word = i == 0 || !is_identifier_byte(bytes[i - 1]);
+        // Compared as bytes. Slicing the text at `i + n` panicked when that
+        // fell inside a multi-byte character: this runs at every byte, so
+        // `name = 'Δ…'` cut the `Δ` at the `=` (an ORM UPDATE of a row with
+        // Greek text and `'[]'`, and "all" anywhere in the statement).
         let word_len = [3usize, 4]
             .into_iter()
             .find(|&n| {
                 bytes.len() - i > n
-                    && matches!(&sql[i..i + n].to_ascii_uppercase()[..], "ANY" | "ALL" | "SOME")
+                    && [&b"ANY"[..], b"ALL", b"SOME"].iter().any(|w| bytes[i..i + n].eq_ignore_ascii_case(w))
                     && !is_identifier_byte(bytes[i + n])
             });
         if let (true, Some(n)) = (at_word, word_len) {
@@ -2124,7 +2130,8 @@ fn tablesample_at(sql: &str, at: usize) -> Result<(usize, usize, String), (&'sta
         before.ends_with(',')
             || ["FROM", "JOIN"].iter().any(|k| {
                 let Some(w) = before.len().checked_sub(k.len()) else { return false };
-                before[w..].eq_ignore_ascii_case(k) && (w == 0 || !is_identifier_byte(before.as_bytes()[w - 1]))
+                // Bytes: `w` can fall inside a character before the keyword.
+                before.as_bytes()[w..].eq_ignore_ascii_case(k.as_bytes()) && (w == 0 || !is_identifier_byte(before.as_bytes()[w - 1]))
             })
     };
     let (relation, alias, start) = if opens_list(w1s) {
@@ -3478,5 +3485,75 @@ mod named_window_tests {
         assert_eq!(named_windows("SELECT rank() OVER (ORDER BY x) FROM t").unwrap(), None);
         assert!(named_windows("SELECT rank() OVER nope FROM t").is_err());
         assert_eq!(named_windows("SELECT over AS x FROM t").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod multibyte_text_tests {
+    use super::*;
+
+    /// Statements that wake each pass: quantified array casts, row
+    /// assignments, named windows, derived column lists, shorthands,
+    /// operators, samples, typed literals, string forms, catalogue casts.
+    const TRIGGERS: &[&str] = &[
+        "SELECT * FROM t WHERE a = ANY('{1,2}'::int[]) AND b <> ALL(ARRAY[1,2]::bigint[]) OR c = SOME('{x}'::text[])",
+        "UPDATE t SET (a, b) = (1, 'x') WHERE c = 'y' RETURNING a",
+        "SELECT sum(a) OVER w, rank() OVER (w ORDER BY c) FROM t WINDOW w AS (PARTITION BY b)",
+        "SELECT d.x FROM (SELECT a, b FROM t) AS d(x, y)",
+        "TABLE t",
+        "CREATE UNLOGGED TABLE t (a INT, b TEXT)",
+        "SELECT a INTO t2 FROM t WHERE b = 'z'",
+        "WITH x AS MATERIALIZED (SELECT 1) SELECT * FROM x",
+        "SELECT ROW(1, 'a') = ROW(1, 'a'), (a, b) IN (SELECT 1, 2) FROM t",
+        "SELECT a || 'x', a ~ 'b', a !~* 'c', a ^@ 'd' FROM t",
+        "SELECT * FROM t TABLESAMPLE BERNOULLI (10) REPEATABLE (1)",
+        "SELECT DATE '2024-01-01', TIMESTAMP '2024-01-01 00:00:00+02', INTERVAL '1 day'",
+        "SELECT E'a\\nb', U&'d\\0061t', $$q$$, $t$q$t$ FROM t",
+        "SELECT ARRAY(SELECT a FROM t), 't'::regclass, to_regclass('t')",
+        "SELECT * FROM t WHERE a > ANY (SELECT b FROM u) AND a < ALL (SELECT c FROM v)",
+        "SELECT \"MixedCase\", Lower FROM T -- note\nWHERE /* c */ x = 1",
+        "UPDATE stores SET name = 'Probe', guest_buttons = '[{\"label\":\"Call the waiter\"}]', basic_guest_buttons = '[]' WHERE id = 's1' RETURNING id",
+    ];
+
+    /// Every pass over every trigger statement with a 2-, 3- and 4-byte
+    /// character put at every position: no pass may slice text inside a
+    /// character. One did (`quantified_array_casts`), and the server handler
+    /// panicked on an ORM UPDATE of a row with Greek text in it.
+    #[test]
+    fn no_pass_cuts_a_multibyte_character() {
+        type Pass = fn(&str);
+        let passes: &[(&str, Pass)] = &[
+            ("catalog_syntax", |s| drop(catalog_syntax(s))),
+            ("array_subqueries", |s| drop(array_subqueries(s))),
+            ("row_assignments", |s| drop(row_assignments(s))),
+            ("named_windows", |s| drop(named_windows(s))),
+            ("derived_column_lists", |s| drop(derived_column_lists(s))),
+            ("statement_shorthands", |s| drop(statement_shorthands(s))),
+            ("flatten_whitespace", |s| drop(flatten_whitespace(s))),
+            ("identifier_with_doubled_quote", |s| { let _ = identifier_with_doubled_quote(s); }),
+            ("typed_literals_as_casts", |s| drop(typed_literals_as_casts(s))),
+            ("quantified_subqueries", |s| drop(quantified_subqueries(s))),
+            ("find_quantified_subquery", |s| drop(find_quantified_subquery(s))),
+            ("text_operators", |s| drop(text_operators(s))),
+            ("tablesample", |s| drop(tablesample(s))),
+            ("fold_core_statement", |s| drop(fold_core_statement(s))),
+            ("fold_unquoted_identifiers", |s| drop(fold_unquoted_identifiers(s))),
+            ("normalize_string_literals", |s| drop(normalize_string_literals(s))),
+            ("zone_free_timestamp_literals", |s| drop(zone_free_timestamp_literals(s))),
+        ];
+        let mut failures = Vec::new();
+        for base in TRIGGERS {
+            for at in (0..=base.len()).filter(|&i| base.is_char_boundary(i)) {
+                for ch in ["Δ", "€", "😀"] {
+                    let sql = format!("{}{}{}", &base[..at], ch, &base[at..]);
+                    for (name, pass) in passes {
+                        if std::panic::catch_unwind(|| pass(&sql)).is_err() {
+                            failures.push(format!("{name}: {sql}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{} panics, first: {:#?}", failures.len(), &failures[..failures.len().min(10)]);
     }
 }
