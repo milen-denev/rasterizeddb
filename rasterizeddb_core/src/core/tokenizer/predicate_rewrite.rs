@@ -3447,7 +3447,9 @@ fn needs_evaluator(text: &str) -> bool {
                 && (is_word(bytes[i - 1]) || bytes[i - 1] == b')')
                 && bytes.get(i + 1) != Some(&b']')
                 && {
-                    let word_start = text[..i].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |at| at + 1);
+                    let word_start = text[..i]
+                        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .map_or(0, |at| at + text[at..].chars().next().map_or(1, char::len_utf8));
                     !text[word_start..i].eq_ignore_ascii_case("ARRAY")
                 } =>
             {

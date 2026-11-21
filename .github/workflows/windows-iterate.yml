@@ -1,0 +1,52 @@
+name: Windows iterate (temporary)
+
+# TEMPORARY, for the Windows fix round on fix/windows-suite: runs the full
+# suites on both Windows runners, on every push to that branch's pull
+# request. Removed before the branch merges.
+
+on:
+  pull_request:
+
+concurrency:
+  group: windows-iterate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_MIN_STACK: "33554432"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  core-lib:
+    if: github.head_ref == 'fix/windows-suite'
+    name: core lib ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          target: ${{ matrix.target }}
+      - name: Directory flush on this runner
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib core::sync_path -- --nocapture
+      # The whole of what ci.yml's `full` job runs, each step even when an
+      # earlier one failed, so one round shows everything left.
+      - name: Core library tests
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib --no-fail-fast
+      - name: Core integration tests
+        if: success() || failure()
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --test '*' --no-fail-fast
+      - name: Compatibility suite
+        if: success() || failure()
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast

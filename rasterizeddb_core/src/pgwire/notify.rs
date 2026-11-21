@@ -151,7 +151,7 @@ pub(crate) fn parse_notify_statement(
     let t = sql.trim().trim_end_matches(';').trim_end();
     let word = |w: &str| {
         t.len() > w.len()
-            && t[..w.len()].eq_ignore_ascii_case(w)
+            && t.get(..w.len()).is_some_and(|h| h.eq_ignore_ascii_case(w))
             && t.as_bytes()[w.len()].is_ascii_whitespace()
     };
     let syntax = |what: &str| Some(Err(("42601", format!("syntax error in {what}"))));

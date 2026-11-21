@@ -337,8 +337,9 @@ async fn differential(in_memory: bool) {
     for sql in FROM_CELLS {
         together += usize::from(run_counting_batches(&db, sql).await.1 > 0);
     }
-    if in_memory {
-        assert_eq!(together, 0, "a database in memory copied cells from a mapping");
+    if in_memory || !crate::core::storage_providers::file_sync::MAPS_FILES {
+        // Nothing mapped: from memory, or from a file where Windows maps none.
+        assert_eq!(together, 0, "cells were copied from a mapping where there is none");
     } else {
         // All but the statements whose WHERE matches nothing (`k > 1000`).
         let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
@@ -363,9 +364,13 @@ async fn differential(in_memory: bool) {
             assert!(again == reply, "reopened, {sql}: two runs differ");
             copied += usize::from(batches > 0);
         }
-        // All but the statements whose WHERE matches nothing (`k > 1000`).
-        let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
-        assert!(copied >= FROM_CELLS.len() - empty, "only {copied} statements read their cells in batches from the mapping");
+        if !crate::core::storage_providers::file_sync::MAPS_FILES {
+            assert_eq!(copied, 0, "reopened, cells were copied from a mapping where there is none");
+        } else {
+            // All but the statements whose WHERE matches nothing (`k > 1000`).
+            let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
+            assert!(copied >= FROM_CELLS.len() - empty, "only {copied} statements read their cells in batches from the mapping");
+        }
     }
     column_scan::set_enabled(true);
 }
@@ -808,7 +813,12 @@ async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
     std::fs::create_dir_all(&dir).expect("the scratch directory");
     LocalStorageProvider::new(&dir, Some("text")).await.append_data(&data, true).await;
     let file = LocalStorageProvider::new(&dir, Some("text")).await;
-    assert!(strings_through_headers(&file, &rows).await >= 2, "the file's batches were not copied from its mapping");
+    let copied = strings_through_headers(&file, &rows).await;
+    if crate::core::storage_providers::file_sync::MAPS_FILES {
+        assert!(copied >= 2, "the file's batches were not copied from its mapping");
+    } else {
+        assert_eq!(copied, 0, "batches copied from a mapping where Windows maps none");
+    }
 }
 
 /// The reads of [`a_string_is_read_through_its_header_and_a_bad_header_drops_its_row`]
@@ -995,6 +1005,12 @@ async fn a_file_copies_a_batch_of_cells_or_none_of_it() {
         let mut out: Vec<&mut Vec<u8>> = bufs.iter_mut().collect();
         io.try_read_cells_sync(&rows, &cells, &mut out)
     };
+    if !crate::core::storage_providers::file_sync::MAPS_FILES {
+        // Windows maps no table file: the fast path refuses, and the caller
+        // reads the cells another way.
+        assert!(!copied, "cells copied from a mapping where Windows maps none");
+        return;
+    }
     assert!(copied, "a file with every cell in it copied none");
     for (c, (&(offset, width), buf)) in cells.iter().zip(&bufs).enumerate() {
         // What was in the buffer stays, and the cells follow it in row order.
@@ -1042,6 +1058,10 @@ async fn a_file_copies_a_batch_of_cells_or_none_of_it() {
 /// row's value with another row's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
+    // The batch copy reads the mapping: Windows maps no table file.
+    if !crate::core::storage_providers::file_sync::MAPS_FILES {
+        return;
+    }
     use crate::core::storage_providers::file_sync::LocalStorageProvider;
     use crate::core::storage_providers::traits::StorageIO;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1058,17 +1078,17 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
     // yields between writes; flat out, it overlapped every read of this
     // size and the reader made 14 reads in a second and a half.
     let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer = {
         let (io, stop, row) = (io.clone(), stop.clone(), data[200 * ROW as usize..201 * ROW as usize].to_vec());
+        let writes = writes.clone();
         tokio::spawn(async move {
-            let mut writes = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 io.write_data(200 * ROW, &row).await;
-                writes += 1;
+                writes.fetch_add(1, Ordering::Relaxed);
                 tokio::task::yield_now().await;
                 std::thread::yield_now();
             }
-            writes
         })
     };
 
@@ -1087,7 +1107,13 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
         .collect();
     let started = std::time::Instant::now();
     let mut reads = 0u64;
-    while started.elapsed() < std::time::Duration::from_millis(1500) {
+    // 1.5 s, or longer until both sides have run a hundred times: a write
+    // syncs, and on a Windows runner 1.5 s held 78 of them.
+    let mut writes_seen = 0u64;
+    while (started.elapsed() < std::time::Duration::from_millis(1500) || reads <= 100 || writes_seen <= 100)
+        && started.elapsed() < std::time::Duration::from_secs(60)
+    {
+        writes_seen = writes.load(Ordering::Relaxed);
         let mut bufs: Vec<Vec<u8>> = vec![vec![0xEE; 3]; cells.len()];
         if io.try_read_cells_sync(&rows, &cells, &mut bufs.iter_mut().collect::<Vec<_>>()) {
             assert!(bufs == expect, "read {reads}: a batch read beside a writer holds other than each cell once");
@@ -1098,7 +1124,8 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let writes = writer.await.expect("the writer");
+    writer.await.expect("the writer");
+    let writes = writes.load(Ordering::Relaxed);
     assert!(reads > 100 && writes > 100, "{reads} reads beside {writes} writes: too few to have overlapped");
 }
 

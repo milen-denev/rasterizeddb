@@ -101,7 +101,7 @@ fn listing(dir: &std::path::Path) -> Vec<(String, u64)> {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| {
-            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+            let len = crate::core::sync_path::entry_metadata(&e).map(|m| m.len()).unwrap_or(0);
             (e.file_name().to_string_lossy().to_string(), len)
         })
         .collect();

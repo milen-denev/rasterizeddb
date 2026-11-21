@@ -423,7 +423,7 @@ pub fn truncate_to_whole_records(
     }
     let file = File::options().write(true).open(path)?;
     file.set_len(to)?;
-    crate::core::sync_audit::note("torn_tail.cut", path);
+    let _synced = crate::core::sync_audit::note("torn_tail.cut", path);
     file.sync_all()?;
     log::info!(
         "{} ended inside a record: cut {partial} bytes ({len} -> {to}, {stride}-byte records) \
@@ -447,7 +447,7 @@ pub fn cut_torn_tails(dir: &Path, floors: &Floors) -> io::Result<Vec<(PathBuf, T
     };
     let mut cut = Vec::new();
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(meta) = crate::core::sync_path::entry_metadata(&entry) else { continue };
         if !meta.is_file() {
             continue;
         }
@@ -458,7 +458,7 @@ pub fn cut_torn_tails(dir: &Path, floors: &Floors) -> io::Result<Vec<(PathBuf, T
             continue;
         };
         let path = entry.path();
-        let floor = floors.floor_of(&meta);
+        let floor = floors.floor_of(&path, &meta);
         let done = truncate_to_whole_records(&path, kind.header, kind.stride, floor)?;
         if done != Truncated::Whole {
             cut.push((path, done));
@@ -479,14 +479,26 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    pub fn of(meta: &Metadata) -> FileIdentity {
+    /// The identity of the file at `path`, which `meta` describes. Unix
+    /// reads it from `meta`. Windows from a handle at `path` (the volume
+    /// serial number and the NTFS file index, which a rename keeps): it used
+    /// to be the creation time alone there, which NTFS stamps from a clock
+    /// that ticks every few milliseconds, so the sidecars a CREATE makes
+    /// together could share one identity and one floor.
+    pub fn of(path: &Path, meta: &Metadata) -> FileIdentity {
         #[cfg(unix)]
         let (dev, ino) = {
             use std::os::unix::fs::MetadataExt;
+            let _ = path;
             (meta.dev(), meta.ino())
         };
-        #[cfg(not(unix))]
-        let (dev, ino) = (0, 0);
+        #[cfg(windows)]
+        let (dev, ino) = crate::core::sync_path::volume_and_index(path).unwrap_or((0, 0));
+        #[cfg(not(any(unix, windows)))]
+        let (dev, ino) = {
+            let _ = path;
+            (0, 0)
+        };
         let born = meta
             .created()
             .ok()
@@ -520,10 +532,11 @@ impl Floors {
         self.entries.is_empty()
     }
 
-    /// The floor of the file `meta` describes; 0 when none is recorded.
-    pub fn floor_of(&self, meta: &Metadata) -> u64 {
+    /// The floor of the file at `path`, which `meta` describes; 0 when none
+    /// is recorded.
+    pub fn floor_of(&self, path: &Path, meta: &Metadata) -> u64 {
         self.entries
-            .get(&FileIdentity::of(meta))
+            .get(&FileIdentity::of(path, meta))
             .map_or(0, |(_, floor)| *floor)
     }
 
@@ -554,7 +567,7 @@ impl Floors {
         let mut present: HashMap<FileIdentity, u64> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                let Ok(meta) = entry.metadata() else { continue };
+                let Ok(meta) = crate::core::sync_path::entry_metadata(&entry) else { continue };
                 if !meta.is_file() {
                     continue;
                 }
@@ -562,7 +575,7 @@ impl Floors {
                     continue;
                 };
                 if let Some(kind) = classify(dir, &name) {
-                    present.insert(FileIdentity::of(&meta), kind.whole(meta.len()));
+                    present.insert(FileIdentity::of(&entry.path(), &meta), kind.whole(meta.len()));
                 }
             }
         }
@@ -644,7 +657,7 @@ impl Floors {
         {
             let mut file = File::create(&temp)?;
             file.write_all(self.render().as_bytes())?;
-            crate::core::sync_audit::note("wal.floors", path);
+            let _synced = crate::core::sync_audit::note("wal.floors", path);
             file.sync_all()?;
         }
         std::fs::rename(&temp, path)?;
@@ -661,7 +674,7 @@ pub fn lower_floor_in(floors: &mut Floors, wal_path: &Path, path: &Path, len: u6
         Err(e) => return Err(e),
     };
     let to = classify_path(path).map_or(len, |kind| kind.whole(len));
-    if floors.lower(FileIdentity::of(&meta), to) {
+    if floors.lower(FileIdentity::of(path, &meta), to) {
         floors.store(&Floors::path_for(wal_path))?;
     }
     Ok(())

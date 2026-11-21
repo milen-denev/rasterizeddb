@@ -254,15 +254,10 @@ fn new_uid_from(dir: &Path, taken: impl Fn(u64) -> bool, mut next: impl FnMut() 
 /// Flushes `dir`'s entries: what makes a create or delete in it durable.
 /// Errors are returned, unlike the constructors' `let _ =`.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let handle = std::fs::File::open(dir)?;
-        crate::core::sync_audit::note("partition_dir", dir);
-        handle.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
+    // As `wal::sync_parent_dir`: noted only when there is a flush to note.
+    if let Some(handle) = crate::core::sync_path::open_dir(dir)? {
+        let _synced = crate::core::sync_audit::note("partition_dir", dir);
+        crate::core::sync_path::flush_dir(&handle)?;
     }
     Ok(())
 }

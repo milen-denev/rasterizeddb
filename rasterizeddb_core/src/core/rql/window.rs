@@ -592,7 +592,7 @@ fn resolve_column(text: &str, schema: &[SchemaField]) -> Result<SchemaField, Str
 /// Whether `text` begins with `word` as a whole word.
 fn starts_with_word(text: &str, word: &str) -> bool {
     let text = text.trim_start();
-    if text.len() < word.len() || !text[..word.len()].eq_ignore_ascii_case(word) {
+    if !text.get(..word.len()).is_some_and(|h| h.eq_ignore_ascii_case(word)) {
         return false;
     }
     text.as_bytes()

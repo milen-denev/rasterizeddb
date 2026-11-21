@@ -49,8 +49,7 @@ pub(crate) fn rewrite_statement(sql: &str, columns_of: &dyn Fn(&str) -> Option<V
 
 fn starts_with_word(text: &str, word: &str) -> bool {
     let t = text.trim_start();
-    t.len() >= word.len()
-        && t[..word.len()].eq_ignore_ascii_case(word)
+    t.get(..word.len()).is_some_and(|h| h.eq_ignore_ascii_case(word))
         && !t[word.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -293,7 +292,9 @@ fn segments(source: &str) -> Option<Vec<Segment>> {
         let mut start = at;
         loop {
             let head = source[..start].trim_end();
-            let word_at = head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |p| p + 1);
+            let word_at = head
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |p| p + head[p..].chars().next().map_or(1, char::len_utf8));
             let word = &head[word_at..];
             if JOIN_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)) {
                 if word.eq_ignore_ascii_case("NATURAL") {

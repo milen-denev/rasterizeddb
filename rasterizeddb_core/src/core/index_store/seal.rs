@@ -502,7 +502,7 @@ fn write_tmp(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     let _ = done;
     failpoint("snapshot_before_fsync", tmp)?;
-    crate::core::sync_audit::note("index_store.snapshot", tmp);
+    let _synced = crate::core::sync_audit::note("index_store.snapshot", tmp);
     f.sync_data()?;
     failpoint("snapshot_after_fsync", tmp)
 }
@@ -544,7 +544,7 @@ fn prepare_marker(gate: &FileGate, ixm: &Path, dir: &Path, root: Option<&Path>) 
         dir_op(DirOp::Create(&tmp));
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&log)?;
-        crate::core::sync_audit::note("index_store.marker_tmp", &tmp);
+        let _synced = crate::core::sync_audit::note("index_store.marker_tmp", &tmp);
         f.sync_all()?;
     }
     dir_op(DirOp::Rename { from: &tmp, to: ixm });
@@ -574,7 +574,7 @@ fn append_clean(ixm: &Path, scan: &MarkerScan, record: CleanRecord) -> Result<()
             }
             marker::MarkerOp::Truncate { len } => file.set_len(len).map_err(|e| (true, e))?,
         }
-        crate::core::sync_audit::note("index_store.marker", ixm);
+        let _synced = crate::core::sync_audit::note("index_store.marker", ixm);
         failpoint("clean_fsync_fails", ixm).map_err(|e| (issued, e))?;
         file.sync_data().map_err(|e| (issued, e))?;
     }

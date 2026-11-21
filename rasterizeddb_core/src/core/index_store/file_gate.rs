@@ -205,7 +205,7 @@ fn delete_flt(files: &GateFiles) -> io::Result<bool> {
     for path in [&flt, &tmp] {
         dir_op(DirOp::Unlink(path));
         match std::fs::remove_file(path) {
-            Ok(()) => crate::core::sync_audit::note("unlink", path),
+            Ok(()) => drop(crate::core::sync_audit::note("unlink", path)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -793,7 +793,7 @@ pub fn copy_files(from: &FileGate, to_dir: &Path, to_stem: &str) -> io::Result<(
                 dir_op(DirOp::Create(&dst));
                 let mut f = std::fs::File::create(&dst)?;
                 f.write_all(&bytes)?;
-                crate::core::sync_audit::note("index_store.carry", &dst);
+                let _synced = crate::core::sync_audit::note("index_store.carry", &dst);
                 f.sync_data()?;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => match std::fs::remove_file(&dst) {
@@ -950,7 +950,7 @@ fn try_append_dirty(files: &GateFiles) -> io::Result<()> {
         // After every step, before the next one is issued: until the
         // truncate is durable a stale record past the new one could read as
         // its successor (owner's decision (a)).
-        crate::core::sync_audit::note("index_store.marker", &path);
+        let _synced = crate::core::sync_audit::note("index_store.marker", &path);
         file.sync_data()?;
     }
     failpoint("dirty_after_fsync", &path)?;
@@ -991,7 +991,7 @@ fn try_rewrite(files: &GateFiles) -> io::Result<()> {
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&marker::compacted_log(files.incarnation))?;
-        crate::core::sync_audit::note("index_store.marker_tmp", &tmp);
+        let _synced = crate::core::sync_audit::note("index_store.marker_tmp", &tmp);
         f.sync_all()?;
     }
     failpoint("unknown_rewrite_after_first_write", &path)?;
@@ -1010,7 +1010,7 @@ fn unlink_snapshot(files: &GateFiles) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    crate::core::sync_audit::note("unlink", &ixs);
+    drop(crate::core::sync_audit::note("unlink", &ixs));
     crate::core::wal::sync_parent_dir(&ixs)
 }
 
@@ -1085,7 +1085,7 @@ async fn bump_in_epoch_log<S: StorageIO>(seed: &S, files: &GateFiles, in_memory:
     if token == 0 {
         // No log in this directory: the provider wrote in place, and the
         // record must be durable before the first effect all the same.
-        crate::core::sync_audit::note("index_store.epoch", &path);
+        let _synced = crate::core::sync_audit::note("index_store.epoch", &path);
         std::fs::File::options().write(true).open(&path)?.sync_data()?;
     }
     Ok(record.slot_epoch)

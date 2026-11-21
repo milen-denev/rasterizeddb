@@ -130,9 +130,7 @@ impl BranchMeta {
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         let temp = dir.join(format!("{META_FILE}.tmp"));
         std::fs::write(&temp, text.as_bytes())?;
-        if let Ok(f) = std::fs::File::open(&temp) {
-            let _ = f.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_file(&temp);
         std::fs::rename(&temp, dir.join(META_FILE))?;
         let _ = crate::core::wal::sync_parent_dir(&dir.join(META_FILE));
         Ok(())
@@ -317,7 +315,7 @@ fn staged_lengths(dirs: &[PathBuf]) -> HashMap<PathBuf, u64> {
             for e in entries.flatten() {
                 let path = e.path();
                 if path.extension().is_some_and(|x| x == "tmp")
-                    && let Ok(m) = e.metadata()
+                    && let Ok(m) = crate::core::sync_path::entry_metadata(&e)
                 {
                     out.insert(path, m.len());
                 }
@@ -814,7 +812,7 @@ fn dir_bytes(dir: &Path) -> u64 {
         .flatten()
         .map(|e| match e.file_type() {
             Ok(t) if t.is_dir() => dir_bytes(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Ok(t) if t.is_file() => crate::core::sync_path::entry_metadata(&e).map(|m| m.len()).unwrap_or(0),
             _ => 0,
         })
         .sum()
@@ -1505,8 +1503,8 @@ impl DatabaseCatalog {
         forget_directory(&final_dir);
         let retiring = root.join(format!("{RETIRING_PREFIX}{name}"));
         remove_quietly(&retiring);
-        std::fs::rename(&final_dir, &retiring).map_err(|e| e.to_string())?;
-        std::fs::rename(&staging, &final_dir).map_err(|e| e.to_string())?;
+        crate::core::sync_path::rename_when_released(&final_dir, &retiring).map_err(|e| e.to_string())?;
+        crate::core::sync_path::rename_when_released(&staging, &final_dir).map_err(|e| e.to_string())?;
         std::mem::forget(guard);
         match self.attach(name).await {
             Ok(_) => {
@@ -1660,7 +1658,7 @@ impl DatabaseCatalog {
         copy_live(&dir, &staging, &next, 1)
             .await
             .map_err(|e| format!("could not copy branch \"{name}\" for the merge: {e}"))?;
-        std::fs::rename(&staging, &next).map_err(|e| e.to_string())?;
+        crate::core::sync_path::rename_when_released(&staging, &next).map_err(|e| e.to_string())?;
         std::mem::forget(guard);
         let database = Database::try_new_named(
             &next.to_string_lossy(),
@@ -1967,7 +1965,7 @@ impl PromoteIntent {
         let text = serde_json::to_string(self).map_err(io::Error::other)?;
         let temp = root.join(format!("{PROMOTE_INTENT}.tmp"));
         std::fs::write(&temp, text)?;
-        std::fs::File::open(&temp)?.sync_all()?;
+        crate::core::sync_path::sync_file(&temp)?;
         std::fs::rename(&temp, root.join(PROMOTE_INTENT))?;
         crate::core::wal::sync_parent_dir(&root.join(PROMOTE_INTENT))
     }
@@ -1995,17 +1993,17 @@ fn finish_promote(root: &Path, intent: &mut PromoteIntent) -> io::Result<()> {
         intent.step = 3;
     }
     if intent.step == 0 {
-        std::fs::rename(&parent_dir, &aside)?;
+        crate::core::sync_path::rename_when_released(&parent_dir, &aside)?;
         intent.step = 1;
         intent.store(root)?;
     }
     if intent.step == 1 {
-        std::fs::rename(&branch_dir, &parent_dir)?;
+        crate::core::sync_path::rename_when_released(&branch_dir, &parent_dir)?;
         intent.step = 2;
         intent.store(root)?;
     }
     if intent.step == 2 {
-        std::fs::rename(&aside, &branch_dir)?;
+        crate::core::sync_path::rename_when_released(&aside, &branch_dir)?;
         intent.step = 3;
         intent.store(root)?;
     }

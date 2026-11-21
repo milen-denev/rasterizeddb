@@ -143,7 +143,7 @@ pub fn require(dir: &Path, flag: &str) -> io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(text.as_bytes())?;
-        crate::core::sync_audit::note("incompat_features", &temp);
+        let _synced = crate::core::sync_audit::note("incompat_features", &temp);
         file.sync_all()?;
     }
     std::fs::rename(&temp, &path)?;

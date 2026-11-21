@@ -226,41 +226,50 @@ impl Sock {
         }
     }
 
-    /// Looks at the next byte without taking it: `0` when the client has
-    /// closed its end.
-    async fn peek_byte(&self) -> io::Result<usize> {
+    /// Looks at the next byte without taking it and without waiting for
+    /// one: `Some(0)` when the client has closed its end, `Some(1)` when a
+    /// byte is there, `None` when nothing is (a readiness that promised data
+    /// it did not have, which Windows' emulated readiness gives). An awaited
+    /// `peek` used to sit there instead: a client parked in BLPOP stopped
+    /// answering, past its wake-up and its own timeout, until its next byte.
+    /// Seeing nothing clears the readiness, so the next `readable` waits.
+    fn try_peek_byte(&self) -> Option<io::Result<usize>> {
         let mut byte = [0u8; 1];
         match self {
-            Sock::Tcp(sock) => sock.peek(&mut byte).await,
+            Sock::Tcp(sock) => {
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                let mut buf = tokio::io::ReadBuf::new(&mut byte);
+                match sock.poll_peek(&mut cx, &mut buf) {
+                    std::task::Poll::Ready(r) => Some(r),
+                    std::task::Poll::Pending => None,
+                }
+            }
             // tokio's unix stream has no `peek`; the socket has, through
             // `recv` with MSG_PEEK on its descriptor.
             #[cfg(unix)]
             Sock::Unix(sock) => {
                 use std::os::fd::AsRawFd;
-                loop {
-                    sock.readable().await?;
-                    let peeked = sock.try_io(tokio::io::Interest::READABLE, || {
-                        // SAFETY: a one-byte buffer owned here, and a
-                        // descriptor the stream keeps open for the call.
-                        let n = unsafe {
-                            libc::recv(
-                                sock.as_raw_fd(),
-                                byte.as_mut_ptr().cast(),
-                                1,
-                                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                            )
-                        };
-                        if n < 0 {
-                            Err(io::Error::last_os_error())
-                        } else {
-                            Ok(n as usize)
-                        }
-                    });
-                    match peeked {
-                        Ok(n) => return Ok(n),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        Err(e) => return Err(e),
+                let peeked = sock.try_io(tokio::io::Interest::READABLE, || {
+                    // SAFETY: a one-byte buffer owned here, and a
+                    // descriptor the stream keeps open for the call.
+                    let n = unsafe {
+                        libc::recv(
+                            sock.as_raw_fd(),
+                            byte.as_mut_ptr().cast(),
+                            1,
+                            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if n < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
                     }
+                });
+                match peeked {
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
+                    r => Some(r),
                 }
             }
         }
@@ -1596,13 +1605,16 @@ impl Conn {
                     r?;
                     // Data or EOF. Data is the client's next command, which
                     // waits its turn; EOF means nobody is left to answer.
-                    match sock.peek_byte().await {
-                        Ok(0) => {
+                    // Nothing at all: the readiness was spurious, and the
+                    // loop waits again.
+                    match sock.try_peek_byte() {
+                        Some(Ok(0)) => {
                             waiters.unregister(&keys, &notify);
                             stats.blocked.fetch_sub(1, Ordering::Relaxed);
                             return Ok(Flow::Close);
                         }
-                        _ => peer_has_data = true,
+                        Some(_) => peer_has_data = true,
+                        None => {}
                     }
                     true
                 }

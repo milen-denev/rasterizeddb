@@ -357,7 +357,7 @@ fn tree_bytes(dir: &std::path::Path) -> u64 {
         .flatten()
         .map(|e| {
             let p = e.path();
-            if p.is_dir() { tree_bytes(&p) } else { e.metadata().map_or(0, |m| m.len()) }
+            if p.is_dir() { tree_bytes(&p) } else { crate::core::sync_path::entry_metadata(&e).map_or(0, |m| m.len()) }
         })
         .sum()
 }

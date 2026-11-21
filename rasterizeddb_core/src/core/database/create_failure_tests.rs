@@ -46,7 +46,7 @@ fn files_of(dir: &Path, table: &str) -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.metadata().is_ok_and(|m| m.len() > 0))
+        .filter(|e| crate::core::sync_path::entry_metadata(&e).is_ok_and(|m| m.len() > 0))
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with(&format!("{table}.")) || n.starts_with(&format!("{table}_")))
         .collect();

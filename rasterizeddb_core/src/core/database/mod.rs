@@ -5103,7 +5103,7 @@ fn remove_rename_intent(path: &std::path::Path) -> io::Result<()> {
     #[cfg(test)]
     crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
     match std::fs::remove_file(path) {
-        Ok(()) => crate::core::sync_audit::note("unlink", path),
+        Ok(()) => drop(crate::core::sync_audit::note("unlink", path)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
@@ -6147,6 +6147,11 @@ async fn process_native_request(
     session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    // Every branch but the plain statement's is boxed where it is awaited:
+    // an async fn's future is as large as its largest await, so the rare
+    // branches (the session's path, the role statements, the checkpoint),
+    // inline, made this future 13 KB, copied whole each time it moved, on
+    // every request.
     // An EXEC request (`rastcp::exec`): a statement's text with `$n` in
     // place of its values, and each value as the SQL literal the client
     // would have written there. It is the rendered statement in every way:
@@ -6176,7 +6181,7 @@ async fn process_native_request(
     // CANCEL of one. Ahead of the one-statement rule below, because a simple
     // query may hold several.
     if request_vec.first() == Some(&crate::pgwire::NATIVE_MARK) {
-        return crate::pgwire::native_answer_marked(session, &principal.user, &request_vec).await;
+        return Box::pin(crate::pgwire::native_answer_marked(session, &principal.user, &request_vec)).await;
     }
 
     // Valid UTF-8 (every request a client sends) is borrowed after the fast
@@ -6214,7 +6219,7 @@ async fn process_native_request(
         && session.takes(&query)
     {
         debug!("Native transaction statement from {}", principal);
-        return session.run(&query).await;
+        return Box::pin(session.run(&query)).await;
     }
 
     // Role management is answered by the auth module rather than the RQL
@@ -6242,7 +6247,7 @@ async fn process_native_request(
                 }
 
                 let method = crate::auth::AuthMethod::ScramSha256;
-                match crate::auth::execute_role_statement(&context.database, statement, method)
+                match Box::pin(crate::auth::execute_role_statement(&context.database, statement, method))
                     .await
                 {
                     Ok(()) => vec![0u8],
@@ -6299,7 +6304,7 @@ async fn process_native_request(
                 "permission denied: rdb_index_checkpoint requires superuser ({principal} is not one)"
             ));
         }
-        return native_index_checkpoint(&context.database, name).await;
+        return Box::pin(native_index_checkpoint(&context.database, name)).await;
     }
 
     // A correlated scalar subquery (`SELECT id, (SELECT count(*) FROM p
@@ -6312,7 +6317,7 @@ async fn process_native_request(
     if let Some(session) = session
         && session.needs_session_path(&query).await
     {
-        return session.run_alone(&query).await;
+        return Box::pin(session.run_alone(&query)).await;
     }
 
     #[cfg(not(feature = "query_stats"))]

@@ -275,7 +275,7 @@ async fn run_case(case: &Case, seeds: u64) -> Outcomes {
                                 let mut files: Vec<String> = std::fs::read_dir(&img)
                                     .unwrap()
                                     .filter_map(|e| e.ok())
-                                    .map(|e| format!("{}:{}", e.file_name().to_string_lossy(), e.metadata().map(|m| m.len()).unwrap_or(0)))
+                                    .map(|e| format!("{}:{}", e.file_name().to_string_lossy(), crate::core::sync_path::entry_metadata(&e).map(|m| m.len()).unwrap_or(0)))
                                     .collect();
                                 files.sort();
                                 problems.push(format!("{label}: {e}\n  files {files:?}"))

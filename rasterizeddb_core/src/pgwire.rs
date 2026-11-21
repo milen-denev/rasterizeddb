@@ -1194,6 +1194,10 @@ struct SessionsEnd {
 #[derive(Default)]
 struct ServerSessions {
     ending: AtomicBool,
+    /// Turned true with `ending`: what [`EndsWithServer`] waits on, so a
+    /// session's read ends however the platform treats a socket whose read
+    /// half was shut down.
+    ended: tokio::sync::watch::Sender<bool>,
     next: std::sync::atomic::AtomicU64,
     open: parking_lot::Mutex<Vec<(u64, WatchSocket)>>,
 }
@@ -1237,9 +1241,17 @@ impl SessionsEnd {
     /// session's socket.
     fn end_all(&self) {
         self.server.ending.store(true, Ordering::Release);
+        self.server.ended.send_replace(true);
         for (_, socket) in self.server.open.lock().iter() {
             shutdown_read(socket);
         }
+    }
+
+    /// The sessions of the server serving `catalog`, for a session to learn
+    /// when that server ends them; `None` when no server serves it.
+    fn server_for(catalog: &Arc<DatabaseCatalog>) -> Option<StdArc<ServerSessions>> {
+        let key = Arc::as_ptr(catalog) as usize;
+        SERVERS.lock().iter().rev().find(|(k, _)| *k == key).map(|(_, s)| s.clone())
     }
 
     /// Whether the server serving `catalog` is ending its sessions: what a
@@ -1725,6 +1737,89 @@ fn watch_socket(stream: &PgSock) -> io::Result<WatchSocket> {
             copy.set_nonblocking(true)?;
             Ok(copy)
         }
+    }
+}
+
+/// A session's stream whose reads end, as at the end of the stream, once its
+/// server ends its sessions ([`SessionsEnd::end_all`]); writes pass through,
+/// so the session can still tell the client why.
+///
+/// `shutdown_read` alone did this on Unix, where a read on a socket whose
+/// read half was shut down sees end-of-file. A pending read on Windows never
+/// does: an idle session, or one reading ahead after an `Execute`, outlived
+/// the shutdown there, and its client never got its 57P01. Every read site
+/// of the session goes through this, so each ends the same way.
+struct EndsWithServer<'a, S> {
+    inner: &'a mut S,
+    /// The server's sessions, and a wait on their end, polled only when a
+    /// read is about to wait: a read with bytes to hand pays one load.
+    server: Option<(StdArc<ServerSessions>, std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>)>,
+}
+
+impl<'a, S> EndsWithServer<'a, S> {
+    fn new(inner: &'a mut S, server: Option<StdArc<ServerSessions>>) -> Self {
+        let server = server.map(|server| {
+            let mut rx = server.ended.subscribe();
+            let ended = Box::pin(async move {
+                let _ = rx.wait_for(|ended| *ended).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+            (server, ended)
+        });
+        EndsWithServer { inner, server }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for EndsWithServer<'_, S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = &mut *self;
+        // Nothing filled is the end of the stream.
+        if let Some((server, _)) = &this.server
+            && server.ending.load(Ordering::Acquire)
+        {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match std::pin::Pin::new(&mut *this.inner).poll_read(cx, buf) {
+            std::task::Poll::Pending => {
+                // Woken by the end as well as by bytes.
+                let over = this.server.as_mut().is_some_and(|(_, ended)| ended.as_mut().poll(cx).is_ready());
+                if over { std::task::Poll::Ready(Ok(())) } else { std::task::Poll::Pending }
+            }
+            ready => ready,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for EndsWithServer<'_, S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
@@ -2488,6 +2583,9 @@ async fn run_message_loop_inner<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Every read below ends once the server ends its sessions.
+    let mut ends_with_server = EndsWithServer::new(stream, SessionsEnd::server_for(&state.catalog));
+    let stream = &mut ends_with_server;
     // Whether the last thing sent was a `ReadyForQuery`, i.e. the session is
     // waiting for the client to start something rather than in the middle of
     // an extended-query batch. The idle timeouts run only then, as in

@@ -159,7 +159,7 @@ pub(super) fn write_intent(path: &Path, text: &str) -> io::Result<()> {
         crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Create(&temp));
         let mut file = std::fs::File::create(&temp)?;
         file.write_all(text.as_bytes())?;
-        crate::core::sync_audit::note("rewrite.intent", path);
+        let _synced = crate::core::sync_audit::note("rewrite.intent", path);
         file.sync_all()?;
     }
     #[cfg(test)]

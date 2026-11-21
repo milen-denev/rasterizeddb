@@ -1014,6 +1014,7 @@ async fn closed_partitions_are_never_reported_ready() {
 }
 
 /// The descriptors this process holds on files under `dir`.
+#[cfg(unix)] // lists /proc/self/fd
 fn fds_under(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out: Vec<_> = std::fs::read_dir("/proc/self/fd")
         .unwrap()
@@ -1037,6 +1038,7 @@ fn fds_under(dir: &Path) -> Vec<std::path::PathBuf> {
 ///
 /// Mutation: the failed open keeping the pointer provider alive (its
 /// descriptors stay).
+#[cfg(unix)] // lists /proc/self/fd
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_failing_between_its_providers_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
@@ -2331,6 +2333,7 @@ async fn an_instance_kept_past_its_close_stays_counted() {
 /// for up to two seconds (fixed in P5b-3, `schema_changes_give_a_plain_
 /// tables_descriptors_back_at_once`). The budget counts rather than charges
 /// all the same: what a plain table holds in passing is not a constant.
+#[cfg(unix)] // lists /proc/self/fd
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_budget_counts_what_tables_and_partitions_hold() {
     let dir = tempfile::tempdir().unwrap();
@@ -2590,6 +2593,7 @@ async fn plain_tables_opening_keep_the_descriptor_count_fresh() {
 
 /// The descriptors held on files under `dir` whose names start with
 /// `prefix`, a deleted file's included.
+#[cfg(unix)] // lists /proc/self/fd
 fn fds_named(dir: &Path, prefix: &str) -> usize {
     fds_under(dir)
         .iter()
@@ -2624,6 +2628,7 @@ async fn count_returns_to(count: impl Fn() -> usize, want: usize, within: Durati
 /// same.
 ///
 /// Mutation: the drop not waking the task (`services_released`).
+#[cfg(unix)] // lists /proc/self/fd
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schema_changes_give_a_plain_tables_descriptors_back_at_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -2670,6 +2675,7 @@ async fn schema_changes_give_a_plain_tables_descriptors_back_at_once() {
 /// table's): a partition opens `External`, with no service task of its own,
 /// and a metadata change reloads it in place. A pin, not a fix: this held
 /// before.
+#[cfg(unix)] // lists /proc/self/fd
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn schema_changes_leave_a_partitioned_tables_descriptors_alone() {
     let dir = tempfile::tempdir().unwrap();

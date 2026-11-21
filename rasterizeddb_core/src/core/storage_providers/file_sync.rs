@@ -237,7 +237,7 @@ impl CommitState {
         // needs its bytes and the new file size durable to be readable after a
         // crash. Forcing out mtime/ctime costs an extra journal transaction and
         // buys nothing here.
-        crate::core::sync_audit::note("file.data", Path::new(path));
+        let _synced = crate::core::sync_audit::note("file.data", Path::new(path));
         #[cfg(test)]
         let flushed = if self.fail_next_flush.swap(false, Ordering::AcqRel) {
             Err(io::Error::other("injected fdatasync failure"))
@@ -759,7 +759,10 @@ pub(crate) mod failed_appends {
     #[cfg(test)]
     pub(super) fn injected_append_failure(file: &str) -> bool {
         let mut armed = FAIL_APPEND_TO.lock();
-        match armed.iter().position(|name| file.ends_with(&format!("/{name}"))) {
+        // By whole path components (`a.db`, or `dir/db/a.db`): a string
+        // suffix of "/name" never matched a Windows path.
+        let file = std::path::Path::new(file);
+        match armed.iter().position(|name| file.ends_with(name)) {
             Some(i) => {
                 armed.swap_remove(i);
                 true
@@ -881,9 +884,7 @@ unsafe impl Send for LocalStorageProvider {}
 impl Clone for LocalStorageProvider {
     fn clone(&self) -> Self {
         let map = Arc::new(unsafe {
-            MmapOptions::new()
-                .map(&std::fs::File::open(&self.file_str).unwrap())
-                .unwrap()
+            map_for_reads(&std::fs::File::open(&self.file_str).unwrap()).unwrap()
         });
 
         let read_file = RcArc::new(
@@ -964,6 +965,48 @@ fn byte_vec_pool() -> &'static Pool<ByteVecAllocator, Vec<u8>> {
 // Remapping a growing file can be expensive. We remap lazily only when the mmap coverage
 // falls behind the logical file length by a meaningful amount.
 const REMAP_GROWTH_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Cuts the file behind an append handle back to `at`. Windows grants an
+/// append handle `FILE_APPEND_DATA` without `FILE_WRITE_DATA`, which
+/// `SetEndOfFile` needs: the cut failed there, leaving a failed append's
+/// partial bytes in the file. A handle of its own does it there.
+fn cut_append_file(append: &std::fs::File, path: &str, at: u64) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = append;
+        std::fs::OpenOptions::new().write(true).open(path)?.set_len(at)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        append.set_len(at)
+    }
+}
+
+/// Whether table files are read through a memory map. Not on Windows: there a
+/// mapped file cannot be shortened (`SetEndOfFile` fails with error 1224, "a
+/// user-mapped section open") until every view of it is unmapped, and the
+/// views here live as long as the provider and on in each thread's cache
+/// ([`TLS_MMAP_CACHE`]). Every truncation of an open table file failed: a
+/// torn tail cut at open (the database refused to open), compaction and
+/// VACUUM FULL (nothing shrank), the cut-back after a failed append. Reads
+/// fall back to positional reads wherever the map is short, which on Windows
+/// is everywhere.
+pub(crate) const MAPS_FILES: bool = !cfg!(windows);
+
+/// The read mapping of a table file: the whole file, or, where
+/// [`MAPS_FILES`] is off, an empty map that holds no view of it (memmap2
+/// maps nothing for a zero length).
+///
+/// # Safety
+/// As [`MmapOptions::map`]: the file must not be shortened while it is mapped.
+unsafe fn map_for_reads(file: &std::fs::File) -> io::Result<Mmap> {
+    let mut options = MmapOptions::new();
+    if !MAPS_FILES {
+        options.len(0);
+    }
+    unsafe { options.map(file) }
+}
 
 thread_local! {
     // (provider_key, generation, cached mmap)
@@ -1108,7 +1151,7 @@ impl LocalStorageProvider {
             };
 
             let map = Arc::new(ArcSwap::new(Arc::new(unsafe {
-                MmapOptions::new().map(&file_read_mmap).unwrap()
+                map_for_reads(&file_read_mmap).unwrap()
             })));
 
             let file_len = file_read_mmap.metadata().unwrap().len();
@@ -1242,7 +1285,7 @@ impl LocalStorageProvider {
             };
 
             let map = Arc::new(ArcSwap::new(Arc::new(unsafe {
-                MmapOptions::new().map(&file_read_mmap).unwrap()
+                map_for_reads(&file_read_mmap).unwrap()
             })));
 
             let file_len = file_read_mmap.metadata().unwrap().len();
@@ -1362,7 +1405,7 @@ impl LocalStorageProvider {
     fn land_into_main(&self, main: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
         let at = self.file_len.load(Ordering::Acquire);
         if let Err(e) = main.write_all(bytes).and_then(|()| main.flush()) {
-            if let Err(cut) = main.set_len(at) {
+            if let Err(cut) = cut_append_file(main, &self.file_str, at) {
                 let _ = self.commit.poison(format!(
                     "landing staged bytes in {} failed ({}) and could not be cut back: {}",
                     self.file_str, e, cut
@@ -1428,7 +1471,7 @@ impl LocalStorageProvider {
             if mem.len() == len {
                 let mut main = self.append_file.write();
                 self.land_into_main(&mut main, &mem)?;
-                crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+                let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
                 synced = main.sync_all();
                 // The mirror is deliberately NOT cleared yet. Until the length
                 // is published below, a read of these offsets is still served
@@ -1456,7 +1499,7 @@ impl LocalStorageProvider {
 
             let mut main = self.append_file.write();
             self.land_into_main(&mut main, &buf[..])?;
-            crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+            let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
             synced = main.sync_all();
 
             // As above: the mirror is dropped after the length is published,
@@ -1501,6 +1544,9 @@ impl LocalStorageProvider {
     }
 
     fn update_memory_map(&self) {
+        if !MAPS_FILES {
+            return;
+        }
         // Reuse the dedicated read-only handle; avoids repeated open/close overhead.
         let file = &*self.read_file;
 
@@ -1515,7 +1561,7 @@ impl LocalStorageProvider {
 
         // Create new memory map with the current file size
         self._memory_map
-            .store(Arc::new(unsafe { MmapOptions::new().map(file).unwrap() }));
+            .store(Arc::new(unsafe { map_for_reads(file).unwrap() }));
 
         // Bump generation to invalidate thread-local caches.
         // Acquire/Release pairing ensures that if a thread observes a new generation,
@@ -2002,7 +2048,7 @@ impl StorageIO for LocalStorageProvider {
             // the next append's offset no longer described where its bytes
             // landed. Cut back to the allocator's end instead, leave `file_len`
             // where it was, and fail the transaction at `commit_durable`.
-            if let Err(cut) = file.set_len(at) {
+            if let Err(cut) = cut_append_file(&file, &self.file_str, at) {
                 let _ = self.commit.poison(format!(
                     "append to {} failed ({}) and could not be cut back: {}",
                     self.file_str, e, cut
@@ -2124,7 +2170,7 @@ impl StorageIO for LocalStorageProvider {
         {
             let file = self.write_file.write();
             file.set_len(len)?;
-            crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+            let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
             file.sync_all()?;
         }
         let _ = crate::core::wal::sync_parent_dir(Path::new(&self.file_str));
@@ -2484,7 +2530,7 @@ impl StorageIO for LocalStorageProvider {
         let written = self.inplace.write(|| file.seek(seek).and_then(|_| file.write_all(buffer)))
             .and_then(|()| file.flush())
             .and_then(|()| {
-                crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+                let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
                 file.sync_all()
             });
         if let Err(e) = written {
@@ -2601,7 +2647,7 @@ impl StorageIO for LocalStorageProvider {
             file_len: AtomicU64::new(file_len).into(),
             inplace_end: AtomicU64::new(0).into(),
             _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe {
-                MmapOptions::new().map(&file_read_mmap).unwrap()
+                map_for_reads(&file_read_mmap).unwrap()
             }))),
             mmap_gen: AtomicU64::new(1).into(),
             mmap_key: next_mmap_key(),
@@ -2771,7 +2817,7 @@ impl StorageIO for LocalStorageProvider {
             temp_file_len: AtomicU64::new(staged_len).into(),
             file_len: AtomicU64::new(file_len).into(),
             inplace_end: AtomicU64::new(0).into(),
-            _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe { MmapOptions::new().map(&file_read_mmap)? }))),
+            _memory_map: Arc::new(ArcSwap::new(Arc::new(unsafe { map_for_reads(&file_read_mmap)? }))),
             mmap_gen: AtomicU64::new(1).into(),
             mmap_key: next_mmap_key(),
             hash: CRC.checksum(format!("{}+++{}", final_location, name).as_bytes()),
@@ -2813,11 +2859,11 @@ impl StorageIO for LocalStorageProvider {
         let file_str = format!("{}{}{}", self.location, delimiter, self.table_name);
         // Not a sync: noted so a crash image can tell which deletions a later
         // directory sync made durable.
-        crate::core::sync_audit::note("unlink", Path::new(&file_str));
+        drop(crate::core::sync_audit::note("unlink", Path::new(&file_str)));
         let _ = remove_file(Path::new(&file_str));
 
         // Also remove the companion temp staging file created by this provider.
-        crate::core::sync_audit::note("unlink", Path::new(&self.temp_file_str));
+        drop(crate::core::sync_audit::note("unlink", Path::new(&self.temp_file_str)));
         let _ = remove_file(Path::new(&self.temp_file_str));
     }
 

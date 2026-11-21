@@ -1101,9 +1101,7 @@ impl StorageManager {
         // The bytes, then the directory entry. Renaming over a file whose
         // contents are still only in the page cache would survive a crash as an
         // empty configuration.
-        if let Ok(file) = std::fs::File::open(&temp_path) {
-            let _ = file.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_file(&temp_path);
         if let Err(e) = std::fs::rename(&temp_path, &final_path) {
             error!(
                 "could not replace {}: {}. The placements this database is running with are \
@@ -1227,9 +1225,7 @@ pub fn drop_kv_placements(written_in: &Path, tables: &[String]) -> io::Result<()
     // Through a temporary file and a rename, for the reason `persist` gives.
     let temp = written_in.join(format!("{}.tmp", POOL_FILE));
     std::fs::write(&temp, out.as_bytes())?;
-    if let Ok(file) = std::fs::File::open(&temp) {
-        let _ = file.sync_all();
-    }
+    let _ = crate::core::sync_path::sync_file(&temp);
     std::fs::rename(&temp, &path)?;
     let _ = crate::core::wal::sync_parent_dir(&path);
     Ok(())
@@ -1361,9 +1357,7 @@ pub fn repoint_restored_pool(
     // Through a temporary file and a rename, for the reason `persist` gives.
     let temp = written_in.join(format!("{}.tmp", POOL_FILE));
     std::fs::write(&temp, out.as_bytes())?;
-    if let Ok(file) = std::fs::File::open(&temp) {
-        let _ = file.sync_all();
-    }
+    let _ = crate::core::sync_path::sync_file(&temp);
     std::fs::rename(&temp, &path)?;
     let _ = crate::core::wal::sync_parent_dir(&path);
 
@@ -1864,15 +1858,46 @@ fn statvfs(path: &str) -> Option<libc::statvfs> {
     (rc == 0).then_some(out)
 }
 
+/// Bytes the caller can still write to the volume holding `path` (its quota
+/// counted), from `GetDiskFreeSpaceExW`.
+#[cfg(windows)]
+pub fn available_bytes(path: &str) -> Option<u64> {
+    disk_free_space(path).map(|(available, _)| available)
+}
+
+#[cfg(windows)]
+pub fn total_bytes(path: &str) -> Option<u64> {
+    disk_free_space(path).map(|(_, total)| total)
+}
+
+/// `(available to the caller, total)` for the volume holding `path`, which
+/// must exist.
+#[cfg(windows)]
+fn disk_free_space(path: &str) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(dir: *const u16, available: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+    }
+    if !Path::new(path).exists() {
+        return None;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: a NUL-terminated wide path and three out-parameters the call
+    // fills on success.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+    (ok != 0).then_some((available, total))
+}
+
 /// No implementation on this platform, so the space-aware policy degrades to
 /// round-robin rather than to a wrong answer — `choose` treats `None` as "not
 /// known to be full".
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn available_bytes(_path: &str) -> Option<u64> {
     None
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn total_bytes(_path: &str) -> Option<u64> {
     None
 }
@@ -1890,7 +1915,13 @@ pub fn filesystem_id(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
-#[cfg(not(unix))]
+/// The volume serial number of the volume holding `path`.
+#[cfg(windows)]
+pub fn filesystem_id(path: &str) -> Option<u64> {
+    crate::core::sync_path::volume_and_index(Path::new(path)).ok().map(|(volume, _)| volume)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn filesystem_id(_path: &str) -> Option<u64> {
     None
 }

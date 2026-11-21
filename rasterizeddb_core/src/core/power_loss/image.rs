@@ -131,6 +131,14 @@ struct State {
     victims: HashMap<u64, Vec<u8>>,
     /// Inodes some recorded sync touched: never taken whole.
     synced_inodes: HashSet<u64>,
+    /// An open handle on every victim, held while recording: a file
+    /// unlinked or renamed over frees its inode, and ext4 hands that number
+    /// to the next file created, which the maps above would then take for
+    /// the victim (its undone image read the newcomer's bytes). An open
+    /// handle keeps the inode allocated. Unix only: on Windows a handle
+    /// leaves a deleted name pending, and creating it again fails.
+    #[cfg(unix)]
+    pins: Vec<std::fs::File>,
 }
 
 /// Recorders by directory. The directory sits beside the state so finding
@@ -242,6 +250,10 @@ impl State {
                 && let Ok(bytes) = std::fs::read(p)
             {
                 self.victims.insert(ino, bytes);
+                #[cfg(unix)]
+                if let Ok(f) = std::fs::File::open(p) {
+                    self.pins.push(f);
+                }
             }
             affected.push((r, prior));
         }
@@ -332,9 +344,7 @@ impl Recorder {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             baseline.insert(ino, bytes);
         }
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_dir(dir);
         let state = StdArc::new(Mutex::new(State {
             dir: dir.to_path_buf(),
             baseline,
@@ -343,6 +353,8 @@ impl Recorder {
             ops: Vec::new(),
             victims: HashMap::new(),
             synced_inodes: HashSet::new(),
+            #[cfg(unix)]
+            pins: Vec::new(),
         }));
         RECORDERS.lock().push((dir.to_path_buf(), StdArc::downgrade(&state)));
         let watch = sync_audit::watch(dir);

@@ -208,8 +208,7 @@ fn take_baseline(src: &Path, img: &Path) -> Baseline {
         std::fs::write(img.join(name), &bytes).unwrap();
         files.insert(path);
     }
-    let dir = std::fs::File::open(src).unwrap();
-    dir.sync_all().unwrap();
+    crate::core::sync_path::sync_dir(src).unwrap();
     Baseline {
         src: src.to_path_buf(),
         img: img.to_path_buf(),
