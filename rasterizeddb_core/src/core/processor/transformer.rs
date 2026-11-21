@@ -1552,6 +1552,35 @@ pub struct TransformerProcessor<'a> {
     in_sets_enabled: bool,
 }
 
+/// A part of a `WHERE` clause on a row where some part failed: true, false,
+/// or failed, and so undecided until the parts beside it are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Truth {
+    True,
+    False,
+    Failed,
+}
+
+impl Truth {
+    /// False wins, then failed: a false part decides an `AND`.
+    fn and(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::False, _) | (_, Truth::False) => Truth::False,
+            (Truth::Failed, _) | (_, Truth::Failed) => Truth::Failed,
+            _ => Truth::True,
+        }
+    }
+
+    /// True wins, then failed: a true part decides an `OR`.
+    fn or(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::True, _) | (_, Truth::True) => Truth::True,
+            (Truth::Failed, _) | (_, Truth::Failed) => Truth::Failed,
+            _ => Truth::False,
+        }
+    }
+}
+
 /// One step of the compiled boolean program, in postfix order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalOp {
@@ -1907,9 +1936,10 @@ impl<'a> TransformerProcessor<'a> {
         }
         self.ensure_intermediate_capacity();
 
+        let mut failed = None;
         for t in self.transformers.iter() {
-            match t.transform_on_row(row, &self.intermediate_results)? {
-                Either::Left(result) => {
+            match t.transform_on_row(row, &self.intermediate_results) {
+                Ok(Either::Left(result)) => {
                     if let Some(store_idx) = t.result_store_index {
                         if store_idx >= self.intermediate_results.len() {
                             self.intermediate_results
@@ -1918,13 +1948,178 @@ impl<'a> TransformerProcessor<'a> {
                         self.intermediate_results[store_idx] = result;
                     }
                 }
-                Either::Right(comp) => {
+                Ok(Either::Right(comp)) => {
                     comparison_results.push(comp);
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failed {
+            return self.execute_row_after_error(row, comparison_results, error);
+        }
+
+        Ok(self.evaluate_comparison_results(comparison_results))
+    }
+
+    /// The row again, after one of its steps failed: the clause fails only
+    /// when the failed parts decide its answer.
+    ///
+    /// An `AND` with a part that is false is false, and an `OR` with a part
+    /// that is true is true, whatever the other parts do, failing included.
+    /// So `WHERE i32c + 1 > 10 AND i32c < 1000` is false for an `i32c` of
+    /// 2147483647, not "integer out of range". PostgreSQL leaves the order in
+    /// which a boolean expression's parts are evaluated undefined, and skips
+    /// the ones that cannot change the result, so it may answer either way.
+    /// What matters here is that the answer is always the same one.
+    ///
+    /// It was not. Each part ran in the order written and the first error
+    /// failed the statement, unless the batch prefilter had already dropped
+    /// the row for its `i32c < 1000`. The prefilter turns itself off part
+    /// way through a statement when nearly every row passes, for all workers
+    /// at once, so the same statement over the same rows answered or failed
+    /// by which batches ran before that switch (seen 2026-11-19). The
+    /// prefilter, the zone maps and the indexes all drop a row only when the
+    /// clause is false whatever its unread parts hold, which is exactly when
+    /// this answers false, so every route now agrees.
+    ///
+    /// Out of line and cold: no statement that does not fail pays for it. The
+    /// steps are deterministic, so running them again meets the same failure.
+    /// The error raised, when one is, is the first in written order.
+    #[cold]
+    #[inline(never)]
+    fn execute_row_after_error<R: RowBlocks + ?Sized>(
+        &mut self,
+        row: &R,
+        comparison_results: &mut SmallVec<[(bool, Option<Next>); 20]>,
+        first: EvalError,
+    ) -> Result<bool, EvalError> {
+        comparison_results.clear();
+        // Which comparisons failed, by position in `comparison_results`, and
+        // which stored intermediates are the result of a failed step.
+        let mut failed_comparisons: SmallVec<[bool; 20]> = SmallVec::new();
+        let mut failed_stores: SmallVec<[bool; 20]> =
+            SmallVec::from_elem(false, self.intermediate_results.len());
+
+        for t in self.transformers.iter() {
+            let from_failed = |index: Option<usize>| {
+                index.is_some_and(|i| failed_stores.get(i).copied().unwrap_or(false))
+            };
+            let outcome = if from_failed(t.result_index_1) || from_failed(t.result_index_2) {
+                None
+            } else {
+                t.transform_on_row(row, &self.intermediate_results).ok()
+            };
+            let is_comparison = matches!(
+                t.transformer_type,
+                ColumnTransformerType::ComparerOperation(_)
+            );
+            match outcome {
+                Some(Either::Left(result)) => {
+                    if let Some(store_idx) = t.result_store_index {
+                        if store_idx >= self.intermediate_results.len() {
+                            self.intermediate_results
+                                .resize(store_idx + 1, MemoryBlock::default());
+                        }
+                        self.intermediate_results[store_idx] = result;
+                        if store_idx < failed_stores.len() {
+                            failed_stores[store_idx] = false;
+                        }
+                    }
+                }
+                Some(Either::Right(comp)) => {
+                    comparison_results.push(comp);
+                    failed_comparisons.push(false);
+                }
+                None if is_comparison => {
+                    comparison_results.push((false, t.next.clone()));
+                    failed_comparisons.push(true);
+                }
+                None => {
+                    if let Some(store_idx) = t.result_store_index {
+                        if store_idx >= failed_stores.len() {
+                            failed_stores.resize(store_idx + 1, false);
+                        }
+                        failed_stores[store_idx] = true;
+                    }
                 }
             }
         }
 
-        Ok(self.evaluate_comparison_results(comparison_results))
+        match self.evaluate_with_failures(comparison_results, &failed_comparisons) {
+            Truth::True => Ok(true),
+            Truth::False => Ok(false),
+            Truth::Failed => Err(first),
+        }
+    }
+
+    /// [`Self::evaluate_comparison_results`] where some comparisons failed:
+    /// a failed part is overruled by a false one in an `AND` and by a true
+    /// one in an `OR`, and decides the result otherwise.
+    fn evaluate_with_failures(
+        &self,
+        results: &[(bool, Option<Next>)],
+        failed: &[bool],
+    ) -> Truth {
+        let truth = |i: usize| match (results.get(i), failed.get(i)) {
+            (_, Some(true)) => Truth::Failed,
+            (Some((true, _)), _) => Truth::True,
+            _ => Truth::False,
+        };
+        if results.is_empty() {
+            return Truth::False;
+        }
+        if self.comparison_program.is_empty() {
+            return Self::evaluate_flat_with_failures(results, &truth);
+        }
+
+        let mut stack: SmallVec<[Truth; 16]> = SmallVec::new();
+        for op in self.comparison_program.iter() {
+            match op {
+                EvalOp::Value(i) => {
+                    if (*i as usize) >= results.len() {
+                        return Self::evaluate_flat_with_failures(results, &truth);
+                    }
+                    stack.push(truth(*i as usize));
+                }
+                EvalOp::And | EvalOp::Or => {
+                    let (Some(b), Some(a)) = (stack.pop(), stack.pop()) else {
+                        return Self::evaluate_flat_with_failures(results, &truth);
+                    };
+                    stack.push(if *op == EvalOp::And { a.and(b) } else { a.or(b) });
+                }
+            }
+        }
+        stack.pop().unwrap_or(Truth::False)
+    }
+
+    /// [`Self::evaluate_flat`] where some comparisons failed.
+    fn evaluate_flat_with_failures(
+        results: &[(bool, Option<Next>)],
+        truth: &impl Fn(usize) -> Truth,
+    ) -> Truth {
+        let mut answer = Truth::False;
+        let mut current_and = Truth::True;
+        for (i, (_, next)) in results.iter().enumerate() {
+            current_and = current_and.and(truth(i));
+            match next {
+                Some(Next::And) => {}
+                Some(Next::Or) => {
+                    answer = answer.or(current_and);
+                    current_and = Truth::True;
+                }
+                None => {
+                    answer = answer.or(current_and);
+                    // As the flat walk: nothing after a part with no link.
+                    return answer;
+                }
+            }
+        }
+        // As the flat walk: a trailing group whose last link dangles counts
+        // for nothing, and the groups closed before it decide.
+        answer
     }
 
     fn evaluate_comparison_results(&self, results: &[(bool, Option<Next>)]) -> bool {

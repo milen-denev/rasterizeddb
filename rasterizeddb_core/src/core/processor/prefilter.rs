@@ -72,7 +72,12 @@
 //! false for that row: `WHERE a > 100 AND 10 / b > 1` no longer divides by a
 //! zero `b` on a row where `a <= 100`. PostgreSQL leaves the order in which
 //! the parts of a boolean expression are evaluated undefined, and skips the
-//! parts whose result cannot matter, so it makes the same choice.
+//! parts whose result cannot matter, so it makes the same choice. The row
+//! interpreter makes it too (`TransformerProcessor::execute_row_after_error`):
+//! a failed part fails the clause only when no other part decides the row.
+//! Before that, a statement answered or failed by which of its batches ran
+//! before this prefilter turned itself off, since the interpreter raised in
+//! written order on the rows the prefilter had not dropped.
 //! `tests::prefilter_cost` measures both ends.
 //!
 //! # When the mask is the answer
@@ -868,6 +873,14 @@ mod tests {
         "n > 1.5 AND i32c < 0",
         "i32c + 1 > 10",
         "(i32c > 10 AND i64c < 0) OR (u8c = 7 AND f IS NULL)",
+        // A part that fails on some rows beside a part that is false on
+        // them. The prefilter drops those rows for the second part only
+        // when it is on, so the clause must not fail on them when it is off.
+        "i32c + 1 > 10 AND i32c < 1000",
+        "i32c < 1000 AND i32c + 1 > 10",
+        "(i32c + 1 > 10 AND i32c < 1000) OR id < 0",
+        "(i32c + 1 > 10 OR i32c > 1000) AND id >= 0",
+        "10 / i8c > 1 AND i8c > 5",
     ];
 
     async fn differential(in_memory: bool) {
@@ -1259,6 +1272,54 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn prefilter_never_changes_an_answer_in_memory() {
         differential(true).await;
+    }
+
+    /// A clause fails on a row only when its failed part decides the row,
+    /// with the prefilter on or off. `i32c` holds 2147483647 on some rows,
+    /// where `i32c + 1` is out of range.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_part_fails_the_clause_only_when_it_decides() {
+        let _g = SWITCH.lock().await;
+        let dir = std::env::temp_dir().join(format!("prefilter_failing_part_{}", std::process::id()));
+        let dir = dir.to_string_lossy().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _cleanup = RemoveDir(dir.clone());
+        let db = Arc::new(Database::new_with_backend(&dir, true).await);
+        // The second list failing is what shows the table holds the rows the
+        // first list must not fail on.
+        table(&db, 25_000).await;
+
+        let fails = |reply: &[u8]| reply.first() == Some(&3);
+        for on in [false, true] {
+            super::set_enabled(on);
+            for sql in [
+                // A false part beside it decides these rows.
+                "SELECT COUNT(*) FROM t WHERE i32c + 1 > 10 AND i32c < 1000",
+                "SELECT COUNT(*) FROM t WHERE i32c < 1000 AND i32c + 1 > 10",
+                // A true part beside it decides them.
+                "SELECT COUNT(*) FROM t WHERE i32c + 1 > 10 OR i32c > 1000",
+                "SELECT COUNT(*) FROM t WHERE (i32c + 1 > 10 OR i32c > 1000) AND id >= 0",
+            ] {
+                let reply = run(&db, sql).await;
+                assert!(!fails(&reply), "prefilter {on}: {sql} failed: {}", String::from_utf8_lossy(&reply));
+            }
+            for sql in [
+                // Nothing beside the failed part decides these rows.
+                "SELECT COUNT(*) FROM t WHERE i32c + 1 > 10 AND i32c > 1000",
+                "SELECT COUNT(*) FROM t WHERE i32c + 1 > 10",
+                "SELECT COUNT(*) FROM t WHERE i32c + 1 > 10 OR i32c < -1000",
+                "SELECT COUNT(*) FROM t WHERE (i32c + 1 > 10 AND id >= 0) OR id < 0",
+            ] {
+                let reply = run(&db, sql).await;
+                assert!(fails(&reply), "prefilter {on}: {sql} answered instead of failing");
+                assert!(
+                    String::from_utf8_lossy(&reply).contains("range"),
+                    "prefilter {on}: {sql} failed with something else: {}",
+                    String::from_utf8_lossy(&reply)
+                );
+            }
+        }
+        super::set_enabled(true);
     }
 
     /// What the prefilter costs and saves, per SIMD level:
