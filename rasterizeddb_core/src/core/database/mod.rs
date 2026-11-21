@@ -6356,7 +6356,9 @@ async fn run_native_query_learning(
             let (response, capture) =
                 crate::core::rql::prepared::capturing(run_native_query(query, database)).await;
             if response.first() != Some(&3) {
-                session.text_learn(watch, capture);
+                if let Some((template, check)) = session.text_learn(watch, capture) {
+                    session.text_check_index(template, check).await;
+                }
             }
             response
         }

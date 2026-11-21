@@ -4710,6 +4710,97 @@ impl<S: StorageIO> Table<S> {
         Ok(self.candidates_for(d, where_clause, limit).await)
     }
 
+    /// The candidates a unique index gives for a full-key equality, from
+    /// the key's stored bytes rather than from a clause's text
+    /// ([`crate::core::row::point_key`]): per key column its write order, its
+    /// type, the bytes it equals, and (`names`) its name. `Ok(None)` when the
+    /// key cannot be answered so (a column not live under that name and type,
+    /// a type off [`point_key::key_type_allowed`], a column no index keys,
+    /// the indexes not built or loading): the text path is the answer then.
+    ///
+    /// The predicate is the one the text `col = literal AND …` extracts to,
+    /// asked of the same `TableIndexes::plan`. A learned statement checks
+    /// that this gives what [`Self::build_candidates`] gives for its rendered
+    /// clause before it uses one.
+    ///
+    /// [`point_key::key_type_allowed`]: crate::core::row::point_key::key_type_allowed
+    // Called by the learned side's IndexPlan (rasterizeddb-78's half).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn candidates_for_key(
+        &self,
+        levels: &[(u32, DbType, &[u8])],
+        names: &[&str],
+    ) -> Result<Option<Arc<CandidateBitmap>>> {
+        let d = self.data()?;
+        Ok(self.key_candidates(d, levels, names).await)
+    }
+
+    /// The key columns, in key order, of each built unique index whose every
+    /// column a bound key can answer ([`Self::candidates_for_key`]): per
+    /// column its write order, type and name. What a learned statement
+    /// matches its compared columns against. A non-unique index is never
+    /// one: a full-key equality on it is not a point.
+    // Called by the learned side's IndexPlan (rasterizeddb-78's half).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn point_indexes(&self) -> Result<Vec<Vec<(u32, DbType, StdArc<str>)>>> {
+        let d = self.data()?;
+        let Some(indexes) = d.indexes.as_ref().filter(|i| i.is_ready()) else {
+            return Ok(Vec::new());
+        };
+        let fields = &self.schema.fields;
+        Ok(indexes
+            .list
+            .iter()
+            .filter(|index| index.decl.unique && !index.decl.is_deleted && !index.columns.is_empty())
+            .filter_map(|index| {
+                index
+                    .columns
+                    .iter()
+                    .map(|(wo, t)| {
+                        let field = fields.iter().find(|f| !f.is_deleted && f.write_order == u64::from(*wo))?;
+                        (field.db_type == *t && crate::core::row::point_key::key_type_allowed(field, fields))
+                            .then(|| (*wo, t.clone(), StdArc::<str>::from(field.name.as_str())))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect())
+    }
+
+    /// [`Self::candidates_for_key`]'s body.
+    async fn key_candidates(
+        &self,
+        d: &TableData<S>,
+        levels: &[(u32, DbType, &[u8])],
+        names: &[&str],
+    ) -> Option<Arc<CandidateBitmap>> {
+        use crate::core::filter::sarg::{MaskExpr, SargPredicate};
+        use crate::core::filter::zonemap::SargOp;
+        if levels.is_empty() || levels.len() != names.len() || self.gate.loads().loading() {
+            return None;
+        }
+        let indexes = d.indexes.as_ref().filter(|i| i.is_ready())?;
+        let fields = &self.schema.fields;
+        let mut preds = Vec::with_capacity(levels.len());
+        for ((wo, db_type, bytes), name) in levels.iter().zip(names) {
+            let field = fields.iter().find(|f| !f.is_deleted && f.write_order == u64::from(*wo))?;
+            if field.name != *name
+                || field.db_type != *db_type
+                || !crate::core::row::point_key::key_type_allowed(field, fields)
+                || !indexes.covers(*wo)
+            {
+                return None;
+            }
+            preds.push(MaskExpr::Pred(SargPredicate { write_order: *wo, op: SargOp::Eq, value: bytes.to_vec() }));
+        }
+        // As `index_candidates`: the length sampled before the index is
+        // asked, so a version appended since stays a candidate.
+        let n_slots = d.io_pointers.get_len().await / ROW_POINTER_RECORD_LEN as u64;
+        let cap = crate::core::index::candidate_cap(n_slots);
+        let mut slots = indexes.plan(&MaskExpr::And(preds), fields, cap)?;
+        slots.retain(|s| *s < n_slots);
+        Some(Arc::new(CandidateBitmap::sparse(slots, n_slots)))
+    }
+
     /// The body of [`Self::build_candidates`], for a caller that already
     /// holds the table's data.
     async fn candidates_for(
@@ -4741,6 +4832,22 @@ impl<S: StorageIO> Table<S> {
         // will then reject with a proper message.
         if where_clause.trim().is_empty() {
             return None;
+        }
+        // A learned point `SELECT`'s own scan: its key asks the index
+        // directly, the clause's text unread (`point_key`). Only for the
+        // table and the clause it was bound for; anything it cannot answer
+        // falls through to the text, below.
+        if let Some(key) = crate::core::row::point_key::current()
+            && *key.table == *self.schema.name
+            && *key.where_clause == *where_clause
+        {
+            let levels: SmallVec<[(u32, DbType, &[u8]); 3]> =
+                key.levels.iter().map(|(wo, t, bytes)| (*wo, t.clone(), bytes.as_slice())).collect();
+            let names: SmallVec<[&str; 3]> = key.names.iter().map(|n| &**n).collect();
+            if let Some(found) = self.key_candidates(d, &levels, &names).await {
+                crate::core::row::point_key::HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(found);
+            }
         }
         let judge_constant = sarg::worth_judging_constant(where_clause);
         // A load of the snapshot's INDEX sections in flight (B17): waited for

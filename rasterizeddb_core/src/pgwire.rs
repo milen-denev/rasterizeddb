@@ -3492,6 +3492,9 @@ struct PreparedLearned {
     /// verifying executions (S16b). Reset with everything else on a schema
     /// change.
     route: Option<crate::core::rql::prepared::RoutePlan>,
+    /// On a plain table, the full-key point shape's index derivation
+    /// ([`LearnedIndex`]).
+    index: LearnedIndex,
     /// The shape epoch of the instance both verifying executions read
     /// (§7 `shape_epoch`, Q7). The executor re-checks it after the lock: a
     /// change while a run waited takes the text path in the same `Execute`.
@@ -7205,6 +7208,10 @@ fn watch_step(
             (Some(lits), Some(cls)) if *cls == l.classes => {
                 let mut query_row = l.query_row.clone();
                 query_row.where_clause = l.template.render(lits);
+                let point = match &l.index {
+                    LearnedIndex::Ready(plan) => plan.bind(lits, query_row.where_clause.as_str().into()),
+                    _ => None,
+                };
                 WatchStep::Run(PreparedRun {
                     rows: Box::new(pr::PreparedRows {
                         table_name: l.table_name.clone(),
@@ -7212,6 +7219,7 @@ fn watch_step(
                         // This execution's own values, through the cached
                         // derivation (I11).
                         key: l.route.as_ref().and_then(|plan| plan.bind(lits)),
+                        point,
                         shape_epoch: l.shape_epoch,
                     }),
                     fields: l.fields.clone(),
@@ -7231,6 +7239,7 @@ fn watch_step(
                         table_name: l.table_name.clone(),
                         query_row,
                         key: None,
+                        point: None,
                         shape_epoch: l.shape_epoch,
                     }),
                     fields: l.fields.clone(),
@@ -7341,6 +7350,13 @@ where
             if result.is_ok() && !state.statement_failed {
                 if let (Some(literals), Some(classes)) = (literals, classes) {
                     learn_prepared(database, state, &key, generation, literals, classes, capture);
+                    let check = watched_slot(state, database, &key, false).and_then(|(p, _)| pending_index(p));
+                    if let Some(check) = check {
+                        let ok = Box::pin(check_index(database, &check)).await;
+                        if let Some((prepared, _)) = watched_slot(state, database, &key, false) {
+                            settle_index(database, prepared, &check, ok);
+                        }
+                    }
                 }
             }
             result
@@ -7464,6 +7480,7 @@ fn learn_into(
                 misses: 0,
                 exact: false,
                 route: None,
+                index: LearnedIndex::None,
                 shape_epoch,
                 #[cfg(feature = "query_stats")]
                 stats: Default::default(),
@@ -7513,6 +7530,10 @@ fn learn_into(
                 && l.template.render(&literals) == query_row.where_clause
             {
                 l.route = learn_route(database, &l, &columns, &literals);
+                l.index = match &l.route {
+                    Some(_) => LearnedIndex::None,
+                    None => derive_index(database, &l, &columns, &literals),
+                };
                 let mut query_row = query_row;
                 query_row.where_clause = String::new();
                 l.query_row = query_row;
@@ -7565,6 +7586,121 @@ fn learn_route(
         }
     }
     Some(plan)
+}
+
+/// A learned statement's index derivation (`prepared::IndexPlan`): none,
+/// one derived when the statement became ready and not yet checked, or one
+/// checked and in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LearnedIndex {
+    None,
+    /// Derived, to be checked against the text path's candidates for the two
+    /// verifying executions' values (`l.literals`, then `second`) before any
+    /// run uses it ([`check_index`]).
+    Pending { plan: crate::core::rql::prepared::IndexPlan, second: Vec<String> },
+    Ready(crate::core::rql::prepared::IndexPlan),
+}
+
+/// The index derivation a statement that just became ready on a plain table
+/// may use: every column of one of the table's unique indexes compared with
+/// exactly one parameter. Only derived here; [`check_index`] decides.
+fn derive_index(
+    database: &Arc<Database>,
+    l: &PreparedLearned,
+    columns: &[String],
+    literals: &[String],
+) -> LearnedIndex {
+    let Some(crate::core::database::Relation::Plain(table)) = database.relation(&l.table_name) else {
+        return LearnedIndex::None;
+    };
+    let name: StdArc<str> = table.schema.name.as_str().into();
+    // A table that cannot answer (a shell) has no index to derive from.
+    table
+        .point_indexes()
+        .unwrap_or_default()
+        .iter()
+        .find_map(|key| crate::core::rql::prepared::IndexPlan::derive(name.clone(), key, columns))
+        .map_or(LearnedIndex::None, |plan| LearnedIndex::Pending { plan, second: literals.to_vec() })
+}
+
+/// What [`check_index`] needs from a statement whose index derivation is
+/// pending, copied out so no lock is held while it reads the table.
+pub(crate) struct IndexCheck {
+    generation: u64,
+    shape_epoch: u64,
+    table_name: String,
+    template: crate::core::rql::prepared::WhereTemplate,
+    plan: crate::core::rql::prepared::IndexPlan,
+    values: [Vec<String>; 2],
+}
+
+/// `prepared`'s pending index derivation, if it has one.
+fn pending_index(prepared: &PreparedSelect) -> Option<IndexCheck> {
+    let PreparedSelect::Ready(l) = prepared else {
+        return None;
+    };
+    let LearnedIndex::Pending { plan, second } = &l.index else {
+        return None;
+    };
+    Some(IndexCheck {
+        generation: l.generation,
+        shape_epoch: l.shape_epoch,
+        table_name: l.table_name.clone(),
+        template: l.template.clone(),
+        plan: plan.clone(),
+        values: [l.literals.clone(), second.clone()],
+    })
+}
+
+/// Whether `check`'s derivation finds, for each verifying execution's
+/// values, exactly the candidate rows the text path finds for its rendered
+/// `WHERE`. Both must answer: a table with no candidates by index either way
+/// (an index not ready, loading) keeps nothing.
+async fn check_index(database: &Arc<Database>, check: &IndexCheck) -> bool {
+    let Some(crate::core::database::Relation::Plain(table)) = database.relation(&check.table_name) else {
+        return false;
+    };
+    if database.slot_shape_epoch(&check.table_name) != Some(check.shape_epoch) {
+        return false;
+    }
+    for values in &check.values {
+        let where_clause = check.template.render(values);
+        let Some(key) = check.plan.bind(values, where_clause.as_str().into()) else {
+            return false;
+        };
+        let levels: Vec<(u32, DbType, &[u8])> = key.levels.iter().map(|(w, t, b)| (*w, t.clone(), &b[..])).collect();
+        let names: Vec<&str> = key.names.iter().map(|n| &**n).collect();
+        // Both outside any key scope: the text candidates are the ones the
+        // rendered `WHERE` alone gives. Rows appended between the two reads
+        // count on one side only, which costs the plan and nothing else.
+        let (Ok(Some(by_key)), Ok(Some(by_text))) =
+            (table.candidates_for_key(&levels, &names).await, table.build_candidates(&where_clause, None).await)
+        else {
+            return false;
+        };
+        if (by_key.slots(), by_key.n_slots()) != (by_text.slots(), by_text.n_slots()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Records [`check_index`]'s answer, `ok`, for the derivation `check` was
+/// taken from, if `prepared` still holds it: unchanged schema, same table
+/// instance, same derivation still pending. A failed check keeps the
+/// statement ready without an index derivation, for good.
+fn settle_index(database: &Arc<Database>, prepared: &mut PreparedSelect, check: &IndexCheck, ok: bool) {
+    let PreparedSelect::Ready(l) = prepared else {
+        return;
+    };
+    if l.generation != check.generation
+        || l.shape_epoch != check.shape_epoch
+        || database.schema_generation.load(std::sync::atomic::Ordering::Acquire) != check.generation
+        || !matches!(&l.index, LearnedIndex::Pending { plan, .. } if *plan == check.plan)
+    {
+        return;
+    }
+    l.index = if ok { LearnedIndex::Ready(check.plan.clone()) } else { LearnedIndex::None };
 }
 
 /// One statement: its cached parse when it has one, its text otherwise.

@@ -146,6 +146,22 @@ impl CandidateBitmap {
         self.sparse.as_deref()
     }
 
+    /// Every candidate slot below `n_slots`, ascending, whichever form the
+    /// mask takes: so two masks compare as sets with `==`. Slots at or past
+    /// `n_slots` are candidates either way and are not listed; compare
+    /// [`Self::n_slots`] too, or a mask sampled after an append differs from
+    /// one sampled before it. Empty for [`Self::nothing`]. For checks, not
+    /// for a scan: a dense mask is walked bit by bit.
+    pub fn slots(&self) -> Vec<u64> {
+        if self.nothing {
+            return Vec::new();
+        }
+        match &self.sparse {
+            Some(list) => list.iter().copied().filter(|s| *s < self.n_slots).collect(),
+            None => (0..self.n_slots).filter(|s| self.get(*s)).collect(),
+        }
+    }
+
     /// The first candidate slot at or after `from`. Past `n_slots` every slot
     /// is a candidate, so this is never more than `max(from, n_slots)`.
     pub fn next_candidate(&self, from: u64) -> u64 {

@@ -59,6 +59,12 @@ pub struct PreparedRows {
     /// values through the statement's [`RoutePlan`] (S16b). `None` routes the
     /// rendered `WHERE` instead, as S15 does.
     pub key: Option<BoundKey>,
+    /// On a plain table whose learned `WHERE` pins every column of a unique
+    /// index by equality to a parameter: this execution's key, through the
+    /// statement's [`IndexPlan`]. The scan finds its candidate rows by it
+    /// rather than by reading the rendered `WHERE` for them; `None` reads
+    /// the `WHERE`, as before.
+    pub(crate) point: Option<crate::core::row::point_key::PointKey>,
     /// The shape epoch of the table instance the parse was learned on
     /// (`docs/persistent-indexes.md` §7 `shape_epoch`, Q7): re-checked by the
     /// executor after the table lock is granted. A table reshaped, or dropped
@@ -111,7 +117,7 @@ pub struct RouteSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundKey {
     pub uid: u64,
-    pub levels: smallvec::SmallVec<[(u32, DbType, smallvec::SmallVec<[u8; 16]>); 3]>,
+    pub levels: KeyLevels,
 }
 
 impl RoutePlan {
@@ -123,28 +129,100 @@ impl RoutePlan {
     /// equalities is not read here; the caller checks the plan against
     /// `route_where` on observed executions before keeping it.
     pub fn derive(uid: u64, key: &[(u32, DbType, &str)], columns: &[String]) -> Option<Self> {
-        let mut slots = smallvec::SmallVec::new();
-        for (write_order, db_type, name) in key {
-            let mut params = columns.iter().enumerate().filter(|(_, c)| c.eq_ignore_ascii_case(name));
-            let (param, _) = params.next()?;
-            if params.next().is_some() {
-                return None;
-            }
-            slots.push(RouteSlot { param, write_order: *write_order, db_type: db_type.clone() });
-        }
-        (!slots.is_empty()).then_some(Self { uid, slots })
+        Some(Self { uid, slots: key_slots(key, columns)? })
     }
 
     /// This execution's key from its `literals` (as `pg_params::param_literal`
     /// wrote them). `None` when a value is not one [`key_value_bytes`] reads
     /// for certain; the execution then routes its rendered `WHERE`.
     pub fn bind(&self, literals: &[String]) -> Option<BoundKey> {
-        let mut levels = smallvec::SmallVec::new();
-        for slot in &self.slots {
-            let value = key_value_bytes(literals.get(slot.param)?, &slot.db_type)?;
-            levels.push((slot.write_order, slot.db_type.clone(), value));
+        Some(BoundKey { uid: self.uid, levels: bind_slots(&self.slots, literals)? })
+    }
+}
+
+/// One execution's values for a key, per column in key order: the column's
+/// write order, declared type, and the stored bytes the value compares as.
+pub type KeyLevels = smallvec::SmallVec<[(u32, DbType, smallvec::SmallVec<[u8; 16]>); 3]>;
+
+/// Which parameter feeds each column of `key` (write order, declared type,
+/// name; in key order), given the column each parameter is compared with
+/// (`columns`, [`compared_columns`]' answer): `Some` when every key column is
+/// compared with exactly one parameter. Whether the comparisons are
+/// top-level equalities is not read here: the caller checks the slots
+/// against the text path on observed executions before keeping them.
+fn key_slots(key: &[(u32, DbType, &str)], columns: &[String]) -> Option<smallvec::SmallVec<[RouteSlot; 3]>> {
+    let mut slots = smallvec::SmallVec::new();
+    for (write_order, db_type, name) in key {
+        let mut params = columns.iter().enumerate().filter(|(_, c)| c.eq_ignore_ascii_case(name));
+        let (param, _) = params.next()?;
+        if params.next().is_some() {
+            return None;
         }
-        Some(BoundKey { uid: self.uid, levels })
+        slots.push(RouteSlot { param, write_order: *write_order, db_type: db_type.clone() });
+    }
+    (!slots.is_empty()).then_some(slots)
+}
+
+/// `slots` bound to this execution's `literals`: `None` when a value is not
+/// one [`key_value_bytes`] reads for certain.
+fn bind_slots(slots: &[RouteSlot], literals: &[String]) -> Option<KeyLevels> {
+    let mut levels = smallvec::SmallVec::new();
+    for slot in slots {
+        let value = key_value_bytes(literals.get(slot.param)?, &slot.db_type)?;
+        levels.push((slot.write_order, slot.db_type.clone(), value));
+    }
+    Some(levels)
+}
+
+/// On a plain table, the full-key point shape's index derivation: which
+/// parameter feeds each column of one of the table's unique indexes
+/// (`Table::point_indexes`), so an execution finds its candidate rows by
+/// looking its own key up rather than by reading its rendered `WHERE` for
+/// them ([`PointKey`](crate::core::row::point_key::PointKey)).
+///
+/// Kept only after pgwire checked, on both executions that verified the
+/// template, that the bound key's candidates are exactly the ones the text
+/// path's candidates are for the rendered `WHERE`: that is what admits
+/// only top-level equalities, as for [`RoutePlan`]. The candidates are a
+/// superset the scan still filters by the whole `WHERE` row by row, so the
+/// one thing a wrong plan could do is lose a row, which is what the check
+/// compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPlan {
+    /// The table it was learned on, by name. The scan uses a key only on a
+    /// table of this name whose live columns have the key's write orders,
+    /// names and types, so a key is never applied to columns it was not
+    /// bound for.
+    pub table: std::sync::Arc<str>,
+    /// One per index column, in the index's key order.
+    pub slots: smallvec::SmallVec<[RouteSlot; 3]>,
+    /// Each slot's column name.
+    pub names: smallvec::SmallVec<[std::sync::Arc<str>; 3]>,
+}
+
+impl IndexPlan {
+    /// The plan for a statement whose parameters are compared with
+    /// `columns`, on table `table` whose unique index has the key `key`
+    /// (`Table::point_indexes`).
+    pub fn derive(table: std::sync::Arc<str>, key: &[(u32, DbType, std::sync::Arc<str>)], columns: &[String]) -> Option<Self> {
+        let named: Vec<(u32, DbType, &str)> = key.iter().map(|(w, t, n)| (*w, t.clone(), &**n)).collect();
+        let slots = key_slots(&named, columns)?;
+        Some(Self { table, slots, names: key.iter().map(|(_, _, n)| n.clone()).collect() })
+    }
+
+    /// This execution's key for its rendered `where_clause`, or `None`
+    /// (the scan reads the `WHERE`).
+    pub(crate) fn bind(
+        &self,
+        literals: &[String],
+        where_clause: std::sync::Arc<str>,
+    ) -> Option<crate::core::row::point_key::PointKey> {
+        Some(crate::core::row::point_key::PointKey {
+            table: self.table.clone(),
+            where_clause,
+            levels: bind_slots(&self.slots, literals)?,
+            names: self.names.clone(),
+        })
     }
 }
 
@@ -688,6 +766,29 @@ pub(crate) mod test_counters {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_index_plan_feeds_each_key_column_from_its_one_parameter() {
+        use crate::core::db_type::DbType;
+        use std::sync::Arc;
+        let key: Vec<(u32, DbType, Arc<str>)> =
+            vec![(3, DbType::I64, "a".into()), (5, DbType::STRING, "b".into())];
+        let cols = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let plan = IndexPlan::derive("t".into(), &key, &cols(&["b", "A"])).unwrap();
+        assert_eq!(plan.slots.iter().map(|s| s.param).collect::<Vec<_>>(), [1, 0]);
+        assert_eq!(&*plan.names[1], "b");
+        // A key column compared twice, or not at all, has no one parameter.
+        assert!(IndexPlan::derive("t".into(), &key, &cols(&["a", "a", "b"])).is_none());
+        assert!(IndexPlan::derive("t".into(), &key, &cols(&["a"])).is_none());
+
+        let point = plan.bind(&["'x'".to_string(), "42".to_string()], "b = 'x' AND a = 42".into()).unwrap();
+        assert_eq!(&*point.table, "t");
+        assert_eq!(&*point.where_clause, "b = 'x' AND a = 42");
+        assert_eq!(point.levels[0].2.as_slice(), 42i64.to_le_bytes());
+        assert_eq!(point.levels[1].2.as_slice(), b"x");
+        // A value key_value_bytes does not read for certain binds nothing.
+        assert!(plan.bind(&["'x'".to_string(), "4.2".to_string()], "".into()).is_none());
+        assert!(plan.bind(&["'x '".to_string(), "42".to_string()], "".into()).is_none());
+    }
     fn lits(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }

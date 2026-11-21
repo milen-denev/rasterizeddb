@@ -395,20 +395,28 @@ impl NativeSession {
     /// from it rather than describing the statement again every time (a
     /// table with a NUMERIC, a document or a timestamp needs a retag on every
     /// answer). The verifying run compares it as it compares the rest.
-    pub(crate) fn text_learn(&self, watch: NativeWatch, mut capture: crate::core::rql::prepared::Capture) {
+    ///
+    /// When the statement just became ready with an index derivation to
+    /// check, answers it, for the caller to hand to [`Self::text_check_index`]
+    /// once the lock is released.
+    pub(crate) fn text_learn(
+        &self,
+        watch: NativeWatch,
+        mut capture: crate::core::rql::prepared::Capture,
+    ) -> Option<(String, super::IndexCheck)> {
         let Some(purpose) = crate::core::rql::lexer_s1::recognize_query_purpose(&watch.query) else {
-            return;
+            return None;
         };
         let Ok(description) = super::result_description(&self.database, &purpose) else {
-            return;
+            return None;
         };
         capture.description = Some(description);
         let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
         let Some(shape) = shapes.get_mut(watch.template.as_str()) else {
-            return;
+            return None;
         };
         if !std::ptr::eq(shape.generations.as_ptr(), StdArc::as_ptr(&self.database.schema_generation)) {
-            return;
+            return None;
         }
         super::learn_into(
             &self.database,
@@ -419,6 +427,18 @@ impl NativeSession {
             watch.classes,
             capture,
         );
+        super::pending_index(&shape.prepared).map(|check| (watch.template, check))
+    }
+
+    /// Checks a template's pending index derivation (`text_learn`'s answer)
+    /// with no lock held, and records the answer if the template still
+    /// holds that derivation.
+    pub(crate) async fn text_check_index(&self, template: String, check: super::IndexCheck) {
+        let ok = Box::pin(super::check_index(&self.database, &check)).await;
+        let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(shape) = shapes.get_mut(template.as_str()) {
+            super::settle_index(&self.database, &mut shape.prepared, &check, ok);
+        }
     }
 
     /// A learned parse met a table reshaped since (`prepared::STALE_PLAN`):
