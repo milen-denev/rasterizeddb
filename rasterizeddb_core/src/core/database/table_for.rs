@@ -261,6 +261,23 @@ impl Database {
         // Two lookups, as `relation` makes: the partitioned map, then the
         // slot, loaded after the lock (a partitioned table is re-resolved
         // after it, which a drop it waited behind may have removed).
+        //
+        // A plain table's own name first, exactly as spelled: no partitioned
+        // table under it, and a slot under it, means no other spelling can
+        // name anything (the collision guard keeps two keys from differing
+        // only by case; `folded_key` relies on the same). Asking the
+        // partitioned map through the resolver instead missed, then looked
+        // the name up in both maps again to rule a respelling out, on every
+        // statement: four lookups of one hot shard where two answer.
+        if !self.is_partitioned_exactly(name) {
+            if let Some(slot) = self.slot_exactly(name) {
+                self.lock_table(name, owner, mode).await?;
+                if slot.is_live() {
+                    return Ok(Some(Relation::Plain(slot.load())));
+                }
+                return Ok(self.relation(name));
+            }
+        }
         if self.partitioned_table(name).is_some() {
             self.lock_table(name, owner, mode).await?;
             return Ok(self.relation(name));

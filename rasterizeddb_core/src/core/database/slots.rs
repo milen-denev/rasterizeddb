@@ -529,6 +529,21 @@ impl Database {
         name
     }
 
+    /// The slot registered under `name` exactly as spelled, with no case
+    /// folding. For `relation_for`'s fast path, which falls back to the
+    /// resolving lookups when this misses.
+    #[inline]
+    pub(crate) fn slot_exactly(&self, name: &str) -> Option<Arc<Slot>> {
+        self.table_slots.get(name).map(|slot| slot.value().clone())
+    }
+
+    /// Whether a partitioned table is registered under `name` exactly as
+    /// spelled.
+    #[inline]
+    pub(crate) fn is_partitioned_exactly(&self, name: &str) -> bool {
+        self.partitioned_tables.contains_key(name)
+    }
+
     /// The slot `name` resolves to; `table_for` loads it after the lock
     /// (and only it may: `slots_source_tests::only_table_for_loads_a_slot`).
     pub(crate) fn slot(&self, name: &str) -> Option<Arc<Slot>> {
