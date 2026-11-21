@@ -10,6 +10,8 @@ There are three release channels. Each is started by pushing a tag, and each mak
 
 `<version>` must equal the version in the crates' `Cargo.toml`. For the client channel that is `rasterizeddb_client` and `rasterizeddb_client_derive`; for the server crates and the executables it is `rasterizeddb_core` (and `rasterizeddb_embedded`). The workflow checks this before it builds anything.
 
+The executables channel also takes a pre-release tag, such as `v1.0.0-rc.1`. The suffix is set aside for the version check, and the GitHub release is marked as a pre-release, so "latest" still points at the last full release. The crate channels take no suffix, because crates.io would receive the version in `Cargo.toml`, not the tag's.
+
 ## Targets
 
 The executables and the CI matrix cover the same four targets, each built and tested on a native GitHub runner (no cross-compiling):

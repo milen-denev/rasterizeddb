@@ -65,9 +65,13 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      # A pre-release tag (v1.0.0-rc.1) matches the version without its
+      # suffix and makes a GitHub pre-release.
       - name: The tag matches the server version
         if: github.event_name == 'push'
         shell: bash
+        env:
+          ALLOW_PRERELEASE: 1
         run: .github/scripts/check-version.sh v rasterizeddb_core
 
       # Per-target rustflags (32 MiB main-thread stack; x86-64-v3 on x86-64)
@@ -142,6 +146,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           name: "Server ${{ github.ref_name }}"
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             dist/rasterizeddb-server-*
