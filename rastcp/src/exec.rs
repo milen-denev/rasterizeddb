@@ -37,6 +37,18 @@
 /// client takes as "unsupported".
 pub const PREFIX: &[u8] = b"\x01EXEC;";
 
+/// The longest statement an EXEC request may render to: the longest
+/// request a server reads by default ([`crate::common::DEFAULT_MAX_MESSAGE_SIZE`]),
+/// so no EXEC request runs a statement longer than one the client could
+/// have sent as text.
+///
+/// Without it the request's size did not bound what it rendered to: a span
+/// may name the same literal as every other, so a 1 MB literal named by
+/// 65,535 one-byte placeholders asked for a 64 GB statement, and the
+/// allocation aborted the server. A client with a longer statement sends it
+/// as text.
+pub const MAX_RENDERED: usize = crate::common::DEFAULT_MAX_MESSAGE_SIZE;
+
 /// Where one placeholder sits in the text, and which literal fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -177,6 +189,21 @@ fn decode_body(body: &[u8]) -> Result<Exec<'_>, String> {
     if at != body.len() {
         return Err("an EXEC request has bytes past its last placeholder".to_string());
     }
+    // What `render` would allocate, worked out before anything is: the text
+    // less each placeholder, plus each placeholder's literal. Every span
+    // lies within the text and they are disjoint, so the subtraction cannot
+    // pass zero; the sum is checked all the same.
+    let rendered = spans.iter().try_fold(sql.len(), |len, span| {
+        len.checked_sub((span.end - span.start) as usize)?.checked_add(literals[span.literal as usize].len())
+    });
+    match rendered {
+        Some(len) if len <= MAX_RENDERED => {}
+        _ => {
+            return Err(format!(
+                "an EXEC request renders to a statement longer than {MAX_RENDERED} bytes: send it as text"
+            ));
+        }
+    }
     Ok(Exec { sql, literals, spans })
 }
 
@@ -186,6 +213,27 @@ mod tests {
 
     fn span(start: u32, end: u32, literal: u16) -> Span {
         Span { start, end, literal }
+    }
+
+    /// A request that would render past [`MAX_RENDERED`] is refused before
+    /// anything is allocated for it, however small the request itself is:
+    /// one literal named by every placeholder multiplies.
+    #[test]
+    fn a_request_that_renders_too_long_is_refused_unrendered() {
+        let literal = "9".repeat(4096);
+        let n: u16 = 4096; // 4096 * 4096 = 16 MB rendered, from a ~45 KB request
+        let sql: String = (0..n).map(|_| "$1,").collect();
+        let spans: Vec<Span> = (0..n as u32).map(|i| span(i * 3, i * 3 + 2, 0)).collect();
+        let request = encode(&sql, &[&literal], &spans).unwrap();
+        assert!(request.len() < 64 * 1024, "the request itself is small: {}", request.len());
+        let refused = decode(&request).unwrap().unwrap_err();
+        assert!(refused.contains("send it as text"), "{refused}");
+        // The same shape within the limit still decodes and renders.
+        let fits: Vec<Span> = spans[..1024].to_vec();
+        let sql_fits: String = (0..1024).map(|_| "$1,").collect();
+        let exec_request = encode(&sql_fits, &[&literal], &fits).unwrap();
+        let exec = decode(&exec_request).unwrap().unwrap();
+        assert_eq!(exec.render().len(), 1024 * (4096 + 1));
     }
 
     #[test]
