@@ -54,6 +54,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use smallvec::SmallVec;
 
 use crate::core::db_type::DbType;
+// Used by the x86-64 permute path, and by the tests on every target.
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_imports))]
 use crate::simds::cpu::{self, SimdLevel};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
