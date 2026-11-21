@@ -104,6 +104,21 @@ impl Error {
         matches!(self, Error::Transport(RastcpError::HandlerTimeout))
     }
 
+    /// Whether [`connect`](crate::Client::connect) failed because it named a
+    /// database ([`Options::database`](crate::Options::database)) and the
+    /// server may predate database selection over the native protocol. Such
+    /// a server serves only its default database there; a caller that can
+    /// live with that may connect again naming none, and check which
+    /// database it got (`SELECT current_database()`).
+    pub fn may_predate_database_selection(&self) -> bool {
+        match self {
+            Error::Transport(RastcpError::AuthenticationError(message)) => {
+                message.contains(crate::login::PREDATES_DATABASE_SELECTION)
+            }
+            _ => false,
+        }
+    }
+
     /// The SQLSTATE the server gave, when it gave one.
     ///
     /// Statements run inside a transaction are answered by the server's

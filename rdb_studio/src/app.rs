@@ -1726,21 +1726,6 @@ impl Studio {
                 Task::batch([self.load_table_stats(), self.load_columns()])
             }
             Message::SelectDatabase(name) => {
-                // A native listener serves one database. Reconnecting "to"
-                // another would open the same one again and show its tables
-                // under the other's name, so it is refused and the way to it
-                // named.
-                if let Some(session) = &self.session
-                    && session.transport == crate::model::Transport::Native
-                    && name != session.database
-                {
-                    self.status = Status::Failed(format!(
-                        "the native protocol serves one database per listener ({}); to open {}, connect \
-                         with Protocol set to PostgreSQL wire",
-                        session.database, name
-                    ));
-                    return Task::none();
-                }
                 // Switching database means a new connection: the protocol binds
                 // one per session, and both engines refuse to change it after
                 // start-up.

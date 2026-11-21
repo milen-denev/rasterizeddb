@@ -116,6 +116,9 @@ pub(crate) struct Dial {
     pub(crate) timeout: Option<Duration>,
     pub(crate) max_message_size: usize,
     pub(crate) authenticator: Option<Arc<dyn ClientAuthenticator>>,
+    /// The database selection of a login that runs no exchange
+    /// ([`crate::Options::database`]).
+    pub(crate) setup: Option<Arc<dyn rastcp::session::ConnectionSetup>>,
     pub(crate) trust: crate::Trust,
 }
 
@@ -153,6 +156,9 @@ impl Connections {
         };
         if let Some(authenticator) = &self.dial.authenticator {
             builder = builder.authenticator(authenticator.clone());
+        }
+        if let Some(setup) = &self.dial.setup {
+            builder = builder.setup(setup.clone());
         }
         let mut tcp = builder.build().await?;
         tcp.connect().await?;

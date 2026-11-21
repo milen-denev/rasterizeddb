@@ -302,9 +302,12 @@ fn native_note(login: NativeLogin, host: &str) -> Element<'static, Message> {
             text(how)
                 .size(11)
                 .color(if warn { theme::WARN } else { theme::TEXT_DIM }),
-            text("The native protocol serves one database per listener; Database is not used.")
-                .size(11)
-                .color(theme::TEXT_DIM),
+            text(
+                "Database is the one opened; a server older than database selection over \
+                 native serves only its default one there."
+            )
+            .size(11)
+            .color(theme::TEXT_DIM),
         ]
         .spacing(4),
     )

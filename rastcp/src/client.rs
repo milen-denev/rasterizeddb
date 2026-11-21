@@ -14,10 +14,10 @@ use tokio_rustls::TlsConnector;
 use crate::mux::MuxClient;
 use crate::config::ConfigBuilderExt;
 use crate::error::RastcpError;
-use crate::frame::{FrameReader, FrameWriter};
+use crate::frame::{FrameReader, FrameWriter, KIND_DATA, KIND_TIMED_OUT, Tag};
 use crate::interrupt::Deadline;
 use crate::net::{ClientStream, Endpoint, Version};
-use crate::session::{AuthChannel, ClientAuthenticator};
+use crate::session::{AuthChannel, ClientAuthenticator, ConnectionSetup};
 use crate::tls::{ClientIdentity, Trust};
 
 /// How long the credential exchange may take, when there is one.
@@ -86,6 +86,7 @@ pub struct TcpClientBuilder {
     trust: Option<Trust>,
     identity: Option<ClientIdentity>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
+    setup: Option<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     allow_tls12: bool,
     max_message_size: usize,
@@ -112,6 +113,8 @@ pub(crate) struct Dialer {
     version: Version,
     pub(crate) timeout: Option<std::time::Duration>,
     authenticator: Option<Arc<dyn ClientAuthenticator>>,
+    /// See [`TcpClientBuilder::setup`].
+    setup: Option<Arc<dyn ConnectionSetup>>,
     auth_timeout: std::time::Duration,
     pub(crate) max_message_size: usize,
     /// Only a multiplexed client has more than one request in flight.
@@ -129,6 +132,7 @@ impl TcpClientBuilder {
             trust: None,
             identity: None,
             authenticator: None,
+            setup: None,
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             // See `crate::server::TcpServerBuilder::allow_tls12`.
             allow_tls12: false,
@@ -182,6 +186,15 @@ impl TcpClientBuilder {
     /// session.
     pub fn authenticator(mut self, authenticator: Arc<dyn ClientAuthenticator>) -> Self {
         self.authenticator = Some(authenticator);
+        self
+    }
+
+    /// A request sent first on every connection this client opens, after the
+    /// credential exchange and before anything else: see [`ConnectionSetup`].
+    /// Part of opening a connection for the same reason the exchange is, so
+    /// a reconnect cannot resume on a connection that was never set up.
+    pub fn setup(mut self, setup: Arc<dyn ConnectionSetup>) -> Self {
+        self.setup = Some(setup);
         self
     }
 
@@ -280,6 +293,7 @@ impl TcpClientBuilder {
                 version,
                 timeout: self.timeout,
                 authenticator: self.authenticator,
+                setup: self.setup,
                 auth_timeout: self.auth_timeout,
                 max_message_size: self.max_message_size,
                 max_in_flight: self.max_in_flight,
@@ -374,6 +388,7 @@ impl TcpClientBuilder {
             version,
             timeout: self.timeout,
             authenticator: self.authenticator,
+            setup: self.setup,
             auth_timeout: self.auth_timeout,
             max_message_size: self.max_message_size,
             max_in_flight: self.max_in_flight,
@@ -642,8 +657,55 @@ impl Dialer {
         };
 
         self.authenticate(&mut stream).await?;
+        self.set_up(&mut stream).await?;
 
         Ok(stream)
+    }
+
+    /// Sends the setup request, if this client has one, and hands its answer
+    /// to it. Under the client's timeout, as the rest of opening is.
+    ///
+    /// The answer is read with a reader of its own, which is then dropped:
+    /// nothing it read ahead is lost, because the server sends nothing on a
+    /// connection that has not asked for anything more.
+    async fn set_up(&self, stream: &mut ClientStream) -> Result<(), RastcpError> {
+        let Some(setup) = self.setup.as_ref() else {
+            return Ok(());
+        };
+        let request = setup.request();
+        let max = self.max_message_size;
+        let exchange = async {
+            let mut writer = FrameWriter::new();
+            let answer = match self.version {
+                Version::Plain => {
+                    if writer.queue(&request)? {
+                        writer.flush(stream).await?;
+                    } else {
+                        writer.send_large(stream, &request).await?;
+                    }
+                    FrameReader::new().frame(stream, max).await?
+                }
+                Version::Multiplexed => {
+                    writer.queue_tagged_copy(Tag::data(0), &request)?;
+                    writer.flush(stream).await?;
+                    let mut reader = FrameReader::tagged();
+                    let (tag, body) =
+                        std::future::poll_fn(|cx| reader.poll_tagged(stream, cx, max)).await?;
+                    match tag.kind {
+                        KIND_DATA => body,
+                        KIND_TIMED_OUT => return Err(RastcpError::HandlerTimeout),
+                        _ => {
+                            return Err(RastcpError::ProtocolError(format!(
+                                "the server could not answer the connection's setup request: {}",
+                                String::from_utf8_lossy(&body)
+                            )));
+                        }
+                    }
+                }
+            };
+            setup.accept(&answer)
+        };
+        self.bounded(exchange, RastcpError::ConnectionTimeout).await
     }
 
     /// Runs `step` under this client's timeout, if it has one.

@@ -76,6 +76,12 @@ pub struct Principal {
     pub user: String,
     /// Whether that name is allowed to do everything.
     pub superuser: bool,
+    /// The database the caller logged in to, when its exchange named one.
+    /// `None` is the server's default. Set only by the exchange, which is
+    /// what decided whose roles the caller was checked against: a server
+    /// whose roles belong to a database must not let a later request move
+    /// the connection to another database's.
+    pub database: Option<String>,
 }
 
 impl Principal {
@@ -83,7 +89,14 @@ impl Principal {
         Self {
             user: user.into(),
             superuser,
+            database: None,
         }
+    }
+
+    /// This principal, as having logged in to `database`.
+    pub fn in_database(mut self, database: impl Into<String>) -> Self {
+        self.database = Some(database.into());
+        self
     }
 
     /// The principal of a server that was never given an authenticator.
@@ -94,6 +107,7 @@ impl Principal {
         Self {
             user: String::new(),
             superuser: false,
+            database: None,
         }
     }
 
@@ -212,6 +226,28 @@ pub trait ServerAuthenticator: Send + Sync + fmt::Debug {
 /// The client half of the same exchange.
 pub trait ClientAuthenticator: Send + Sync + fmt::Debug {
     fn authenticate<'a>(&'a self, channel: &'a mut AuthChannel<'_>) -> AuthFuture<'a, ()>;
+}
+
+/// A request a client sends first on every connection it opens, and what it
+/// makes of the answer.
+///
+/// It goes out after the credential exchange and before any other request,
+/// on the first connection and on every one opened after it (a reconnect
+/// included), framed as the connection's protocol frames requests: on
+/// `rastcp/2` that is a tagged frame like any other. The connection is
+/// handed to callers only once [`ConnectionSetup::accept`] has taken the
+/// answer; an error from it fails the open, and the caller sees that error.
+///
+/// For whatever a connection must be told before it is used and the server
+/// cannot learn from the exchange — the exchange may not run at all, on a
+/// server that asks for no credentials. rastcp does not read the request; to
+/// the server it is the connection's first request.
+pub trait ConnectionSetup: Send + Sync + fmt::Debug {
+    /// The request.
+    fn request(&self) -> Vec<u8>;
+    /// Whether `answer` (the server's reply to [`ConnectionSetup::request`])
+    /// lets the connection be used.
+    fn accept(&self, answer: &[u8]) -> Result<(), RastcpError>;
 }
 
 /// Derives the `tls-exporter` channel binding from a finished handshake.

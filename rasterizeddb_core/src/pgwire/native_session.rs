@@ -63,6 +63,19 @@ pub(crate) const MARK: u8 = 1;
 /// to a server without it, so refused there without anything running.
 const CANCEL_PREFIX: &[u8] = b"\x01CANCEL;";
 
+/// A database selection: `\x01DATABASE;<name>` makes `<name>` the database
+/// the connection's statements run in. Sent by a client as the first request
+/// of every connection it opens (rastcp's connection setup), and honoured
+/// only there: a connection's database is fixed once it has run anything, as
+/// a PostgreSQL connection's is. On a listener that authenticates, the
+/// database is named in the login instead, because its roles are what the
+/// login was checked against; this request may then name only that database.
+/// Answered in the simple-query form, so a refusal carries its SQLSTATE.
+/// Two statements to a server without it, refused there whole, and an
+/// unknown marked request to one with marked requests but not this: either
+/// way never the default database by accident.
+pub(crate) const DATABASE_PREFIX: &[u8] = b"\x01DATABASE;";
+
 /// What a simple query's header asked for: `\x01SIMPLE:key=value,…;text`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SimpleOptions {
@@ -142,6 +155,15 @@ pub(crate) async fn answer_marked(
     user: &str,
     request: &[u8],
 ) -> Vec<u8> {
+    if request.starts_with(DATABASE_PREFIX) {
+        // A connection's (`core::database::NativeConnection::select`), which
+        // answers it before this is reached; a caller here has none.
+        return simple_error(
+            "0A000",
+            "a database is chosen by a connection, and this caller has none",
+            b'I',
+        );
+    }
     if let Some(token) = request.strip_prefix(CANCEL_PREFIX) {
         let token = String::from_utf8_lossy(token);
         if !valid_token(&token) {
@@ -181,7 +203,7 @@ pub(crate) async fn answer_marked(
 
 /// A simple-query answer holding one `CommandComplete` and an idle
 /// `ReadyForQuery`.
-fn simple_complete(tag: &str) -> Vec<u8> {
+pub(crate) fn simple_complete(tag: &str) -> Vec<u8> {
     let mut answer = Vec::with_capacity(tag.len() + 13);
     answer.push(SIMPLE_ANSWER);
     answer.push(b'C');
@@ -357,6 +379,11 @@ impl NativeSession {
             temp_session: fastrand::u64(..),
             text_shapes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The database this session's statements run in.
+    pub(crate) fn database(&self) -> &Arc<Database> {
+        &self.database
     }
 
     /// How an autocommit statement on the native path runs: from a parse

@@ -132,8 +132,10 @@ from one process, on one catalogue. The `--pg-*` flags configure this listener
 and `--rdb-*` the native one (`--rdb-addr 0.0.0.0 --rdb-port 61170` to reach it
 from another host). The two share the role catalogue, which is seeded from
 `--pg-user`/`--pg-password`, so the same role logs in on either; the native
-protocol answers SCRAM only, so keep `--pg-auth scram-sha-256` there. The
-native protocol is single-database and serves `--pg-default-db`.
+protocol answers SCRAM only, so keep `--pg-auth scram-sha-256` there. A
+native connection uses `--pg-default-db` unless its client names another
+database (`Options::database`); as on pgwire, a login is checked against the
+roles of the database it names.
 
 ### MySQL and SQL Server network compatibility
 
@@ -476,6 +478,14 @@ never crosses the wire, and it refuses a server that lets the connection in
 without proving it holds the verifier. On a unix socket (`--rdb-socket`),
 `Login::Peer` logs in as the operating-system user, and `Login::Trust` sends no
 credentials.
+
+`Options::database` picks the database, as the `/name` of a PostgreSQL URL
+does. Password and peer logins name it in the login and are checked against
+that database's roles; a trust connection selects it with its first request.
+Every connection the client opens uses it, a reopened one and each
+transaction's included. A name that does not exist fails `connect` (3D000),
+and so does a server too old to select a database: neither quietly gives you
+the default database.
 
 TCP is TLS. The server makes itself a self-signed certificate at every start
 unless given one with `--rdb-cert`/`--rdb-key`; a client that should verify it

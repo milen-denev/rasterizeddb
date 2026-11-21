@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use rastcp::error::RastcpError;
-use rastcp::session::{AuthChannel, AuthFuture, ClientAuthenticator};
+use rastcp::session::{AuthChannel, AuthFuture, ClientAuthenticator, ConnectionSetup};
 
 /// Who a connection logs in as.
 ///
@@ -63,15 +63,21 @@ impl fmt::Debug for Login {
 }
 
 impl Login {
+    /// The exchange this login runs, naming `database` in its hello when one
+    /// is given. `None` for [`Login::Trust`], which runs none: its database
+    /// goes in [`database_setup`] instead.
     pub(crate) fn authenticator(
         &self,
+        database: Option<&str>,
     ) -> Result<Option<Arc<dyn ClientAuthenticator>>, RastcpError> {
+        let database = database.map(str::to_string);
         let user = match self {
             Login::Trust => return Ok(None),
             Login::Password { user, password } => {
                 return Ok(Some(Arc::new(PasswordLogin {
                     user: user.clone(),
                     password: password.clone(),
+                    database,
                 }) as Arc<dyn ClientAuthenticator>));
             }
             Login::Peer => current_os_user().ok_or_else(|| {
@@ -80,14 +86,75 @@ impl Login {
             Login::PeerAs(user) => user.clone(),
         };
         Ok(Some(
-            Arc::new(PeerLogin { user }) as Arc<dyn ClientAuthenticator>
+            Arc::new(PeerLogin { user, database }) as Arc<dyn ClientAuthenticator>
         ))
+    }
+
+    /// What selects `database` on a connection this login opens, when the
+    /// login runs no exchange to name it in: a [`Login::Trust`] connection
+    /// sends it as its first request. `None` for the other logins and for
+    /// no database.
+    pub(crate) fn database_setup(
+        &self,
+        database: Option<&str>,
+    ) -> Option<Arc<dyn ConnectionSetup>> {
+        match (self, database) {
+            (Login::Trust, Some(name)) => Some(Arc::new(DatabaseSetup {
+                name: name.to_string(),
+            }) as Arc<dyn ConnectionSetup>),
+            _ => None,
+        }
+    }
+}
+
+/// What every error saying a server may predate database selection holds
+/// ([`crate::Error::may_predate_database_selection`]).
+pub(crate) const PREDATES_DATABASE_SELECTION: &str = "predate database selection";
+
+/// The server's `pgwire::native_session::DATABASE_PREFIX`.
+const DATABASE_PREFIX: &[u8] = b"\x01DATABASE;";
+
+/// Selects a database on a connection that logs in with no exchange: the
+/// connection's first request, answered in the simple-query form.
+#[derive(Debug)]
+struct DatabaseSetup {
+    name: String,
+}
+
+impl ConnectionSetup for DatabaseSetup {
+    fn request(&self) -> Vec<u8> {
+        let mut request = DATABASE_PREFIX.to_vec();
+        request.extend_from_slice(self.name.as_bytes());
+        request
+    }
+
+    fn accept(&self, answer: &[u8]) -> Result<(), RastcpError> {
+        let predates = |detail: &str| {
+            RastcpError::AuthenticationError(format!(
+                "this server cannot select database \"{}\" over the native protocol (it seems \
+                 to {PREDATES_DATABASE_SELECTION}), so the connection was not used: {detail}",
+                self.name
+            ))
+        };
+        match crate::simple::decode(answer.to_vec()) {
+            Ok(_) => Ok(()),
+            // Two statements to a server older than the simple-query form.
+            Err(crate::Error::Unsupported(detail)) => Err(predates(&detail)),
+            Err(e) if e.sqlstate() == Some("0A000") => Err(predates(&e.to_string())),
+            Err(e) => Err(RastcpError::AuthenticationError(match e {
+                crate::Error::Server(message) => message,
+                other => other.to_string(),
+            })),
+        }
     }
 }
 
 // The exchange's opening message and the server's reply tags
 // (`rasterizeddb_core::native_auth`).
 const PROTOCOL_VERSION: u8 = 1;
+/// The hello that names a database too; sent only when one is named, so a
+/// server older than it refuses the login instead of using its default.
+const PROTOCOL_VERSION_DATABASE: u8 = 2;
 const C_HELLO: u8 = 0x01;
 const C_SASL_INITIAL: u8 = 0x02;
 const C_SASL_FINAL: u8 = 0x03;
@@ -109,9 +176,23 @@ fn no_exchange_here(what_happened: &str) -> RastcpError {
     ))
 }
 
-/// The server's answer to the hello.
-async fn hello_reply(channel: &mut AuthChannel<'_>) -> Result<(u8, String), RastcpError> {
+/// The server's answer to the hello. `database` is the one it named.
+async fn hello_reply(
+    channel: &mut AuthChannel<'_>,
+    database: Option<&str>,
+) -> Result<(u8, String), RastcpError> {
     match server_reply(channel).await {
+        // A server that predates the hello naming a database closes the
+        // connection at it without a word, as one running no exchange can.
+        Err(RastcpError::ConnectionClosed) if database.is_some() => {
+            Err(RastcpError::AuthenticationError(format!(
+                "the server closed the connection at the login, which named database \"{}\": \
+                 it may {PREDATES_DATABASE_SELECTION} over the native protocol, or ask for no \
+                 login at all (a unix socket under --rdb-socket-auth trust; connect with \
+                 Login::Trust then)",
+                database.unwrap_or_default()
+            )))
+        }
         Err(RastcpError::ConnectionClosed) => Err(no_exchange_here("it closed the connection")),
         Ok((tag, _)) if !matches!(tag, S_OK | S_SASL | S_ERROR) => {
             Err(no_exchange_here(&format!("it answered with a message of kind {tag}")))
@@ -120,15 +201,23 @@ async fn hello_reply(channel: &mut AuthChannel<'_>) -> Result<(u8, String), Rast
     }
 }
 
-/// The opening message: who the caller wants to be.
-fn hello(user: &str) -> Result<Vec<u8>, RastcpError> {
-    let len = u16::try_from(user.len())
-        .map_err(|_| RastcpError::AuthenticationError("the user name is too long".to_string()))?;
-    let mut hello = Vec::with_capacity(4 + user.len());
+/// The opening message: who the caller wants to be, and in which database
+/// when it names one.
+fn hello(user: &str, database: Option<&str>) -> Result<Vec<u8>, RastcpError> {
+    let field = |text: &str, what: &str| {
+        u16::try_from(text.len())
+            .map(|len| len.to_le_bytes())
+            .map_err(|_| RastcpError::AuthenticationError(format!("the {what} is too long")))
+    };
+    let mut hello = Vec::with_capacity(6 + user.len() + database.map_or(0, str::len));
     hello.push(C_HELLO);
-    hello.push(PROTOCOL_VERSION);
-    hello.extend_from_slice(&len.to_le_bytes());
+    hello.push(if database.is_some() { PROTOCOL_VERSION_DATABASE } else { PROTOCOL_VERSION });
+    hello.extend_from_slice(&field(user, "user name")?);
     hello.extend_from_slice(user.as_bytes());
+    if let Some(database) = database {
+        hello.extend_from_slice(&field(database, "database name")?);
+        hello.extend_from_slice(database.as_bytes());
+    }
     Ok(hello)
 }
 
@@ -146,20 +235,23 @@ async fn server_reply(channel: &mut AuthChannel<'_>) -> Result<(u8, String), Ras
 struct PasswordLogin {
     user: String,
     password: String,
+    database: Option<String>,
 }
 
 impl fmt::Debug for PasswordLogin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PasswordLogin")
             .field("user", &self.user)
+            .field("database", &self.database)
             .finish_non_exhaustive()
     }
 }
 
 impl PasswordLogin {
     async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<(), RastcpError> {
-        channel.send(&hello(&self.user)?).await?;
-        match hello_reply(channel).await? {
+        let database = self.database.as_deref();
+        channel.send(&hello(&self.user, database)?).await?;
+        match hello_reply(channel, database).await? {
             (S_SASL, _) => {}
             (S_OK, _) => {
                 return Err(RastcpError::AuthenticationError(
@@ -211,28 +303,23 @@ impl ClientAuthenticator for PasswordLogin {
 
 struct PeerLogin {
     user: String,
+    database: Option<String>,
 }
 
 impl fmt::Debug for PeerLogin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PeerLogin")
             .field("user", &self.user)
+            .field("database", &self.database)
             .finish()
     }
 }
 
 impl PeerLogin {
     async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<(), RastcpError> {
-        let len = u16::try_from(self.user.len()).map_err(|_| {
-            RastcpError::AuthenticationError("the user name is too long".to_string())
-        })?;
-        let mut hello = Vec::with_capacity(4 + self.user.len());
-        hello.push(C_HELLO);
-        hello.push(PROTOCOL_VERSION);
-        hello.extend_from_slice(&len.to_le_bytes());
-        hello.extend_from_slice(self.user.as_bytes());
-        channel.send(&hello).await?;
-        match hello_reply(channel).await? {
+        let database = self.database.as_deref();
+        channel.send(&hello(&self.user, database)?).await?;
+        match hello_reply(channel, database).await? {
             (S_OK, _) => Ok(()),
             (S_SASL, _) => Err(RastcpError::AuthenticationError(
                 "the server asks for a password: peer login needs a unix socket under \
@@ -294,5 +381,83 @@ pub(crate) fn current_os_user() -> Option<String> {
         // SAFETY: `pw_name` points into `buffer`, NUL-terminated by getpwuid_r.
         let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
         return name.to_str().ok().map(str::to_string);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hello_naming_no_database_is_the_one_every_server_reads() {
+        // Byte for byte what clients sent before database selection, so a
+        // client that names none still logs in to an older server.
+        assert_eq!(hello("alice", None).unwrap(), b"\x01\x01\x05\x00alice");
+    }
+
+    #[test]
+    fn a_hello_naming_a_database_says_so_in_its_version() {
+        assert_eq!(
+            hello("alice", Some("kopa")).unwrap(),
+            b"\x01\x02\x05\x00alice\x04\x00kopa"
+        );
+        // Lengths are bytes.
+        let multibyte = hello("a", Some("κ")).unwrap();
+        assert_eq!(&multibyte[5..7], &[2, 0]);
+        assert!(hello("a", Some(&"x".repeat(70_000))).is_err());
+    }
+
+    fn simple(messages: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = vec![4u8];
+        for (tag, body) in messages {
+            out.push(*tag);
+            out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    fn error_body(code: &str, message: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (field, value) in [(b'S', "ERROR"), (b'C', code), (b'M', message)] {
+            body.push(field);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        body
+    }
+
+    #[test]
+    fn the_setup_answer_decides_the_connection() {
+        let setup = DatabaseSetup { name: "kopa".to_string() };
+        assert_eq!(setup.request(), b"\x01DATABASE;kopa");
+
+        let ok = simple(&[(b'C', b"SET\0"), (b'Z', b"I")]);
+        assert!(setup.accept(&ok).is_ok());
+
+        // Refused by the server that knows the request: its reason, with its
+        // SQLSTATE, and not "too old".
+        let missing = simple(&[
+            (b'E', &error_body("3D000", "database \"kopa\" does not exist")),
+            (b'Z', b"I"),
+        ]);
+        let e = crate::Error::Transport(setup.accept(&missing).unwrap_err());
+        assert!(e.to_string().contains("3D000"), "{e}");
+        assert!(!e.may_predate_database_selection(), "{e}");
+
+        // A server with marked requests but not this one, and one older still
+        // that refuses the text as two statements: both "too old", neither
+        // ever the default database.
+        let unknown = simple(&[
+            (b'E', &error_body("0A000", "this server does not know the marked request")),
+            (b'Z', b"I"),
+        ]);
+        let e = crate::Error::Transport(setup.accept(&unknown).unwrap_err());
+        assert!(e.may_predate_database_selection(), "{e}");
+        let mut two_statements = vec![3u8];
+        two_statements.extend_from_slice(b"the native protocol runs one statement per request");
+        let e = crate::Error::Transport(setup.accept(&two_statements).unwrap_err());
+        assert!(e.may_predate_database_selection(), "{e}");
     }
 }

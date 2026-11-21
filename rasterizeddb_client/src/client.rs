@@ -23,6 +23,19 @@ pub struct Options {
     pub timeout: Option<Duration>,
     /// Who the connections log in as.
     pub login: Login,
+    /// The database the connections use; `None` (the default) is the
+    /// server's default database (its `--pg-default-db`, `postgres` unless
+    /// set). Every connection the client opens uses it: the shared ones,
+    /// each reopened one, and each transaction's.
+    ///
+    /// A login that runs an exchange ([`Login::Password`], [`Login::Peer`])
+    /// names it there, and is checked against that database's roles, as a
+    /// PostgreSQL client's is: a role exists in the database it was created
+    /// in. A [`Login::Trust`] connection selects it with its first request.
+    /// A database that does not exist, or one being imported, fails
+    /// [`connect`](Client::connect). So does a server that predates database
+    /// selection: it is never quietly the default database instead.
+    pub database: Option<String>,
     /// The largest answer accepted, in bytes (rastcp's default, 8 MiB). The
     /// limit is this side's: the server sends an answer of any size. One past
     /// it fails whole with [`Error::Transport`], never arriving cut short, and
@@ -66,6 +79,7 @@ impl Default for Options {
             connections: 1,
             timeout: Some(Duration::from_secs(30)),
             login: Login::Trust,
+            database: None,
             max_message_size: 8 * 1024 * 1024,
             migrations: None,
             auto_migrate: crate::orm::AutoMigrate::Apply,
@@ -192,7 +206,9 @@ impl Client {
     /// either way: its exchange is bound to the connection, and the server
     /// must prove it holds the password's verifier.
     pub async fn connect(addr: &str, options: Options) -> Result<Self> {
-        let authenticator = options.login.authenticator()?;
+        let database = options.database.as_deref();
+        let authenticator = options.login.authenticator(database)?;
+        let setup = options.login.database_setup(database);
         let mut connections = Vec::with_capacity(options.connections.max(1));
         for _ in 0..options.connections.max(1) {
             let mut builder =
@@ -204,6 +220,9 @@ impl Client {
             };
             if let Some(authenticator) = &authenticator {
                 builder = builder.authenticator(authenticator.clone());
+            }
+            if let Some(setup) = &setup {
+                builder = builder.setup(setup.clone());
             }
             let mux = builder.build_multiplexed().await?;
             mux.connect().await?;
@@ -224,6 +243,7 @@ impl Client {
                 timeout: options.timeout,
                 max_message_size: options.max_message_size,
                 authenticator,
+                setup,
                 trust: options.trust.clone(),
             }),
             exec: AtomicU8::new(EXEC_UNKNOWN),
@@ -256,6 +276,7 @@ impl Client {
                 timeout: None,
                 max_message_size: 0,
                 authenticator: None,
+                setup: None,
                 trust: crate::Trust::AcceptAny,
             }),
             exec: AtomicU8::new(EXEC_NO),

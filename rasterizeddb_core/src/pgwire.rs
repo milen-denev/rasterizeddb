@@ -96,7 +96,9 @@ pub(crate) use native_session::{
     parse_simple as native_parse_simple,
 };
 pub(crate) use native_session::{
-    MARK as NATIVE_MARK, answer_marked as native_answer_marked,
+    DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK,
+    answer_marked as native_answer_marked, simple_complete as native_simple_complete,
+    simple_error as native_simple_error,
 };
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).

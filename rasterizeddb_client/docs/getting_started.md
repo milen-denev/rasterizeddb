@@ -31,7 +31,13 @@ let remote = Client::connect(
         ..Options::default()
     },
 ).await?;
-# let _ = (local, peer, remote); Ok(()) }
+
+// Another database than the server's default, as `/kopa` in a PostgreSQL URL.
+let kopa = Client::connect(
+    "unix:/run/rdb/rdb.sock",
+    Options { database: Some("kopa".into()), ..Options::default() },
+).await?;
+# let _ = (local, peer, remote, kopa); Ok(()) }
 ```
 
 Every connection is opened and logged in before `connect` returns, so a
@@ -45,6 +51,7 @@ run (or are verified) before it returns too: see the
 | `connections` | 1 | connections shared by every caller; each carries many statements at once |
 | `timeout` | 30 s | how long a statement waits for its answer (`None`: forever) |
 | `login` | `Trust` | `Trust`, `Peer`, `PeerAs(name)` or `Password { user, password }` (`Login::password`) |
+| `database` | `None` | the database every connection uses (`None`: the server's `--pg-default-db`); a password or peer login is checked against that database's roles |
 | `max_message_size` | 8 MiB | the largest answer accepted; a larger one fails whole |
 | `migrations` | `None` | a [`Migrator`](crate::orm::Migrator) to run on connect |
 | `auto_migrate` | `Apply` | `Off`, `Apply` or `Verify` |

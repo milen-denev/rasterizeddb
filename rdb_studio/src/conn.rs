@@ -20,10 +20,12 @@
 //! token and the editor's row limit; see [`Canceller`].
 //!
 //! What the native protocol does not do, and the console therefore does not
-//! offer over it: a second database (a native listener serves one, so
-//! switching database is refused rather than reconnecting to the same one
-//! under another name) and prepared statements in the benchmark. A statement
-//! is also cut off by the server's `--rdb-request-timeout`, 30 s by default.
+//! offer over it: prepared statements in the benchmark. A statement is also
+//! cut off by the server's `--rdb-request-timeout`, 30 s by default. The
+//! database is the profile's, as over the wire protocol, except on a server
+//! that predates database selection over native: that one serves only its
+//! default database there, and a profile naming another is refused rather
+//! than shown that one's tables under the other's name.
 //!
 //! # Why the simple query protocol
 //!
@@ -199,9 +201,10 @@ const NATIVE_MAX_ANSWER: usize = 512 * 1024 * 1024;
 /// two things a successful login does not: it proves the server answers the
 /// simple-query form every panel depends on (an older one refuses it, and
 /// that is said here rather than as an error in every panel), and it names
-/// the database from the server's side. A native listener serves one
-/// database, whatever the profile says, so the profile's name is not trusted
-/// for it.
+/// the database from the server's side: the profile's database is asked
+/// for, and a server that predates database selection over native serves
+/// its default one instead, which is accepted only when it is the one the
+/// profile names.
 async fn connect_native(profile: Connection) -> Result<Session, String> {
     use rasterizeddb_client::{Login, Options};
 
@@ -238,24 +241,40 @@ async fn connect_native(profile: Connection) -> Result<Session, String> {
         rasterizeddb_client::load_ca(profile.ca_file.trim())
             .map_err(|e| format!("the CA file: {}", native_error(&e)))?
     };
-    let options = Options {
+    let wanted = Some(profile.database.trim()).filter(|name| !name.is_empty());
+    let options = |database: Option<&str>| Options {
         connections: 1,
         // Statements are bounded by the server's request timeout; a
         // client-side one would only abandon an answer the server is still
         // working on.
         timeout: None,
-        login,
+        login: login.clone(),
+        database: database.map(str::to_string),
         max_message_size: NATIVE_MAX_ANSWER,
-        trust,
+        trust: trust.clone(),
         ..Options::default()
     };
 
-    let client = match tokio::time::timeout(
+    let connected = tokio::time::timeout(
         NATIVE_CONNECT_TIMEOUT,
-        rasterizeddb_client::Client::connect(&address, options),
+        rasterizeddb_client::Client::connect(&address, options(wanted)),
     )
-    .await
-    {
+    .await;
+    // A server from before database selection over native refuses a login
+    // naming one. It serves its default database there, which will do when
+    // that is the profile's: checked against what it says it serves below.
+    let (connected, unselected) = match connected {
+        Ok(Err(e)) if wanted.is_some() && e.may_predate_database_selection() => (
+            tokio::time::timeout(
+                NATIVE_CONNECT_TIMEOUT,
+                rasterizeddb_client::Client::connect(&address, options(None)),
+            )
+            .await,
+            true,
+        ),
+        other => (other, false),
+    };
+    let client = match connected {
         Ok(Ok(client)) => client,
         Ok(Err(e)) => return Err(describe_native(&e.to_string(), &profile, &address)),
         Err(_) => {
@@ -310,6 +329,16 @@ async fn connect_native(profile: Connection) -> Result<Session, String> {
         }
         Err(e) => return Err(describe_native(&native_error(&e), &profile, &address)),
     };
+    if unselected
+        && let Some(wanted) = wanted
+        && wanted != database
+    {
+        return Err(format!(
+            "the server at {} predates database selection over the native protocol and serves \
+             only {} there; to open {}, upgrade the server or set Protocol to PostgreSQL wire",
+            address, database, wanted
+        ));
+    }
 
     Ok(Session {
         backend: Backend::Native(Arc::new(client)),

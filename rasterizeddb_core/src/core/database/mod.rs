@@ -4502,6 +4502,7 @@ impl Database {
     #[cfg(unix)]
     async fn bind_native_socket(
         database: &Arc<Database>,
+        catalog: Option<&Arc<catalog::DatabaseCatalog>>,
         auth: &crate::native_auth::NativeAuthConfig,
         socket: &NativeSocket,
         credential_exists: bool,
@@ -4566,8 +4567,9 @@ impl Database {
         }
         if authenticates {
             builder = builder.authenticator(
-                StdArc::new(RoleAuthenticator::new(database.clone(), method))
-                    as StdArc<dyn rastcp::session::ServerAuthenticator>,
+                StdArc::new(
+                    RoleAuthenticator::new(database.clone(), method).with_catalog(catalog.cloned()),
+                ) as StdArc<dyn rastcp::session::ServerAuthenticator>,
             );
             info!(
                 "Native protocol on unix:{} requires {} authentication",
@@ -4590,6 +4592,7 @@ impl Database {
     #[cfg(not(unix))]
     async fn bind_native_socket(
         _database: &Arc<Database>,
+        _catalog: Option<&Arc<catalog::DatabaseCatalog>>,
         _auth: &crate::native_auth::NativeAuthConfig,
         _socket: &NativeSocket,
         _credential_exists: bool,
@@ -4688,8 +4691,10 @@ impl Database {
                 auth.method.name()
             );
             Some(
-                StdArc::new(RoleAuthenticator::new(database.clone(), auth.method))
-                    as StdArc<dyn rastcp::session::ServerAuthenticator>,
+                StdArc::new(
+                    RoleAuthenticator::new(database.clone(), auth.method)
+                        .with_catalog(catalog.clone()),
+                ) as StdArc<dyn rastcp::session::ServerAuthenticator>,
             )
         } else {
             // Only about the TCP listener: with it off there is no address to
@@ -4735,6 +4740,7 @@ impl Database {
             Some(socket) => Some(
                 Self::bind_native_socket(
                     &database,
+                    catalog.as_ref(),
                     &auth,
                     socket,
                     credential_exists,
@@ -6090,25 +6096,179 @@ pub async fn serve_native(
         .await
 }
 
-/// A native connection's session, opened once its caller has authenticated
-/// (rastcp's `run_with_session`). Keyed on the connection, never on the
-/// principal: two connections of one user are two sessions.
+/// The database a native connection may use when it names `name`: the
+/// listener's own (`own`) when it has no catalogue, otherwise the catalogue's
+/// database of that name, unless it is being imported. The refusal is a
+/// SQLSTATE and the message pgwire gives for the same name at start-up.
+pub(crate) fn resolve_native_database(
+    catalog: Option<&catalog::DatabaseCatalog>,
+    own: &Arc<Database>,
+    name: &str,
+) -> Result<Arc<Database>, (&'static str, String)> {
+    let missing = || ("3D000", format!("database \"{}\" does not exist", name));
+    match catalog {
+        None if name == own.name => Ok(own.clone()),
+        None => Err(missing()),
+        Some(catalog) => {
+            if catalog.is_loading(name) {
+                return Err((
+                    "57P03",
+                    format!(
+                        "database \"{}\" is being imported and is not ready for connections \
+                         yet; it will accept them once the import finishes",
+                        name
+                    ),
+                ));
+            }
+            catalog.get(name).ok_or_else(missing)
+        }
+    }
+}
+
+/// A native connection (rastcp's `run_with_session`): who opened it, and the
+/// session its statements run in, made for the database it uses once that is
+/// known. Keyed on the connection, never on the principal: two connections of
+/// one user are two sessions.
+///
+/// The database is the one the login named ([`rastcp::session::Principal::database`]),
+/// or on a listener that asks for no login the one a
+/// [`crate::pgwire::NATIVE_DATABASE_PREFIX`] request selects first, or the
+/// listener's own. The session is made by the first request, so a
+/// connection that selects a database is never counted among the default
+/// database's sessions on the way.
+pub(crate) struct NativeConnection {
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    multiplexed: bool,
+    session: std::sync::OnceLock<crate::pgwire::NativeSession>,
+}
+
+impl NativeConnection {
+    /// The database the login named, or the listener's.
+    fn login_database(&self) -> &str {
+        self.principal
+            .database
+            .as_deref()
+            .unwrap_or(&self.context.database.name)
+    }
+
+    /// The connection's session, made in `name` if it has none yet.
+    ///
+    /// Two requests of a `rastcp/2` connection can both find none; each
+    /// makes one, the first to finish keeps its own and the other's is
+    /// dropped unused. What the caller gets is the one kept, which may be
+    /// in another database than `name`: [`Self::select`] checks.
+    fn session_in(
+        &self,
+        name: &str,
+    ) -> Result<&crate::pgwire::NativeSession, (&'static str, String)> {
+        if let Some(session) = self.session.get() {
+            return Ok(session);
+        }
+        let database =
+            resolve_native_database(self.context.catalog.as_deref(), &self.context.database, name)?;
+        let made = native_session_in(&self.context, database, &self.principal, self.multiplexed);
+        let _ = self.session.set(made);
+        Ok(self.session.get().expect("set just above"))
+    }
+
+    /// Answers a [`crate::pgwire::NATIVE_DATABASE_PREFIX`] request naming
+    /// `name`.
+    fn select(&self, name: &[u8]) -> Vec<u8> {
+        use crate::pgwire::{native_simple_complete as complete, native_simple_error as refuse};
+
+        let Ok(name) = std::str::from_utf8(name) else {
+            return refuse("22021", "the database name is not valid UTF-8", b'I');
+        };
+        if name.is_empty() {
+            return refuse("08P01", "the database selection names no database", b'I');
+        }
+
+        // A login checked against one database's roles stays in it: a
+        // selection could otherwise carry it into a database whose role of the
+        // same name is someone else.
+        let fixed_by_login =
+            self.principal.database.is_some() || self.context.authentication_required;
+        if fixed_by_login && name != self.login_database() {
+            return refuse(
+                "28000",
+                &format!(
+                    "this connection logged in to database \"{}\": a server that authenticates \
+                     checks a login against the roles of the database it names, so name \
+                     \"{}\" in the login instead of selecting it afterwards",
+                    self.login_database(),
+                    name
+                ),
+                b'I',
+            );
+        }
+
+        if let Some(session) = self.session.get()
+            && session.database().name != name
+        {
+            return refuse(
+                "08P01",
+                &format!(
+                    "this connection already runs in database \"{}\": a database is selected \
+                     before a connection's first statement, and stays",
+                    session.database().name
+                ),
+                b'I',
+            );
+        }
+
+        match self.session_in(name) {
+            Ok(session) if session.database().name == name => complete("SET"),
+            Ok(session) => refuse(
+                "08P01",
+                &format!(
+                    "this connection already runs in database \"{}\": a statement sent with \
+                     the selection reached it first",
+                    session.database().name
+                ),
+                b'I',
+            ),
+            Err((code, message)) => refuse(code, &message, b'I'),
+        }
+    }
+}
+
+/// A native connection, opened once its caller has authenticated: its
+/// session is made by its first request ([`NativeConnection`]).
 fn open_native_session(
     context: &NativeContext,
     principal: &StdArc<rastcp::session::Principal>,
     connection: &rastcp::server::ConnectionInfo,
-) -> crate::pgwire::NativeSession {
-    native_session_for(context, principal, connection.multiplexed)
+) -> NativeConnection {
+    NativeConnection {
+        context: context.clone(),
+        principal: principal.clone(),
+        multiplexed: connection.multiplexed,
+        session: std::sync::OnceLock::new(),
+    }
 }
 
-/// [`open_native_session`], for a connection that is `multiplexed` or not.
+/// A session in the listener's own database, for a connection that is
+/// `multiplexed` or not.
+#[cfg(test)]
 fn native_session_for(
     context: &NativeContext,
     principal: &StdArc<rastcp::session::Principal>,
     multiplexed: bool,
 ) -> crate::pgwire::NativeSession {
+    native_session_in(context, context.database.clone(), principal, multiplexed)
+}
+
+/// A session in `database`, counted among its sessions in the server's
+/// catalogue when the listener has one.
+fn native_session_in(
+    context: &NativeContext,
+    database: Arc<Database>,
+    principal: &StdArc<rastcp::session::Principal>,
+    multiplexed: bool,
+) -> crate::pgwire::NativeSession {
     let session = crate::pgwire::NativeSession::new(
-        context.database.clone(),
+        database,
         &principal.user,
         principal.superuser,
         context.authentication_required,
@@ -6120,14 +6280,31 @@ fn native_session_for(
     }
 }
 
-/// One request on a connection that has a session.
+/// One request on a connection: a database selection, or a request run in
+/// the connection's session, in the connection's database.
 async fn serve_native_request(
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
-    session: StdArc<crate::pgwire::NativeSession>,
+    connection: StdArc<NativeConnection>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
-    process_native_request(context, principal, Some(&session), request_vec).await
+    if let Some(name) = request_vec.strip_prefix(crate::pgwire::NATIVE_DATABASE_PREFIX) {
+        return connection.select(name);
+    }
+    let session = match connection.session_in(connection.login_database()) {
+        Ok(session) => session,
+        Err((_, message)) => return error_response(&message),
+    };
+    // Everything below reads the database from the context.
+    let context = if Arc::ptr_eq(session.database(), &context.database) {
+        context
+    } else {
+        NativeContext {
+            database: session.database().clone(),
+            ..context
+        }
+    };
+    process_native_request(context, principal, Some(session), request_vec).await
 }
 
 /// One request with no connection session: transaction control is refused.

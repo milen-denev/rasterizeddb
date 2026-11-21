@@ -47,6 +47,13 @@ use crate::core::database::Database;
 /// client that is simply confused.
 const PROTOCOL_VERSION: u8 = 1;
 
+/// The hello that also names a database: `[C_HELLO][2][u16 len][user]
+/// [u16 len][database]`, lengths little-endian. A client sends it only when
+/// it names a database, so a server older than it refuses the login by its
+/// version ("unsupported authentication protocol version 2") rather than
+/// letting the caller into the default database unasked.
+const PROTOCOL_VERSION_DATABASE: u8 = 2;
+
 // Client -> server message tags.
 const C_HELLO: u8 = 0x01;
 const C_SASL_INITIAL: u8 = 0x02;
@@ -206,6 +213,10 @@ pub fn os_user_name(uid: u32) -> Option<String> {
 pub struct RoleAuthenticator {
     database: Arc<Database>,
     method: AuthMethod,
+    /// The server's databases, which a hello naming one is resolved against.
+    /// `None` for a listener serving `database` alone: a hello may then name
+    /// only that database.
+    catalog: Option<Arc<crate::core::database::catalog::DatabaseCatalog>>,
 }
 
 impl fmt::Debug for RoleAuthenticator {
@@ -218,7 +229,36 @@ impl fmt::Debug for RoleAuthenticator {
 
 impl RoleAuthenticator {
     pub fn new(database: Arc<Database>, method: AuthMethod) -> Self {
-        Self { database, method }
+        Self {
+            database,
+            method,
+            catalog: None,
+        }
+    }
+
+    /// Resolves a hello that names a database against `catalog`, and checks
+    /// the caller against that database's roles, as the PostgreSQL listener
+    /// does: roles are per database
+    /// ([`crate::core::database::catalog`]).
+    pub fn with_catalog(
+        mut self,
+        catalog: Option<Arc<crate::core::database::catalog::DatabaseCatalog>>,
+    ) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    /// The database a hello named, or why it cannot be logged in to. Said
+    /// to a caller that has not authenticated yet, as pgwire says it: a
+    /// database's roles decide the login, so it has to be resolved first,
+    /// and database names are not secret.
+    fn resolve(&self, name: &str) -> Result<Arc<Database>, String> {
+        crate::core::database::resolve_native_database(
+            self.catalog.as_deref(),
+            &self.database,
+            name,
+        )
+        .map_err(|(_, message)| message)
     }
 
     /// Tells the caller why, then fails.
@@ -236,21 +276,40 @@ impl RoleAuthenticator {
 
     async fn run(&self, channel: &mut AuthChannel<'_>) -> Result<Principal, RastcpError> {
         let hello = channel.recv().await?;
-        let user = parse_hello(&hello)?;
+        let (user, named) = parse_hello(&hello)?;
 
         if user.is_empty() {
             return Err(Self::refuse(channel, &user).await);
         }
 
+        // The database whose roles decide this login: the one the hello
+        // named, or this listener's own.
+        let database = match named.as_deref() {
+            None => self.database.clone(),
+            Some(name) => match self.resolve(name) {
+                Ok(database) => database,
+                Err(e) => {
+                    let mut message = vec![S_ERROR];
+                    message.extend_from_slice(e.as_bytes());
+                    let _ = channel.send(&message).await;
+                    return Err(RastcpError::AuthenticationError(e));
+                }
+            },
+        };
+        let principal = |user: String, superuser: bool| match &named {
+            Some(name) => Principal::new(user, superuser).in_database(name.clone()),
+            None => Principal::new(user, superuser),
+        };
+
         // Looked up before anything is decided, so that the same messages and
         // roughly the same work happen whether or not the role exists.
-        let role = crate::auth::lookup_role(&self.database, &user).await;
+        let role = crate::auth::lookup_role(&database, &user).await;
         let may_login = role.as_ref().map(|r| r.can_login).unwrap_or(false);
         let superuser = role.as_ref().map(|r| r.is_superuser).unwrap_or(false);
 
         if self.method == AuthMethod::Trust {
             channel.send(&[S_OK]).await?;
-            return Ok(Principal::new(user, superuser));
+            return Ok(principal(user, superuser));
         }
 
         if self.method == AuthMethod::Peer {
@@ -263,7 +322,7 @@ impl RoleAuthenticator {
                 return Err(Self::refuse(channel, &user).await);
             }
             channel.send(&[S_OK]).await?;
-            return Ok(Principal::new(user, superuser));
+            return Ok(principal(user, superuser));
         }
 
         let verifier = match role.as_ref().and_then(|r| r.verifier.clone()) {
@@ -316,7 +375,7 @@ impl RoleAuthenticator {
         message.extend_from_slice(server_final.as_bytes());
         channel.send(&message).await?;
 
-        Ok(Principal::new(user, superuser))
+        Ok(principal(user, superuser))
     }
 }
 
@@ -326,29 +385,52 @@ impl ServerAuthenticator for RoleAuthenticator {
     }
 }
 
-/// Reads the user name out of the client's opening message.
-fn parse_hello(message: &[u8]) -> Result<String, RastcpError> {
+/// Reads the user name, and the database when the hello names one, out of
+/// the client's opening message.
+fn parse_hello(message: &[u8]) -> Result<(String, Option<String>), RastcpError> {
     let malformed = || RastcpError::AuthenticationError("malformed hello".to_string());
 
     if message.len() < 4 || message[0] != C_HELLO {
         return Err(malformed());
     }
-    if message[1] != PROTOCOL_VERSION {
-        return Err(RastcpError::AuthenticationError(format!(
-            "unsupported authentication protocol version {}",
-            message[1]
-        )));
-    }
+    let names_database = match message[1] {
+        PROTOCOL_VERSION => false,
+        PROTOCOL_VERSION_DATABASE => true,
+        version => {
+            return Err(RastcpError::AuthenticationError(format!(
+                "unsupported authentication protocol version {}",
+                version
+            )));
+        }
+    };
 
-    let len = u16::from_le_bytes([message[2], message[3]]) as usize;
-    let end = 4usize.checked_add(len).ok_or_else(malformed)?;
+    // One `[u16 len][UTF-8]` field starting at `at`, and where the next begins.
+    let field = |at: usize, what: &str| -> Result<(String, usize), RastcpError> {
+        let header = message.get(at..at + 2).ok_or_else(malformed)?;
+        let len = u16::from_le_bytes([header[0], header[1]]) as usize;
+        let end = (at + 2).checked_add(len).ok_or_else(malformed)?;
+        let bytes = message.get(at + 2..end).ok_or_else(malformed)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| RastcpError::AuthenticationError(format!("{what} is not UTF-8")))?;
+        Ok((text.to_string(), end))
+    };
+
+    let (user, end) = field(2, "user name")?;
+    let (database, end) = if names_database {
+        let (database, end) = field(end, "database name")?;
+        if database.is_empty() {
+            return Err(RastcpError::AuthenticationError(
+                "the hello names an empty database".to_string(),
+            ));
+        }
+        (Some(database), end)
+    } else {
+        (None, end)
+    };
     if end != message.len() {
         return Err(malformed());
     }
-
-    std::str::from_utf8(&message[4..end])
-        .map(str::to_string)
-        .map_err(|_| RastcpError::AuthenticationError("user name is not UTF-8".to_string()))
+    Ok((user, database))
 }
 
 /// Reads one tagged text message from the peer.
@@ -371,7 +453,47 @@ mod tests {
         let mut hello = vec![C_HELLO, PROTOCOL_VERSION];
         hello.extend_from_slice(&(5u16).to_le_bytes());
         hello.extend_from_slice(b"alice");
-        assert_eq!(parse_hello(&hello).unwrap(), "alice");
+        assert_eq!(parse_hello(&hello).unwrap(), ("alice".to_string(), None));
+    }
+
+    fn hello_v2(user: &[u8], database: &[u8]) -> Vec<u8> {
+        let mut hello = vec![C_HELLO, PROTOCOL_VERSION_DATABASE];
+        hello.extend_from_slice(&(user.len() as u16).to_le_bytes());
+        hello.extend_from_slice(user);
+        hello.extend_from_slice(&(database.len() as u16).to_le_bytes());
+        hello.extend_from_slice(database);
+        hello
+    }
+
+    #[test]
+    fn a_hello_naming_a_database_round_trips() {
+        assert_eq!(
+            parse_hello(&hello_v2(b"alice", b"kopa")).unwrap(),
+            ("alice".to_string(), Some("kopa".to_string()))
+        );
+        // Multibyte names are lengths in bytes, not characters.
+        assert_eq!(
+            parse_hello(&hello_v2("ålice".as_bytes(), "κόπα".as_bytes())).unwrap(),
+            ("ålice".to_string(), Some("κόπα".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_hello_naming_a_database_is_checked_to_its_last_byte() {
+        // An empty name, a short field, trailing bytes and a cut length are
+        // each refused, never read as the default database.
+        assert!(parse_hello(&hello_v2(b"alice", b"")).is_err());
+        let full = hello_v2(b"alice", b"kopa");
+        for cut in 1..full.len() {
+            assert!(parse_hello(&full[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut long = full.clone();
+        long.push(0);
+        assert!(parse_hello(&long).is_err());
+        let mut bad = hello_v2(b"alice", b"kopa");
+        let at = bad.len() - 1;
+        bad[at] = 0xFF;
+        assert!(parse_hello(&bad).unwrap_err().to_string().contains("UTF-8"));
     }
 
     #[test]
@@ -390,7 +512,7 @@ mod tests {
 
     #[test]
     fn a_hello_from_a_future_version_is_named_as_such() {
-        let mut hello = vec![C_HELLO, PROTOCOL_VERSION + 1];
+        let mut hello = vec![C_HELLO, PROTOCOL_VERSION_DATABASE + 1];
         hello.extend_from_slice(&(0u16).to_le_bytes());
         let err = parse_hello(&hello).unwrap_err().to_string();
         assert!(err.contains("version"), "{}", err);
