@@ -293,10 +293,13 @@ async fn a_returning_conflict_after_a_partition_applied_rows_is_not_replayed() {
     let blocker = db.transactions.begin();
     let held = exec_in(&db, blocker, &format!("UPDATE acct SET note = 'held' WHERE tenant_id = {b}")).await;
     assert_ne!(held.first(), Some(&3u8), "{}", String::from_utf8_lossy(&held));
+    // The statement fails as soon as it meets the held row, so the blocker
+    // only has to outlast the first partition's apply. 40 ms did not on a
+    // Windows runner: the blocker was gone first and the statement answered.
     let ender = {
         let db = db.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             rollback(&db, blocker);
         })
     };

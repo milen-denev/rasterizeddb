@@ -5,6 +5,9 @@
 //! CLOSE-WAIT — the client had closed and the server never called `close`.
 //! After about four hours the engine held 105 of them and every background
 //! worker failed with "connection pool timed out".
+//!
+//! Linux only: the socket states come from `ss`.
+#![cfg(target_os = "linux")]
 
 use sqlx::{AssertSqlSafe, Connection, Executor};
 use rasterizeddb_compat::TestServer;

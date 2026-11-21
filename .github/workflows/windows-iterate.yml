@@ -14,6 +14,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Line tables only: with full debug info the compat suite's hundred-odd test
+  # executables ran the arm64 runner out of disk and hit MSVC's PDB size
+  # limit (LNK1180, LNK1140). Backtraces keep their file and line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_MIN_STACK: "33554432"
   RUST_BACKTRACE: "1"
 

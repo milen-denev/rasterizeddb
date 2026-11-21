@@ -417,10 +417,26 @@ async fn rebalance_gives_each_moved_table_back() {
         Some(second_path.as_str()),
         "REBALANCE has not moved {first} before waiting on {then}"
     );
+    // Given back while REBALANCE still waits on the held table. Asked until it
+    // is, not once: the move switches the placement before it releases the
+    // table, and on a Windows runner the release had not come yet one settle
+    // after the switch. REBALANCE cannot finish meanwhile (the block holds
+    // `then`), so a lock taken here was given back before it finished.
     let mut other = session(&db);
-    ok(&db, &mut other, "BEGIN").await;
-    let took = send(&db, &mut other, &format!("LOCK TABLE {first} IN ACCESS EXCLUSIVE MODE NOWAIT")).await;
-    took.expect("a table REBALANCE had already moved was still locked");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        ok(&db, &mut other, "BEGIN").await;
+        let took = send(&db, &mut other, &format!("LOCK TABLE {first} IN ACCESS EXCLUSIVE MODE NOWAIT")).await;
+        assert!(!rebalance.is_finished(), "REBALANCE finished while the block held {then}");
+        match took {
+            Ok(_) => break,
+            Err(e) => {
+                ok(&db, &mut other, "ROLLBACK").await;
+                assert!(Instant::now() < deadline, "a table REBALANCE had already moved was still locked: {e:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
     ok(&db, &mut other, "COMMIT").await;
     ok(&db, &mut h, "COMMIT").await;
     let (_, out, _) = finish("REBALANCE", rebalance).await;

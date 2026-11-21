@@ -11,9 +11,11 @@ description = "A schemafull, high-performance database written in Rust, designed
 [dependencies]
 # `AT TIME ZONE`: zone rules from the system's tz database
 # (/usr/share/zoneinfo). Already in the tree through env_logger; no bundled
-# copy, so the server answers with the zones its host knows, as PostgreSQL
-# built --with-system-tzdata does.
-jiff = { version = "0.2.43", default-features = false, features = ["std", "tzdb-zoneinfo"] }
+# copy where the host has one, so the server answers with the zones its host
+# knows, as PostgreSQL built --with-system-tzdata does. Windows has no such
+# database: `tzdb-bundle-platform` compiles one in there (and on wasm) only,
+# or no named zone at all resolves on a Windows server.
+jiff = { version = "0.2.43", default-features = false, features = ["std", "tzdb-zoneinfo", "tzdb-bundle-platform"] }
 tokio = { version = "1", features = ["full"] }
 byteorder = "1.5"
 itertools = "0.15"
