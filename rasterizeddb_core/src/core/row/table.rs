@@ -4724,8 +4724,6 @@ impl<S: StorageIO> Table<S> {
     /// clause before it uses one.
     ///
     /// [`point_key::key_type_allowed`]: crate::core::row::point_key::key_type_allowed
-    // Called by the learned side's IndexPlan (rasterizeddb-78's half).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn candidates_for_key(
         &self,
         levels: &[(u32, DbType, &[u8])],
@@ -4740,8 +4738,6 @@ impl<S: StorageIO> Table<S> {
     /// column its write order, type and name. What a learned statement
     /// matches its compared columns against. A non-unique index is never
     /// one: a full-key equality on it is not a point.
-    // Called by the learned side's IndexPlan (rasterizeddb-78's half).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn point_indexes(&self) -> Result<Vec<Vec<(u32, DbType, StdArc<str>)>>> {
         let d = self.data()?;
         let Some(indexes) = d.indexes.as_ref().filter(|i| i.is_ready()) else {
