@@ -2514,7 +2514,7 @@ impl Wal {
                     {
                         let name = path.file_name().unwrap_or_default().to_string_lossy();
                         floors.push((
-                            crate::core::torn_tail::FileIdentity::of(&meta),
+                            crate::core::torn_tail::FileIdentity::of(&path, &meta),
                             name.into_owned(),
                             kind.whole(meta.len()),
                         ));

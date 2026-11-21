@@ -315,7 +315,7 @@ fn staged_lengths(dirs: &[PathBuf]) -> HashMap<PathBuf, u64> {
             for e in entries.flatten() {
                 let path = e.path();
                 if path.extension().is_some_and(|x| x == "tmp")
-                    && let Ok(m) = e.metadata()
+                    && let Ok(m) = crate::core::sync_path::entry_metadata(&e)
                 {
                     out.insert(path, m.len());
                 }
@@ -812,7 +812,7 @@ fn dir_bytes(dir: &Path) -> u64 {
         .flatten()
         .map(|e| match e.file_type() {
             Ok(t) if t.is_dir() => dir_bytes(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Ok(t) if t.is_file() => crate::core::sync_path::entry_metadata(&e).map(|m| m.len()).unwrap_or(0),
             _ => 0,
         })
         .sum()

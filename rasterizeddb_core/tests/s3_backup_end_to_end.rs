@@ -203,7 +203,7 @@ fn staging_listing(dir: &Path) -> String {
         for e in entries {
             let path = e.path();
             let rel = path.strip_prefix(base).unwrap_or(&path).display().to_string();
-            match e.metadata() {
+            match std::fs::metadata(e.path()) {
                 Ok(m) if m.is_dir() => {
                     out.push(format!("{rel}/ (dir)"));
                     walk(base, &path, out);

@@ -1,6 +1,11 @@
-//! Flushing a file or a directory named by its path, on every platform.
+//! Filesystem calls whose Unix habits do not carry over to Windows: flushing
+//! a file or a directory by its path, a file's identity, a directory entry's
+//! length.
 //!
-//! Two Unix habits do not carry over to Windows:
+//! - **`DirEntry::metadata` for a length.** On Windows it comes from the
+//!   directory listing, which NTFS updates lazily for a file someone has
+//!   open, so a file being written reads short. [`entry_metadata`] asks the
+//!   file there.
 //!
 //! - **`File::open(path)?.sync_all()`.** `fsync` takes any descriptor, but
 //!   Windows' `FlushFileBuffers` needs a handle with write access, and on a
@@ -21,6 +26,19 @@
 use std::fs::File;
 use std::io;
 use std::path::Path;
+
+/// `entry`'s metadata, its length current: the file's own on Windows, where
+/// the listing's lags a file that is open (see the module docs).
+pub fn entry_metadata(entry: &std::fs::DirEntry) -> io::Result<std::fs::Metadata> {
+    #[cfg(windows)]
+    {
+        std::fs::metadata(entry.path())
+    }
+    #[cfg(not(windows))]
+    {
+        entry.metadata()
+    }
+}
 
 /// Flushes the file at `path`: its bytes and its metadata.
 pub fn sync_file(path: &Path) -> io::Result<()> {
@@ -67,6 +85,43 @@ pub fn sync_dir(dir: &Path) -> io::Result<bool> {
         Some(handle) => flush_dir(&handle),
         None => Ok(false),
     }
+}
+
+/// The volume serial number and the file index of the file or directory at
+/// `path`: who it is on Windows, kept through a rename, never shared by two
+/// files on a volume at once. Read through a handle that asks for no access
+/// (a directory opens only with `FILE_FLAG_BACKUP_SEMANTICS`).
+#[cfg(windows)]
+pub fn volume_and_index(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct ByHandleFileInformation {
+        dwFileAttributes: u32,
+        ftCreationTime: [u32; 2],
+        ftLastAccessTime: [u32; 2],
+        ftLastWriteTime: [u32; 2],
+        dwVolumeSerialNumber: u32,
+        nFileSizeHigh: u32,
+        nFileSizeLow: u32,
+        nNumberOfLinks: u32,
+        nFileIndexHigh: u32,
+        nFileIndexLow: u32,
+    }
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut ByHandleFileInformation) -> i32;
+    }
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = File::options().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)?;
+    // SAFETY: the handle is open for the call and `info` is a plain struct
+    // the call fills.
+    let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Ok((info.dwVolumeSerialNumber as u64, index))
 }
 
 /// The errors a volume answers a directory flush with when it does not

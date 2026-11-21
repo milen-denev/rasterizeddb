@@ -2889,7 +2889,14 @@ mod tests {
 
         let started = std::time::Instant::now();
         let mut peak = 0usize;
-        while started.elapsed() < std::time::Duration::from_secs(secs) && !full.load(Ordering::Relaxed) {
+        // `secs`, or longer until the floors asserted below are reached:
+        // slower machines (a Windows runner) took 72741 ids in the time.
+        let floors_met = || m.next_id() > 100_000 && checked.load(Ordering::Relaxed) > 10_000;
+        let deadline = std::time::Duration::from_secs(secs * 6);
+        while (started.elapsed() < std::time::Duration::from_secs(secs) || !floors_met())
+            && started.elapsed() < deadline
+            && !full.load(Ordering::Relaxed)
+        {
             std::thread::sleep(std::time::Duration::from_millis(50));
             peak = peak.max(m.status().memory_bytes());
         }

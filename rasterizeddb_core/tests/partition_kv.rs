@@ -222,7 +222,7 @@ fn tree_bytes(dir: &Path) -> u64 {
         .flatten()
         .map(|e| match e.file_type() {
             Ok(t) if t.is_dir() => tree_bytes(&e.path()),
-            Ok(_) => e.metadata().map(|m| m.len()).unwrap_or(0),
+            Ok(_) => std::fs::metadata(e.path()).map(|m| m.len()).unwrap_or(0),
             Err(_) => 0,
         })
         .sum()

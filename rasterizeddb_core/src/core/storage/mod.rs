@@ -1915,41 +1915,10 @@ pub fn filesystem_id(path: &str) -> Option<u64> {
     std::fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
-/// The volume serial number of the volume holding `path`, read through a
-/// handle that asks for no access (a directory opens only with
-/// `FILE_FLAG_BACKUP_SEMANTICS`).
+/// The volume serial number of the volume holding `path`.
 #[cfg(windows)]
 pub fn filesystem_id(path: &str) -> Option<u64> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct ByHandleFileInformation {
-        dwFileAttributes: u32,
-        ftCreationTime: [u32; 2],
-        ftLastAccessTime: [u32; 2],
-        ftLastWriteTime: [u32; 2],
-        dwVolumeSerialNumber: u32,
-        nFileSizeHigh: u32,
-        nFileSizeLow: u32,
-        nNumberOfLinks: u32,
-        nFileIndexHigh: u32,
-        nFileIndexLow: u32,
-    }
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut ByHandleFileInformation) -> i32;
-    }
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let file = std::fs::OpenOptions::new()
-        .access_mode(0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .ok()?;
-    // SAFETY: the handle is open for the call and `info` is a plain struct
-    // the call fills.
-    let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
-    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
-    (ok != 0).then_some(info.dwVolumeSerialNumber as u64)
+    crate::core::sync_path::volume_and_index(Path::new(path)).ok().map(|(volume, _)| volume)
 }
 
 #[cfg(not(any(unix, windows)))]

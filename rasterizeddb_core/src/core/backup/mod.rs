@@ -2921,7 +2921,7 @@ fn staged_lengths_in(
             }
             lengths.insert(
                 format!("{prefix}{name}"),
-                entry.metadata().map(|m| m.len()).unwrap_or(0),
+                crate::core::sync_path::entry_metadata(&entry).map(|m| m.len()).unwrap_or(0),
             );
         }
         Ok(())
@@ -2938,7 +2938,7 @@ fn staged_lengths_in(
             {
                 lengths.insert(
                     format!("{key}/{name}"),
-                    entry.metadata().map(|m| m.len()).unwrap_or(0),
+                    crate::core::sync_path::entry_metadata(&entry).map(|m| m.len()).unwrap_or(0),
                 );
             }
         }

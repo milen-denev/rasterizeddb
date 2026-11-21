@@ -286,6 +286,6 @@ fn the_epoch_log_has_a_torn_tail_cut_with_a_durable_floor() {
     short.extend_from_slice(&[1u8; 5]);
     std::fs::write(&path, &short).unwrap();
     let mut floors = Floors::default();
-    floors.set(FileIdentity::of(&std::fs::metadata(&path).unwrap()), EPOCH_LOG_FILE, whole as u64);
+    floors.set(FileIdentity::of(&path, &std::fs::metadata(&path).unwrap()), EPOCH_LOG_FILE, whole as u64);
     assert!(cut_torn_tails(dir.path(), &floors).is_err(), "a cut below the durable floor");
 }

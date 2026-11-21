@@ -1058,17 +1058,17 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
     // yields between writes; flat out, it overlapped every read of this
     // size and the reader made 14 reads in a second and a half.
     let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer = {
         let (io, stop, row) = (io.clone(), stop.clone(), data[200 * ROW as usize..201 * ROW as usize].to_vec());
+        let writes = writes.clone();
         tokio::spawn(async move {
-            let mut writes = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 io.write_data(200 * ROW, &row).await;
-                writes += 1;
+                writes.fetch_add(1, Ordering::Relaxed);
                 tokio::task::yield_now().await;
                 std::thread::yield_now();
             }
-            writes
         })
     };
 
@@ -1087,7 +1087,13 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
         .collect();
     let started = std::time::Instant::now();
     let mut reads = 0u64;
-    while started.elapsed() < std::time::Duration::from_millis(1500) {
+    // 1.5 s, or longer until both sides have run a hundred times: a write
+    // syncs, and on a Windows runner 1.5 s held 78 of them.
+    let mut writes_seen = 0u64;
+    while (started.elapsed() < std::time::Duration::from_millis(1500) || reads <= 100 || writes_seen <= 100)
+        && started.elapsed() < std::time::Duration::from_secs(60)
+    {
+        writes_seen = writes.load(Ordering::Relaxed);
         let mut bufs: Vec<Vec<u8>> = vec![vec![0xEE; 3]; cells.len()];
         if io.try_read_cells_sync(&rows, &cells, &mut bufs.iter_mut().collect::<Vec<_>>()) {
             assert!(bufs == expect, "read {reads}: a batch read beside a writer holds other than each cell once");
@@ -1098,7 +1104,8 @@ async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let writes = writer.await.expect("the writer");
+    writer.await.expect("the writer");
+    let writes = writes.load(Ordering::Relaxed);
     assert!(reads > 100 && writes > 100, "{reads} reads beside {writes} writes: too few to have overlapped");
 }
 
