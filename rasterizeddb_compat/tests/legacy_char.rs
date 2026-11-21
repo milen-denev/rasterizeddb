@@ -194,8 +194,16 @@ impl LegacyDb {
                 }
             }
             // Into the files, so the log does not replay the records over the
-            // edit below.
-            rasterizeddb_core::core::wal::checkpoint_all().expect("checkpoint");
+            // edit below. Until this database's log says it is done: a
+            // checkpoint declines while writes are pending (`Ok(false)`),
+            // which `checkpoint_all` does not report, and on a Windows runner
+            // the replay then put the UINT4 records back over the edit.
+            let wal = rasterizeddb_core::core::wal::wal_for(&db.root_text()).expect("the database's log");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !wal.checkpoint().expect("checkpoint") {
+                assert!(std::time::Instant::now() < deadline, "the log never checkpointed");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         }
         for table in tables {
             // The field records of the legacy columns, retyped from UINT4 (8)
