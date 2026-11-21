@@ -1181,3 +1181,128 @@ async fn a_learned_native_point_read_finds_its_row_by_the_key() {
         rounds(context.clone(), session).await;
     }
 }
+
+
+/// An EXEC request (`rastcp::exec`) for `sql` with `literals[n - 1]` as
+/// `$n`'s literal; every `$n` in `sql` is a placeholder (the statements here
+/// hold no `$` in a string).
+fn exec_request(sql: &str, literals: &[&str]) -> Vec<u8> {
+    let b = sql.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' {
+            let start = i;
+            i += 1;
+            let digits = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > digits {
+                let n: u16 = sql[digits..i].parse().unwrap();
+                spans.push(rastcp::exec::Span { start: start as u32, end: i as u32, literal: n - 1 });
+            }
+            continue;
+        }
+        i += 1;
+    }
+    rastcp::exec::encode(sql, literals, &spans).unwrap()
+}
+
+/// `sql` with each `$n` replaced by `literals[n - 1]`, highest `n` first so
+/// `$1` never eats the start of `$10`.
+fn rendered(sql: &str, literals: &[&str]) -> String {
+    let mut out = sql.to_string();
+    for (i, literal) in literals.iter().enumerate().rev() {
+        out = out.replace(&format!("${}", i + 1), literal);
+    }
+    out
+}
+
+/// An EXEC request answers exactly as its rendered text does on the plain
+/// path (no session, nothing learned), whatever the learned path makes of
+/// it: values out of order, one a class does not read, one in the select
+/// list, a parameter the text never names, a write. A learned point read
+/// takes its key; a malformed request is refused and runs nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exec_request_answers_as_its_rendered_text() {
+    use std::sync::atomic::Ordering;
+    let (_dir, database) = database().await;
+    let context = context(&database, false);
+    ok(&context, "CREATE TABLE ex (k BIGINT PRIMARY KEY, s TEXT, n BIGINT)").await;
+    for k in 1..=40 {
+        ok(&context, &format!("INSERT INTO ex (k, s, n) VALUES ({k}, 'n{k}', {})", k % 4)).await;
+    }
+    let session = crate::pgwire::NativeSession::new(database.clone(), "svc", true, false, false);
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let cases: &[(&str, &[&[&str]])] = &[
+        ("SELECT k, s, n FROM ex WHERE k = $1", &[&["5"], &["17"], &["999"], &["40"]]),
+        ("SELECT k FROM ex WHERE n = $2 AND k > $1 ORDER BY k", &[&["3", "1"], &["10", "2"], &["30", "0"]]),
+        ("SELECT k FROM ex WHERE s = $1", &[&["'n7'"], &["'it''s'"], &["'n9'"]]),
+        ("SELECT $2, k FROM ex WHERE k = $1", &[&["5", "'x'"], &["6", "'y'"]]),
+        ("SELECT k, n FROM ex WHERE k = $3", &[&["", "", "7"], &["", "", "8"]]),
+        ("SELECT k FROM ex WHERE k = $1 OR n = $2 ORDER BY k", &[&["5", "1"], &["9", "2"], &["13", "3"]]),
+    ];
+    let hits = crate::core::row::point_key::HITS.load(Ordering::Relaxed);
+    let runs = crate::pgwire::TEXT_RUNS.load(Ordering::Relaxed);
+    for _round in 0..3 {
+        for (sql, sets) in cases {
+            for set in *sets {
+                let text = rendered(sql, set);
+                let plain = process_native_request(context.clone(), principal.clone(), None, text.clone().into_bytes()).await;
+                let exec =
+                    process_native_request(context.clone(), principal.clone(), Some(&session), exec_request(sql, set)).await;
+                assert_eq!(exec, plain, "{text}: the EXEC answer differs from the text's ({})", self::text(&exec));
+            }
+        }
+    }
+    assert!(crate::pgwire::TEXT_RUNS.load(Ordering::Relaxed) > runs, "no EXEC request ran from a learned parse");
+    assert!(crate::core::row::point_key::HITS.load(Ordering::Relaxed) > hits, "no EXEC point read took its key");
+
+    // A write sent as EXEC is the write its text is.
+    let answer = process_native_request(
+        context.clone(),
+        principal.clone(),
+        Some(&session),
+        exec_request("UPDATE ex SET n = $1 WHERE k = $2", &["100", "3"]),
+    )
+    .await;
+    assert_ne!(answer.first(), Some(&3), "{}", self::text(&answer));
+    let n_of = |r: &[crate::core::row::row::Row]| -> Vec<i64> {
+        r.iter().map(|row| i64::from_le_bytes(row.columns[0].data.into_slice().try_into().expect("a BIGINT"))).collect()
+    };
+    assert_eq!(n_of(&rows(&context, "SELECT n FROM ex WHERE k = 3").await), [100]);
+
+    // Inside the connection's transaction block an EXEC request is a
+    // statement of the block, as its text would be: it reads the block's own
+    // write, and after ROLLBACK it does not.
+    let point = |k: &'static str| exec_request("SELECT k FROM ex WHERE k = $1", &[k]);
+    let k_of = |answer: &[u8]| -> Vec<i64> {
+        assert_eq!(answer.first(), Some(&2), "{}", self::text(answer));
+        crate::core::row::row::vec_into_rows(&answer[1..])
+            .expect("rows")
+            .iter()
+            .map(|row| i64::from_le_bytes(row.columns[0].data.into_slice().try_into().expect("a BIGINT")))
+            .collect()
+    };
+    for statement in ["BEGIN", "INSERT INTO ex (k, s, n) VALUES (500, 'b', 1)"] {
+        let answer = process_native_request(context.clone(), principal.clone(), Some(&session), statement.as_bytes().to_vec()).await;
+        assert_ne!(answer.first(), Some(&3), "{statement}: {}", self::text(&answer));
+    }
+    for _ in 0..3 {
+        let answer = process_native_request(context.clone(), principal.clone(), Some(&session), point("500")).await;
+        assert_eq!(k_of(&answer), [500], "an EXEC read in the block missed the block's own write");
+    }
+    process_native_request(context.clone(), principal.clone(), Some(&session), b"ROLLBACK".to_vec()).await;
+    for _ in 0..3 {
+        let answer = process_native_request(context.clone(), principal.clone(), Some(&session), point("500")).await;
+        assert_eq!(k_of(&answer), Vec::<i64>::new(), "an EXEC read saw a rolled-back write");
+    }
+
+    // Malformed: refused, and nothing of it runs.
+    let mut bad = exec_request("UPDATE ex SET n = $1 WHERE k = $2", &["7", "4"]);
+    bad.truncate(bad.len() - 3);
+    let answer = process_native_request(context.clone(), principal, Some(&session), bad).await;
+    assert_eq!(answer.first(), Some(&3), "a malformed EXEC request was answered");
+    assert_eq!(n_of(&rows(&context, "SELECT n FROM ex WHERE k = 4").await), [0], "a malformed request wrote k = 4");
+}

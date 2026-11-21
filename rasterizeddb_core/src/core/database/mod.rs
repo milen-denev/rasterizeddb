@@ -6058,6 +6058,28 @@ async fn process_native_request(
     session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
 ) -> Vec<u8> {
+    // An EXEC request (`rastcp::exec`): a statement's text with `$n` in
+    // place of its values, and each value as the SQL literal the client
+    // would have written there. It is the rendered statement in every way:
+    // the text below is exactly what the client would otherwise have sent,
+    // and every rule below reads it as such. The one thing the client's
+    // split adds is the statement's template, ready made, which the learned
+    // path then keys on instead of working it out from the text
+    // (`NativeSession::text_step`). Ahead of the marked requests, whose mark
+    // is EXEC's first byte too. A malformed one is refused, never run as
+    // whatever its bytes read as.
+    let (request_vec, exec_template) = match rastcp::exec::decode(&request_vec) {
+        None => (request_vec, None),
+        Some(Err(e)) => return error_response(&format!("malformed EXEC request: {e}")),
+        Some(Ok(exec)) => {
+            let template = crate::pgwire::NativeTemplate {
+                sql: exec.sql.to_string(),
+                literals: exec.literals.iter().map(|l| l.to_string()).collect(),
+            };
+            (exec.render().into_bytes(), Some(template))
+        }
+    };
+
     // A marked request (`pgwire::native_session::answer_marked`): the
     // simple-query form, whose text is a PostgreSQL simple query run by the
     // connection's session through pgwire's own path (its gates, statement
@@ -6206,7 +6228,7 @@ async fn process_native_request(
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query_in(&query, context.database, session).await
+        run_native_query_in(&query, context.database, session, exec_template).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -6215,11 +6237,11 @@ async fn process_native_request(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query_in(&query, context.database, session).await;
+            return run_native_query_in(&query, context.database, session, exec_template).await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response = run_native_query_in(&query, context.database, session).await;
+            let response = run_native_query_in(&query, context.database, session, exec_template).await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -6301,12 +6323,13 @@ async fn run_native_query_in(
     query: &str,
     database: Arc<Database>,
     session: Option<&crate::pgwire::NativeSession>,
+    template: Option<crate::pgwire::NativeTemplate>,
 ) -> Vec<u8> {
     let response = match session {
         Some(session) => {
             crate::core::rql::sequence::session::scoped(
                 session.sequence_scope(),
-                Box::pin(run_native_query_learning(query, database.clone(), session)),
+                Box::pin(run_native_query_learning(query, database.clone(), session, template)),
             )
             .await
         }
@@ -6325,9 +6348,10 @@ async fn run_native_query_learning(
     query: &str,
     database: Arc<Database>,
     session: &crate::pgwire::NativeSession,
+    template: Option<crate::pgwire::NativeTemplate>,
 ) -> Vec<u8> {
     use crate::pgwire::NativeTextStep;
-    match session.text_step(query) {
+    match session.text_step(query, template) {
         NativeTextStep::Plain => run_native_query(query, database).await,
         NativeTextStep::Run {
             template,

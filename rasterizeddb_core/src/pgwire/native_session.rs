@@ -316,6 +316,14 @@ pub(crate) enum NativeTextStep {
 }
 
 /// A watched statement's template and values, for [`NativeSession::text_learn`].
+/// A statement's template as an EXEC request carries it: the text with
+/// `$n` for each value, and `literals[n - 1]` the SQL literal of `$n`
+/// (empty for a parameter the text never names).
+pub(crate) struct NativeTemplate {
+    pub(crate) sql: String,
+    pub(crate) literals: Vec<String>,
+}
+
 pub(crate) struct NativeWatch {
     /// The statement itself, described while it is learned.
     query: String,
@@ -354,16 +362,29 @@ impl NativeSession {
     /// How an autocommit statement on the native path runs: from a parse
     /// learned for its template, watched while one is learned, or plainly.
     /// The same rules as a pgwire session's simple query (`watch_step`).
-    pub(crate) fn text_step(&self, query: &str) -> NativeTextStep {
+    ///
+    /// `given` is the template an EXEC request arrived with
+    /// (`rastcp::exec`): its text with `$n` for each value and the values'
+    /// literals by parameter number, `query` being that template rendered.
+    /// It is learned and run under exactly the rules a template worked out
+    /// from `query` would be, as a prepared statement's text is, with the
+    /// literals as values; a parameter the text never names arrives as an
+    /// empty literal, which no class reads, so such a statement runs as text.
+    pub(crate) fn text_step(&self, query: &str, given: Option<NativeTemplate>) -> NativeTextStep {
         use crate::core::rql::prepared as pr;
         if !super::text_shapes_on().load(Ordering::Relaxed) {
             return NativeTextStep::Plain;
         }
-        let Some((template, literals)) = super::text_template(query) else {
-            return NativeTextStep::Plain;
+        let (template, literals) = match given {
+            Some(NativeTemplate { sql, literals }) => (sql, literals),
+            None => match super::text_template(query) {
+                Some(found) => found,
+                None => return NativeTextStep::Plain,
+            },
         };
         let generation = self.database.schema_generation.load(Ordering::Acquire);
-        let classes: Option<Vec<u8>> = literals.iter().map(|x| pr::literal_class(x)).collect();
+        let classes: Option<Vec<u8>> =
+            literals.iter().map(|x| if x.is_empty() { None } else { pr::literal_class(x) }).collect();
         let literals = Some(literals);
         let mut shapes = self.text_shapes.lock().unwrap_or_else(|e| e.into_inner());
         let prepared = super::text_shape_slot(&mut shapes, &self.database, &template);
