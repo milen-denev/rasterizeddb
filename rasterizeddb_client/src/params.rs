@@ -837,11 +837,17 @@ pub(crate) fn render_with(
 /// statement reads its values (pgwire's Bind order), up to the highest `$n`
 /// named. A parameter no placeholder names in between is an empty literal,
 /// which no value renders as (an empty string is `''`) and is never written.
+///
+/// `Ok(None)` when the statement would render past
+/// [`rastcp::exec::MAX_RENDERED`], which a server refuses unrendered (it
+/// bounds what a small request may make it allocate): such a statement is
+/// sent as text, which a server whose message limit allows it still takes.
+/// Measured as the server measures it, from the same spans and literals.
 pub(crate) fn exec_request_with(
     sql: &str,
     count: usize,
     mut write: impl FnMut(usize, &mut String) -> Result<()>,
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     let bytes = sql.as_bytes();
     // Per parameter, its literal once a placeholder named it.
     let mut literals: Vec<Option<String>> = Vec::new();
@@ -886,7 +892,13 @@ pub(crate) fn exec_request_with(
     }
     check_not_transaction_control(sql)?;
     let literals: Vec<&str> = literals.iter().map(|l| l.as_deref().unwrap_or("")).collect();
-    rastcp::exec::encode(sql, &literals, &spans).map_err(Error::Param)
+    let rendered = spans.iter().try_fold(sql.len(), |len, s| {
+        len.checked_sub((s.end - s.start) as usize)?.checked_add(literals[s.literal as usize].len())
+    });
+    if rendered.is_none_or(|len| len > rastcp::exec::MAX_RENDERED) {
+        return Ok(None);
+    }
+    rastcp::exec::encode(sql, &literals, &spans).map(Some).map_err(Error::Param)
 }
 
 /// Whether the quote at `quote` opens an `E'…'` string, whose backslashes
@@ -1282,7 +1294,8 @@ mod tests {
                 for start in 0..values.len() {
                     let params: Vec<Param<'_>> = (0..take).map(|i| values[(start + i) % values.len()].clone()).collect();
                     let text = render(sql, &params);
-                    let request = exec_request_with(sql, params.len(), |i, out| push_param(out, &params[i]));
+                    let request = exec_request_with(sql, params.len(), |i, out| push_param(out, &params[i]))
+                        .map(|r| r.expect("a short statement is sent as EXEC"));
                     match (text, request) {
                         (Ok(text), Ok(request)) => {
                             let exec = rastcp::exec::decode(&request).expect("an EXEC request").expect("well formed");
@@ -1307,5 +1320,27 @@ mod tests {
             }
         }
         assert!(compared > 100, "only {compared} compared");
+    }
+
+    /// A statement is sent as EXEC exactly while the server would render it:
+    /// at the limit the request is made and the server's decoder takes it,
+    /// one byte past it the statement goes as text (`None`) instead of being
+    /// refused; and one that small values would make large by naming them
+    /// over and over goes as text too.
+    #[test]
+    fn a_statement_too_long_to_render_from_a_request_goes_as_text() {
+        let max = rastcp::exec::MAX_RENDERED;
+        // `SELECT ` + the quoted literal: 7 + len + 2 bytes rendered.
+        let at_limit = "x".repeat(max - 9);
+        let request = exec_request_with("SELECT $1", 1, |_, out| push_param(out, &Param::Text(&at_limit)))
+            .unwrap()
+            .expect("at the limit, an EXEC request");
+        let exec = rastcp::exec::decode(&request).unwrap().expect("the server takes it");
+        assert_eq!(exec.render().len(), max);
+        let past = "x".repeat(max - 8);
+        assert!(exec_request_with("SELECT $1", 1, |_, out| push_param(out, &Param::Text(&past))).unwrap().is_none());
+        let value = "y".repeat(100_000);
+        let sql = format!("SELECT {}", vec!["$1"; 100].join(", "));
+        assert!(exec_request_with(&sql, 1, |_, out| push_param(out, &Param::Text(&value))).unwrap().is_none());
     }
 }

@@ -451,7 +451,10 @@ impl Client {
             let request = crate::params::exec_request_with(sql, params.len(), |i, out| {
                 crate::params::push_param(out, &params[i])
             })?;
-            return decode_response(self.send_bytes(&request).await?);
+            // `None`: too long to render from a request; sent as text.
+            if let Some(request) = request {
+                return decode_response(self.send_bytes(&request).await?);
+            }
         }
         let statement = render(sql, params)?;
         self.send(&statement).await
@@ -487,7 +490,10 @@ impl Client {
             let request = crate::params::exec_request_with(sql, params.len(), |i, out| {
                 crate::params::push_param(out, &params[i].to_param())
             })?;
-            return decode_response(self.send_bytes(&request).await?);
+            // `None`: too long to render from a request; sent as text.
+            if let Some(request) = request {
+                return decode_response(self.send_bytes(&request).await?);
+            }
         }
         let statement = render_dyn(sql, params)?;
         self.send(&statement).await
