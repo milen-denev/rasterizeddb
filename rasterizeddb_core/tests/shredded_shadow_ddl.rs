@@ -247,3 +247,36 @@ fn concurrent_writers_adding_keys_lose_no_document() {
         }
     });
 }
+
+/// Under `json_shadow_tables`, `ADD COLUMN … JSONB` is shredded exactly as
+/// `CREATE TABLE` makes the column: registered against its shadow table, and
+/// a document written to it reads back. A partitioned table still refuses a
+/// shredded column (a shadow table the partitions would have to share).
+/// Without the knob the column is a stored document, which a partitioned
+/// table takes (`partition_alter.rs`).
+#[test]
+fn an_added_jsonb_column_follows_the_knob_and_a_partitioned_table_refuses_it() {
+    on_a_big_stack(async {
+        init_globals();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::new_with_backend(&dir.path().to_string_lossy(), false).await);
+        run(&db, "CREATE TABLE p (id INT NOT NULL)").await.unwrap();
+        run(&db, "INSERT INTO p (id) VALUES (1)").await.unwrap();
+        run(&db, "ALTER TABLE p ADD COLUMN doc JSONB").await.unwrap();
+        let schema = db.table_for_tests("p").expect("p").schema.clone();
+        assert!(
+            schema.json_columns.iter().any(|j| !j.is_deleted && j.column == "doc"),
+            "the added column is not registered as shredded: {:?}",
+            schema.json_columns
+        );
+        run(&db, r#"INSERT INTO p (id, doc) VALUES (2, '{"a":1}')"#).await.unwrap();
+        let doc = doc_of(&db, 2).await;
+        assert!(doc.contains("\"a\":1"), "the document did not read back: {doc}");
+
+        run(&db, "CREATE TABLE q (k INT NOT NULL, n INT) PARTITION BY HASH (k) PARTITIONS 2")
+            .await
+            .unwrap();
+        let e = run(&db, "ALTER TABLE q ADD COLUMN doc JSONB").await.expect_err("a shredded column was added");
+        assert!(e.contains("shadow tables"), "{e}");
+    });
+}

@@ -335,10 +335,11 @@ fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
     pair.ok("ALTER TABLE {t} ALTER COLUMN must DROP NOT NULL");
     pair.ok("ALTER TABLE {t} ALTER COLUMN filled DROP NOT NULL");
     pair.refused("ALTER TABLE {t} ALTER COLUMN tenant_id DROP NOT NULL", "must be NOT NULL");
-    // A shredded jsonb column has shadow tables, refused here; `json` is
-    // text as written, an ordinary column.
-    pair.refused("ALTER TABLE {t} ADD COLUMN doc JSONB", "shadow tables");
-    pair.ok("ALTER TABLE {t} ADD COLUMN doc JSON");
+    // `jsonb` is a stored document and `json` its text as written: both
+    // ordinary columns, as `CREATE TABLE` makes them. (A shredded one, made
+    // only under `json_shadow_tables`, is refused: `shredded_shadow_ddl.rs`.)
+    pair.ok("ALTER TABLE {t} ADD COLUMN doc JSONB");
+    pair.ok("ALTER TABLE {t} ADD COLUMN note JSON");
     pair.compare("columns added");
     pair.ok(
         "INSERT INTO {t} (tenant_id, id, n, s, extra, dec, must) VALUES (1, 1, 5, 'a', NULL, 12.34, NULL), \
@@ -352,6 +353,29 @@ fn metadata_only_add_column_and_drop_not_null_on_an_empty_table() {
     // Once it holds rows, the same statement rewrites every row (phase 6
     // P8), and answers as the twin.
     pair.ok("ALTER TABLE {t} ADD COLUMN late INT");
+    // A migration's array-defaulted document column (the KOPA report):
+    // every row already there gets the array, a new one too.
+    pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS lines JSONB NOT NULL DEFAULT '[]'");
+    pair.ok("ALTER TABLE {t} ADD COLUMN IF NOT EXISTS lines JSONB NOT NULL DEFAULT '[]'");
+    pair.ok("INSERT INTO {t} (tenant_id, id, n) VALUES (5, 5, 1)");
+    pair.ok(r#"INSERT INTO {t} (tenant_id, id, n, lines, doc) VALUES (6, 6, 1, '[{"q": 2}]', '{"k": [1, 2]}')"#);
+    // Equal on both sides is not enough: both could read the default alike
+    // and wrongly. Rows 1-5 hold the default, row 6 what it was given.
+    let read = pair.ok(
+        "SELECT tenant_id, lines, jsonb_array_length(lines), lines->0->>'q', doc->'k'->>1 FROM {t} \
+         ORDER BY tenant_id, id",
+    );
+    let want: Vec<Vec<Option<String>>> = (1..=5)
+        .map(|i| vec![Some(i.to_string()), Some("[]".into()), Some("0".into()), None, None])
+        .chain([vec![
+            Some("6".into()),
+            Some(r#"[{"q": 2}]"#.into()),
+            Some("1".into()),
+            Some("2".into()),
+            Some("2".into()),
+        ]])
+        .collect();
+    assert_eq!(read.rows, want, "the added document column's values");
     pair.compare("rewritten with rows");
     pair.restart();
     pair.compare("rewritten, restarted");
