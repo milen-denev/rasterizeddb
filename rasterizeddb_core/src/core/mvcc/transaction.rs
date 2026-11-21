@@ -71,13 +71,15 @@ pub struct Snapshot {
     /// are not committed. `NO_TX` for a snapshot taken outside any transaction.
     pub own: TxId,
     /// Every id belonging to the reading transaction, itself and each savepoint
-    /// it has opened.
+    /// it has opened. `None` when that is `own` alone (or nothing, for a
+    /// snapshot taken outside any transaction): the usual case, answered by
+    /// `solo`, and not worth a set and an `Arc` per statement.
     ///
     /// A savepoint is a sub-transaction with an id of its own, so "is this write
     /// mine?" stops being an equality test the moment savepoints exist. A write
     /// made before a savepoint carries the outer id and must stay visible after
     /// it; a write made inside one that was rolled back must not.
-    family: Arc<BTreeSet<TxId>>,
+    family: Option<Arc<BTreeSet<TxId>>>,
     /// Keeps `xmin` in the manager's registry of live snapshots for as long as
     /// any clone of this snapshot exists. `None` for a snapshot built by hand.
     registration: Option<Arc<SnapshotRegistration>>,
@@ -161,13 +163,34 @@ impl Snapshot {
         } else {
             NO_TX
         };
+        // `own` alone, or nothing outside a transaction: what `None` means.
+        let just_own = if own == NO_TX {
+            family.is_empty()
+        } else {
+            solo == own
+        };
         Snapshot {
             xmax,
             xmin,
             solo,
             running: Arc::new(running),
             own,
-            family: Arc::new(family),
+            family: if just_own { None } else { Some(Arc::new(family)) },
+            registration: None,
+        }
+    }
+
+    /// [`Self::at_with_family`] for a reader whose family is `own` alone,
+    /// without building the one-element set.
+    fn at_own(xmax: TxId, running: BTreeSet<TxId>, own: TxId) -> Self {
+        let xmin = running.first().copied().unwrap_or(xmax).min(xmax);
+        Snapshot {
+            xmax,
+            xmin,
+            solo: own,
+            running: Arc::new(running),
+            own,
+            family: None,
             registration: None,
         }
     }
@@ -181,7 +204,7 @@ impl Snapshot {
         if self.solo != NO_TX {
             return tx == self.solo;
         }
-        self.family.contains(&tx)
+        self.family.as_ref().is_some_and(|family| family.contains(&tx))
     }
 
     /// True when nothing was in flight, so every version below `xmax` is either
@@ -211,7 +234,13 @@ impl Snapshot {
         xmax: TxId,
         outcome: &impl Fn(TxId) -> TxOutcome,
     ) -> bool {
-        let is_mine = |tx: TxId| self.own != NO_TX && self.family.contains(&tx);
+        let is_mine = |tx: TxId| {
+            self.own != NO_TX
+                && match &self.family {
+                    Some(family) => family.contains(&tx),
+                    None => tx == self.own,
+                }
+        };
         let started_before = |tx: TxId| tx < self.xmax && !self.running.contains(&tx);
         let created = if xmin == FROZEN_TX {
             true
@@ -1064,6 +1093,15 @@ impl TransactionManager {
     /// parent, whose outcome was just written.
     fn retire_family(&self, tx: TxId) {
         let mut inner = self.inner.write();
+        // The usual transaction opened no savepoint: its family is itself,
+        // with no sub-transaction outcome to write down. Retired here without
+        // building the family set, which allocated twice under this write
+        // lock on every statement's commit.
+        if inner.children.get(&tx).is_none_or(|kids| kids.is_empty()) && !inner.parent.contains_key(&tx) {
+            Self::forget_retired(&mut inner, tx);
+            self.publish_savepoints(&inner);
+            return;
+        }
         let family = Self::collect_family(&inner, tx);
 
         // Each sub-transaction's outcome is written down before its parent link
@@ -1089,20 +1127,25 @@ impl TransactionManager {
         // `rolled_back` grow for the life of the process, one entry per
         // savepoint ever opened.
         for id in family {
-            inner.running.remove(&id);
-            inner.pinned.remove(&id);
-            inner.statement_scoped.remove(&id);
-            inner.rolled_back.remove(&id);
-            inner.wrote.remove(&id);
-            inner.owner_only.remove(&id);
-            if let Some(parent) = inner.parent.remove(&id) {
-                if let Some(kids) = inner.children.get_mut(&parent) {
-                    kids.retain(|k| *k != id);
-                }
-            }
-            inner.children.remove(&id);
+            Self::forget_retired(&mut inner, id);
         }
         self.publish_savepoints(&inner);
+    }
+
+    /// Drops every record of `id`, which has retired.
+    fn forget_retired(inner: &mut Inner, id: TxId) {
+        inner.running.remove(&id);
+        inner.pinned.remove(&id);
+        inner.statement_scoped.remove(&id);
+        inner.rolled_back.remove(&id);
+        inner.wrote.remove(&id);
+        inner.owner_only.remove(&id);
+        if let Some(parent) = inner.parent.remove(&id) {
+            if let Some(kids) = inner.children.get_mut(&parent) {
+                kids.retain(|k| *k != id);
+            }
+        }
+        inner.children.remove(&id);
     }
 
     /// Opens a savepoint inside `parent` and returns the sub-transaction id that
@@ -1318,6 +1361,10 @@ impl TransactionManager {
         let inner = self.inner.read();
         if inner.wrote.contains(&tx) {
             return true;
+        }
+        // No savepoint under it: nothing else can have written for it.
+        if inner.children.get(&tx).is_none_or(|kids| kids.is_empty()) {
+            return false;
         }
         // A savepoint's writes are the transaction's writes. Checking only the
         // top-level id would call a block read-only because everything in it
@@ -1559,6 +1606,15 @@ impl TransactionManager {
         // A transaction does not count itself as running: it sees its own
         // writes, which `Snapshot::sees` handles through `own`, and listing it
         // here would only make the fast path fire less often.
+        //
+        // With no savepoint open anywhere, `own`'s family is `own` alone
+        // (`family_locked` would walk an empty `parent` and return just it),
+        // so the set is not built. This runs under `inner`'s read lock on
+        // every statement, which writers (`begin`, `retire_family`) wait on.
+        if own != NO_TX && inner.parent.is_empty() {
+            let running: BTreeSet<TxId> = inner.running.iter().copied().filter(|id| *id != own).collect();
+            return Snapshot::at_own(inner.next_id, running, own);
+        }
         let family = Self::family_locked(inner, own);
         let running: BTreeSet<TxId> = inner
             .running

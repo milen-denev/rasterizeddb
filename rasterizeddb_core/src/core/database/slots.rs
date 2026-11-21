@@ -372,6 +372,7 @@ impl SchemaStats<'_> {
 
 /// The catalogue tables the engine makes for itself, each always under this
 /// exact name ([`Database::folded_key`] does not look for other spellings).
+/// At most 32: [`Database::has_table`] keeps one bit for each.
 const ENGINE_CATALOGUE_TABLES: &[&str] = &[
     crate::auth::ROLE_TABLE,
     crate::core::rql::functions::FUNCTION_TABLE,
@@ -385,7 +386,46 @@ const ENGINE_CATALOGUE_TABLES: &[&str] = &[
     "__rdb_mysql_on_update",
 ];
 
+const _: () = assert!(ENGINE_CATALOGUE_TABLES.len() <= 32);
+
+/// The bit [`Database::has_table`] keeps for `name`, when it is an engine
+/// catalogue table.
+#[inline]
+fn catalogue_bit(name: &str) -> Option<u32> {
+    ENGINE_CATALOGUE_TABLES
+        .iter()
+        .position(|table| *table == name)
+        .map(|i| 1u32 << i)
+}
+
+/// Which engine catalogue tables `slots` holds, one bit each.
+pub(super) fn catalogue_bits(slots: &dashmap::DashMap<String, Arc<Slot>, ahash::RandomState>) -> u32 {
+    ENGINE_CATALOGUE_TABLES
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| slots.contains_key(**table))
+        .fold(0, |bits, (i, _)| bits | (1u32 << i))
+}
+
 impl Database {
+    /// Brings `name`'s bit in `catalogue_present` up to date with the map,
+    /// after a slot was added or removed under it.
+    ///
+    /// Recomputed from the map rather than set or cleared by the caller, and
+    /// under `catalogue_noting`, so two changes racing on one name leave the
+    /// bit as the map stands after both: every change is followed by a
+    /// recomputation that reads the map after it, and the last one to run
+    /// reads it last.
+    fn note_catalogue_change(&self, name: &str) {
+        let Some(bit) = catalogue_bit(name) else { return };
+        let _serial = self.catalogue_noting.lock();
+        if self.table_slots.contains_key(name) {
+            self.catalogue_present.fetch_or(bit, Ordering::AcqRel);
+        } else {
+            self.catalogue_present.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+
     /// The one place a table name is resolved to a map key: `find` is asked
     /// with the key `name` means. Every lookup by name in this file goes
     /// through it.
@@ -489,6 +529,21 @@ impl Database {
         name
     }
 
+    /// The slot registered under `name` exactly as spelled, with no case
+    /// folding. For `relation_for`'s fast path, which falls back to the
+    /// resolving lookups when this misses.
+    #[inline]
+    pub(crate) fn slot_exactly(&self, name: &str) -> Option<Arc<Slot>> {
+        self.table_slots.get(name).map(|slot| slot.value().clone())
+    }
+
+    /// Whether a partitioned table is registered under `name` exactly as
+    /// spelled.
+    #[inline]
+    pub(crate) fn is_partitioned_exactly(&self, name: &str) -> bool {
+        self.partitioned_tables.contains_key(name)
+    }
+
     /// The slot `name` resolves to; `table_for` loads it after the lock
     /// (and only it may: `slots_source_tests::only_table_for_loads_a_slot`).
     pub(crate) fn slot(&self, name: &str) -> Option<Arc<Slot>> {
@@ -552,7 +607,18 @@ impl Database {
         // The engine's own catalogue tables are only ever registered under
         // their own names: one lookup answers, where the resolver made three
         // (exact, exact again, the other map) on the miss that is usual.
-        if ENGINE_CATALOGUE_TABLES.contains(&name) {
+        //
+        // And a missing one is answered without touching the map at all.
+        // Statements ask after them several times each, from every worker,
+        // under one key: every ask took the same shard's lock, and that
+        // shared lock word was ~1.2% of a native point read on 2026-11-21.
+        // A bit that says absent is exact (see `note_catalogue_change`); one
+        // that says present is checked against the map, so it never answers
+        // for a table that has just gone.
+        if let Some(bit) = catalogue_bit(name) {
+            if self.catalogue_present.load(Ordering::Acquire) & bit == 0 {
+                return false;
+            }
             return self.table_slots.contains_key(name);
         }
         self.resolve(name, |key| self.table_slots.contains_key(key).then_some(()))
@@ -663,11 +729,13 @@ impl Database {
         let name = Self::canonical_key(name);
         let private = super::table_for::lock_exempt(&name);
         let epoch = if private { 0 } else { self.draw_shape_epoch() };
+        let name_for_note = catalogue_bit(&name).map(|_| name.clone()).unwrap_or_default();
         let replaced = {
             let mut reverse = self.fk_reverse.write();
             reverse.set_child(&name, &table.schema.foreign_keys);
             self.table_slots.insert(name, Arc::new(Slot::new(table, epoch)))
         };
+        self.note_catalogue_change(&name_for_note);
         if let Some(old) = replaced {
             old.mark_dropped();
         }
@@ -708,6 +776,7 @@ impl Database {
             }
             removed
         };
+        self.note_catalogue_change(name);
         removed.map(|(_, slot)| {
             slot.mark_dropped();
             slot.load()

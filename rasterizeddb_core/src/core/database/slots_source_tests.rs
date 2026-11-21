@@ -37,7 +37,7 @@ const EXEC: &str = "core/rql/executor.rs";
 /// "<items>" for outside any fn, count)`.
 const MAP_FIELDS: &[(&str, &str, &str, usize)] = &[
     ("table_slots", MOD, "<items>", 1),
-    ("table_slots", MOD, "try_new_named", 4),
+    ("table_slots", MOD, "try_new_named", 5),
     ("partitioned_tables", MOD, "<items>", 1),
     ("partitioned_tables", MOD, "try_new_named", 1),
 ];
@@ -414,10 +414,20 @@ fn the_test_accessor_is_never_called_by_the_engine() {
 /// does so through `resolve`, except a walk over the map's own keys and
 /// the resolver's own exact-spelling check (`is_exact_key`, which
 /// `folded_key` asks so a name that is itself registered is not scanned
-/// for under another spelling).
+/// for under another spelling), the catalogue-bit upkeep (engine
+/// catalogue tables are only ever registered under their own names), and
+/// `relation_for`'s exact-spelling fast path (`slot_exactly`,
+/// `is_partitioned_exactly`), which falls back to the resolving lookups
+/// whenever it misses.
 #[test]
 fn every_lookup_by_name_goes_through_resolve() {
-    const KEY_WALKS: &[&str] = &["relation_names", "is_exact_key"];
+    const KEY_WALKS: &[&str] = &[
+        "relation_names",
+        "is_exact_key",
+        "note_catalogue_change",
+        "slot_exactly",
+        "is_partitioned_exactly",
+    ];
     fn looks_up(tokens: TokenStream) -> bool {
         let flat: Vec<TokenTree> = tokens.into_iter().collect();
         flat.windows(3).any(|w| match (&w[0], &w[1], &w[2]) {

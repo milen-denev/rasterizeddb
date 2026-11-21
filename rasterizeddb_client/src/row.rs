@@ -139,6 +139,14 @@ impl Rows {
                 p = start + size + 1;
             }
             rows.push((first, cells.len() - first));
+            // Sized once from the first row, the answer's rows being alike:
+            // pushing from empty regrew both vectors two or three times on
+            // every answer, a measurable share of the client's allocations.
+            if rows.len() == 1 && end < data.len() {
+                let estimate = data.len().div_ceil(end.max(1));
+                rows.reserve(estimate);
+                cells.reserve(estimate.saturating_mul(cells.len()));
+            }
             at = end;
         }
         Ok(Rows {
@@ -483,6 +491,31 @@ mod tests {
         assert!(r.get_text(5).is_err(), "not UTF-8");
         assert!(r.is_null(6).is_err(), "past the end is not NULL");
         assert_eq!(rows.get(1).unwrap().get_i32(0).unwrap(), 9);
+    }
+
+    /// The vectors are sized from the first row. A first row narrower than
+    /// the rest must still give every later row all of its cells.
+    #[test]
+    fn rows_wider_than_the_first_are_whole() {
+        let mut data = row(&[(tag::I32, &1i32.to_le_bytes())]);
+        let long = vec![b'x'; 300];
+        for i in 0..50i64 {
+            data.extend(row(&[
+                (tag::I64, &i.to_le_bytes()),
+                (tag::STRING, &long),
+                (tag::I16, &7i16.to_le_bytes()),
+            ]));
+        }
+        let rows = Rows::decode(data).unwrap();
+        assert_eq!(rows.len(), 51);
+        assert_eq!(rows.get(0).unwrap().get_i32(0).unwrap(), 1);
+        for i in 0..50 {
+            let r = rows.get(i + 1).unwrap();
+            assert_eq!(r.get_i64(0).unwrap(), i as i64);
+            assert_eq!(r.get_text(1).unwrap().len(), 300);
+            assert_eq!(r.get_i16(2).unwrap(), 7);
+            assert!(r.is_null(3).is_err(), "row {i} has a fourth cell");
+        }
     }
 
     #[test]

@@ -598,7 +598,13 @@ impl<S: StorageIO> RowPointerIterator<S> {
         out.clear();
 
         let batch_size = self.batch_limit.unwrap_or_else(crate::batch_size);
-        out.reserve(batch_size.saturating_sub(out.capacity()));
+        // A caller that sized `out` knows how many pointers to expect: the
+        // scan's dispatch sizes it to the rows still expected, so a point
+        // read allocates room for one pointer, not a whole batch (10,000 of
+        // them, ~0.6 MB, twice a statement). Pushes past it still grow it.
+        if out.capacity() == 0 {
+            out.reserve(batch_size);
+        }
 
         // Inline the synchronous fast-path of `next_row_pointer_with_offset` so we avoid
         // creating/polling a fresh async future for every pointer. We only `.await` when
