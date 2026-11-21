@@ -3716,7 +3716,7 @@ impl<S: StorageIO> Table<S> {
         }
 
         let calc = SchemaCalculator;
-        let mut columns_fetching_data: SmallVec<[ColumnFetchingData; 32]> = SmallVec::new();
+        let mut columns_fetching_data: crate::core::row::row::FetchColumns = SmallVec::new();
         for (field, _) in tuple.iter() {
             let (column_offset, schema_id) =
                 calc.calculate_schema_offset(&field.name, &self.schema.fields);
@@ -4260,7 +4260,7 @@ impl<S: StorageIO> Table<S> {
         // declared type read a document (or any value stored like text) as
         // something else, so no stored row ever matched and a UNIQUE `jsonb`
         // column accepted the same document twice.
-        let mut columns_fetching_data: SmallVec<[ColumnFetchingData; 32]> =
+        let mut columns_fetching_data: crate::core::row::row::FetchColumns =
             smallvec::smallvec![ColumnFetchingData {
                 column_offset,
                 column_type: field.db_type.physical(),

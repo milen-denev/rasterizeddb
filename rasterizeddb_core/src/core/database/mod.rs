@@ -2,6 +2,8 @@ pub mod catalog;
 pub mod incompat;
 pub mod index_checkpoint;
 #[cfg(test)]
+mod catalogue_present_tests;
+#[cfg(test)]
 mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;
@@ -1383,6 +1385,11 @@ pub struct Database {
     /// Private, and named only in `slots.rs`: metadata readers use
     /// [`Database::schema_view`], execution the escape hatches listed there.
     table_slots: DashMap<String, Arc<slots::Slot>, ahash::RandomState>,
+    /// Which engine catalogue tables are registered, one bit each
+    /// (`slots::ENGINE_CATALOGUE_TABLES`); see `Database::has_table`.
+    catalogue_present: std::sync::atomic::AtomicU32,
+    /// Serialises the recomputation of `catalogue_present`.
+    catalogue_noting: parking_lot::Mutex<()>,
     /// Hash-partitioned tables by logical name. Each one's schema-only shell
     /// has a slot too (unless its schema could not be read); resolve a name
     /// through [`Database::relation`], which asks here first.
@@ -1957,6 +1964,8 @@ impl Database {
             triggers: crate::core::rql::triggers::TriggerRegistry::default(),
             id,
             name: name.to_string(),
+            catalogue_present: std::sync::atomic::AtomicU32::new(slots::catalogue_bits(&table_slots)),
+            catalogue_noting: parking_lot::Mutex::new(()),
             table_slots,
             partitioned_tables: DashMap::with_hasher(ahash::RandomState::new()),
             fk_reverse: parking_lot::RwLock::new(slots::FkReverse::default()),

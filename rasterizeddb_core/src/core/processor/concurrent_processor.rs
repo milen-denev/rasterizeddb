@@ -811,9 +811,38 @@ impl ConcurrentProcessor {
     ///
     /// Built before the cache is consulted, because serving a cached answer
     /// still needs the schema to apply `ORDER BY`.
+    ///
+    /// Shared from a small per-thread cache, so a statement over a table this
+    /// thread read recently allocates nothing here. Building it clones every
+    /// field, a `String` each, and on 2026-11-21 that was a measurable part of
+    /// a native point read's allocations. A cached copy is handed out only
+    /// when it equals the fields passed in, compared in full, so a schema
+    /// that changed (an `ALTER`) or a table whose fields happen to sit at a
+    /// reused address can never be served another's.
     #[inline]
     fn schema_arc(table_schema: &[SchemaField]) -> Arc<SmallVec<[SchemaField; 20]>> {
-        Arc::new(table_schema.iter().cloned().collect())
+        const KEPT: usize = 4;
+        thread_local! {
+            static RECENT: std::cell::RefCell<SmallVec<[Arc<SmallVec<[SchemaField; 20]>>; KEPT]>> =
+                std::cell::RefCell::new(SmallVec::new());
+        }
+        RECENT.with(|recent| {
+            let mut recent = recent.borrow_mut();
+            if let Some(i) = recent.iter().position(|kept| kept.as_slice() == table_schema) {
+                let hit = Arc::clone(&recent[i]);
+                if i != 0 {
+                    let entry = recent.remove(i);
+                    recent.insert(0, entry);
+                }
+                return hit;
+            }
+            let made: Arc<SmallVec<[SchemaField; 20]>> = Arc::new(table_schema.iter().cloned().collect());
+            if recent.len() == KEPT {
+                recent.pop();
+            }
+            recent.insert(0, Arc::clone(&made));
+            made
+        })
     }
 
     #[inline]
@@ -1801,15 +1830,24 @@ impl ConcurrentProcessor {
         iterator.reset();
 
         let mut pointer_read_error: Option<crate::core::row::error::RowError> = None;
+        // Pointers still expected, to size each batch's allocation by: a
+        // batch is sent away to a worker, so each needs its own.
+        let mut still_expected = expected;
 
         loop {
             if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
 
-            // Direct allocation; with BATCH_SIZE up to 65536 RowPointers per
-            // batch, this is one alloc per ~thousands of rows — negligible.
-            let mut pointers: Vec<RowPointer> = Vec::with_capacity(crate::batch_size());
+            // Sized to what is left, never more than a batch. This was
+            // `batch_size()` whatever the scan, so a point read through an
+            // index allocated room for 10,000 pointers (~0.6 MB) for its one
+            // row, and the same again for the empty read that ends the loop:
+            // two large-chunk mallocs and frees per statement. The estimate
+            // can fall short (rows appended since it was made); pushes past
+            // it grow the vector.
+            let capacity = (still_expected.min(per_batch as u64) as usize).max(1);
+            let mut pointers: Vec<RowPointer> = Vec::with_capacity(capacity);
 
             // "No more pointers" and "the read failed" are different answers
             // and must not share a branch. The end of the table is `Ok` with an
@@ -1834,6 +1872,7 @@ impl ConcurrentProcessor {
             if pointers.is_empty() {
                 break;
             }
+            still_expected = still_expected.saturating_sub(pointers.len() as u64);
 
             // The candidate rows this statement has had to look at. Counted
             // here rather than in the workers: this loop runs in the task that
@@ -3095,12 +3134,19 @@ impl ConcurrentProcessor {
         // joined so the scan reports the failure instead of a short answer.
         let mut pointer_read_error: Option<crate::core::row::error::RowError> = None;
 
+        // As in the row-mode dispatcher: each batch is sized to the rows
+        // still expected, so a one-row `UPDATE` through an index does not
+        // allocate room for a whole batch (and again for the empty read
+        // that ends the loop).
+        let mut still_expected = iterator.expected_records();
+
         loop {
             if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
 
-            let mut pointers: Vec<RowPointerWithOffset> = Vec::with_capacity(crate::batch_size());
+            let capacity = (still_expected.min(crate::batch_size() as u64) as usize).max(1);
+            let mut pointers: Vec<RowPointerWithOffset> = Vec::with_capacity(capacity);
 
             for _ in 0..crate::batch_size() {
                 match iterator.next_row_pointer_with_offset().await {
@@ -3124,6 +3170,7 @@ impl ConcurrentProcessor {
             if pointers.is_empty() {
                 break;
             }
+            still_expected = still_expected.saturating_sub(pointers.len() as u64);
 
             // As in the row-mode dispatcher above: the candidate rows this
             // statement read, counted once per batch in the task running it.

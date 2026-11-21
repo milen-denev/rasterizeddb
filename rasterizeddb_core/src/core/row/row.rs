@@ -15,8 +15,20 @@ use super::schema::SchemaField;
 /// no row data — so copying it costs nothing next to the scan it configures.
 #[derive(Debug, Clone)]
 pub struct RowFetch {
-    pub columns_fetching_data: SmallVec<[ColumnFetchingData; 32]>,
+    pub columns_fetching_data: FetchColumns,
 }
+
+/// How many columns a [`RowFetch`] lists before spilling to the heap.
+///
+/// Was 32, which made every `RowFetch` 776 bytes whatever it listed, and a
+/// `QueryRows` (two of them) 2,160. Both are moved by value down the read
+/// path, and on 2026-11-21 copying such state was 14% of a native point
+/// read's server CPU. 12, as for [`ROW_INLINE_COLUMNS`] and for the same
+/// application widths: 296 bytes, and a wider fetch costs one allocation.
+pub const FETCH_INLINE_COLUMNS: usize = 12;
+
+/// The columns of a [`RowFetch`]. Spell the type through this alias.
+pub type FetchColumns = SmallVec<[ColumnFetchingData; FETCH_INLINE_COLUMNS]>;
 
 #[derive(Debug, Clone)]
 pub struct ColumnFetchingData {
