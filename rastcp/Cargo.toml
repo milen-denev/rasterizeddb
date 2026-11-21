@@ -1,6 +1,6 @@
 [package]
 name = "rastcp"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "RasterizedDB's native transport: framed, multiplexed requests over TLS or unix sockets, with pluggable authentication"
 repository = "https://github.com/milen-denev/rasterizeddb"

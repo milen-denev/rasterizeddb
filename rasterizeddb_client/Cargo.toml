@@ -1,6 +1,6 @@
 [package]
 name = "rasterizeddb_client"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
 description = "A client SDK and ORM for RasterizedDB's native protocol that does not compile the engine"
 repository = "https://github.com/milen-denev/rasterizeddb"
@@ -27,7 +27,7 @@ cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
 # the tests in `tests/` run them against a real server so the
 # copies cannot drift unnoticed.
 [dependencies]
-rastcp = { path = "../rastcp", version = "0.1.0" }
+rastcp = { path = "../rastcp", version = "1.0.0" }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
 libc = "0.2"
 # The operating system's random generator on every platform (Linux's
@@ -41,7 +41,7 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 base64 = "0.23"
 # RowStream is a futures_core::Stream (the trait only, no executor).
 futures-core = { version = "0.3", default-features = false }
-rasterizeddb_client_derive = { path = "../rasterizeddb_client_derive", version = "0.2.0", optional = true }
+rasterizeddb_client_derive = { path = "../rasterizeddb_client_derive", version = "1.0.0", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
 uuid = { version = "1", default-features = false, optional = true }
 serde = { version = "1", optional = true }

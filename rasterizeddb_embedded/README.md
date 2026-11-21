@@ -6,7 +6,7 @@ The full engine runs in-process, on a thread of its own with the 32 MiB stacks t
 
 ```toml
 [dependencies]
-rasterizeddb_embedded = "0.2"
+rasterizeddb_embedded = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
