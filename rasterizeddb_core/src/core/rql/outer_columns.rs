@@ -195,7 +195,9 @@ pub(crate) fn select_items(list: &str) -> Option<Vec<(String, String)>> {
         }
         // `count(*)` is named `count`, a CASE `case`, anything else
         // `?column?`.
-        let word: String = item.bytes().take_while(|b| is_identifier_byte(*b)).map(|b| b as char).collect();
+        // A slice, not bytes made chars: each byte of a multi-byte letter
+        // became a two-byte char, and `word.len()` overran `item`.
+        let word = &item[..item.bytes().take_while(|b| is_identifier_byte(*b)).count()];
         let rest = item[word.len()..].trim_start();
         let name = if !word.is_empty() && rest.starts_with('(') {
             word.to_ascii_lowercase()

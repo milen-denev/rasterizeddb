@@ -341,9 +341,10 @@ fn parse_timestamp(text: &str, apply_zone: bool) -> Option<i64> {
                     // `+02`
                     1 | 2 => (digits.parse::<i64>().ok()?, 0),
                     // `+0200`
+                    // `get`: four bytes need not be four characters.
                     4 => (
-                        digits[..2].parse::<i64>().ok()?,
-                        digits[2..].parse::<i64>().ok()?,
+                        digits.get(..2)?.parse::<i64>().ok()?,
+                        digits.get(2..)?.parse::<i64>().ok()?,
                     ),
                     _ => return None,
                 },
