@@ -72,7 +72,7 @@ jobs:
         shell: bash
         env:
           ALLOW_PRERELEASE: 1
-        run: .github/scripts/check-version.sh v rasterizeddb_core
+        run: bash .github/scripts/check-version.sh v rasterizeddb_core
 
       # Per-target rustflags (32 MiB main-thread stack; x86-64-v3 on x86-64)
       # come from .cargo/config.toml, so RUSTFLAGS must stay unset here;

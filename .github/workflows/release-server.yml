@@ -71,7 +71,7 @@ jobs:
 
       - name: The tag matches the crate versions
         if: github.event_name == 'push'
-        run: .github/scripts/check-version.sh server-v rasterizeddb_core rasterizeddb_embedded
+        run: bash .github/scripts/check-version.sh server-v rasterizeddb_core rasterizeddb_embedded
 
       - name: The client version the embedded SDK needs is on crates.io
         run: |
@@ -93,7 +93,7 @@ jobs:
         if: github.event_name == 'push' || !inputs.dry_run
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: .github/scripts/publish-crates.sh rastcp rasterizeddb_core rasterizeddb_embedded
+        run: bash .github/scripts/publish-crates.sh rastcp rasterizeddb_core rasterizeddb_embedded
 
       - name: GitHub release
         if: github.event_name == 'push'
