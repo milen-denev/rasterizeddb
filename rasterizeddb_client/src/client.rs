@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rastcp::client::TcpClientBuilder;
@@ -166,7 +166,15 @@ pub struct Client {
     /// Where transactions get their connections: each one its own, never
     /// one of the shared connections above.
     transactions: std::sync::Arc<crate::transaction::Connections>,
+    /// Whether the server takes a statement and its values apart
+    /// (`rastcp::exec`): [`EXEC_UNKNOWN`] until the first statement with
+    /// values asks it, then [`EXEC_YES`] or [`EXEC_NO`].
+    exec: AtomicU8,
 }
+
+const EXEC_UNKNOWN: u8 = 0;
+const EXEC_YES: u8 = 1;
+const EXEC_NO: u8 = 2;
 
 impl Client {
     /// Connects to `addr`: `unix:/path/to/socket` for a unix socket (the
@@ -218,6 +226,7 @@ impl Client {
                 authenticator,
                 trust: options.trust.clone(),
             }),
+            exec: AtomicU8::new(EXEC_UNKNOWN),
         };
         if let Some(migrator) = &options.migrations {
             use crate::orm::AutoMigrate;
@@ -249,6 +258,7 @@ impl Client {
                 authenticator: None,
                 trust: crate::Trust::AcceptAny,
             }),
+            exec: AtomicU8::new(EXEC_NO),
         }
     }
 
@@ -437,13 +447,48 @@ impl Client {
     /// returns its rows. A statement that returns none answers with an empty
     /// [`Rows`] whose [`Rows::rows_affected`] says what it reported.
     pub async fn query(&self, sql: &str, params: &[Param<'_>]) -> Result<Rows> {
+        if self.sends_exec().await {
+            let request = crate::params::exec_request_with(sql, params.len(), |i, out| {
+                crate::params::push_param(out, &params[i])
+            })?;
+            return decode_response(self.send_bytes(&request).await?);
+        }
         let statement = render(sql, params)?;
         self.send(&statement).await
+    }
+
+    /// Whether statements with values go to the server as their text and
+    /// values apart (`rastcp::exec`), which a server that knows the form
+    /// answers without finding the values in the text again. Asked of the
+    /// server once, with `SELECT 1`: a server without the form refuses the
+    /// request without running anything, and its statements are then
+    /// rendered as text, as they always were.
+    async fn sends_exec(&self) -> bool {
+        match self.exec.load(Ordering::Relaxed) {
+            EXEC_YES => return true,
+            EXEC_NO => return false,
+            _ => {}
+        }
+        let probe = rastcp::exec::encode("SELECT 1", &[], &[]).expect("a short request");
+        let answer = match self.send_bytes(&probe).await {
+            Ok(answer) => answer,
+            // Not an answer about the form: decided by a later statement.
+            Err(_) => return false,
+        };
+        let supported = answer.first() == Some(&2);
+        self.exec.store(if supported { EXEC_YES } else { EXEC_NO }, Ordering::Relaxed);
+        supported
     }
 
     /// [`query`](Self::query) with values given as [`ToSql`], as
     /// [`params!`](crate::params) builds them.
     pub async fn query_with(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Rows> {
+        if self.sends_exec().await {
+            let request = crate::params::exec_request_with(sql, params.len(), |i, out| {
+                crate::params::push_param(out, &params[i].to_param())
+            })?;
+            return decode_response(self.send_bytes(&request).await?);
+        }
         let statement = render_dyn(sql, params)?;
         self.send(&statement).await
     }

@@ -826,6 +826,69 @@ pub(crate) fn render_with(
     Ok(out)
 }
 
+/// [`render`]'s statement as an EXEC request (`rastcp::exec`): the text as
+/// written, each value's literal as [`render`] would write it in, and where
+/// each placeholder sits. The same scan, the same checks and the same errors
+/// as [`render_with`], and a value is written only where a placeholder names
+/// it, as there; so the server, splicing the literals into those places, runs
+/// byte for byte the text [`render`] makes.
+///
+/// Literals are by parameter number, `$n`'s at `n - 1`, as a learned
+/// statement reads its values (pgwire's Bind order), up to the highest `$n`
+/// named. A parameter no placeholder names in between is an empty literal,
+/// which no value renders as (an empty string is `''`) and is never written.
+pub(crate) fn exec_request_with(
+    sql: &str,
+    count: usize,
+    mut write: impl FnMut(usize, &mut String) -> Result<()>,
+) -> Result<Vec<u8>> {
+    let bytes = sql.as_bytes();
+    // Per parameter, its literal once a placeholder named it.
+    let mut literals: Vec<Option<String>> = Vec::new();
+    let mut spans: Vec<rastcp::exec::Span> = Vec::new();
+    for event in scan(sql) {
+        match event {
+            Event::Semicolon(at) => {
+                if !only_trivia_after(bytes, at + 1) {
+                    return Err(second_statement(at));
+                }
+            }
+            Event::Placeholder { start, end, digits } => {
+                if count == 0 {
+                    return Err(Error::Param(format!(
+                        "${digits} has no value: the statement was given no parameters"
+                    )));
+                }
+                let n: usize = digits
+                    .parse()
+                    .map_err(|_| Error::Param(format!("${digits} is not a usable number")))?;
+                if n == 0 || n > count {
+                    return Err(Error::Param(format!(
+                        "${n} has no value: {count} parameter(s) were given"
+                    )));
+                }
+                let literal = u16::try_from(n - 1)
+                    .map_err(|_| Error::Param("more parameters than a request carries".to_string()))?;
+                if literals.len() < n {
+                    literals.resize(n, None);
+                }
+                if literals[n - 1].is_none() {
+                    let mut text = String::new();
+                    write(n - 1, &mut text)?;
+                    literals[n - 1] = Some(text);
+                }
+                let position = |p: usize| {
+                    u32::try_from(p).map_err(|_| Error::Param("a statement too long for a request".to_string()))
+                };
+                spans.push(rastcp::exec::Span { start: position(start)?, end: position(end)?, literal });
+            }
+        }
+    }
+    check_not_transaction_control(sql)?;
+    let literals: Vec<&str> = literals.iter().map(|l| l.as_deref().unwrap_or("")).collect();
+    rastcp::exec::encode(sql, &literals, &spans).map_err(Error::Param)
+}
+
 /// Whether the quote at `quote` opens an `E'…'` string, whose backslashes
 /// escape the next character: an `e` or `E` right before it that is not
 /// itself the end of a longer identifier.
@@ -1171,5 +1234,78 @@ mod tests {
             render_dyn("SELECT $1, $2, $3", &[&name, &n, &7u32]).unwrap(),
             "SELECT 'o''k', NULL, 7"
         );
+    }
+
+    /// An EXEC request is the rendered statement taken apart: spliced back
+    /// together by the codec the server uses, it is byte for byte what
+    /// `render` writes, and wherever `render` refuses, so does it, with the
+    /// same error. Over statements with strings, comments, dollar quotes,
+    /// `E''` escapes, repeated and unused placeholders, and every value kind.
+    ///
+    /// Mutation: write a placeholder's literal from the value after it
+    /// (`write(n, …)`): every statement with values differs.
+    #[test]
+    fn an_exec_request_renders_as_the_text_render_writes() {
+        let values = [
+            Param::Null,
+            Param::Bool(true),
+            Param::I16(-7),
+            Param::I32(42),
+            Param::I64(i64::MIN),
+            Param::Text("it's $1 -- not a comment"),
+            Param::Bytes(&[0, 1, 0xff]),
+            Param::U64(u64::MAX),
+            Param::I128(-170141183460469231731687303715884105728),
+            Param::F32(0.1),
+            Param::F64(f64::NAN),
+            Param::Numeric("-12.50"),
+        ];
+        let statements = [
+            "SELECT * FROM t WHERE a = $1",
+            "SELECT $1, $2, $1",
+            "SELECT * FROM t WHERE b = $2 AND a = $1",
+            "SELECT $3, $1",
+            "SELECT '$1', $2 -- $3\n, $1",
+            "SELECT $$ $1 $$, $1 /* $2 */",
+            "SELECT E'\\'' || $1, \"$1\" FROM t WHERE x = $2",
+            "SELECT 1",
+            "SELECT $3",
+            "UPDATE t SET a = $2 WHERE id = $1;",
+            "SELECT $0",
+            "SELECT $1; SELECT $2",
+            "BEGIN",
+            "SELECT $99999999999999999999",
+        ];
+        let mut compared = 0;
+        for sql in statements {
+            for take in [0usize, 1, 2, 3] {
+                for start in 0..values.len() {
+                    let params: Vec<Param<'_>> = (0..take).map(|i| values[(start + i) % values.len()].clone()).collect();
+                    let text = render(sql, &params);
+                    let request = exec_request_with(sql, params.len(), |i, out| push_param(out, &params[i]));
+                    match (text, request) {
+                        (Ok(text), Ok(request)) => {
+                            let exec = rastcp::exec::decode(&request).expect("an EXEC request").expect("well formed");
+                            assert_eq!(exec.sql, sql);
+                            assert_eq!(exec.render(), text, "{sql} with {params:?}");
+                            // `$n`'s literal at `n - 1`; one no placeholder
+                            // names, empty.
+                            for (i, literal) in exec.literals.iter().enumerate() {
+                                let named = exec.spans.iter().any(|s| s.literal as usize == i);
+                                let mut want = String::new();
+                                if named {
+                                    push_param(&mut want, &params[i]).unwrap();
+                                }
+                                assert_eq!(*literal, want, "{sql} with {params:?}: literal {i}");
+                            }
+                            compared += 1;
+                        }
+                        (Err(a), Err(b)) => assert_eq!(format!("{a}"), format!("{b}"), "{sql} with {params:?}"),
+                        (a, b) => panic!("{sql} with {params:?}: render {a:?}, exec {:?}", b.map(|_| ())),
+                    }
+                }
+            }
+        }
+        assert!(compared > 100, "only {compared} compared");
     }
 }
