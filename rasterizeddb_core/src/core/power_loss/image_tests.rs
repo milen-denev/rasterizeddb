@@ -26,7 +26,7 @@ fn sync_file(path: &Path) {
 
 fn sync_dir_of(path: &Path) {
     sync_audit::note("dir", path);
-    std::fs::File::open(path.parent().unwrap()).unwrap().sync_all().unwrap();
+    crate::core::sync_path::sync_dir(path.parent().unwrap()).unwrap();
 }
 
 fn write_at(path: &Path, at: u64, bytes: &[u8]) {

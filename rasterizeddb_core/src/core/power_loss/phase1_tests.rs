@@ -1109,7 +1109,7 @@ async fn marker_rot(run: &mut Run) {
     let last = log.len() - 1;
     log[last] ^= 0x5A;
     std::fs::write(&ixm, &log).unwrap();
-    std::fs::File::open(&ixm).unwrap().sync_all().unwrap();
+    crate::core::sync_path::sync_file(&ixm).unwrap();
     run.db = Some(open(&run.dirs).await.unwrap());
     assert!(!table(run.db()).gate().vouched(), "a CLEAN followed by rotten bytes proved a snapshot");
     let before = run.model.clone();
@@ -1134,9 +1134,9 @@ fn stale_pair_and_flt(dir: &Path, pair: &(Vec<u8>, Vec<u8>)) {
     flt.extend_from_slice(&[1u8; 56]);
     std::fs::write(dir.join(format!("{TABLE}_flt.db")), &flt).unwrap();
     for f in [format!("{TABLE}.ixs"), format!("{TABLE}.ixm"), format!("{TABLE}_flt.db")] {
-        std::fs::File::open(dir.join(f)).unwrap().sync_all().unwrap();
+        crate::core::sync_path::sync_file(&dir.join(f)).unwrap();
     }
-    std::fs::File::open(dir).unwrap().sync_all().unwrap();
+    crate::core::sync_path::sync_dir(dir).unwrap();
 }
 
 /// `flt_evidence_before_ixs_unlink` and `unknown_flt_delete_order`: an old

@@ -239,12 +239,11 @@ impl PublishedLocations {
             let to = destination.join(entry.file_name());
             self.files.push(to.clone());
             std::fs::copy(entry.path(), &to)?;
-            std::fs::File::open(&to)?.sync_all()?;
+            crate::core::sync_path::sync_file(&to)?;
         }
         // The entries, not only the bytes: a crash after the root is renamed
         // into place must not leave it naming files the directory lost.
-        #[cfg(unix)]
-        std::fs::File::open(destination)?.sync_all()?;
+        crate::core::sync_path::sync_dir(destination)?;
         Ok(())
     }
 
@@ -781,9 +780,18 @@ fn validate_locations(snapshot: &SnapshotEntry) -> io::Result<()> {
             hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
         });
         let path = Path::new(&location.path);
+        // A drive or UNC prefix is what makes a Windows path absolute: without
+        // it in the list, every location a backup on Windows recorded was
+        // refused, and no restore there could run. `components` yields a
+        // prefix only first.
         let plain_path = path.is_absolute()
             && path.components().all(|c| {
-                matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_))
+                matches!(
+                    c,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::Normal(_)
+                )
             });
         if !well_formed
             || !plain_path
@@ -1344,27 +1352,30 @@ mod tests {
     /// anything a backup would not have written.
     #[test]
     fn a_location_that_could_name_any_path_is_refused() {
-        let good_key = super::super::location_key("/mnt/disk2");
+        // An absolute path is spelled per platform: with a drive on Windows.
+        let at = |rest: &str| if cfg!(windows) { format!(r"C:\{}", rest.replace('/', "\\")) } else { format!("/{rest}") };
+        let (disk2, elsewhere, dotted) = (at("mnt/disk2"), at("mnt/elsewhere"), at("mnt/../disk2"));
+        let good_key = super::super::location_key(&disk2);
         let mut s = entry(0, 0);
-        s.locations = vec![location(&good_key, "/mnt/disk2")];
+        s.locations = vec![location(&good_key, &disk2)];
         validate_locations(&s).expect("what a backup writes");
 
-        let other_key = super::super::location_key("/mnt/elsewhere");
+        let other_key = super::super::location_key(&elsewhere);
         for (key, path) in [
-            ("/tmp/x", "/mnt/disk2"),
-            ("../x", "/mnt/disk2"),
-            ("~loc-../../../../x", "/mnt/disk2"),
-            ("~loc-ABCDEF0123456789", "/mnt/disk2"),
-            (other_key.as_str(), "/mnt/disk2"),
+            ("/tmp/x", disk2.as_str()),
+            ("../x", disk2.as_str()),
+            ("~loc-../../../../x", disk2.as_str()),
+            ("~loc-ABCDEF0123456789", disk2.as_str()),
+            (other_key.as_str(), disk2.as_str()),
             (good_key.as_str(), "relative/disk2"),
-            (good_key.as_str(), "/mnt/../disk2"),
+            (good_key.as_str(), dotted.as_str()),
         ] {
             s.locations = vec![location(key, path)];
             let err = validate_locations(&s).expect_err(&format!("{key:?} at {path:?}"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
         }
 
-        s.locations = vec![location(&good_key, "/mnt/disk2"), location(&good_key, "/mnt/disk2")];
+        s.locations = vec![location(&good_key, &disk2), location(&good_key, &disk2)];
         validate_locations(&s).expect_err("one key twice");
     }
 

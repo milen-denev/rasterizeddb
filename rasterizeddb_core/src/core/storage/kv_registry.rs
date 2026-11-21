@@ -959,9 +959,7 @@ impl KvRegistry {
         // The bytes, then the directory entry. Renaming over a file whose
         // contents are still only in the page cache would survive a crash as an
         // empty configuration — which is every store gone.
-        if let Ok(file) = std::fs::File::open(&temp_path) {
-            let _ = file.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_file(&temp_path);
         if let Err(e) = std::fs::rename(&temp_path, &final_path) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(format!("could not replace {}: {}", final_path.display(), e));
@@ -1028,9 +1026,7 @@ impl KvRegistry {
         let temp_path: PathBuf = Path::new(root).join(format!("{}.tmp", KV_SECRETS_FILE));
         write_private(&temp_path, text.as_bytes())
             .map_err(|e| format!("could not write {}: {}", temp_path.display(), e))?;
-        if let Ok(file) = std::fs::File::open(&temp_path) {
-            let _ = file.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_file(&temp_path);
         if let Err(e) = std::fs::rename(&temp_path, &final_path) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(format!("could not replace {}: {}", final_path.display(), e));

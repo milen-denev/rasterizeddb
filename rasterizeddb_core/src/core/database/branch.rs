@@ -130,9 +130,7 @@ impl BranchMeta {
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         let temp = dir.join(format!("{META_FILE}.tmp"));
         std::fs::write(&temp, text.as_bytes())?;
-        if let Ok(f) = std::fs::File::open(&temp) {
-            let _ = f.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_file(&temp);
         std::fs::rename(&temp, dir.join(META_FILE))?;
         let _ = crate::core::wal::sync_parent_dir(&dir.join(META_FILE));
         Ok(())
@@ -1967,7 +1965,7 @@ impl PromoteIntent {
         let text = serde_json::to_string(self).map_err(io::Error::other)?;
         let temp = root.join(format!("{PROMOTE_INTENT}.tmp"));
         std::fs::write(&temp, text)?;
-        std::fs::File::open(&temp)?.sync_all()?;
+        crate::core::sync_path::sync_file(&temp)?;
         std::fs::rename(&temp, root.join(PROMOTE_INTENT))?;
         crate::core::wal::sync_parent_dir(&root.join(PROMOTE_INTENT))
     }

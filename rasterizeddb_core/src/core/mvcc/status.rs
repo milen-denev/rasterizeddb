@@ -1147,8 +1147,12 @@ impl IdReservation {
         };
         #[cfg(test)]
         if reservation_test_hooks::fails(path) {
-            // What a full disk answers.
+            // What a full disk answers: ENOSPC on Unix. Built from the kind on
+            // Windows, where raw error 28 is ERROR_OUT_OF_PAPER.
+            #[cfg(unix)]
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            #[cfg(not(unix))]
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "injected: the disk is full"));
         }
         let bytes = encode_reservation(mark);
         if let Some(wal) = log {
@@ -1748,9 +1752,7 @@ fn write_sidecar(path: &Path, file: &mut File, settled: &Settled) -> io::Result<
     }
     std::fs::rename(&temp, &target)?;
     if let Some(dir) = target.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_dir(dir);
     }
     Ok(())
 }

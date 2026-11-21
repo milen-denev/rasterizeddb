@@ -324,18 +324,12 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    // Opening a directory read-only and fsyncing it is the portable-on-Unix way
-    // to flush its entries. On Windows there is no directory handle to sync and
-    // file creation is already ordered, so this is a no-op there.
-    #[cfg(unix)]
-    {
-        let dir = File::open(parent)?;
+    // Noted only once there is a handle to flush through: where the volume
+    // cannot flush a directory (see `sync_path`), nothing is flushed, and the
+    // power-loss harness must not take the entries as durable.
+    if let Some(dir) = crate::core::sync_path::open_dir(parent)? {
         crate::core::sync_audit::note("dir", path);
-        dir.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
+        crate::core::sync_path::flush_dir(&dir)?;
     }
     Ok(())
 }
@@ -733,10 +727,11 @@ pub(crate) fn read_records(path: &Path) -> Vec<u8> {
 /// What [`Wal::reserve_locked`] writes from.
 static ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
 
-/// Writes `len` zeros at `at`, leaving the file's cursor where it was.
-#[cfg(unix)]
+/// Writes `len` zeros at `at`. On Unix the file's cursor stays where it was;
+/// Windows' positional write moves it, so `append_locked` seeks back to the
+/// append point there.
 fn write_zeros_at(file: &File, mut at: u64, mut len: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     while len > 0 {
         let n = len.min(ZEROS.len() as u64) as usize;
         file.write_all_at(&ZEROS[..n], at)?;
@@ -1703,6 +1698,10 @@ impl Wal {
         let at = self.write_pos.load(Ordering::Relaxed);
         let framed: u64 = bufs.iter().map(|b| b.len() as u64).sum();
         self.reserve_locked(file, at, framed);
+        // The padding's positional write moved the cursor the record is
+        // written through (Windows only; see `write_zeros_at`).
+        #[cfg(not(unix))]
+        file.seek(SeekFrom::Start(at))?;
         #[cfg(test)]
         let written = match test_hooks::SHORT_WAL_WRITE.with(|h| h.take()) {
             Some(keep) => {
@@ -1761,9 +1760,7 @@ impl Wal {
     /// tries again until the log is next discarded. A record of a chunk or
     /// more is not padded for: writing it twice would cost more than the
     /// journal commit it saves.
-    #[allow(unused_variables)]
     fn reserve_locked(&self, file: &File, at: u64, need: u64) {
-        #[cfg(unix)]
         {
             let chunk = self.prealloc.load(Ordering::Relaxed);
             let allocated = self.allocated.load(Ordering::Relaxed);
@@ -5195,7 +5192,7 @@ mod tests {
         }
         // Everything clean on disk before timing.
         for i in 0..2_000 {
-            File::open(dir.path().join(format!("t{i}.db"))).unwrap().sync_all().unwrap();
+            crate::core::sync_path::sync_file(&dir.path().join(format!("t{i}.db"))).unwrap();
         }
         for round in 0..3 {
             // What every checkpoint used to do first: sync each registered file.

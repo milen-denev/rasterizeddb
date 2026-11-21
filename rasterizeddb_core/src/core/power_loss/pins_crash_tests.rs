@@ -92,7 +92,7 @@ fn force_out(dir: &Path, uid: u64, pid: u32) {
     for name in crate::core::partition::files::data_files(uid, pid) {
         let path = dir.join(name);
         crate::core::sync_audit::note("file.data", &path);
-        std::fs::File::open(&path).unwrap().sync_all().unwrap();
+        crate::core::sync_path::sync_file(&path).unwrap();
     }
 }
 
