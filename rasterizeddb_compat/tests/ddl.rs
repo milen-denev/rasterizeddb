@@ -354,9 +354,10 @@ async fn ddl_runs_and_reports_no_row_count() {
 /// `ALTER TABLE … ADD COLUMN … JSONB` must do what `CREATE TABLE … JSONB` does.
 ///
 /// It used to refuse with "RasterizedDB has no JSON type" — wrong, and
-/// inconsistent with the statement beside it, since a JSON column has been a
-/// `UUID` plus a table of its own since the mapping landed. A migration that
-/// adds a JSON column to an existing table hit it on a fresh install.
+/// inconsistent with the statement beside it. A migration that adds a JSON
+/// column to an existing table hit it on a fresh install. Later it shredded
+/// the column into a table of its own while `CREATE TABLE` stored the
+/// document; both store it now (shredding only under `json_shadow_tables`).
 #[tokio::test(flavor = "multi_thread")]
 async fn add_column_supports_json_like_create_table_does() {
     let (_s, pool) = server().await;

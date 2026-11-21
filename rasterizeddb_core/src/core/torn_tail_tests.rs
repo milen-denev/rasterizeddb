@@ -350,9 +350,8 @@ async fn build_base(dir: &Path) {
              g1 INTEGER GENERATED ALWAYS AS (a + 1) STORED, CHECK (a > 0))",
             "ALTER TABLE t ADD CONSTRAINT fk1 FOREIGN KEY (a) REFERENCES p (id)",
             "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1",
-            // `jsonb`: an added one is shredded, so it registers itself
-            // (`json` is the text it is written as and registers nothing).
-            "ALTER TABLE t ADD COLUMN j1 JSONB",
+            // A shredded column's physical form; registered below.
+            "ALTER TABLE t ADD COLUMN j1 UUID",
             "CREATE INDEX pi1 ON t ((doc->>'k'))",
             "CREATE INDEX i1 ON t (a)",
             "ALTER TABLE t ADD CONSTRAINT u1 UNIQUE (id)",
@@ -365,6 +364,21 @@ async fn build_base(dir: &Path) {
     for s in &sql {
         exec(&db, s).await.unwrap();
     }
+    // A record in the JSON registrations too. A shredded column is made only
+    // under `json_shadow_tables`, a process-wide knob this test process
+    // leaves off, so `j1` is registered as `CREATE TABLE` registers one under
+    // it: a `UUID` field plus this record. (`ADD COLUMN … JSONB` shredded
+    // whatever the knob said until it was made to agree with CREATE.)
+    crate::core::rql::json_map::append(
+        db.table_for_tests("t").unwrap().io_schema.clone(),
+        &crate::core::rql::json_map::JsonColumn {
+            column: "j1".into(),
+            shadow_table: crate::core::rql::json_map::shadow_table_name("t", "j1"),
+            is_deleted: false,
+        },
+    )
+    .await
+    .unwrap();
     checkpoint(dir);
     close(dir, db);
 }

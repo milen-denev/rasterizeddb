@@ -20,8 +20,10 @@ pub enum AlterAction {
         if_not_exists: bool,
         /// The `DEFAULT` expression, as written.
         default: Option<String>,
-        /// Declared `JSON`/`JSONB`, so it is stored as a `UUID` pointing at a
-        /// table of its own — the same mapping `CREATE TABLE` applies.
+        /// Declared `JSON`/`JSONB` while `json_shadow_tables` is on, so it is
+        /// shredded: stored as a `UUID` pointing at a table of its own — the
+        /// same mapping `CREATE TABLE` applies under the knob. Off (the
+        /// default), it is false and `db_type` is `JSONB` or `JSONTEXT`.
         ///
         /// `CREATE TABLE t (payload JSONB)` has worked since the JSON layer
         /// landed; `ALTER TABLE t ADD COLUMN payload JSONB` refused with "no
@@ -432,18 +434,26 @@ pub fn parse_alter_table(sql: &str) -> Result<AlterTable, String> {
             let type_tokens: Vec<&str> = rest[i..].to_vec();
             // A shredded JSON column is a `UUID` on this side of the mapping;
             // the shadow table is registered by the executor, as it is for
-            // CREATE. `jsonb` here always is (whatever `json_shadow_tables`
-            // says, unlike CREATE: a known difference, kept so a column added
-            // so far and one added now are the same kind). `json` is the text
-            // it is written as (`DbType::JSONTEXT`), shredded only when the
-            // knob is on, as at CREATE.
-            let json = type_tokens
-                .first()
-                .map(|t| {
-                    let head = t.split('(').next().unwrap_or(t).to_ascii_uppercase();
-                    head == "JSONB" || (head == "JSON" && crate::json_shadow_tables())
-                })
-                .unwrap_or(false);
+            // CREATE. Shredded only when `json_shadow_tables` is on, exactly
+            // as at CREATE (`lexer_ct`): otherwise `jsonb` is a stored
+            // document (`DbType::JSONB`) and `json` its text as written
+            // (`DbType::JSONTEXT`), both from `parse_column_type`.
+            //
+            // `jsonb` used to be shredded here whatever the knob said, so a
+            // migration's `ADD COLUMN x JSONB` made a different column from
+            // `CREATE TABLE … (x JSONB)`: refused outright on a partitioned
+            // table, refused an array `DEFAULT '[]'`, and grew a shadow column
+            // per document key. A column's kind is read from its schema (a
+            // `json_columns` entry or not), so columns added the old way keep
+            // reading as they were.
+            let json = crate::json_shadow_tables()
+                && type_tokens
+                    .first()
+                    .map(|t| {
+                        let head = t.split('(').next().unwrap_or(t).to_ascii_uppercase();
+                        head == "JSONB" || head == "JSON"
+                    })
+                    .unwrap_or(false);
             // The type as written, its array suffix and a modifier however
             // it is spaced included, and refused when what follows it is no
             // constraint, as at CREATE (`lexer_ct::column_type_span`).
