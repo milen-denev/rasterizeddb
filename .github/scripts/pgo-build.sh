@@ -63,7 +63,14 @@ TRAIN="$WORK/pgo_train$EXE"
 echo "::endgroup::"
 
 echo "::group::2/4 instrumented server and training run"
-build_server "\"-Cprofile-generate=$(native_path "$WORK/profiles")\""
+flags="\"-Cprofile-generate=$(native_path "$WORK/profiles")\""
+# On Windows ARM64, Microsoft's link.exe pads the profile names section and
+# llvm-profdata then rejects every profile ("symbol name is empty"; LLVM issue
+# 243922, rust-lang/rust#150123). The instrumented build links with rust-lld
+# instead. The profile matches functions by name and IR hash, not by layout,
+# so the optimised build in stage 3 still links with link.exe.
+if [ "$TARGET" = "aarch64-pc-windows-msvc" ]; then flags="$flags,\"-Clinker=rust-lld\""; fi
+build_server "$flags"
 "$TRAIN" "$BIN"
 count="$(find "$WORK/profiles" -name '*.profraw' | wc -l)"
 if [ "$count" -eq 0 ]; then

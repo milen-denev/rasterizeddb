@@ -90,13 +90,15 @@ jobs:
       # The release build's PGO training run, here against the debug server:
       # a mixed workload over both protocols with its row counts checked,
       # then a graceful stop (SIGTERM; Ctrl+Break on Windows) that must exit 0.
+      # A fifth of the release size: a debug server on ARM64 runs scalar code
+      # and its correlated subquery outlasted the 30 s request timeout.
       - name: Workload over both protocols, then a graceful stop
         shell: bash
         timeout-minutes: 30
         run: |
           cargo build --locked --target ${{ matrix.target }} -p pgo_train
           ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
-          "target/${{ matrix.target }}/debug/pgo_train$ext" "target/${{ matrix.target }}/debug/rasterizeddb_core$ext"
+          "target/${{ matrix.target }}/debug/pgo_train$ext" "target/${{ matrix.target }}/debug/rasterizeddb_core$ext" --scale 0.2
 
   full:
     name: full suites ${{ matrix.name }}

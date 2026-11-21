@@ -13,6 +13,11 @@
 //! pgo_train <server binary> [--scale N]
 //! ```
 //!
+//! `--scale` multiplies the table sizes and may be a fraction: CI runs the
+//! workload against a debug server with `--scale 0.2`, because on ARM64
+//! (scalar SIMD paths) a debug server takes longer than the native protocol's
+//! request timeout over the correlated subquery at full size.
+//!
 //! Every statement must succeed, and the row counts are checked: a workload
 //! that quietly stops early trains the optimiser on start-up code alone, and
 //! the release would still build.
@@ -20,6 +25,7 @@
 //! The stop is SIGTERM on unix and Ctrl+Break on Windows. The server is
 //! started in its own process group there, so the event reaches it alone.
 
+#[cfg(unix)]
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -66,19 +72,19 @@ fn main() -> ExitCode {
 
 struct Args {
     server: PathBuf,
-    scale: usize,
+    scale: f64,
 }
 
 fn args() -> Result<Args> {
     let mut server = None;
-    let mut scale = 1;
+    let mut scale = 1.0;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--scale" => {
                 scale = it.next().ok_or("--scale needs a number")?.parse()?;
-                if scale == 0 {
-                    return Err("--scale must be at least 1".into());
+                if !(0.05..=100.0).contains(&scale) {
+                    return Err("--scale must be between 0.05 and 100".into());
                 }
             }
             _ if server.is_none() => server = Some(PathBuf::from(arg)),
@@ -336,13 +342,13 @@ struct Sizes {
     point_ops: i64,
 }
 
-async fn workload(server: &Server, scale: usize) -> Result<()> {
-    let scale = scale as i64;
+async fn workload(server: &Server, scale: f64) -> Result<()> {
+    let scaled = |base: f64| (base * scale).round() as i64;
     let sizes = Sizes {
-        customers: 20_000 * scale,
-        orders: 100_000 * scale,
-        events: 5_000 * scale,
-        point_ops: 3_000 * scale,
+        customers: scaled(20_000.0),
+        orders: scaled(100_000.0),
+        events: scaled(5_000.0),
+        point_ops: scaled(3_000.0),
     };
     let native = Arc::new(connect_native(server, 4).await?);
     let pg = connect_pg(server).await?;
