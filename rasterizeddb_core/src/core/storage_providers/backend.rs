@@ -605,6 +605,11 @@ mod tests {
     /// copies is what the async path reads.
     #[tokio::test]
     async fn a_file_backend_serves_resident_reads_synchronously() {
+        // A resident read is one the mapping holds: Windows maps no table
+        // file (`MAPS_FILES`), so there the fast path has nothing to serve.
+        if !crate::core::storage_providers::file_sync::MAPS_FILES {
+            return;
+        }
         // Written before the provider opens it, so its map covers every byte:
         // a small append is served from the file rather than remapped (see
         // `REMAP_GROWTH_THRESHOLD`), and the fast path rightly refuses those.

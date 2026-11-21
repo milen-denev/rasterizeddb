@@ -337,8 +337,9 @@ async fn differential(in_memory: bool) {
     for sql in FROM_CELLS {
         together += usize::from(run_counting_batches(&db, sql).await.1 > 0);
     }
-    if in_memory {
-        assert_eq!(together, 0, "a database in memory copied cells from a mapping");
+    if in_memory || !crate::core::storage_providers::file_sync::MAPS_FILES {
+        // Nothing mapped: from memory, or from a file where Windows maps none.
+        assert_eq!(together, 0, "cells were copied from a mapping where there is none");
     } else {
         // All but the statements whose WHERE matches nothing (`k > 1000`).
         let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
@@ -808,7 +809,12 @@ async fn a_string_is_read_through_its_header_and_a_bad_header_drops_its_row() {
     std::fs::create_dir_all(&dir).expect("the scratch directory");
     LocalStorageProvider::new(&dir, Some("text")).await.append_data(&data, true).await;
     let file = LocalStorageProvider::new(&dir, Some("text")).await;
-    assert!(strings_through_headers(&file, &rows).await >= 2, "the file's batches were not copied from its mapping");
+    let copied = strings_through_headers(&file, &rows).await;
+    if crate::core::storage_providers::file_sync::MAPS_FILES {
+        assert!(copied >= 2, "the file's batches were not copied from its mapping");
+    } else {
+        assert_eq!(copied, 0, "batches copied from a mapping where Windows maps none");
+    }
 }
 
 /// The reads of [`a_string_is_read_through_its_header_and_a_bad_header_drops_its_row`]
@@ -995,6 +1001,12 @@ async fn a_file_copies_a_batch_of_cells_or_none_of_it() {
         let mut out: Vec<&mut Vec<u8>> = bufs.iter_mut().collect();
         io.try_read_cells_sync(&rows, &cells, &mut out)
     };
+    if !crate::core::storage_providers::file_sync::MAPS_FILES {
+        // Windows maps no table file: the fast path refuses, and the caller
+        // reads the cells another way.
+        assert!(!copied, "cells copied from a mapping where Windows maps none");
+        return;
+    }
     assert!(copied, "a file with every cell in it copied none");
     for (c, (&(offset, width), buf)) in cells.iter().zip(&bufs).enumerate() {
         // What was in the buffer stays, and the cells follow it in row order.
@@ -1042,6 +1054,10 @@ async fn a_file_copies_a_batch_of_cells_or_none_of_it() {
 /// row's value with another row's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_batch_read_again_after_an_overlapping_write_holds_each_cell_once() {
+    // The batch copy reads the mapping: Windows maps no table file.
+    if !crate::core::storage_providers::file_sync::MAPS_FILES {
+        return;
+    }
     use crate::core::storage_providers::file_sync::LocalStorageProvider;
     use crate::core::storage_providers::traits::StorageIO;
     use std::sync::atomic::{AtomicBool, Ordering};

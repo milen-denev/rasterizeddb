@@ -621,7 +621,7 @@ pub(crate) fn remove_eventually(path: &std::path::Path) {
         "{DROPPED_PREFIX}{}-{nanos:x}",
         base.to_string_lossy().trim_start_matches('.')
     ));
-    if let Err(e) = std::fs::rename(path, &aside) {
+    if let Err(e) = crate::core::sync_path::rename_when_released(path, &aside) {
         warn!(
             "could not remove {} ({e}), nor set it aside; it is left as it is",
             path.display()

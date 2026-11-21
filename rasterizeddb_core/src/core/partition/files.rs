@@ -256,7 +256,7 @@ fn new_uid_from(dir: &Path, taken: impl Fn(u64) -> bool, mut next: impl FnMut() 
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     // As `wal::sync_parent_dir`: noted only when there is a flush to note.
     if let Some(handle) = crate::core::sync_path::open_dir(dir)? {
-        crate::core::sync_audit::note("partition_dir", dir);
+        let _synced = crate::core::sync_audit::note("partition_dir", dir);
         crate::core::sync_path::flush_dir(&handle)?;
     }
     Ok(())

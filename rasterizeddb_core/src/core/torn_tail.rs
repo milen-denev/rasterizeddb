@@ -423,7 +423,7 @@ pub fn truncate_to_whole_records(
     }
     let file = File::options().write(true).open(path)?;
     file.set_len(to)?;
-    crate::core::sync_audit::note("torn_tail.cut", path);
+    let _synced = crate::core::sync_audit::note("torn_tail.cut", path);
     file.sync_all()?;
     log::info!(
         "{} ended inside a record: cut {partial} bytes ({len} -> {to}, {stride}-byte records) \
@@ -657,7 +657,7 @@ impl Floors {
         {
             let mut file = File::create(&temp)?;
             file.write_all(self.render().as_bytes())?;
-            crate::core::sync_audit::note("wal.floors", path);
+            let _synced = crate::core::sync_audit::note("wal.floors", path);
             file.sync_all()?;
         }
         std::fs::rename(&temp, path)?;

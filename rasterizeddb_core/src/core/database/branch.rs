@@ -1503,8 +1503,8 @@ impl DatabaseCatalog {
         forget_directory(&final_dir);
         let retiring = root.join(format!("{RETIRING_PREFIX}{name}"));
         remove_quietly(&retiring);
-        std::fs::rename(&final_dir, &retiring).map_err(|e| e.to_string())?;
-        std::fs::rename(&staging, &final_dir).map_err(|e| e.to_string())?;
+        crate::core::sync_path::rename_when_released(&final_dir, &retiring).map_err(|e| e.to_string())?;
+        crate::core::sync_path::rename_when_released(&staging, &final_dir).map_err(|e| e.to_string())?;
         std::mem::forget(guard);
         match self.attach(name).await {
             Ok(_) => {
@@ -1658,7 +1658,7 @@ impl DatabaseCatalog {
         copy_live(&dir, &staging, &next, 1)
             .await
             .map_err(|e| format!("could not copy branch \"{name}\" for the merge: {e}"))?;
-        std::fs::rename(&staging, &next).map_err(|e| e.to_string())?;
+        crate::core::sync_path::rename_when_released(&staging, &next).map_err(|e| e.to_string())?;
         std::mem::forget(guard);
         let database = Database::try_new_named(
             &next.to_string_lossy(),
@@ -1993,17 +1993,17 @@ fn finish_promote(root: &Path, intent: &mut PromoteIntent) -> io::Result<()> {
         intent.step = 3;
     }
     if intent.step == 0 {
-        std::fs::rename(&parent_dir, &aside)?;
+        crate::core::sync_path::rename_when_released(&parent_dir, &aside)?;
         intent.step = 1;
         intent.store(root)?;
     }
     if intent.step == 1 {
-        std::fs::rename(&branch_dir, &parent_dir)?;
+        crate::core::sync_path::rename_when_released(&branch_dir, &parent_dir)?;
         intent.step = 2;
         intent.store(root)?;
     }
     if intent.step == 2 {
-        std::fs::rename(&aside, &branch_dir)?;
+        crate::core::sync_path::rename_when_released(&aside, &branch_dir)?;
         intent.step = 3;
         intent.store(root)?;
     }

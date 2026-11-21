@@ -23,7 +23,7 @@ fn clean_log(incarnation: u128) -> Vec<u8> {
 }
 
 fn sync_file(path: &Path) {
-    crate::core::sync_audit::note("file.data", path);
+    let _synced = crate::core::sync_audit::note("file.data", path);
     std::fs::File::options().write(true).open(path).unwrap().sync_data().unwrap();
 }
 

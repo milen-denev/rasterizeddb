@@ -87,6 +87,33 @@ pub fn sync_dir(dir: &Path) -> io::Result<bool> {
     }
 }
 
+/// Renames `from` to `to`. On Windows a directory with a file open inside
+/// cannot be renamed (access denied, or a sharing violation), and a database
+/// just detached still has tasks letting go of its files: the rename is
+/// retried there for up to five seconds. Linux renames it at once.
+pub fn rename_when_released(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut tries = 0;
+        loop {
+            match std::fs::rename(from, to) {
+                Err(e)
+                    if tries < 50
+                        && (e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32)) =>
+                {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                done => return done,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
 /// The volume serial number and the file index of the file or directory at
 /// `path`: who it is on Windows, kept through a rename, never shared by two
 /// files on a volume at once. Read through a handle that asks for no access

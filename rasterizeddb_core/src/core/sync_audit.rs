@@ -51,9 +51,38 @@ pub struct SyncEvent {
 #[cfg(any(test, feature = "index_store_failpoints"))]
 static EVENTS: Mutex<Vec<(PathBuf, Vec<SyncEvent>)>> = Mutex::new(Vec::new());
 
-/// Records a sync of `path` from the site named `tag`.
+/// Held by a call site across the sync a [`note`] announced: dropping it says
+/// the sync has returned. Without it nothing off Linux could tell (there,
+/// `/proc` shows where the thread is), and the power-loss harness took
+/// every sync of another thread as still in flight, durable never. Nothing
+/// in a build without the harness.
+#[must_use = "hold it until the sync it notes has returned"]
+pub struct SyncNote {
+    #[cfg(any(test, feature = "index_store_failpoints"))]
+    done: Option<(std::sync::Arc<calls::Calls>, u64)>,
+}
+
+impl SyncNote {
+    const NONE: SyncNote = SyncNote {
+        #[cfg(any(test, feature = "index_store_failpoints"))]
+        done: None,
+    };
+}
+
+impl Drop for SyncNote {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "index_store_failpoints"))]
+        if let Some((calls, entry)) = self.done.take() {
+            calls.returned(entry);
+        }
+    }
+}
+
+/// Records a sync of `path` from the site named `tag`. Hold what it returns
+/// until the sync has returned.
 #[inline]
-pub fn note(tag: &'static str, path: &Path) {
+pub fn note(tag: &'static str, path: &Path) -> SyncNote {
     note_as(tag, path, None)
 }
 
@@ -61,15 +90,15 @@ pub fn note(tag: &'static str, path: &Path) {
 /// bytes of it are what the sync makes durable. The log's syncs, which cover
 /// its records and not the padding past them.
 #[inline]
-pub fn note_extent(tag: &'static str, path: &Path, extent: u64) {
+pub fn note_extent(tag: &'static str, path: &Path, extent: u64) -> SyncNote {
     note_as(tag, path, Some(extent))
 }
 
 #[inline]
 #[cfg_attr(not(any(test, feature = "index_store_failpoints")), allow(unused_variables))]
-fn note_as(tag: &'static str, path: &Path, extent: Option<u64>) {
+fn note_as(tag: &'static str, path: &Path, extent: Option<u64>) -> SyncNote {
     if WATCHERS.load(Ordering::Relaxed) == 0 {
-        return;
+        return SyncNote::NONE;
     }
     // Entered before any lock below, so a thread parked on one of them is
     // seen as still inside this call: its sync has not been issued.
@@ -117,7 +146,13 @@ fn note_as(tag: &'static str, path: &Path, extent: Option<u64>) {
         crate::core::power_loss::on_sync(&event);
     }
     #[cfg(any(test, feature = "index_store_failpoints"))]
-    drop(inside);
+    {
+        let done = inside.done();
+        drop(inside);
+        SyncNote { done: Some(done) }
+    }
+    #[cfg(not(any(test, feature = "index_store_failpoints")))]
+    SyncNote::NONE
 }
 
 /// A directory operation, announced by a hooked path just **before** it
@@ -199,9 +234,17 @@ mod calls {
     pub(super) static SEQ: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Default)]
-    struct Calls {
+    pub(crate) struct Calls {
         entered: AtomicU64,
         inside: AtomicBool,
+        /// The highest entry whose sync its site said had returned.
+        returned: AtomicU64,
+    }
+
+    impl Calls {
+        pub(super) fn returned(&self, entry: u64) {
+            self.returned.fetch_max(entry, Ordering::AcqRel);
+        }
     }
 
     /// Every thread that ever called `note` while something was watched, by
@@ -225,6 +268,13 @@ mod calls {
         calls: StdArc<Calls>,
     }
 
+    impl Inside {
+        /// What the site's [`super::SyncNote`] reports to when dropped.
+        pub(super) fn done(&self) -> (StdArc<Calls>, u64) {
+            (self.calls.clone(), self.entry)
+        }
+    }
+
     impl Drop for Inside {
         fn drop(&mut self) {
             self.calls.inside.store(false, Ordering::Release);
@@ -245,8 +295,8 @@ mod calls {
         })
     }
 
-    /// Without `/proc` a thread past `note` cannot be told apart from one
-    /// still inside its sync, so it counts as in flight: what a cut also
+    /// Without `/proc` a thread past `note` whose site has not said its sync
+    /// returned ([`super::SyncNote`]) counts as in flight: what a cut also
     /// decides on Linux once its probe rounds run out.
     #[cfg(not(target_os = "linux"))]
     fn probe(_event: &SyncEvent) -> Completion {
@@ -294,7 +344,7 @@ mod calls {
         // Read before `inside`: entering sets `inside` first, so a thread
         // seen outside with this count has left the call that recorded it.
         let entered = calls.entered.load(Ordering::Acquire);
-        if entered > event.entry {
+        if entered > event.entry || calls.returned.load(Ordering::Acquire) >= event.entry {
             return Completion::Returned;
         }
         if calls.inside.load(Ordering::Acquire) {
@@ -341,19 +391,64 @@ mod calls {
 /// such as a replay target opened by file id. The path is read back from the
 /// descriptor, and only while something is watching.
 #[inline]
-pub fn note_file(tag: &'static str, file: &std::fs::File) {
+pub fn note_file(tag: &'static str, file: &std::fs::File) -> SyncNote {
     if WATCHERS.load(Ordering::Relaxed) == 0 {
-        return;
+        return SyncNote::NONE;
     }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         if let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
-            note(tag, &path);
+            return note(tag, &path);
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    if let Some(path) = windows_path_of(file) {
+        return note(tag, &path);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = (tag, file);
+    SyncNote::NONE
+}
+
+/// The path `file` was opened at, from its handle, spelled as the watched
+/// directory it lies under spells it. Windows gives the long, `\\?\`-prefixed
+/// form (`runneradmin`), and a watch may have been made on the short one
+/// (`RUNNER~1`), so a match goes through each watched directory's canonical
+/// form.
+#[cfg(windows)]
+fn windows_path_of(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(file: *mut std::ffi::c_void, path: *mut u16, len: u32, flags: u32) -> u32;
+    }
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: an open handle and a buffer of the length passed.
+        let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle().cast(), buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            break;
+        }
+        buf.resize(n + 1, 0);
+    }
+    let strip = |p: PathBuf| -> PathBuf {
+        let text = p.to_string_lossy().into_owned();
+        PathBuf::from(text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text))
+    };
+    let path = strip(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+    for (dir, _) in WATCHED.lock().iter() {
+        if let Ok(canonical) = std::fs::canonicalize(dir).map(strip)
+            && let Ok(rest) = path.strip_prefix(&canonical)
+        {
+            return Some(dir.join(rest));
+        }
+    }
+    Some(path)
 }
 
 /// Starts recording syncs of paths under `dir`; the guard stops it and hands

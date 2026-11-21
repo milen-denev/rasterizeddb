@@ -5103,7 +5103,7 @@ fn remove_rename_intent(path: &std::path::Path) -> io::Result<()> {
     #[cfg(test)]
     crate::core::sync_audit::dir_op(crate::core::sync_audit::DirOp::Unlink(path));
     match std::fs::remove_file(path) {
-        Ok(()) => crate::core::sync_audit::note("unlink", path),
+        Ok(()) => drop(crate::core::sync_audit::note("unlink", path)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }

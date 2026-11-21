@@ -1185,7 +1185,7 @@ impl IdReservation {
         {
             let mut file = File::create(&temp)?;
             file.write_all(&bytes)?;
-            crate::core::sync_audit::note("mvcc.id_reservation", path);
+            let _synced = crate::core::sync_audit::note("mvcc.id_reservation", path);
             file.sync_all()?;
         }
         std::fs::rename(&temp, path)?;

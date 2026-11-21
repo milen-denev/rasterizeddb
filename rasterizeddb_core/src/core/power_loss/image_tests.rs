@@ -20,12 +20,12 @@ const P1_LOGS_SYNCED: u64 = 2;
 const HALF: u64 = 3;
 
 fn sync_file(path: &Path) {
-    sync_audit::note("file.data", path);
+    let _synced = sync_audit::note("file.data", path);
     std::fs::File::options().write(true).open(path).unwrap().sync_data().unwrap();
 }
 
 fn sync_dir_of(path: &Path) {
-    sync_audit::note("dir", path);
+    let _synced = sync_audit::note("dir", path);
     crate::core::sync_path::sync_dir(path.parent().unwrap()).unwrap();
 }
 
@@ -120,7 +120,7 @@ fn a_log_is_cut_at_its_synced_length_for_the_log_seed() {
     std::fs::write(&log, b"head").unwrap();
     let rec = Recorder::start(dir.path());
     write_at(&log, 4, &vec![b'r'; 3 * PAGE]);
-    sync_audit::note("wal.log", &log);
+    let _synced = sync_audit::note("wal.log", &log);
     std::fs::File::options().write(true).open(&log).unwrap().sync_data().unwrap();
     let synced = std::fs::read(&log).unwrap();
     write_at(&log, synced.len() as u64, &vec![b'u'; 2 * PAGE]);

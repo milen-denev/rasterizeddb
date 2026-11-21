@@ -237,7 +237,7 @@ impl CommitState {
         // needs its bytes and the new file size durable to be readable after a
         // crash. Forcing out mtime/ctime costs an extra journal transaction and
         // buys nothing here.
-        crate::core::sync_audit::note("file.data", Path::new(path));
+        let _synced = crate::core::sync_audit::note("file.data", Path::new(path));
         #[cfg(test)]
         let flushed = if self.fail_next_flush.swap(false, Ordering::AcqRel) {
             Err(io::Error::other("injected fdatasync failure"))
@@ -759,9 +759,10 @@ pub(crate) mod failed_appends {
     #[cfg(test)]
     pub(super) fn injected_append_failure(file: &str) -> bool {
         let mut armed = FAIL_APPEND_TO.lock();
-        // By file name: a suffix of "/name" never matched a Windows path.
-        let file_name = std::path::Path::new(file).file_name();
-        match armed.iter().position(|name| file_name.is_some_and(|f| f == name.as_str())) {
+        // By whole path components (`a.db`, or `dir/db/a.db`): a string
+        // suffix of "/name" never matched a Windows path.
+        let file = std::path::Path::new(file);
+        match armed.iter().position(|name| file.ends_with(name)) {
             Some(i) => {
                 armed.swap_remove(i);
                 true
@@ -964,6 +965,23 @@ fn byte_vec_pool() -> &'static Pool<ByteVecAllocator, Vec<u8>> {
 // Remapping a growing file can be expensive. We remap lazily only when the mmap coverage
 // falls behind the logical file length by a meaningful amount.
 const REMAP_GROWTH_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+/// Cuts the file behind an append handle back to `at`. Windows grants an
+/// append handle `FILE_APPEND_DATA` without `FILE_WRITE_DATA`, which
+/// `SetEndOfFile` needs: the cut failed there, leaving a failed append's
+/// partial bytes in the file. A handle of its own does it there.
+fn cut_append_file(append: &std::fs::File, path: &str, at: u64) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = append;
+        std::fs::OpenOptions::new().write(true).open(path)?.set_len(at)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        append.set_len(at)
+    }
+}
 
 /// Whether table files are read through a memory map. Not on Windows: there a
 /// mapped file cannot be shortened (`SetEndOfFile` fails with error 1224, "a
@@ -1387,7 +1405,7 @@ impl LocalStorageProvider {
     fn land_into_main(&self, main: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
         let at = self.file_len.load(Ordering::Acquire);
         if let Err(e) = main.write_all(bytes).and_then(|()| main.flush()) {
-            if let Err(cut) = main.set_len(at) {
+            if let Err(cut) = cut_append_file(main, &self.file_str, at) {
                 let _ = self.commit.poison(format!(
                     "landing staged bytes in {} failed ({}) and could not be cut back: {}",
                     self.file_str, e, cut
@@ -1453,7 +1471,7 @@ impl LocalStorageProvider {
             if mem.len() == len {
                 let mut main = self.append_file.write();
                 self.land_into_main(&mut main, &mem)?;
-                crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+                let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
                 synced = main.sync_all();
                 // The mirror is deliberately NOT cleared yet. Until the length
                 // is published below, a read of these offsets is still served
@@ -1481,7 +1499,7 @@ impl LocalStorageProvider {
 
             let mut main = self.append_file.write();
             self.land_into_main(&mut main, &buf[..])?;
-            crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+            let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
             synced = main.sync_all();
 
             // As above: the mirror is dropped after the length is published,
@@ -2030,7 +2048,7 @@ impl StorageIO for LocalStorageProvider {
             // the next append's offset no longer described where its bytes
             // landed. Cut back to the allocator's end instead, leave `file_len`
             // where it was, and fail the transaction at `commit_durable`.
-            if let Err(cut) = file.set_len(at) {
+            if let Err(cut) = cut_append_file(&file, &self.file_str, at) {
                 let _ = self.commit.poison(format!(
                     "append to {} failed ({}) and could not be cut back: {}",
                     self.file_str, e, cut
@@ -2152,7 +2170,7 @@ impl StorageIO for LocalStorageProvider {
         {
             let file = self.write_file.write();
             file.set_len(len)?;
-            crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+            let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
             file.sync_all()?;
         }
         let _ = crate::core::wal::sync_parent_dir(Path::new(&self.file_str));
@@ -2512,7 +2530,7 @@ impl StorageIO for LocalStorageProvider {
         let written = self.inplace.write(|| file.seek(seek).and_then(|_| file.write_all(buffer)))
             .and_then(|()| file.flush())
             .and_then(|()| {
-                crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
+                let _synced = crate::core::sync_audit::note("file.data", Path::new(&self.file_str));
                 file.sync_all()
             });
         if let Err(e) = written {
@@ -2841,11 +2859,11 @@ impl StorageIO for LocalStorageProvider {
         let file_str = format!("{}{}{}", self.location, delimiter, self.table_name);
         // Not a sync: noted so a crash image can tell which deletions a later
         // directory sync made durable.
-        crate::core::sync_audit::note("unlink", Path::new(&file_str));
+        drop(crate::core::sync_audit::note("unlink", Path::new(&file_str)));
         let _ = remove_file(Path::new(&file_str));
 
         // Also remove the companion temp staging file created by this provider.
-        crate::core::sync_audit::note("unlink", Path::new(&self.temp_file_str));
+        drop(crate::core::sync_audit::note("unlink", Path::new(&self.temp_file_str)));
         let _ = remove_file(Path::new(&self.temp_file_str));
     }
 
