@@ -2890,9 +2890,10 @@ mod tests {
         let started = std::time::Instant::now();
         let mut peak = 0usize;
         // `secs`, or longer until the floors asserted below are reached:
-        // slower machines (a Windows runner) took 72741 ids in the time.
+        // slower machines (a Windows runner) took 72741 ids in the time, and
+        // 92552 in six times it under a loaded suite.
         let floors_met = || m.next_id() > 100_000 && checked.load(Ordering::Relaxed) > 10_000;
-        let deadline = std::time::Duration::from_secs(secs * 6);
+        let deadline = std::time::Duration::from_secs(secs * 20);
         while (started.elapsed() < std::time::Duration::from_secs(secs) || !floors_met())
             && started.elapsed() < deadline
             && !full.load(Ordering::Relaxed)

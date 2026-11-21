@@ -1,8 +1,8 @@
 name: Windows iterate (temporary)
 
-# TEMPORARY, for the Windows fix round on fix/windows-suite: runs the core
-# library modules that failed on Windows, on both Windows runners, on every
-# push to that branch's pull request. Removed before the branch merges.
+# TEMPORARY, for the Windows fix round on fix/windows-suite: runs the full
+# suites on both Windows runners, on every push to that branch's pull
+# request. Removed before the branch merges.
 
 on:
   pull_request:
@@ -22,7 +22,7 @@ jobs:
     if: github.head_ref == 'fix/windows-suite'
     name: core lib ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -40,11 +40,13 @@ jobs:
           target: ${{ matrix.target }}
       - name: Directory flush on this runner
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib core::sync_path -- --nocapture
-      - name: The modules that failed
-        run: >
-          cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib --no-fail-fast --
-          core::auto_compact core::backup core::database core::index::paged core::index_store
-          core::kv_cache core::mvcc::status core::partition core::power_loss
-          core::processor::column_scan_tests core::row::write_path_tests core::rql::row_source
-          core::storage core::storage_providers core::torn_tail core::wal
-          pgwire::branch_tests pgwire::index_store_wire_tests
+      # The whole of what ci.yml's `full` job runs, each step even when an
+      # earlier one failed, so one round shows everything left.
+      - name: Core library tests
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib --no-fail-fast
+      - name: Core integration tests
+        if: success() || failure()
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --test '*' --no-fail-fast
+      - name: Compatibility suite
+        if: success() || failure()
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast

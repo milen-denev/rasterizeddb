@@ -4403,10 +4403,20 @@ async fn forgetting_under_concurrent_writes_and_reads_matches_a_reference_model(
     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     // And on until something was forgotten, the floor asserted below: every
     // write syncs, and a Windows runner's 210 ids in the time forgot none.
+    // The status log settles, and so forgets, in whole blocks of 4096 ids; a
+    // runner whose syncs are slow reached 2155 in eighteen seconds. Read-only
+    // transactions, run alongside the writers, carry the ids past a block
+    // when the writes alone do not.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs * 6);
     while (forgets.load(Ordering::Relaxed) == 0 || manager.status().forgotten_below() == 0)
         && std::time::Instant::now() < deadline
     {
+        if manager.next_id() < 3 * 4096 {
+            for _ in 0..512 {
+                let r = manager.begin();
+                manager.commit(r);
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     stop.store(true, Ordering::Relaxed);

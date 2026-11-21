@@ -364,9 +364,13 @@ async fn differential(in_memory: bool) {
             assert!(again == reply, "reopened, {sql}: two runs differ");
             copied += usize::from(batches > 0);
         }
-        // All but the statements whose WHERE matches nothing (`k > 1000`).
-        let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
-        assert!(copied >= FROM_CELLS.len() - empty, "only {copied} statements read their cells in batches from the mapping");
+        if !crate::core::storage_providers::file_sync::MAPS_FILES {
+            assert_eq!(copied, 0, "reopened, cells were copied from a mapping where there is none");
+        } else {
+            // All but the statements whose WHERE matches nothing (`k > 1000`).
+            let empty = FROM_CELLS.iter().filter(|sql| sql.contains("k > 1000")).count();
+            assert!(copied >= FROM_CELLS.len() - empty, "only {copied} statements read their cells in batches from the mapping");
+        }
     }
     column_scan::set_enabled(true);
 }
