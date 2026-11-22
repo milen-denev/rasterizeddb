@@ -1321,7 +1321,25 @@ async fn idle_close_closes_only_what_no_routed_access_touched() {
     let open = open_pids(&t);
     assert!(open.contains(&busy_pid), "a partition read every round was closed as idle ({open:?})");
     assert!(open.contains(&held_pid), "a held partition was closed as idle ({open:?})");
-    assert_eq!(open.len(), 2, "idle partitions stayed open: {open:?}");
+    // Every other partition closes, though maybe not yet: the scheduler runs
+    // these rounds too, and one of its rounds could have closed `idle_pid`
+    // and still be going through the rest ("idle partitions stayed open: [0,
+    // 1, 4, 5, 6, 7]" on a Windows runner, 2026-11-22, its closes slow). The
+    // busy tenant goes on being read, so a round starting meanwhile keeps
+    // it; the checks above are what a round ignoring its reads fails.
+    let settle = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let open = open_pids(&t);
+        if open.len() == 2 {
+            break;
+        }
+        assert!(std::time::Instant::now() < settle, "idle partitions stayed open: {open:?}");
+        let mine: Vec<_> = expected().into_iter().filter(|r| r.0 == busy).collect();
+        assert_eq!(rows(&db, &format!("tenant_id = {busy}")).await, mine);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let open = open_pids(&t);
+    assert!(open.contains(&busy_pid) && open.contains(&held_pid), "{open:?}");
     drop(held);
     let _ = held_tenant;
     drop(board);
