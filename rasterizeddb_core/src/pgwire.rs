@@ -13160,18 +13160,54 @@ where
         return Ok(false);
     }
 
+    // `ANALYZE` names tables, and runs nothing: a statement after it is
+    // refused as PostgreSQL refuses it, and a table that is not there is
+    // reported, rather than both answering success.
+    if let Some(parsed) = crate::core::rql::lexer_alter::parse_analyze(s) {
+        match parsed {
+            Err(message) => {
+                fail_statement(state, stream, "42601", &message).await?;
+                return Ok(true);
+            }
+            Ok(tables) => {
+                let database = state.catalog.get(&state.database_name);
+                if let Some(missing) = database
+                    .as_ref()
+                    .and_then(|database| tables.iter().find(|t| !database.has_table(t)))
+                {
+                    fail_statement(
+                        state,
+                        stream,
+                        "42P01",
+                        &format!("relation \"{missing}\" does not exist"),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
     if let Some(reason) = crate::core::rql::lexer_alter::no_op_reason(s) {
         log::info!(
             "accepted without acting: {} ({})",
             s.lines().next().unwrap_or(s),
             reason
         );
-        let tag = s
-            .split_whitespace()
-            .take(2)
-            .map(|w| w.to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .join(" ");
+        // PostgreSQL's tags: one word for these two, the first two words
+        // (`CREATE EXTENSION`, `DROP SCHEMA`) for the rest. Two words made
+        // `ANALYZE ORDERS` and `COMMENT ON`.
+        let first = s.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+        let tag = match first.as_str() {
+            "ANALYZE" | "ANALYSE" => "ANALYZE".to_string(),
+            "COMMENT" => "COMMENT".to_string(),
+            _ => s
+                .split_whitespace()
+                .take(2)
+                .map(|w| w.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
         send_command_complete(stream, &tag).await?;
         return Ok(true);
     }
