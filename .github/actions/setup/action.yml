@@ -7,6 +7,30 @@ inputs:
 runs:
   using: composite
   steps:
+    # The engine's tests create, sync and delete thousands of small files.
+    # On the Windows runners Defender scans each one, and those tests ran
+    # 8-23x slower than on Linux while CPU- and network-bound tests ran at
+    # the same speed. The runners are throwaway VMs: real-time scanning is
+    # turned off, and the temp directory (where every test's tempdir lives)
+    # moves to the workspace drive. Best effort: a refused setting only
+    # leaves the job as slow as before.
+    - name: Windows file-system speed (Defender off, temp on the work drive)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Continue
+        foreach ($p in @($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP, $env:TEMP, "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")) {
+          Add-MpPreference -ExclusionPath $p -ErrorAction Continue
+        }
+        Get-MpComputerStatus | Format-List AMRunningMode, RealTimeProtectionEnabled, IsTamperProtected
+        $t = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Qualifier) 'rdbtmp'
+        New-Item -ItemType Directory -Force $t | Out-Null
+        Add-MpPreference -ExclusionPath $t -ErrorAction Continue
+        "TEMP=$t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "TMP=$t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free, Root
+
     - uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ inputs.target }}

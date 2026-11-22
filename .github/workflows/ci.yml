@@ -162,8 +162,10 @@ jobs:
       - name: Core library tests
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --lib --no-fail-fast
 
+      # `--test '*'`, not `--tests`: `--tests` also reruns the library's own
+      # unit tests, which the step above already ran (85 minutes on Windows).
       - name: Core integration tests
-        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --tests --no-fail-fast
+        run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_core --test '*' --no-fail-fast
 
       - name: Compatibility suite (PostgreSQL / MySQL / SQL Server drivers)
         run: cargo test --locked --target ${{ matrix.target }} -p rasterizeddb_compat --no-fail-fast
