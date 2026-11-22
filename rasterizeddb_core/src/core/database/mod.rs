@@ -4,6 +4,8 @@ pub mod index_checkpoint;
 #[cfg(test)]
 mod catalogue_present_tests;
 #[cfg(test)]
+mod cached_clause_candidates_tests;
+#[cfg(test)]
 mod incarnation_tests;
 #[cfg(test)]
 mod native_authz_tests;

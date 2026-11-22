@@ -224,6 +224,38 @@ fn slot_hash(table: &str, where_clause: &str, limit: Option<u64>) -> u64 {
     digest.finalize()
 }
 
+/// Whether [`lookup`] would answer `(table, where_clause)` at `generation`
+/// right now, asked without counting a hit or a miss and without releasing a
+/// stranded entry.
+///
+/// For a caller deciding whether to do the work a miss needs before it
+/// knows: a scan narrows its slots by the indexes first, and for a clause an
+/// index answers only loosely (a key prefix) that narrowing is most of the
+/// statement, wasted when the entry then answers it. An entry evicted between
+/// this and the lookup is a miss like any other; the caller must still be
+/// correct, only slower, without the work it skipped.
+pub fn holds(table: &str, where_clause: &str, generation: u64, limit: Option<u64>) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let probe = |key_limit: Option<u64>| -> bool {
+        let Some(cache) = QUERY_CACHE.get() else {
+            return false;
+        };
+        cache
+            .read(&slot_hash(table, where_clause, key_limit), |slot| {
+                slot.entry.load_full().is_some_and(|entry| {
+                    &*entry.table == table
+                        && &*entry.where_clause == where_clause
+                        && entry.limit == key_limit
+                        && entry.generation == generation
+                })
+            })
+            .unwrap_or(false)
+    };
+    probe(None) || (limit.is_some() && probe(limit))
+}
+
 /// Looks up the complete match set for `(table, where_clause)` as of
 /// `generation`.
 ///
