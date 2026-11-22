@@ -1309,6 +1309,8 @@ async fn vacuum_reaches_the_engine_rather_than_the_no_op_list() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_genuine_no_ops_are_still_accepted() {
     let (_server, pool) = server().await;
+    // `ANALYZE t` names a table that has to exist, as in PostgreSQL.
+    run(&pool, "CREATE TABLE pms_case (id INT PRIMARY KEY)").await.expect("pms_case");
 
     for sql in [
         // A plain column index is real now (see `secondary_indexes.rs`); a
@@ -1324,4 +1326,15 @@ async fn the_genuine_no_ops_are_still_accepted() {
     ] {
         run(&pool, sql).await.unwrap_or_else(|e| panic!("{sql:?} should be accepted: {e}"));
     }
+
+    // Not accepted for anything at all: a table that is not there, and a
+    // statement written after ANALYZE, which ran nothing and answered success.
+    let err = run(&pool, "ANALYZE no_such_table_at_all")
+        .await
+        .expect_err("ANALYZE of a missing table must be reported");
+    assert!(err.to_lowercase().contains("not exist"), "{err}");
+    let err = run(&pool, "ANALYZE SELECT id FROM pms_case")
+        .await
+        .expect_err("ANALYZE SELECT must be refused");
+    assert!(err.contains("EXPLAIN ANALYZE"), "{err}");
 }
