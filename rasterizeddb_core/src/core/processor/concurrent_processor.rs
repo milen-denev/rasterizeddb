@@ -472,6 +472,36 @@ impl ScanFailure {
 
 pub struct ConcurrentProcessor;
 
+/// A scan's workers: the spawned ones to join, and the outcome of the one
+/// that ran in the statement's own task, if it ran there.
+struct ScanWorkers {
+    spawned: Vec<tokio::task::JoinHandle<()>>,
+    inline: Option<std::result::Result<(), String>>,
+}
+
+impl ScanWorkers {
+    /// Every worker's outcome, a panic as its message.
+    async fn join(self) -> Vec<std::result::Result<(), String>> {
+        let mut out: Vec<std::result::Result<(), String>> = join_all(self.spawned)
+            .await
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect();
+        out.extend(self.inline);
+        out
+    }
+}
+
+/// What a caught panic said, as a panicked task's `JoinError` says it.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let said = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with no message".to_string());
+    format!("task panicked with message {said:?}")
+}
+
 /// The fewest index candidates a scan worker is given. Below this the
 /// cost of another worker outweighs the fetches it would take over.
 const SPARSE_MIN_BATCH: usize = 512;
@@ -525,7 +555,7 @@ impl ConcurrentProcessor {
     /// had already matched with it — and `join_all`'s ignored `Result` meant the
     /// query then returned that truncated set as a success.
     fn check_worker_outcome(
-        join_results: Vec<std::result::Result<(), tokio::task::JoinError>>,
+        join_results: Vec<std::result::Result<(), String>>,
         eval_error: &ScanFailure,
     ) -> std::io::Result<()> {
         if let Some(e) = eval_error.outcome() {
@@ -1042,10 +1072,7 @@ impl ConcurrentProcessor {
         // already running and must be joined before the error is reported.
         // `Some` means a pointer read failed and the scan stopped short, so the
         // rows the workers produced are a prefix and must not be returned.
-    ) -> (
-        Vec<tokio::task::JoinHandle<()>>,
-        Option<crate::core::row::error::RowError>,
-    ) {
+    ) -> (ScanWorkers, Option<crate::core::row::error::RowError>) {
         // As many workers as there is work to hand them, never more.
         //
         // This used to spawn `max_permits_threads()` — 16 by default — for
@@ -1114,7 +1141,23 @@ impl ConcurrentProcessor {
                 })
             });
 
-        let mut worker_handles = Vec::with_capacity(n_workers);
+        // A scan of one batch runs its worker here, in the statement's own task,
+        // polled together with the dispatch loop below rather than spawned.
+        //
+        // That is every point read and every small scan, and for them the
+        // spawn was a measurable share of the statement: the task's
+        // allocation, the copy of its future into it, a wake on another
+        // thread and the join back. Joining in place is deadlock-free for the
+        // same reason the spawned worker was: the two futures share the task,
+        // the work channel holds a batch, and every output channel is
+        // unbounded, so neither side can wait on the other forever.
+        //
+        // A panic is caught at the join and reported exactly as a panicked
+        // task was, as a worker that terminated abnormally, not unwound
+        // through the connection.
+        let run_inline = batches == 1;
+        let mut inline_worker = None;
+        let mut worker_handles = Vec::with_capacity(if run_inline { 0 } else { n_workers });
 
         for _ in 0..n_workers {
             let work_rx = work_rx.clone();
@@ -1148,7 +1191,7 @@ impl ConcurrentProcessor {
             // scan stays consistent with itself either way.
             let horizon_ref = crate::core::vacuum::VersionHorizon::for_visibility(&visibility);
 
-            let h = task::spawn(crate::core::statement_clock::inherit(async move {
+            let worker = crate::core::statement_clock::inherit(async move {
                 let io_rows_ref: &S = &*io_rows_batch;
 
                 // Worker-local Buffer; allocated ONCE and reused across every
@@ -1815,9 +1858,13 @@ impl ConcurrentProcessor {
                         let _ = sink.chunks.send(chunk).await;
                     }
                 }
-            }));
+            });
 
-            worker_handles.push(h);
+            if run_inline {
+                inline_worker = Some(Box::pin(worker));
+            } else {
+                worker_handles.push(task::spawn(worker));
+            }
         }
 
         // Drop our copy of the receiver; once the iterator finishes and we
@@ -1829,90 +1876,104 @@ impl ConcurrentProcessor {
         // Drive the iterator inline. No more per-batch task::spawn.
         iterator.reset();
 
-        let mut pointer_read_error: Option<crate::core::row::error::RowError> = None;
-        // Pointers still expected, to size each batch's allocation by: a
-        // batch is sent away to a worker, so each needs its own.
-        let mut still_expected = expected;
+        let dispatch = async {
+            let mut pointer_read_error: Option<crate::core::row::error::RowError> = None;
+            // Pointers still expected, to size each batch's allocation by: a
+            // batch is sent away to a worker, so each needs its own.
+            let mut still_expected = expected;
 
-        loop {
-            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
+            loop {
+                if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // Sized to what is left, never more than a batch. This was
+                // `batch_size()` whatever the scan, so a point read through an
+                // index allocated room for 10,000 pointers (~0.6 MB) for its one
+                // row, and the same again for the empty read that ends the loop:
+                // two large-chunk mallocs and frees per statement. The estimate
+                // can fall short (rows appended since it was made); pushes past
+                // it grow the vector.
+                let capacity = (still_expected.min(per_batch as u64) as usize).max(1);
+                let mut pointers: Vec<RowPointer> = Vec::with_capacity(capacity);
+
+                // "No more pointers" and "the read failed" are different answers
+                // and must not share a branch. The end of the table is `Ok` with an
+                // empty batch: the iterator already turns every benign end of data
+                // into that — the declared length reached, a trailing partial
+                // record, and a concurrent append's reserved-but-unwritten tail
+                // (`load_next_chunk`'s `UnexpectedEof` arm). So an `Err` here is a
+                // real I/O failure or corruption, and it fails the statement.
+                //
+                // This used to clear the batch and fall into the `is_empty` break,
+                // which ended the scan as though the table had ended: a truncated
+                // result reported as a success, and — with the query cache on — a
+                // truncated match set stored as a *complete* one, because the stop
+                // flag stayed clear. The batch that failed is discarded rather than
+                // dispatched: the statement is failing, so its rows are not wanted.
+                if let Err(e) = iterator.next_row_pointers_into(&mut pointers).await {
+                    pointer_read_error = Some(e);
+                    stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+
+                if pointers.is_empty() {
+                    break;
+                }
+                still_expected = still_expected.saturating_sub(pointers.len() as u64);
+
+                // The candidate rows this statement has had to look at. Counted
+                // here rather than in the workers: this loop runs in the task that
+                // is executing the statement, so the counter is reachable without
+                // being passed down, and one add per batch is not a contended cache
+                // line in the per-row loop. Pointers the filter index excluded were
+                // dropped inside the iterator and so are not counted, which is what
+                // makes the figure show that the index worked.
+                #[cfg(feature = "query_stats")]
+                crate::core::query_stats::note_rows_scanned(pointers.len() as u64);
+
+                // Whether this statement is still allowed to run. Checked here, in
+                // the task executing it, because the signal is a task-local and
+                // does not cross the `task::spawn` that made the workers.
+                //
+                // The error is recorded BEFORE the stop flag is set, and the order
+                // is the whole point: `check_worker_outcome` reads the error, and a
+                // stop flag on its own is indistinguishable from a scan that
+                // finished — so a cancelled statement would return the rows it
+                // happened to reach as though they were the complete answer.
+                if let Some(reason) = crate::core::cancel::tripped() {
+                    eval_error.record(reason.eval_error());
+                    stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+
+                if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // Bounded send: blocks the iterator when all workers are busy.
+                if work_tx.send(pointers).await.is_err() {
+                    break;
+                }
             }
 
-            // Sized to what is left, never more than a batch. This was
-            // `batch_size()` whatever the scan, so a point read through an
-            // index allocated room for 10,000 pointers (~0.6 MB) for its one
-            // row, and the same again for the empty read that ends the loop:
-            // two large-chunk mallocs and frees per statement. The estimate
-            // can fall short (rows appended since it was made); pushes past
-            // it grow the vector.
-            let capacity = (still_expected.min(per_batch as u64) as usize).max(1);
-            let mut pointers: Vec<RowPointer> = Vec::with_capacity(capacity);
+            // Closing work_tx tells workers no more batches are coming.
+            drop(work_tx);
+            pointer_read_error
+        };
 
-            // "No more pointers" and "the read failed" are different answers
-            // and must not share a branch. The end of the table is `Ok` with an
-            // empty batch: the iterator already turns every benign end of data
-            // into that — the declared length reached, a trailing partial
-            // record, and a concurrent append's reserved-but-unwritten tail
-            // (`load_next_chunk`'s `UnexpectedEof` arm). So an `Err` here is a
-            // real I/O failure or corruption, and it fails the statement.
-            //
-            // This used to clear the batch and fall into the `is_empty` break,
-            // which ended the scan as though the table had ended: a truncated
-            // result reported as a success, and — with the query cache on — a
-            // truncated match set stored as a *complete* one, because the stop
-            // flag stayed clear. The batch that failed is discarded rather than
-            // dispatched: the statement is failing, so its rows are not wanted.
-            if let Err(e) = iterator.next_row_pointers_into(&mut pointers).await {
-                pointer_read_error = Some(e);
-                stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
-                break;
+        let (pointer_read_error, inline_outcome) = match inline_worker {
+            Some(worker) => {
+                let (pointer_read_error, outcome) = futures::join!(
+                    dispatch,
+                    futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(worker))
+                );
+                (pointer_read_error, Some(outcome.map_err(|payload| panic_message(&*payload))))
             }
+            None => (dispatch.await, None),
+        };
 
-            if pointers.is_empty() {
-                break;
-            }
-            still_expected = still_expected.saturating_sub(pointers.len() as u64);
-
-            // The candidate rows this statement has had to look at. Counted
-            // here rather than in the workers: this loop runs in the task that
-            // is executing the statement, so the counter is reachable without
-            // being passed down, and one add per batch is not a contended cache
-            // line in the per-row loop. Pointers the filter index excluded were
-            // dropped inside the iterator and so are not counted, which is what
-            // makes the figure show that the index worked.
-            #[cfg(feature = "query_stats")]
-            crate::core::query_stats::note_rows_scanned(pointers.len() as u64);
-
-            // Whether this statement is still allowed to run. Checked here, in
-            // the task executing it, because the signal is a task-local and
-            // does not cross the `task::spawn` that made the workers.
-            //
-            // The error is recorded BEFORE the stop flag is set, and the order
-            // is the whole point: `check_worker_outcome` reads the error, and a
-            // stop flag on its own is indistinguishable from a scan that
-            // finished — so a cancelled statement would return the rows it
-            // happened to reach as though they were the complete answer.
-            if let Some(reason) = crate::core::cancel::tripped() {
-                eval_error.record(reason.eval_error());
-                stop_processing.store(true, std::sync::atomic::Ordering::Relaxed);
-                break;
-            }
-
-            if stop_processing.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-
-            // Bounded send: blocks the iterator when all workers are busy.
-            if work_tx.send(pointers).await.is_err() {
-                break;
-            }
-        }
-
-        // Closing work_tx tells workers no more batches are coming.
-        drop(work_tx);
-
-        (worker_handles, pointer_read_error)
+        (ScanWorkers { spawned: worker_handles, inline: inline_outcome }, pointer_read_error)
     }
 
     // Old per-batch spawning loop removed; kept signature-compatible.
@@ -2440,7 +2501,7 @@ impl ConcurrentProcessor {
         )
         .await;
 
-        let join_results = join_all(batch_handles).await;
+        let join_results = batch_handles.join().await;
         // After the join, so no worker outlives the statement it served.
         if let Some(e) = pointer_read_error {
             return Err(e.into());
@@ -2567,7 +2628,7 @@ impl ConcurrentProcessor {
         )
         .await;
 
-        let join_results = join_all(batch_handles).await;
+        let join_results = batch_handles.join().await;
         drop(tx_rp);
         // After the join, so no worker outlives the statement it served.
         if let Some(e) = pointer_read_error {
@@ -2753,7 +2814,7 @@ impl ConcurrentProcessor {
         .await;
 
         // Wait for all batch tasks to complete
-        let join_results = join_all(batch_handles).await;
+        let join_results = batch_handles.join().await;
 
         // Drop the sender to signal that no more rows will be sent
         drop(tx);
@@ -2985,7 +3046,7 @@ impl ConcurrentProcessor {
         )
         .await;
 
-        let join_results = join_all(batch_handles).await;
+        let join_results = batch_handles.join().await;
         drop(tx_b);
 
         // After the join, so no worker outlives the statement it served.
@@ -3451,7 +3512,11 @@ impl ConcurrentProcessor {
             batch_handles.push(batch_handle);
         }
 
-        let join_results = join_all(batch_handles).await;
+        let join_results: Vec<std::result::Result<(), String>> = join_all(batch_handles)
+            .await
+            .into_iter()
+            .map(|r| r.map_err(|e| e.to_string()))
+            .collect();
         drop(tx);
 
         Self::check_worker_outcome(join_results, &eval_error)?;
