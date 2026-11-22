@@ -1,14 +1,20 @@
-name: Release - server executables
+name: Release - server and Studio executables
 
 # Channel 3 of 3. Tag `v<version>` (the version in
-# rasterizeddb_core/Cargo.toml) builds the server for four targets on native
-# runners, smoke-tests each binary (start, write, kill -9, restart, read),
-# and attaches the archives and their SHA-256 sums to the GitHub release:
+# rasterizeddb_core/Cargo.toml) builds the server and RasterizedDB Studio
+# (rdb_studio) for four targets on native runners, smoke-tests each server
+# binary (start, write, kill -9, restart, read), and attaches the archives
+# and their SHA-256 sums to the GitHub release:
 #
 #   rasterizeddb-server-<version>-linux-x86_64.tar.gz     (x86-64-v3: AVX2 CPUs)
 #   rasterizeddb-server-<version>-linux-arm64.tar.gz      (armv8-a)
 #   rasterizeddb-server-<version>-windows-x86_64.zip      (x86-64-v3: AVX2 CPUs)
 #   rasterizeddb-server-<version>-windows-arm64.zip       (armv8-a)
+#   rdb-studio-<version>-<same four platforms>.tar.gz / .zip
+#
+# Studio is a desktop application (iced): it is built in the release profile
+# without PGO, and only built here, since it cannot start without a display.
+# Its archives carry the release's version, not the rdb_studio crate's.
 #
 # Every binary is built with profile-guided optimisation: an instrumented
 # build runs pgo_train's workload (both protocols, loads, point reads and
@@ -106,30 +112,49 @@ jobs:
             "target/${{ matrix.target }}/release/rasterizeddb_core$ext" \
             "target/${{ matrix.target }}/debug/examples/quickstart$ext"
 
+      # Studio: the release profile, no PGO (its time goes to the GPU and the
+      # network, not to code a training run would cover). Built, not run: it
+      # opens a window at start.
+      - name: Build RasterizedDB Studio (release profile)
+        run: cargo build --locked --release --target ${{ matrix.target }} -p rdb_studio
+
       - name: Package
         id: package
         shell: bash
         run: |
           version="$(cargo pkgid -p rasterizeddb_core | sed 's/.*[#@]//')"
-          name="rasterizeddb-server-$version-${{ matrix.name }}"
-          mkdir -p "dist/$name"
           ext="${{ runner.os == 'Windows' && '.exe' || '' }}"
-          cp "target/${{ matrix.target }}/release/rasterizeddb_core$ext" "dist/$name/rasterizeddb$ext"
-          cp README.md LICENSE-GPL "dist/$name/"
+          # pack <name>: archives dist/<name> as the matrix says, prints the file.
+          pack() {
+            if [ "${{ matrix.archive }}" = zip ]; then
+              pwsh -NoProfile -Command "Compress-Archive -Path '$1' -DestinationPath '$1.zip'" >/dev/null
+              echo "dist/$1.zip"
+            else
+              tar czf "$1.tar.gz" "$1" >/dev/null
+              echo "dist/$1.tar.gz"
+            fi
+          }
+          server="rasterizeddb-server-$version-${{ matrix.name }}"
+          mkdir -p "dist/$server"
+          cp "target/${{ matrix.target }}/release/rasterizeddb_core$ext" "dist/$server/rasterizeddb$ext"
+          cp README.md LICENSE-GPL "dist/$server/"
+          studio="rdb-studio-$version-${{ matrix.name }}"
+          mkdir -p "dist/$studio"
+          cp "target/${{ matrix.target }}/release/rdb_studio$ext" "dist/$studio/rdb-studio$ext"
+          cp rdb_studio/README.md "dist/$studio/README.md"
+          cp LICENSE-GPL "dist/$studio/"
           cd dist
-          if [ "${{ matrix.archive }}" = zip ]; then
-            pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
-            file="$name.zip"
-          else
-            tar czf "$name.tar.gz" "$name"
-            file="$name.tar.gz"
-          fi
-          echo "file=dist/$file" >> "$GITHUB_OUTPUT"
+          {
+            echo "server=$(pack "$server")"
+            echo "studio=$(pack "$studio")"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ steps.package.outputs.file }}
+          path: |
+            ${{ steps.package.outputs.server }}
+            ${{ steps.package.outputs.studio }}
           if-no-files-found: error
 
   release:
@@ -142,14 +167,15 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum rasterizeddb-server-* > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum rasterizeddb-server-* rdb-studio-* > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          name: "Server ${{ github.ref_name }}"
+          name: "RasterizedDB ${{ github.ref_name }}"
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: |
             dist/rasterizeddb-server-*
+            dist/rdb-studio-*
             dist/SHA256SUMS
           body: |
             The RasterizedDB server for Linux and Windows, x86-64 and ARM64.
@@ -162,3 +188,5 @@ jobs:
             | Windows ARM64 | `windows-arm64.zip` | any ARMv8-A |
 
             Built with fat LTO and profile-guided optimisation; the Linux binaries are also optimised with BOLT. Linux binaries need glibc 2.39+. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
+
+            **RasterizedDB Studio** (`rdb-studio-*`), the desktop console for RasterizedDB and PostgreSQL, is in the same four builds: dashboard, tables and schema, data editing, queries, activity, benchmarks, backups, branches, replication, migration, key/value browsing, roles and configuration. Run `rdb-studio` (`rdb-studio.exe` on Windows). It needs a desktop session: on Linux a Wayland or X11 session with a Vulkan or OpenGL driver, glibc 2.39+; the x86-64 builds need an AVX2 CPU like the server. Saved passwords go to the OS credential store (the Secret Service on Linux, Credential Manager on Windows).
