@@ -735,6 +735,10 @@ impl NativeSession {
         if self.multiplexed {
             let mut state = self.new_state();
             let mut answer = Box::pin(self.simple_in(&mut state, query, &run)).await;
+            // The connection's temporary tables outlive the request, as
+            // `run_alone` keeps them; without this one made by a simple
+            // query was gone by the next ("Table not found").
+            self.keep_temp_tables(&state);
             if let Some(t) = state.transaction.take() {
                 state.end_block_settings(&t);
                 self.database.block_ddl_abort(t.id).await;
@@ -760,6 +764,7 @@ impl NativeSession {
         };
         let state = slot.get_or_insert_with(|| self.new_state());
         let answer = Box::pin(self.simple_in(state, query, &run)).await;
+        self.keep_temp_tables(state);
         let open = state.transaction.is_some();
         if !open {
             *slot = None;
