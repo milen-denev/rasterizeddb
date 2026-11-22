@@ -1091,6 +1091,64 @@ async fn a_native_connection_lists_and_creates_the_server_s_databases() {
     );
 }
 
+/// With the server's catalogue, a native connection of a role that is not a
+/// superuser is held to what pgwire holds it to: `CREATE DATABASE` and
+/// `DROP DATABASE` are refused (42501, `pgwire::privileged_statement`),
+/// inside a block as well as outside one, and `SHOW DATABASES` lists what
+/// pgwire's lists for any role, the catalogue's listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_role_without_superuser_cannot_create_or_drop_databases() {
+    let catalog = super::catalog::DatabaseCatalog::open(None, super::DEFAULT_DATABASE_NAME)
+        .await
+        .expect("a catalogue");
+    catalog.create("native_kept").await.expect("a second database");
+    let database = catalog.get(super::DEFAULT_DATABASE_NAME).expect("its default database");
+    let context = NativeContext {
+        database: database.clone(),
+        authentication_required: true,
+        catalog: Some(catalog.clone()),
+    };
+    let reader = std::sync::Arc::new(rastcp::session::Principal::new("reader", false));
+    let session = native_session_for(&context, &reader, false);
+    let ask = |sql: &str| {
+        let context = context.clone();
+        let reader = reader.clone();
+        let session = &session;
+        let sql = sql.to_string();
+        async move {
+            read_simple(
+                &process_native_request(context, reader, Some(session), simple_request(&sql))
+                    .await,
+            )
+        }
+    };
+    let refused = |said: &SimpleSaid| said.errors.iter().any(|(code, _)| code == "42501");
+
+    let said = ask("CREATE DATABASE native_not_made").await;
+    assert!(refused(&said), "{said:?}");
+    assert!(catalog.get("native_not_made").is_none());
+
+    let said = ask("DROP DATABASE native_kept").await;
+    assert!(refused(&said), "{said:?}");
+    assert!(catalog.get("native_kept").is_some());
+
+    // Inside a block, through the session's own path.
+    let said = ask("BEGIN").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    let said = ask("CREATE DATABASE native_not_made").await;
+    assert!(!said.errors.is_empty(), "{said:?}");
+    assert!(catalog.get("native_not_made").is_none());
+    let _ = ask("ROLLBACK").await;
+
+    let said = ask("SHOW DATABASES").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    let (columns, rows, _) = &said.results[0];
+    let at = columns.iter().position(|c| c == "database_name").expect("database_name");
+    let listed: Vec<String> = rows.iter().map(|r| r[at].clone().unwrap_or_default()).collect();
+    let pgwire: Vec<String> = catalog.listing().into_iter().map(|d| d.name).collect();
+    assert_eq!(listed, pgwire);
+}
+
 /// A row of a native answer comes out the same whichever rows come before
 /// it. A first row holding NULL in a NUMERIC, `jsonb`, `bytea` or
 /// `timestamp` column made the retag read the answer as needing nothing, so
