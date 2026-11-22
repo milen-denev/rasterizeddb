@@ -65,7 +65,7 @@ pub async fn execute(statement: BackupStatement) -> Vec<u8> {
 
         BackupStatement::ArchiveWal => match require_service() {
             Err(response) => response,
-            Ok(service) => match service.archive_wal_now().await {
+            Ok(service) => match service.archive_wal_barrier().await {
                 Ok(report) => count(report.compressed_bytes),
                 Err(e) => {
                     error!("BACKUP WAL failed: {e}");

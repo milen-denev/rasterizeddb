@@ -143,8 +143,8 @@ async fn attempts_outcomes_and_the_last_error_are_reported() {
 /// restore from such a flush came back without the rows committed just
 /// before it (`s3_backup_end_to_end`, CI 2026-11-22: 10 rows of 20).
 ///
-/// Mutation: `archive_wal_now` takes any `Ok` for a cut
-/// (`cut_all_logs(None)`): the flush returns while the hold is still on, the
+/// Mutation: `archive_wal_barrier` takes any `Ok` for a cut
+/// (`archive_wal(None)`): the flush returns while the hold is still on, the
 /// insert left in the live log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wal_flush_waits_out_a_declining_checkpoint() {
@@ -166,7 +166,7 @@ async fn a_wal_flush_waits_out_a_declining_checkpoint() {
     let hold = wal.hold_checkpoints();
     let flush = {
         let service = service.clone();
-        tokio::spawn(async move { service.archive_wal_now().await })
+        tokio::spawn(async move { service.archive_wal_barrier().await })
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!flush.is_finished(), "the flush returned while every checkpoint declined");
