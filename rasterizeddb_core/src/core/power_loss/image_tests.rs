@@ -313,6 +313,49 @@ fn announced_directory_operations_without_a_directory_sync_may_be_undone() {
     assert_eq!(img[&rel("t.db")], b"replacement");
 }
 
+/// A file deleted with no announced directory operation (a provider's
+/// `delete`, noted only as `unlink`, which is how an `ALTER` rewrite drops
+/// the table's old files) keeps its inode while the recorder lives, so the
+/// file created next is never taken for it. On ext4 a freed inode goes to
+/// the next create at once: a rewrite's new field file took a discarded
+/// file's number, the image filled it with that file's baseline bytes, and
+/// the schema read back a column no allocation could hold (CI linux-arm64,
+/// 2026-11-22). Only meaningful where inodes are reused (run with `TMPDIR`
+/// on ext4; tmpfs passes either way).
+///
+/// Mutation: drop the baseline pins in `Recorder::start`; on ext4 the new
+/// file has the unlinked one's inode.
+#[cfg(unix)]
+#[test]
+fn a_file_created_after_an_unannounced_unlink_is_never_taken_for_it() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("old.db");
+    std::fs::write(&old, b"old bytes").unwrap();
+    let old_ino = std::fs::metadata(&old).unwrap().ino();
+    let rec = Recorder::start(dir.path());
+
+    drop(sync_audit::note("unlink", &old));
+    std::fs::remove_file(&old).unwrap();
+    let new = dir.path().join("new.db");
+    std::fs::write(&new, b"new").unwrap();
+    assert_ne!(
+        std::fs::metadata(&new).unwrap().ino(),
+        old_ino,
+        "the recorder let an unlinked baseline file's inode go to a new file"
+    );
+
+    let cp = rec.cut_quiescent("after the unlink").unwrap();
+    for seed in [P0, P1].into_iter().chain(3..40) {
+        let img = cp.image(seed);
+        assert_ne!(
+            img.get(&rel("new.db")).map(Vec::as_slice),
+            Some(&b"old bytes"[..]),
+            "seed {seed}: the new file imaged with the unlinked one's bytes"
+        );
+    }
+}
+
 /// `partition::files::sync_dir` notes the directory itself as
 /// `partition_dir`, where `wal::sync_parent_dir` notes a file in it as `dir`:
 /// either makes the directory's earlier operations durable.

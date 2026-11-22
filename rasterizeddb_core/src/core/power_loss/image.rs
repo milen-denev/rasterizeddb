@@ -131,10 +131,17 @@ struct State {
     victims: HashMap<u64, Vec<u8>>,
     /// Inodes some recorded sync touched: never taken whole.
     synced_inodes: HashSet<u64>,
-    /// An open handle on every victim, held while recording: a file
-    /// unlinked or renamed over frees its inode, and ext4 hands that number
-    /// to the next file created, which the maps above would then take for
-    /// the victim (its undone image read the newcomer's bytes). An open
+    /// An open handle on every file whose inode the maps above name (each
+    /// file of the baseline, each a recorded sync touched, each victim),
+    /// held while recording: a file unlinked or renamed over frees its
+    /// inode, and ext4 hands that number to the next file created, which
+    /// the maps would then take for the old one. A victim's undone image
+    /// read the newcomer's bytes; a field file an `ALTER` rewrite created
+    /// took a discarded data file's baseline, and the image's schema held
+    /// records of other bytes: a column whose write order no allocation could
+    /// size, a capacity overflow at open (CI linux-arm64, 2026-11-22).
+    /// Unlinks noted only as `note("unlink")`, some after the fact, are
+    /// never `dir_op` victims, so pinning victims alone missed them. An open
     /// handle keeps the inode allocated. Unix only: on Windows a handle
     /// leaves a deleted name pending, and creating it again fails.
     #[cfg(unix)]
@@ -215,6 +222,12 @@ impl State {
                 .unwrap_or_else(|| e.path.clone());
             match (ino_of(&target), std::fs::read(&target)) {
                 (Some(ino), Ok(bytes)) => {
+                    #[cfg(unix)]
+                    if !self.synced_inodes.contains(&ino)
+                        && let Ok(f) = std::fs::File::open(&target)
+                    {
+                        self.pins.push(f);
+                    }
                     self.synced_inodes.insert(ino);
                     Some((ino, bytes))
                 }
@@ -331,6 +344,8 @@ impl Recorder {
     /// durable, and records from here on.
     pub fn start(dir: &Path) -> StdArc<Recorder> {
         let mut baseline = HashMap::new();
+        #[cfg(unix)]
+        let mut pins = Vec::new();
         for rel in walk(dir) {
             let path = dir.join(&rel);
             // A file gone since the walk was removed by a background thread
@@ -343,6 +358,8 @@ impl Recorder {
             let ino = file_identity(&f).unwrap();
             let Ok(bytes) = std::fs::read(&path) else { continue };
             baseline.insert(ino, bytes);
+            #[cfg(unix)]
+            pins.push(f);
         }
         let _ = crate::core::sync_path::sync_dir(dir);
         let state = StdArc::new(Mutex::new(State {
@@ -354,7 +371,7 @@ impl Recorder {
             victims: HashMap::new(),
             synced_inodes: HashSet::new(),
             #[cfg(unix)]
-            pins: Vec::new(),
+            pins,
         }));
         RECORDERS.lock().push((dir.to_path_buf(), StdArc::downgrade(&state)));
         let watch = sync_audit::watch(dir);
