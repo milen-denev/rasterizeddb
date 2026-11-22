@@ -127,6 +127,13 @@ jobs:
       (github.event_name == 'push' && github.ref == 'refs/heads/feat/secondary-indexes')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
+    env:
+      # Line tables only: with full debug info the compat suite's hundred-odd
+      # test executables ran the runners out of disk (linux-arm64 "No space
+      # left on device" at link, linux-x86_64 lost its runner, the Windows
+      # arm64 runner too) and hit MSVC's PDB size limit (LNK1180, LNK1140).
+      # Backtraces keep file and line.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       fail-fast: false
       matrix:
