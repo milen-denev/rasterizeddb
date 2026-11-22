@@ -690,15 +690,15 @@ async fn closes_racing_writers_readers_and_sweeps_lose_nothing() {
             }
         }));
     }
+    let closed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let closer = {
-        let (t, stop) = (t.clone(), stop.clone());
+        let (t, stop, closed) = (t.clone(), stop.clone(), closed.clone());
         tokio::spawn(async move {
-            let mut closed = 0;
             while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                closed += t.close_idle().await.unwrap();
+                let n = t.close_idle().await.unwrap();
+                closed.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                 tokio::task::yield_now().await;
             }
-            closed
         })
     };
     let reader = {
@@ -728,8 +728,19 @@ async fn closes_racing_writers_readers_and_sweeps_lose_nothing() {
     for w in writers {
         w.await.unwrap();
     }
+    // The closer and the reader go on until the closer has closed enough:
+    // the writers alone could finish first ("the closer closed only 8
+    // partitions" in a loaded full run, then 8 and 3 in one routine once
+    // point reads got cheaper), with every correctness assert green, as the
+    // open/close storm did before 186df372. The reader reopens what the
+    // closer closes. Bounded, so a closer that never closes still fails.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while closed.load(std::sync::atomic::Ordering::Relaxed) <= 8 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     stop.store(true, std::sync::atomic::Ordering::Release);
-    let closed = closer.await.unwrap();
+    closer.await.unwrap();
+    let closed = closed.load(std::sync::atomic::Ordering::Relaxed);
     let reads = reader.await.unwrap();
     sweeper.await.unwrap();
     assert!(closed > 8, "the closer closed only {closed} partitions");
