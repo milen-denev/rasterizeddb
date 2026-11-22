@@ -1006,6 +1006,91 @@ async fn a_native_connection_counts_among_its_database_s_sessions() {
     assert_eq!(sessions(), 0);
 }
 
+/// A native connection sees the server's catalogue, as a pgwire one does:
+/// `SHOW DATABASES` lists every database with this connection's marked
+/// current, and `CREATE DATABASE` / `DROP DATABASE` act on the server's
+/// catalogue. Under the one-database view a native connection used to get,
+/// the listing held only its own database, and `CREATE DATABASE` answered
+/// success having made an in-memory database inside the view that nothing
+/// else could see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_connection_lists_and_creates_the_server_s_databases() {
+    let catalog = super::catalog::DatabaseCatalog::open(None, super::DEFAULT_DATABASE_NAME)
+        .await
+        .expect("a catalogue");
+    catalog.create("native_other").await.expect("a second database");
+    let database = catalog.get(super::DEFAULT_DATABASE_NAME).expect("its default database");
+    let context = NativeContext {
+        database: database.clone(),
+        authentication_required: false,
+        catalog: Some(catalog.clone()),
+    };
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let session = native_session_for(&context, &principal, false);
+
+    let listed = |said: &SimpleSaid| -> Vec<(String, String)> {
+        let (columns, rows, _) = &said.results[0];
+        let at = |name: &str| columns.iter().position(|c| c == name).expect(name);
+        rows.iter()
+            .map(|r| {
+                (
+                    r[at("database_name")].clone().unwrap_or_default(),
+                    r[at("is_current")].clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+
+    let said = simple(&context, Some(&session), "SHOW DATABASES").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    let mut expected = vec![
+        (super::DEFAULT_DATABASE_NAME.to_string(), "t".to_string()),
+        ("native_other".to_string(), "f".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(listed(&said), expected, "{said:?}");
+
+    // Created in the server's catalogue, where a pgwire connection or the
+    // next native one finds it.
+    let said = simple(&context, Some(&session), "CREATE DATABASE native_made").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert!(catalog.get("native_made").is_some(), "created in the server's catalogue");
+    let said = simple(&context, Some(&session), "SHOW DATABASES").await;
+    assert!(
+        listed(&said).iter().any(|(name, _)| name == "native_made"),
+        "{said:?}"
+    );
+
+    let said = simple(&context, Some(&session), "DROP DATABASE native_made").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert!(catalog.get("native_made").is_none(), "dropped from the server's catalogue");
+
+    // The connection's own database is not dropped from under it.
+    let said = simple(
+        &context,
+        Some(&session),
+        &format!("DROP DATABASE {}", super::DEFAULT_DATABASE_NAME),
+    )
+    .await;
+    assert!(!said.errors.is_empty(), "{said:?}");
+    assert!(catalog.get(super::DEFAULT_DATABASE_NAME).is_some());
+
+    // A listener serving a database of its own has no catalogue to create
+    // one in: refused, not answered with a database only it would hold.
+    let alone = NativeContext { catalog: None, ..context.clone() };
+    let lone = native_session_for(&alone, &principal, false);
+    let said = simple(&alone, Some(&lone), "CREATE DATABASE native_lost").await;
+    assert!(!said.errors.is_empty(), "{said:?}");
+    assert!(catalog.get("native_lost").is_none());
+    let said = simple(&alone, Some(&lone), "SHOW DATABASES").await;
+    assert!(said.errors.is_empty(), "{:?}", said.errors);
+    assert_eq!(
+        listed(&said),
+        vec![(super::DEFAULT_DATABASE_NAME.to_string(), "t".to_string())],
+        "{said:?}"
+    );
+}
+
 /// A row of a native answer comes out the same whichever rows come before
 /// it. A first row holding NULL in a NUMERIC, `jsonb`, `bytea` or
 /// `timestamp` column made the retag read the answer as needing nothing, so

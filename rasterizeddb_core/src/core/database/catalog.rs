@@ -108,6 +108,11 @@ pub struct DatabaseCatalog {
     /// The database a connection that names none is given, and the one that
     /// lives at the root rather than in a subdirectory.
     default_name: String,
+    /// A catalogue of one database that is served through another catalogue
+    /// ([`DatabaseCatalog::single_unmanaged`]): `CREATE DATABASE` is refused
+    /// rather than answered with an in-memory database that only this
+    /// catalogue would ever hold.
+    fixed: bool,
     /// Each branch's merge base, once opened: `(generation, database)`.
     #[cfg(feature = "db_branching")]
     bases: DashMap<String, (u64, Arc<Database>), ahash::RandomState>,
@@ -184,6 +189,7 @@ impl DatabaseCatalog {
             databases,
             root: root.map(str::to_string),
             default_name: default_name.to_string(),
+            fixed: false,
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
         });
@@ -223,6 +229,7 @@ impl DatabaseCatalog {
             databases,
             root: None,
             default_name: name,
+            fixed: false,
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
         })
@@ -242,34 +249,10 @@ impl DatabaseCatalog {
             databases: StdArc::new(databases),
             root: None,
             default_name: name,
+            fixed: true,
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
         })
-    }
-
-    /// [`DatabaseCatalog::single_unmanaged`] for the named database of this
-    /// catalogue, sharing its session count: what a native connection's
-    /// session resolves against, so `SHOW DATABASES` over native counts the
-    /// connections attached here, every protocol's. `None` for a name this
-    /// catalogue does not hold.
-    pub(crate) fn view_of(&self, name: &str) -> Option<Arc<Self>> {
-        let entry = self.databases.get(name)?;
-        let databases = DashMap::with_hasher(ahash::RandomState::new());
-        databases.insert(
-            name.to_string(),
-            Entry {
-                database: entry.database.clone(),
-                loading: entry.loading.clone(),
-                sessions: entry.sessions.clone(),
-            },
-        );
-        Some(Arc::new(Self {
-            databases: StdArc::new(databases),
-            root: None,
-            default_name: name.to_string(),
-            #[cfg(feature = "db_branching")]
-            bases: DashMap::with_hasher(ahash::RandomState::new()),
-        }))
     }
 
     /// What `SHOW DATABASES` reports, ordered by name.
@@ -356,6 +339,12 @@ impl DatabaseCatalog {
     pub async fn create(&self, name: &str) -> Result<Arc<Database>, String> {
         validate_name(name)?;
 
+        if self.fixed {
+            return Err(format!(
+                "could not create database \"{}\": this listener serves the one database \"{}\"",
+                name, self.default_name
+            ));
+        }
         if self.databases.contains_key(name) {
             return Err(format!("database \"{}\" already exists", name));
         }
