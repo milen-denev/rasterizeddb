@@ -14,7 +14,8 @@ name: Release - server and Studio executables
 #
 # Studio is a desktop application (iced): it is built in the release profile
 # without PGO, and only built here, since it cannot start without a display.
-# Its archives carry the release's version, not the rdb_studio crate's.
+# Its archives carry the release's version; rdb_studio is versioned with the
+# server (1.0.0 at the first release).
 #
 # Every binary is built with profile-guided optimisation: an instrumented
 # build runs pgo_train's workload (both protocols, loads, point reads and

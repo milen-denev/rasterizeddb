@@ -1,6 +1,6 @@
 [package]
 name = "rdb_studio"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "A database console for RasterizedDB and PostgreSQL"
 license = "GPL-3.0"
