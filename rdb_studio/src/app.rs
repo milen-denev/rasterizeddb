@@ -760,6 +760,9 @@ pub enum Message {
     SelectTab(Tab),
     SelectTable(String),
     SelectDatabase(String),
+    /// Moves the tab strip sideways by this many pixels: its `<` and `>`
+    /// buttons, and a wheel turned over it.
+    ScrollTabs(f32),
     TableFilter(String),
     RefreshAll,
 
@@ -1732,6 +1735,10 @@ impl Studio {
                 self.form.database = name;
                 self.update(Message::Connect)
             }
+            Message::ScrollTabs(by) => iced::widget::operation::scroll_by(
+                crate::views::tab_strip_id(),
+                iced::widget::operation::AbsoluteOffset { x: by, y: 0.0 },
+            ),
             Message::TableFilter(v) => { self.table_filter = v; Task::none() }
             Message::RefreshAll => self.reload_everything(),
 
