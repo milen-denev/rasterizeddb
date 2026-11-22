@@ -26,7 +26,7 @@ fn dir_bytes(p: &Path) -> u64 {
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
         for e in rd.flatten() {
-            let Ok(md) = e.metadata() else { continue };
+            let Ok(md) = crate::core::sync_path::entry_metadata(&e) else { continue };
             total += if md.is_dir() { dir_bytes(&e.path()) } else { md.len() };
         }
     }

@@ -1147,8 +1147,12 @@ impl IdReservation {
         };
         #[cfg(test)]
         if reservation_test_hooks::fails(path) {
-            // What a full disk answers.
+            // What a full disk answers: ENOSPC on Unix. Built from the kind on
+            // Windows, where raw error 28 is ERROR_OUT_OF_PAPER.
+            #[cfg(unix)]
             return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+            #[cfg(not(unix))]
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "injected: the disk is full"));
         }
         let bytes = encode_reservation(mark);
         if let Some(wal) = log {
@@ -1181,7 +1185,7 @@ impl IdReservation {
         {
             let mut file = File::create(&temp)?;
             file.write_all(&bytes)?;
-            crate::core::sync_audit::note("mvcc.id_reservation", path);
+            let _synced = crate::core::sync_audit::note("mvcc.id_reservation", path);
             file.sync_all()?;
         }
         std::fs::rename(&temp, path)?;
@@ -1748,9 +1752,7 @@ fn write_sidecar(path: &Path, file: &mut File, settled: &Settled) -> io::Result<
     }
     std::fs::rename(&temp, &target)?;
     if let Some(dir) = target.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_dir(dir);
     }
     Ok(())
 }
@@ -2887,7 +2889,15 @@ mod tests {
 
         let started = std::time::Instant::now();
         let mut peak = 0usize;
-        while started.elapsed() < std::time::Duration::from_secs(secs) && !full.load(Ordering::Relaxed) {
+        // `secs`, or longer until the floors asserted below are reached:
+        // slower machines (a Windows runner) took 72741 ids in the time, and
+        // 92552 in six times it under a loaded suite.
+        let floors_met = || m.next_id() > 100_000 && checked.load(Ordering::Relaxed) > 10_000;
+        let deadline = std::time::Duration::from_secs(secs * 20);
+        while (started.elapsed() < std::time::Duration::from_secs(secs) || !floors_met())
+            && started.elapsed() < deadline
+            && !full.load(Ordering::Relaxed)
+        {
             std::thread::sleep(std::time::Duration::from_millis(50));
             peak = peak.max(m.status().memory_bytes());
         }

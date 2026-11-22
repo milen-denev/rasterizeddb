@@ -17,6 +17,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Lets a race run for `window`, then on until `floors` holds — the counts
+/// the test asserts it reached — for at most five windows more. A Windows
+/// runner, whose syncs are slower, made 8 or 9 relocating updates in the
+/// window where 10 are asserted.
+async fn race_for(window: Duration, floors: impl Fn() -> bool) {
+    tokio::time::sleep(window).await;
+    let deadline = std::time::Instant::now() + window * 5;
+    while !floors() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -347,7 +359,7 @@ async fn a_key_whose_row_is_being_relocated_is_never_inserted_twice() {
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    race_for(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8)), || relocations.load(Ordering::Relaxed) >= 10 && attempts.load(Ordering::Relaxed) >= 100).await;
     stop.store(true, Ordering::Relaxed);
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
@@ -443,7 +455,7 @@ async fn a_composite_key_whose_row_is_being_relocated_is_never_inserted_twice() 
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    race_for(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8)), || relocations.load(Ordering::Relaxed) >= 10 && refused.load(Ordering::Relaxed) >= 100).await;
     stop.store(true, Ordering::Relaxed);
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
@@ -550,7 +562,7 @@ async fn an_update_assigning_keys_and_inserts_of_them_never_store_one_twice() {
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    race_for(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8)), || shifts.load(Ordering::Relaxed) >= 100 && admitted.load(Ordering::Relaxed) >= 100).await;
     stop.store(true, Ordering::Relaxed);
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
@@ -682,7 +694,7 @@ async fn a_live_email_whose_row_is_being_relocated_is_never_inserted_twice() {
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    race_for(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8)), || relocations.load(Ordering::Relaxed) >= 10 && refused.load(Ordering::Relaxed) >= 100).await;
     stop.store(true, Ordering::Relaxed);
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(60), t).await;
@@ -792,7 +804,7 @@ async fn an_undelete_and_an_insert_of_its_email_never_both_land() {
             }
         }));
     }
-    tokio::time::sleep(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8))).await;
+    race_for(Duration::from_secs(env_u64("FAIR_DUP_SECS", 8)), || toggles.load(Ordering::Relaxed) >= 100 && admitted.load(Ordering::Relaxed) >= 100).await;
     stop.store(true, Ordering::Relaxed);
     for t in tasks {
         let _ = tokio::time::timeout(Duration::from_secs(60), t).await;

@@ -154,7 +154,7 @@ pub fn save(key: &str, value: &str) -> Result<(), String> {
         f.sync_all()?;
         std::fs::rename(&tmp, &path)?;
         if let Some(dir) = path.parent() {
-            std::fs::File::open(dir)?.sync_all()?;
+            crate::core::sync_path::sync_dir(dir)?;
         }
         Ok(())
     };

@@ -795,7 +795,7 @@ impl RunWriter {
         std::fs::rename(&self.tmp, &path)?;
         if durable {
             if let Some(dir) = path.parent() {
-                File::open(dir)?.sync_all()?;
+                crate::core::sync_path::sync_dir(dir)?;
             }
         }
         let digest = std::mem::take(&mut self.digest).finalize();

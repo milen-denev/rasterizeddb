@@ -2601,7 +2601,7 @@ fn wall_cap(ops: usize) -> Duration {
 fn dir_bytes(dir: &std::path::Path) -> u64 {
     let mut total = 0;
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let m = match e.metadata() {
+        let m = match std::fs::metadata(e.path()) {
             Ok(m) => m,
             Err(_) => continue,
         };

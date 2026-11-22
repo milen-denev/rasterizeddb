@@ -140,7 +140,30 @@ struct LegacyDb {
 
 impl Drop for LegacyDb {
     fn drop(&mut self) {
+        let _ = rasterizeddb_core::core::wal::remove_for(&self.root_text());
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Takes the log of the database at `root` out of the process-wide registry
+/// and waits until nothing else holds it, so the next server opens a log of
+/// its own over a file no stopped server still writes.
+///
+/// A stopped server's log outlives it: the registry keeps it, and so does a
+/// checkpoint a write started on a blocking thread, which the server's
+/// runtime does not wait for. Reopened beside it, the new log appended to
+/// the file while the old one's checkpoint cut it, and the next in-place
+/// write read its payload back from past the end ("failed to fill whole
+/// buffer"), poisoning the log. Seen on the Windows runners, where a
+/// checkpoint's flushes are slow enough to outlast the stop.
+async fn release_log(root: &str) {
+    let Some(log) = rasterizeddb_core::core::wal::remove_for(root) else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::sync::Arc::strong_count(&log) > 1 {
+        assert!(std::time::Instant::now() < deadline, "the stopped server's log is still held");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
@@ -194,9 +217,18 @@ impl LegacyDb {
                 }
             }
             // Into the files, so the log does not replay the records over the
-            // edit below.
-            rasterizeddb_core::core::wal::checkpoint_all().expect("checkpoint");
+            // edit below. Until this database's log says it is done: a
+            // checkpoint declines while writes are pending (`Ok(false)`),
+            // which `checkpoint_all` does not report, and on a Windows runner
+            // the replay then put the UINT4 records back over the edit.
+            let wal = rasterizeddb_core::core::wal::wal_for(&db.root_text()).expect("the database's log");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !wal.checkpoint().expect("checkpoint") {
+                assert!(std::time::Instant::now() < deadline, "the log never checkpointed");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         }
+        release_log(&db.root_text()).await;
         for table in tables {
             // The field records of the legacy columns, retyped from UINT4 (8)
             // to the legacy CHAR (13): the record an older build wrote for
@@ -236,6 +268,7 @@ impl LegacyDb {
     }
 
     async fn open(&self) -> TestServer {
+        release_log(&self.root_text()).await;
         TestServer::start_file_backed(&self.root_text()).await.expect("open")
     }
 }

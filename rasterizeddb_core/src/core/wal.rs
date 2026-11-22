@@ -191,7 +191,7 @@ fn write_mark(path: &Path, partial: &str, audit: &'static str, value: u64) -> io
     {
         let mut file = File::create(&temp)?;
         file.write_all(value.to_string().as_bytes())?;
-        crate::core::sync_audit::note(audit, path);
+        let _synced = crate::core::sync_audit::note(audit, path);
         file.sync_all()?;
     }
     std::fs::rename(&temp, path)?;
@@ -324,18 +324,12 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
-    // Opening a directory read-only and fsyncing it is the portable-on-Unix way
-    // to flush its entries. On Windows there is no directory handle to sync and
-    // file creation is already ordered, so this is a no-op there.
-    #[cfg(unix)]
-    {
-        let dir = File::open(parent)?;
-        crate::core::sync_audit::note("dir", path);
-        dir.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = parent;
+    // Noted only once there is a handle to flush through: where the volume
+    // cannot flush a directory (see `sync_path`), nothing is flushed, and the
+    // power-loss harness must not take the entries as durable.
+    if let Some(dir) = crate::core::sync_path::open_dir(parent)? {
+        let _synced = crate::core::sync_audit::note("dir", path);
+        crate::core::sync_path::flush_dir(&dir)?;
     }
     Ok(())
 }
@@ -733,10 +727,11 @@ pub(crate) fn read_records(path: &Path) -> Vec<u8> {
 /// What [`Wal::reserve_locked`] writes from.
 static ZEROS: [u8; 64 * 1024] = [0u8; 64 * 1024];
 
-/// Writes `len` zeros at `at`, leaving the file's cursor where it was.
-#[cfg(unix)]
+/// Writes `len` zeros at `at`. On Unix the file's cursor stays where it was;
+/// Windows' positional write moves it, so `append_locked` seeks back to the
+/// append point there.
 fn write_zeros_at(file: &File, mut at: u64, mut len: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
+    use crate::core::pos_io::FileExt;
     while len > 0 {
         let n = len.min(ZEROS.len() as u64) as usize;
         file.write_all_at(&ZEROS[..n], at)?;
@@ -1573,7 +1568,7 @@ impl Wal {
         // cut the log at the file's length would keep every record written
         // after it. Read before the sync is issued, so it never claims more
         // than the sync covers.
-        crate::core::sync_audit::note_extent("wal.log", &self.path, self.write_pos.load(Ordering::Relaxed));
+        let _synced = crate::core::sync_audit::note_extent("wal.log", &self.path, self.write_pos.load(Ordering::Relaxed));
         #[cfg(test)]
         let synced = match test_hooks::FAIL_LOG_SYNC.with(|f| f.take()) {
             Some(errno) => Err(io::Error::from_raw_os_error(errno)),
@@ -1703,6 +1698,10 @@ impl Wal {
         let at = self.write_pos.load(Ordering::Relaxed);
         let framed: u64 = bufs.iter().map(|b| b.len() as u64).sum();
         self.reserve_locked(file, at, framed);
+        // The padding's positional write moved the cursor the record is
+        // written through (Windows only; see `write_zeros_at`).
+        #[cfg(not(unix))]
+        file.seek(SeekFrom::Start(at))?;
         #[cfg(test)]
         let written = match test_hooks::SHORT_WAL_WRITE.with(|h| h.take()) {
             Some(keep) => {
@@ -1761,9 +1760,7 @@ impl Wal {
     /// tries again until the log is next discarded. A record of a chunk or
     /// more is not padded for: writing it twice would cost more than the
     /// journal commit it saves.
-    #[allow(unused_variables)]
     fn reserve_locked(&self, file: &File, at: u64, need: u64) {
-        #[cfg(unix)]
         {
             let chunk = self.prealloc.load(Ordering::Relaxed);
             let allocated = self.allocated.load(Ordering::Relaxed);
@@ -2230,7 +2227,7 @@ impl Wal {
         let synced = (|| -> io::Result<()> {
             Self::injected("truncate_seek")?;
             file.seek(SeekFrom::Start(0))?;
-            crate::core::sync_audit::note("wal.truncate", &self.path);
+            let _synced = crate::core::sync_audit::note("wal.truncate", &self.path);
             Self::injected("truncate_sync")?;
             file.sync_all()
         })();
@@ -2359,7 +2356,7 @@ impl Wal {
         if staged.metadata()?.len() > upto {
             staged.set_len(upto)?;
         }
-        crate::core::sync_audit::note("wal.stage_segment", &final_path);
+        let _synced = crate::core::sync_audit::note("wal.stage_segment", &final_path);
         staged.sync_data()?;
         drop(staged);
         std::fs::rename(&partial, &final_path)?;
@@ -2517,14 +2514,14 @@ impl Wal {
                     {
                         let name = path.file_name().unwrap_or_default().to_string_lossy();
                         floors.push((
-                            crate::core::torn_tail::FileIdentity::of(&meta),
+                            crate::core::torn_tail::FileIdentity::of(&path, &meta),
                             name.into_owned(),
                             kind.whole(meta.len()),
                         ));
                     }
                     #[cfg(test)]
                     test_hooks::CHECKPOINT_SYNCS.with(|n| n.set(n.get() + 1));
-                    crate::core::sync_audit::note("wal.checkpoint.data_file", &path);
+                    let _synced = crate::core::sync_audit::note("wal.checkpoint.data_file", &path);
                     // A failed flush is not something the next checkpoint can
                     // retry. On Linux the kernel reports the writeback error
                     // once and may drop the dirty pages with it, so a second
@@ -2699,7 +2696,7 @@ impl Wal {
                     self.path.display()
                 )));
             }
-            crate::core::sync_audit::note("wal.keep_tail", &self.path);
+            let _synced = crate::core::sync_audit::note("wal.keep_tail", &self.path);
             target.sync_data()?;
         }
         #[cfg(test)]
@@ -2987,7 +2984,7 @@ impl Wal {
 
         // Recovery is only complete once what it wrote is itself durable.
         for target in open_files.values_mut().flatten() {
-            crate::core::sync_audit::note_file("wal.recover.data_file", target);
+            let _synced = crate::core::sync_audit::note_file("wal.recover.data_file", target);
             target.sync_data()?;
         }
 
@@ -5195,7 +5192,7 @@ mod tests {
         }
         // Everything clean on disk before timing.
         for i in 0..2_000 {
-            File::open(dir.path().join(format!("t{i}.db"))).unwrap().sync_all().unwrap();
+            crate::core::sync_path::sync_file(&dir.path().join(format!("t{i}.db"))).unwrap();
         }
         for round in 0..3 {
             // What every checkpoint used to do first: sync each registered file.

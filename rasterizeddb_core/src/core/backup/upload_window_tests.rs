@@ -109,7 +109,7 @@ fn nonempty_files_of(dir: &Path, table: &str) -> Vec<String> {
         .filter_map(|e| {
             let name = e.file_name().to_str()?.to_string();
             let stem = name.split(['_', '.']).next()?.to_string();
-            (stem == table && e.metadata().ok()?.len() > 0).then_some(name)
+            (stem == table && crate::core::sync_path::entry_metadata(&e).ok()?.len() > 0).then_some(name)
         })
         .collect();
     found.sort();
@@ -246,7 +246,7 @@ fn nonempty_files_of_uid(dir: &Path, uid: u64) -> Vec<String> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_str()?.to_string();
-            (name.starts_with(&prefix) && e.metadata().ok()?.len() > 0).then_some(name)
+            (name.starts_with(&prefix) && crate::core::sync_path::entry_metadata(&e).ok()?.len() > 0).then_some(name)
         })
         .collect();
     found.sort();

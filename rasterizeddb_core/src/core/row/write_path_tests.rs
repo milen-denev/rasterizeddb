@@ -4401,6 +4401,24 @@ async fn forgetting_under_concurrent_writes_and_reads_matches_a_reference_model(
     }
 
     tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    // And on until something was forgotten, the floor asserted below: every
+    // write syncs, and a Windows runner's 210 ids in the time forgot none.
+    // The status log settles, and so forgets, in whole blocks of 4096 ids; a
+    // runner whose syncs are slow reached 2155 in eighteen seconds. Read-only
+    // transactions, run alongside the writers, carry the ids past a block
+    // when the writes alone do not.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs * 6);
+    while (forgets.load(Ordering::Relaxed) == 0 || manager.status().forgotten_below() == 0)
+        && std::time::Instant::now() < deadline
+    {
+        if manager.next_id() < 3 * 4096 {
+            for _ in 0..512 {
+                let r = manager.begin();
+                manager.commit(r);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     stop.store(true, Ordering::Relaxed);
     for task in tasks {
         task.await.unwrap();
@@ -4931,6 +4949,10 @@ async fn a_copying_read_never_returns_half_an_in_place_write() {
 /// Mutation: `decode_record` ignoring the count fails the assert.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_decoded_from_the_mapping_is_never_half_an_in_place_write() {
+    // Mapped reads only: Windows maps no table file (`MAPS_FILES`).
+    if !crate::core::storage_providers::file_sync::MAPS_FILES {
+        return;
+    }
     use crate::core::row::row_pointer::RowPointerIterator;
     const T: u64 = 0x000A_BCDE;
     let dir = tempfile::tempdir().unwrap();
@@ -5043,6 +5065,10 @@ async fn an_in_place_write_without_a_log_is_one_step_to_readers() {
 /// Mutation: either vectored path not checking the count fails its assert.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vectored_read_never_returns_half_an_in_place_write() {
+    // Mapped reads only: Windows maps no table file (`MAPS_FILES`).
+    if !crate::core::storage_providers::file_sync::MAPS_FILES {
+        return;
+    }
     const T: u64 = 0x000A_BCDE;
     let dir = tempfile::tempdir().unwrap();
     init();

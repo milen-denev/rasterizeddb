@@ -167,11 +167,11 @@ impl PendingErases {
             }
             let temp = self.path.with_extension("pending.tmp");
             std::fs::write(&temp, text.as_bytes())?;
-            std::fs::File::open(&temp)?.sync_all()?;
+            crate::core::sync_path::sync_file(&temp)?;
             std::fs::rename(&temp, &self.path)?;
         }
         if let Some(dir) = self.path.parent() {
-            std::fs::File::open(dir)?.sync_all()?;
+            crate::core::sync_path::sync_dir(dir)?;
         }
         Ok(())
     }

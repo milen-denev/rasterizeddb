@@ -59,7 +59,9 @@ fn start() -> Servers {
                 let catalog: Arc<DatabaseCatalog> = DatabaseCatalog::open(None, "postgres").await.unwrap();
                 let config = MsConfig {
                     tcp: Some(("127.0.0.1".into(), 0)),
-                    socket: Some(MsSocket { path: socket_path, mode: 0o600, group: None, auth: None }),
+                    // No unix socket where the platform has none: `bind` refuses one
+                    // there, and only `tiberius_socket_and_refusals` (unix only) uses it.
+                    socket: cfg!(unix).then(|| MsSocket { path: socket_path, mode: 0o600, group: None, auth: None }),
                     auth: MsAuth::Password,
                     tls: MsTls::Prefer,
                     cert_path: None,

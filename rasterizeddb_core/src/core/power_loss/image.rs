@@ -344,9 +344,7 @@ impl Recorder {
             let Ok(bytes) = std::fs::read(&path) else { continue };
             baseline.insert(ino, bytes);
         }
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_dir(dir);
         let state = StdArc::new(Mutex::new(State {
             dir: dir.to_path_buf(),
             baseline,

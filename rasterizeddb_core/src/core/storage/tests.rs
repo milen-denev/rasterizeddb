@@ -579,7 +579,8 @@ fn aliases_follow_a_disk_through_every_restore() {
     repoint_restored_pool(&target, &target, Some("/r1"), &[]).unwrap();
     let text = std::fs::read_to_string(target.join(POOL_FILE)).unwrap();
     let root = normalize(&target.to_string_lossy());
-    let moved = normalize(&format!("{root}/pool-location-1"));
+    // Joined as the pool joins it: with a backslash on Windows.
+    let moved = normalize(&Path::new(&root).join("pool-location-1").to_string_lossy());
     assert!(text.contains(&format!("alias\t/mnt/fast\t{moved}\n")), "{text}");
     assert!(text.contains(&format!("alias\t/r1/pool-location-1\t{moved}\n")), "{text}");
     assert_eq!(text.matches("alias\t").count(), 2, "{text}");
@@ -634,7 +635,8 @@ fn a_created_databases_pool_file_follows_the_restore_too() {
 
     assert!(dropped.is_empty(), "{dropped:?}");
     let text = std::fs::read_to_string(staging.join(POOL_FILE)).unwrap();
-    assert!(text.contains("table\t/restored/shop\tcarts\n"), "{text}");
+    let shop = Path::new("/restored").join("shop");
+    assert!(text.contains(&format!("table\t{}\tcarts\n", shop.display())), "{text}");
     assert!(!text.contains("/srv/live"), "{text}");
 }
 

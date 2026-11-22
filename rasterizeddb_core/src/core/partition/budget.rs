@@ -427,7 +427,30 @@ fn count_now() -> u64 {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    open_descriptors()
+}
+
+#[cfg(not(windows))]
+fn open_descriptors() -> u64 {
     std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count() as u64)
+}
+
+/// Windows has no descriptor table to list: the process's handle count,
+/// which every open file adds one to, and every other handle too (threads,
+/// events, the runtime's). Windows has no per-process descriptor limit, so
+/// the budget does not derive from it there (`derived_limit` is `MAX_OPEN`);
+/// it is the figure the statistics and the recount report.
+#[cfg(windows)]
+fn open_descriptors() -> u64 {
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn GetProcessHandleCount(process: *mut std::ffi::c_void, count: *mut u32) -> i32;
+    }
+    let mut count = 0u32;
+    // SAFETY: the pseudo-handle of this process needs no closing, and the
+    // call writes one u32.
+    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    if ok != 0 { count as u64 } else { 0 }
 }
 
 /// Test-only: a listing waits while this is set, so a test can cancel a

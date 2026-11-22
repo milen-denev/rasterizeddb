@@ -170,9 +170,7 @@ pub fn save(handle: &KvCacheHandle) -> Result<usize, KvError> {
     if let Some(dir) = path.parent() {
         // The rename is what makes the new file the snapshot; a directory
         // that has not been synced can forget it happened.
-        if let Ok(dir) = File::open(dir) {
-            let _ = dir.sync_all();
-        }
+        let _ = crate::core::sync_path::sync_dir(dir);
     }
     for (store, version) in versions {
         store.saved_version.store(version, Ordering::Relaxed);

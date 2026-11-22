@@ -246,7 +246,7 @@ impl LocalDirStore {
                 Ok(t) if t.is_file() => {
                     if let Ok(rel) = path.strip_prefix(base) {
                         let key = rel.to_string_lossy().replace('\\', "/");
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        let size = crate::core::sync_path::entry_metadata(&entry).map(|m| m.len()).unwrap_or(0);
                         out.push(ObjectInfo { key, size });
                     }
                 }

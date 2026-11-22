@@ -190,22 +190,22 @@ fn floors_round_trip_and_a_damaged_file_is_no_floors() {
     std::fs::write(&file, vec![0; 37 * 4]).unwrap();
     let meta = std::fs::metadata(&file).unwrap();
     let mut floors = Floors::default();
-    assert!(floors.set(FileIdentity::of(&meta), "t pointers with spaces.db", 37 * 4));
-    assert!(!floors.set(FileIdentity::of(&meta), "t pointers with spaces.db", 37 * 4));
+    assert!(floors.set(FileIdentity::of(&file, &meta), "t pointers with spaces.db", 37 * 4));
+    assert!(!floors.set(FileIdentity::of(&file, &meta), "t pointers with spaces.db", 37 * 4));
     floors.store(&at).unwrap();
     let back = Floors::load(&at);
     assert_eq!(back, floors);
-    assert_eq!(back.floor_of(&meta), 37 * 4);
+    assert_eq!(back.floor_of(&file, &meta), 37 * 4);
     // Lowered, never raised by `lower`.
     let mut lowered = back.clone();
-    assert!(!lowered.lower(FileIdentity::of(&meta), 37 * 9));
-    assert!(lowered.lower(FileIdentity::of(&meta), 37));
-    assert_eq!(lowered.floor_of(&meta), 37);
+    assert!(!lowered.lower(FileIdentity::of(&file, &meta), 37 * 9));
+    assert!(lowered.lower(FileIdentity::of(&file, &meta), 37));
+    assert_eq!(lowered.floor_of(&file, &meta), 37);
     // Reconcile clamps to what the file holds and forgets what is gone.
     std::fs::write(&file, vec![0; 37 * 2 + 5]).unwrap();
     let mut clamped = back.clone();
     assert!(clamped.reconcile(dir.path()));
-    assert_eq!(clamped.floor_of(&std::fs::metadata(&file).unwrap()), 37 * 2);
+    assert_eq!(clamped.floor_of(&file, &std::fs::metadata(&file).unwrap()), 37 * 2);
     std::fs::remove_file(&file).unwrap();
     assert!(clamped.reconcile(dir.path()));
     assert!(clamped.is_empty());
@@ -544,7 +544,7 @@ async fn a_torn_tail_below_the_durable_floor_refuses_to_open() {
     let file = dir.join("t_pointers.db");
     let stride = ROW_POINTER_RECORD_LEN as u64;
     assert_eq!(len(&file), 10 * stride);
-    assert_eq!(floors.floor_of(&std::fs::metadata(&file).unwrap()), 10 * stride, "the checkpoint recorded no floor");
+    assert_eq!(floors.floor_of(&file, &std::fs::metadata(&file).unwrap()), 10 * stride, "the checkpoint recorded no floor");
 
     // In place, so it is still the file the floor was recorded for.
     let original = std::fs::read(&file).unwrap();
@@ -657,7 +657,7 @@ async fn a_shrink_in_place_lowers_the_floor_first() {
     let file = dir.join("t_pointers.db");
     let floor = |db: &Arc<Database>| {
         let _ = db;
-        crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap())
+        crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&file, &std::fs::metadata(&file).unwrap())
     };
     assert_eq!(floor(&db), 10 * stride);
     let io = db.table_for_tests("t").unwrap().io_pointers().unwrap().clone();
@@ -665,7 +665,7 @@ async fn a_shrink_in_place_lowers_the_floor_first() {
     assert_eq!(floor(&db), 4 * stride, "the shrink left the floor above the file");
     // And on disk, where the next open reads it.
     let stored = Floors::load(&Floors::path_for(&dir.join("rasterized.wal")));
-    assert_eq!(stored.floor_of(&std::fs::metadata(&file).unwrap()), 4 * stride);
+    assert_eq!(stored.floor_of(&file, &std::fs::metadata(&file).unwrap()), 4 * stride);
     close(&dir, db);
     // A torn tail after the shrink opens.
     let mut f = File::options().append(true).open(&file).unwrap();
@@ -688,7 +688,7 @@ fn partition_pointer_files(dir: &Path) -> Vec<(String, u64)> {
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
             (name.starts_with(crate::core::partition::files::PREFIX) && name.ends_with("_pointers.db"))
-                .then(|| (name, e.metadata().unwrap().len()))
+                .then(|| (name, crate::core::sync_path::entry_metadata(&e).unwrap().len()))
         })
         .collect();
     out.sort();
@@ -888,7 +888,7 @@ async fn a_partitions_pointers_get_a_durable_floor() {
     let (name, whole) = files.iter().max_by_key(|(_, l)| *l).cloned().unwrap();
     assert!(whole >= 2 * stride, "{files:?}");
     let file = dir.join(&name);
-    let floor = crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap());
+    let floor = crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&file, &std::fs::metadata(&file).unwrap());
     assert_eq!(floor, whole, "{name}: the checkpoint recorded no floor");
     close(&dir, db);
     // Lose a synced record and tear the one before it: below the floor.
@@ -936,7 +936,7 @@ async fn a_partitions_shrink_in_place_lowers_its_floor() {
     let whole = len(&file);
     assert!(whole >= 2 * stride, "{}: {whole} bytes", file.display());
     let floor = || {
-        crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&std::fs::metadata(&file).unwrap())
+        crate::core::wal::wal_for(&path_str(&dir)).unwrap().floors().floor_of(&file, &std::fs::metadata(&file).unwrap())
     };
     assert_eq!(floor(), whole, "the checkpoint recorded no floor for the partition");
     let io = part.io_pointers().unwrap().clone();
