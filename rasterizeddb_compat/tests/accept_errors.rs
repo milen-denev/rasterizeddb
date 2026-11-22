@@ -45,8 +45,12 @@ impl Exhausted {
         assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) }, 0);
 
         let mut exhausted = Self { original, filler: Vec::new() };
-        // Bounded: the limit leaves room for at most 16 more.
-        for _ in 0..64 {
+        // Bounded by the limit itself: no more than `rlim_cur` descriptors can
+        // be open, so the open after that many is refused. Not by the 16 above
+        // `highest`: an open takes the lowest free number, so every gap below
+        // `highest` (descriptors other tests and runtimes closed) fills first,
+        // and a CI runner had more than the 48 gaps a fixed 64 allowed.
+        for _ in 0..=lowered.rlim_cur {
             match std::fs::File::open("/dev/null") {
                 Ok(f) => exhausted.filler.push(f),
                 Err(e) if e.raw_os_error() == Some(libc::EMFILE) => return exhausted,
