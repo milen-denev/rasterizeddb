@@ -91,6 +91,7 @@ mod offline_start_tests;
 pub mod archive;
 pub mod cold;
 pub mod manifest;
+
 #[cfg(test)]
 mod pitr_tests;
 #[cfg(test)]
@@ -518,6 +519,33 @@ pub struct BackupService {
     /// See [`CatalogueState`].
     catalogue: std::sync::Mutex<CatalogueState>,
 }
+
+/// How long `BACKUP WAL` waits for a declining checkpoint to cut its log: a
+/// checkpoint already running ends in well under this, and a transaction
+/// still holding in-place writes past it fails the barrier rather than
+/// leaving its own commits' records out of it unsaid.
+const BARRIER_PATIENCE: Duration = Duration::from_secs(30);
+
+/// Checkpoints `wal` until a checkpoint cuts it (see [`Wal::checkpoint`]'s
+/// declines), for up to `patience`. Blocking: run on a blocking thread.
+fn cut_until_done(wal: &crate::core::wal::Wal, patience: Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        if wal.checkpoint()? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "its checkpoint kept declining for {} s (another checkpoint running, a hold on \
+                 the log, or a transaction with in-place writes still open), so the commits \
+                 before this point were not cut and are not in the archive",
+                patience.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 
 impl BackupService {
     /// Builds the service, reads or creates the catalogue, and points the log's
@@ -2042,7 +2070,7 @@ impl BackupService {
         // the segments every other database has already staged, and stopping
         // here stopped point-in-time recovery for all of them. The failure is
         // still the result, so the caller learns which database is not covered.
-        let cut = self.checkpoint_all_logs().await;
+        let cut = self.cut_all_logs(Some(BARRIER_PATIENCE)).await;
         let uploaded = self.flush_staged_segments().await;
         let result = match (cut, uploaded) {
             (Ok(()), uploaded) => uploaded,
@@ -2070,11 +2098,29 @@ impl BackupService {
     /// A log that cannot be named — its database's pool file does not parse —
     /// is reported the same way, after every other log has been cut.
     async fn checkpoint_all_logs(self: &Arc<Self>) -> io::Result<()> {
+        self.cut_all_logs(None).await
+    }
+
+    /// [`Self::checkpoint_all_logs`], and with `insist` a checkpoint that
+    /// declines is tried again until it cuts, for up to that long, and a log
+    /// still uncut then is a failure.
+    ///
+    /// A checkpoint declines (`Ok(false)`) while another runs, while a hold
+    /// is taken, or while a transaction holds in-place writes, and a decline
+    /// cuts nothing: the records stay in the live log, unstaged. `BACKUP WAL`
+    /// took any `Ok` for a cut and reported success with its barrier's last
+    /// commits never uploaded. A restore from it came back without them (CI,
+    /// 2026-11-22: 10 rows of 20, the 10 committed just before `BACKUP WAL`,
+    /// while an automatic checkpoint that began before them was running).
+    async fn cut_all_logs(self: &Arc<Self>, insist: Option<Duration>) -> io::Result<()> {
         let (streams, mut failed) = self.log_streams_checked();
         self.attach_unattached(&streams);
         for (key, wal) in streams {
             let w = wal.clone();
-            let outcome = tokio::task::spawn_blocking(move || w.checkpoint())
+            let outcome = tokio::task::spawn_blocking(move || match insist {
+                None => w.checkpoint().map(|_| ()),
+                Some(patience) => cut_until_done(&w, patience),
+            })
                 .await
                 .map_err(|e| io::Error::other(e.to_string()))
                 .and_then(|r| r);
