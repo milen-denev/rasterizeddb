@@ -136,6 +136,48 @@ async fn attempts_outcomes_and_the_last_error_are_reported() {
     crate::core::wal::remove_for(&live_str);
 }
 
+/// `BACKUP WAL` is a barrier: once it returns, every commit made before it
+/// is in the archive. A checkpoint that declines (another running, a hold, an
+/// open transaction's in-place writes) cuts nothing, so the flush waits it out
+/// rather than uploading without the latest records and reporting success. A
+/// restore from such a flush came back without the rows committed just
+/// before it (`s3_backup_end_to_end`, CI 2026-11-22: 10 rows of 20).
+///
+/// Mutation: `archive_wal_barrier` takes any `Ok` for a cut
+/// (`archive_wal(None)`): the flush returns while the hold is still on, the
+/// insert left in the live log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wal_flush_waits_out_a_declining_checkpoint() {
+    init_globals();
+    let s3 = fake_s3::start();
+    let base = tempfile::tempdir().unwrap();
+    let live = base.path().join("live");
+    std::fs::create_dir_all(&live).unwrap();
+    let live_str = path_str(&live);
+    let db = Arc::new(Database::new(&live_str).await);
+    ok(&db, "CREATE TABLE t (id INT, note STRING)").await;
+    let service = BackupService::connect(config(&s3, 0), &live_str).await.expect("connect");
+    service.archive_wal_now().await.expect("the first flush");
+
+    ok(&db, "INSERT INTO t (id, note) VALUES (1, 'a')").await;
+    let wal = crate::core::wal::wal_for(&live_str).expect("the database's log");
+    assert!(wal.bytes_since_checkpoint() > 0, "the insert is not in the live log");
+
+    let hold = wal.hold_checkpoints();
+    let flush = {
+        let service = service.clone();
+        tokio::spawn(async move { service.archive_wal_barrier().await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!flush.is_finished(), "the flush returned while every checkpoint declined");
+    drop(hold);
+    flush.await.unwrap().expect("the flush once the hold is gone");
+    assert_eq!(wal.bytes_since_checkpoint(), 0, "the flush left the insert in the live log");
+
+    drop(db);
+    crate::core::wal::remove_for(&live_str);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_next_scheduled_snapshot_is_reported() {
     init_globals();
