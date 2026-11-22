@@ -203,9 +203,15 @@ pub(super) fn rewrite(temps: &[TempTable], sql: &str) -> Option<String> {
     // Table DDL names its table where no relation list does.
     if edits.is_empty() {
         let upper = sql.trim_start().to_ascii_uppercase();
-        let ddl = ["DROP TABLE", "ALTER TABLE", "TRUNCATE", "CREATE INDEX", "CREATE UNIQUE INDEX", "LOCK TABLE", "LOCK "]
-            .iter()
-            .any(|p| upper.starts_with(p));
+        // `ANALYZE t` and `VACUUM t` too: a bulk load's `CREATE TEMP TABLE;
+        // COPY; ANALYZE` was refused at its last step ("does not exist"),
+        // and `VACUUM` of a temporary table said "Table t not found".
+        let ddl = [
+            "DROP TABLE", "ALTER TABLE", "TRUNCATE", "CREATE INDEX", "CREATE UNIQUE INDEX", "LOCK TABLE", "LOCK ",
+            "ANALYZE", "ANALYSE", "VACUUM",
+        ]
+        .iter()
+        .any(|p| upper.starts_with(p));
         if ddl {
             let bytes = sql.as_bytes();
             let mut i = 0;

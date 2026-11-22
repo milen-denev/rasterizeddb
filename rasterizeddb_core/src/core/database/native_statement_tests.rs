@@ -319,6 +319,8 @@ struct SimpleSaid {
     /// Per result: its column names, its rows' text cells, its tag.
     results: Vec<(Vec<String>, Vec<Vec<Option<String>>>, String)>,
     errors: Vec<(String, String)>,
+    /// Notices and warnings: code, message.
+    notices: Vec<(String, String)>,
     /// The last `ReadyForQuery` status.
     status: u8,
 }
@@ -382,7 +384,7 @@ fn read_simple(answer: &[u8]) -> SimpleSaid {
                     tag,
                 ));
             }
-            b'E' => {
+            b'E' | b'N' => {
                 let (mut code, mut message) = (String::new(), String::new());
                 while body[p] != 0 {
                     let field = body[p];
@@ -394,7 +396,11 @@ fn read_simple(answer: &[u8]) -> SimpleSaid {
                         _ => {}
                     }
                 }
-                said.errors.push((code, message));
+                if tag == b'E' {
+                    said.errors.push((code, message));
+                } else {
+                    said.notices.push((code, message));
+                }
             }
             b'Z' => said.status = body[0],
             _ => {}
@@ -1147,6 +1153,64 @@ async fn a_native_role_without_superuser_cannot_create_or_drop_databases() {
     let listed: Vec<String> = rows.iter().map(|r| r[at].clone().unwrap_or_default()).collect();
     let pgwire: Vec<String> = catalog.listing().into_iter().map(|d| d.name).collect();
     assert_eq!(listed, pgwire);
+}
+
+/// `ANALYZE` over native, on what PostgreSQL analyzes without complaint: a
+/// temporary table (a bulk load's `CREATE TEMP TABLE; COPY; ANALYZE`), and a
+/// view, skipped with a warning. Before, the temporary table's name reached
+/// the existence check unrewritten and was refused as missing, and so was
+/// the view. A name that is neither is still refused, and so is a statement
+/// after ANALYZE. `VACUUM` of a temporary table said "Table … not found".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn analyze_takes_temporary_tables_and_skips_views() {
+    let catalog = super::catalog::DatabaseCatalog::open(None, super::DEFAULT_DATABASE_NAME)
+        .await
+        .expect("a catalogue");
+    let database = catalog.get(super::DEFAULT_DATABASE_NAME).expect("its default database");
+    let context = NativeContext {
+        database: database.clone(),
+        authentication_required: false,
+        catalog: Some(catalog.clone()),
+    };
+    let principal = std::sync::Arc::new(rastcp::session::Principal::new("svc", true));
+    let session = native_session_for(&context, &principal, false);
+    let ok = |said: &SimpleSaid, sql: &str| assert!(said.errors.is_empty(), "{sql}: {:?}", said.errors);
+
+    for sql in [
+        "CREATE TABLE analyzed (id INT PRIMARY KEY)",
+        "CREATE TEMP TABLE staged (a INT)",
+        "INSERT INTO staged VALUES (1)",
+        "ANALYZE staged",
+        "ANALYZE pg_temp.staged",
+        "ANALYZE analyzed, staged",
+        "VACUUM staged",
+        "CREATE VIEW seen AS SELECT 1 AS x",
+        "ANALYZE",
+        "ANALYZE VERBOSE analyzed",
+    ] {
+        let said = simple(&context, Some(&session), sql).await;
+        ok(&said, sql);
+    }
+    let said = simple(&context, Some(&session), "SELECT count(*) AS n FROM staged").await;
+    ok(&said, "count");
+    assert_eq!(said.results[0].1, vec![vec![Some("1".to_string())]]);
+
+    let said = simple(&context, Some(&session), "ANALYZE seen").await;
+    ok(&said, "ANALYZE seen");
+    assert!(
+        said.notices.iter().any(|(code, m)| code == "01000" && m.contains("cannot analyze non-tables")),
+        "{said:?}"
+    );
+
+    let said = simple(&context, Some(&session), "ANALYZE no_such_relation").await;
+    assert_eq!(said.errors.first().map(|e| e.0.as_str()), Some("42P01"), "{said:?}");
+    let said = simple(&context, Some(&session), "ANALYZE SELECT 1").await;
+    assert_eq!(said.errors.first().map(|e| e.0.as_str()), Some("42601"), "{said:?}");
+
+    // Another connection's temporary table is not this one's.
+    let other = native_session_for(&context, &principal, false);
+    let said = simple(&context, Some(&other), "ANALYZE staged").await;
+    assert_eq!(said.errors.first().map(|e| e.0.as_str()), Some("42P01"), "{said:?}");
 }
 
 /// A row of a native answer comes out the same whichever rows come before

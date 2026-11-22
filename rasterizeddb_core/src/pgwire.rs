@@ -13170,19 +13170,36 @@ where
                 return Ok(true);
             }
             Ok(tables) => {
-                let database = state.catalog.get(&state.database_name);
-                if let Some(missing) = database
-                    .as_ref()
-                    .and_then(|database| tables.iter().find(|t| !database.has_table(t)))
-                {
-                    fail_statement(
-                        state,
-                        stream,
-                        "42P01",
-                        &format!("relation \"{missing}\" does not exist"),
-                    )
-                    .await?;
-                    return Ok(true);
+                // A temporary table arrives here under its real name
+                // (`temp_tables::rewrite`). A view is skipped with
+                // PostgreSQL's warning; only a name that is neither is
+                // refused.
+                if let Some(database) = state.catalog.get(&state.database_name) {
+                    let tx = state.current_tx();
+                    for table in &tables {
+                        if database.has_table(table) {
+                            continue;
+                        }
+                        match crate::core::rql::views::lookup(&database, table, tx).await {
+                            Ok(Some(_)) => {
+                                crate::core::notice::push(
+                                    "WARNING",
+                                    "01000",
+                                    format!("skipping \"{table}\" --- cannot analyze non-tables"),
+                                );
+                            }
+                            _ => {
+                                fail_statement(
+                                    state,
+                                    stream,
+                                    "42P01",
+                                    &format!("relation \"{table}\" does not exist"),
+                                )
+                                .await?;
+                                return Ok(true);
+                            }
+                        }
+                    }
                 }
             }
         }

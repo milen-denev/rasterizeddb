@@ -1338,3 +1338,46 @@ async fn the_genuine_no_ops_are_still_accepted() {
         .expect_err("ANALYZE SELECT must be refused");
     assert!(err.contains("EXPLAIN ANALYZE"), "{err}");
 }
+
+/// `ANALYZE` of what PostgreSQL analyzes without complaint, on one
+/// connection: a temporary table (a bulk load's `CREATE TEMP TABLE; COPY;
+/// ANALYZE`), a view (skipped, with a warning), a materialized view, a
+/// quoted name. The temporary table's name used to
+/// reach the existence check unrewritten, and both it and the view were
+/// refused as missing; `VACUUM` of a temporary table said "not found".
+#[tokio::test(flavor = "multi_thread")]
+async fn analyze_takes_what_postgresql_analyzes() {
+    let (_server, pool) = server().await;
+    let mut conn = pool.acquire().await.expect("a connection");
+    let mut on = async |sql: &str| {
+        sqlx::query(AssertSqlSafe(sql))
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    for sql in [
+        "CREATE TEMP TABLE staged (a INT)",
+        "INSERT INTO staged VALUES (1)",
+        "ANALYZE staged",
+        "ANALYZE pg_temp.staged",
+        "VACUUM staged",
+        "CREATE VIEW seen AS SELECT 1 AS x",
+        "ANALYZE seen",
+        // A plain table: this server is in memory, which holds no
+        // partitioned one (probed on disk: `ANALYZE` of one is answered).
+        "CREATE TABLE ap (cid BIGINT NOT NULL PRIMARY KEY, v INT)",
+        "ANALYZE ap",
+        "CREATE MATERIALIZED VIEW amv AS SELECT 1 AS one",
+        "ANALYZE amv",
+        "CREATE TABLE \"MixedCase\" (id INT)",
+        "ANALYZE \"MixedCase\"",
+        "ANALYZE public.ap",
+        "ANALYZE VERBOSE ap, staged, seen",
+        "ANALYZE",
+    ] {
+        on(sql).await.unwrap_or_else(|e| panic!("{sql:?} should be accepted: {e}"));
+    }
+    let err = on("ANALYZE no_such_relation").await.expect_err("a missing relation is refused");
+    assert!(err.contains("does not exist"), "{err}");
+}
