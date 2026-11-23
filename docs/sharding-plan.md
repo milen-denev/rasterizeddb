@@ -79,6 +79,7 @@ D1 and D6.
 | D5 | Persistent index default | Flip `index_snapshot.index_storage` to `snapshot` before phase 3. Follower apply and relocation depend on a cheap reopen. |
 | D6 | Where Track B stops | Phase **1c** gives write scale-out without HA. Phase **3** is the first production topology for a large target. Decide this before B1a starts, because phases 1–2 alone have no replicas. |
 | D7 | HA before phase 3 | Allow the **existing replication one-way per shard** as a warm standby with manual failover. It is statement-based, with known divergence risks (§4.3 B1a.13). The alternative is RF1 plus S3 restore. |
+| D8 | Default for a statement with no route key (`unrouted`, B1b) | **`refuse` by default.** Turn on `fan_out` per role (reporting, admin) or per gateway where the app expects it. A forgotten key then surfaces as an error instead of a silent whole-cluster scan. `unrouted_writes = each_shard` is never a gateway-wide default, because it is not atomic before 2PC |
 
 ## 2. Cargo features
 
@@ -418,7 +419,8 @@ in the default database.
                           hash 1 value → range map → shard   ──rastcp/2 mux──┤   (pgwire session per client session)
                           relay pgwire bytes both ways, no row decode         │   admission: map/owner/schema epoch
                           first sight of a shape: Classify{sql} ─────────────┘   rewrites, views, triggers, CTEs run HERE
-                          fan-out merge (1b/1c)                                   ownership: route_where ∩ Owned,
+                          no key + unrouted=fan_out: tier-1 merge here,           ownership: route_where ∩ Owned,
+                          tier-2 (aggregates, top-N) on a coordinator shard
                    Track A routers connect to shards directly ─────────────►      FOREIGN refuses, write guard
 ```
 
@@ -538,8 +540,11 @@ gateway routes in this order:
    (`filter/sarg.rs:555`) and `route()` that `route_where` enforces. So the
    gateway carries no SQL parser and no catalogue, and statements through
    views route automatically when their key is visible after expansion.
-4. **`NeedsKey`:** `0A000 "statement needs a route key in cluster mode"`.
-   This is fail-closed ([[a-guard-is-an-allowlist]]).
+4. **No key:**
+   - `NeedsKey`: `0A000 "statement needs a route key in cluster mode"`.
+     This is fail-closed ([[a-guard-is-an-allowlist]]).
+   - `FanOut`: decided by the `unrouted` option (B1b): refuse, or send to
+     every shard and combine the results.
 
 A wrong template costs an `RDB02` from the shard, never wrong rows. A
 template that produced an `RDB02` is dropped from the cache and counted
@@ -675,9 +680,63 @@ calls), `partition/table.rs` (`route_where`). Each hunk goes to the file's
 current owner before commit ([[parallel-sessions-coordinate]],
 [[table-pub-methods-seam-rule]]).
 
-### 4.4 Phase B1b: fan-out `COUNT` and rows
+### 4.4 Phase B1b: the no-key option, fan-out `COUNT` and rows
 
-- **Gateway.** It scatters `Exec{Part{ranges}}`. Fan-out statements are a
+**The option: what happens when no key is given.** A statement may carry no
+route key while its template is not single-shard (`FanOut`). The gateway's
+`unrouted` setting then decides:
+
+| Setting | Set where | Reads | Writes |
+|---|---|---|---|
+| `unrouted = refuse` | gateway config; per role (`ALTER ROLE … SET rdb.unrouted`); per session (`SET rdb.unrouted`) | `0A000 "statement needs a route key"` | `0A000` |
+| `unrouted = fan_out` | same | Sent to every shard owning a routed range, and the results combined **exactly** (the operators below). A shape the merge cannot make exact is refused, never approximated | still refused unless `unrouted_writes` says otherwise |
+| `unrouted_writes = each_shard` | per session or role only, never as a gateway-wide default | — | Autocommit only. `UPDATE`/`DELETE` run on each shard as that shard's own transaction (`EXECUTE ON EACH SHARD` semantics): row counts are summed, and any failure errors naming the shards that already applied. Inside `BEGIN`: refused until 2PC (B5) makes it atomic |
+
+- **`INSERT` always routes by the row's key values.** Rows for several
+  shards are a multi-shard write (`rdb.split_bulk_writes`, sharding.md §8.5).
+- **Fan-out runs only under certain sessions:**
+  - autocommit or `BEGIN READ ONLY`, at READ COMMITTED;
+  - refused in REPEATABLE READ, SERIALIZABLE and write transactions;
+  - a role can forbid it with `rdb.cross_shard_read = refuse`.
+- **What a fan-out result means:**
+  - Each shard reads at its own snapshot.
+  - Every transaction is seen whole, because there are no cross-shard
+    transactions before B5.
+  - Transactions committing concurrently on different shards may appear in
+    any combination.
+  - This text is in the docs and in `SHOW SHARDING`.
+- **Cost stays bounded even with `fan_out`.** A statement without a key
+  visits every partition on every shard (sharding.md §11.6). So
+  `shard_unrouted_max_partitions` still refuses one whose estimate is too
+  large (`54000`), and a NOTICE fires past `shard_fanout_warn`.
+- **The default is decision D8.**
+
+**Where results are combined.**
+- **Tier 1, in the gateway: shapes that need no decoding.**
+  - A plain row stream with no `ORDER BY` and no aggregate: each shard's
+    DataRows are relayed in turn under one RowDescription, and the
+    CommandComplete counts are summed.
+  - `LIMIT k` without `ORDER BY`: stop after k rows and cancel the rest.
+  - `COUNT(*)` alone: sum one int8 per shard.
+
+  This is the gateway's `fanout` feature. It keeps the gateway free of
+  engine code (§4.9 G1).
+- **Tier 2, on a coordinator shard: everything that needs engine
+  semantics.** That covers aggregates, `GROUP BY`/`HAVING` and
+  `ORDER BY … LIMIT` (B1c), and later `DISTINCT`, windows and joins (B4).
+  - The gateway forwards the statement to one coordinator: the home shard,
+    or the least-loaded shard.
+  - The coordinator scatters `Exec{Part}` to its peers over rshard, merges
+    with the engine's own `Folder`, sort and post-scan pipeline, and returns
+    pgwire bytes that the gateway relays as usual.
+  - **Cost:** one extra hop, on a path that is already a whole-cluster
+    operation.
+  - **Benefit:** the merge logic exists once, in the engine. A second
+    implementation in the gateway is how a merged `NUMERIC` sum ends up
+    looking right and being wrong ([[the-number-that-looks-right]]).
+
+**Mechanics, whichever tier scatters:**
+- **The scatterer** sends `Exec{Part{ranges}}`. Fan-out statements are a
   narrow allowlist:
   - a `SELECT` over sharded base tables and views;
   - autocommit or `BEGIN READ ONLY`, at READ COMMITTED;
@@ -697,7 +756,7 @@ current owner before commit ([[parallel-sessions-coordinate]],
   `coverage_mismatch` alarm (S5).
 - **Caps:**
   - `shard_gather_max_bytes`; `54000` past it, never a truncation;
-  - a gateway gather semaphore (`53200`);
+  - a gather semaphore on each scatterer, gateway or coordinator (`53200`);
   - unrouted statements are refused above `shard_unrouted_max_partitions`,
     estimated from each shard's `totals()` (`partition/table.rs:2037`;
     `PartitionInfo` has no live-row count, so the estimate uses bytes);
@@ -723,14 +782,15 @@ current owner before commit ([[parallel-sessions-coordinate]],
     else `XX000` ([[the-number-that-looks-right]],
     [[numeric-scale-must-reach-the-planner]]).
 - **Fold-only executor mode.** It stops before `HAVING`/`ORDER`/`OFFSET`/
-  `LIMIT`. The gateway builds its `Folder` from its own plan template, merges
+  `LIMIT`. The coordinator shard (tier 2, B1b) builds its `Folder` from its
+  own plan of the statement, merges
   (`Folder::merge`, `:3510`) and finishes once (`finish_into`, `:3535`).
   Today `Folder::merge` serves only thread-parallel cell folds
   (`executor.rs:13333`).
 - **Top-N:**
   - Shards return scan-schema rows carrying every sort key and its `__null_`
     companion, capped at k+o.
-  - The gateway re-cuts with `sort_rows_for_merge`
+  - The coordinator re-cuts with `sort_rows_for_merge`
     (`processor/concurrent_processor.rs:2282`), which re-sorts the union.
     That is fine at k × shards rows, and there is still no streaming k-way
     merge.
