@@ -377,6 +377,66 @@ pub struct Replication {
     /// Wakes the key/value flusher.
     kv_wake: Arc<tokio::sync::Notify>,
     kv_flusher: AtomicBool,
+    /// The database this instance replicates, when it is not the node's
+    /// default one: its links greet peers with it ([`super::protocol::Hello`]'s
+    /// `database`), and it serves no listener of its own — the default
+    /// database's listener routes its connections to it.
+    routed: parking_lot::Mutex<Option<String>>,
+    /// The node's catalogue, for the `CREATE DATABASE` and `DROP DATABASE`
+    /// records the default database's stream carries. Weak: the listener's
+    /// router owns it, and a database holding its own catalogue strongly
+    /// would be a cycle that outlives the catalogue.
+    catalog: parking_lot::Mutex<Option<std::sync::Weak<dyn CatalogLink>>>,
+}
+
+/// A catalogue change one node's default stream carries to the others.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogOp {
+    Create(String),
+    Drop(String),
+}
+
+impl CatalogOp {
+    /// The statement the record carries: `CREATE DATABASE name`.
+    pub fn statement(&self) -> String {
+        match self {
+            CatalogOp::Create(name) => format!("CREATE DATABASE {name}"),
+            CatalogOp::Drop(name) => format!("DROP DATABASE {name}"),
+        }
+    }
+
+    /// The catalogue change a record's statement is, if it is one. Only a
+    /// record of the default stream is read this way, and only this node's
+    /// own capture writes these: a client's `CREATE DATABASE` never reaches
+    /// the executor or its capture.
+    pub fn parse(statement: &str) -> Option<CatalogOp> {
+        let words: Vec<&str> = statement.split_whitespace().collect();
+        match words.as_slice() {
+            [create, database, name] if create.eq_ignore_ascii_case("CREATE") && database.eq_ignore_ascii_case("DATABASE") => {
+                Some(CatalogOp::Create(name.to_string()))
+            }
+            [drop, database, name] if drop.eq_ignore_ascii_case("DROP") && database.eq_ignore_ascii_case("DATABASE") => {
+                Some(CatalogOp::Drop(name.to_string()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            CatalogOp::Create(name) | CatalogOp::Drop(name) => name,
+        }
+    }
+}
+
+/// What applies a [`CatalogOp`] on this node: creates or drops the database
+/// in the catalogue (without recording it again) and starts or stops its
+/// replication. Implemented over the catalogue in `core::database`.
+pub trait CatalogLink: Send + Sync {
+    fn apply<'a>(
+        &'a self,
+        op: CatalogOp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 impl std::fmt::Debug for Replication {
@@ -430,7 +490,31 @@ impl Replication {
             kv_flushing: parking_lot::Mutex::new(()),
             kv_wake: Arc::new(tokio::sync::Notify::new()),
             kv_flusher: AtomicBool::new(false),
+            routed: parking_lot::Mutex::new(None),
+            catalog: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Makes this the replication of the non-default database `name`.
+    pub fn route_as(&self, name: &str) {
+        *self.routed.lock() = Some(name.to_string());
+    }
+
+    /// The database named in this instance's greetings; `None` for the
+    /// node's default database, whose greetings name none.
+    pub fn routed_database(&self) -> Option<String> {
+        self.routed.lock().clone()
+    }
+
+    /// Hands this instance the catalogue its default stream's catalogue
+    /// records are applied to.
+    pub fn link_catalog(&self, link: std::sync::Weak<dyn CatalogLink>) {
+        *self.catalog.lock() = Some(link);
+    }
+
+    /// The catalogue, while its owner (the listener) is running.
+    pub fn catalog(&self) -> Option<std::sync::Arc<dyn CatalogLink>> {
+        self.catalog.lock().as_ref().and_then(std::sync::Weak::upgrade)
     }
 
     /// Claims the right to start the inbound listener, once.

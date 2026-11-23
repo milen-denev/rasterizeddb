@@ -438,6 +438,16 @@ pub struct Hello {
     /// Where this node's own listener is, so the answerer can dial back
     /// without being configured to.
     pub advertised_addr: String,
+    /// The database this connection's stream is, when it is not the node's
+    /// default one. Every database replicates over its own links (one per
+    /// database and peer, all to the one listener), and the listener routes a
+    /// connection by this name.
+    ///
+    /// Written last and only when set, and read only when there are bytes
+    /// left: a node from before it neither sends it nor reads it, and its
+    /// links, which only ever carried the default database, are read as the
+    /// default database's.
+    pub database: Option<String>,
 }
 
 impl Hello {
@@ -448,6 +458,9 @@ impl Hello {
         put_u64(out, self.clock);
         put_str(out, &self.token);
         put_str(out, &self.advertised_addr);
+        if let Some(database) = &self.database {
+            put_str(out, database);
+        }
     }
 
     pub fn decode(reader: &mut Reader<'_>) -> Result<Hello, ProtocolError> {
@@ -458,6 +471,7 @@ impl Hello {
             clock: reader.u64()?,
             token: reader.str()?,
             advertised_addr: reader.str()?,
+            database: if reader.remaining() > 0 { Some(reader.str()?) } else { None },
         })
     }
 }
@@ -1312,6 +1326,7 @@ mod tests {
             clock: 1234,
             token: "s3cret".to_string(),
             advertised_addr: "10.0.0.1:61171".to_string(),
+            database: None,
         };
         let mut buf = Vec::new();
         hello.encode(&mut buf);

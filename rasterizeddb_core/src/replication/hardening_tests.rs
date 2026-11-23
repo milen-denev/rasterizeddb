@@ -1266,6 +1266,7 @@ fn hello_frame(node_id: u64, token: &str) -> Vec<u8> {
         clock: 1,
         token: token.to_string(),
         advertised_addr: "127.0.0.1:1".to_string(),
+        database: None,
     };
     let mut payload = Vec::new();
     hello.encode(&mut payload);

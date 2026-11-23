@@ -6468,19 +6468,9 @@ where
             }
             match state.catalog.create(&name).await {
                 Ok(database) => {
-                    // Replication is single-database: it carries the default
-                    // one, and nothing written in this one reaches the peers.
-                    if state.catalog.all().iter().any(|d| d.replication.is_active()) {
-                        crate::core::notice::push(
-                            "WARNING",
-                            "01000",
-                            format!(
-                                "not replicated: database \"{name}\" is this node's alone; replication \
-                                 carries only the default database \"{}\"",
-                                state.catalog.default_name()
-                            ),
-                        );
-                    }
+                    // Replicated when the default database is: the catalogue
+                    // starts its replication and records the CREATE for the
+                    // peers (`DatabaseCatalog::create`).
                     if let Err(e) = seed_roles(&database, &state.auth).await {
                         // The database exists but nobody can log into it, which
                         // is worse than not having created it.

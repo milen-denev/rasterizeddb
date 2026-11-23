@@ -405,6 +405,40 @@ impl DatabaseCatalog {
     /// that account should be is the server's configuration rather than the
     /// catalogue's business.
     pub async fn create(&self, name: &str) -> Result<Arc<Database>, String> {
+        let database = self.create_unrecorded(name).await?;
+        self.replicate(crate::replication::manager::CatalogOp::Create(name.to_string()), Some(&database))
+            .await;
+        Ok(database)
+    }
+
+    /// When the default database replicates, a catalogue change does too: a
+    /// new database starts replicating (its links name it, and the peers'
+    /// listeners route them to theirs once it is there), and the default
+    /// stream carries the change for the peers to make (`ReplicatedCatalog`).
+    ///
+    /// The record follows the change. A crash between them leaves the change
+    /// on this node alone, as a failed `REPLICATION` capture does; the other
+    /// order would have the peers make a change this node may then refuse.
+    async fn replicate(&self, op: crate::replication::manager::CatalogOp, created: Option<&Arc<Database>>) {
+        let Some(default) = self.get(&self.default_name) else { return };
+        if !default.replication.is_active() {
+            return;
+        }
+        if let Some(database) = created {
+            let config = default.replication.config();
+            if let Err(e) = Database::start_routed_replication(database.clone(), op.name(), &config) {
+                log::error!("Database \"{}\" was created but does not replicate: {}", op.name(), e);
+            }
+        }
+        let tx = default.transactions.begin();
+        default.replication.note_statement(tx, &op.statement(), None);
+        let family = default.commit_transaction(tx);
+        default.publish_transaction(family).await;
+    }
+
+    /// [`DatabaseCatalog::create`] without recording it for the peers: what
+    /// applying a peer's `CREATE DATABASE` record does.
+    pub(crate) async fn create_unrecorded(&self, name: &str) -> Result<Arc<Database>, String> {
         validate_name(name)?;
 
         if self.fixed {
@@ -485,6 +519,14 @@ impl DatabaseCatalog {
     /// discarded rather than resurrected, but the space is not reclaimed until
     /// then.
     pub async fn drop_database(&self, name: &str, current: &str) -> Result<(), String> {
+        self.drop_unrecorded(name, current).await?;
+        self.replicate(crate::replication::manager::CatalogOp::Drop(name.to_string()), None).await;
+        Ok(())
+    }
+
+    /// [`DatabaseCatalog::drop_database`] without recording it for the
+    /// peers: what applying a peer's `DROP DATABASE` record does.
+    pub(crate) async fn drop_unrecorded(&self, name: &str, current: &str) -> Result<(), String> {
         if name == self.default_name {
             return Err(format!(
                 "cannot drop the default database \"{}\"; it is the catalogue root",
@@ -507,7 +549,13 @@ impl DatabaseCatalog {
                 name, attached
             ));
         }
+        let database = entry.database.clone();
         drop(entry);
+
+        // Its replication stops first: its links end, and the listener's
+        // router stops serving it with the name gone from the map below.
+        database.stop_replication();
+        drop(database);
 
         // Out of the map first: a session that resolves the name after this
         // point must not be handed files that are about to be unlinked.
@@ -583,6 +631,74 @@ impl DatabaseCatalog {
 
         info!("Dropped database \"{}\"", name);
         Ok(())
+    }
+}
+
+/// The catalogue this process serves, registered by the server's `main` so a
+/// `REPLICATION ENABLE` on its default database starts every database's
+/// replication, as `--replication` does at start. Unset in tests and
+/// embedded use, where replication starts with the catalogue it is given.
+static SERVED: std::sync::OnceLock<Arc<DatabaseCatalog>> = std::sync::OnceLock::new();
+
+/// Registers the catalogue this process serves. The first call wins.
+pub fn register_served(catalog: Arc<DatabaseCatalog>) {
+    let _ = SERVED.set(catalog);
+}
+
+/// The served catalogue, when `database` is its default database.
+pub(crate) fn served_by_default(database: &Arc<Database>) -> Option<Arc<DatabaseCatalog>> {
+    let catalog = SERVED.get()?;
+    let default = catalog.get(&catalog.default_name)?;
+    Arc::ptr_eq(&default, database).then(|| catalog.clone())
+}
+
+/// Applies the catalogue changes the default stream carries
+/// ([`crate::replication::manager::CatalogOp`]) to this node's catalogue.
+///
+/// Idempotent, as a record offered again after a restart must be: a database
+/// that is already there is only made to replicate, and one already gone is
+/// done. Neither is recorded again, so nothing travels back.
+pub struct ReplicatedCatalog {
+    catalog: Arc<DatabaseCatalog>,
+}
+
+impl ReplicatedCatalog {
+    pub fn new(catalog: Arc<DatabaseCatalog>) -> Self {
+        Self { catalog }
+    }
+}
+
+impl crate::replication::manager::CatalogLink for ReplicatedCatalog {
+    fn apply<'a>(
+        &'a self,
+        op: crate::replication::manager::CatalogOp,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::replication::manager::CatalogOp;
+            match op {
+                CatalogOp::Create(name) => {
+                    let database = match self.catalog.get(&name) {
+                        Some(database) => database,
+                        None => self.catalog.create_unrecorded(&name).await?,
+                    };
+                    let default = self
+                        .catalog
+                        .get(&self.catalog.default_name)
+                        .ok_or_else(|| "this node has no default database".to_string())?;
+                    if !database.replication.is_active() {
+                        Database::start_routed_replication(database, &name, &default.replication.config())
+                            .map_err(|e| format!("database \"{name}\" was created but does not replicate: {e}"))?;
+                    }
+                    Ok(())
+                }
+                CatalogOp::Drop(name) => {
+                    if self.catalog.get(&name).is_none() {
+                        return Ok(());
+                    }
+                    self.catalog.drop_unrecorded(&name, "").await
+                }
+            }
+        })
     }
 }
 
