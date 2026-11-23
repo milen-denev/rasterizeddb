@@ -180,7 +180,8 @@ jobs:
             ${{ steps.package.outputs.studio }}
           if-no-files-found: error
 
-  # Container images, ghcr.io/<owner>/rasterizeddb, for linux/amd64 and
+  # Container images, ghcr.io/<owner>/rasterizeddb and (when the variable
+  # DOCKERHUB_USERNAME is set) docker.io/<that user>/rasterizeddb, for linux/amd64 and
   # linux/arm64, from the binaries the build job made (no compiling here):
   #
   #   <version>-ubuntu24.04  <version>  <minor>  <major>  latest   (the default)
@@ -230,23 +231,37 @@ jobs:
           cp README.md LICENSE-GPL docker/
           file docker/bin*/*/rasterizeddb
 
+      # The version comes from the tag (v1.0.1-rc.1 -> 1.0.1-rc.1): Cargo.toml
+      # never carries a pre-release suffix, so reading it there would give a
+      # release candidate the full release's tags, `latest` included. Docker
+      # Hub gets the same tags when the repository variable DOCKERHUB_USERNAME
+      # is set (with the secret DOCKERHUB_TOKEN).
       - name: Tags
         id: tags
         shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
-          version="$(cargo pkgid -p rasterizeddb_core | sed 's/.*[#@]//')"
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rasterizeddb"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(cargo pkgid -p rasterizeddb_core | sed 's/.*[#@]//')"
+          fi
+          images="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/rasterizeddb"
+          if [ -n "$DOCKERHUB_USERNAME" ]; then images="$images docker.io/${DOCKERHUB_USERNAME,,}/rasterizeddb"; fi
           variant="${{ matrix.variant }}"
-          tags="$image:$version-$variant"
+          tags=""
+          add() { local image; for image in $images; do tags="${tags:+$tags,}$image:$1"; done; }
+          add "$version-$variant"
           case "$version" in
             *-*)
-              if [ "${{ matrix.default }}" = true ]; then tags="$tags,$image:$version"; fi ;;
+              if [ "${{ matrix.default }}" = true ]; then add "$version"; fi ;;
             *)
               minor="${version%.*}"; major="${version%%.*}"
-              tags="$tags,$image:$minor-$variant,$image:$variant"
+              add "$minor-$variant"; add "$variant"
               if [ "${{ matrix.default }}" = true ]; then
-                tags="$tags,$image:$version,$image:$minor,$image:$major,$image:latest"
+                add "$version"; add "$minor"; add "$major"; add latest
               fi ;;
           esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -276,6 +291,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && vars.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build both architectures (pushed for a tag)
         uses: docker/build-push-action@v6
@@ -376,7 +398,7 @@ jobs:
 
             Built with fat LTO and profile-guided optimisation; the glibc Linux binaries are also optimised with BOLT and need glibc 2.39+. The static musl binaries run on any Linux (Alpine included) and use mimalloc. Start with `rasterizeddb --location <dir>` (or `--in-memory`); `rasterizeddb --help` lists every option. Verify a download with `sha256sum -c SHA256SUMS`.
 
-            **Container images** (linux/amd64 and linux/arm64): `ghcr.io/${{ github.repository_owner }}/rasterizeddb:<version>` on Ubuntu 24.04 (also `<version>-ubuntu24.04`), `<version>-ubuntu26.04`, and `<version>-alpine`. Run with `docker run -e RASTERIZEDDB_PG_PASSWORD=<password> -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb ghcr.io/${{ github.repository_owner }}/rasterizeddb:<version>`; see docs/docker.md.
+            **Container images** (linux/amd64 and linux/arm64), on Docker Hub as `${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb` and on `ghcr.io/${{ github.repository_owner }}/rasterizeddb`: `<version>` on Ubuntu 24.04 (also `<version>-ubuntu24.04`), `<version>-ubuntu26.04`, and `<version>-alpine`. Run with `docker run -e RASTERIZEDDB_PG_PASSWORD=<password> -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb ${{ vars.DOCKERHUB_USERNAME }}/rasterizeddb:<version>`; see docs/docker.md.
 
             **Arch Linux / CachyOS** (x86-64-v3): `sudo pacman -U rasterizeddb-bin-*.pkg.tar.zst`, set the password in `/etc/rasterizeddb/rasterizeddb.env`, then `sudo systemctl enable --now rasterizeddb`. `rasterizeddb-bin-aur-*.tar.gz` holds the same PKGBUILD for the AUR.
 

@@ -57,7 +57,7 @@ The glibc Linux builds need glibc 2.39 or newer; the static musl builds run on a
 ```sh
 docker run -d --name rasterizeddb -e RASTERIZEDDB_PG_PASSWORD=change-me \
   -p 5432:5432 -p 61170:61170 -v rasterizeddb:/var/lib/rasterizeddb \
-  ghcr.io/milen-denev/rasterizeddb:latest
+  milendenev/rasterizeddb:latest          # or ghcr.io/milen-denev/rasterizeddb:latest
 ```
 
 **Arch Linux / CachyOS** (x86-64-v3): each release carries `rasterizeddb-bin-<version>-1-x86_64.pkg.tar.zst`, with a systemd service:

@@ -1,6 +1,6 @@
 # Docker images
 
-Each server release (`v<version>`) pushes images to `ghcr.io/milen-denev/rasterizeddb` for `linux/amd64` and `linux/arm64`. They hold the same binaries as the GitHub release, so nothing is compiled during the image build.
+Each server release (`v<version>`) pushes images to Docker Hub as `milendenev/rasterizeddb` and to GitHub's registry as `ghcr.io/milen-denev/rasterizeddb`, for `linux/amd64` and `linux/arm64`, with the same tags in both. They hold the same binaries as the GitHub release, so nothing is compiled during the image build.
 
 | Tag | Base | Server binary |
 |---|---|---|
@@ -19,7 +19,7 @@ docker run -d --name rasterizeddb \
   -e RASTERIZEDDB_PG_PASSWORD=change-me \
   -p 5432:5432 -p 61170:61170 \
   -v rasterizeddb:/var/lib/rasterizeddb \
-  ghcr.io/milen-denev/rasterizeddb:latest
+  milendenev/rasterizeddb:latest
 
 psql "host=localhost user=rasterized dbname=postgres sslmode=require"
 ```
