@@ -213,13 +213,14 @@ async fn a_join_never_sees_a_cross_partition_transfer_half_applied() {
 
 /// I3 for joins, seen from the reads. A join whose `WHERE` pins the
 /// partitioned side's key reads that one partition; a key pinned through an
-/// `IN` list reads its partitions; a constant-false clause on it reads none.
-/// A key pinned only on the *other* side (`o.tenant_id = 5`) routes nothing
-/// on the partitioned side: no transitive inference in 2b, so it fans out
-/// over every materialized partition (and still answers right).
+/// `IN` list reads its partitions; a constant-false clause on it reads none,
+/// and so does a key held to two values. A key pinned only on the *other*
+/// side (`o.tenant_id = 5`) is carried across the join's equality
+/// (`join::infer_join_constants`) and reads that one partition too.
 ///
-/// Mutation: route the fan-out on an empty clause instead of the relation's
-/// own pushed-down predicate: the pinned join reads every partition.
+/// Mutations: route the fan-out on an empty clause instead of the
+/// relation's own pushed-down predicate (the pinned join reads every
+/// partition); no `infer_join_constants` (the other-side pin fans out).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_join_reads_only_the_partitions_its_own_predicate_proves() {
     let dir = tempfile::tempdir().unwrap();
@@ -273,27 +274,68 @@ async fn a_join_reads_only_the_partitions_its_own_predicate_proves() {
     assert_eq!(got, vec![0]);
     assert_eq!(test_hooks::take_reads(uid), Vec::<u32>::new(), "a constant-false clause read partitions");
 
-    // Two equalities on the key: the route proves no more than either one
-    // (as for a single table), so it reads their two partitions, no other.
+    // Two equalities on the key: no row can hold both, so no partition is
+    // read, as PostgreSQL prunes it.
     let got = ints_row(
         &db,
         "SELECT COUNT(*) FROM acct a JOIN owners o ON a.tenant_id = o.tenant_id WHERE a.tenant_id = 1 AND a.tenant_id = 2",
     )
     .await;
     assert_eq!(got, vec![0]);
-    let mut want = vec![pid_of(&pt, 1), pid_of(&pt, 2)];
-    want.sort();
-    want.dedup();
-    assert_eq!(test_hooks::take_reads(uid), want);
+    assert_eq!(test_hooks::take_reads(uid), Vec::<u32>::new(), "a key held to two values read partitions");
 
-    // The key pinned on the other side only: a fan-out, by design.
+    // The key pinned on the other side only: carried across the equality.
     let got = table(
         &db,
         "SELECT a.tenant_id, o.name FROM acct a JOIN owners o ON a.tenant_id = o.tenant_id WHERE o.tenant_id = 5",
     )
     .await;
     assert_eq!(got, vec![vec![Cell::Int(5), Cell::Text("owner 5".into())]]);
-    assert_eq!(test_hooks::take_reads(uid), parts, "a join term naming the other side routed the partitioned one");
+    assert_eq!(test_hooks::take_reads(uid), vec![pid_of(&pt, 5)], "the other side's pin did not route");
+
+    // Two pins that disagree across the join: nothing pairs, nothing read.
+    let got = ints_row(
+        &db,
+        "SELECT COUNT(*) FROM acct a JOIN owners o ON a.tenant_id = o.tenant_id WHERE o.tenant_id = 5 AND a.tenant_id = 6",
+    )
+    .await;
+    assert_eq!(got, vec![0]);
+    assert_eq!(test_hooks::take_reads(uid), Vec::<u32>::new(), "disagreeing pins read partitions");
+
+    // A LEFT JOIN carries the preserved side's pin onto the joined one.
+    let got = table(
+        &db,
+        "SELECT o.tenant_id, a.bal FROM owners o LEFT JOIN acct a ON a.tenant_id = o.tenant_id WHERE o.tenant_id = 4",
+    )
+    .await;
+    assert_eq!(got, vec![vec![Cell::Int(4), Cell::Int(OPENING)]]);
+    assert_eq!(test_hooks::take_reads(uid), vec![pid_of(&pt, 4)], "a LEFT JOIN's preserved pin did not route");
+    // Never the other way: the joined side's ON pin keeps every owner.
+    let got = ints_row(
+        &db,
+        "SELECT COUNT(*) FROM owners o LEFT JOIN acct a ON a.tenant_id = o.tenant_id AND a.tenant_id = 4",
+    )
+    .await;
+    assert_eq!(got, vec![TENANTS + ORPHANS.len() as i64]);
+    test_hooks::take_reads(uid);
+
+    // A pin on the partitioned side's key carried through a comma join's
+    // WHERE equality, and through a chain of two equalities.
+    let got = table(
+        &db,
+        "SELECT a.tenant_id, o.name FROM acct a, owners o WHERE a.tenant_id = o.tenant_id AND o.tenant_id = 8",
+    )
+    .await;
+    assert_eq!(got, vec![vec![Cell::Int(8), Cell::Text("owner 8".into())]]);
+    assert_eq!(test_hooks::take_reads(uid), vec![pid_of(&pt, 8)], "a comma join's pin did not route");
+    let got = table(
+        &db,
+        "SELECT a.tenant_id FROM owners o JOIN owners p ON p.tenant_id = o.tenant_id \
+         JOIN acct a ON a.tenant_id = p.tenant_id WHERE o.tenant_id = 9",
+    )
+    .await;
+    assert_eq!(got, vec![vec![Cell::Int(9)]]);
+    assert_eq!(test_hooks::take_reads(uid), vec![pid_of(&pt, 9)], "a chained pin did not route");
 
     // A self-join, each side pinned to its own tenant: two partitions.
     let got = table(
@@ -304,6 +346,63 @@ async fn a_join_reads_only_the_partitions_its_own_predicate_proves() {
     assert_eq!(got, vec![vec![Cell::Int(2), Cell::Int(11)]]);
     assert_eq!(test_hooks::take_reads(uid), vec![pid_of(&pt, 2), pid_of(&pt, 11)]);
     drop(pt);
+    close(db, dir.path());
+}
+
+/// Constants carried across a join's equalities change no answer. Each
+/// query runs with its pin written `o.tenant_id = v`, which
+/// `join::infer_join_constants` carries onto the other side, and written
+/// `o.tenant_id + 0 = v`, which it cannot read, so that run is the plan
+/// without inference; both run against the partitioned `acct` and its plain
+/// twin `acct_q`, and all four answers must agree; a pin on `a` (`{apin}`)
+/// is written both ways alike. Pins cover a tenant with
+/// an account, an orphan owner (no account: NULL-extended or no row) and a
+/// tenant whose `lim` is NULL; joins cover INNER both ways, LEFT both ways,
+/// the anti-join, a comma join, a chain and disagreeing pins.
+///
+/// Mutation: carry a LEFT JOIN's constant from the joined side to the
+/// preserved one (`both = true` for `Left`): the second LEFT query loses
+/// every owner but one.
+#[tokio::test(flavor = "multi_thread")]
+async fn carried_join_constants_answer_as_the_uninferred_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "join_infer").await;
+    accounts(&db, "acct", 16).await;
+    accounts(&db, "acct_q", 0).await;
+    owners(&db).await;
+    let queries = [
+        "SELECT a.tenant_id, a.bal, a.lim, o.name FROM {a} a JOIN owners o ON a.tenant_id = o.tenant_id WHERE {pin}",
+        "SELECT o.tenant_id, a.bal FROM owners o JOIN {a} a ON o.tenant_id = a.tenant_id WHERE {pin}",
+        "SELECT o.tenant_id, a.bal, a.lim FROM owners o LEFT JOIN {a} a ON a.tenant_id = o.tenant_id WHERE {pin}",
+        "SELECT o.tenant_id, a.bal FROM owners o LEFT JOIN {a} a ON a.tenant_id = o.tenant_id AND {apin}",
+        "SELECT o.tenant_id, a.bal FROM owners o LEFT JOIN {a} a ON a.tenant_id = o.tenant_id AND {apin} WHERE {pin}",
+        "SELECT o.tenant_id FROM owners o LEFT JOIN {a} a ON a.tenant_id = o.tenant_id WHERE a.tenant_id IS NULL AND {pin}",
+        "SELECT COUNT(*), SUM(a.bal) FROM {a} a, owners o WHERE a.tenant_id = o.tenant_id AND {pin}",
+        "SELECT a.tenant_id, p.name FROM owners o JOIN owners p ON p.tenant_id = o.tenant_id \
+         JOIN {a} a ON a.tenant_id = p.tenant_id WHERE {pin}",
+        "SELECT COUNT(*) FROM {a} a JOIN owners o ON a.tenant_id = o.tenant_id WHERE {pin} AND a.tenant_id = 6",
+        "SELECT a.tenant_id, o.tenant_id FROM {a} a RIGHT JOIN owners o ON a.tenant_id = o.tenant_id WHERE {pin}",
+        "SELECT a.tenant_id, o.tenant_id FROM {a} a FULL JOIN owners o ON a.tenant_id = o.tenant_id WHERE {pin}",
+    ];
+    for v in [5, 6, 7, 100] {
+        for q in queries {
+            let mut answers = Vec::new();
+            for a in ["acct", "acct_q"] {
+                for (pin, apin) in [
+                    (format!("o.tenant_id = {v}"), format!("a.tenant_id = {v}")),
+                    (format!("o.tenant_id + 0 = {v}"), format!("a.tenant_id + 0 = {v}")),
+                ] {
+                    let sql = q.replace("{a}", a).replace("{pin}", &pin).replace("{apin}", &apin);
+                    let mut got = table(&db, &sql).await;
+                    got.sort();
+                    answers.push((sql, got));
+                }
+            }
+            for (sql, got) in &answers[1..] {
+                assert_eq!(got, &answers[0].1, "{sql}\n  differs from\n{}", answers[0].0);
+            }
+        }
+    }
     close(db, dir.path());
 }
 

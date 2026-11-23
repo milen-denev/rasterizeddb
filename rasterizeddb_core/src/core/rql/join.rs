@@ -3207,6 +3207,305 @@ pub fn split_qualified(name: &str) -> (Option<String>, String) {
     }
 }
 
+/// The most constants carried onto one column. A clause pinning a key to
+/// more values than this is not the shape this serves (a point read through
+/// a join), and every one added is a term each scanned row evaluates.
+const MAX_CARRIED_CONSTANTS: usize = 8;
+
+/// Adds to each relation's scan the `column = constant` terms its join
+/// equalities imply. Every row a relation's scan returns satisfies its
+/// predicate's top-level `col = literal` conjuncts; across an equality
+/// `a.x = b.y` that every surviving tuple satisfies, a row of `b` with `y`
+/// other than that constant pairs with no row of `a`, so it is dropped from
+/// `b`'s scan and nothing the join answers changes. The new terms route a
+/// partitioned relation to the partitions holding the constant, and narrow
+/// a plain one through its indexes and filter.
+///
+/// Where an equality carries a constant, by join kind:
+/// - an `INNER` join's key: both ways;
+/// - a `LEFT` join's key: from the preserved side to the joined
+///   (null-supplying) one only. The other way would drop preserved rows that
+///   must come out NULL-padded;
+/// - `RIGHT`, `FULL` and cross joins: never;
+/// - a top-level `WHERE` conjunct `a.x = b.y` across two relations: both
+///   ways, whatever the join kinds. A tuple in which either side is
+///   NULL-padded fails it, so no restriction it implies can drop a tuple
+///   that would have come out.
+///
+/// Only between two columns of the same type, or two integer columns with
+/// the constant in the target's range, and never a column with a
+/// case-insensitive collation, whose `=` is not the bytes'. A text constant
+/// ending in a space is not carried: a `character(n)` column compares
+/// without trailing spaces, a `text` one with them. Facts are carried to a
+/// fixpoint, so a chain `a = b = c` reaches `c`; a column given two
+/// different constants reads nothing, as `x = 1 AND x = 2` does, and its
+/// route is empty.
+fn infer_join_constants(
+    joins: &[Option<JoinedRelation>],
+    relations: &[RelationRef],
+    schemas: &[SmallVec<[SchemaField; 20]>],
+    cross_relation: &[String],
+    predicates: &mut [Vec<String>],
+) {
+    // (from relation, from column, to relation, to column)
+    let mut edges: Vec<(usize, String, usize, String)> = Vec::new();
+    let add = |edges: &mut Vec<(usize, String, usize, String)>, a: (usize, &str), b: (usize, &str), both: bool| {
+        edges.push((a.0, a.1.to_string(), b.0, b.1.to_string()));
+        if both {
+            edges.push((b.0, b.1.to_string(), a.0, a.1.to_string()));
+        }
+    };
+    for (i, join) in joins.iter().enumerate() {
+        let Some(join) = join else { continue };
+        let both = match join.kind {
+            JoinKind::Inner => true,
+            JoinKind::Left => false,
+            JoinKind::Right | JoinKind::Full | JoinKind::Cross => continue,
+        };
+        for (left, right) in &join.keys {
+            add(&mut edges, (join.left_rel, left), (i, right), both);
+        }
+    }
+    for term in cross_relation {
+        if let Some((a, b)) = column_equality(term, relations, schemas) {
+            if a.0 != b.0 {
+                add(&mut edges, (a.0, &a.1), (b.0, &b.1), true);
+            }
+        }
+    }
+    if edges.is_empty() {
+        return;
+    }
+
+    // The constants each relation's scan pins each column to.
+    let mut facts: Vec<Vec<(String, String)>> = predicates
+        .iter()
+        .enumerate()
+        .map(|(rel, terms)| {
+            terms
+                .iter()
+                .filter_map(|t| constant_equality(t, &relations[rel], &schemas[rel]))
+                .collect()
+        })
+        .collect();
+    loop {
+        let mut added = false;
+        for (from, from_col, to, to_col) in &edges {
+            let (Some(from_field), Some(to_field)) = (
+                schemas[*from].iter().find(|f| f.name == *from_col),
+                schemas[*to].iter().find(|f| f.name == *to_col),
+            ) else {
+                continue;
+            };
+            if !crate::core::rql::collation::of(from_col, &schemas[*from]).is_binary()
+                || !crate::core::rql::collation::of(to_col, &schemas[*to]).is_binary()
+            {
+                continue;
+            }
+            let carried: Vec<String> = facts[*from]
+                .iter()
+                .filter(|(c, _)| c == from_col)
+                .map(|(_, v)| v.clone())
+                .filter(|v| constant_fits(v, &from_field.db_type, &to_field.db_type))
+                .collect();
+            for value in carried {
+                let held = facts[*to].iter().filter(|(c, _)| c == to_col).count();
+                if held >= MAX_CARRIED_CONSTANTS || facts[*to].iter().any(|(c, v)| c == to_col && *v == value) {
+                    continue;
+                }
+                predicates[*to].push(format!("{} = {}", bare_ident(to_col), value));
+                facts[*to].push((to_col.clone(), value));
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
+/// A column name as a scan reads it: bare when it is a plain lower-case
+/// identifier, quoted otherwise.
+fn bare_ident(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if plain { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
+}
+
+/// Whether `literal`, pinning a column of type `from`, may be carried onto
+/// one of type `to` and mean the same there.
+fn constant_fits(literal: &str, from: &DbType, to: &DbType) -> bool {
+    let integer = |t: &DbType| {
+        matches!(
+            t,
+            DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32 | DbType::U64
+        )
+    };
+    if literal.starts_with('\'') {
+        // A text constant, only onto the same type, and not one a
+        // `character(n)` column would read without its trailing spaces.
+        return from == to && matches!(to, DbType::STRING) && !literal.trim_end_matches('\'').ends_with(' ');
+    }
+    if !(integer(from) && integer(to)) {
+        return false;
+    }
+    let Ok(v) = literal.replace(' ', "").parse::<i128>() else {
+        return false;
+    };
+    let (lo, hi): (i128, i128) = match to {
+        DbType::I8 => (i8::MIN.into(), i8::MAX.into()),
+        DbType::I16 => (i16::MIN.into(), i16::MAX.into()),
+        DbType::I32 => (i32::MIN.into(), i32::MAX.into()),
+        DbType::I64 => (i64::MIN.into(), i64::MAX.into()),
+        DbType::U8 => (0, u8::MAX.into()),
+        DbType::U16 => (0, u16::MAX.into()),
+        DbType::U32 => (0, u32::MAX.into()),
+        DbType::U64 => (0, u64::MAX.into()),
+        _ => return false,
+    };
+    (lo..=hi).contains(&v)
+}
+
+/// `conjunct` as `column = literal` (or `literal = column`) over one column
+/// of `rel`, the literal an integer or a single-quoted string as written;
+/// `None` for anything else, so only a plain equality is a fact.
+fn constant_equality(conjunct: &str, rel: &RelationRef, schema: &[SchemaField]) -> Option<(String, String)> {
+    let (lhs, rhs) = split_equality(conjunct)?;
+    let (column, literal) = match (column_of(lhs, rel, schema), column_of(rhs, rel, schema)) {
+        (Some(c), None) => (c, rhs),
+        (None, Some(c)) => (c, lhs),
+        _ => return None,
+    };
+    is_plain_literal(literal).then(|| (column, literal.to_string()))
+}
+
+/// `conjunct` as `x.a = y.b` over two relations' columns, each side
+/// qualified by a relation's label or table name.
+fn column_equality(
+    conjunct: &str,
+    relations: &[RelationRef],
+    schemas: &[SmallVec<[SchemaField; 20]>],
+) -> Option<((usize, String), (usize, String))> {
+    let (lhs, rhs) = split_equality(conjunct)?;
+    let side = |text: &str| -> Option<(usize, String)> {
+        let (qualifier, _) = text.split_once('.')?;
+        let qualifier = qualifier.trim().trim_matches('"');
+        let rel = relations
+            .iter()
+            .position(|r| r.label.eq_ignore_ascii_case(qualifier))
+            .or_else(|| relations.iter().position(|r| r.table.eq_ignore_ascii_case(qualifier)))?;
+        column_of(text, &relations[rel], &schemas[rel]).map(|c| (rel, c))
+    };
+    Some((side(lhs)?, side(rhs)?))
+}
+
+/// The two sides of a conjunct that is one top-level `=` and nothing else,
+/// outer parentheses removed.
+fn split_equality(conjunct: &str) -> Option<(&str, &str)> {
+    let mut text = conjunct.trim();
+    while text.starts_with('(') && text.ends_with(')') && wraps_whole(text) {
+        text = text[1..text.len() - 1].trim();
+    }
+    let bytes = text.as_bytes();
+    let (mut depth, mut quote, mut at) = (0usize, None::<u8>, None::<usize>);
+    for (i, &c) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth = depth.checked_sub(1)?,
+                b'=' if depth == 0 => {
+                    let before = i.checked_sub(1).map(|j| bytes[j]);
+                    let after = bytes.get(i + 1).copied();
+                    if matches!(before, Some(b'<' | b'>' | b'!' | b'=' | b':')) || after == Some(b'=') || at.is_some() {
+                        return None;
+                    }
+                    at = Some(i);
+                }
+                b'<' | b'>' | b'!' | b'|' | b'~' if depth == 0 => return None,
+                _ => {}
+            },
+        }
+    }
+    let at = at?;
+    let (lhs, rhs) = (text[..at].trim(), text[at + 1..].trim());
+    // One operand each side: a keyword (`a = 1 OR b = 2` never reaches here
+    // as one conjunct, but `x = 1 IS TRUE` could) makes it something else.
+    let simple = |s: &str| {
+        !s.is_empty()
+            && (s.starts_with('\'') || !s.split_whitespace().nth(1).is_some_and(|w| w.chars().any(|c| c.is_ascii_alphabetic())))
+    };
+    (simple(lhs) && simple(rhs)).then_some((lhs, rhs))
+}
+
+/// Whether `text` opens with a parenthesis that closes at its last byte.
+fn wraps_whole(text: &str) -> bool {
+    let (mut depth, mut quote) = (0usize, None::<u8>);
+    for (i, &c) in text.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i == text.len() - 1;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
+/// `text` as a column of `rel`: bare or qualified by its label or table,
+/// quoted or not. The field's own name.
+fn column_of(text: &str, rel: &RelationRef, schema: &[SchemaField]) -> Option<String> {
+    let text = text.trim();
+    let column = match text.rsplit_once('.') {
+        Some((qualifier, column)) if !text.starts_with('\'') => {
+            let qualifier = qualifier.trim().trim_matches('"');
+            if !qualifier.eq_ignore_ascii_case(&rel.label) && !qualifier.eq_ignore_ascii_case(&rel.table) {
+                return None;
+            }
+            column.trim()
+        }
+        _ => text,
+    };
+    if let Some(quoted) = column.strip_prefix('"').and_then(|c| c.strip_suffix('"')) {
+        return schema.iter().find(|f| f.name == quoted).map(|f| f.name.clone());
+    }
+    if column.is_empty() || !column.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if column.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    schema.iter().find(|f| f.name.eq_ignore_ascii_case(column)).map(|f| f.name.clone())
+}
+
+/// An integer (`7`, `-7`, `- 7`) or one single-quoted string with no cast.
+fn is_plain_literal(text: &str) -> bool {
+    let t = text.trim();
+    if let Some(inner) = t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        // One string: every quote inside doubled.
+        return !inner.replace("''", "").contains('\'');
+    }
+    let digits = t.strip_prefix('-').map(str::trim_start).unwrap_or(t);
+    !digits.is_empty() && digits.len() <= 39 && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Splits a `WHERE` clause into top-level `AND` conjuncts, respecting quotes and
 /// parentheses.
 pub fn split_conjuncts(where_clause: &str) -> Vec<String> {
@@ -3888,6 +4187,14 @@ pub fn plan(
     for (rel, terms) in not_null.into_iter().enumerate() {
         predicates[rel].extend(terms);
     }
+
+    // --- Key constants carried across the join --------------------------
+    //
+    // `s JOIN f ON f.case_id = s.case_id WHERE s.case_id = 7` reads `f` only
+    // where `case_id = 7`: the constant is added to `f`'s scan, which routes
+    // a partitioned `f` to one partition instead of all of them
+    // (`infer_join_constants`).
+    infer_join_constants(&joins, &relations, &schemas, &cross_relation, &mut predicates);
 
     // --- aggregate stage -------------------------------------------------
     //
@@ -7606,5 +7913,73 @@ mod outer_join_reference {
         let p = planned("ta a LEFT JOIN tb b ON b.k = a.k AND b.s = 'x'", "").expect("on term");
         assert!(!p.relations[1].predicate.is_empty());
         assert!(p.relations[1].match_condition.is_none());
+    }
+
+    /// `infer_join_constants`, by join kind: which relation's scan gains the
+    /// constant its equalities imply.
+    #[test]
+    fn join_constants_are_carried_only_where_sound() {
+        let planned = |from: &str, where_clause: &str| {
+            plan(
+                parse_from_clause(from).unwrap(),
+                "a.id",
+                where_clause,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                &schema_of,
+            )
+            .expect(from)
+        };
+        // The scan's rewrite may wrap the terms in parentheses: every
+        // conjunct, at any depth of `AND`.
+        fn flat(text: &str, out: &mut Vec<String>) {
+            for t in split_conjuncts(text) {
+                let t = t.trim();
+                if t.starts_with('(') && t.ends_with(')') && wraps_whole(t) {
+                    flat(&t[1..t.len() - 1], out);
+                } else {
+                    out.push(t.to_string());
+                }
+            }
+        }
+        let pins = |p: &JoinPlan, rel: usize, column: &str, v: &str| {
+            let mut terms = Vec::new();
+            flat(&p.relations[rel].predicate, &mut terms);
+            terms.iter().any(|t| split_equality(t).is_some_and(|(l, r)| l == column && r.replace(" ", "") == v))
+        };
+        // INNER: both ways.
+        let p = planned("ta a JOIN tb b ON b.k = a.k", "a.k = 5");
+        assert!(pins(&p, 1, "k", "5"), "{:?}", p.relations[1].predicate);
+        let p = planned("ta a JOIN tb b ON b.k = a.k", "b.k = 5");
+        assert!(pins(&p, 0, "k", "5"), "{:?}", p.relations[0].predicate);
+        // A chain reaches the third relation; a negative constant rides along.
+        let p = planned("ta a JOIN tb b ON b.k = a.k JOIN tc c ON c.bk = b.k", "a.k = -5");
+        assert!(pins(&p, 2, "bk", "-5"), "{:?}", p.relations[2].predicate);
+        // LEFT: preserved to joined only.
+        let p = planned("ta a LEFT JOIN tb b ON b.k = a.k", "a.k = 5");
+        assert!(pins(&p, 1, "k", "5"), "{:?}", p.relations[1].predicate);
+        let p = planned("ta a LEFT JOIN tb b ON b.k = a.k AND b.k = 5", "");
+        assert!(!pins(&p, 0, "k", "5"), "a LEFT JOIN's joined pin narrowed the preserved side");
+        // RIGHT and FULL: never.
+        for from in ["ta a RIGHT JOIN tb b ON b.k = a.k", "ta a FULL JOIN tb b ON b.k = a.k"] {
+            for (rel, term) in [(0, "b.k = 5"), (1, "a.k = 5")] {
+                let p = planned(from, term);
+                assert!(!pins(&p, rel, "k", "5"), "{from} WHERE {term}: carried");
+            }
+        }
+        // A WHERE equality across a comma join: both ways.
+        let p = planned("ta a, tb b", "a.k = b.k AND b.k = 7");
+        assert!(pins(&p, 0, "k", "7"), "{:?}", p.relations[0].predicate);
+        // Not a plain equality, so no fact: arithmetic, a range, a cast.
+        for term in ["a.k + 0 = 5", "a.k > 5", "a.k = 5::bigint", "a.k = 5 OR a.k = 6"] {
+            let p = planned("ta a JOIN tb b ON b.k = a.k", term);
+            assert!(!p.relations[1].predicate.contains('5') && !p.relations[1].predicate.contains('6'), "{term}: carried");
+        }
+        // Not across types: an integer key onto a text column.
+        let p = planned("ta a JOIN tb b ON b.s = a.id", "a.id = 5");
+        assert!(!pins(&p, 1, "s", "5"), "carried an integer onto text");
     }
 }

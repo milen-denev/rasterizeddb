@@ -3,9 +3,11 @@
 //!
 //! The input is what `sarg::extract_gated` returns with a gate admitting only
 //! the key's write_orders (not `extract_gated_with_paths`), and whether
-//! `sarg::clause_is_constant_false` holds. That flag is the only way to route
-//! to nothing: everything else widens when unsure, since pruning without proof
-//! is a silent wrong answer and fanning out is only slower.
+//! `sarg::clause_is_constant_false` holds. That flag, and a key column held
+//! to two disjoint sets of values by one `AND` (`t = 1 AND t = 2`, compared
+//! by the bytes the router hashes), are the only ways to route to nothing:
+//! everything else widens when unsure, since pruning without proof is a
+//! silent wrong answer and fanning out is only slower.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -24,7 +26,8 @@ pub const POINT_CAP: u64 = 256;
 /// Where a statement's rows can be.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
-    /// No row can match. Only from `clause_is_constant_false`.
+    /// No row can match: `clause_is_constant_false`, or an `AND` holding a
+    /// key column to disjoint values (`KeyBox::meet`).
     Zero,
     /// Every partition.
     All,
@@ -69,7 +72,12 @@ pub fn route(spec: &KeySpec, mask: Option<&MaskExpr>, constant_false: bool) -> R
     let Some(mask) = mask else {
         return Route::All;
     };
-    expand(spec, &fold(spec, mask))
+    let boxes = fold(spec, mask);
+    if boxes.set.is_empty() {
+        // Every box met in nothing (`KeyBox::meet`).
+        return Route::Zero;
+    }
+    expand(spec, &boxes)
 }
 
 /// A level's admissible values: sorted and distinct.
@@ -119,27 +127,48 @@ impl KeyBox {
         }
     }
 
-    /// The box of `self AND other`. Sets for one level are unioned, never
-    /// intersected: `t = 1 AND t = 2` routes to both tenants. An empty
-    /// intersection would route to nothing without the proof only
-    /// `clause_is_constant_false` gives, and would skip the scan that raises
-    /// any evaluation error.
-    fn meet(&self, other: &KeyBox) -> KeyBox {
+    /// The box of `self AND other`, `None` when no row can be in it. Two
+    /// sets for one level intersect, compared by the bytes the router
+    /// hashes (`key::route_bytes`): `t = 1 AND t = 2` routes to nothing, as
+    /// PostgreSQL prunes every partition for it, and `t IN (1, 2) AND t IN
+    /// (2, 3)` to tenant 2. Comparing what routing compares makes the
+    /// intersection exactly as sound as routing: a row placed by one value's
+    /// bytes cannot match a value whose bytes differ, or routing itself
+    /// would miss it. A set holding a value that does not normalise (a width
+    /// no coercion produces) is unioned instead, as before, which only
+    /// widens.
+    fn meet(&self, other: &KeyBox, spec: &KeySpec) -> Option<KeyBox> {
         let mut out = KeyBox::any();
-        for (o, (a, b)) in out.0.iter_mut().zip(self.0.iter().zip(&other.0)) {
+        for (level, (o, (a, b))) in out.0.iter_mut().zip(self.0.iter().zip(&other.0)).enumerate() {
             *o = match (a, b) {
-                (Some(a), Some(b)) => {
-                    let mut u: ValueSet = a.iter().chain(b).cloned().collect();
-                    u.sort_unstable();
-                    u.dedup();
-                    Some(u)
-                }
+                (Some(a), Some(b)) => match intersect(spec, level, a, b) {
+                    Some(both) if both.is_empty() => return None,
+                    Some(both) => Some(both),
+                    None => {
+                        let mut u: ValueSet = a.iter().chain(b).cloned().collect();
+                        u.sort_unstable();
+                        u.dedup();
+                        Some(u)
+                    }
+                },
                 (Some(s), None) | (None, Some(s)) => Some(s.clone()),
                 (None, None) => None,
             };
         }
-        out
+        Some(out)
     }
+}
+
+/// The values of `a` that `b` holds too, as level `level` routes them; `None`
+/// when a value of either does not normalise, so nothing is proven.
+fn intersect(spec: &KeySpec, level: usize, a: &ValueSet, b: &ValueSet) -> Option<ValueSet> {
+    let t = &spec.levels().get(level)?.db_type;
+    let routed = |set: &ValueSet| -> Option<Vec<Vec<u8>>> {
+        set.iter().map(|v| super::key::route_bytes(t, v).ok()).collect()
+    };
+    let (ra, rb) = (routed(a)?, routed(b)?);
+    let rb: HashSet<Vec<u8>> = rb.into_iter().collect();
+    Some(a.iter().zip(ra).filter(|(_, r)| rb.contains(r)).map(|(v, _)| v.clone()).collect())
 }
 
 /// A union of boxes kept at most [`POINT_CAP`] points by degrading as it
@@ -275,16 +304,23 @@ fn fold_and(spec: &KeySpec, children: &[MaskExpr]) -> Boxes {
             continue;
         }
         // Capped as it is built: two 256-box operands never hold 65,536.
+        // A pair that meets in nothing adds no box; when none meets, the
+        // product is empty and so is the whole `AND`.
         let mut product = Boxes::new();
         'product: for a in &acc.set {
             for b in &next.set {
-                product.push(a.meet(b));
+                if let Some(m) = a.meet(b, spec) {
+                    product.push(m);
+                }
                 if product.is_any() {
                     break 'product;
                 }
             }
         }
         acc = product;
+        if acc.set.is_empty() {
+            break;
+        }
     }
     acc
 }
@@ -307,8 +343,9 @@ fn fold_or(spec: &KeySpec, children: &[MaskExpr]) -> Boxes {
             return out;
         }
     }
-    // An empty `Or` is no proof of anything.
-    if out.set.is_empty() { Boxes::any() } else { out }
+    // An empty `Or` is no proof of anything; one whose every branch is
+    // empty (each an `AND` meeting in nothing) matches no row.
+    if children.is_empty() { Boxes::any() } else { out }
 }
 
 /// `col IN (…)` as the rewriter lowers it, `col = a OR col = b OR …` on one
@@ -657,30 +694,36 @@ mod tests {
             r(&s, &or(vec![eq(T, 1), and(vec![eq(T, 3), eq(G, 4)])])),
             points(vec![prefix(&s, &[1]), prefix(&s, &[3, 4])])
         );
-        // An AND over an OR keeps the OR's narrow branches.
+        // An AND over an OR keeps the OR's narrow branches, each met with
+        // the other side: `t = 1` meets `t = 3` in nothing, `g = 2` in the
+        // point (3, 2).
         assert_eq!(
             r(&s, &and(vec![or(vec![eq(T, 1), eq(G, 2)]), eq(T, 3)])),
-            points(vec![prefix(&s, &[1]), prefix(&s, &[3]), prefix(&s, &[3, 2])])
+            points(vec![prefix(&s, &[3, 2])])
         );
     }
 
     #[test]
-    fn and_unions_a_level_never_intersects() {
+    fn and_intersects_a_level() {
         let s = spec(&[T, G]);
-        // A contradiction the constant-false check does not see still routes
-        // somewhere: the scan, not the router, finds it matches nothing.
-        assert_eq!(
-            r(&s, &and(vec![eq(T, 1), eq(T, 2)])),
-            points(vec![prefix(&s, &[1]), prefix(&s, &[2])])
-        );
-        assert_eq!(
-            r(&s, &and(vec![eq(T, 1), eq(G, 7), eq(G, 8)])),
-            points(vec![prefix(&s, &[1, 7]), prefix(&s, &[1, 8])])
-        );
-        assert_eq!(
-            r(&s, &and(vec![in_list(T, [1, 2]), in_list(T, [2, 3])])),
-            points(vec![prefix(&s, &[1]), prefix(&s, &[2]), prefix(&s, &[3])])
-        );
+        // A key column held to two values by one AND: no row, no partition,
+        // as PostgreSQL prunes it. Mutation: union in `meet` again.
+        assert_eq!(r(&s, &and(vec![eq(T, 1), eq(T, 2)])), Route::Zero);
+        assert_eq!(r(&s, &and(vec![eq(T, 1), eq(G, 7), eq(G, 8)])), Route::Zero);
+        assert_eq!(r(&s, &and(vec![in_list(T, [1, 2]), in_list(T, [2, 3])])), points(vec![prefix(&s, &[2])]));
+        assert_eq!(r(&s, &and(vec![eq(T, 1), eq(T, 1)])), points(vec![prefix(&s, &[1])]));
+        // An OR whose every branch is a contradiction matches nothing; one
+        // live branch routes it.
+        let dead = || and(vec![eq(T, 1), eq(T, 2)]);
+        assert_eq!(r(&s, &or(vec![dead(), dead()])), Route::Zero);
+        assert_eq!(r(&s, &or(vec![dead(), eq(T, 3)])), points(vec![prefix(&s, &[3])]));
+        // A contradiction under an AND with something unreadable is still
+        // one: `All` constrains nothing.
+        assert_eq!(r(&s, &and(vec![MaskExpr::All, dead()])), Route::Zero);
+        // A value that does not normalise proves nothing: the sets union.
+        let mut short = enc(T, 2);
+        short.pop();
+        assert_ne!(r(&s, &and(vec![eq(T, 1), pred(T, SargOp::Eq, short)])), Route::Zero);
     }
 
     #[test]
@@ -916,8 +959,9 @@ mod tests {
             let split = split_map(&s, 0..DOMAIN as i64, 4);
             for _ in 0..600 {
                 let e = random_tree(&mut rng, 3);
+                // `Zero` is allowed: a key held to disjoint values. The rows
+                // below then prove it matched none.
                 let got = r(&s, &e);
-                assert_ne!(got, Route::Zero);
                 let pids = got.pids(&map);
                 let split_pids = got.pids(&split);
                 let mut hit = false;
