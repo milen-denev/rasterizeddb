@@ -81,8 +81,8 @@ D1 and D6.
 | D7 | HA before phase 3 | Allow the **existing replication one-way per shard** as a warm standby with manual failover. It is statement-based, with known divergence risks (§4.3 B1a.13). The alternative is RF1 plus S3 restore. |
 | D8 | Default for a statement with no route key (`unrouted`, B1b) | **`refuse` by default.** Turn on `fan_out` per role (reporting, admin) or per gateway where the app expects it. A forgotten key then surfaces as an error instead of a silent whole-cluster scan. `unrouted_writes = each_shard` is never a gateway-wide default, because it is not atomic before 2PC |
 | D9 | User-based routing (G11): which modes, and the default | Build **both modes**. `user_routing = off` by default, `prefer` where tenants log in as their own roles. `user_key` is the one to choose when the data has a tenant column, because moves and fan-out keep working. `user_shard` is for apps whose tables have no tenant column |
-| D10 | Enterprise packaging | Whether `segregation_policies` (and possibly `tenant_isolation`) is an open feature or a licensed enterprise build is the owner's call. The code is separable either way, because each is its own Cargo feature |
-| D11 | HA for customer databases | Extend today's replication from the default database to every database (sooner, statement-based), or wait for B3's Raft. Recommendation: extend replication for the service's first customers, and move to Raft when B3 lands |
+| D10 | Licensing | **Decided 2026-11-23:** a dual licence. An organisation with **more than 100 employees, or more than 1 million in revenue, or more than 5 million in assets** must obtain a licence from **Denev Operations EOOD**, the licensor. Engineering items and the caveat are in §10 |
+| D11 | HA for customer databases | **Decided 2026-11-23:** replication covers **every database in an instance, any number of them**, not only the default one. The work items are in §4.10 (R-ALL) |
 
 ## 2. Cargo features
 
@@ -1268,10 +1268,25 @@ role and password verifier from the default database (`catalog.rs:453-467`,
      has its own WAL.
   3. Verify, flip the tenant directory, release.
 - **Backups.** Each customer's database already archives to its own prefix.
-- **HA gap (stated).** Today's replication covers the default database
-  only (`main.rs:1829`). Customer databases therefore get HA only from B3's
-  Raft, or from extending replication to every database. That is a
-  decision, D11.
+- **HA for every database (D11, decided): R-ALL.** Replication must cover
+  every database in an instance, any number of them. Today it covers the
+  default database only (`main.rs:1829`), and a `CREATE DATABASE` database
+  gets a "not replicated" warning. Work items, in today's replication
+  (statement-based, [replication.md](replication.md)), until B3's Raft
+  replaces it per shard:
+
+  | # | Item |
+  |---|---|
+  | R-ALL.1 | **One stream per database.** Each `Database` keeps its own `db_replication.*` log, intents and state in its own directory, with its own sequence. Streams never mix. Apply runs in that database's context; [[task-locals-cross-databases]] is the known trap. |
+  | R-ALL.2 | **One link per peer pair, carrying every database's stream.** Frames are tagged with the database's **name plus a creation uid**, never `Database::id`, which is a per-process counter. Pipelining (depth 8) runs per database, so one busy customer cannot stall another's stream (the same fairness rule as gateway R3). |
+  | R-ALL.3 | **The database set replicates too.** `CREATE DATABASE`, `CREATE TENANT`, `DROP DATABASE`/`DROP TENANT` and renames go into a small instance-level stream, ordered so a database exists on the peer before its first record applies, and its stream stops before the drop. |
+  | R-ALL.4 | **Seeding.** The handshake exchanges the database list with each stream's position. A database the peer lacks, or one that reports `needs reseed`, is seeded from the backup snapshot routine for that one database, with the per-database state files kept or stripped as [[replication-reseed-state-files]] says. |
+  | R-ALL.5 | **Per-database control and status.** `SHOW REPLICATION` and `SHOW REPLICATION STATS` gain a database column. `REPLICATION CHECK [DATABASE d]` runs per database. A setting `replication.databases = all` (the default when replication is on) \| `default` \| a list, as a runtime knob. In tenant mode, all of these are process-admin only (T1). |
+  | R-ALL.6 | **Branches** are databases too and replicate as ordinary databases. Branch operations (`RESET`/`PROMOTE`/`MERGE BRANCH`) are captured as instance-stream events, or refused on a replicating instance until they are. Today branches are documented as not replicated. |
+  | R-ALL.7 | **Tests.** Two real nodes (the `.claude/reviews/repl-hardening/e2e.py` pattern): N databases created and dropped during load, kill -9 of each node, then a per-database verify and sum. Power-loss crash images per database. A slow database does not delay another's apply. Mutations: an untagged frame, stream order across databases, a create applied after its first record. |
+
+  *Size:* about 3–4k LOC. It has no sharding dependency and can run in
+  parallel with T1–T10.
 - **Noisy neighbours.** A customer that outgrows a shared shard moves to its
   own shard, or to a dedicated one under a policy (below).
 
@@ -1492,3 +1507,36 @@ covers the growth path.
 - **Line anchors.** All of them are stale: `route()` is `route.rs:68`; the
   status decoders are `status.rs:590`/`:1584`; the table write paths are as
   in §4.3 here.
+
+## 10. Licensing (D10, decided 2026-11-23)
+
+**The owner's decision.** The software ships under a dual licence. An
+organisation with **more than 100 employees**, **more than 1 million in
+revenue**, or **more than 5 million in assets** must obtain a licence from
+**Denev Operations EOOD**, which is responsible for licensing.
+
+**Caveat for the owner's legal review (this is not legal advice):**
+- **GPL cannot carry a size limit.** Today every crate is `GPL-3.0-only`
+  (`LICENSE-GPL`, every `Cargo.toml`, the README). GPLv3 forbids adding
+  conditions such as a size threshold (its §7 and §10). While the code is
+  offered under GPL, a large organisation may use it under GPL without
+  buying a licence.
+- **The threshold needs a different free licence.** To make it binding, the
+  free licence would have to be a source-available licence that contains
+  the threshold, paired with the commercial licence. The PolyForm Small
+  Business licence is a published template close to this: under 100 people
+  and under USD 1M revenue, with no assets test.
+- **Released versions keep their licence.** Versions already released under
+  GPL, 1.0.0 included, stay available under GPL.
+- **Currency.** The thresholds need a currency (EUR or USD) and a
+  measurement rule (group or affiliate counting, which year).
+
+**Engineering items, on the owner's word:**
+
+| # | Item |
+|---|---|
+| L1 | Licence files: the chosen free licence and `LICENSE-COMMERCIAL` (contact: Denev Operations EOOD), at the root and in every published crate |
+| L2 | `license` / `license-file` in every `Cargo.toml` (an SPDX `LicenseRef-…` for a custom licence), docker images' labels, the Arch package |
+| L3 | README and docs: the threshold and how to obtain a licence |
+| L4 | Scope: whether the dual licence covers the whole project or only the service and enterprise features (`tenant_isolation`, `segregation_policies`, the gateway). Each is its own Cargo feature, so either is possible |
+| L5 | No licence-enforcement code (keys, phone-home) is planned. If wanted, it is a separate design, and it would conflict with a GPL grant |
