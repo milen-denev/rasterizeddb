@@ -650,6 +650,21 @@ impl ConfigEntry {
         self.hot || self.restart_settable
     }
 
+    /// A restart-only setting the server was started with a flag for. Both
+    /// servers let the command line win over a saved value — RasterizedDB's
+    /// `rasterizeddb.conf` and PostgreSQL's `postgresql.auto.conf` alike — so
+    /// a save is kept but a restart does not apply it: the flag has to go
+    /// from whatever starts the server, a systemd unit as a rule, first.
+    pub fn held_by_flag(&self) -> bool {
+        !self.hot && self.source.trim().eq_ignore_ascii_case("command line")
+    }
+
+    /// The flag that sets it, from `set_with` (`--batch-size N (restart)`
+    /// gives `--batch-size`), when that names one.
+    pub fn flag(&self) -> Option<&str> {
+        self.set_with.split_whitespace().next().filter(|w| w.starts_with("--"))
+    }
+
     /// The values this setting takes, when it takes a fixed set.
     ///
     /// The server's `options` when it reports them. Until every server does,
