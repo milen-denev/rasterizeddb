@@ -883,7 +883,7 @@ async fn running_out_of_file_descriptors_fails_the_statement_with_53000() {
     let dir = tempfile::tempdir().unwrap();
     // Its own budget: an open out of descriptors evicts before its retry,
     // and from the process's budget that would close other tests' partitions.
-    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::DEFAULT_MAX_OPEN, Some(0));
     let db = open(dir.path()).await;
     populated(&db).await;
     let t = pt(&db);
@@ -919,7 +919,7 @@ async fn running_out_of_file_descriptors_in_the_existence_check_is_53000() {
     let dir = tempfile::tempdir().unwrap();
     // Its own budget: an open out of descriptors evicts before its retry,
     // and from the process's budget that would close other tests' partitions.
-    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::DEFAULT_MAX_OPEN, Some(0));
     let db = open(dir.path()).await;
     populated(&db).await;
     let t = pt(&db);
@@ -1055,7 +1055,7 @@ async fn an_open_failing_between_its_providers_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     // Its own budget: an open out of descriptors evicts before its retry,
     // and from the process's budget that would close other tests' partitions.
-    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::DEFAULT_MAX_OPEN, Some(0));
     let db = open(dir.path()).await;
     populated(&db).await;
     let t = pt(&db);
@@ -1510,7 +1510,7 @@ async fn a_partition_closed_after_writes_reopens_from_the_snapshot_its_close_sea
     use crate::core::index_store::load::{Origin, settings::IndexStorage, storage_override};
     let dir = tempfile::tempdir().unwrap();
     let _snap = storage_override::set(dir.path(), IndexStorage::Snapshot);
-    let _budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let _budget = super::budget::isolate_with(dir.path(), super::budget::DEFAULT_MAX_OPEN, Some(0));
     let db = open(dir.path()).await;
     db.partition_maintenance().set_period(Duration::from_secs(3600));
     populated(&db).await;
@@ -1623,7 +1623,7 @@ async fn a_reopened_partition_never_takes_the_legacy_char_canonical_flag() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_open_out_of_descriptors_closes_idle_partitions_and_retries() {
     let dir = tempfile::tempdir().unwrap();
-    let budget = super::budget::isolate_with(dir.path(), super::budget::MAX_OPEN, Some(0));
+    let budget = super::budget::isolate_with(dir.path(), super::budget::DEFAULT_MAX_OPEN, Some(0));
     let db = open(dir.path()).await;
     db.partition_maintenance().set_period(Duration::from_secs(3600));
     populated(&db).await;

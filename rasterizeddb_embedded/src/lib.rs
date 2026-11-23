@@ -380,6 +380,14 @@ impl Builder {
         self.config("partition.open_budget", partitions.to_string())
     }
 
+    /// The most partitions a derived open budget allows (`partition.max_open`,
+    /// `--partition-max-open`, default 4096). With
+    /// [`Builder::raise_descriptor_limit`], the open-file limit is raised for
+    /// this many, ten descriptors each. Read once.
+    pub fn partition_max_open(self, partitions: usize) -> Self {
+        self.config("partition.max_open", partitions.to_string())
+    }
+
     /// Raises this process's soft open-file limit toward its hard limit, as
     /// far as the largest partition budget needs, the way the server binary
     /// does at start (default off: the limit is the application's). Unix

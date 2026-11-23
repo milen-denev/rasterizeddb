@@ -4,7 +4,8 @@
 //! # The budget
 //!
 //! At most [`Budget::limit`] partitions are open per process, across tables
-//! and databases: `min(4096, (RLIMIT_NOFILE − 2048) / 10)`, read from the
+//! and databases: `min(partition.max_open, (RLIMIT_NOFILE − 2048) / 10)`
+//! (`partition.max_open` 4096 unless a start set it), read from the
 //! soft limit at each open that may need room (so a server that raises its
 //! limit after starting gets the larger budget), at least 16, or the value
 //! `SET CONFIG partition.open_budget` set. The design's divisor is 10 (two
@@ -52,8 +53,11 @@ use super::table::Parts;
 
 /// Rings in the CLOCK.
 pub const SHARDS: usize = 16;
-/// The derived budget's ceiling (§7.1).
-pub const MAX_OPEN: usize = 4096;
+/// The derived budget's ceiling (§7.1) unless a start sets
+/// `partition.max_open` ([`settings::max_open`]).
+pub const DEFAULT_MAX_OPEN: usize = 4096;
+/// The largest `partition.max_open` takes: ten million descriptors.
+pub const MAX_OPEN_LIMIT: usize = 1_000_000;
 /// The derived budget's floor.
 pub const MIN_OPEN: usize = 16;
 /// Descriptors reserved for everything that is not a partition.
@@ -66,12 +70,28 @@ pub const CLOSES_PER_OPEN: usize = 2;
 /// Partitions one board round closes to trim an overrun, at most.
 pub const TRIM_PER_ROUND: usize = 8;
 
-/// `SET CONFIG partition.open_budget` (0: derived) and `partition.idle_close_secs`.
+/// `SET CONFIG partition.open_budget` (0: derived) and `partition.idle_close_secs`;
+/// `partition.max_open`, set at start.
 pub mod settings {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     static OPEN_BUDGET: AtomicU64 = AtomicU64::new(0);
     static IDLE_CLOSE_SECS: AtomicU64 = AtomicU64::new(300);
+    static MAX_OPEN: AtomicUsize = AtomicUsize::new(super::DEFAULT_MAX_OPEN);
+
+    /// The derived budget's ceiling, and what the descriptor limit a start
+    /// raises is sized for: `--partition-max-open`, `RDB_PARTITION_MAX_OPEN`
+    /// or `partition.max_open` in the settings file; 4096 otherwise.
+    pub fn max_open() -> usize {
+        MAX_OPEN.load(Ordering::Relaxed)
+    }
+
+    /// Sets [`max_open`], within 16 (the floor) and [`super::MAX_OPEN_LIMIT`].
+    /// A start sets it before [`super::raise_descriptor_limit`], which sizes
+    /// the descriptor limit from it.
+    pub fn set_max_open(n: usize) {
+        MAX_OPEN.store(n.clamp(super::MIN_OPEN, super::MAX_OPEN_LIMIT), Ordering::Relaxed);
+    }
 
     /// The configured budget; 0 derives it from the descriptor limit.
     pub fn open_budget() -> u64 {
@@ -389,21 +409,26 @@ fn derived_limit() -> usize {
             let n = limit_for(limit.rlim_cur as u64, others);
             // On a server, a budget short of the largest is first raised
             // toward it within the hard limit (`raise_descriptor_limit`).
-            if n < MAX_OPEN && RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
+            if n < settings::max_open() && RAISE_AS_TABLES_OPEN.load(Ordering::Relaxed) {
                 let (_, now) = raise_to_target();
                 return limit_for(now, others);
             }
             return n;
         }
     }
-    MAX_OPEN
+    settings::max_open()
 }
 
 /// The budget a soft descriptor limit of `soft` leaves when `others`
 /// descriptors are in use by everything but the open partitions.
 pub fn limit_for(soft: u64, others: u64) -> usize {
+    limit_under(soft, others, settings::max_open())
+}
+
+/// [`limit_for`] under a ceiling of `max_open` partitions.
+pub fn limit_under(soft: u64, others: u64, max_open: usize) -> usize {
     let n = soft.saturating_sub(RESERVE).saturating_sub(others) / PER_PARTITION;
-    (n as usize).clamp(MIN_OPEN, MAX_OPEN)
+    (n as usize).clamp(MIN_OPEN, max_open.max(MIN_OPEN))
 }
 
 /// How often the descriptors in use are counted, at most.
@@ -438,7 +463,7 @@ fn open_descriptors() -> u64 {
 /// Windows has no descriptor table to list: the process's handle count,
 /// which every open file adds one to, and every other handle too (threads,
 /// events, the runtime's). Windows has no per-process descriptor limit, so
-/// the budget does not derive from it there (`derived_limit` is `MAX_OPEN`);
+/// the budget does not derive from it there (`derived_limit` is `max_open`);
 /// it is the figure the statistics and the recount report.
 #[cfg(windows)]
 fn open_descriptors() -> u64 {
@@ -633,7 +658,7 @@ pub fn process_figures() -> (usize, usize, u64, u64) {
 }
 
 /// The soft descriptor limit a server raises itself to: as far as the
-/// largest open budget needs (`MAX_OPEN` partitions of ten descriptors over
+/// largest open budget needs (`partition.max_open` partitions of ten descriptors over
 /// the 2,048 reserve and `others`, the descriptors in use that are not
 /// partitions'), within the hard limit, and never lower than it is. `None` when the soft limit is already there or the hard limit leaves
 /// no room. pgwire raises it further if its connection cap needs more. Not
@@ -641,8 +666,33 @@ pub fn process_figures() -> (usize, usize, u64, u64) {
 /// anything still using `select()` breaks on a descriptor above 1,024, and a
 /// larger table is not free).
 pub fn descriptor_target(soft: u64, hard: u64, plain: u64) -> Option<u64> {
-    let wanted = RESERVE + plain + MAX_OPEN as u64 * PER_PARTITION;
+    target_under(soft, hard, plain, settings::max_open())
+}
+
+/// [`descriptor_target`] for a ceiling of `max_open` partitions.
+pub fn target_under(soft: u64, hard: u64, plain: u64, max_open: usize) -> Option<u64> {
+    let wanted = descriptors_for(max_open) + plain;
     (soft < wanted && hard > soft).then(|| wanted.min(hard))
+}
+
+/// The descriptors `max_open` open partitions need over the reserve, with no
+/// plain table open: what a start raises the soft limit toward.
+pub fn descriptors_for(max_open: usize) -> u64 {
+    RESERVE + max_open as u64 * PER_PARTITION
+}
+
+/// The hard `RLIMIT_NOFILE`, the most the soft limit can be raised to; `None`
+/// where there is none (Windows) or it cannot be read.
+pub fn hard_descriptor_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: a valid out-pointer to an `rlimit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            return Some(limit.rlim_max as u64);
+        }
+    }
+    None
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to [`descriptor_target`] for the
@@ -688,14 +738,32 @@ mod tests {
     /// limit at it, is left alone; a hard limit below the target caps it.
     #[test]
     fn the_descriptor_target_reaches_the_largest_budget_within_the_hard_limit() {
-        let wanted = RESERVE + MAX_OPEN as u64 * PER_PARTITION;
-        assert_eq!(descriptor_target(1024, 524_288, 0), Some(wanted));
-        assert_eq!(descriptor_target(1024, 4096, 0), Some(4096));
-        assert_eq!(descriptor_target(wanted, 524_288, 0), None);
-        assert_eq!(descriptor_target(524_288, 524_288, 0), None);
-        assert_eq!(descriptor_target(2256, 2256, 0), None);
+        let max = DEFAULT_MAX_OPEN;
+        let wanted = RESERVE + max as u64 * PER_PARTITION;
+        assert_eq!(target_under(1024, 524_288, 0, max), Some(wanted));
+        assert_eq!(target_under(1024, 4096, 0, max), Some(4096));
+        assert_eq!(target_under(wanted, 524_288, 0, max), None);
+        assert_eq!(target_under(524_288, 524_288, 0, max), None);
+        assert_eq!(target_under(2256, 2256, 0, max), None);
         // Open plain tables raise the target by what they hold.
-        assert_eq!(descriptor_target(wanted, 524_288, 6_000), Some(wanted + 6_000));
+        assert_eq!(target_under(wanted, 524_288, 6_000, max), Some(wanted + 6_000));
+    }
+
+    /// `partition.max_open` moves both the ceiling and the descriptor target:
+    /// pms's 5 tables of 1,024 partitions want 5,120 open, which the default
+    /// ceiling of 4,096 cut short whatever the descriptor limit.
+    #[test]
+    fn a_larger_max_open_raises_the_ceiling_and_the_descriptor_target() {
+        let max = 5 * 1024;
+        assert_eq!(descriptors_for(max), RESERVE + 51_200);
+        assert_eq!(target_under(1024, 524_288, 0, max), Some(RESERVE + 51_200));
+        // The hard limit caps the target, and the budget follows the cap.
+        assert_eq!(target_under(1024, 40_000, 0, max), Some(40_000));
+        assert_eq!(limit_under(40_000, 0, max), ((40_000 - RESERVE) / PER_PARTITION) as usize);
+        assert_eq!(limit_under(524_288, 0, max), max);
+        assert_eq!(limit_under(524_288, 0, DEFAULT_MAX_OPEN), DEFAULT_MAX_OPEN);
+        // A ceiling under the floor is the floor.
+        assert_eq!(limit_under(524_288, 0, 1), MIN_OPEN);
     }
 
     /// The count the budget reads is the last one taken, not a listing per
@@ -800,7 +868,7 @@ mod tests {
     fn open_plain_tables_shrink_the_derived_budget() {
         assert_eq!(limit_for(20_000, 0), ((20_000 - RESERVE) / PER_PARTITION) as usize);
         assert_eq!(limit_for(20_000, 12_000), ((20_000 - RESERVE - 12_000) / PER_PARTITION) as usize);
-        assert_eq!(limit_for(524_288, 60_000), MAX_OPEN);
+        assert_eq!(limit_under(524_288, 60_000, DEFAULT_MAX_OPEN), DEFAULT_MAX_OPEN);
         assert_eq!(limit_for(2_256, 400), MIN_OPEN);
         // Review B's case: 500 indexed tables (60 descriptors each) under a
         // soft limit of 43,008 leave room for about 1,100 partitions, not

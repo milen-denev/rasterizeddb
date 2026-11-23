@@ -21,6 +21,7 @@ use rasterizeddb_core::configuration::saved::{self, Source};
 use rasterizeddb_core::core::index::paged;
 use rasterizeddb_core::core::introspect;
 use rasterizeddb_core::core::kv_cache::{self, EvictionPolicy};
+use rasterizeddb_core::core::partition::budget as partition_budget;
 use rasterizeddb_core::simds::cpu::{self, SimdLevel, SimdRequest};
 
 /// Every key the engine reads once, before it starts (`SHOW CONFIG KEYS`
@@ -38,6 +39,7 @@ pub(crate) const STARTUP_KEYS: &[(&str, &str)] = &[
     ("index.residency", "memory"),
     ("index.cache_mb", "0"),
     ("index.delta_mb", "0"),
+    ("partition.max_open", "4096"),
 ];
 
 /// What a Builder was told. `config` holds every `section.key` setting in
@@ -330,6 +332,10 @@ impl Settings {
                 paged::set_delta_mb(number());
                 true
             }
+            "partition.max_open" => {
+                partition_budget::settings::set_max_open(number() as usize);
+                true
+            }
             other => unreachable!("{other} is in STARTUP_KEYS and has no setter"),
         };
         if took { Ok(true) } else { refused(key, value, origin) }
@@ -351,6 +357,7 @@ fn running(key: &str) -> Option<String> {
         "index.residency" => paged::residency().name().to_string(),
         "index.cache_mb" => paged::cache_mb_setting().to_string(),
         "index.delta_mb" => paged::delta_mb_setting().to_string(),
+        "partition.max_open" => partition_budget::settings::max_open().to_string(),
         _ => return None,
     })
 }

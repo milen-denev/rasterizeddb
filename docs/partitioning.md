@@ -1367,6 +1367,15 @@ the budget it derives with the SIMD line. A unit whose hard limit is low
 proportionally smaller budget; set `LimitNOFILE` to at least 43,008 (or
 size `partition.open_budget` to it).
 
+**The ceiling is a setting.** The 4,096 above is `partition.max_open`'s
+default: `--partition-max-open N`, the `RDB_PARTITION_MAX_OPEN` environment
+variable, or `SET CONFIG partition.max_open = N` (saved, applied at the
+next start; the flag and the environment win over the file), 16 to
+1,000,000. The start raises the soft limit toward 2,048 + N × 10 within the
+hard limit, and when the hard limit is what stops it short, says so with
+the figure `LimitNOFILE=` needs. pms's five tables of 1,024 partitions want
+`--partition-max-open 5120` and a hard limit of at least 53,248.
+
 **Decision: the budget is soft.** With every open partition held (by a
 statement, a job, or a transaction's kept ticket, P5b-1's close rule), an
 open goes past the budget (counted, `Budget::overruns`) rather than wait

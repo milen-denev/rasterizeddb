@@ -2538,6 +2538,16 @@ const CONFIG_KEYS: &[ConfigKey] = &[
     },
     ConfigKey {
         section: "partition",
+        key: "max_open",
+        hot: false,
+        set_with: "--partition-max-open N (restart)",
+        options: "",
+        help: "the most partitions a derived open budget allows (partition.open_budget = 0), across tables; \
+               a start raises the open-file limit for it, ten descriptors each over a 2,048 reserve, as far \
+               as the hard limit allows; RDB_PARTITION_MAX_OPEN sets it as the flag does",
+    },
+    ConfigKey {
+        section: "partition",
         key: "idle_close_secs",
         hot: true,
         set_with: "SET CONFIG partition.idle_close_secs = 300",
@@ -2702,6 +2712,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             ("auto_compact", "dead_fraction_max_slots") => crate::auto_compact_dead_fraction_max_slots().to_string(),
             ("auto_compact", "cooldown_secs") => crate::auto_compact_cooldown_secs().to_string(),
             ("partition", "open_budget") => crate::core::partition::budget::process_figures().0.to_string(),
+            ("partition", "max_open") => crate::core::partition::budget::settings::max_open().to_string(),
             ("partition", "idle_close_secs") => crate::core::partition::budget::settings::idle_close_secs().to_string(),
             ("index_snapshot", "idle_checkpoint_secs") => {
                 crate::core::index_store::seal::settings::idle_checkpoint_secs().to_string()
@@ -2787,6 +2798,10 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
         ("cache", "enabled") => parse_bool(v).map(|b| b.to_string()),
         // The slot array is built whole at start, two slots an entry.
         ("cache", "size") => number(1, 100_000_000),
+        ("partition", "max_open") => number(
+            crate::core::partition::budget::MIN_OPEN as u64,
+            crate::core::partition::budget::MAX_OPEN_LIMIT as u64,
+        ),
         ("index", "residency") => crate::core::index::paged::Residency::parse(v)
             .map(|r| r.name().to_string())
             .ok_or_else(|| format!("`{v}` is not a residency (memory, hybrid or disk)")),

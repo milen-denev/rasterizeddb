@@ -231,6 +231,14 @@ struct Args {
     #[arg(long = "log-level", alias = "log_level", value_name = "LEVEL")]
     log_level: Option<LevelFilter>,
 
+    /// The most partitions a derived open budget allows, across tables
+    /// (default: 4096; `partition.max_open`). The start raises the soft
+    /// open-file limit for it, ten descriptors a partition over a 2,048
+    /// reserve, within the hard limit. `RDB_PARTITION_MAX_OPEN` sets it when
+    /// the flag is not given.
+    #[arg(long = "partition-max-open", value_name = "N")]
+    partition_max_open: Option<usize>,
+
     /// Cache size in number of entries (default: 100_000)
     #[arg(long = "cache-size", alias = "cache_size", value_name = "N")]
     cache_size: Option<usize>,
@@ -1151,6 +1159,21 @@ fn apply_saved_settings(args: &mut Args) -> std::collections::BTreeMap<String, S
     one("index.residency", &mut args.index_residency, &stored, "memory");
     one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
     one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
+    // The environment stands in for the flag, and wins over the file as it
+    // does: it is part of how the server was started (a unit's
+    // Environment=).
+    if args.partition_max_open.is_none()
+        && let Ok(v) = std::env::var("RDB_PARTITION_MAX_OPEN")
+    {
+        match v.trim().parse() {
+            Ok(n) => args.partition_max_open = Some(n),
+            Err(_) => {
+                eprintln!("RDB_PARTITION_MAX_OPEN={v:?}: expected a whole number of partitions");
+                std::process::exit(2);
+            }
+        }
+    }
+    one("partition.max_open", &mut args.partition_max_open, &stored, "4096");
     stored
 }
 
@@ -1379,10 +1402,18 @@ fn main() -> std::io::Result<()> {
     // systemd unit's soft limit of 1,024 would leave a budget of 16 open
     // partitions; raised toward the hard limit, as far as the largest
     // budget needs (docs/partitioning.md, "Phase 3 P5b-2a as built").
-    let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
+    //
     // Startup settings `SET CONFIG` saved, under the flags: a flag given here
-    // wins (configuration::saved).
+    // wins (configuration::saved). First, as `partition.max_open` sizes the
+    // raise.
     let stored_settings = apply_saved_settings(&mut args);
+    let max_open = args.partition_max_open.unwrap_or(rasterizeddb_core::core::partition::budget::DEFAULT_MAX_OPEN);
+    if let Err(e) = rasterizeddb_core::core::introspect::startup_value("partition", "max_open", &max_open.to_string()) {
+        eprintln!("--partition-max-open: {e}");
+        std::process::exit(2);
+    }
+    rasterizeddb_core::core::partition::budget::settings::set_max_open(max_open);
+    let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
     // Before the runtime starts a thread: an arena made is not undone.
     if let Some(n) = args.malloc_arenas {
         if !rasterizeddb_core::set_malloc_arenas(n) {
@@ -1682,9 +1713,22 @@ fn main() -> std::io::Result<()> {
             // Printed for the same reason: a unit without LimitNOFILE leaves
             // a small partition budget, which shows as closes and reopens.
             println!(
-                "descriptors: soft limit {nofile_now}{}; partition open budget {open_budget}",
+                "descriptors: soft limit {nofile_now}{}; partition open budget {open_budget} of max_open {max_open}",
                 if nofile_now != nofile_before { format!(" (raised from {nofile_before})") } else { String::new() },
             );
+            // Said plainly when the hard limit is what stops the budget
+            // short of max_open: no setting here can fix it, the unit can.
+            let wanted = rasterizeddb_core::core::partition::budget::descriptors_for(max_open);
+            if let Some(hard) = rasterizeddb_core::core::partition::budget::hard_descriptor_limit()
+                && nofile_now < wanted
+                && hard <= nofile_now
+            {
+                println!(
+                    "descriptors: the hard limit {hard} caps the soft limit below the {wanted} that \
+                     {max_open} open partitions need, so at most {open_budget} stay open; raise the \
+                     hard limit (LimitNOFILE= in the unit, or ulimit -Hn) to at least {wanted}"
+                );
+            }
         }
 
         #[cfg(debug_assertions)]
