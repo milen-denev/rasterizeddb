@@ -872,3 +872,7 @@ mod returning_tests;
 #[cfg(test)]
 #[path = "row_source_join_tests.rs"]
 mod join_tests;
+
+#[cfg(test)]
+#[path = "row_source_joined_write_tests.rs"]
+mod joined_write_tests;
