@@ -1271,3 +1271,62 @@ async fn exists_over_a_select_without_from_answers_as_postgresql_does() {
     .await
     .expect("bounded");
 }
+
+/// A sequence read as a relation is PostgreSQL's one row of `last_value`,
+/// `log_cnt` and `is_called` (42P01 here before), for a `CREATE SEQUENCE`
+/// one and a serial column's; a write to one is 42809. Every answer is
+/// PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sequence_reads_as_its_row() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("CREATE SEQUENCE sq START 1", at(&[], "CREATE SEQUENCE")),
+            ("SELECT last_value, log_cnt, is_called FROM sq", at(&["1|0|f"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["1|0|f"], "SELECT 1")),
+            ("SELECT nextval('sq')", at(&["1"], "SELECT 1")),
+            ("SELECT last_value FROM sq", at(&["1"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["1|32|t"], "SELECT 1")),
+            ("SELECT setval('sq', 10, false)", at(&["10"], "SELECT 1")),
+            ("SELECT last_value, is_called FROM sq", at(&["10|f"], "SELECT 1")),
+            ("SELECT nextval('sq')", at(&["10"], "SELECT 1")),
+            ("SELECT last_value, is_called FROM sq", at(&["10|t"], "SELECT 1")),
+            ("SELECT setval('sq', 20)", at(&["20"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["20|0|t"], "SELECT 1")),
+            ("SELECT nextval('sq'), nextval('sq')", at(&["21|22"], "SELECT 1")),
+            ("SELECT * FROM \"sq\"", at(&["22|31|t"], "SELECT 1")),
+            ("CREATE SEQUENCE s5 START 5 INCREMENT 3", at(&[], "CREATE SEQUENCE")),
+            ("SELECT * FROM s5", at(&["5|0|f"], "SELECT 1")),
+            ("SELECT nextval('s5'), nextval('s5')", at(&["5|8"], "SELECT 1")),
+            ("SELECT s.last_value FROM s5 s", at(&["8"], "SELECT 1")),
+            ("SELECT last_value FROM public.s5", at(&["8"], "SELECT 1")),
+            ("SELECT last_value + 1 AS nx FROM s5 WHERE is_called", at(&["9"], "SELECT 1")),
+            ("SELECT count(*) FROM s5", at(&["1"], "SELECT 1")),
+            ("SELECT (SELECT last_value FROM s5) + 1", at(&["9"], "SELECT 1")),
+            // A serial column's.
+            ("CREATE TABLE ser (id serial PRIMARY KEY, v text)", at(&[], "CREATE TABLE")),
+            ("SELECT last_value, is_called FROM ser_id_seq", at(&["1|f"], "SELECT 1")),
+            ("INSERT INTO ser (v) VALUES ('a'), ('b')", at(&[], "INSERT 0 2")),
+            ("SELECT last_value, is_called FROM ser_id_seq", at(&["2|t"], "SELECT 1")),
+            // Not a table.
+            ("INSERT INTO sq VALUES (1, 0, true)", err("42809")),
+            ("UPDATE sq SET last_value = 5", err("42809")),
+            ("DELETE FROM ser_id_seq", err("42809")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // Not transactional: a value a rolled-back block took stays taken.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "SELECT nextval('sq')").await, at(&["23"], "SELECT 1"));
+        assert_eq!(answer(&db, &mut s, "SELECT last_value FROM sq").await, at(&["23"], "SELECT 1"));
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT last_value FROM sq").await, at(&["23"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}

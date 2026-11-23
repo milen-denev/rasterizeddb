@@ -5182,6 +5182,15 @@ pub(crate) async fn describe_query(
         }
         _ => stmt,
     };
+    // A sequence read as a relation, as its row (`sequence_statements`).
+    let sequence_rows;
+    let stmt = match crate::core::rql::sequence_catalog::relations_as_rows(database, stmt) {
+        Ok(Some(text)) => {
+            sequence_rows = text;
+            sequence_rows.as_str()
+        }
+        _ => stmt,
+    };
     // An outer column a subquery names bare, qualified by its relation
     // (`rql::outer_columns`), so the correlated passes below find it.
     let qualified_outer;
