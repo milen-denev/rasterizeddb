@@ -38,6 +38,31 @@ struct Collected {
     /// `INSERT` routing under `partition_trace`, said once per table per
     /// statement: (table, why, partitions declared, partitions written, rows).
     inserts: Vec<(String, String, usize, std::collections::BTreeSet<u32>, u64)>,
+    /// How many [`hold`]s are open: while any is, [`drain`] answers nothing
+    /// and the notices wait for the statement that holds them.
+    held: u32,
+}
+
+/// Keeps the statement's notices until it is dropped ([`hold`]).
+pub struct Held(());
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = NOTICES.try_with(|n| {
+            let mut n = n.borrow_mut();
+            n.held = n.held.saturating_sub(1);
+        });
+    }
+}
+
+/// Holds the current statement's notices while the statements it runs
+/// inside itself complete: a PL/pgSQL block's `RAISE NOTICE` is the block's,
+/// sent when the block is done. Each statement the block ran drained the
+/// collector into its own, discarded, output as it completed, so only what
+/// was raised after the last of them reached the client.
+pub fn hold() -> Held {
+    let _ = NOTICES.try_with(|n| n.borrow_mut().held += 1);
+    Held(())
 }
 
 tokio::task_local! {
@@ -147,6 +172,9 @@ pub fn count(key: &str, message: impl FnOnce() -> String) {
 
 /// Takes every notice collected so far in this task, the counted ones last.
 pub fn drain() -> Vec<Notice> {
+    if NOTICES.try_with(|n| n.borrow().held > 0).unwrap_or(false) {
+        return Vec::new();
+    }
     let collected = NOTICES
         .try_with(|n| {
             let mut n = n.borrow_mut();

@@ -36,6 +36,61 @@ pub fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
+/// `ix.indkey::text` and the catalogue's other vector columns cast to text,
+/// as `array_to_string(ix.indkey, ' ')`: PostgreSQL's `int2vector` and
+/// `oidvector` print their numbers apart by a space (`3 1`), and a catalogue
+/// query splits them there (`string_to_array(ix.indkey::text, ' ')`). They
+/// are arrays here, whose text is `{3,1}`. `None` when there is none.
+pub fn vector_columns_as_text(sql: &str) -> Option<String> {
+    const VECTORS: [&str; 6] = ["indkey", "indclass", "indoption", "indcollation", "proargtypes", "partattrs"];
+    if !VECTORS.iter().any(|v| contains_ignore_ascii_case(sql, v.as_bytes())) || !sql.contains("::") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let (mut copied, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        if !is_identifier_byte(bytes[i]) || (i > 0 && is_identifier_byte(bytes[i - 1])) {
+            i += 1;
+            continue;
+        }
+        // A name, with the qualifier before it if it has one.
+        let start = i;
+        let mut end = i + bytes[i..].iter().take_while(|b| is_identifier_byte(**b)).count();
+        let mut column = &sql[start..end];
+        if bytes.get(end) == Some(&b'.') {
+            let next = end + 1 + bytes[end + 1..].iter().take_while(|b| is_identifier_byte(**b)).count();
+            column = &sql[end + 1..next];
+            end = next;
+        }
+        i = end;
+        if !VECTORS.iter().any(|v| column.eq_ignore_ascii_case(v)) {
+            continue;
+        }
+        let Some(cast) = sql[end..].trim_start().strip_prefix("::") else {
+            continue;
+        };
+        let cast = cast.trim_start();
+        if !starts_with_keyword(cast, "text") {
+            continue;
+        }
+        let cast_end = sql.len() - cast.len() + 4;
+        out.push_str(&sql[copied..start]);
+        out.push_str(&format!("array_to_string({}, ' ')", &sql[start..end]));
+        copied = cast_end;
+        i = cast_end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
 /// Whether `text` begins with the keyword `keyword`, whatever its case, as a
 /// whole word: `SELECT 1` and `select(1)` do, `selected_branches` does not.
 ///

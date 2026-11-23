@@ -524,6 +524,9 @@ async fn run_statements(
     old: &Option<Values>,
     vars: &mut Vec<(String, String, Option<String>)>,
 ) -> io::Result<Result<Option<Returned>, Failure>> {
+    // What the body raises is its statement's to send, whatever it runs
+    // between raising it and ending (`notice::hold`).
+    let _notices = crate::core::notice::hold();
     for stmt in stmts {
         match stmt {
             PlStmt::Null => {}

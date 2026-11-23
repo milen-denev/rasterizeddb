@@ -1106,6 +1106,66 @@ fn exists_used_as_value(sql: &str, start: usize, end: usize) -> bool {
         || matches!(before.as_bytes().last(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'|'))
 }
 
+/// `sql` with each `[NOT] EXISTS (…)` that compares an outer column by
+/// anything but `=` written as the count it asks about: `(SELECT count(*)
+/// FROM … WHERE …) > 0`, or `= 0`. `None` when it has none.
+///
+/// The `IN` an `EXISTS` is answered as carries equalities only
+/// (`subquery::exists_to_in`), so `cov.id <> cand.id` or `cov.n >= cand.n`
+/// was refused ("a correlated EXISTS can compare an outer column only with
+/// `=`"). As a correlated scalar subquery it is run for each outer row,
+/// where every comparison is the subquery's own. Slower than the `IN`, and
+/// only what the `IN` cannot say goes this way. Run before the correlated
+/// subqueries are placed (`correlated::rewrite_select`), which is what
+/// answers it.
+pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
+    use crate::core::rql::join::{find_keyword, find_phrase};
+    use crate::core::rql::subquery;
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b"exists") {
+        return None;
+    }
+    let mut current = sql.to_string();
+    let mut changed = false;
+    let mut from = 0usize;
+    while let Some(mut clause) = current.get(from..).and_then(subquery::find_exists) {
+        clause.start += from;
+        clause.end += from;
+        from = clause.end.max(from + 1);
+        if inside_a_subquery(&current, clause.start) {
+            continue;
+        }
+        let outer = outer_relation_names(&current);
+        let Ok((body, bounds)) = subquery::strip_exists_tail(&clause) else {
+            continue;
+        };
+        let only_equalities_refusal = |e: &str| e.contains("can compare an outer column only with");
+        let goes = bounds.limit != Some(0)
+            && bounds.offset == 0
+            && subquery::uncorrelated_exists(&body, &outer).is_none()
+            && subquery::exists_to_in(&body, &outer).is_err_and(|e| only_equalities_refusal(&e));
+        if !goes {
+            continue;
+        }
+        let inner = body.inner_sql.trim();
+        let Some(from_at) = find_keyword(inner, "FROM", 0) else {
+            continue;
+        };
+        // A grouped or aggregated body answers a row whatever matched: its
+        // refusal stands.
+        if find_phrase(inner, &["GROUP", "BY"], 0).is_some()
+            || find_keyword(inner, "HAVING", 0).is_some()
+            || !crate::core::rql::lexer_query::find_aggregate_calls(&inner[..from_at]).is_empty()
+        {
+            continue;
+        }
+        let counted = format!("((SELECT count(*) {}) {} 0)", &inner[from_at..], if clause.negated { "=" } else { ">" });
+        from = clause.start + counted.len();
+        current = format!("{}{}{}", &current[..clause.start], counted, &current[clause.end..]);
+        changed = true;
+    }
+    changed.then_some(current)
+}
+
 /// The first `[NOT] EXISTS (…)` of `sql` that is not inside another
 /// parenthesised `SELECT`.
 fn top_level_exists(sql: &str) -> Option<crate::core::rql::subquery::ExistsClause> {

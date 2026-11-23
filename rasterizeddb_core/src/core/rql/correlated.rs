@@ -83,7 +83,13 @@ pub(crate) fn rewrite_select(sql: &str) -> Option<Result<String, String>> {
     if !starts_with_word(sql, "SELECT") && !set_operation() {
         return None;
     }
-    outside_from(sql)?;
+    // An EXISTS the `IN` form cannot say, as the count it asks about: a
+    // correlated scalar subquery, placed with the rest below.
+    let counted = crate::core::rql::executor::exists_as_counts(sql);
+    let sql = counted.as_deref().unwrap_or(sql);
+    if outside_from(sql).is_none() {
+        return counted.map(Ok);
+    }
     Some(rewrite_select_inner(sql))
 }
 

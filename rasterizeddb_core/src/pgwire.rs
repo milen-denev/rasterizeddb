@@ -8128,6 +8128,10 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `indkey::text` and the other vector columns, spaced as PostgreSQL
+    // prints them (`sql_scan::vector_columns_as_text`).
+    let vectors = crate::core::sql_scan::vector_columns_as_text(&stmt);
+    take(&mut stmt, vectors);
     // `pg_partition_tree('t'::regclass)` as the one leaf every table is
     // here (`rql::reg_casts::partition_tree`), before its argument is an oid.
     let relation_exists = |name: &str| {

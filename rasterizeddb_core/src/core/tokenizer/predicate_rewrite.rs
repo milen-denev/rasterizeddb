@@ -3722,10 +3722,24 @@ pub fn lift_evaluated_operands(
         && !mentions_distinct_from(clause)
         && !mentions_range(clause)
         && !in_after_non_column(clause)
+        && !may_compare_an_array(clause, schema)
     {
         return Ok(clause.to_string());
     }
     lift_condition(clause, schema, 0)
+}
+
+/// Whether `text` may hold a comparison of arrays ([`compares_an_array`]):
+/// it names an array column of the table, or builds an array. The cheap
+/// test asked of every clause before any of it is parsed.
+fn may_compare_an_array(text: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::db_type::DbType;
+    crate::core::sql_scan::contains_ignore_ascii_case(text, b"array[")
+        || schema.iter().any(|f| {
+            !f.is_deleted
+                && matches!(f.db_type, DbType::ARRAY | DbType::ARRAYOF(_))
+                && crate::core::sql_scan::contains_ignore_ascii_case(text, f.name.as_bytes())
+        })
 }
 
 /// Whether `text` says `DISTINCT FROM` outside quotes: a clause whose terms
@@ -4129,7 +4143,20 @@ fn lift_term(
     depth: usize,
 ) -> Result<String, String> {
     let plain = !evaluated(term, schema) && !char_lift_needed(term, schema) && !reads_legacy_char(term, schema);
-    if plain && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
+    // A comparison of arrays, or a group that may hold one (`(a = b)`,
+    // `NOT (a = b AND …)`), which is read below. Any other term naming an
+    // array column (`tags @> '{a}'`, `'x' = ANY(tags)`) is read as it was.
+    let array = may_compare_an_array(term, schema) && {
+        let mut inner = term.trim();
+        while inner.len() > 3
+            && inner.as_bytes()[..3].eq_ignore_ascii_case(b"NOT")
+            && !(inner.as_bytes()[3].is_ascii_alphanumeric() || inner.as_bytes()[3] == b'_')
+        {
+            inner = inner[3..].trim_start();
+        }
+        (inner.starts_with('(') && matching_paren_at(inner, 0) == Some(inner.len() - 1)) || compares_an_array(inner, schema)
+    };
+    if plain && !array && !mentions_distinct_from(term) && !mentions_range(term) && !in_after_non_column(term) {
         return Ok(term.to_string());
     }
     let lead = &term[..term.len() - term.trim_start().len()];
@@ -4149,12 +4176,30 @@ fn lift_term(
         || quantified_over_expression(body)
         || distinct_from_expression(body, schema)
         || compares_an_interval(body, schema)
+        || (array && compares_an_array(body, schema))
         || compares_a_computed_range(body, schema)
         || (plain && in_over_non_column(body, schema))
         || mixed_numeric_columns(body, schema)
         || constant_mixed_comparison(body)
         || quoted_against_arithmetic(body)
     {
+        // An array compared with a literal that is no array is PostgreSQL's
+        // 22P02. The evaluator reads such a literal as text, unequal to
+        // every array, and the clause would answer no rows.
+        if array && compares_an_array(body, schema)
+            && let Some((at, end, false)) = comparison_operator(body)
+        {
+            for side in [body[..at].trim(), body[end..].trim()] {
+                let quoted = side.starts_with('\'')
+                    && crate::core::sql_scan::quoted_end(side.as_bytes(), 0, b'\'') == side.len();
+                if quoted {
+                    let text = side[1..side.len() - 1].replace("''", "'");
+                    if crate::core::value_codec::parse_array_literal(&text).is_none() {
+                        return Err(format!("malformed array literal: \"{text}\""));
+                    }
+                }
+            }
+        }
         // The evaluator's three values, NULL for UNKNOWN, so a `NOT` pushed
         // onto the comparison below still leaves an unknown row out.
         let case = format!("CASE WHEN ({body}) THEN true WHEN NOT ({body}) THEN false END");
@@ -4305,6 +4350,39 @@ fn compares_an_interval(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> boo
             })
     };
     interval(&body[..at]) || interval(&body[end..])
+}
+
+/// Whether `body` is a symbol comparison with a side that is an array
+/// (`tags = other`, `sig[1:n] = key`, `a <> ARRAY['x']`). The scan compares
+/// scalars only, and refused each ("operation is not supported for this
+/// column type", "yields a ARRAY value, which a WHERE clause cannot compare
+/// yet"); the evaluator compares arrays element by element, as PostgreSQL
+/// does, and already answered the same comparison in a select list.
+///
+/// Asked only of a term that names an array column or builds an array
+/// ([`may_compare_an_array`]): every other comparison is spared the two
+/// parses.
+fn compares_an_array(body: &str, schema: &SmallVec<[SchemaField; 20]>) -> bool {
+    use crate::core::db_type::DbType;
+    let is_array = |ty: &DbType| matches!(ty, DbType::ARRAY | DbType::ARRAYOF(_));
+    if !may_compare_an_array(body, schema) {
+        return false;
+    }
+    let body = body.trim();
+    let Some((at, end, false)) = comparison_operator(body) else {
+        return false;
+    };
+    // The six comparisons only: `@>`, `<@` and `&&` over arrays are the
+    // containment reader's, as they were.
+    if !matches!(body[at..end].trim(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") {
+        return false;
+    }
+    let array = |side: &str| {
+        let side = side.trim();
+        !side.is_empty()
+            && crate::core::rql::expr::parse(side, schema).is_ok_and(|e| is_array(&crate::core::rql::expr::static_type(&e)))
+    };
+    array(&body[..at]) || array(&body[end..])
 }
 
 /// Whether `body` compares with `ANY`/`SOME`/`ALL` over an array the

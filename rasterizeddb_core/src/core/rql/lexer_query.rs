@@ -548,6 +548,21 @@ fn parse_select_items(
         if item.is_empty() {
             continue;
         }
+        // `*` or `t.*` beside other items: every column, where it stands.
+        // Alone it was read above; in a list it was "Column 't.*' not found
+        // in schema", though a join's list took it.
+        let star_of_one_relation = item.strip_suffix(".*").is_some_and(|qualifier| {
+            let name = qualifier.trim_matches('"');
+            !name.is_empty() && !name.contains(['.', '(', ' ', '"'])
+        });
+        if item == "*" || star_of_one_relation {
+            out.extend(
+                crate::core::rql::nullable::visible_fields(schema)
+                    .into_iter()
+                    .map(|f| SelectItem::Column { label: f.name.clone(), field: f }),
+            );
+            continue;
+        }
         // `COUNT(*) FILTER (WHERE …)` is peeled off the item *before* anything
         // reads it as a call, because the cast that usually follows —
         // `COUNT(*) FILTER (…)::bigint` — otherwise sends the item down the

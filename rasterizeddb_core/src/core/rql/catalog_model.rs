@@ -1736,6 +1736,13 @@ pub(crate) fn columns_of(view: &str) -> Option<&'static [(&'static str, DbType)]
             ("indcheckxmin", BOOL),
             ("indisreplident", BOOL),
             ("indkey", INT2_ARRAY),
+            // One operator class and one option word per key column, zero
+            // each: a key compares by the engine's own rule for its type,
+            // ascending, NULLs last. What a catalogue query needs of them is
+            // that two indexes over the same columns answer the same.
+            ("indclass", INT2_ARRAY),
+            ("indoption", INT2_ARRAY),
+            ("indcollation", INT2_ARRAY),
         ],
         // `partclass` and `partcollation` (oidvectors) as arrays, one zero
         // each: the key hashes by the engine's own rule, not an operator
@@ -2145,8 +2152,12 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::B(true),
                         V::B(i.ready),
                         V::B(true),
-                        t(""),
-                        t(""),
+                        // No index here is partial or over an expression
+                        // (a partial unique index is a constraint): NULL, as
+                        // PostgreSQL has it, where the empty string made
+                        // `indpred IS NOT NULL` true of every index.
+                        V::N,
+                        V::N,
                         V::I(i.keys.len() as i64),
                         V::B(false),
                         V::B(false),
@@ -2155,6 +2166,9 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::B(false),
                         V::B(false),
                         V::A(i.keys.clone()),
+                        V::A(vec![0; i.keys.len()]),
+                        V::A(vec![0; i.keys.len()]),
+                        V::A(vec![0; i.keys.len()]),
                     ]
                 })
             })

@@ -358,11 +358,11 @@ pub fn parse_drop(sql: &str) -> Option<(String, bool)> {
         rest = rest["IF EXISTS".len()..].trim_start();
     }
     // `CASCADE`/`RESTRICT` have nothing to act on here.
-    let name = rest
-        .split_whitespace()
-        .next()?
+    // A schema before the name is not part of it: `DROP INDEX public.idx`
+    // looked for an index called "public.idx", found none, and answered
+    // DROP INDEX with the index still there.
+    let name = crate::core::sql_scan::last_name_segment(rest.split_whitespace().next()?.trim_end_matches(','))
         .trim_matches('"')
-        .trim_end_matches(',')
         .to_string();
     if name.is_empty() {
         return None;
