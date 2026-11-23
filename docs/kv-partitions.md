@@ -307,3 +307,40 @@ rebuilds and answers through its index; the same-lengths rewrite; a plain
 table on a store; DROP sweeps the sidecar), `tests/partition_kv_snapshot.rs`
 (over the wire at the store's default tuning: the shutdown seal, two
 restarts, written partitions rebuild, a reseal loads again).
+
+## Read cost against files (2026-11-23)
+
+`examples/kv_table_bench.rs`: the same 100,000 rows in a plain table
+(`id` primary key, an index on `n`) and a 64-way hash-partitioned twin,
+once on files and once placed on a directory store, the database reopened,
+the query cache off. A store table's reads are served from its resident
+pages: no query read a byte from the store. Instructions per query (user
+mode, `perf stat`, the difference of two run lengths; wall time on the
+shared box drifted 2x between runs):
+
+| Query | Files | Store, before | Store, after |
+|---|---|---|---|
+| primary-key point | 155k | | 150k |
+| `n = v` through the index (100 rows) | 259k | ~3x files (wall 153 µs against 43) | 666k |
+| primary-key range (100 rows) | 301k | | 524k |
+| routed point on the partitioned twin | level with files | | level |
+| routed + index on the partitioned twin | 341k | | 893k |
+
+Two fixes, so far:
+- **A thin slot list read its whole span.** An index's candidates spread
+  over the table made `RowPointerIterator::load_next_chunk` read from the
+  first candidate to the last that a chunk reaches. A file lends that span
+  from its mapping, but a store file copies every byte, which was about
+  the whole pointer file per statement. When the provider lends nothing
+  and the list has fewer than one candidate per 8 records of the span, it
+  now reads one run of adjacent candidates at a time (`SPARSE_RUN_FACTOR`).
+- **A small read built a page map.** `KvFile::read_at` took the fetch path,
+  which builds a `HashMap` of pages per read, even for resident bytes. It
+  now tries the row fetch's resident path (`try_read_many_sync`) first:
+  748k to 666k instructions for the indexed lookup.
+
+Still open: an indexed or routed-and-indexed read on a store table costs
+about 2.6x files, spread through the per-row read path with no single
+hotspot. A load is about 7x slower (284 s against 40 s for 2 x 100k rows,
+multi-row INSERTs). S3 (MinIO/RustFS) is not measured yet; no S3 image is
+on this box.

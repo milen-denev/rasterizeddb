@@ -1580,6 +1580,20 @@ impl KvFile {
 
     /// Reads into `dst`, returning how many bytes the file actually had.
     async fn read_at(&self, position: u64, dst: &mut [u8]) -> io::Result<usize> {
+        // Resident and wholly inside the file: memory work under the two
+        // read locks the row fetch takes (`try_read_many_sync`), rather than
+        // the fetch path's map of pages built per read. A pointer read of an
+        // index's candidates is one small read per run of them, and that map
+        // was most of what each cost. Still noted, so a scan through here
+        // keeps its read-ahead for the pages that are not resident.
+        let n = dst.len();
+        if n > 0
+            && position.saturating_add(n as u64) <= self.len.load(Ordering::Acquire)
+            && self.try_read_many_sync(&mut [(position, &mut *dst)])
+        {
+            self.note_read(position, position + n as u64);
+            return Ok(n);
+        }
         self.read_at_inner(position, dst, true).await
     }
 
