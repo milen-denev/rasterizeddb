@@ -1203,7 +1203,7 @@ switch, dormant until configured.
 | **Enterprise segregation** (placement by policy) | `segregation_policies` (needs `sharding`) in `rasterizeddb_enterprise`; `segregation` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `placement_policies = enforce` (`off` by default) | The authority and moves (B2); `tenant_isolation` when policies apply to databases |
 | (base for both) user routing, `user_key`/`user_shard` | `user_routing` in `rasterizeddb_gateway_enterprise` (dual-licensed, §10) | `user_routing = off \| prefer \| require` (G11) | — |
 
-**The security floor comes first, in every build.** An isolation audit on
+**The security floor comes first, in every build.** It is now planned in full as **R0 of the role system plan** (`docs/roles-plan.md`, branch `wip/roles`, GPL and standard). T1's process-admin split uses that plan's R1 `PROCESS ADMIN` attribute. An isolation audit on
 2026-11-23 found that today **any login role can make itself superuser**.
 This was reproduced live: a non-superuser ran
 `UPDATE rdb_roles SET is_superuser = true WHERE name = 'me'`, reconnected,
@@ -1270,7 +1270,7 @@ role and password verifier from the default database (`catalog.rs:453-467`,
      has its own WAL.
   3. Verify, flip the tenant directory, release.
 - **Backups.** Each customer's database already archives to its own prefix.
-- **HA for every database (D11, decided): R-ALL.** Replication must cover
+- **HA for every database (D11, decided): R-ALL. Largely BUILT since this plan was written:** `0d65afd8` (merged into local `dev` as `21a4cc83`, 2026-11-23) makes every database replicate, routed by the greeting's database through the one listener, with `CREATE`/`DROP DATABASE` carried in the default stream. Re-check the items below against it before starting; what it already covers is done. The items as first planned: Replication must cover
   every database in an instance, any number of them. Today it covers the
   default database only (`main.rs:1829`), and a `CREATE DATABASE` database
   gets a "not replicated" warning. Work items, in today's replication
