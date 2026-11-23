@@ -24,14 +24,16 @@ The executables channel also takes a pre-release tag, such as `v1.0.0-rc.1`. The
 ./push_release.sh client minor --dry-run   # show the version commit, change nothing
 ```
 
-It releases what is on `origin/feat/secondary-indexes` (`--from` for another branch), working in a scratch worktree so the local checkout is left alone:
+Branches: work lands on `dev`; `release` holds exactly what was released; `main` (the GitHub default) follows `release` by fast-forward only. No other branch lives on the remote, apart from the script's short-lived `release-pr/<tag>`.
+
+It releases what is on `origin/dev` (`--from` for another branch), working in a scratch worktree so the local checkout is left alone:
 
 1. It bumps the channel's crate versions, every `{ path, version }` requirement on them, and README pins such as `rasterizeddb_embedded = "1"`, then refreshes `Cargo.lock`.
-2. It commits on `release/<tag>` and opens a pull request into `main`.
+2. It commits on `release-pr/<tag>` and opens a pull request into `release`.
 3. It waits for the pull request's own runs: the `pull_request` runs of that branch at that commit. It does not wait for every check on the commit, because a release with no version change has the source tip as its head, and that tip also carries the push runs and their full suites, which a pull request never runs. If a run fails, it stops and leaves the pull request open.
-4. It merges with a merge commit, and only if the head is still the commit that was tested.
+4. It merges with a merge commit, and only if the head is still the commit that was tested. Then it fast-forwards `main` to that merge commit: its checks already ran on exactly that commit, so `main` gets no second pull request and no second CI run. If `main` ever has a commit `release` lacks, the script stops there, before any tag.
 5. It brings the version commit back to the source branch: a fast-forward when that branch has not moved, a merge commit otherwise.
-6. It tags the merge commit on `main` and pushes the tags. `all` waits for the client release first, because the server crates need it on crates.io. Then it waits for the release workflows and prints the release links.
+6. It tags the merge commit and pushes the tags. `all` waits for the client release first, because the server crates need it on crates.io. Then it waits for the release workflows and prints the release links.
 
 Each channel has its own version: the client channel owns `rasterizeddb_client` and `rasterizeddb_client_derive`, and the server channel owns `rasterizeddb_core` and `rasterizeddb_embedded`. The executables carry the core version.
 
@@ -91,4 +93,4 @@ To build a release binary locally the same way, run `rustup component add llvm-t
 - **Server crates:** the embedded SDK tests and a server smoke test (start, write, `kill -9`, restart, read back) on all four targets.
 - **Executables:** the same smoke test, run on the release binary of each target before it is packaged.
 
-CI (`ci.yml`) runs the four-target build and tests on every push and pull request. The engine's long suites (core lib, core integration tests, compat) run on all four targets weekly, on demand (`full = true`) and on pushes to `feat/secondary-indexes`.
+CI (`ci.yml`) runs the four-target build and tests on every push to `dev` and every pull request. The engine's long suites (core lib, core integration tests, compat) run on all four targets weekly, on demand (`full = true`) and on pushes to `dev`.

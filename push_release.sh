@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# push_release.sh: cut a release through a pull request into main.
+# push_release.sh: cut a release: dev -> pull request into release -> main.
+#
+# Branches: work lands on `dev`; `release` holds exactly what was released,
+# and `main`, the GitHub default, follows `release` by fast-forward only.
+# Nothing else lives on the remote except this script's short-lived
+# `release-pr/<tag>` branch, deleted once its pull request is merged.
 #
 #   ./push_release.sh client   <bump>    client crates      -> client-vX.Y.Z
 #   ./push_release.sh server   <bump>    server crates      -> server-vX.Y.Z and vX.Y.Z
@@ -11,7 +16,7 @@
 # that is already tagged or on crates.io is always refused.
 #
 # Options:
-#   --from <branch>   branch to release from (default: $RELEASE_SOURCE or feat/secondary-indexes)
+#   --from <branch>   branch to release from (default: $RELEASE_SOURCE or dev)
 #   --rastcp <keep|major|minor|patch|X.Y.Z>
 #                     what to do with the shared rastcp crate (default: bump it a
 #                     patch when it changed since the last crate release and its
@@ -26,13 +31,15 @@
 #      git worktree, so your checkout is never touched.
 #   2. Bumps the channel's crate versions, the version requirements that point
 #      at them, and README pins; refreshes Cargo.lock; commits on a new branch
-#      release/<first tag>.
-#   3. Opens a pull request from that branch into main and waits for every
+#      release-pr/<first tag>.
+#   3. Opens a pull request from that branch into release and waits for every
 #      check. If one fails it stops and leaves the pull request open.
 #   4. Merges the pull request (a merge commit, only if the head is still the
-#      commit it tested), then brings the version commit back to <from>:
-#      a fast-forward when <from> has not moved, a merge commit otherwise.
-#   5. Tags the merge commit on main and pushes the tags in channel order. The
+#      commit it tested) and fast-forwards main to it: the checks already ran
+#      on exactly that commit, so main gets no pull request and no second CI
+#      run. Then it brings the version commit back to <from>: a fast-forward
+#      when <from> has not moved, a merge commit otherwise.
+#   5. Tags the merge commit and pushes the tags in channel order. The
 #      server crates need the client version on crates.io, so `all` waits for
 #      the client release before pushing the server tags.
 #   6. Waits for the release workflows and prints the GitHub release links.
@@ -44,8 +51,10 @@
 # publishes it.
 set -euo pipefail
 
-SOURCE="${RELEASE_SOURCE:-feat/secondary-indexes}"
-BASE="main"
+SOURCE="${RELEASE_SOURCE:-dev}"
+BASE="release"
+# Follows BASE by fast-forward after each release.
+PUBLISHED="main"
 REMOTE="origin"
 CLIENT_CRATES=(rasterizeddb_client rasterizeddb_client_derive)
 SERVER_CRATES=(rasterizeddb_core rasterizeddb_embedded)
@@ -273,7 +282,8 @@ if [ -n "$SERVER_VER" ]; then
     if on_crates_io "$c" "$SERVER_VER"; then die "$c $SERVER_VER is already on crates.io; bump it"; fi
   done
 fi
-BRANCH="release/${TAGS[0]}"
+# Not release/<tag>: a branch named `release` rules out any release/... ref.
+BRANCH="release-pr/${TAGS[0]}"
 # A run that stopped (a failed check, Ctrl+C) leaves its branch and pull
 # request behind. A rerun takes both over: the branch is this script's own,
 # so it is moved to the new head (with a lease on the commit seen here), and
@@ -295,7 +305,7 @@ fi
 [ "$CHANNEL" = binaries ] && note "executables of rasterizeddb_core $CORE_NOW"
 true
 note "tags:   ${TAGS[*]}"
-note "flow:   $BRANCH -> pull request into $BASE -> checks -> merge -> tags on $BASE -> back into $SOURCE"
+note "flow:   $BRANCH -> pull request into $BASE -> checks -> merge -> $PUBLISHED fast-forwarded -> tags -> back into $SOURCE"
 if [ -n "$OLD_BRANCH_SHA" ]; then
   note "rerun:  $BRANCH exists on $REMOTE at ${OLD_BRANCH_SHA:0:8}; it is moved to the new head${OPEN_PR:+ and pull request #$OPEN_PR is reused}"
 fi
@@ -498,6 +508,20 @@ git push --quiet "$REMOTE" --delete "$BRANCH" 2>/dev/null || true
 git fetch --quiet "$REMOTE" "+refs/heads/$BASE:refs/remotes/$REMOTE/$BASE" "+refs/heads/$SOURCE:refs/remotes/$REMOTE/$SOURCE"
 git merge-base --is-ancestor "$MERGE_SHA" "$REMOTE/$BASE" || die "$MERGE_SHA is not on $REMOTE/$BASE"
 
+# ---------------------------------------------------------------- main follows release
+
+step "$PUBLISHED fast-forwarded to $BASE"
+git fetch --quiet "$REMOTE" "+refs/heads/$PUBLISHED:refs/remotes/$REMOTE/$PUBLISHED"
+if git merge-base --is-ancestor "$MERGE_SHA" "$REMOTE/$PUBLISHED"; then
+  note "$PUBLISHED already has $(git rev-parse --short "$MERGE_SHA")"
+elif git merge-base --is-ancestor "$REMOTE/$PUBLISHED" "$MERGE_SHA"; then
+  git push --quiet "$REMOTE" "$MERGE_SHA:refs/heads/$PUBLISHED" \
+    || die "could not fast-forward $PUBLISHED (branch protection?); nothing was tagged. Push $MERGE_SHA to $PUBLISHED, then rerun"
+  note "$PUBLISHED is at $(git rev-parse --short "$MERGE_SHA")"
+else
+  die "$PUBLISHED has commits that $BASE does not; only releases may reach $PUBLISHED. Nothing was tagged: merge $PUBLISHED into $SOURCE, then rerun"
+fi
+
 # ---------------------------------------------------------------- back into the source branch
 
 if [ ${#NEW[@]} -gt 0 ]; then
@@ -527,7 +551,7 @@ fi
 
 # ---------------------------------------------------------------- tags
 
-step "Tags on $BASE"
+step "Tags on $BASE (and $PUBLISHED)"
 for tag in "${TAGS[@]}"; do
   # The server crates need the client version on crates.io.
   if [ -n "$CLIENT_VER" ] && [ "$tag" = "server-v$SERVER_VER" ]; then

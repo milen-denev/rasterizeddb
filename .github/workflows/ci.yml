@@ -8,8 +8,10 @@ name: CI
 # release branch.
 
 on:
+  # dev is where work lands; main and release only ever take commits whose
+  # checks already ran (a release pull request, then a fast-forward).
   push:
-    branches: [main, feat/secondary-indexes]
+    branches: [dev]
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
@@ -124,7 +126,7 @@ jobs:
     if: >
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_dispatch' && inputs.full) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/feat/secondary-indexes')
+      (github.event_name == 'push' && github.ref == 'refs/heads/dev')
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
     env:
