@@ -870,15 +870,40 @@ fn composite_key<'r>(row: RowRef<'r>, keys: &[KeyColumn]) -> Option<SmallVec<[Ke
 /// allocation failed, and the process aborted, taking every session with
 /// it. Past this it is a statement error instead.
 fn join_slots_limit() -> usize {
-    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
+    *JOIN_SLOTS_LIMIT.get_or_init(|| {
         let mb = std::env::var("RDB_JOIN_MEMORY_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|mb| *mb > 0)
             .unwrap_or(1024);
-        mb.saturating_mul(1 << 20) / std::mem::size_of::<u32>()
+        join_slots_for(mb)
     })
+}
+
+/// [`join_slots_limit`], once a join has read it or [`set_join_memory_mb`]
+/// has set it.
+static JOIN_SLOTS_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn join_slots_for(mb: usize) -> usize {
+    mb.saturating_mul(1 << 20) / std::mem::size_of::<u32>()
+}
+
+/// Sets what `RDB_JOIN_MEMORY_MB` sets, for a process that configures the
+/// engine in code (an embedding application). Process-wide and read once:
+/// `false` when a join has already run under another limit, or another
+/// value was set, and this one therefore cannot take effect. 0 is refused
+/// too: there is no unlimited setting.
+pub fn set_join_memory_mb(mb: usize) -> bool {
+    if mb == 0 {
+        return false;
+    }
+    let slots = join_slots_for(mb);
+    JOIN_SLOTS_LIMIT.set(slots).is_ok() || JOIN_SLOTS_LIMIT.get() == Some(&slots)
+}
+
+/// The limit in effect, in MiB. Reading it fixes it, as a join does.
+pub fn join_memory_mb() -> usize {
+    join_slots_limit() / ((1 << 20) / std::mem::size_of::<u32>())
 }
 
 /// The refusal for a join that grew past [`join_slots_limit`]: SQLSTATE
@@ -6139,6 +6164,20 @@ fn relations_referenced(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The join budget is read once: the value in effect can be set again
+    /// (two engines in a process asking for the same), another cannot, and
+    /// zero is never a budget.
+    #[test]
+    fn the_join_budget_is_set_once() {
+        let now = join_memory_mb();
+        assert!(now > 0);
+        assert!(set_join_memory_mb(now));
+        assert!(!set_join_memory_mb(now + 1));
+        assert!(!set_join_memory_mb(0));
+        assert_eq!(join_memory_mb(), now);
+        assert_eq!(join_slots_limit(), join_slots_for(now));
+    }
 
     #[test]
     fn on_splits_the_join_key_from_its_extra_filters() {

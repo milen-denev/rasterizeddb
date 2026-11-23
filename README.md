@@ -1012,6 +1012,8 @@ client.execute("CREATE TABLE IF NOT EXISTS notes (id BIGINT, body TEXT)", &[]).a
 db.shutdown().await?;
 ```
 
+The server's flags are `Builder` methods there (memory, durability, threads, and `config(key, value)` for every `SHOW CONFIG` key); see its README, "Settings".
+
 How releases are cut (crates and executables): [docs/releasing.md](docs/releasing.md).
 
 ##### Sponsor
