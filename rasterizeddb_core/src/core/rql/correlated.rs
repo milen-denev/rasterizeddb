@@ -83,12 +83,18 @@ pub(crate) fn rewrite_select(sql: &str) -> Option<Result<String, String>> {
     if !starts_with_word(sql, "SELECT") && !set_operation() {
         return None;
     }
+    // A correlated `IN` subquery, as the `EXISTS` it means
+    // (`executor::correlated_in_as_exists`): first, so its `NOT IN` form is
+    // counted below like any other.
+    let as_exists = crate::core::rql::executor::correlated_in_as_exists(sql);
+    let sql = as_exists.as_deref().unwrap_or(sql);
     // An EXISTS the `IN` form cannot say, as the count it asks about: a
     // correlated scalar subquery, placed with the rest below.
     let counted = crate::core::rql::executor::exists_as_counts(sql);
+    let changed = counted.is_some() || as_exists.is_some();
     let sql = counted.as_deref().unwrap_or(sql);
     if outside_from(sql).is_none() {
-        return counted.map(Ok);
+        return changed.then(|| Ok(sql.to_string()));
     }
     Some(rewrite_select_inner(sql))
 }

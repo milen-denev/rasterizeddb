@@ -1106,6 +1106,314 @@ fn exists_used_as_value(sql: &str, start: usize, end: usize) -> bool {
         || matches!(before.as_bytes().last(), Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'|'))
 }
 
+/// `sql` with each `x [NOT] IN (SELECT c FROM … WHERE …)` whose subquery
+/// reads the outer row written as the `EXISTS` it means. `None` when it has
+/// none.
+///
+/// An `IN` subquery is run once and its rows substituted, which a correlated
+/// one cannot be ("missing FROM-clause entry for table a"); the `EXISTS`
+/// forms are answered per outer row (`exists_to_in`, `exists_as_counts`):
+///
+/// - `x IN (SELECT c FROM … WHERE w)` is `EXISTS (SELECT 1 FROM … WHERE (w)
+///   AND (c) = x)`: true exactly when a row of the subquery equals `x`, and
+///   otherwise not true, which is all a condition asks;
+/// - `x NOT IN (…)` is `NOT EXISTS (… AND ((c) = x OR (c) IS NULL OR x IS
+///   NULL))`, PostgreSQL's NULL rule: true when the subquery has no rows,
+///   never true when it has one and either side of a comparison is NULL.
+///
+/// `x` is one column; bare, it is qualified with the outer relation (inside
+/// the subquery a bare name would be the subquery's own column), so only a
+/// statement with one outer relation is rewritten then. A subquery that
+/// groups, limits, orders or combines is left as written.
+pub(crate) fn correlated_in_as_exists(sql: &str) -> Option<String> {
+    use crate::core::rql::join::{find_keyword, find_phrase};
+    use crate::core::rql::subquery;
+    if !crate::core::sql_scan::contains_ignore_ascii_case(sql, b" in") {
+        return None;
+    }
+    let mut current = sql.to_string();
+    let mut changed = false;
+    let mut from = 0usize;
+    for _ in 0..64 {
+        let Some(mut sub) = current.get(from..).and_then(subquery::find_in_subquery) else { break };
+        sub.start += from;
+        sub.end += from;
+        sub.negated_start = sub.negated_start.map(|n| n + from);
+        from = sub.end.max(from + 1);
+        if inside_a_subquery(&current, sub.start) {
+            continue;
+        }
+        let inner = sub.inner_sql.trim();
+        let outer = outer_relation_names(&current);
+        let reads_outer = subquery::outer_refs(inner)
+            .iter()
+            .any(|(qualifier, _)| outer.iter().any(|o| o.eq_ignore_ascii_case(qualifier)));
+        if !reads_outer {
+            continue;
+        }
+        let Some(from_at) = find_keyword(inner, "FROM", 0) else { continue };
+        if find_phrase(inner, &["GROUP", "BY"], 0).is_some()
+            || find_phrase(inner, &["ORDER", "BY"], 0).is_some()
+            || ["HAVING", "LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT", "EXCEPT", "WINDOW"]
+                .iter()
+                .any(|k| find_keyword(inner, k, 0).is_some())
+        {
+            continue;
+        }
+        // The one item, without a DISTINCT, which an EXISTS does not need.
+        let items = inner["SELECT".len()..from_at].trim();
+        let items = crate::core::rql::lexer_query::leading_word(items, "DISTINCT").unwrap_or(items).trim();
+        if items.is_empty() || crate::core::sql_scan::split_top_level(items, b',').len() != 1 {
+            continue;
+        }
+        if !crate::core::rql::lexer_query::find_aggregate_calls(items).is_empty() {
+            continue;
+        }
+        // `x [NOT] IN (`: the IN keyword, the NOT, and the one column before.
+        let head = current[..sub.start].trim_end();
+        if !head.get(head.len().saturating_sub(2)..).is_some_and(|w| w.eq_ignore_ascii_case("IN")) {
+            continue;
+        }
+        let before_in = head[..head.len() - 2].trim_end();
+        let (before_not, negated) = match before_in.get(before_in.len().saturating_sub(3)..) {
+            Some(w) if w.eq_ignore_ascii_case("NOT") && before_in[..before_in.len() - 3].ends_with(char::is_whitespace) => {
+                (before_in[..before_in.len() - 3].trim_end(), true)
+            }
+            _ => (before_in, false),
+        };
+        // The left side: columns, numbers and arithmetic, back to the
+        // nearest WHERE, AND, OR, NOT or open parenthesis.
+        let Some(lhs_start) = left_operand_start(before_not) else { continue };
+        let lhs = before_not[lhs_start..].trim();
+        // Each bare column is the outer relation's, which must be the only
+        // one: inside the subquery a bare name would be its own column.
+        let Some(lhs) = qualify_bare_columns(lhs, || single_outer_alias(&current)) else { continue };
+        let lhs = format!("({lhs})");
+        let item = items;
+        let rest = &inner[from_at..];
+        let (rest, filter) = match find_keyword(rest, "WHERE", 0) {
+            Some(at) => (rest[..at].trim_end(), Some(rest[at + "WHERE".len()..].trim())),
+            None => (rest.trim_end(), None),
+        };
+        let probe = |test: String| {
+            let condition = match filter {
+                Some(filter) => format!("({filter}) AND {test}"),
+                None => test,
+            };
+            format!("EXISTS (SELECT 1 {rest} WHERE {condition})")
+        };
+        let equal = probe(format!("({item}) = {lhs}"));
+        let null = probe(format!("(({item}) IS NULL OR {lhs} IS NULL)"));
+        let exists = if decides_the_where(&current, lhs_start) {
+            // Only its truth matters: the cheaper two-valued forms.
+            if negated {
+                format!("NOT {}", probe(format!("(({item}) = {lhs} OR ({item}) IS NULL OR {lhs} IS NULL)")))
+            } else {
+                equal
+            }
+        } else {
+            // A value (a select item, under a NOT, in a CASE): all three,
+            // NULL when no row is equal and a NULL met a row.
+            let (hit, miss) = if negated { ("FALSE", "TRUE") } else { ("TRUE", "FALSE") };
+            format!("(CASE WHEN {equal} THEN {hit} WHEN {null} THEN NULL ELSE {miss} END)")
+        };
+        current = format!("{}{}{}", &current[..lhs_start], exists, &current[sub.end..]);
+        from = lhs_start + exists.len();
+        changed = true;
+    }
+    changed.then_some(current)
+}
+
+/// Where the operand ending `text` begins: back over names, numbers,
+/// arithmetic and balanced parentheses to the nearest `WHERE`, `AND`, `OR`,
+/// `NOT`, `ON`, `,` or unbalanced `(`. `None` when what is there is not such
+/// an operand (a quoted literal, a keyword, nothing).
+fn left_operand_start(text: &str) -> Option<usize> {
+    const BOUNDARIES: [&str; 10] = ["WHERE", "AND", "OR", "NOT", "ON", "WHEN", "THEN", "ELSE", "SELECT", "BETWEEN"];
+    let bytes = text.as_bytes();
+    let mut i = bytes.len();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c.is_ascii_whitespace() {
+            i -= 1;
+            continue;
+        }
+        match c {
+            b')' => depth += 1,
+            b'(' if depth == 0 => break,
+            b'(' => depth -= 1,
+            b',' if depth == 0 => break,
+            b'+' | b'-' | b'*' | b'/' | b'%' | b',' => {}
+            _ if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'"') => {
+                let end = i;
+                let mut j = i;
+                while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || matches!(bytes[j - 1], b'_' | b'.' | b'"')) {
+                    j -= 1;
+                }
+                if depth == 0 && BOUNDARIES.iter().any(|k| text[j..end].eq_ignore_ascii_case(k)) {
+                    break;
+                }
+                i = j;
+                start = Some(j);
+                continue;
+            }
+            _ => return None,
+        }
+        i -= 1;
+        start = Some(i);
+    }
+    if depth != 0 {
+        return None;
+    }
+    start
+}
+
+/// `text` with each bare column name qualified by `alias()`: `id + 0` as
+/// `a.id + 0`. `None` when one is bare and there is no single alias, or the
+/// text holds a call.
+fn qualify_bare_columns(text: &str, alias: impl Fn() -> Option<String>) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'"' {
+            let start = i;
+            if c == b'"' {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'"');
+            } else {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+            }
+            let word = &text[start..i];
+            let qualified_before = start > 0 && bytes[start - 1] == b'.';
+            let qualifier_after = bytes.get(i) == Some(&b'.');
+            let called = text[i..].trim_start().starts_with('(');
+            if called {
+                return None;
+            }
+            if !qualified_before && !qualifier_after {
+                out.push_str(&alias()?);
+                out.push('.');
+            }
+            out.push_str(word);
+            continue;
+        }
+        if c.is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.') {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Whether the condition starting at `at` decides the statement's `WHERE`
+/// on its own truth: reached from the last top-level `WHERE` before it only
+/// through `AND`, `OR` and grouping parentheses, with no `NOT`, `CASE`,
+/// comparison or call around it. There a NULL and a FALSE both leave the row
+/// out, so a two-valued form is exact; anywhere else the value is kept.
+fn decides_the_where(sql: &str, at: usize) -> bool {
+    use crate::core::rql::join::find_keyword;
+    let mut where_at = None;
+    let mut from = 0;
+    while let Some(found) = find_keyword(sql, "WHERE", from) {
+        if found >= at {
+            break;
+        }
+        where_at = Some(found);
+        from = found + 5;
+    }
+    let Some(where_at) = where_at else { return false };
+    let between = &sql[where_at + 5..at];
+    // Every word between must be a connective or part of a closed term;
+    // conservatively, none of the words that change a value's meaning.
+    let upper = between.to_ascii_uppercase();
+    let words_ok = !["NOT", "CASE", "WHEN", "THEN", "ELSE", "IS", "SELECT"].iter().any(|w| {
+        upper
+            .match_indices(w)
+            .any(|(i, _)| {
+                let before = upper[..i].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+                let after = upper[i + w.len()..].chars().next().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+                before && after
+            })
+    });
+    if !words_ok {
+        return false;
+    }
+    // Each parenthesis still open at `at` must be a group, opened right
+    // after WHERE, AND, OR or another such parenthesis.
+    let bytes = between.as_bytes();
+    let mut open: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            b'(' => open.push(i),
+            b')' => {
+                open.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let opens_a_group = |pos: usize| {
+        let head = between[..pos].trim_end();
+        head.is_empty()
+            || head.ends_with('(')
+            || ["AND", "OR"].iter().any(|k| {
+                head.len() >= k.len()
+                    && head[head.len() - k.len()..].eq_ignore_ascii_case(k)
+                    && head[..head.len() - k.len()].ends_with(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            })
+    };
+    open.iter().all(|&pos| opens_a_group(pos)) && opens_a_group(between.len())
+}
+
+/// The one relation a statement reads, by the name its columns are
+/// qualified with (its alias, or its table's last part): `SELECT … FROM t
+/// [AS] a`, `DELETE FROM t [a]`, `UPDATE t [AS] a SET` with no FROM. `None`
+/// for more than one, or a FROM list it cannot read.
+fn single_outer_alias(sql: &str) -> Option<String> {
+    use crate::core::rql::join::find_keyword;
+    let trimmed = sql.trim_start();
+    let list = if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"UPDATE") {
+        let set = find_keyword(sql, "SET", 0)?;
+        if find_keyword(sql, "FROM", set).is_some() {
+            return None;
+        }
+        sql[..set].trim()[6..].to_string()
+    } else {
+        let from = find_keyword(sql, "FROM", 0)? + "FROM".len();
+        let end = ["WHERE", "ORDER", "LIMIT", "OFFSET", "GROUP", "HAVING", "RETURNING", "UNION", "INTERSECT", "EXCEPT"]
+            .iter()
+            .filter_map(|kw| find_keyword(sql, kw, from))
+            .min()
+            .unwrap_or(sql.len());
+        sql[from..end].to_string()
+    };
+    if list.contains(',') || find_keyword(&list, "JOIN", 0).is_some() || list.contains('(') {
+        return None;
+    }
+    let words: Vec<&str> = list.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("AS")).collect();
+    let name = match words.as_slice() {
+        [table] => table.rsplit('.').next()?,
+        [_, alias] => alias,
+        _ => return None,
+    };
+    Some(name.trim_matches('"').to_string())
+}
+
 /// `sql` with each `[NOT] EXISTS (…)` that compares an outer column by
 /// anything but `=` written as the count it asks about: `(SELECT count(*)
 /// FROM … WHERE …) > 0`, or `= 0`. `None` when it has none.
@@ -1170,17 +1478,34 @@ pub(crate) fn exists_as_counts(sql: &str) -> Option<String> {
 /// `correlated::rewrite_write_where` when its `WHERE` holds a correlated
 /// subquery, after an `EXISTS` that compares the row by anything but `=` is
 /// counted (`exists_as_counts`); `None` when it holds none.
-fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<String, String>> {
+fn correlated_write_where(sql: &str, database: &Arc<Database>, delete: bool) -> Option<Result<WriteWhere, String>> {
+    let as_exists = correlated_in_as_exists(sql);
+    let sql = as_exists.as_deref().unwrap_or(sql);
     let counted = exists_as_counts(sql);
-    let sql = counted.as_deref().unwrap_or(sql);
-    let target = if delete { sql.split_whitespace().nth(2) } else { sql.split_whitespace().nth(1) }?
+    let counted_sql = counted.as_deref().unwrap_or(sql);
+    let target = if delete { counted_sql.split_whitespace().nth(2) } else { counted_sql.split_whitespace().nth(1) }?
         .trim_matches('"')
         .to_string();
     let key: Vec<String> = match database.schema_view(&target) {
         Some(view) => identifying_key(view.schema()).map(|k| k.fields.iter().map(|f| f.name.clone()).collect()).unwrap_or_default(),
         None => return None,
     };
-    crate::core::rql::correlated::rewrite_write_where(sql, &key, delete)
+    match crate::core::rql::correlated::rewrite_write_where(counted_sql, &key, delete) {
+        Some(Ok(joined)) => Some(Ok(WriteWhere::Joined(joined))),
+        Some(Err(e)) => Some(Err(e)),
+        // A correlated IN that became an EXISTS the write path answers
+        // itself (an equality, `exists_to_in`): the statement goes on as
+        // that. Left as the IN it was, it was refused.
+        None => as_exists.map(|plain| Ok(WriteWhere::Plain(plain))),
+    }
+}
+
+/// What [`correlated_write_where`] made of a write.
+enum WriteWhere {
+    /// Over a second relation: `UPDATE … FROM` / `DELETE … USING`.
+    Joined(String),
+    /// The same write, rewritten in place: run as it now reads.
+    Plain(String),
 }
 
 /// The first `[NOT] EXISTS (…)` of `sql` that is not inside another
@@ -22715,7 +23040,15 @@ pub(crate) async fn execute_with_need(
             // correlated EXISTS can compare an outer column only with `=`").
             if let QueryPurpose::UpdateRow(sql) = &query {
                 match correlated_write_where(sql, &database, false) {
-                    Some(Ok(rewritten)) => return Box::pin(execute_update_from(&rewritten, &database, depth, tx)).await,
+                    Some(Ok(WriteWhere::Joined(rewritten))) => {
+                        return Box::pin(execute_update_from(&rewritten, &database, depth, tx)).await;
+                    }
+                    Some(Ok(WriteWhere::Plain(rewritten))) => {
+                        return match recognize_query_purpose(&rewritten) {
+                            Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+                            None => ddl_error("a correlated IN in UPDATE could not be read"),
+                        };
+                    }
                     Some(Err(e)) => return ddl_error(&e),
                     None => {}
                 }
@@ -23339,7 +23672,15 @@ pub(crate) async fn execute_with_need(
             // its values: see the UPDATE arm.
             if let QueryPurpose::DeleteRow(sql) = &query {
                 match correlated_write_where(sql, &database, true) {
-                    Some(Ok(rewritten)) => return Box::pin(execute_delete_using(&rewritten, &database, depth, tx)).await,
+                    Some(Ok(WriteWhere::Joined(rewritten))) => {
+                        return Box::pin(execute_delete_using(&rewritten, &database, depth, tx)).await;
+                    }
+                    Some(Ok(WriteWhere::Plain(rewritten))) => {
+                        return match recognize_query_purpose(&rewritten) {
+                            Some(purpose) => Box::pin(execute_with_context(purpose, database.clone(), depth, tx)).await,
+                            None => ddl_error("a correlated IN in DELETE could not be read"),
+                        };
+                    }
                     Some(Err(e)) => return ddl_error(&e),
                     None => {}
                 }

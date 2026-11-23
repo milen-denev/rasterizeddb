@@ -352,26 +352,19 @@ async fn a_correlated_exists_in_an_update_or_delete_runs_at_every_isolation_leve
         // 1: 10 -> 2; 2: deleted (w 200); 3: 30 + 1 (no u row); 4: 40 -> 2, then deleted (w 50).
         assert_eq!(rows(&pool).await, vec![(1, 2), (3, 31)], "{session:?} {begin:?}");
     }
-    // Refused under any snapshot: an IN subquery reading the target.
-    let refused = [
-        "UPDATE t SET v = 0 WHERE id IN (SELECT m.id FROM u m WHERE EXISTS (SELECT 1 FROM u x WHERE x.tid = t.id))",
-    ];
+    // An IN subquery reading the target (through an EXISTS inside it),
+    // answered as PostgreSQL answers it (`executor::correlated_in_as_exists`):
+    // it was refused. Row 1's subquery holds its id; row 3's is empty.
     let before = rows(&pool).await;
-    for sql in refused {
-        let e = pool.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "autocommit {sql}: {e}");
-    }
+    let reads_target =
+        "UPDATE t SET v = 0 WHERE id IN (SELECT m.id FROM u m WHERE EXISTS (SELECT 1 FROM u x WHERE x.tid = t.id))";
     let mut conn = pool.acquire().await.expect("conn");
     conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    for sql in refused {
-        let e = conn.execute(sqlx::raw_sql(AssertSqlSafe(sql.to_string()))).await.expect_err(sql);
-        assert_eq!(code(&e), "0A000", "{sql}: {e}");
-        conn.execute("ROLLBACK").await.expect("rollback");
-        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ").await.expect("begin");
-    }
+    let changed = conn.execute(sqlx::raw_sql(AssertSqlSafe(reads_target.to_string()))).await.expect(reads_target);
+    assert_eq!(changed.rows_affected(), 1, "{reads_target}");
     conn.execute("ROLLBACK").await.expect("rollback");
     drop(conn);
-    assert_eq!(rows(&pool).await, before, "a refused statement changed a row");
+    assert_eq!(rows(&pool).await, before, "a rolled-back statement changed a row");
 
     // An inequality to the outer row, answered as PostgreSQL answers it
     // (`correlated::rewrite_write_where`): it was refused. Under a snapshot
