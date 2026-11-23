@@ -8,13 +8,16 @@ runs:
   using: composite
   steps:
     # The engine's tests create, sync and delete thousands of small files.
-    # On the Windows runners Defender scans each one, and those tests ran
+    # On the Windows runners Defender scans each one: file-heavy tests ran
     # 8-23x slower than on Linux while CPU- and network-bound tests ran at
-    # the same speed. The runners are throwaway VMs: real-time scanning is
-    # turned off, and the temp directory (where every test's tempdir lives)
-    # moves to the workspace drive. Best effort: a refused setting only
-    # leaves the job as slow as before.
-    - name: Windows file-system speed (Defender off, temp on the work drive)
+    # the same speed. The runners are throwaway VMs, so real-time scanning is
+    # turned off where the image allows it (windows-2025: the library suite
+    # went from 85 to 33 minutes). windows-11-arm has Tamper Protection, which
+    # ignores that silently; there the temp directory, where every test's
+    # tempdir lives, moves to a trusted Dev Drive (ReFS, scanned
+    # asynchronously), on every Windows runner alike. Best effort: a refused
+    # setting leaves the job as slow as before.
+    - name: Windows - Defender real-time scanning off
       if: runner.os == 'Windows'
       shell: pwsh
       continue-on-error: true
@@ -24,11 +27,28 @@ runs:
           Add-MpPreference -ExclusionPath $p -ErrorAction Continue
         }
         Get-MpComputerStatus | Format-List AMRunningMode, RealTimeProtectionEnabled, IsTamperProtected
-        $t = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Qualifier) 'rdbtmp'
-        New-Item -ItemType Directory -Force $t | Out-Null
-        Add-MpPreference -ExclusionPath $t -ErrorAction Continue
-        "TEMP=$t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        "TMP=$t" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+    - name: Windows - Dev Drive for the temp directory
+      if: runner.os == 'Windows'
+      uses: samypr100/setup-dev-drive@v4.1.0
+      with:
+        drive-size: 40GB
+        drive-format: ReFS
+        drive-type: Dynamic
+        trusted-dev-drive: true
+        env-mapping: |
+          TEMP,{{ DEV_DRIVE }}/tmp
+          TMP,{{ DEV_DRIVE }}/tmp
+
+    - name: Windows - temp directory on the Dev Drive
+      if: runner.os == 'Windows'
+      shell: pwsh
+      continue-on-error: true
+      run: |
+        New-Item -ItemType Directory -Force $env:TEMP | Out-Null
+        Add-MpPreference -ExclusionPath $env:DEV_DRIVE -ErrorAction Continue
+        "TEMP=$env:TEMP"
+        fsutil devdrv query $env:DEV_DRIVE
         Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free, Root
 
     - uses: dtolnay/rust-toolchain@stable
