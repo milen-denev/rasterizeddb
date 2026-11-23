@@ -522,6 +522,18 @@ pub struct ExplicitSequence {
     /// The value up to which the persisted row covers: a value past it must
     /// be written ahead before the process could lose it.
     pub reserved: AtomicI64,
+    /// PostgreSQL's `log_cnt`, as its `nextval` keeps it between checkpoints:
+    /// 32 at the first value after a `setval`, a restart or a load (when it
+    /// is 0), one less at each value after, 32 again past 0. Shown by the
+    /// sequence read as a relation; it governs nothing here (`reserved`
+    /// does).
+    pub log_cnt: AtomicI64,
+}
+
+/// See [`ExplicitSequence::log_cnt`]: its value after a `nextval` that found
+/// it at `before`, the sequence called (`true`) or not before.
+fn log_cnt_after_next(before: i64, called: bool) -> i64 {
+    if !called || before < 1 { RESERVE_AHEAD } else { before - 1 }
 }
 
 /// Every explicit sequence of every database, by [`key`].
@@ -532,9 +544,15 @@ static EXPLICIT: std::sync::LazyLock<DashMap<String, std::sync::Arc<ExplicitSequ
 /// covers.
 pub const RESERVE_AHEAD: i64 = 32;
 
+/// Whether any explicit sequence has been registered in this process, ever:
+/// one load before [`explicit_mentioned_in`], which a statement in a process
+/// without sequences then never pays for.
+static ANY_EXPLICIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Registers (or replaces) `database`'s explicit sequence `name`.
 pub fn register_explicit(database: u64, name: &str, sequence: ExplicitSequence) {
     EXPLICIT.insert(key(database, name), std::sync::Arc::new(sequence));
+    ANY_EXPLICIT.store(true, Ordering::Release);
 }
 
 /// Forgets `database`'s explicit sequence `name`.
@@ -554,6 +572,21 @@ pub fn explicit_all(database: u64) -> Vec<(String, std::sync::Arc<ExplicitSequen
         .iter()
         .filter_map(|e| e.key().strip_prefix(&prefix).map(|name| (name.to_string(), e.value().clone())))
         .collect()
+}
+
+/// Whether `sql` mentions the name of one of `database`'s explicit
+/// sequences anywhere: the cheap test before a statement is searched for a
+/// sequence read as a relation. No allocation.
+pub fn explicit_mentioned_in(database: u64, sql: &str) -> bool {
+    if !ANY_EXPLICIT.load(Ordering::Acquire) {
+        return false;
+    }
+    let prefix = key(database, "");
+    EXPLICIT.iter().any(|e| {
+        e.key()
+            .strip_prefix(&prefix)
+            .is_some_and(|name| crate::core::sql_scan::contains_ignore_ascii_case(sql, name.as_bytes()))
+    })
 }
 
 /// The explicit sequences of `database` whose reservation a value has
@@ -601,11 +634,16 @@ fn next_explicit(name: &str, sequence: &ExplicitSequence) -> Result<i64, String>
         };
         if !called {
             if sequence.called.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                sequence.log_cnt.store(log_cnt_after_next(0, false), Ordering::Relaxed);
                 return Ok(candidate);
             }
             continue;
         }
         if sequence.last.compare_exchange(last, candidate, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            // A display value: two racing calls may each count from the same
+            // `before`, which only shows one fewer value logged.
+            let before = sequence.log_cnt.load(Ordering::Relaxed);
+            sequence.log_cnt.store(log_cnt_after_next(before, true), Ordering::Relaxed);
             return Ok(candidate);
         }
     }
@@ -636,6 +674,7 @@ pub fn set_value(database: u64, name: &str, value: i64, is_called: bool) -> Resu
             }
             sequence.last.store(value, Ordering::SeqCst);
             sequence.called.store(is_called, Ordering::SeqCst);
+            sequence.log_cnt.store(0, Ordering::Relaxed);
             // Past the reservation: written ahead at the statement's end.
             if (sequence.increment > 0 && value > sequence.reserved.load(Ordering::SeqCst))
                 || (sequence.increment < 0 && value < sequence.reserved.load(Ordering::SeqCst))
@@ -683,6 +722,22 @@ pub mod session {
     /// Runs `fut` with `scope` in reach of its expressions.
     pub async fn scoped<F: std::future::Future>(scope: Scope, fut: F) -> F::Output {
         SCOPE.scope(scope, fut).await
+    }
+
+    /// `fut`, to be spawned, under the scope of the statement spawning it
+    /// (if any), as `statement_clock::inherit` carries the clock: a scan
+    /// worker judging `WHERE n < nextval('q')` for its rows draws from the
+    /// statement's sequences and records the values in its session. A
+    /// task-local does not cross `task::spawn`, so the call failed there
+    /// ("not available in this context").
+    pub fn inherit<F: std::future::Future>(fut: F) -> impl std::future::Future<Output = F::Output> {
+        let scope = SCOPE.try_with(Scope::clone).ok();
+        async move {
+            match scope {
+                Some(scope) => SCOPE.scope(scope, fut).await,
+                None => fut.await,
+            }
+        }
     }
 
     /// The scope's database, when a statement set one.

@@ -4185,6 +4185,16 @@ pub fn plan(
                 // relation rather than needing a plan-level short circuit.
                 predicates[0].push(conjunct);
             }
+            0 if crate::core::rql::replicated_values::calls_volatile(&conjunct)
+                || crate::core::rql::generated::moves_a_sequence(&conjunct) =>
+            {
+                // A call that answers anew at each call (`random()`,
+                // `nextval('s')`) reads no relation and is no constant: judged
+                // on each joined row, as PostgreSQL judges it. Refused here
+                // before (`random()`), or folded once for the statement
+                // (`nextval`, which then drew one value for every row).
+                cross_relation.push(conjunct);
+            }
             0 => {
                 // Still an error for anything naming something: a misspelled
                 // column must not be quietly treated as a constant.

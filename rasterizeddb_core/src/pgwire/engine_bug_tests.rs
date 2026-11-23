@@ -1024,3 +1024,309 @@ async fn self_referencing_foreign_key_across_a_copy() {
     .await
     .expect("bounded");
 }
+
+/// Runs `sql`: its rows as `a|b` text (`NULL` for a NULL) and its command
+/// tag, or the error's SQLSTATE.
+async fn answer(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<(Vec<String>, String), String> {
+    Box::pin(execute_recorded(db, &mut s.state, &mut s.server, sql, &[], false, None))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut out = Vec::new();
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'D' => {
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                let mut at = 2;
+                let mut row = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let l = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                    at += 4;
+                    if l < 0 {
+                        row.push("NULL".to_string());
+                    } else {
+                        row.push(String::from_utf8_lossy(&body[at..at + l as usize]).into_owned());
+                        at += l as usize;
+                    }
+                }
+                out.push(row.join("|"));
+            }
+            b'C' => return Ok((out, String::from_utf8_lossy(&body).trim_end_matches('\0').to_string())),
+            b'E' => return Err(sqlstate_of(&String::from_utf8_lossy(&body)).to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// PostgreSQL checks a foreign key on the row it inserted, after the row is
+/// in: a row `ON CONFLICT` skips, or turns into an update of the row it met,
+/// never has its proposed key checked, and a CHECK or a uniqueness violation
+/// is the error before a missing parent is. Each row's key was checked first
+/// here, so all of these were 23503. Every answer is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_key_is_checked_on_the_row_the_insert_writes() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        for sql in [
+            "CREATE TABLE parn (id int PRIMARY KEY)",
+            "INSERT INTO parn VALUES (1), (2)",
+            "CREATE TABLE chn (id int PRIMARY KEY, pn int REFERENCES parn(id), c int CHECK (c > 0))",
+            "INSERT INTO chn VALUES (1, 1)",
+            "CREATE TABLE ch2 (id int PRIMARY KEY, u int UNIQUE, pn int REFERENCES parn(id))",
+            "INSERT INTO ch2 VALUES (1, 10, 1)",
+            "CREATE SEQUENCE s1",
+            "CREATE TABLE cs (id int PRIMARY KEY, k bigint DEFAULT nextval('s1'), pn int REFERENCES parn(id))",
+            "INSERT INTO cs VALUES (1, 100, 1)",
+            "CREATE TABLE src (id int, pn int)",
+            "INSERT INTO src VALUES (1, 81), (7, 2), (8, 1)",
+            "CREATE TABLE ck (a char(3), b int, pn int REFERENCES parn(id), PRIMARY KEY (a, b))",
+            "INSERT INTO ck VALUES ('x', 1, 1)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        let ins = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn", ins(&["2"], "INSERT 0 1")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO NOTHING", ins(&[], "INSERT 0 0")),
+            (
+                "INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO UPDATE SET pn = 1 RETURNING id, pn",
+                ins(&["1|1"], "INSERT 0 1"),
+            ),
+            // No conflict: the row is inserted, and its key is missing.
+            ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO UPDATE SET pn = 2", err("23503")),
+            // The update's own key is checked.
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = EXCLUDED.pn", err("23503")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 99", err("23503")),
+            // A row of a multi-row insert.
+            ("INSERT INTO chn VALUES (1, 81), (2, 1), (3, 82) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("INSERT INTO chn VALUES (1, 81), (2, 1), (5, 2) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 2")),
+            (
+                "INSERT INTO chn VALUES (1, 81), (2, 77), (6, 2) ON CONFLICT (id) DO UPDATE SET pn = 1 RETURNING id, pn",
+                ins(&["1|1", "2|1", "6|2"], "INSERT 0 3"),
+            ),
+            ("SELECT id, pn FROM chn ORDER BY id", ins(&["1|1", "2|1", "5|2", "6|2"], "SELECT 4")),
+            // Without the clause, or a clash on another key: 23505 first.
+            ("INSERT INTO chn VALUES (1, 81)", err("23505")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT (id) DO NOTHING", err("23505")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT (u) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ch2 VALUES (1, 11, 81) ON CONFLICT (u) DO NOTHING", err("23505")),
+            // A CHECK is judged before either.
+            ("INSERT INTO chn VALUES (1, 81, -1) ON CONFLICT DO NOTHING", err("23514")),
+            ("INSERT INTO chn VALUES (30, 81, -1)", err("23514")),
+            // A default computed once per row, the skipped row's too.
+            ("INSERT INTO cs (id, pn) VALUES (1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO cs (id, pn) VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING id, k, pn", ins(&["1|100|2"], "INSERT 0 1")),
+            ("SELECT nextval('s1')", ins(&["3"], "SELECT 1")),
+            // INSERT … SELECT.
+            ("INSERT INTO chn (id, pn) SELECT id, pn FROM src ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 2")),
+            (
+                "INSERT INTO chn (id, pn) SELECT id, pn FROM src ON CONFLICT (id) DO UPDATE SET c = 5 RETURNING id, pn, c",
+                ins(&["1|1|5", "7|2|5", "8|1|5"], "INSERT 0 3"),
+            ),
+            // A key compared as the column stores it.
+            ("INSERT INTO ck VALUES ('x  ', 1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ck VALUES ('x', 1, 81) ON CONFLICT (a, b) DO UPDATE SET pn = 2 RETURNING *", ins(&["x  |1|2"], "INSERT 0 1")),
+            ("INSERT INTO ck VALUES ('x', 2, 81) ON CONFLICT (a, b) DO NOTHING", err("23503")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // In a block: the skipped row does not fail it.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING").await, ins(&[], "INSERT 0 0"));
+        assert_eq!(
+            answer(&db, &mut s, "INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn").await,
+            ins(&["2"], "INSERT 0 1")
+        );
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT pn FROM chn WHERE id = 1").await, ins(&["1"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A volatile call in a condition is evaluated for each row it judges, as
+/// PostgreSQL evaluates it: `nextval` in a WHERE was folded into one value
+/// for the statement (`WHERE n < nextval('q') + 100000` over four rows drew
+/// one value, not four), and over a scan's workers it had no sequence to draw
+/// from. `clock_timestamp()` in a WHERE was refused (0A000), and `random()`
+/// or `nextval` in a join's WHERE too ("references no column"). Every answer
+/// is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_volatile_call_in_a_condition_is_evaluated_per_row() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE t (id int PRIMARY KEY, n int)").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, NULL)").await;
+        ok(&db, &mut s, "CREATE SEQUENCE q START 1").await;
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        for (sql, expected) in [
+            ("SELECT count(*) FROM t WHERE n < nextval('q') + 100000", at(&["3"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["5"], "SELECT 1")),
+            ("SELECT currval('q')", at(&["5"], "SELECT 1")),
+            ("SELECT id FROM t WHERE nextval('q') < 10 ORDER BY id", at(&["1", "2", "3", "4"], "SELECT 4")),
+            ("SELECT currval('q')", at(&["9"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE nextval('q') > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["14"], "SELECT 1")),
+            ("UPDATE t SET n = n WHERE nextval('q') > 0", at(&[], "UPDATE 4")),
+            ("SELECT nextval('q')", at(&["19"], "SELECT 1")),
+            // Not a point lookup: the key is a new value for each row.
+            ("UPDATE t SET n = 5 WHERE id = nextval('q') - 100", at(&[], "UPDATE 0")),
+            ("DELETE FROM t WHERE id = nextval('q')", at(&[], "DELETE 0")),
+            ("SELECT nextval('q')", at(&["28"], "SELECT 1")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE nextval('q') > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["33"], "SELECT 1")),
+            ("INSERT INTO t SELECT id + 10, n FROM t WHERE nextval('q') > 0", at(&[], "INSERT 0 4")),
+            ("SELECT nextval('q')", at(&["38"], "SELECT 1")),
+            // Eight values in a row: four of them even, whichever row takes which.
+            ("DELETE FROM t WHERE nextval('q') % 2 = 0", at(&[], "DELETE 4")),
+            ("SELECT count(*) FROM t", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["47"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE setval('q', 100) > 0", at(&["4"], "SELECT 1")),
+            ("SELECT nextval('q')", at(&["101"], "SELECT 1")),
+            // The other volatile calls.
+            ("SELECT count(*) FROM t WHERE clock_timestamp() > now() - interval '1 hour'", at(&["4"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE clock_timestamp() < now() - interval '1 hour'", at(&["0"], "SELECT 1")),
+            ("SELECT count(*) FROM t WHERE random() >= 0 AND random() < 1", at(&["4"], "SELECT 1")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE random() >= 0", at(&["4"], "SELECT 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // The `SET` of one conflict's update still draws once.
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET n = nextval('q')").await;
+        assert_eq!(answer(&db, &mut s, "SELECT n FROM t WHERE id = 1").await, at(&["102"], "SELECT 1"));
+        assert_eq!(answer(&db, &mut s, "SELECT nextval('q')").await, at(&["103"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// `EXISTS` over a `SELECT` with no `FROM` is the truth of its condition (one
+/// row when it holds, none otherwise). Every `EXISTS` path wanted a relation
+/// (42601, "the SELECT inside EXISTS has no FROM clause"), in a select list,
+/// in a `WHERE` with or without a table, and over a parameter. Every answer
+/// is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exists_over_a_select_without_from_answers_as_postgresql_does() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE t (id int PRIMARY KEY, n int)").await;
+        ok(&db, &mut s, "INSERT INTO t VALUES (1, 1), (2, 7), (3, NULL)").await;
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        for (sql, expected) in [
+            ("SELECT EXISTS (SELECT 1)", at(&["t"], "SELECT 1")),
+            ("SELECT EXISTS (SELECT 1 WHERE false)", at(&["f"], "SELECT 1")),
+            ("SELECT NOT EXISTS (SELECT 1)", at(&["f"], "SELECT 1")),
+            ("SELECT EXISTS (SELECT 1 WHERE NULL)", at(&["f"], "SELECT 1")),
+            ("SELECT NOT EXISTS (SELECT 1 WHERE NULL)", at(&["t"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1)", at(&["1"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE false)", at(&[], "SELECT 0")),
+            ("SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2)", at(&["1"], "SELECT 1")),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE EXISTS (SELECT 1 WHERE 1 = 1))", at(&["1"], "SELECT 1")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1) AND n IS NULL", at(&["3"], "SELECT 1")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE false) ORDER BY id", at(&[], "SELECT 0")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1) ORDER BY id", at(&[], "SELECT 0")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE false) ORDER BY id", at(&["1", "2", "3"], "SELECT 3")),
+            // The outer row's columns, qualified or bare.
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE t.n > 5) ORDER BY id", at(&["2"], "SELECT 1")),
+            ("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE t.n > 5) ORDER BY id", at(&["1", "3"], "SELECT 2")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 WHERE n > 5) ORDER BY id", at(&["2"], "SELECT 1")),
+            ("SELECT id, EXISTS (SELECT 1 WHERE t.n > 5) FROM t ORDER BY id", at(&["1|f", "2|t", "3|f"], "SELECT 3")),
+            ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id WHERE EXISTS (SELECT 1 WHERE a.n > 1)", at(&["1"], "SELECT 1")),
+            // Aggregates yield a row whatever the condition.
+            ("SELECT id FROM t WHERE EXISTS (SELECT count(*) WHERE false) ORDER BY id", at(&["1", "2", "3"], "SELECT 3")),
+            ("SELECT id FROM t WHERE EXISTS (SELECT 1 LIMIT 0) ORDER BY id", at(&[], "SELECT 0")),
+            (
+                "SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE 1 = 2) AND EXISTS (SELECT 1 FROM t)",
+                at(&["1"], "SELECT 1"),
+            ),
+            ("SELECT 'é' AS x WHERE EXISTS (SELECT 'ü')", at(&["é"], "SELECT 1")),
+            ("DELETE FROM t WHERE NOT EXISTS (SELECT 1 WHERE false) AND id = 3 RETURNING id", at(&["3"], "DELETE 1")),
+            ("UPDATE t SET n = 9 WHERE EXISTS (SELECT 1) AND id = 1 RETURNING id, n", at(&["1|9"], "UPDATE 1")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // A parameter, prepared and executed.
+        ok(&db, &mut s, "PREPARE p(int) AS SELECT id FROM t WHERE NOT EXISTS (SELECT 1 WHERE $1 = 2) ORDER BY id").await;
+        assert_eq!(answer(&db, &mut s, "EXECUTE p(2)").await, at(&[], "SELECT 0"));
+        assert_eq!(answer(&db, &mut s, "EXECUTE p(3)").await, at(&["1", "2"], "SELECT 2"));
+    })
+    .await
+    .expect("bounded");
+}
+
+/// A sequence read as a relation is PostgreSQL's one row of `last_value`,
+/// `log_cnt` and `is_called` (42P01 here before), for a `CREATE SEQUENCE`
+/// one and a serial column's; a write to one is 42809. Every answer is
+/// PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sequence_reads_as_its_row() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        let at = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("CREATE SEQUENCE sq START 1", at(&[], "CREATE SEQUENCE")),
+            ("SELECT last_value, log_cnt, is_called FROM sq", at(&["1|0|f"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["1|0|f"], "SELECT 1")),
+            ("SELECT nextval('sq')", at(&["1"], "SELECT 1")),
+            ("SELECT last_value FROM sq", at(&["1"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["1|32|t"], "SELECT 1")),
+            ("SELECT setval('sq', 10, false)", at(&["10"], "SELECT 1")),
+            ("SELECT last_value, is_called FROM sq", at(&["10|f"], "SELECT 1")),
+            ("SELECT nextval('sq')", at(&["10"], "SELECT 1")),
+            ("SELECT last_value, is_called FROM sq", at(&["10|t"], "SELECT 1")),
+            ("SELECT setval('sq', 20)", at(&["20"], "SELECT 1")),
+            ("SELECT * FROM sq", at(&["20|0|t"], "SELECT 1")),
+            ("SELECT nextval('sq'), nextval('sq')", at(&["21|22"], "SELECT 1")),
+            ("SELECT * FROM \"sq\"", at(&["22|31|t"], "SELECT 1")),
+            ("CREATE SEQUENCE s5 START 5 INCREMENT 3", at(&[], "CREATE SEQUENCE")),
+            ("SELECT * FROM s5", at(&["5|0|f"], "SELECT 1")),
+            ("SELECT nextval('s5'), nextval('s5')", at(&["5|8"], "SELECT 1")),
+            ("SELECT s.last_value FROM s5 s", at(&["8"], "SELECT 1")),
+            ("SELECT last_value FROM public.s5", at(&["8"], "SELECT 1")),
+            ("SELECT last_value + 1 AS nx FROM s5 WHERE is_called", at(&["9"], "SELECT 1")),
+            ("SELECT count(*) FROM s5", at(&["1"], "SELECT 1")),
+            ("SELECT (SELECT last_value FROM s5) + 1", at(&["9"], "SELECT 1")),
+            // A serial column's.
+            ("CREATE TABLE ser (id serial PRIMARY KEY, v text)", at(&[], "CREATE TABLE")),
+            ("SELECT last_value, is_called FROM ser_id_seq", at(&["1|f"], "SELECT 1")),
+            ("INSERT INTO ser (v) VALUES ('a'), ('b')", at(&[], "INSERT 0 2")),
+            ("SELECT last_value, is_called FROM ser_id_seq", at(&["2|t"], "SELECT 1")),
+            // Not a table.
+            ("INSERT INTO sq VALUES (1, 0, true)", err("42809")),
+            ("UPDATE sq SET last_value = 5", err("42809")),
+            ("DELETE FROM ser_id_seq", err("42809")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // Not transactional: a value a rolled-back block took stays taken.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "SELECT nextval('sq')").await, at(&["23"], "SELECT 1"));
+        assert_eq!(answer(&db, &mut s, "SELECT last_value FROM sq").await, at(&["23"], "SELECT 1"));
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT last_value FROM sq").await, at(&["23"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}

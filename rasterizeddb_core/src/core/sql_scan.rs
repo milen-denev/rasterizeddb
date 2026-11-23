@@ -288,6 +288,133 @@ fn matching_paren_at(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// `[NOT] EXISTS (SELECT … [WHERE c])` whose `SELECT` reads no relation, as
+/// the truth value it is: `TRUE` (`FALSE`) with no `WHERE`, else `((c) IS
+/// TRUE)` (`IS NOT TRUE`), `c` reading the outer row as it did. A `SELECT`
+/// with no `FROM` yields one row when its condition is true and none
+/// otherwise (NULL is not true). Every `EXISTS` path wanted a relation
+/// ("the SELECT inside EXISTS has no FROM clause", 42601), so `WHERE NOT
+/// EXISTS (SELECT 1 WHERE $1 = 2)` failed whatever `$1` was.
+///
+/// Only that shape is rewritten, an allowlist: a select list calling no
+/// function (an aggregate yields a row whatever the condition, a
+/// set-returning function any number) and holding no subquery, and no
+/// clause but `WHERE` (`LIMIT 0`, `HAVING` and a set operation change the
+/// count). Anything else is left as written, to be refused as before.
+pub fn from_less_exists(sql: &str) -> Option<String> {
+    if !contains_ignore_ascii_case(sql, b"EXISTS") {
+        return None;
+    }
+    let bytes = sql.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end;
+            continue;
+        }
+        let word = i + 6 <= bytes.len()
+            && bytes[i..i + 6].eq_ignore_ascii_case(b"EXISTS")
+            && (i == 0 || !is_identifier_byte(bytes[i - 1]))
+            && bytes.get(i + 6).is_none_or(|b| !is_identifier_byte(*b));
+        if !word {
+            i += 1;
+            continue;
+        }
+        let mut open = i + 6;
+        while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+            open += 1;
+        }
+        let Some(close) = (bytes.get(open) == Some(&b'(')).then(|| matching_close(sql, open)).flatten() else {
+            i += 6;
+            continue;
+        };
+        let Some(condition) = from_less_condition(&sql[open + 1..close]) else {
+            i += 6;
+            continue;
+        };
+        // A `NOT` before it is the negation of this test, absorbed.
+        let head = sql[copied..i].trim_end_matches(|c: char| c.is_ascii_whitespace());
+        let negated = head.len() >= 3
+            && head.as_bytes()[head.len() - 3..].eq_ignore_ascii_case(b"NOT")
+            && (head.len() == 3 || !is_identifier_byte(head.as_bytes()[head.len() - 4]));
+        let start = if negated { copied + head.len() - 3 } else { i };
+        out.push_str(&sql[copied..start]);
+        match condition {
+            None => out.push_str(if negated { "FALSE" } else { "TRUE" }),
+            Some(condition) => {
+                // An `EXISTS` inside the condition, rewritten as well.
+                let condition = from_less_exists(condition).map_or(Cow::Borrowed(condition), Cow::Owned);
+                out.push_str("((");
+                out.push_str(&condition);
+                out.push_str(if negated { ") IS NOT TRUE)" } else { ") IS TRUE)" });
+            }
+        }
+        copied = close + 1;
+        i = close + 1;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// For [`from_less_exists`]: `Some(None)` when `inner` is a `SELECT` with
+/// neither `FROM` nor `WHERE` (one row), `Some(Some(c))` when its only clause
+/// is `WHERE c`, `None` for anything else.
+fn from_less_condition(inner: &str) -> Option<Option<&str>> {
+    use crate::core::rql::join::find_keyword;
+    let inner = inner.trim();
+    if !starts_with_keyword(inner, "SELECT") {
+        return None;
+    }
+    const CLAUSES: [&str; 13] = [
+        "FROM", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "UNION", "INTERSECT", "EXCEPT", "WINDOW",
+        "INTO", "FOR",
+    ];
+    if CLAUSES.iter().any(|k| find_keyword(inner, k, 0).is_some()) {
+        return None;
+    }
+    let where_at = find_keyword(inner, "WHERE", 0);
+    let items = inner["SELECT".len()..where_at.unwrap_or(inner.len())].trim();
+    // `SELECT *` with no table is PostgreSQL's error; a call or a subquery
+    // may yield other than one row. Aggregates alone (`SELECT count(*) WHERE
+    // false`) yield one row whatever the condition.
+    const AGGREGATES: [&str; 12] = [
+        "count", "sum", "avg", "min", "max", "bool_and", "bool_or", "every", "string_agg", "array_agg", "json_agg",
+        "jsonb_agg",
+    ];
+    let b = items.as_bytes();
+    let mut calls = 0usize;
+    let mut aggregates = 0usize;
+    for p in (0..b.len()).filter(|p| b[*p] == b'(') {
+        let before = items[..p].trim_end();
+        if !before.as_bytes().last().is_some_and(|c| is_identifier_byte(*c) || *c == b'"') {
+            continue;
+        }
+        calls += 1;
+        let name_at = before.bytes().rposition(|c| !is_identifier_byte(c)).map_or(0, |at| at + 1);
+        if AGGREGATES.iter().any(|a| before.as_bytes()[name_at..].eq_ignore_ascii_case(a.as_bytes())) {
+            aggregates += 1;
+        }
+    }
+    if items.is_empty() || items == "*" || contains_ignore_ascii_case(items, b"SELECT") {
+        return None;
+    }
+    if calls > 0 {
+        return (calls == aggregates).then_some(None);
+    }
+    match where_at {
+        None => Some(None),
+        Some(at) => {
+            let condition = inner[at + "WHERE".len()..].trim();
+            (!condition.is_empty()).then_some(Some(condition))
+        }
+    }
+}
+
 /// `ARRAY(SELECT x FROM … [ORDER BY o])`, the array constructor over a
 /// subquery, as `COALESCE((SELECT array_agg(x ORDER BY o) FROM …), '{}')`:
 /// the same elements in the same order, and the empty array (not NULL) for
@@ -3780,7 +3907,7 @@ mod multibyte_text_tests {
         "SELECT ARRAY(SELECT a FROM t), 't'::regclass, to_regclass('t')",
         "SELECT * FROM t WHERE a > ANY (SELECT b FROM u) AND a < ALL (SELECT c FROM v)",
         "SELECT \"MixedCase\", Lower FROM T -- note\nWHERE /* c */ x = 1",
-        "UPDATE stores SET name = 'Probe', guest_buttons = '[{\"label\":\"Call the waiter\"}]', basic_guest_buttons = '[]' WHERE id = 's1' RETURNING id",
+        "UPDATE stores SET name = 'Probe', guest_buttons = '[{\"label\":\"Call the waiter\"}]', basic_guest_buttons = '[]' WHERE id = 's1' RETURNING id",        "SELECT 1 WHERE NOT EXISTS (SELECT 'x' WHERE a = 'y') AND EXISTS (SELECT 1) OR EXISTS (SELECT 2 WHERE b > 3)",
     ];
 
     /// Every pass over every trigger statement with a 2-, 3- and 4-byte
@@ -3808,6 +3935,7 @@ mod multibyte_text_tests {
             ("fold_unquoted_identifiers", |s| drop(fold_unquoted_identifiers(s))),
             ("normalize_string_literals", |s| drop(normalize_string_literals(s))),
             ("zone_free_timestamp_literals", |s| drop(zone_free_timestamp_literals(s))),
+            ("from_less_exists", |s| drop(from_less_exists(s))),
         ];
         let mut failures = Vec::new();
         for base in TRIGGERS {
@@ -3937,6 +4065,50 @@ mod branch_parentheses_tests {
             "UPDATE t SET a = (SELECT 1)",
         ] {
             assert!(matches!(source_query_parentheses(sql), Cow::Borrowed(_)), "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod from_less_exists_tests {
+    use super::from_less_exists;
+
+    #[test]
+    fn a_from_less_exists_is_its_condition_and_nothing_else_is_rewritten() {
+        for (sql, expected) in [
+            ("SELECT EXISTS (SELECT 1)", "SELECT TRUE"),
+            ("SELECT 1 WHERE NOT EXISTS (SELECT count(*), max(1) WHERE false)", "SELECT 1 WHERE FALSE"),
+            ("SELECT NOT EXISTS (SELECT 1)", "SELECT FALSE"),
+            ("SELECT 1 WHERE EXISTS (SELECT 1 WHERE false)", "SELECT 1 WHERE ((false) IS TRUE)"),
+            ("SELECT 1 WHERE NOT EXISTS (SELECT 1 WHERE $1 = 2)", "SELECT 1 WHERE (($1 = 2) IS NOT TRUE)"),
+            (
+                "SELECT id FROM t WHERE exists(select 'é' where t.n > 5) AND n IS NULL",
+                "SELECT id FROM t WHERE ((t.n > 5) IS TRUE) AND n IS NULL",
+            ),
+            (
+                "SELECT 1 WHERE EXISTS (SELECT 1 WHERE NOT EXISTS (SELECT 2 WHERE a = 1))",
+                "SELECT 1 WHERE ((((a = 1) IS NOT TRUE)) IS TRUE)",
+            ),
+        ] {
+            assert_eq!(from_less_exists(sql).as_deref(), Some(expected), "{sql}");
+        }
+        // A relation, a clause that changes the count, a call or a subquery
+        // in the select list, `*`, or no EXISTS at all: left as written.
+        for sql in [
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM t)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 LIMIT 0)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 WHERE a = 1 OFFSET 1)",
+            "SELECT 1 WHERE EXISTS (SELECT count(*), lower('x') WHERE false)",
+            "SELECT 1 WHERE EXISTS (SELECT generate_series(1, 0))",
+            "SELECT 1 WHERE EXISTS (SELECT (SELECT 1) WHERE true)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 UNION SELECT 2)",
+            "SELECT 1 WHERE EXISTS (SELECT 1 GROUP BY 1 HAVING false)",
+            "SELECT 1 WHERE EXISTS (SELECT *)",
+            "SELECT 'EXISTS (SELECT 1)'",
+            "SELECT not_exists (SELECT 1)",
+            "SELECT exists_x FROM t",
+        ] {
+            assert_eq!(from_less_exists(sql), None, "{sql}");
         }
     }
 }

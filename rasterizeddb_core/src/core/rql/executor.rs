@@ -10387,7 +10387,7 @@ fn fold_where_constants_into(sql: &str, refused: &mut Option<String>) -> String 
     format!(
         "{}{}{}",
         &sql[..body_start],
-        fold_constants_in_predicate_into(&body[..end], refused),
+        fold_constants_in_predicate_into(&body[..end], refused, true),
         &body[end..]
     )
 }
@@ -10429,7 +10429,7 @@ fn fold_on_clauses(sql: &str, refused: &mut Option<String>) -> String {
         {
             out.push_str(&rest[..end]);
         } else {
-            out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused));
+            out.push_str(&fold_constants_in_predicate_into(&rest[..end], refused, true));
         }
         cursor = start + end;
     }
@@ -10445,13 +10445,19 @@ fn fold_on_clauses(sql: &str, refused: &mut Option<String>) -> String {
 /// reference fails to resolve there — so that is what decides whether a term is
 /// folded or left alone.
 fn fold_constants_in_predicate(text: &str) -> String {
-    fold_constants_in_predicate_into(text, &mut None)
+    fold_constants_in_predicate_into(text, &mut None, false)
 }
 
 /// [`fold_constants_in_predicate`], noting in `refused` the first constant
 /// PostgreSQL would refuse to compute (see [`fold_where_constants_checked`]).
-fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) -> String {
-    fn fold_operand(operand: &str, refused: &mut Option<String>) -> String {
+///
+/// `per_row`: the text is a condition, evaluated once per row it judges (a
+/// `WHERE`, a join's `ON`), where a `nextval('s')` or `setval(…)` draws for
+/// every row as PostgreSQL's does, and so is left to the evaluator. Folded,
+/// `WHERE n < nextval('q') + 100000` over four rows drew one value, not four.
+/// Otherwise (the `SET` of one conflict's update) it is computed once here.
+fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>, per_row: bool) -> String {
+    fn fold_operand(operand: &str, refused: &mut Option<String>, per_row: bool) -> String {
         // The statement's own `;` is not part of its last operand: left on
         // it, `id <= 5 + 100;` (as pgbench and many drivers send it) and
         // `ts < NOW();` were never folded.
@@ -10466,7 +10472,11 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
         let wrap = |value: String| format!("{}{}{}", lead, value, tail);
         // Asked by computing the operand, which a `nextval('s')` in it must
         // not be twice: the fold below computes it, once.
-        if !crate::core::rql::generated::moves_a_sequence(trimmed)
+        let moves_a_sequence = crate::core::rql::generated::moves_a_sequence(trimmed);
+        if per_row && moves_a_sequence {
+            return operand.to_string();
+        }
+        if !moves_a_sequence
             && let Some(e) = constant_refusal(trimmed)
         {
             refused.get_or_insert(e);
@@ -10638,7 +10648,7 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                 // same way.
                 if let Some((lead, inner, tail)) = parenthesised(term) {
                     out.push_str(lead);
-                    out.push_str(&fold_constants_in_predicate_into(inner, refused));
+                    out.push_str(&fold_constants_in_predicate_into(inner, refused, per_row));
                     out.push_str(tail);
                     continue;
                 }
@@ -10646,9 +10656,9 @@ fn fold_constants_in_predicate_into(text: &str, refused: &mut Option<String>) ->
                 // them is usually constant.
                 match find_comparison(term) {
                     Some((at, width)) => {
-                        let left = fold_operand(&term[..at], refused);
+                        let left = fold_operand(&term[..at], refused, per_row);
                         let op = &term[at..at + width];
-                        let right = fold_operand(&term[at + width..], refused);
+                        let right = fold_operand(&term[at + width..], refused, per_row);
                         // A number on the left of arithmetic over columns
                         // (`12 = v * 1`) is written the other way round: the
                         // predicate compiler reads arithmetic on the left
@@ -22221,6 +22231,12 @@ async fn insert_row_resolved(
     // `early_row` is the row when the check had to encode it to read a key
     // (`Some(None)`: it was refused). Boxed, as it is held across the check.
     let mut early_row: Option<Option<Box<crate::core::row::row::RowWrite>>> = None;
+    // A violation found, reported only once the row is known to be one the
+    // insert would write: PostgreSQL checks a key after the row is in, so a
+    // CHECK (before it) or a uniqueness violation (at it) is the error
+    // instead, and a row `ON CONFLICT` skips or turns into an update never
+    // has its key checked (`insert_conflict_in_txn` below).
+    let mut foreign_key_error: Option<String> = None;
     // What the statement's scope had deferred before this row's check: a
     // row that is not written takes its own deferred checks back.
     let deferred_at = deferred_mark();
@@ -22269,8 +22285,13 @@ async fn insert_row_resolved(
             if let Err(e) =
                 Box::pin(check_foreign_keys_of(&database, Some(&table.schema), table_name, checked, tx)).await
             {
-                error!("{}", e);
-                return ddl_error(&e);
+                // A partitioned table's row is routed by the write, which
+                // has no check without it: reported now, as before.
+                if partitioned.is_some() {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+                foreign_key_error = Some(e);
             }
         }
         None => {
@@ -22337,9 +22358,19 @@ async fn insert_row_resolved(
         // it on first write; the partition's own unique check is exact
         // because every unique key holds every key column (§1b). Boxed:
         // routing adds a materialization to this arm's future.
-        let outcome = match &partitioned {
-            Some(pt) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
-            None => table.insert_row_in_txn(insert_row, tx).await,
+        let outcome = match (&partitioned, foreign_key_error) {
+            (Some(pt), _) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
+            (None, None) => table.insert_row_in_txn(insert_row, tx).await,
+            // Not written: the uniqueness violation the write would have met
+            // is the statement's answer (`ON CONFLICT`'s, or 23505), and the
+            // key's violation only when there is none.
+            (None, Some(e)) => match Box::pin(table.insert_conflict_in_txn(insert_row, tx)).await {
+                Ok(()) => {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+                Err(conflict) => Err(conflict),
+            },
         };
         // Not written (`ON CONFLICT DO NOTHING` skips it, `DO UPDATE` updates
         // the row it met, which is checked as an update): the key this row

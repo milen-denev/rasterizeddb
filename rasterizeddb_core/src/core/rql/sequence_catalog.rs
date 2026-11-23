@@ -540,6 +540,7 @@ pub fn register(database: &Database, def: &SequenceDef) {
             } else {
                 def.last_value.saturating_sub(def.increment)
             }),
+            log_cnt: std::sync::atomic::AtomicI64::new(0),
         },
     );
 }
@@ -615,6 +616,99 @@ pub fn implicit_sequences(database: &Database) -> Vec<(String, String, String)> 
 pub async fn exists(database: &Arc<Database>, name: &str, tx: Option<TxId>) -> bool {
     matches!(load(database, Some(&[name.to_string()]), tx).await, Ok(v) if !v.is_empty())
         || implicit_sequences(database).iter().any(|(s, _, _)| s == name)
+}
+
+/// `sql` with each sequence it reads as a relation (`SELECT last_value FROM
+/// s`, `SELECT * FROM s`) written as the one-row derived table PostgreSQL's
+/// sequence relation is: `last_value`, `log_cnt`, `is_called`. `None` when it
+/// reads none. It was 42P01: a sequence is no table here.
+///
+/// An explicit sequence is read off its counter (`sequence::explicit`). An
+/// implicit one (a `SERIAL` or identity column's, a name ending `_seq`) off
+/// its counter once seeded, else off its column, which is what the counter
+/// would be seeded from: its largest value, or the start (1) and not called
+/// for an empty table. A write to one is PostgreSQL's 42809.
+pub fn relations_as_rows(database: &Database, sql: &str) -> Result<Option<String>, Refusal> {
+    use crate::core::sql_scan::contains_ignore_ascii_case;
+    // Every statement passes here: a statement naming no sequence pays one
+    // scan for `_` and one load (`explicit_mentioned_in`).
+    let implicit = contains_ignore_ascii_case(sql, b"_seq");
+    let explicit = sequence::explicit_mentioned_in(database.id, sql) && database.has_table(SEQUENCE_TABLE);
+    if !explicit && !implicit {
+        return Ok(None);
+    }
+    if !(contains_ignore_ascii_case(sql, b"FROM")
+        || contains_ignore_ascii_case(sql, b"INTO")
+        || contains_ignore_ascii_case(sql, b"UPDATE"))
+    {
+        return Ok(None);
+    }
+    let mut implicit_names: Option<Vec<(String, String, String)>> = None;
+    let mut replaced: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for r in crate::core::rql::lock_set::relation_references(sql) {
+        if database.has_table(&r.name)
+            || database.views.contains(&r.name)
+            || crate::core::rql::views::cte_names(sql).contains(&r.name.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let explicit = explicit.then(|| sequence::explicit(database.id, &r.name)).flatten();
+        if r.mode != crate::core::mvcc::table_locks::TableMode::AccessShare {
+            let is_sequence = explicit.is_some()
+                || implicit
+                    && implicit_names.get_or_insert_with(|| implicit_sequences(database)).iter().any(|(s, _, _)| *s == r.name);
+            if is_sequence {
+                return Err(("42809", format!("cannot change sequence \"{}\"", r.name)));
+            }
+            continue;
+        }
+        let row = if let Some(s) = explicit {
+            let called = s.called.load(Ordering::SeqCst);
+            format!(
+                "SELECT {}::bigint AS last_value, {}::bigint AS log_cnt, {} AS is_called",
+                s.last.load(Ordering::SeqCst),
+                if called { s.log_cnt.load(Ordering::Relaxed) } else { 0 },
+                if called { "true" } else { "false" }
+            )
+        } else {
+            let names = implicit_names.get_or_insert_with(|| implicit_sequences(database));
+            let Some((_, table, column)) = names.iter().find(|(s, _, _)| *s == r.name) else {
+                continue;
+            };
+            // `log_cnt` as PostgreSQL's would stand after `last` values from
+            // 1 with no checkpoint between (see `ExplicitSequence::log_cnt`).
+            match sequence::current(database.id, &r.name) {
+                Some(last) if last > 0 => format!(
+                    "SELECT {last}::bigint AS last_value, {}::bigint AS log_cnt, true AS is_called",
+                    sequence::RESERVE_AHEAD - (last - 1) % (sequence::RESERVE_AHEAD + 1)
+                ),
+                Some(_) => "SELECT 1::bigint AS last_value, 0::bigint AS log_cnt, false AS is_called".to_string(),
+                None => {
+                    let (table, column) =
+                        (crate::core::rql::views::quote_ident(table), crate::core::rql::views::quote_ident(column));
+                    format!(
+                        "SELECT coalesce(max({column}), 1)::bigint AS last_value, 0::bigint AS log_cnt, \
+                         max({column}) IS NOT NULL AS is_called FROM {table}"
+                    )
+                }
+            }
+        };
+        let derived = if r.aliased {
+            format!("({row})")
+        } else {
+            format!("({row}) AS {}", crate::core::rql::views::quote_ident(&r.name))
+        };
+        replaced.push((r.span, derived));
+    }
+    if replaced.is_empty() {
+        return Ok(None);
+    }
+    let mut text = sql.to_string();
+    replaced.sort_by_key(|(span, _)| std::cmp::Reverse(span.start));
+    for (span, derived) in replaced {
+        text.replace_range(span, &derived);
+    }
+    Ok(Some(text))
 }
 
 /// The sequences a statement's `nextval`/`currval`/`setval` calls name, read
