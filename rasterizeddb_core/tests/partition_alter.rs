@@ -540,13 +540,20 @@ fn a_ddl_queues_behind_the_tables_users_and_a_timeout_writes_nothing() {
     });
     assert!(done_rx.recv_timeout(Duration::from_millis(400)).is_err(), "the reader did not queue behind the DDL");
     a.ok("COMMIT");
+    // Both finish. Which client hears back first is not the order the server
+    // ran them in: the DDL releases its lock before its client's thread
+    // wakes, and on a slow runner the reader's thread reported first
+    // (linux-arm64, 2026-11-23). The queueing itself is what the wait above
+    // proves: a reader allowed past the waiting DDL shares the block's lock
+    // and would have answered within it.
     let mut seen = Vec::new();
     for _ in 0..2 {
         let (who, r) = done_rx.recv_timeout(Duration::from_secs(60)).expect("both finish");
         assert!(r.is_ok(), "{who}: {r:?}");
         seen.push(who);
     }
-    assert_eq!(seen, ["ddl", "reader"], "the reader ran ahead of the queued DDL");
+    seen.sort_unstable();
+    assert_eq!(seen, ["ddl", "reader"]);
     let _ = (ddl_thread.join().unwrap(), reader.join().unwrap());
     let e = a.simple("INSERT INTO pa (tenant_id, id, n) VALUES (1, 500, -1)").expect_err("the CHECK holds");
     assert_eq!(e.code, "23514");

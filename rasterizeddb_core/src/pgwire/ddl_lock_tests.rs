@@ -410,13 +410,17 @@ async fn rebalance_gives_each_moved_table_back() {
     ok(&db, &mut h, "BEGIN").await;
     ok(&db, &mut h, &format!("LOCK TABLE {then} IN ACCESS SHARE MODE")).await;
     let rebalance = spawn(&db, session(&db), "STORAGE REBALANCE");
+    // Until the move has happened, not one settle: on the Windows ARM64
+    // runner moving `first` outlasted a settle (CI, 2026-11-23). REBALANCE
+    // cannot finish meanwhile, as the block holds `then`.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while db.storage.spec_of(first).as_deref() != Some(second_path.as_str()) {
+        assert!(!rebalance.is_finished(), "REBALANCE finished while the block held {then}");
+        assert!(Instant::now() < deadline, "REBALANCE has not moved {first} before waiting on {then}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     tokio::time::sleep(SETTLE).await;
     assert!(!rebalance.is_finished(), "REBALANCE did not wait on the held table");
-    assert_eq!(
-        db.storage.spec_of(first).as_deref(),
-        Some(second_path.as_str()),
-        "REBALANCE has not moved {first} before waiting on {then}"
-    );
     // Given back while REBALANCE still waits on the held table. Asked until it
     // is, not once: the move switches the placement before it releases the
     // table, and on a Windows runner the release had not come yet one settle
