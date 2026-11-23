@@ -144,6 +144,30 @@ It is also not a replacement for replication, which ships transactions to
 another *process* and survives this machine. A backup location survives the
 primary disk. Those are different failures.
 
+### Opening a copy
+
+A backup location is a database: point `--location` at it and it opens.
+`db_storage.cfg` names absolute paths, though, and the mirror's copy of it names
+the primary (with the mirror itself only as the *backup*), so read as it was it
+sent every table back to the primary's files: reads answered from there and
+writes landed there. The same held for a data directory copied or moved by
+hand.
+
+An open now checks that one of the file's primary locations is the directory
+being opened (the same directory reached through a symlink counts). When none
+is, the directory is a copy:
+
+- **One primary location**, every table on it or in memory, no restore aliases:
+  the file is rewritten for the copy before anything opens. The tables resolve
+  inside it, and backup locations are dropped, since a copy mirroring into the
+  original's backup disk would overwrite it. The start logs what changed.
+- **Anything else** (tables on a second disk, on a key/value store, behind a
+  restore's aliases): the database is **not opened**, and the error names the
+  file and why. Which of those files the copy carries cannot be told from the
+  file, and guessing wrong would read the original's. `RESTORE` repoints such
+  a copy; a hand-made one needs the file edited or removed. Partition maps
+  refuse the same way for partitions placed off the root.
+
 Adding a backup location mirrors tables **created or opened afterwards**. Tables
 already open are mirrored from the next restart — their providers were built
 before the location existed and cannot be swapped underneath a live table. The

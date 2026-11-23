@@ -272,10 +272,18 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
     }
 
     // The point of a mirrored copy: point the engine at the backup directory
-    // and it is a database, not an archive that needs restoring first. The pool
-    // file is removed so the copy does not try to mirror back into a location
-    // that is now its own.
-    let _ = std::fs::remove_file(backup.path().join(super::POOL_FILE));
+    // and it is a database, not an archive that needs restoring first. Its
+    // pool file, copied from the primary, names the primary: opened as it
+    // was, the copy read and wrote the primary's files. It is adopted now,
+    // so the copy reads its own and leaves the original alone.
+    let original_rows: Vec<(String, u64)> = files_for(root.path(), "survivor")
+        .into_iter()
+        .map(|name| {
+            let len = std::fs::metadata(root.path().join(&name)).unwrap().len();
+            (name, len)
+        })
+        .collect();
+    let original_pool = std::fs::read(root.path().join(super::POOL_FILE)).unwrap();
     let recovered = open(backup.path()).await;
     let table = recovered.table_for_tests("survivor")
         .expect("the backup copy should list the table");
@@ -283,6 +291,22 @@ async fn a_backup_directory_opens_as_a_database_of_its_own() {
         StorageIO::get_len(&*table.data().unwrap().io_rows).await > 0,
         "the backup copy lists the table but holds none of its rows"
     );
+    assert_eq!(
+        recovered.storage.location_of("survivor").as_deref(),
+        Some(backup.path().to_string_lossy().as_ref()),
+        "the copy resolves its table outside itself"
+    );
+    // A write to the copy lands in the copy.
+    insert(&recovered, "survivor", 8, "only in the copy").await;
+    let after: Vec<(String, u64)> = files_for(root.path(), "survivor")
+        .into_iter()
+        .map(|name| {
+            let len = std::fs::metadata(root.path().join(&name)).unwrap().len();
+            (name, len)
+        })
+        .collect();
+    assert_eq!(after, original_rows, "a write to the copy changed the original's files");
+    assert_eq!(std::fs::read(root.path().join(super::POOL_FILE)).unwrap(), original_pool);
 }
 
 #[tokio::test(flavor = "multi_thread")]
