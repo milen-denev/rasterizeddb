@@ -80,12 +80,6 @@ impl Database {
                     return Some(why);
                 }
             }
-            if fk.is_composite()
-                && let Some(why) =
-                    crate::core::rql::foreign_key::composite_refusal(fk, &ct.table_name, partition_key.is_some())
-            {
-                return Some(why);
-            }
         }
         // Keys another table declared on this name while no table had it: a
         // partitioned table must be a parent they can be checked against by

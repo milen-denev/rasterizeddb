@@ -539,3 +539,115 @@ fn real_pg_dump_round_trips_plain_and_partitioned_tables() {
         );
     }
 }
+
+/// The `pms` layout: composite keys on and onto hash-partitioned tables.
+const PMS: &[&str] = &[
+    "CREATE TABLE \"case\" (domain_id BIGINT NOT NULL, id BIGINT NOT NULL, PRIMARY KEY (domain_id, id))",
+    "CREATE TABLE step (domain_id BIGINT NOT NULL, case_id BIGINT NOT NULL, id BIGINT NOT NULL, \
+     PRIMARY KEY (domain_id, case_id, id)) PARTITION BY HASH (domain_id, case_id) PARTITIONS 4",
+    "CREATE TABLE field (domain_id BIGINT NOT NULL, case_id BIGINT NOT NULL, step_id BIGINT NOT NULL, \
+     id BIGINT NOT NULL, PRIMARY KEY (domain_id, case_id, step_id, id)) PARTITION BY HASH (domain_id, case_id) PARTITIONS 4",
+    "ALTER TABLE field ADD CONSTRAINT field_step_fk FOREIGN KEY (domain_id, case_id, step_id) \
+     REFERENCES step (domain_id, case_id, id) ON DELETE CASCADE",
+    "ALTER TABLE step ADD CONSTRAINT step_case_fk FOREIGN KEY (domain_id, case_id) REFERENCES \"case\" (domain_id, id)",
+    "CREATE TABLE note (n INT PRIMARY KEY, domain_id BIGINT, case_id BIGINT, step_id BIGINT, \
+     FOREIGN KEY (domain_id, case_id, step_id) REFERENCES step MATCH FULL)",
+    "INSERT INTO \"case\" VALUES (1, 10), (1, 11), (2, 10), (-3, 7)",
+    "INSERT INTO step VALUES (1, 10, 100), (1, 10, 101), (2, 10, 100), (-3, 7, 1)",
+    "INSERT INTO field VALUES (1, 10, 100, 1), (1, 10, 101, 1), (-3, 7, 1, 1)",
+    "INSERT INTO note VALUES (1, 1, 10, 100), (2, NULL, NULL, NULL)",
+];
+
+/// A dump of the `pms` layout restores whole: the partitioned tables are
+/// dumped plain and converted by their post-data `CREATE INDEX … USING
+/// partition`, and the composite keys, also post-data, are added onto and
+/// from them; enforced afterwards, both sides, from both dump formats.
+#[test]
+fn real_pg_dump_round_trips_composite_keys_on_partitioned_tables() {
+    let Some(bin) = pg_bin() else {
+        eprintln!("skipped: no pg_dump, pg_restore and psql on PATH or in RDB_PG_BIN");
+        return;
+    };
+    let (_server, port, cleanup) = start("pg_dump_cfk");
+    let mut pg = Pg::connect(port, "postgres");
+    for sql in PMS {
+        pg.query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let tool = |name: &str| {
+        let mut c = Command::new(bin.join(name));
+        c.args(["-h", "127.0.0.1", "-p", &port.to_string(), "-U", "rasterized", "-w"]).env("PGCONNECT_TIMEOUT", "30");
+        c
+    };
+    let plain = cleanup.0.join("pms.sql");
+    let custom = cleanup.0.join("pms.custom");
+    for (format, file) in [("-Fp", &plain), ("-Fc", &custom)] {
+        let mut c = tool("pg_dump");
+        c.args([format, "--no-owner", "-d", "postgres", "-f"]).arg(file);
+        run(c, Duration::from_secs(300)).unwrap_or_else(|e| panic!("pg_dump {format}: {e}"));
+    }
+    let text = std::fs::read_to_string(&plain).unwrap();
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("the dump lacks `{needle}`:\n{text}"));
+    let converts = at("CREATE INDEX step_partition_key ON public.step USING partition (domain_id, case_id) WITH (partitions = 4);");
+    at("CREATE INDEX field_partition_key ON public.field USING partition (domain_id, case_id) WITH (partitions = 4);");
+    // Every name quoted (`pg_get_constraintdef`'s documented divergence).
+    let key = at("ADD CONSTRAINT field_step_fk FOREIGN KEY (\"domain_id\", \"case_id\", \"step_id\") REFERENCES public.step(\"domain_id\", \"case_id\", \"id\") ON DELETE CASCADE;");
+    at("ADD CONSTRAINT step_case_fk FOREIGN KEY (\"domain_id\", \"case_id\") REFERENCES public.\"case\"(\"domain_id\", \"id\");");
+    at("REFERENCES public.step(\"domain_id\", \"case_id\", \"id\") MATCH FULL;");
+    // pg_dump's order: indexes, then foreign keys.
+    assert!(converts < key, "the conversion comes before the keys");
+
+    for (database, restore) in [("pms_plain", "plain"), ("pms_custom", "custom")] {
+        pg.rows(&format!("CREATE DATABASE {database}"));
+        let mut c = if restore == "plain" {
+            let mut c = tool("psql");
+            c.args(["-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", database, "-f"]).arg(&plain);
+            c
+        } else {
+            let mut c = tool("pg_restore");
+            c.args(["--no-owner", "--exit-on-error", "-d", database]).arg(&custom);
+            c
+        };
+        c.env("PGOPTIONS", "");
+        run(c, Duration::from_secs(300)).unwrap_or_else(|e| panic!("restore {restore}: {e}"));
+        let mut r = Pg::connect(port, database);
+        assert_eq!(
+            r.rows("SELECT relname, relkind FROM pg_class WHERE relname IN ('case', 'step', 'field') ORDER BY relname"),
+            vec![
+                vec![Some("case".to_string()), Some("r".to_string())],
+                vec![Some("field".to_string()), Some("p".to_string())],
+                vec![Some("step".to_string()), Some("p".to_string())],
+            ],
+            "{restore}"
+        );
+        assert_eq!(
+            r.rows("SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f' ORDER BY conname"),
+            vec![
+                vec![
+                    Some("field_step_fk".to_string()),
+                    Some("FOREIGN KEY (\"domain_id\", \"case_id\", \"step_id\") REFERENCES \"step\"(\"domain_id\", \"case_id\", \"id\") ON DELETE CASCADE".to_string())
+                ],
+                vec![
+                    Some("note_domain_id_case_id_step_id_fkey".to_string()),
+                    Some("FOREIGN KEY (\"domain_id\", \"case_id\", \"step_id\") REFERENCES \"step\"(\"domain_id\", \"case_id\", \"id\") MATCH FULL".to_string())
+                ],
+                vec![
+                    Some("step_case_fk".to_string()),
+                    Some("FOREIGN KEY (\"domain_id\", \"case_id\") REFERENCES \"case\"(\"domain_id\", \"id\")".to_string())
+                ],
+            ],
+            "{restore}"
+        );
+        assert_eq!(cell(&r.rows("SELECT count(*) FROM field"), 0, 0), "3");
+        for sql in [
+            "INSERT INTO field VALUES (1, 10, 102, 1)",
+            "INSERT INTO step VALUES (2, 11, 1)",
+            "INSERT INTO note VALUES (3, 1, NULL, 100)",
+            "DELETE FROM \"case\" WHERE domain_id = 1 AND id = 10",
+        ] {
+            let e = r.query(sql).expect_err(sql);
+            assert!(e.contains("foreign key"), "{restore}: {sql}: {e}");
+        }
+        r.rows("DELETE FROM step WHERE domain_id = -3");
+        assert_eq!(cell(&r.rows("SELECT count(*) FROM field"), 0, 0), "2", "{restore}: cascaded");
+    }
+}

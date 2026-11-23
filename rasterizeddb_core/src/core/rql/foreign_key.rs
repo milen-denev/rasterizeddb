@@ -933,9 +933,13 @@ impl<'a> ReferencedSide<'a> {
 ///   given keys for referenced table …"; a partial unique index is no such
 ///   constraint);
 /// - the two column lists are of different lengths (42830);
-/// - the parent is **partitioned** and the column is not its whole
-///   partition key, so a check could not route (phase 3 P4); a composite key
-///   onto a partitioned table is not supported (0A000).
+/// - the parent is **partitioned** and the referenced columns do not hold
+///   every column of its partition key, so a check could not route to one
+///   partition (42830; phase 3 P4 for one column, which must then be the
+///   whole one-column key; any number of columns since composite keys reach
+///   partitioned tables). A unique key of a partitioned table holds every
+///   partition key column (§1b), so only a record written behind the DDL
+///   gets here.
 ///
 /// A plain parent's column must be unique too, as in PostgreSQL. It once
 /// need not be (docs/partitioning.md, "Phase 3 P4 as built", divergences),
@@ -994,14 +998,12 @@ pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> O
         return Some("number of referencing and referenced columns for foreign key disagree".to_string());
     }
     if let Some(key) = &parent.partition_key {
-        if fk.is_composite() {
-            return Some(format!(
-                "a composite foreign key referencing partitioned table \"{}\" is not supported",
-                parent.table
-            ));
-        }
-        let column = fk.parent_columns[0].as_str();
-        if !(key.len() == 1 && key[0].eq_ignore_ascii_case(column)) {
+        // Every partition key column among the referenced ones, so each
+        // parent lookup hashes to one partition: PostgreSQL's rule, since a
+        // unique key of a partitioned table holds every partition key
+        // column (§1b). For one column: the whole one-column key.
+        let covered = key.iter().all(|k| fk.parent_columns.iter().any(|c| c.eq_ignore_ascii_case(k)));
+        if !covered {
             return Some(format!(
                 "{}: partitioned table \"{}\" is partitioned by ({}), and a foreign key must reference its whole \
                  partition key",
@@ -1010,21 +1012,6 @@ pub fn referenced_key_refusal(fk: &ForeignKey, parent: &ReferencedSide<'_>) -> O
                 key.join(", ")
             ));
         }
-    }
-    None
-}
-
-/// What a composite key may not be yet, refused rather than half-enforced
-/// (0A000): a key on a partitioned table (`child_partitioned`; one onto a
-/// partitioned table is refused by [`referenced_key_refusal`]), whose
-/// checks and actions would have to fan out over its partitions. `None`
-/// for a one-column key.
-pub fn composite_refusal(fk: &ForeignKey, table: &str, child_partitioned: bool) -> Option<String> {
-    if !fk.is_composite() {
-        return None;
-    }
-    if child_partitioned {
-        return Some(format!("a composite foreign key on partitioned table \"{table}\" is not supported"));
     }
     None
 }

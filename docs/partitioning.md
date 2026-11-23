@@ -1933,9 +1933,9 @@ listed at the end):
   (`alter_lock_set`).
 - **Onto a partitioned table**: `REFERENCES p (k)` where `k` is a `UNIQUE`
   or `PRIMARY KEY` of `p`. By §1b such a key holds every partition key
-  column, and a foreign key is one column (composite keys are refused on
-  every table), so `k` **is** `p`'s whole partition key: `PARTITION BY HASH
-  (k)`. Anything else is PostgreSQL's 42830 ("there is no unique constraint
+  column, and a foreign key was one column (composite keys came later, see
+  [Composite keys on partitioned tables](#composite-keys-on-partitioned-tables-as-built)),
+  so `k` **is** `p`'s whole partition key: `PARTITION BY HASH (k)`. Anything else is PostgreSQL's 42830 ("there is no unique constraint
   matching given keys for referenced table …"), at CREATE and ADD
   (`foreign_key::referenced_key_refusal`), and so is a partitioned table
   created under a name an existing key already names by another column.
@@ -2508,10 +2508,13 @@ here).
 
 - An `ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT` that writes a
   partitioned child's partition key column is a key change: refused with
-  0A000 until phase 6 moves rows. PostgreSQL moves the row.
-- Keys are one column on every table, so a table partitioned by two or
+  0A000 until phase 6 moves rows. PostgreSQL moves the row. (Since phase 6
+  the action's `UPDATE` moves it, as any key-changing `UPDATE` does: pinned
+  for composite keys by `fk_composite_tests::composite_keys_hold_on_and_onto_partitioned_tables`,
+  whose `ON UPDATE CASCADE` moves `ev` rows to their new partition.)
+- ~~Keys are one column on every table, so a table partitioned by two or
   three columns can be referenced by no key at all; composite keys would
-  lift that.
+  lift that.~~ Lifted: [Composite keys on partitioned tables](#composite-keys-on-partitioned-tables-as-built).
 - ~~By reading: a column-level `CONSTRAINT n REFERENCES p (k)` gave its key
   no name of its own~~ (fixed in round 2, `lexer_ct::inline_constraint_name`).
 - Seen while pinning round 3, not investigated (CHECK code P4 does not
@@ -2520,6 +2523,116 @@ here).
 - The insert-time check finds its parent by exact name (`has_table`), as
   every lookup here does (identifiers are not case-folded, an open finding):
   a key on `P` never matches `p`.
+
+## Composite keys on partitioned tables (as built)
+
+Built on `wip/6f-cfkpart` (from local dev `2c90dc56`, 2026-11-24), after
+composite foreign keys (`86d19ac2`, `2e92e54f`), which refused them on and
+onto hash-partitioned tables (0A000). The layout it was built for, `pms`:
+
+```sql
+CREATE TABLE "case" (domain_id BIGINT NOT NULL, id BIGINT NOT NULL, PRIMARY KEY (domain_id, id));
+CREATE TABLE step (domain_id BIGINT NOT NULL, case_id BIGINT NOT NULL, id BIGINT NOT NULL,
+  PRIMARY KEY (domain_id, case_id, id)) PARTITION BY HASH (domain_id, case_id) PARTITIONS 4;
+CREATE TABLE field (domain_id BIGINT NOT NULL, case_id BIGINT NOT NULL, step_id BIGINT NOT NULL, id BIGINT NOT NULL,
+  PRIMARY KEY (domain_id, case_id, step_id, id)) PARTITION BY HASH (domain_id, case_id) PARTITIONS 4;
+ALTER TABLE field ADD CONSTRAINT field_step_fk FOREIGN KEY (domain_id, case_id, step_id)
+  REFERENCES step (domain_id, case_id, id);                      -- partitioned onto partitioned
+ALTER TABLE step ADD CONSTRAINT step_case_fk FOREIGN KEY (domain_id, case_id)
+  REFERENCES "case" (domain_id, id);                             -- partitioned onto plain
+```
+
+**What works**, each answer PostgreSQL 17's with declarative partitions
+(`MODULUS`/`REMAINDER` children), statement for statement: a partitioned
+table's composite key onto a plain or a partitioned parent and a plain
+table's onto a partitioned one, inline in `CREATE TABLE … PARTITION BY` or
+by `ADD` (validated in every partition); the child's checks on every write
+path (multi-row, `ON CONFLICT`, `INSERT … SELECT`, `COPY`, prepared, and
+`UPDATE`, including one that moves a row to another partition by changing
+its partition key); `MATCH SIMPLE`/`FULL`; a partitioned table onto itself
+(the postponed check behind `Database::fk_onto_itself`); every parent-side
+action, `ON DELETE SET NULL (cols)` included, either side partitioned (an
+`ON UPDATE CASCADE` that writes a partitioned child's partition key moves
+its rows, phase 6's move); `DROP CONSTRAINT`, `DROP COLUMN` (2BP01 for a
+referenced column, the key dropped with a referencing one), `DROP TABLE`
+(2BP01, `CASCADE`), `RENAME COLUMN` and `RENAME TO` on both sides; the
+catalogue rows of the plain-table keys (PostgreSQL's rows for the
+partitioned parent, `conparentid = 0`; its per-partition clones are not
+shown); conversion of a table holding composite keys, as child or as
+parent, by `ALTER TABLE … PARTITION BY` and `CREATE INDEX … USING
+partition`, so a `pg_dump` of `pms` restores (the dump converts the tables
+in its index section and adds the keys after it, as `pg_dump` orders
+post-data items; both orders are tested); the reshapes, the rewrite of a
+populated partitioned table, and a restart.
+
+**The declaration rule.** The referenced columns are exactly a unique key
+of the parent, and a unique key of a partitioned table holds every
+partition key column (§1b), so they cover the parent's partition key. That
+is checked again where a key is declared and where a partitioned table is
+created or converted under a name keys already reference
+(`foreign_key::referenced_key_refusal`: every partition key column among
+the referenced ones, else 42830); a one-column key's rule, the whole
+one-column partition key, is the same rule.
+
+**How a check routes** (`fk_composite::tuples_now`, the composite
+counterpart of `referenced_values_now`):
+
+- *Parent side* (`KeySide::Parent`: an insert's or update's probe and its
+  recheck under the key lock, `ADD`'s and `VALIDATE`'s chunks, `ON UPDATE`'s
+  "is the old tuple still held"): each tuple is routed by the bytes its
+  partition key columns encode to (`tuple_key_ranges`: the parent-typed
+  literal through `lexer_ir::encode_column_value`, the encoder an `INSERT`
+  stores and routes by, then `keyed_range` over all levels), and only those
+  partitions are read (`RowSource::partitioned_in`), the probe's predicate
+  applied in each. So `(-3, 7)`, which `route_where` reads no point in (a
+  signed number), routes too. A value that encodes as no key of its column
+  is routed on the predicate (correct, the rare case, warned); a key whose
+  referenced columns miss a partition key column (only a record written
+  behind the DDL) is refused with 0A000 "cannot be checked … not
+  supported", never read everywhere and never skipped.
+- *Child side* (`KeySide::Child`: a parent `DELETE`'s or key-moving
+  `UPDATE`'s "does any child reference these tuples", before and after its
+  action, and the self-reference's end-of-statement check): routed the same
+  way when the child's partition key columns are among the key's columns (a
+  co-located child, `field` on `step`), else every partition the predicate
+  does not rule out. The action itself is SQL through `execute_with_context`,
+  routed as any statement is (`route_where`: a signed key value reads every
+  partition, §4.1).
+- *Locks* are the plain path's: the tuple's key-share lock on (parent's
+  logical name, `lock_column` of the referenced columns, `lock_key` of the
+  stored bytes), so no partition enters it and a child insert racing a
+  parent delete meets it whichever partitions hold the two rows.
+
+Nothing else is new: the composite paths already read through `Relation`
+(`relation_rows_as_of`, `tuples_as_of`, `keys_about_to_change`), the
+partitioned `INSERT`, `UPDATE` and `DELETE` arms call the same helpers the
+plain ones do, and the key lives in the shell's FK sidecar, which a reshape
+does not touch and a conversion or rewrite writes from the definition. No
+storage change: the composite records and the `composite_foreign_key_v1`
+fence are the ones `86d19ac2` laid out (the fence is set by `ADD`, `CREATE …
+PARTITION BY`, a conversion and a rewrite alike); byte 128 of the unique
+key slot is not touched.
+
+**Tests.** `fk_composite_tests::composite_keys_hold_on_and_onto_partitioned_tables`
+(the `pms` layout, every path above, a restart),
+`…::composite_keys_on_partitioned_tables_follow_their_ddl`,
+`…::composite_keys_survive_conversion_reshapes_and_rewrites`;
+`fk_partition_tests::a_composite_check_of_a_partitioned_parent_reads_one_partition_per_tuple`
+(the probe and its recheck in the tuple's one partition, a negative key's
+too; a multi-row insert at most one per tuple; a co-located child's side of
+a parent delete on its route) and
+`…::a_composite_check_that_cannot_route_is_refused_never_skipped`;
+`rasterizeddb_compat/tests/composite_foreign_keys.rs`
+(`composite_keys_on_and_onto_partitioned_tables`, prepared, `COPY` and the
+catalogues over a real client; `composite_key_actions_across_partitioned_tables`);
+`tests/pg_dump_round_trip.rs::real_pg_dump_round_trips_composite_keys_on_partitioned_tables`
+(a real `pg_dump` of `pms`, plain and custom, restored and enforced).
+
+**Still unlike PostgreSQL:** a violation on the parent side names the key
+(`field_step_fk`) where PostgreSQL 17 names the clone it attached to the
+referenced partition (`field_domain_id_case_id_step_id_fkey2`); the
+catalogues show the partitioned table's key only, not one clone per
+partition.
 
 ## Phase 3 P3 as built
 
@@ -3459,7 +3572,7 @@ built.
 | Temporary partitioned tables | not scheduled |
 | `DROP INDEX` on a `USING partition` index | not an index (above) |
 | Until their phase: physical-rewrite `ALTER` on partitioned tables (phase 6, §11; the metadata forms, `RENAME` and `CREATE`/`DROP INDEX` are built in phase 3 P1); point-changing key assignment (phase 6, §9; any key assignment its `WHERE` does not pin to the same value, §4.5, which includes an `ON UPDATE CASCADE`, `SET NULL` or `SET DEFAULT` writing a child's partition key column); conversion and reshapes (phase 5). `FOR UPDATE`/`SHARE`, `SKIP LOCKED`, `NOWAIT` and partitioned targets of `UPDATE … FROM`/`DELETE … USING` are built (phase 3 P3, §1b); FKs either way are built (phase 3 P4, §10) | §15 |
-| A `FOREIGN KEY` referencing a partitioned table by anything but its whole partition key (42830, PostgreSQL's "no unique constraint matching given keys": a unique key holds every key column, §1b, and a key is one column) | §10 |
+| A `FOREIGN KEY` referencing a partitioned table by columns that miss one of its partition key columns (42830, PostgreSQL's "no unique constraint matching given keys": a unique key holds every key column, §1b); composite keys are built ([as built](#composite-keys-on-partitioned-tables-as-built)) | §10 |
 
 **What phase 2b refuses, as built (S20).** Each with 0A000 and "not
 supported" and a reason, before anything is read or written; the twin's

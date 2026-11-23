@@ -107,8 +107,15 @@ fn key_fields(
 /// reason: a foreign key's question is about what is committed (and `tx`'s
 /// own writes), never about an older snapshot.
 ///
-/// A partitioned table is read through a fan-out routed on the predicate,
-/// every partition under one as-of-now snapshot.
+/// A partitioned table is read under one as-of-now snapshot, only in the
+/// partitions the tuples' keys hash to when `columns` hold every partition
+/// key column ([`tuple_key_ranges`]: each tuple routed by the bytes an
+/// insert of it stores and routes by). Otherwise the parent side
+/// ([`KeySide::Parent`]) is refused, never read everywhere or skipped (the
+/// declaration rule makes the referenced columns cover the key, so only a
+/// record written behind the DDL gets there), and the child side reads every
+/// partition the predicate does not rule out: the question there is whether
+/// any row anywhere references the tuples.
 async fn tuples_now_fut(
     database: &Arc<Database>,
     table_name: &str,
@@ -116,6 +123,7 @@ async fn tuples_now_fut(
     tuples: &[Vec<String>],
     tx: TxId,
     limit: Option<u64>,
+    side: KeySide,
 ) -> Result<Vec<Vec<Vec<u8>>>, String> {
     let Some(relation) = database.relation_for(table_name, owner(), TableMode::AccessShare).await? else {
         return Err(format!("relation \"{}\" does not exist", table_name));
@@ -130,6 +138,28 @@ async fn tuples_now_fut(
     let names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
     let requested = crate::core::rql::join::fetch_for(&fields, schema);
     let all_fields = schema.to_vec();
+    // Where each partition key level is among `fields`, leading level first.
+    let key_at: Option<Vec<usize>> = match &relation {
+        crate::core::database::Relation::Partitioned(pt) => {
+            let spec = pt.spec().map_err(|e| e.to_string())?;
+            let at: Option<Vec<usize>> = spec
+                .levels()
+                .iter()
+                .map(|level| fields.iter().position(|f| f.write_order == u64::from(level.write_order)))
+                .collect();
+            if at.is_none() && side == KeySide::Parent {
+                return Err(format!(
+                    "a foreign key referencing ({}) of partitioned table \"{}\" cannot be checked: its partition \
+                     key is ({}), so the check would read every partition; this is not supported",
+                    names.join(", "),
+                    table_name,
+                    pt.key_columns().map_err(|e| e.to_string())?.join(", ")
+                ));
+            }
+            at
+        }
+        crate::core::database::Relation::Plain(_) => None,
+    };
 
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -164,15 +194,33 @@ async fn tuples_now_fut(
                 .await
                 .map_err(|e| e.to_string())?,
             crate::core::database::Relation::Partitioned(pt) => {
-                crate::core::rql::row_source::RowSource::partitioned_with(
-                    pt.clone(),
-                    &rewritten,
-                    pt.visibility_now_for(tx),
-                )
-                .map_err(|e| e.to_string())?
-                .query_rows(&rewritten, &all_fields, query_fetch, requested.clone(), limit, None, tx)
-                .await
-                .map_err(|e| e.to_string())?
+                // The snapshot first, then the partitions (§4.4's order).
+                let visibility = pt.visibility_now_for(tx);
+                #[cfg(test)]
+                super::fk_probe_hooks::note(table_name, side);
+                let ranges = key_at.as_deref().and_then(|at| tuple_key_ranges(pt, &fields, at, chunk));
+                let source = match ranges {
+                    Some(ranges) => {
+                        crate::core::rql::row_source::RowSource::partitioned_in(pt.clone(), &ranges, visibility)
+                    }
+                    None => {
+                        if key_at.is_some() {
+                            // A value that encodes as no key of its column
+                            // (`7.5` for a BIGINT): read where the predicate
+                            // may match, as a plain table's scan decides.
+                            warn!(
+                                "foreign key probe of partitioned table {table_name} is routed on its predicate: a \
+                                 value in ({predicate}) is no key of its type"
+                            );
+                        }
+                        crate::core::rql::row_source::RowSource::partitioned_with(pt.clone(), &rewritten, visibility)
+                    }
+                };
+                source
+                    .map_err(|e| e.to_string())?
+                    .query_rows(&rewritten, &all_fields, query_fetch, requested.clone(), limit, None, tx)
+                    .await
+                    .map_err(|e| e.to_string())?
             }
         };
         for row in &rows {
@@ -192,6 +240,43 @@ async fn tuples_now_fut(
         }
     }
     Ok(out)
+}
+
+/// The point range of each of `tuples` on partitioned table `pt`, whose key
+/// level `i` is `fields[key_at[i]]`: each key value encoded as an `INSERT`
+/// of it into that column stores it (`lexer_ir::encode_column_value`, the
+/// one encoder: casts, signs, quoted strings, UUIDs), so routed by the bytes
+/// its row was routed by (`keyed_range`), as `parent_key_ranges` routes a
+/// one-column key's values. `None` when a value does not encode as a key of
+/// its column, or the key changed under the caller: the caller then routes
+/// on the predicate, never skipping a partition that may hold the tuple.
+fn tuple_key_ranges(
+    pt: &crate::core::partition::table::PartitionedTable,
+    fields: &[crate::core::row::schema::SchemaField],
+    key_at: &[usize],
+    tuples: &[Vec<String>],
+) -> Option<Vec<crate::core::partition::PointRange>> {
+    let modifiers = &pt.shell().schema.type_modifiers;
+    tuples
+        .iter()
+        .map(|tuple| {
+            let mut levels = Vec::with_capacity(key_at.len());
+            for &at in key_at {
+                let field = &fields[at];
+                let encoded = crate::core::rql::lexer_ir::encode_column_value(tuple.get(at)?.trim(), field, modifiers);
+                // An encoder's refusal is this probe's only, never a later
+                // statement's reason.
+                let _ = crate::core::rql::lexer_ir::take_refusal();
+                let bytes = encoded?.into_slice().to_vec();
+                // An empty block is a NULL, which no key is.
+                if bytes.is_empty() {
+                    return None;
+                }
+                levels.push((u32::try_from(field.write_order).ok()?, field.db_type.clone(), bytes));
+            }
+            pt.keyed_range(pt.uid(), &levels)
+        })
+        .collect()
 }
 
 /// The distinct tuples of `columns` in the rows `where_clause` (engine form,
@@ -356,7 +441,7 @@ async fn check_child_row_fut(
         deferred
     };
     let probes = std::slice::from_ref(&probe);
-    let found = tuples_now(database, &fk.parent_table, &fk.parent_columns, probes, tx, Some(1))
+    let found = tuples_now(database, &fk.parent_table, &fk.parent_columns, probes, tx, Some(1), KeySide::Parent)
         .await
         .map_err(unchecked)?;
     let Some(key) = found.into_iter().next() else {
@@ -374,7 +459,7 @@ async fn check_child_row_fut(
         crate::core::rql::row_lock::LockStrength::Share,
     )
     .await?;
-    let still = tuples_now(database, &fk.parent_table, &fk.parent_columns, probes, tx, Some(1))
+    let still = tuples_now(database, &fk.parent_table, &fk.parent_columns, probes, tx, Some(1), KeySide::Parent)
         .await
         .map_err(unchecked)?;
     if still.is_empty() {
@@ -428,7 +513,7 @@ async fn referenced_by_child_fut(
     if tuples.is_empty() {
         return Ok(false);
     }
-    let found = tuples_now(database, child_table, &fk.columns, tuples, tx, Some(1))
+    let found = tuples_now(database, child_table, &fk.columns, tuples, tx, Some(1), KeySide::Child)
         .await
         .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", fk.name, e))?;
     Ok(!found.is_empty())
@@ -558,7 +643,7 @@ async fn vanished_tuples_fut(
     tx: TxId,
 ) -> Result<Vec<usize>, String> {
     let present: std::collections::HashSet<Vec<u8>> =
-        tuples_now(database, parent_table, &change.columns, &change.old_tuples, tx, None)
+        tuples_now(database, parent_table, &change.columns, &change.old_tuples, tx, None, KeySide::Parent)
             .await?
             .iter()
             .map(|cells| lock_key(cells))
@@ -773,8 +858,9 @@ pub(super) fn tuples_now<'a>(
     tuples: &'a [Vec<String>],
     tx: TxId,
     limit: Option<u64>,
+    side: KeySide,
 ) -> Boxed<'a, Result<Vec<Vec<Vec<u8>>>, String>> {
-    Box::pin(tuples_now_fut(database, table_name, columns, tuples, tx, limit))
+    Box::pin(tuples_now_fut(database, table_name, columns, tuples, tx, limit, side))
 }
 
 /// [`tuples_as_of_fut`], boxed where it is made, so a caller's frame never holds

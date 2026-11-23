@@ -637,10 +637,22 @@ parent row holding all of its key values at once.
   composite key over whole, with `MATCH FULL` and an `ON DELETE SET` list
   (`confdelsetcols`), where it used to leave it out with a note.
 - An unnamed key is `<table>_<a>_<b>_fkey`, numbered on a collision.
-- Not supported (0A000): a composite key on or onto a hash-partitioned
-  table, by `CREATE TABLE`, `ADD` or a conversion (`ALTER TABLE …
-  PARTITION BY`); the checks and actions would have to read every partition.
-  One-column keys to and from partitioned tables are unchanged.
+- On and onto hash-partitioned tables, as PostgreSQL 17 runs them with
+  declarative partitions: a partitioned table's key onto a plain or a
+  partitioned parent, and a plain table's key onto a partitioned one,
+  declared inline, by `ADD` (validated in every partition), or carried by a
+  conversion (`ALTER TABLE … PARTITION BY`, `CREATE INDEX … USING
+  partition`), so a `pg_dump` of such a layout restores. The referenced
+  columns are a unique key of the parent, which holds every partition key
+  column, so each parent lookup hashes the tuple's partition key values and
+  reads the one partition they route to, never every partition (a key
+  naming a partitioned parent by columns missing one of its partition key
+  columns is 42830, and a check of one written behind the DDL is refused,
+  0A000, never skipped). Every check, action, dependency and catalogue row
+  above holds there too; an action that changes a partitioned child's
+  partition key moves its rows to their new partition. The pair of tables
+  in `docs/partitioning.md` ("Composite keys on partitioned tables") is the
+  `pms` layout this was built for.
 
 Since the partitioning work's phase 3 P4 (`docs/partitioning.md`, "Phase 3 P4
 as built") foreign keys also run to and from hash-partitioned tables, and:

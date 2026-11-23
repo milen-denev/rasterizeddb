@@ -13852,9 +13852,6 @@ async fn add_foreign_key(
         }
     }
     if fk.is_composite() {
-        if let Some(why) = foreign_key::composite_refusal(&fk, table_name, database.partitioned_table(table_name).is_some()) {
-            return ddl_error(&why);
-        }
         // Before the first record that needs it: a binary that would read a
         // composite key as one column refuses this directory instead.
         if let Err(e) = database.require_composite_foreign_keys() {
@@ -14093,7 +14090,9 @@ async fn first_tuple_without_parent(
             continue;
         }
         let values: Vec<Vec<String>> = chunk.iter().map(|(_, probe)| probe.clone()).collect();
-        let found = fk_composite::tuples_now(database, &fk.parent_table, &fk.parent_columns, &values, tx, None).await?;
+        let found =
+            fk_composite::tuples_now(database, &fk.parent_table, &fk.parent_columns, &values, tx, None, KeySide::Parent)
+                .await?;
         if found.len() >= chunk.len() {
             continue;
         }

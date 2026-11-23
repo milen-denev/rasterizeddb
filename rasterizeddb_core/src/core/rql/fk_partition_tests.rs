@@ -450,3 +450,153 @@ async fn child_probe_chunk_timing() {
     ok(out, "delete");
     println!("child partition scans: {}", reads.len());
 }
+
+/// A composite key's checks of a partitioned parent route as a one-column
+/// key's do: each tuple is hashed by the partition key columns among its
+/// referenced columns, so an insert's probe and its recheck read the
+/// tuple's one partition (a negative key, which the router reads no point
+/// in, too), a multi-row insert at most one per tuple, and a co-located
+/// partitioned child's side of a parent DELETE only the tuple's partition.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_check_of_a_partitioned_parent_reads_one_partition_per_tuple() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    run_ok(
+        &db,
+        "CREATE TABLE cr_p (d BIGINT NOT NULL, c BIGINT NOT NULL, id BIGINT NOT NULL, PRIMARY KEY (d, c, id)) \
+         PARTITION BY HASH (d, c) PARTITIONS 16",
+    )
+    .await;
+    let values: Vec<String> = (1..=96).map(|i| format!("({}, {}, {i})", i - 40, i % 5)).collect();
+    run_ok(&db, &format!("INSERT INTO cr_p VALUES {}", values.join(", "))).await;
+    run_ok(
+        &db,
+        "CREATE TABLE cr_c (d BIGINT NOT NULL, c BIGINT NOT NULL, s BIGINT NOT NULL, n BIGINT NOT NULL, \
+         PRIMARY KEY (d, c, s, n), FOREIGN KEY (d, c, s) REFERENCES cr_p (d, c, id) ON DELETE CASCADE) \
+         PARTITION BY HASH (d, c) PARTITIONS 16",
+    )
+    .await;
+    let materialized = {
+        let (_, all) = reads_of(&db, "cr_p", "SELECT id FROM cr_p").await;
+        distinct(&all)
+    };
+    assert!(materialized.len() > 8, "the parent spans most partitions: {materialized:?}");
+    crate::core::rql::executor::fk_probe_hooks::take();
+
+    // i = 1 and i = 50. Its home partition, then the probe and recheck.
+    for (d, c, id) in [(-39i64, 1i64, 1i64), (10, 0, 50)] {
+        let (_, home) = reads_of(&db, "cr_p", &format!("SELECT id FROM cr_p WHERE d = {d} AND c = {c} AND id = {id}")).await;
+        assert_eq!(home.len(), 1, "a tuple's own partition: {home:?}");
+        crate::core::rql::executor::fk_probe_hooks::take();
+        let (out, reads) =
+            reads_of(&db, "cr_p", &format!("INSERT INTO cr_c VALUES ({d}, {c}, {id}, 1)")).await;
+        ok(out, "insert");
+        assert_eq!(reads, vec![home[0], home[0]], "the probe and its recheck, each in the tuple's partition");
+        let probes = crate::core::rql::executor::fk_probe_hooks::take();
+        assert!(
+            probes.iter().filter(|(t, parent)| t == "cr_p" && *parent).count() >= 2,
+            "the parent was probed as a partitioned parent: {probes:?}"
+        );
+    }
+    // Spelled as an ORM or a hand might: casts, quotes. Each its one
+    // partition, routed by the bytes the parent row was routed by.
+    for (n, tuple) in [(2, "-39::bigint, 1::bigint, 1"), (3, "'-39', '1', '1'"), (4, "CAST(-39 AS BIGINT), 1, 1")] {
+        let (out, reads) = reads_of(&db, "cr_p", &format!("INSERT INTO cr_c VALUES ({tuple}, {n})")).await;
+        ok(out, tuple);
+        assert_eq!(distinct(&reads).len(), 1, "{tuple}: {reads:?}");
+    }
+    let (out, reads) = reads_of(&db, "cr_p", "INSERT INTO cr_c VALUES (-39, 1, 2, 1)").await;
+    assert!(out.unwrap_err().contains("violates foreign key constraint"));
+    assert!(distinct(&reads).len() <= 1, "a missing tuple reads at most its own partition: {reads:?}");
+
+    let tuples: Vec<String> = (10..20).map(|i| format!("({}, {}, {i}, 7)", i - 40, i % 5)).collect();
+    let (out, reads) = reads_of(&db, "cr_p", &format!("INSERT INTO cr_c VALUES {}", tuples.join(", "))).await;
+    ok(out, "multi-row insert");
+    assert!(distinct(&reads).len() <= 10, "ten tuples read at most ten partitions: {reads:?}");
+    assert!(distinct(&reads).len() < materialized.len(), "never every partition: {reads:?}");
+
+    // The parent's DELETE: the child's side reads the tuple's partition of
+    // the co-located child (its partition key is among the key's columns).
+    // (A positive key: the cascade is a `DELETE` statement, which routes on
+    // its `WHERE`, and the router reads no point in a signed number.)
+    let (_, child_home) = reads_of(&db, "cr_c", "SELECT n FROM cr_c WHERE d = 10 AND c = 0").await;
+    assert_eq!(distinct(&child_home).len(), 1, "{child_home:?}");
+    let (out, reads) = reads_of(&db, "cr_c", "DELETE FROM cr_p WHERE d = 10 AND c = 0 AND id = 50").await;
+    ok(out, "delete");
+    assert_eq!(distinct(&reads), distinct(&child_home), "the child's side routes: {reads:?}");
+    assert_eq!(rows_of(&run_ok(&db, "SELECT n FROM cr_c WHERE d = 10 AND c = 0 AND s = 50").await), 0, "cascaded");
+}
+
+/// A composite key over a text partition key, values holding quotes and
+/// spaces: each check reads its tuple's one partition.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_check_routes_quoted_text_keys_by_their_bytes() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    run_ok(
+        &db,
+        "CREATE TABLE ct_p (code TEXT NOT NULL, n BIGINT NOT NULL, PRIMARY KEY (code, n)) PARTITION BY HASH (code) PARTITIONS 8",
+    )
+    .await;
+    let parents: Vec<String> = (0..40).map(|i| format!("('c''{i} x', {i})")).collect();
+    run_ok(&db, &format!("INSERT INTO ct_p VALUES {}", parents.join(", "))).await;
+    run_ok(&db, "CREATE TABLE ct_c (id BIGINT NOT NULL PRIMARY KEY, code TEXT, n BIGINT, FOREIGN KEY (code, n) REFERENCES ct_p)").await;
+    let materialized = distinct(&reads_of(&db, "ct_p", "SELECT count(*) FROM ct_p").await.1);
+    assert!(materialized.len() > 4, "{materialized:?}");
+    for i in 0..6 {
+        let (out, reads) = reads_of(&db, "ct_p", &format!("INSERT INTO ct_c VALUES ({i}, 'c''{i} x', {i})")).await;
+        ok(out, "a quoted key");
+        assert_eq!(distinct(&reads).len(), 1, "{reads:?}");
+    }
+    let (out, reads) = reads_of(&db, "ct_p", "INSERT INTO ct_c VALUES (9, 'c''1 x', 2)").await;
+    assert!(out.unwrap_err().contains("violates foreign key constraint"));
+    assert!(distinct(&reads).len() <= 1, "{reads:?}");
+}
+
+/// A composite key whose referenced columns miss a partitioned parent's
+/// partition key cannot be declared (42830), so it can only come from a
+/// record written behind the DDL. Its parent probe is refused, never read
+/// in every partition and never skipped: the tuple exists, so a fanned-out
+/// check would pass, and a skipped one would let anything in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_composite_check_that_cannot_route_is_refused_never_skipped() {
+    init_globals();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path()).await;
+    run_ok(
+        &db,
+        "CREATE TABLE cn_p (k BIGINT NOT NULL, a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (k, a, b)) \
+         PARTITION BY HASH (k) PARTITIONS 8",
+    )
+    .await;
+    run_ok(&db, "INSERT INTO cn_p VALUES (1, 10, 100), (2, 20, 200)").await;
+    run_ok(&db, "CREATE TABLE cn_c (id BIGINT NOT NULL PRIMARY KEY, x BIGINT, y BIGINT)").await;
+    let e = run(&db, "ALTER TABLE cn_c ADD FOREIGN KEY (x, y) REFERENCES cn_p (a, b)").await.unwrap_err();
+    assert!(e.contains("there is no unique constraint matching given keys"), "{e}");
+    db.require_composite_foreign_keys().unwrap();
+    let io = db.table_for_tests("cn_c").unwrap().io_schema.clone();
+    crate::core::rql::foreign_key::append(
+        io,
+        &crate::core::rql::foreign_key::ForeignKey {
+            name: "behind".to_string(),
+            columns: vec!["x".to_string(), "y".to_string()],
+            parent_table: "cn_p".to_string(),
+            parent_columns: vec!["a".to_string(), "b".to_string()],
+            match_full: false,
+            on_delete_columns: Vec::new(),
+            on_delete: crate::core::rql::foreign_key::ReferentialAction::NoAction,
+            on_update: crate::core::rql::foreign_key::ReferentialAction::NoAction,
+            is_deleted: false,
+        },
+    )
+    .await
+    .unwrap();
+    db.reload_table("cn_c").await.unwrap();
+    assert!(db.schema_view("cn_c").unwrap().schema().foreign_keys.iter().any(|k| k.is_composite()));
+    let e = run(&db, "INSERT INTO cn_c VALUES (1, 20, 200)").await.unwrap_err();
+    assert!(e.contains("cannot be checked") && e.contains("not supported"), "{e}");
+    assert_eq!(crate::pgwire::sqlstate_for(&e), "0A000", "{e}");
+    assert_eq!(rows_of(&run_ok(&db, "SELECT id FROM cn_c").await), 0, "nothing written");
+}
