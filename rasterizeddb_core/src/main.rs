@@ -1944,7 +1944,13 @@ fn main() -> std::io::Result<()> {
                 std::process::exit(2);
             }
             let (socket_mode, socket_group) = socket_permissions(&args);
-            match args.kv.listener(&args.pg_user, socket_mode, socket_group) {
+            match args.kv.listener(
+                &args.pg_user,
+                socket_mode,
+                socket_group,
+                args.pg_cert.as_deref(),
+                args.pg_key.as_deref(),
+            ) {
                 Ok(Some(config)) => {
                     match rasterizeddb_core::core::kv_cache::resp::bind(&config).await {
                         Ok(listener) => {

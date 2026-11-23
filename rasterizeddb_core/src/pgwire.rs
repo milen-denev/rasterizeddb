@@ -15896,6 +15896,17 @@ fn ensure_crypto_provider() {
     });
 }
 
+/// The TLS acceptor for a certificate chain and key in PEM files, or for a
+/// self-signed pair made now when neither is given: what the PostgreSQL port
+/// serves, and the Redis port under `--kv-tls on`.
+pub fn tls_acceptor(cert_path: Option<&str>, key_path: Option<&str>) -> io::Result<TlsAcceptor> {
+    build_tls_acceptor(&TlsConfig {
+        mode: TlsMode::Require,
+        cert_path: cert_path.map(str::to_string),
+        key_path: key_path.map(str::to_string),
+    })
+}
+
 fn build_tls_acceptor(tls: &TlsConfig) -> io::Result<TlsAcceptor> {
     ensure_crypto_provider();
     let (certs, key) = match (&tls.cert_path, &tls.key_path) {

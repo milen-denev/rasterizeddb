@@ -755,6 +755,7 @@ async fn start_server() -> (u16, KvCacheHandle) {
         socket: None,
         auth: super::resp::RespAuth::Trust,
         threads: Some(2),
+        tls: None,
     };
     let listener = super::resp::bind(&config).await.expect("bind");
     let port = listener.tcp_port().unwrap();
@@ -1011,6 +1012,65 @@ async fn tcp_large_values_and_many_clients() {
     assert_eq!(c.call(&["GET", "shared"]).await, "8000");
 }
 
+/// `--kv-tls on`: a client that completes a handshake against the server's
+/// certificate is served as on plain TCP, pipelining included; one that
+/// speaks plain RESP to the TLS port is not answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_tcp_port_speaks_tls_when_asked() {
+    let _settings = default_settings();
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key, _) = rastcp::cert::write_self_signed_identity(dir.path(), &["localhost".to_string()])
+        .expect("a self-signed identity");
+    let acceptor = crate::pgwire::tls_acceptor(cert.to_str(), key.to_str()).expect("the acceptor");
+    let database = rclite::Arc::new(crate::core::database::Database::new_with_backend("kvtls", true).await);
+    let handle = database.kv_cache.clone();
+    let config = super::resp::RespConfig {
+        addr: "127.0.0.1".into(),
+        port: Some(0),
+        socket: None,
+        auth: super::resp::RespAuth::Trust,
+        threads: Some(2),
+        tls: Some(super::resp::RespTls(acceptor)),
+    };
+    let listener = super::resp::bind(&config).await.expect("bind");
+    let port = listener.tcp_port().unwrap();
+    tokio::spawn(super::resp::serve(listener, database, handle, config));
+
+    // The client trusts exactly the server's certificate.
+    let mut roots = rustls::RootCertStore::empty();
+    let pem = std::fs::read(&cert).unwrap();
+    for c in rustls_pemfile::certs(&mut pem.as_slice()) {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config));
+    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(name, tcp).await.expect("the TLS handshake");
+    let mut c = Client { sock: Box::new(tls), buf: Vec::new() };
+    assert_eq!(c.call(&["PING"]).await, "+PONG");
+    let mut batch = Client::encode(&["SET", "secret", "1"]);
+    batch.extend(Client::encode(&["INCR", "secret"]));
+    batch.extend(Client::encode(&["GET", "secret"]));
+    c.send_raw(&batch).await;
+    assert_eq!(c.read().await, "+OK");
+    assert_eq!(c.read().await, ":2");
+    assert_eq!(c.read().await, "2");
+    let value = "x".repeat(100_000);
+    assert_eq!(c.call(&["SET", "big", &value]).await, "+OK");
+    assert_eq!(c.call(&["GET", "big"]).await, value);
+
+    // Plain RESP on the TLS port: the server reads it as a bad handshake and
+    // closes, never answering a command.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    plain.write_all(&Client::encode(&["PING"])).await.unwrap();
+    let mut got = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), plain.read_to_end(&mut got)).await;
+    assert!(read.is_ok(), "the server kept a plain client on its TLS port open");
+    assert!(!String::from_utf8_lossy(&got).contains("PONG"), "a plain client was answered: {got:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trust_is_refused_on_a_public_address() {
     let _settings = default_settings();
@@ -1020,6 +1080,7 @@ async fn trust_is_refused_on_a_public_address() {
         socket: None,
         auth: super::resp::RespAuth::Trust,
         threads: None,
+        tls: None,
     };
     assert!(super::resp::bind(&config).await.is_err());
 }
@@ -1059,6 +1120,7 @@ async fn start_unix_server(
         }),
         auth,
         threads: Some(2),
+        tls: None,
     };
     let listeners = super::resp::bind(&config).await?;
     assert_eq!(listeners.tcp_port(), None, "a socket-only listener bound a TCP port");
@@ -1170,6 +1232,7 @@ async fn a_listener_needs_a_port_or_a_socket() {
         socket: None,
         auth: super::resp::RespAuth::Trust,
         threads: None,
+        tls: None,
     };
     assert!(super::resp::bind(&config).await.is_err());
 }

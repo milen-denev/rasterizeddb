@@ -64,7 +64,26 @@ pub struct RespConfig {
     pub auth: RespAuth,
     /// I/O threads; `None` is one per CPU this process may run on.
     pub threads: Option<usize>,
+    /// TLS on the TCP port (`--kv-tls on`): every TCP connection must
+    /// complete a handshake first, as on Redis's `tls-port`. The unix socket
+    /// stays plain: it never leaves the machine, and its permissions are what
+    /// guard it.
+    pub tls: Option<RespTls>,
 }
+
+/// The TLS the TCP port speaks: the certificate and key the PostgreSQL port
+/// serves (`--pg-cert`/`--pg-key`, or the self-signed pair a start makes).
+#[derive(Clone)]
+pub struct RespTls(pub tokio_rustls::TlsAcceptor);
+
+impl std::fmt::Debug for RespTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RespTls")
+    }
+}
+
+/// How long a TLS client has to finish its handshake, from accept.
+const TLS_HANDSHAKE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Where and how the protocol is served on a unix socket.
 #[derive(Clone, Debug)]
@@ -202,9 +221,12 @@ enum StdSock {
     Unix(std::os::unix::net::UnixStream),
 }
 
-/// A client connection: TCP or a unix socket.
+/// A client connection: TCP, TLS over TCP, or a unix socket.
 enum Sock {
     Tcp(TcpStream),
+    /// Boxed: the session state is a few kilobytes, and the plain variants
+    /// are a descriptor.
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
     #[cfg(unix)]
     Unix(tokio::net::UnixStream),
 }
@@ -221,6 +243,9 @@ impl Sock {
     async fn readable(&self) -> io::Result<()> {
         match self {
             Sock::Tcp(sock) => sock.readable().await,
+            // The TCP socket under the session: bytes there are a record
+            // (the client's next command, or its close) or the end.
+            Sock::Tls(tls) => tls.get_ref().0.readable().await,
             #[cfg(unix)]
             Sock::Unix(sock) => sock.readable().await,
         }
@@ -233,10 +258,22 @@ impl Sock {
     /// `peek` used to sit there instead: a client parked in BLPOP stopped
     /// answering, past its wake-up and its own timeout, until its next byte.
     /// Seeing nothing clears the readiness, so the next `readable` waits.
+    ///
+    /// Under TLS this looks at the TCP socket: a client that closes sends a
+    /// `close_notify` record before its FIN, which reads as data, so a closed
+    /// TLS client parked in a blocking pop is noticed at its timeout or at
+    /// its wake-up rather than at once.
     fn try_peek_byte(&self) -> Option<io::Result<usize>> {
         let mut byte = [0u8; 1];
+        let tcp = match self {
+            Sock::Tcp(sock) => Some(sock),
+            Sock::Tls(tls) => Some(tls.get_ref().0),
+            #[cfg(unix)]
+            Sock::Unix(_) => None,
+        };
         match self {
-            Sock::Tcp(sock) => {
+            Sock::Tcp(_) | Sock::Tls(_) => {
+                let sock = tcp.expect("a TCP socket");
                 let waker = std::task::Waker::noop();
                 let mut cx = std::task::Context::from_waker(waker);
                 let mut buf = tokio::io::ReadBuf::new(&mut byte);
@@ -284,6 +321,7 @@ impl tokio::io::AsyncRead for Sock {
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
             Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_read(cx, buf),
+            Sock::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_read(cx, buf),
             #[cfg(unix)]
             Sock::Unix(sock) => std::pin::Pin::new(sock).poll_read(cx, buf),
         }
@@ -298,6 +336,7 @@ impl tokio::io::AsyncWrite for Sock {
     ) -> std::task::Poll<io::Result<usize>> {
         match self.get_mut() {
             Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_write(cx, buf),
+            Sock::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_write(cx, buf),
             #[cfg(unix)]
             Sock::Unix(sock) => std::pin::Pin::new(sock).poll_write(cx, buf),
         }
@@ -309,6 +348,7 @@ impl tokio::io::AsyncWrite for Sock {
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
             Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_flush(cx),
+            Sock::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_flush(cx),
             #[cfg(unix)]
             Sock::Unix(sock) => std::pin::Pin::new(sock).poll_flush(cx),
         }
@@ -320,6 +360,7 @@ impl tokio::io::AsyncWrite for Sock {
     ) -> std::task::Poll<io::Result<()>> {
         match self.get_mut() {
             Sock::Tcp(sock) => std::pin::Pin::new(sock).poll_shutdown(cx),
+            Sock::Tls(tls) => std::pin::Pin::new(tls.as_mut()).poll_shutdown(cx),
             #[cfg(unix)]
             Sock::Unix(sock) => std::pin::Pin::new(sock).poll_shutdown(cx),
         }
@@ -363,7 +404,8 @@ pub async fn serve(
         RespAuth::Roles { default_user } => format!("database roles, default user {default_user}"),
     };
     if listeners.tcp.is_some() {
-        info!("kv cache: Redis protocol on {}:{} ({})", config.addr, port, auth);
+        let tls = if config.tls.is_some() { ", TLS" } else { "" };
+        info!("kv cache: Redis protocol on {}:{} ({}{})", config.addr, port, auth, tls);
     }
     #[cfg(unix)]
     if let Some((_, file)) = listeners.unix.as_ref() {
@@ -443,6 +485,23 @@ async fn connection(
     config: Arc<RespConfig>,
     main: tokio::runtime::Handle,
 ) {
+    // The handshake on the I/O thread that owns the connection, not in the
+    // accept loop: a slow or silent client holds up nobody else, and gives up
+    // its descriptor after `TLS_HANDSHAKE`.
+    let socket = match (socket, config.tls.as_ref()) {
+        (Sock::Tcp(tcp), Some(tls)) => match tokio::time::timeout(TLS_HANDSHAKE, tls.0.accept(tcp)).await {
+            Ok(Ok(session)) => Sock::Tls(Box::new(session)),
+            Ok(Err(e)) => {
+                warn!("kv cache: TLS handshake with {peer} failed: {e}");
+                return;
+            }
+            Err(_) => {
+                warn!("kv cache: {peer} did not finish its TLS handshake within {TLS_HANDSHAKE:?}");
+                return;
+            }
+        },
+        (socket, _) => socket,
+    };
     let stats = &handle.inner().stats;
     stats.connected.fetch_add(1, Ordering::Relaxed);
     stats.connections_total.fetch_add(1, Ordering::Relaxed);

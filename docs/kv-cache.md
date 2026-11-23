@@ -28,6 +28,7 @@ redis-cli -p 6379 -a secret PING
 | `--kv-addr IP` | `127.0.0.1` | Address to bind |
 | `--kv-auth password\|trust` | `password` | `password` checks `AUTH` against the database's roles; `trust` asks nothing and is refused on a non-loopback address |
 | `--kv-user ROLE` | `--pg-user` | The role `AUTH <password>` (no user name) is checked as |
+| `--kv-tls on\|off` | `off` | TLS on `--kv-port`, with the PostgreSQL port's certificate (`--pg-cert`/`--pg-key`, or a self-signed pair made at start); `--kv-socket` stays plain |
 | `--kv-max-memory SIZE` | `0` (unbounded) | Redis's `maxmemory`: `512mb`, `4gb` |
 | `--kv-eviction POLICY` | `noeviction` | Redis's `maxmemory-policy` |
 | `--kv-persist` | off | Save periodically and on clean shutdown |
@@ -46,6 +47,14 @@ and the PostgreSQL port checks. `AUTH alice <password>` and
 `HELLO 3 AUTH alice <password>` both work. Until a client authenticates it may
 only send `AUTH`, `HELLO`, `QUIT` and `RESET`, and its frames are capped at
 10 arguments of 16 KiB each, as Redis caps unauthenticated clients.
+
+**TLS.** With `--kv-tls on` every TCP client completes a TLS handshake
+before its first command, as on Redis's `tls-port`; plain RESP on that port is
+dropped unanswered. Clients connect with `redis-cli --tls --cacert ca.pem`,
+or `rediss://` URLs in client libraries. Without `--pg-cert`/`--pg-key` the
+certificate is self-signed and made at each start, so clients must either
+skip verification or be given the files. A handshake has ten seconds. The
+unix socket stays plain, since it never leaves the machine.
 
 ## From SQL
 
@@ -135,7 +144,7 @@ Every command such a client may then send is in the list above.
 **Not implemented:** Lua scripting (`EVAL`, `FUNCTION`), streams (`XADD` …),
 HyperLogLog, geo, `BITFIELD`/`BITOP`/`BITPOS`, `OBJECT FREQ` and the LFU
 policies, keyspace notifications, `CLIENT TRACKING`, `WAIT`, cluster mode,
-replication of the store, TLS on the Redis port, and the append-only file.
+replication of the store, and the append-only file.
 A command outside the list is answered with Redis's `ERR unknown command`.
 
 ## How it is built
