@@ -502,16 +502,150 @@ pub(crate) fn rewrite_update(sql: &str, key: &[String]) -> Option<Result<String,
     Some(rewrite_update_inner(sql, key))
 }
 
+/// An `UPDATE` or `DELETE` whose `WHERE` holds a correlated scalar subquery
+/// — what `executor::exists_as_counts` makes of an `EXISTS` comparing the
+/// outer row by anything but `=`, `(SELECT count(*) FROM ev e2 WHERE e2.v >
+/// ev.v) > 0` — as the `UPDATE … FROM` or `DELETE … USING` over a SELECT
+/// computing each row's subquery values, keyed by the target's identifying
+/// key:
+///
+/// ```sql
+/// UPDATE ev SET v = 0 FROM (SELECT ev.id AS __k0, (SELECT count(*) …) AS __w0
+///   FROM ev) __cw WHERE ev.id = __cw.__k0 AND ((__cw.__w0) > 0) RETURNING id
+/// ```
+///
+/// The values are read before any row is written, under the statement's
+/// snapshot, so a subquery over the table being written sees it as it was,
+/// as PostgreSQL's does. `None` when the `WHERE` holds no correlated
+/// subquery; refused when the `SET` holds one too, or the statement already
+/// names a second relation.
+pub(crate) fn rewrite_write_where(sql: &str, key: &[String], delete: bool) -> Option<Result<String, String>> {
+    let sql = sql.trim().trim_end_matches(';').trim_end();
+    let where_at = find_keyword(sql, "WHERE", 0)?;
+    let (body_end, returning) = match find_keyword(sql, "RETURNING", where_at) {
+        Some(at) => (at, Some(sql[at..].trim())),
+        None => (sql.len(), None),
+    };
+    let condition = sql[where_at + "WHERE".len()..body_end].trim();
+    // The target and its alias: `UPDATE t [AS] a SET`, `DELETE FROM t [AS] a WHERE`.
+    let (head_end, target_text) = if delete {
+        let from = find_keyword(sql, "FROM", 0)?;
+        (where_at, sql[from + 4..where_at].trim())
+    } else {
+        let set_at = find_keyword(sql, "SET", 0)?;
+        (set_at, sql[6..set_at].trim())
+    };
+    let mut words = target_text.split_whitespace();
+    let table = words.next()?.to_string();
+    let alias = match (words.next(), words.next()) {
+        (Some(w), Some(a)) if w.eq_ignore_ascii_case("AS") => a.to_string(),
+        (Some(a), None) => a.to_string(),
+        (None, _) => table.clone(),
+        _ => return None,
+    };
+    // A write that already names a second relation (`UPDATE … FROM`,
+    // `DELETE … USING`) evaluates its correlated terms per joined row
+    // itself (`executor::split_correlated_terms`): left to it.
+    let second = if delete { find_keyword(sql, "USING", 0) } else { find_keyword(sql, "FROM", head_end) };
+    if second.is_some_and(|at| at < where_at) {
+        return None;
+    }
+    let probe = format!("SELECT 1 FROM {table} {alias} WHERE {condition}");
+    crate::core::rql::subquery::find_correlated_scalar_subquery(&probe)?;
+    Some(rewrite_write_where_inner(sql, key, delete, head_end, where_at, condition, returning, &table, &alias))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_write_where_inner(
+    sql: &str,
+    key: &[String],
+    delete: bool,
+    head_end: usize,
+    where_at: usize,
+    condition: &str,
+    returning: Option<&str>,
+    table: &str,
+    alias: &str,
+) -> Result<String, String> {
+    if key.is_empty() {
+        return Err(format!(
+            "a correlated subquery in the WHERE of an {} needs a primary key or a unique column on the table to \
+             name each row by",
+            if delete { "DELETE" } else { "UPDATE" }
+        ));
+    }
+    if !delete {
+        let assignments = &sql[head_end + 3..where_at];
+        if crate::core::rql::subquery::find_correlated_scalar_subquery(assignments).is_some() {
+            return Err(
+                "an UPDATE with a correlated subquery in both its SET and its WHERE is not supported yet".to_string(),
+            );
+        }
+    }
+    // Each correlated subquery of the condition, out to the derived table,
+    // and its place taken by the column holding its value.
+    let prefix = format!("SELECT 1 FROM {table} {alias} WHERE ");
+    let mut probe = format!("{prefix}{condition}");
+    let mut values: Vec<String> = Vec::new();
+    for n in 0..=32usize {
+        let Some(sub) = crate::core::rql::subquery::find_correlated_scalar_subquery(&probe) else { break };
+        if n == 32 {
+            return Err("more than 32 correlated subqueries in one WHERE".to_string());
+        }
+        values.push(format!("{} AS __w{n}", &probe[sub.start..sub.end]));
+        probe = format!("{}(__cw.__w{n}){}", &probe[..sub.start], &probe[sub.end..]);
+    }
+    let condition = &probe[prefix.len()..];
+    let keys = key
+        .iter()
+        .enumerate()
+        .map(|(n, k)| format!("{alias}.{} AS __k{n}", ident(k)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select = format!("SELECT {keys}, {} FROM {table} {alias}", values.join(", "));
+    let select = match rewrite_select(&select) {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => return Err(e),
+        None => select,
+    };
+    let join = key
+        .iter()
+        .enumerate()
+        .map(|(n, k)| format!("{alias}.{} = __cw.__k{n}", ident(k)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let alias_clause = if alias == table { String::new() } else { format!(" {alias}") };
+    let returning = returning.map(|r| format!(" {r}")).unwrap_or_default();
+    Ok(if delete {
+        format!("DELETE FROM {table}{alias_clause} USING ({select}) __cw WHERE {join} AND ({condition}){returning}")
+    } else {
+        let assignments = sql[head_end + 3..where_at].trim();
+        format!("UPDATE {table}{alias_clause} SET {assignments} FROM ({select}) __cw WHERE {join} AND ({condition}){returning}")
+    })
+}
+
 fn rewrite_update_inner(sql: &str, key: &[String]) -> Result<String, String> {
     let sql = sql.trim().trim_end_matches(';').trim_end();
     let set_at = find_keyword(sql, "SET", 0).ok_or_else(|| "UPDATE without SET".to_string())?;
-    for kw in ["FROM", "RETURNING"] {
-        if find_keyword(sql, kw, set_at).is_some() {
-            return Err(format!(
-                "a correlated subquery in an UPDATE with {kw} is not supported yet; compute it in the FROM list"
-            ));
-        }
+    if find_keyword(sql, "FROM", set_at).is_some() {
+        return Err(
+            "a correlated subquery in an UPDATE with FROM is not supported yet; compute it in the FROM list".to_string(),
+        );
     }
+    // `RETURNING` stays the statement's: carried onto the `UPDATE … FROM`
+    // this becomes, which returns each written row. It was refused.
+    let (sql, returning) = match find_keyword(sql, "RETURNING", set_at) {
+        Some(at) => (sql[..at].trim_end(), Some(sql[at..].trim())),
+        None => (sql, None),
+    };
+    let rewritten = rewrite_update_body(sql, set_at, key)?;
+    Ok(match returning {
+        Some(returning) => format!("{rewritten} {returning}"),
+        None => rewritten,
+    })
+}
+
+fn rewrite_update_body(sql: &str, set_at: usize, key: &[String]) -> Result<String, String> {
     if key.is_empty() {
         return Err(
             "a correlated subquery in UPDATE needs a primary key or a unique column on the table to name each \

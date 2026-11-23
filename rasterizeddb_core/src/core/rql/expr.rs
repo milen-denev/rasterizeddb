@@ -3928,6 +3928,9 @@ pub fn static_type(expr: &Expr) -> DbType {
                     DbType::DATETIME if matches!(op, ArithOp::Sub) => DbType::INTERVAL,
                     DbType::DATETIME | DbType::INTERVAL => DbType::DATETIME,
                     DbType::TIME if matches!(op, ArithOp::Add) || date(lhs) => DbType::DATETIME,
+                    // `date + timetz`: a `timestamptz` (not a `timestamp`:
+                    // `yields_timestamp` answers false for it).
+                    DbType::TIMETZ if matches!(op, ArithOp::Add) => DbType::DATETIME,
                     _ => DbType::DATE,
                 };
             }
@@ -7380,6 +7383,37 @@ fn date_arith(a: &Value, op: ArithOp, b: &Value) -> Result<Value, String> {
         // `interval + date`, which the timestamp arithmetic reads date first.
         (None, Some(_)) if matches!((a.db_type(), op), (Some(DbType::INTERVAL), ArithOp::Add)) => {
             arith(&as_timestamp(b), op, a)
+        }
+        // `date + timetz` and `timetz + date`: that time of day, in its own
+        // zone, on that date — an instant, a `timestamptz` (PostgreSQL's
+        // `datetimetz_pl`). The zone is stored as seconds west of UTC, so
+        // `10:00+02` is 08:00 UTC. It was "operator does not exist: date +
+        // time with time zone". PostgreSQL has no `date - timetz`, and
+        // neither has this: only `+` comes here.
+        (Some(_), None) | (None, Some(_))
+            if matches!(op, ArithOp::Add)
+                && matches!(if date_days(a).is_some() { b.db_type() } else { a.db_type() }, Some(DbType::TIMETZ)) =>
+        {
+            let (date, timetz) = if date_days(a).is_some() { (a, b) } else { (b, a) };
+            let (of_day, west) = match timetz {
+                Value::Data { bytes, .. } => (
+                    bytes.get(..8).and_then(|b| b.try_into().ok()).map(i64::from_be_bytes),
+                    bytes.get(8..12).and_then(|b| b.try_into().ok()).map(i32::from_be_bytes),
+                ),
+                Value::Null => (None, None),
+            };
+            let (of_day, west) = (of_day.ok_or_else(refuse)?, west.ok_or_else(refuse)?);
+            match as_timestamp(date) {
+                Value::Data { bytes, db_type: DbType::DATETIME } => {
+                    let midnight = i64::from_le_bytes(bytes.as_slice().try_into().map_err(|_| refuse())?);
+                    let instant = midnight
+                        .checked_add(of_day)
+                        .and_then(|t| t.checked_add(i64::from(west) * 1_000_000))
+                        .ok_or("timestamp out of range")?;
+                    Ok(Value::Data { bytes: instant.to_le_bytes().to_vec(), db_type: DbType::DATETIME })
+                }
+                _ => Err(refuse()),
+            }
         }
         // `date + time` and `time + date`: that time of day on that date, a
         // `timestamp` (PostgreSQL's `datetime_pl`). It was "operator does

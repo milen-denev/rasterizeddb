@@ -3071,7 +3071,7 @@ pub fn rewrite_scan_where(
     // lifted on its own. Expanding again inside `rewrite_where` finds nothing.
     // `s ~ 'x'`, `s ~* 'x'`, `!~`, `!~*`: the `regexp_like` comparison
     // they mean, which the evaluator answers.
-    let lowered = normalize_where_shapes(clause);
+    let lowered = normalize_where_shapes(clause, schema);
     let lowered = crate::core::rql::check::lower_regex_operators(&lowered, "regexp_like");
     let lowered = crate::core::rql::check::lower_text_match(&lowered);
     // Before the lift, so an operand folded through the key function is
@@ -6218,8 +6218,8 @@ pub fn rewrite_where(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> Resu
 ///   it ("unexpected Op(">")"), a syntax error at `IS`, or an integer;
 /// - `x [NOT] IN (n / 10, 2)`, a list holding an expression, is the
 ///   comparisons it means ([`expand_expression_in_lists`]).
-pub(crate) fn normalize_where_shapes(clause: &str) -> String {
-    expand_expression_in_lists(&unwrap_lone_names(clause))
+pub(crate) fn normalize_where_shapes(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> String {
+    expand_expression_in_lists(&unwrap_lone_names(clause), schema)
 }
 
 /// Whether `text` is one name: `n`, `t.n`, `"N"`, `t."N"`.
@@ -6319,7 +6319,34 @@ fn is_literal_item(item: &str) -> bool {
 /// values: a NULL item folds `x = NULL` false, so `IN` is never true through
 /// it and `NOT IN` never true at all, as PostgreSQL answers in a `WHERE`. A
 /// list of literals, or a subquery, is left to the paths that read those.
-fn expand_expression_in_lists(clause: &str) -> String {
+///
+/// Only over an integer column, with items of integer arithmetic (names,
+/// whole numbers, operators, parentheses): PostgreSQL resolves an IN list to
+/// one common type with its left side, which separate comparisons do not —
+/// a `real` against `0.1`, a `character(n)` against a computed text — and
+/// for integers the two agree. Anything else is left as written, to the
+/// operand lifting that reads it.
+fn expand_expression_in_lists(clause: &str, schema: &SmallVec<[SchemaField; 20]>) -> String {
+    use crate::core::db_type::DbType;
+    let integer_column = |name: &str| {
+        let column = name.rsplit('.').next().unwrap_or(name).trim_matches('"');
+        schema.iter().any(|f| {
+            !f.is_deleted
+                && f.name.eq_ignore_ascii_case(column)
+                && matches!(
+                    f.db_type,
+                    DbType::I8 | DbType::I16 | DbType::I32 | DbType::I64 | DbType::U8 | DbType::U16 | DbType::U32
+                )
+        })
+    };
+    let integer_arithmetic = |item: &str| {
+        let b = item.as_bytes();
+        !item.trim().is_empty()
+            && item.bytes().all(|c| c.is_ascii_alphanumeric() || b" _+-*/%()\".".contains(&c))
+            // A decimal point between digits is a numeric, not a qualifier.
+            && !b.windows(3).any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit())
+            && !b.windows(2).any(|w| w[0] == b'.' && w[1].is_ascii_digit())
+    };
     let bytes = clause.as_bytes();
     let mut out = String::with_capacity(clause.len());
     let mut copied = 0;
@@ -6375,7 +6402,11 @@ fn expand_expression_in_lists(clause: &str) -> String {
                     .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '$'))
                     .map_or(0, |at| at + 1);
                 let name = &head[name_start..];
-                if !is_lone_name(name) || name_start < copied {
+                if !is_lone_name(name)
+                    || name_start < copied
+                    || !integer_column(name)
+                    || !items.iter().all(|item| integer_arithmetic(item))
+                {
                     i += 1;
                     continue;
                 }
@@ -6405,7 +6436,7 @@ fn rewrite_where_in(clause: &str, schema: &SmallVec<[SchemaField; 20]>, scan: bo
     if clause.trim().is_empty() {
         return Ok(String::new());
     }
-    let clause = &normalize_where_shapes(clause);
+    let clause = &normalize_where_shapes(clause, schema);
 
     // The regular-expression operators as `regexp_like` (a no-op once
     // `rewrite_scan_where` has done it).
