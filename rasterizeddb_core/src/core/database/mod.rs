@@ -6876,6 +6876,33 @@ async fn run_native_query_body(query: &str, database: Arc<Database>) -> Vec<u8> 
         );
     }
 
+    // A `LATERAL` item — what a correlated scalar subquery was just
+    // rewritten into (`rql::correlated`), or one written as such — is
+    // materialised before the statement runs, as pgwire materialises it for
+    // an autocommit SELECT (`effective_tx` is `FROZEN_TX` there too), and its
+    // relations are dropped after. Left to the engine, the statement named a
+    // relation nothing had built: "missing FROM-clause entry for table
+    // \"__cs0\"".
+    let is_select = stmt.trim_start().as_bytes().get(..6).is_some_and(|w| w.eq_ignore_ascii_case(b"SELECT"));
+    if is_select && crate::core::rql::lateral::next_item(stmt).is_some() {
+        let tx = crate::core::mvcc::transaction::FROZEN_TX;
+        return match crate::core::rql::cte::materialize_derived(stmt, &database, tx).await {
+            Ok(Some(lateral)) => {
+                crate::core::rql::prepared::note_rewritten();
+                let response = Box::pin(run_native_with_catalog(&lateral.rewritten, database.clone())).await;
+                crate::core::rql::cte::drop_temps(&database, &lateral.temps, tx).await;
+                response
+            }
+            Ok(None) => Box::pin(run_native_with_catalog(stmt, database)).await,
+            Err(e) => error_response(&e),
+        };
+    }
+    run_native_with_catalog(stmt, database).await
+}
+
+/// [`run_native_query_body`]'s last step: the catalogue relations the
+/// statement reads, built for it, and the statement run.
+async fn run_native_with_catalog(stmt: &str, database: Arc<Database>) -> Vec<u8> {
     // The catalogue relations (`pg_tables`, `pg_class`,
     // `information_schema.tables` and the rest) exist only per statement:
     // built from the live catalogue into temporary relations the text is

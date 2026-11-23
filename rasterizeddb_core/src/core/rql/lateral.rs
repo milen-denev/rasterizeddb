@@ -935,7 +935,21 @@ pub(crate) async fn materialize(
                     "SELECT DISTINCT {} FROM {relation} {alias}",
                     columns.iter().map(|c| format!("{alias}.{c}::text")).collect::<Vec<_>>().join(", ")
                 );
-                let tuples = text_rows(&key_query, columns.len(), database, tx).await?;
+                // Only the outer rows the statement can keep need a run. The
+                // item ran for every row of the outer relation: one customer
+                // of a thousand cost a thousand runs, and an outer table past
+                // `MAX_TUPLES` was refused whatever its WHERE kept.
+                let tuples = match outer_only_filter(&current, &item, alias) {
+                    Some(filter) => match text_rows(&format!("{key_query} WHERE {filter}"), columns.len(), database, tx).await {
+                        Ok(tuples) => tuples,
+                        // Read as written it failed; every outer row is
+                        // still a superset of what the statement keeps.
+                        Err(_) => text_rows(&key_query, columns.len(), database, tx).await?,
+                    },
+                    None => text_rows(&key_query, columns.len(), database, tx).await?,
+                };
+                #[cfg(test)]
+                test_hooks::record_runs(relation, tuples.len());
                 if tuples.len() > MAX_TUPLES {
                     return Err(format!(
                         "LATERAL item {} would run for {} distinct outer values, more than the {MAX_TUPLES} this \
@@ -1011,6 +1025,146 @@ pub(crate) async fn materialize(
         }
     }
     Ok(found.then_some(current))
+}
+
+/// The statement's own top-level `WHERE` conjuncts that read nothing but the
+/// outer item `alias`'s columns, joined by `AND`: a row of that item they
+/// refuse is not in the result, so the `LATERAL` item need not run for its
+/// values. `None` when there is none, or when it is not safe to say:
+///
+/// - the outer item must be the first `FROM` item, and no `RIGHT` or `FULL`
+///   join may pad it with NULLs, where a conjunct over it reads a row the
+///   relation does not hold;
+/// - a conjunct may hold only `alias.column`s, literals, operators, casts
+///   and `AND OR NOT IS NULL IN BETWEEN LIKE ILIKE TRUE FALSE DISTINCT FROM`:
+///   no call (a volatile one would answer differently twice), no subquery,
+///   no bare or other item's column, no quoted name and no parameter.
+///
+/// Dropping a conjunct only keeps more rows, never fewer, so whatever is
+/// left out is still decided by the statement's own `WHERE`.
+fn outer_only_filter(sql: &str, item: &Item, alias: &str) -> Option<String> {
+    let first = items_before(sql, item.start).into_iter().next()?;
+    if !first.0.eq_ignore_ascii_case(alias) {
+        return None;
+    }
+    let from = find_keyword(sql, "FROM", 0)?;
+    if ["RIGHT", "FULL"].iter().any(|w| find_keyword(&sql[from..], w, 0).is_some()) {
+        return None;
+    }
+    let at = find_keyword(sql, "WHERE", item.end)?;
+    let body = at + "WHERE".len();
+    let mut end = sql.len();
+    for word in ["GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FETCH", "FOR", "RETURNING"] {
+        if let Some(found) = find_keyword(sql, word, body) {
+            end = end.min(found);
+        }
+    }
+    let clause = sql[body..end].trim().trim_end_matches(';');
+    let terms: Vec<String> = conjuncts(clause).into_iter().filter(|t| !t.is_empty() && reads_only(t, alias)).collect();
+    (!terms.is_empty()).then(|| terms.join(" AND "))
+}
+
+/// `split_conjuncts`, with a `BETWEEN`'s own `AND` kept inside its term:
+/// split there, `a BETWEEN 1 AND 2 OR b = 5` became `a BETWEEN 1` and
+/// `2 OR b = 5`.
+fn conjuncts(clause: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut open = false;
+    for part in crate::core::rql::join::split_conjuncts(clause) {
+        let part = part.trim().to_string();
+        if open {
+            if let Some(last) = out.last_mut() {
+                last.push_str(" AND ");
+                last.push_str(&part);
+            }
+        } else {
+            out.push(part);
+        }
+        let last = out.last().map(String::as_str).unwrap_or("");
+        // Open while the term's last BETWEEN has no AND after it yet.
+        let mut at = 0;
+        let mut between = None;
+        while let Some(found) = find_keyword(last, "BETWEEN", at) {
+            between = Some(found);
+            at = found + "BETWEEN".len();
+        }
+        open = between.is_some_and(|b| find_keyword(last, "AND", b).is_none());
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn reads_only_for_tests(term: &str, alias: &str) -> bool {
+    reads_only(term, alias)
+}
+
+/// Whether `term` reads only `alias`'s columns, by [`outer_only_filter`]'s
+/// rule.
+fn reads_only(term: &str, alias: &str) -> bool {
+    const WORDS: &[&str] =
+        &["AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE", "ILIKE", "TRUE", "FALSE", "DISTINCT", "FROM"];
+    let bytes = term.as_bytes();
+    let mut column = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b'\'');
+                continue;
+            }
+            b'"' | b'$' | b';' => return false,
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                // `::type`: the type's one-word name is not a column. A
+                // two-word type's second word is refused below, as any
+                // unknown word is.
+                i += 2;
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            b'0'..=b'9' => {
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'_') {
+                    i += 1;
+                }
+                continue;
+            }
+            _ if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && is_word(bytes[i]) {
+                    i += 1;
+                }
+                let word = &term[start..i];
+                if bytes.get(i) == Some(&b'.') {
+                    if !word.eq_ignore_ascii_case(alias) {
+                        return false;
+                    }
+                    i += 1;
+                    let c0 = i;
+                    while i < bytes.len() && is_word(bytes[i]) {
+                        i += 1;
+                    }
+                    if i == c0 || term[i..].trim_start().starts_with('(') {
+                        return false;
+                    }
+                    column = true;
+                    continue;
+                }
+                let called = term[i..].trim_start().starts_with('(');
+                if !WORDS.iter().any(|w| w.eq_ignore_ascii_case(word)) || (called && !word.eq_ignore_ascii_case("IN")) {
+                    return false;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    column
 }
 
 /// A row of NULLs in `relation` when it has no rows.
@@ -1225,5 +1379,30 @@ mod binds_name_tests {
         ] {
             assert!(binds_name(body, "u7"), "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// The runs each outer relation's `LATERAL` items took, by relation name.
+    static RUNS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+    pub(crate) fn record_runs(relation: &str, runs: usize) {
+        *RUNS.lock().unwrap().get_or_insert_with(HashMap::new).entry(relation.to_string()).or_default() += runs;
+    }
+
+    /// The runs recorded so far for `relation`, and for the relations a
+    /// statement whose outer item is `alias` materialised in its place (an
+    /// item after the first reads the earlier ones' join, `__cte_<alias>_…`),
+    /// and forgets them.
+    pub(crate) fn take_runs(relation: &str, alias: &str) -> usize {
+        let derived = format!("__cte_{alias}_");
+        let mut runs = RUNS.lock().unwrap();
+        let Some(map) = runs.as_mut() else { return 0 };
+        let names: Vec<String> = map.keys().filter(|k| *k == relation || k.starts_with(&derived)).cloned().collect();
+        names.iter().filter_map(|k| map.remove(k)).sum()
     }
 }
