@@ -276,7 +276,15 @@ fn select_list_of(body: &str) -> Option<&str> {
     // and every Rust raw-string query formats across lines. `find_keyword`
     // already respects quoting and nesting, which is what this used to
     // hand-roll.
-    if let Some(at) = crate::core::rql::join::find_keyword(body, "FROM", start) {
+    // The list is the first branch's: a `FROM` after a set operator belongs
+    // to a later branch. `SELECT 7 AS id UNION ALL SELECT id FROM t` read its
+    // list as `7 AS id UNION ALL SELECT id`, and the relation built from it
+    // was "syntax error at or near \"ALL\"".
+    let set_operator = ["UNION", "INTERSECT", "EXCEPT"]
+        .iter()
+        .filter_map(|keyword| crate::core::rql::join::find_keyword(body, keyword, start))
+        .min();
+    if let Some(at) = crate::core::rql::join::find_keyword(body, "FROM", start).filter(|at| set_operator.is_none_or(|op| *at < op)) {
         return Some(&body[start..at]);
     }
     // A `SELECT` with no `FROM` is one row of its items. It was reported as

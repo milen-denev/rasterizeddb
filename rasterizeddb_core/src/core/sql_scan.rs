@@ -2118,6 +2118,66 @@ pub fn plain_branch_parentheses(sql: &str) -> std::borrow::Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// `text` without the parentheses around the whole of it, however many:
+/// `((SELECT 1))` is `SELECT 1`, and `SELECT 9, round(2.5, 1)` is itself.
+/// Trimming every leading `(` and trailing `)` took the last call's own
+/// parenthesis with them ("trailing text after 'round(2.567, 1)'").
+pub fn without_outer_parentheses(text: &str) -> &str {
+    let mut text = text.trim();
+    while text.starts_with('(') && matching_close(text, 0) == Some(text.len() - 1) {
+        text = text[1..text.len() - 1].trim();
+    }
+    text
+}
+
+/// [`plain_branch_parentheses`] for every query written inside parentheses,
+/// at any depth: `x IN ((SELECT 1) UNION (SELECT 2))`, `EXISTS ((SELECT …)
+/// EXCEPT (SELECT …))`, `((SELECT 1) UNION (SELECT 1))` as a value, a
+/// derived table, a CTE's body. Borrowed when nothing changes.
+///
+/// A subquery's readers take its text from the `SELECT` after the
+/// parenthesis: one that opened with another parenthesis was "column
+/// \"SELECT\" does not exist" or "EXISTS must contain a SELECT".
+pub fn nested_branch_parentheses(sql: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    // Only a set operation has branches to write in parentheses.
+    if !["UNION", "INTERSECT", "EXCEPT"].iter().any(|kw| contains_ignore_ascii_case(sql, kw.as_bytes())) {
+        return Cow::Borrowed(sql);
+    }
+    let mut out: Option<String> = None;
+    let mut i = 0usize;
+    loop {
+        let text = out.as_deref().unwrap_or(sql);
+        let bytes = text.as_bytes();
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'(' {
+            i = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)).map_or(i + 1, |end| end.max(i + 1));
+            continue;
+        }
+        // A group that opens with a parenthesis or with a query; anything
+        // else is stepped into without looking for where it closes.
+        let first = text[i + 1..].trim_start();
+        if !(first.starts_with('(') || starts_with_keyword(first, "SELECT")) {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_close(text, i) else {
+            i += 1;
+            continue;
+        };
+        if let Cow::Owned(plain) = plain_branch_parentheses(&text[i + 1..close]) {
+            if starts_with_keyword(plain.trim_start(), "SELECT") {
+                out = Some(format!("{}{}{}", &text[..=i], plain, &text[close..]));
+            }
+        }
+        // On into the group, as it now reads.
+        i += 1;
+    }
+    out.map_or(Cow::Borrowed(sql), Cow::Owned)
+}
+
 /// `INSERT INTO t [(columns)] (SELECT …)` and `CREATE TABLE t AS (SELECT …)`
 /// with the query that supplies their rows read as the top level reads one
 /// ([`plain_branch_parentheses`]). Borrowed when the query is not in
@@ -3908,6 +3968,39 @@ mod branch_parentheses_tests {
             assert!(matches!(plain_branch_parentheses(sql), Cow::Borrowed(_)), "{sql}");
         }
         assert_eq!(plain("(SELECT 'é) UNION (ü' AS t) UNION ALL (SELECT 'ß')"), "SELECT 'é) UNION (ü' AS t UNION ALL SELECT 'ß'");
+    }
+
+    #[test]
+    fn only_the_parentheses_around_the_whole_are_removed() {
+        assert_eq!(without_outer_parentheses(" ((SELECT 1)) "), "SELECT 1");
+        assert_eq!(without_outer_parentheses("SELECT 9, round(2.5, 1)"), "SELECT 9, round(2.5, 1)");
+        assert_eq!(without_outer_parentheses("(SELECT 9, CAST(NULL AS numeric))"), "SELECT 9, CAST(NULL AS numeric)");
+        assert_eq!(without_outer_parentheses("(SELECT 1) UNION (SELECT 2)"), "(SELECT 1) UNION (SELECT 2)");
+        assert_eq!(without_outer_parentheses("(SELECT ')'"), "(SELECT ')'");
+    }
+
+    #[test]
+    fn a_query_inside_parentheses_is_read_the_same_way() {
+        let nested = |sql: &str| nested_branch_parentheses(sql).into_owned();
+        assert_eq!(nested("SELECT a FROM t WHERE a IN ((SELECT 1) UNION (SELECT 2))"), "SELECT a FROM t WHERE a IN (SELECT 1 UNION SELECT 2)");
+        assert_eq!(nested("SELECT EXISTS ((SELECT 1) EXCEPT (SELECT 1))"), "SELECT EXISTS (SELECT 1 EXCEPT SELECT 1)");
+        assert_eq!(nested("SELECT ((SELECT 1) UNION (SELECT 1)) AS one"), "SELECT (SELECT 1 UNION SELECT 1) AS one");
+        assert_eq!(nested("SELECT a FROM t WHERE a IN (SELECT 1 UNION (SELECT b FROM u))"), "SELECT a FROM t WHERE a IN (SELECT 1 UNION SELECT b FROM u)");
+        // A group inside a group.
+        assert_eq!(
+            nested("SELECT a FROM t WHERE a IN ((SELECT 1) EXCEPT ((SELECT 2) UNION (SELECT 3)))"),
+            "SELECT a FROM t WHERE a IN (SELECT 1 EXCEPT SELECT * FROM (SELECT 2 UNION SELECT 3) __rdb_branch1)"
+        );
+        for sql in [
+            "SELECT a FROM t WHERE (a = 1) AND ((b = 2) OR (c = 3))",
+            "SELECT ((SELECT 1) + (SELECT 2)) UNION ALL SELECT 3",
+            "SELECT ((SELECT 1), (SELECT 2)) UNION ALL SELECT (3, 4)",
+            "SELECT '((SELECT 1) UNION (SELECT 2))' UNION ALL SELECT 'x'",
+            "SELECT a FROM t WHERE a IN (SELECT b FROM u UNION SELECT c FROM v)",
+            "SELECT a FROM t WHERE a IN ((SELECT b FROM u ORDER BY b LIMIT 1) UNION ALL (SELECT c FROM v ORDER BY c LIMIT 1))",
+        ] {
+            assert!(matches!(nested_branch_parentheses(sql), Cow::Borrowed(_)), "{sql}");
+        }
     }
 
     #[test]

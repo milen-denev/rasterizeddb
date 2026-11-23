@@ -130,8 +130,87 @@ pub(crate) fn rewrite(
     // `23::regtype`: an oid written as a number, read as the quoted form
     // below reads it. It was "cast to 'regtype' is not supported yet".
     let numbered = quote_numeric_operands(sql);
-    let rewritten = rewrite_literals(numbered.as_deref().unwrap_or(sql), relation_exists, user_type)?;
-    Ok(rewritten.or(numbered))
+    let rewritten = rewrite_literals(numbered.as_deref().unwrap_or(sql), relation_exists, user_type)?.or(numbered);
+    // What is left is a cast of something other than a literal.
+    let named = column_regtype_casts(rewritten.as_deref().unwrap_or(sql));
+    Ok(named.or(rewritten))
+}
+
+/// `sql` with each `column::regtype` as the type's name, `None` when it has
+/// none: `atttypid::regtype`, `t.oid_col::regtype::text`. With `::oid` after
+/// it the value is the column itself. It was "cast to 'regtype' is not
+/// supported yet" outside a catalogue statement. A whole select item keeps
+/// the column's name, as PostgreSQL names a cast column.
+fn column_regtype_casts(sql: &str) -> Option<String> {
+    const CAST: &str = "regtype";
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 32);
+    let (mut copied, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        // By bytes: `i` may be inside a character wider than one.
+        if !bytes[i..].starts_with(b"::") {
+            i += 1;
+            continue;
+        }
+        let after = sql[i + 2..].trim_start();
+        if !crate::core::sql_scan::starts_with_keyword(after, CAST) {
+            i += 2;
+            continue;
+        }
+        let cast_end = sql.len() - after.len() + CAST.len();
+        // The operand: a name, qualified or quoted, right before the cast.
+        let before = sql[..i].trim_end();
+        let start = before
+            .bytes()
+            .rposition(|b| !(is_identifier_byte(b) || b == b'.' || b == b'"'))
+            .map_or(0, |p| p + 1);
+        let operand = &before[start..];
+        let is_name = operand.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '"')
+            && !operand.ends_with('.')
+            // A quoted name with a space in it is not read from its end.
+            && operand.bytes().filter(|b| *b == b'"').count() % 2 == 0
+            && start >= copied;
+        if !is_name {
+            i = cast_end;
+            continue;
+        }
+        // `::oid` after it, or a cast to an integer (an earlier pass writes
+        // `oid` as one): the column is the oid. So it is when it is compared
+        // with another type, which the literal pass has made an oid too
+        // (`t::regtype = 'integer'::regtype`).
+        let next = sql[cast_end..].trim_start();
+        let keyword = |text: &str, words: &[&str]| words.iter().any(|w| crate::core::sql_scan::starts_with_keyword(text, w));
+        let compared = ["=", "<>", "!="].iter().any(|op| next.starts_with(op) || before[..start].trim_end().ends_with(op))
+            || keyword(next, &["IN"])
+            || (keyword(next, &["NOT"]) && keyword(next[3..].trim_start(), &["IN"]));
+        let (replacement, end) = match next.strip_prefix("::").map(str::trim_start) {
+            Some(rest) if keyword(rest, &["oid"]) => (operand.to_string(), sql.len() - rest.len() + 3),
+            Some(rest) if keyword(rest, &["bigint", "int8", "integer", "int4", "int"]) => (operand.to_string(), cast_end),
+            Some(_) => (format!("__regtype_name({operand})"), cast_end),
+            None if compared => (operand.to_string(), cast_end),
+            None => (format!("__regtype_name({operand})"), cast_end),
+        };
+        let alias = if crate::core::sql_scan::whole_select_item(sql, start, end) {
+            let name = operand.rsplit('.').next().unwrap_or(operand);
+            format!(" AS {name}")
+        } else {
+            String::new()
+        };
+        out.push_str(&sql[copied..start]);
+        out.push_str(&replacement);
+        out.push_str(&alias);
+        copied = end;
+        i = end;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
 }
 
 /// `sql` with each bare integer cast to `regtype` or `regclass` quoted
@@ -520,7 +599,25 @@ mod tests {
         let oid = crate::core::rql::user_types::oid_of("mood");
         assert_eq!(r("SELECT 1 WHERE t = 'public.mood'::regtype").as_deref(), Some(format!("SELECT 1 WHERE t = {oid}").as_str()));
         // Numbers that are not cast to one of the two are left alone.
-        assert_eq!(r("SELECT 23::int, x1::regtype, 1.5::regtype, '23::regtype' FROM regs"), None);
+        assert_eq!(r("SELECT 23::int, 1.5::regtype, '23::regtype' FROM regs"), None);
+        // A column's cast is the type's name, under the column's own name.
+        assert_eq!(
+            r("SELECT x1::regtype, t.\"Ty\"::regtype::text, y::regtype::oid FROM regs t WHERE y::regtype = 'integer'").as_deref(),
+            Some("SELECT __regtype_name(x1) AS x1, __regtype_name(t.\"Ty\")::text, y AS y FROM regs t WHERE y = 'integer'")
+        );
+        // Compared with a type, both sides are the oid.
+        assert_eq!(
+            r("SELECT 1 FROM regs WHERE y::regtype = 'integer'::regtype AND 'text'::regtype <> x1::regtype AND y::regtype IN (23, 25)").as_deref(),
+            Some("SELECT 1 FROM regs WHERE y = 23 AND 25 <> x1 AND y IN (23, 25)")
+        );
+        assert_eq!(r("SELECT y::regtype::bigint FROM regs").as_deref(), Some("SELECT y::bigint FROM regs"));
+        // Characters wider than a byte around the cast.
+        assert_eq!(
+            r("SELECT 'é', y::regtype AS \"ü\" FROM regs WHERE n = 'ß€' AND 7::regtype = 7").as_deref(),
+            Some("SELECT 'é', __regtype_name(y) AS \"ü\" FROM regs WHERE n = 'ß€' AND 7 = 7")
+        );
+        assert_eq!(r("SELECT é::regtype::text, ünï FROM regs"), None);
+        assert_eq!(r("SELECT (a + 1)::regtype, f(a)::regtype, \"my ty\"::regtype FROM regs"), None);
         let refused = rewrite("SELECT 'nosuchtype'::regtype", &|_| true, &|_| false);
         assert_eq!(refused, Err(("42704", "type \"nosuchtype\" does not exist".to_string())));
     }
