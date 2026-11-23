@@ -1398,6 +1398,37 @@ fn plain_group_column<'s>(
         .find(|f| f.name.eq_ignore_ascii_case(name) && !f.is_deleted)
 }
 
+/// The select item an `ORDER BY` key (or a `DISTINCT ON` key) names, as
+/// PostgreSQL reads one: a position always means an output column, and a
+/// bare name means one when an item is labelled with it, before any input
+/// column of that name. A qualified name or an expression reads the input.
+///
+/// A quoted name matches its label exactly; an unquoted one as written or
+/// folded to lower case, which is how the wire folds a client's text.
+///
+/// Without it a label that shadows a column — `SELECT -id AS id … ORDER BY
+/// id`, or `ORDER BY 1` — sorted by the stored column: -1 -2 -3 where
+/// PostgreSQL answers -3 -2 -1. A silent wrong order.
+fn output_item_named(token: &str, items: &[SelectItem]) -> Option<usize> {
+    let t = token.trim();
+    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+        let n: usize = t.parse().ok()?;
+        return (1..=items.len()).contains(&n).then(|| n - 1);
+    }
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        let name = &t[1..t.len() - 1];
+        if name.contains('"') {
+            return None;
+        }
+        return items.iter().position(|i| i.label() == name);
+    }
+    if !is_identifier(t) {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    items.iter().position(|i| i.label() == t || i.label() == lower)
+}
+
 /// Resolves every `ORDER BY` key against the schema and renders the spec the
 /// scan carries down to the sorter.
 ///
@@ -2203,14 +2234,21 @@ fn parse_select_query(
         }
         for key in &keys {
             let bare = key.rsplit('.').next().unwrap_or(key).trim_matches('"');
-            let named = select_items.iter().find(|i| i.label().eq_ignore_ascii_case(bare)).and_then(|i| match i {
+            let item_named = |i: &SelectItem| match i {
                 SelectItem::Column { field, .. } => Some(crate::core::rql::expr::Expr::Column(field.clone())),
                 SelectItem::RowExpr { expr, .. } => Some(expr.clone()),
                 _ => None,
-            });
-            let expr = match named {
-                Some(expr) if !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) => expr,
-                _ => match crate::core::rql::expr::parse(key, schema) {
+            };
+            // A key naming an output column is that column, before any input
+            // column of the name (`output_item_named`), as ORDER BY's is.
+            let output = output_item_named(key, &select_items)
+                .filter(|_| !key.trim().bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|i| item_named(&select_items[i]));
+            let named = select_items.iter().find(|i| i.label().eq_ignore_ascii_case(bare)).and_then(item_named);
+            let expr = match (output, named) {
+                (Some(expr), _) => expr,
+                (None, Some(expr)) if !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted) => expr,
+                (_, _) => match crate::core::rql::expr::parse(key, schema) {
                     Ok(expr) => expr,
                     // A condition is a boolean key: `DISTINCT ON (a > 0)`.
                     Err(e) => match crate::core::rql::join::comparison_value(key, schema) {
@@ -2223,6 +2261,11 @@ fn parse_select_query(
         }
     }
 
+    // Which select item each key names, if it names one (a position, or a
+    // bare name that is an item's label): read before the positions become
+    // labels, which the paths below look up among the input columns first.
+    let order_outputs: Vec<Option<usize>> =
+        order_terms.iter().map(|t| output_item_named(&t.token, &select_items)).collect();
     // `ORDER BY 2` names the second select item. Resolved before anything below
     // looks at a sort key, so every path sees an ordinary one.
     crate::core::rql::order_by::resolve_ordinals(
@@ -2382,6 +2425,26 @@ fn parse_select_query(
     // needs no special case: it already emits the grouping key for a plain
     // column, so a plan whose items are all keys yields one row per group.
     let is_grouped = has_aggregate || !group_by.is_empty();
+    // A key naming an output column sorts by that column's value
+    // (`output_item_named`). A plain column item sorts by its source column,
+    // which every path below reads; a computed one by its expression
+    // (`output_exprs`), and a window by its value (`output_windows`). A
+    // grouped query resolves its keys against its output already.
+    let mut order_terms = order_terms;
+    let mut output_exprs: Vec<Option<crate::core::rql::expr::Expr>> = vec![None; order_terms.len()];
+    let mut output_windows: Vec<Option<usize>> = vec![None; order_terms.len()];
+    if !is_grouped {
+        for (k, term) in order_terms.iter_mut().enumerate() {
+            let Some(position) = order_outputs.get(k).copied().flatten() else { continue };
+            match &select_items[position] {
+                SelectItem::Column { field, .. } => term.token = format!("\"{}\"", field.name),
+                SelectItem::RowExpr { expr, .. } => output_exprs[k] = Some(expr.clone()),
+                SelectItem::Window { .. } => output_windows[k] = Some(position),
+                _ => {}
+            }
+        }
+    }
+    let by_output = output_exprs.iter().any(Option::is_some) || output_windows.iter().any(Option::is_some);
     // Columns with a nondeterministic collation sort by their key; what
     // would compare them by their bytes is refused (`collation::plan_single`).
     let order_terms =
@@ -2806,7 +2869,7 @@ fn parse_select_query(
     // A sort key the scan can handle is a plain schema column with no explicit
     // NULLS placement; anything else — an expression, a select alias, or a
     // NULLS FIRST/LAST — is evaluated and sorted after the scan instead.
-    let scan_can_sort = order_terms.iter().all(|term| {
+    let scan_can_sort = !by_output && order_terms.iter().all(|term| {
         term.nulls_first.is_none() && {
             let bare = term
                 .token
@@ -2834,7 +2897,7 @@ fn parse_select_query(
     // the *input* rows and silently produce a wrong aggregate.
     let (order_by, limit, offset) = if is_grouped {
         (None, None, None)
-    } else if distinct {
+    } else if distinct && !by_output {
         // Ordering still helps — deduplication preserves the first occurrence,
         // so a sorted input yields sorted output — but a row cap applied before
         // the duplicates are removed would return too few rows.
@@ -2901,13 +2964,33 @@ fn parse_select_query(
         // to expressions; the scan runs unsorted and UNBOUNDED (a limit would
         // cut rows before the sort decided which ones belong in the page),
         // and the executor evaluates, sorts and pages.
-        for term in &order_terms {
+        // Under DISTINCT a key must be an output column, as the arm above
+        // requires of a stored one: the columns the select list reads, before
+        // any key's are added below.
+        let selected_columns = requested_columns.clone();
+        for (k, term) in order_terms.iter().enumerate() {
             let bare = term
                 .token
                 .rsplit('.')
                 .next()
                 .unwrap_or(&term.token)
                 .trim_matches('"');
+            if let Some(position) = output_windows[k] {
+                window_order.push((WindowOrderKey::Window(position), term.descending, term.nulls_first));
+                continue;
+            }
+            if let Some(expr) = output_exprs[k].clone() {
+                for f in expr_reads(&expr, schema) {
+                    if !requested_columns.iter().any(|c| c.eq_ignore_ascii_case(&f.name)) {
+                        requested_columns.push(f.name.clone());
+                    }
+                }
+                order_expressions.push((expr, term.descending, term.nulls_first));
+                continue;
+            }
+            if distinct && !selected_columns.iter().any(|c| c.eq_ignore_ascii_case(bare)) {
+                return Err(format!("for SELECT DISTINCT, ORDER BY term '{}' must appear in the select list", term.token));
+            }
             let window_item = select_items.iter().position(|s| {
                 matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare)
             });
@@ -2981,12 +3064,16 @@ fn parse_select_query(
             let mut all: Vec<(WindowOrderKey, bool, Option<bool>)> = Vec::with_capacity(order_terms.len());
             let mut windows = std::mem::take(&mut window_order).into_iter();
             let mut exprs = std::mem::take(&mut order_expressions).into_iter();
-            for term in &order_terms {
+            for (k, term) in order_terms.iter().enumerate() {
                 let bare = term.token.rsplit('.').next().unwrap_or(&term.token).trim_matches('"');
-                let is_window = select_items
-                    .iter()
-                    .any(|s| matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare))
-                    && !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted);
+                // As the loop above decided it: an output window first, an
+                // output expression never, else a window label no column has.
+                let is_window = output_windows[k].is_some()
+                    || (output_exprs[k].is_none()
+                        && select_items
+                            .iter()
+                            .any(|s| matches!(s, SelectItem::Window { .. }) && s.label().eq_ignore_ascii_case(bare))
+                        && !schema.iter().any(|f| f.name.eq_ignore_ascii_case(bare) && !f.is_deleted));
                 let next = if is_window {
                     windows.next()
                 } else {
