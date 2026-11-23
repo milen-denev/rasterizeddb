@@ -144,7 +144,9 @@ pub fn split_with(sql: &str) -> Result<Option<(Vec<CteDef>, String)>, String> {
         let open = after_as.as_ptr() as usize - rest.as_ptr() as usize;
         let close = matching_paren(rest, open)
             .ok_or_else(|| format!("unterminated WITH body for '{}'", name))?;
-        let body = rest[open + 1..close].trim().to_string();
+        // A body of parenthesised branches, as the top level reads one
+        // (`sql_scan::plain_branch_parentheses`): it was "cannot parse".
+        let body = crate::core::sql_scan::plain_branch_parentheses(rest[open + 1..close].trim()).into_owned();
         if body.is_empty() {
             return Err(format!("the WITH clause '{}' has an empty body", name));
         }
@@ -2351,6 +2353,13 @@ pub(crate) async fn create_table_as(
     // `TABLE t` is `SELECT * FROM t`.
     let table_form = crate::core::rql::ctas::table_as_select(&statement.query);
     let query = table_form.as_deref().unwrap_or(&statement.query);
+    // `AS VALUES (…), (…)`: the SELECT it means, its columns `column1`… as
+    // PostgreSQL names them. It was "over anything but a SELECT or TABLE".
+    let values_form = values_as_select(query);
+    let query = values_form.as_deref().unwrap_or(query);
+    // `AS (SELECT …) UNION ALL (SELECT …)`, as the top level reads it.
+    let unparenthesised = crate::core::sql_scan::plain_branch_parentheses(query);
+    let query = unparenthesised.as_ref();
     let distinct_on = crate::core::rql::distinct_on::rewrite_statement(query);
     let query = distinct_on.as_deref().unwrap_or(query);
     let materialized = materialize(query, database, tx).await?;
@@ -2917,7 +2926,11 @@ pub fn next_derived_table(sql: &str) -> Option<(usize, usize, String, String)> {
                 from = after_keyword;
                 continue;
             };
-            let inner = sql[inner_start..close].trim();
+            // `FROM ((SELECT …) UNION ALL (SELECT …)) u`: its branches
+            // without the parentheses that group nothing, as the top level
+            // reads them. It was read as a relation with no name.
+            let inner = crate::core::sql_scan::plain_branch_parentheses(sql[inner_start..close].trim());
+            let inner = inner.as_ref();
             if !crate::core::sql_scan::starts_with_keyword(inner, "SELECT") && !crate::core::sql_scan::starts_with_keyword(inner, "WITH") {
                 from = after_keyword;
                 continue;

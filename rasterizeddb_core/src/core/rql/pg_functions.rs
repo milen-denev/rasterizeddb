@@ -1340,7 +1340,7 @@ pub fn shown_at(value: Value, scale: u32) -> Value {
 /// Calls `func` over its evaluated arguments.
 pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
     use PgFunc::*;
-    let non_strict = matches!(func, DomainValue | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill);
+    let non_strict = matches!(func, DomainValue | Int4Range | Int8Range | NumRange | DateRange | TsRange | TstzRange | ArrayCtor | ArraySlice | QuantifiedCmp | Concat | ConcatWs | Format | JsonBuildObject | JsonBuildArray | JsonBuildObjectText | JsonBuildArrayText | NumNonnulls | NumNulls | ToJson | ToJsonText | StringToArray | ArrayToString | ArrayAppend | ArrayPrepend | ArrayCat | ArrayPosition | ArrayRemove | ArrayReplace | ArrayFill | FormatType);
     // An element argument may be NULL (it finds, removes or replaces the
     // array's NULLs, as PostgreSQL's do); a NULL array is a NULL answer.
     if matches!(func, ArrayPosition | ArrayRemove | ArrayReplace) && (args[0].is_null() || args.get(2).is_some_and(|a| func == ArrayPosition && a.is_null())) {
@@ -2213,6 +2213,9 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
         }
         JsonbStripNulls => data(crate::core::jsonb::strip_nulls(&jsonb_of(&args[0])?)?, DbType::JSONB),
         PgGetUserById => text_value(crate::core::rql::catalog_model::user_by_id(int_of(&args[0], "the role's oid")?)),
+        // Not strict: a NULL modifier is none (`format_type(23, NULL)` is
+        // `integer`), and only a NULL type is NULL.
+        FormatType if args[0].is_null() => Value::Null,
         FormatType => {
             let typmod = int_of(&args[1], "the type modifier").ok();
             match crate::core::rql::catalog_model::format_type(int_of(&args[0], "the type's oid")?, typmod) {

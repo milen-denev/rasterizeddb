@@ -1237,7 +1237,15 @@ pub(crate) fn type_oid_by_name(name: &str) -> i64 {
         Some(b) => (b.trim().to_string(), true),
         None => (lower, false),
     };
-    let canonical = match base.split('(').next().unwrap_or("").trim() {
+    // Without its modifier, wherever it is written: `numeric(10,2)`,
+    // `timestamp(3) with time zone`.
+    let base = match (base.find('('), base.find(')')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{} {}", base[..open].trim_end(), base[close + 1..].trim_start()).trim().to_string()
+        }
+        _ => base,
+    };
+    let canonical = match base.as_str() {
         "integer" | "int" | "int4" => "int4",
         "bigint" | "int8" => "int8",
         "smallint" | "int2" => "int2",

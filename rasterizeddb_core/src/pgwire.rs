@@ -5118,10 +5118,15 @@ pub(crate) async fn describe_query(
     };
     let flat = crate::core::sql_scan::flatten_whitespace(&uncommented).into_owned();
     let mut catalog = crate::core::sql_scan::catalog_syntax(&flat).into_owned();
+    if let std::borrow::Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&catalog) {
+        catalog = text;
+    }
     // `'t'::regclass` and the like, as `rewrite_statement_text` reads them.
-    if let Some(text) = crate::core::rql::reg_casts::rewrite(&catalog, &|name: &str| {
-        database.schema_view(name).is_some() || database.views.contains(name)
-    }) {
+    if let Ok(Some(text)) = crate::core::rql::reg_casts::rewrite(
+        &catalog,
+        &|name: &str| database.schema_view(name).is_some() || database.views.contains(name),
+        &|name: &str| database.types.contains(name) || database.domains.contains(name),
+    ) {
         catalog = text;
     }
     let arrays = crate::core::sql_scan::array_subqueries(&catalog).into_owned();
@@ -8121,6 +8126,16 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::catalog_syntax(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // `(SELECT …) EXCEPT (SELECT …)` without the parentheses that group
+    // nothing (`sql_scan::plain_branch_parentheses`).
+    if let Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
+    // `INSERT INTO t (SELECT …)` and `CREATE TABLE t AS (SELECT …)`: the
+    // query in parentheses, the same way (`sql_scan::source_query_parentheses`).
+    if let Cow::Owned(text) = crate::core::sql_scan::source_query_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
     // `indkey::text` and the other vector columns, spaced as PostgreSQL
     // prints them (`sql_scan::vector_columns_as_text`).
     let vectors = crate::core::sql_scan::vector_columns_as_text(&stmt);
@@ -8134,9 +8149,11 @@ pub(crate) fn rewrite_statement_text<'a>(
     take(&mut stmt, tree);
     // `'t'::regclass`, `'int4'::regtype` and `to_regclass('t')` as the name
     // or oid they stand for (`rql::reg_casts`).
-    let reg = crate::core::rql::reg_casts::rewrite(&stmt, &|name: &str| {
-        database.schema_view(name).is_some() || database.views.contains(name)
-    });
+    let reg = crate::core::rql::reg_casts::rewrite(
+        &stmt,
+        &|name: &str| database.schema_view(name).is_some() || database.views.contains(name),
+        &|name: &str| database.types.contains(name) || database.domains.contains(name),
+    )?;
     take(&mut stmt, reg);
     // `ARRAY(SELECT …)` as the aggregate it is (`sql_scan::array_subqueries`).
     if let Cow::Owned(text) = crate::core::sql_scan::array_subqueries(&stmt) {
@@ -8588,6 +8605,15 @@ where
         fail_statement(state, stream, code, &message).await?;
         return Ok(());
     }
+    // `pg_get_viewdef(view)` as the view's query (`views::viewdef_calls`).
+    let with_viewdefs = match crate::core::rql::views::viewdef_calls(database, stmt, state.current_tx()).await {
+        Ok(text) => text,
+        Err((code, message)) => {
+            fail_statement(state, stream, code, &message).await?;
+            return Ok(());
+        }
+    };
+    let stmt = with_viewdefs.as_deref().unwrap_or(stmt);
     let expanded_views;
     let stmt = if database.has_table(crate::core::rql::views::VIEW_TABLE) {
         let options = crate::core::rql::views::ExpandOptions {

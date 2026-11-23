@@ -798,9 +798,9 @@ tied values gives the later one, as PostgreSQL's `numeric_larger` does.
 
 Such a column's slot is seventeen bytes (the value and its scale); the
 field's recorded width says which format a column holds, and one column never
-mixes them. `CREATE TABLE`, `ALTER TABLE … ADD COLUMN`, a partitioned table,
-pg-import and a CTE or derived table make every new unconstrained `NUMERIC`
-column this way (`CREATE TABLE … AS` and `SELECT INTO` are not supported yet).
+mixes them. `CREATE TABLE`, `CREATE TABLE … AS`, `SELECT INTO`, `ALTER TABLE … ADD
+COLUMN`, a partitioned table, pg-import and a CTE or derived table make every
+new unconstrained `NUMERIC` column this way.
 Range predicates on such a column are not pruned by zone maps yet; equality
 is pruned by the filter index, and both B-tree and hash indexes key it.
 
@@ -816,8 +816,8 @@ failure part-way leaves the old column, `database/rewrite.rs`). Each value
 keeps its value and is shown at the places it needs (1.500000000 becomes
 1.5; the scale it was written with was never stored). Any other rewrite of
 the table converts it the same way: an `ADD COLUMN` on a table with rows,
-`DROP NOT NULL`. A partitioned table is not rewritten yet, so its old columns
-stay as they are.
+`DROP NOT NULL`. A partitioned table is rewritten the same way, every
+partition in one step (`Database::rewrite_partitioned`).
 
 `ALTER COLUMN c TYPE NUMERIC(p, s)` over an unconstrained column, a scale
 change of a `NUMERIC(p, s)` column, a narrower precision, and `TYPE NUMERIC`
@@ -1434,7 +1434,13 @@ sequences, views, triggers, `MERGE`, `DO` blocks, `PREPARE`/`EXECUTE`,
 `RIGHT`/`FULL`/`CROSS JOIN`, `JOIN … USING`, `NATURAL JOIN`,
 `ROLLUP`/`CUBE`/`GROUPING SETS`, `WITH RECURSIVE`, a column list on a table
 alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
-`::regtype` and `to_regclass` all run now and are no longer gaps. What is still missing:
+`::regtype` (a name, a name with a modifier, an oid written as a number, an
+enum's or a domain's name; 42704 for a name no type has), `to_regclass`,
+`CREATE TABLE … AS` over a `SELECT`, `TABLE`, `VALUES` or a parenthesised
+query, `pg_get_viewdef`, and a set operation whose branches are in
+parentheses (with correlated subqueries or `EXISTS` in them, as a group
+`(a UNION b) INTERSECT c`, as a CTE's body, a derived table or an `INSERT`'s
+source) all run now and are no longer gaps. What is still missing:
 
 - **Types**: `CREATE TYPE` for composites and ranges (enums work, see
   "Enum types" above), multirange types (`int4multirange`), multidimensional
@@ -1442,12 +1448,20 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
   PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
   PostgreSQL): a sequence's name is not known to the text pass that reads
-  the cast.
+  the cast. `::regtype` over a column or an expression (`atttypid::regtype`)
+  is not supported, only over a literal; `format_type(atttypid, atttypmod)`
+  answers the same name.
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: a row compared with a correlated subquery (`(a, b) IN (SELECT …
-  WHERE u.k = t.k)`; an uncorrelated one works), an outer column
+- **Queries**: a correlated subquery after `IN` (`a IN (SELECT u.a FROM u
+  WHERE u.k = t.k)`, refused with "missing FROM-clause entry"; write it as
+  `EXISTS`, and an uncorrelated one works), the same with a row (`(a, b) IN
+  (SELECT … WHERE u.k = t.k)`), a parenthesised set operation as a value
+  (`IN ((SELECT 1) UNION (SELECT 2))`, `EXISTS ((SELECT …) EXCEPT (SELECT
+  …))`; without the inner parentheses it works), a `UNION` of a `NUMERIC`
+  column with a branch that has no `FROM` (`… EXCEPT SELECT 3, NULL::numeric`,
+  refused, 0A000), an outer column
   named bare where the subquery's relations are not all known (a CTE, a
   function in `FROM`, `SELECT *` in a derived table) or two outer relations
   have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on
@@ -1456,7 +1470,10 @@ alias (`FROM t AS x(a, b)`), `^@`, `OVERLAPS`, a literal's `::regclass` /
   the `SEARCH`/`CYCLE` clauses of a recursive CTE, `FOR UPDATE`
   on a table with no unique column, and a `WINDOW` clause inside a subquery
   (the outermost one works).
-- **Functions**: the ordered-set aggregates (`percentile_cont`,
+- **Functions**: `pg_get_viewdef` answers the view's query as it was
+  written (what `pg_views.definition` shows), where PostgreSQL prints its own
+  layout of it, one select item to a line; the pretty flag and the wrap
+  column change nothing. The ordered-set aggregates (`percentile_cont`,
   `percentile_disc`, `mode`), `json_object_agg`/`jsonb_object_agg`,
   `regexp_matches` and `regexp_split_to_table` in a select list, the
   `jsonb_path_*` functions, `row_to_json`, `to_number`, `date_bin`, the XML

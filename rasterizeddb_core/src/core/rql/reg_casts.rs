@@ -114,15 +114,71 @@ fn enclosing_call(sql: &str, at: usize) -> Option<&str> {
 /// `sql` with its literal `regclass` / `regtype` casts and `to_regclass`
 /// calls written as the engine reads them; `None` when it has none.
 /// `relation_exists` answers for `to_regclass`.
-pub(crate) fn rewrite(sql: &str, relation_exists: &dyn Fn(&str) -> bool) -> Option<String> {
+pub(crate) fn rewrite(
+    sql: &str,
+    relation_exists: &dyn Fn(&str) -> bool,
+    user_type: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, (&'static str, String)> {
     let lower = sql.to_ascii_lowercase();
     if !lower.contains("reg") {
-        return None;
+        return Ok(None);
     }
     let head = lower.trim_start();
     if ["create", "alter", "comment", "drop"].iter().any(|k| head.starts_with(k)) {
+        return Ok(None);
+    }
+    // `23::regtype`: an oid written as a number, read as the quoted form
+    // below reads it. It was "cast to 'regtype' is not supported yet".
+    let numbered = quote_numeric_operands(sql);
+    let rewritten = rewrite_literals(numbered.as_deref().unwrap_or(sql), relation_exists, user_type)?;
+    Ok(rewritten.or(numbered))
+}
+
+/// `sql` with each bare integer cast to `regtype` or `regclass` quoted
+/// (`23::regtype` as `'23'::regtype`), `None` when it has none.
+fn quote_numeric_operands(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let (mut copied, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(end) = skip_quoted(bytes, i).or_else(|| skip_comment(bytes, i)) {
+            i = end.max(i + 1);
+            continue;
+        }
+        let starts = bytes[i].is_ascii_digit() && (i == 0 || !(is_identifier_byte(bytes[i - 1]) || bytes[i - 1] == b'.'));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let end = i + bytes[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let names_reg = |c: &str| ["regtype", "regclass"].iter().any(|word| crate::core::sql_scan::starts_with_keyword(c, word));
+        let after = sql[end..].trim_start();
+        // `23::regtype`, or `CAST(23 AS regtype)`.
+        let reg = after.strip_prefix("::").map(str::trim_start).is_some_and(names_reg)
+            || (crate::core::sql_scan::starts_with_keyword(after, "AS")
+                && names_reg(after[2..].trim_start())
+                && sql[..i].trim_end().strip_suffix('(').is_some_and(|head| strip_word(head, "CAST").is_some()));
+        if reg {
+            out.push_str(&sql[copied..i]);
+            out.push('\'');
+            out.push_str(&sql[i..end]);
+            out.push('\'');
+            copied = end;
+        }
+        i = end.max(i + 1);
+    }
+    if copied == 0 {
         return None;
     }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+fn rewrite_literals(
+    sql: &str,
+    relation_exists: &dyn Fn(&str) -> bool,
+    user_type: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, (&'static str, String)> {
     let bytes = sql.as_bytes();
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0;
@@ -216,14 +272,21 @@ pub(crate) fn rewrite(sql: &str, relation_exists: &dyn Fn(&str) -> bool) -> Opti
                 Ok(n) => n,
                 Err(_) => crate::core::rql::catalog_model::type_oid_by_name(&text),
             };
-            if oid == 0 {
-                continue;
+            // An enum or a domain: its own name, or the oid it is listed
+            // under. `user_type` answers for every name the database has
+            // had, so a dropped type still reads as one here.
+            let named = relation_name(&text).filter(|name| oid == 0 && user_type(name));
+            // A name no type has: PostgreSQL's 42704. Left as written, it
+            // was "cast to 'regtype' is not supported yet", naming the cast.
+            if oid == 0 && named.is_none() {
+                return Err(("42704", format!("type \"{}\" does not exist", text.trim())));
             }
-            if shown {
-                match crate::core::rql::catalog_model::format_type(oid, None) {
-                    Some(name) => sql_literal(&name),
-                    None => continue,
-                }
+            if let Some(name) = named {
+                if shown { sql_literal(&regclass_text(&name)) } else { crate::core::rql::user_types::oid_of(&name).to_string() }
+            } else if shown {
+                // An oid no type has is shown as the number, as PostgreSQL
+                // shows it.
+                sql_literal(&crate::core::rql::catalog_model::format_type(oid, None).unwrap_or_else(|| oid.to_string()))
             } else {
                 oid.to_string()
             }
@@ -238,20 +301,20 @@ pub(crate) fn rewrite(sql: &str, relation_exists: &dyn Fn(&str) -> bool) -> Opti
         i = end;
     }
     if edits.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut out = String::with_capacity(sql.len());
     let mut copied = 0;
     for (start, end, text) in edits {
         if start < copied {
-            return None;
+            return Ok(None);
         }
         out.push_str(&sql[copied..start]);
         out.push_str(&text);
         copied = end;
     }
     out.push_str(&sql[copied..]);
-    Some(out)
+    Ok(Some(out))
 }
 
 /// `pg_partition_tree('t'::regclass)` in a FROM list, as the rows it
@@ -440,8 +503,30 @@ fn cast_call(sql: &str, lit_start: usize, lit_end: usize) -> Option<(String, usi
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_number_a_modifier_and_an_enum_are_read_and_an_unknown_name_refused() {
+        assert_eq!(r("SELECT 23::regtype").as_deref(), Some("SELECT 'integer' AS regtype"));
+        assert_eq!(r("SELECT 1082::regtype::text, 16 :: regtype::oid").as_deref(), Some("SELECT 'date' AS text, 16 AS oid"));
+        assert_eq!(r("SELECT CAST(20 AS regtype)").as_deref(), Some("SELECT 'bigint' AS regtype"));
+        assert_eq!(r("SELECT 'numeric(10,2)'::regtype").as_deref(), Some("SELECT 'numeric' AS regtype"));
+        assert_eq!(
+            r("SELECT 'timestamp(3) with time zone'::regtype").as_deref(),
+            Some("SELECT 'timestamp with time zone' AS regtype")
+        );
+        // An oid no type has is shown as the number.
+        assert_eq!(r("SELECT 99999::regtype").as_deref(), Some("SELECT '99999' AS regtype"));
+        // An enum: its name shown, its own oid compared.
+        assert_eq!(r("SELECT 'mood'::regtype").as_deref(), Some("SELECT 'mood' AS regtype"));
+        let oid = crate::core::rql::user_types::oid_of("mood");
+        assert_eq!(r("SELECT 1 WHERE t = 'public.mood'::regtype").as_deref(), Some(format!("SELECT 1 WHERE t = {oid}").as_str()));
+        // Numbers that are not cast to one of the two are left alone.
+        assert_eq!(r("SELECT 23::int, x1::regtype, 1.5::regtype, '23::regtype' FROM regs"), None);
+        let refused = rewrite("SELECT 'nosuchtype'::regtype", &|_| true, &|_| false);
+        assert_eq!(refused, Err(("42704", "type \"nosuchtype\" does not exist".to_string())));
+    }
+
     fn r(sql: &str) -> Option<String> {
-        rewrite(sql, &|name| name == "items" || name == "Items")
+        rewrite(sql, &|name| name == "items" || name == "Items", &|name| name == "mood").unwrap()
     }
 
     #[test]
@@ -482,7 +567,7 @@ mod pg_typeof_tests {
     /// answers; anywhere else compared, the oid it was.
     #[test]
     fn a_regtype_beside_pg_typeof_is_the_type_name() {
-        let r = |sql: &str| rewrite(sql, &|_| true).unwrap_or_else(|| sql.to_string());
+        let r = |sql: &str| rewrite(sql, &|_| true, &|_| false).unwrap().unwrap_or_else(|| sql.to_string());
         assert_eq!(r("SELECT 1 WHERE pg_typeof(d) = 'date'::regtype"), "SELECT 1 WHERE pg_typeof(d) = 'date'");
         assert_eq!(r("SELECT 1 WHERE 'int4'::regtype <> PG_TYPEOF (n + (1))"), "SELECT 1 WHERE 'integer' <> PG_TYPEOF (n + (1))");
         assert_eq!(
