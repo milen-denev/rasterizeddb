@@ -84,6 +84,12 @@ pub struct StatementCancel {
     /// The end of the statement's wire reply, held until its lock owner has
     /// released (pgwire's `ReplyHold`); `None` when nothing is held back.
     held_reply: Option<parking_lot::Mutex<HeldReply>>,
+    /// The statement's notices, for a native client that asked for them
+    /// ([`Self::collecting_notices`]); `None` when nobody will read them.
+    /// Carried here for the reason `held_reply` is: the signal is already
+    /// scoped to exactly the statement, and a scope of its own would wrap
+    /// (and copy) the statement's future once more.
+    notices: Option<parking_lot::Mutex<Vec<crate::core::notice::Notice>>>,
 }
 
 /// Wire bytes a statement's reply ends with, kept back until the statement's
@@ -120,7 +126,37 @@ impl StatementCancel {
             ask_gone_from: None,
             lock_timeout_ms: 0,
             held_reply: None,
+            notices: None,
         }
+    }
+
+    /// Keeps the notices the statement raises outside any notice scope
+    /// (`core::notice::push`), for [`Self::take_notices`].
+    pub fn collecting_notices(mut self) -> Self {
+        self.notices = Some(parking_lot::Mutex::new(Vec::new()));
+        self
+    }
+
+    /// Keeps `notice` if this signal collects notices; gives it back if not.
+    pub(crate) fn keep_notice(
+        &self,
+        notice: crate::core::notice::Notice,
+    ) -> Result<(), crate::core::notice::Notice> {
+        match &self.notices {
+            Some(kept) => {
+                kept.lock().push(notice);
+                Ok(())
+            }
+            None => Err(notice),
+        }
+    }
+
+    /// The notices kept so far, in the order they were raised.
+    pub fn take_notices(&self) -> Vec<crate::core::notice::Notice> {
+        self.notices
+            .as_ref()
+            .map(|kept| std::mem::take(&mut *kept.lock()))
+            .unwrap_or_default()
     }
 
     /// Holds back the end of this statement's reply (see [`HeldReply`]).

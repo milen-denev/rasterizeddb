@@ -103,3 +103,6 @@ let (id, hits): (i64, i64) = client
 [`is_unique_violation`](crate::Error::is_unique_violation) and
 [`is_no_rows`](crate::Error::is_no_rows) answer the two questions code most
 often asks of an error.
+[`is_statement_timeout`](crate::Error::is_statement_timeout) is a
+statement the server stopped at its statement timeout (`57014`); nothing of
+it took effect, and the connection goes on.

@@ -125,6 +125,8 @@ pub struct TcpServerBuilder {
     session_cache_size: usize,
     handshake_timeout: Duration,
     request_timeout: Duration,
+    /// `None`: the request timeout. See [`TcpServerBuilder::handler_timeout`].
+    handler_timeout: Option<Option<Duration>>,
     max_message_size: usize,
     max_in_flight: usize,
     inline_handlers: bool,
@@ -166,6 +168,9 @@ pub struct TcpServer {
     connection_backoff_ms: u64,
     handshake_timeout: Duration,
     request_timeout: Duration,
+    /// How long a handler may run before the server stops waiting for it;
+    /// `None` waits as long as it takes.
+    handler_timeout: Option<Duration>,
     max_message_size: usize,
     max_in_flight: usize,
     inline_handlers: bool,
@@ -191,6 +196,7 @@ impl TcpServerBuilder {
             session_cache_size: 1024,         // Increased from 128
             handshake_timeout: Duration::from_secs(10),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            handler_timeout: None,
             max_message_size: crate::common::DEFAULT_MAX_MESSAGE_SIZE,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             inline_handlers: false,
@@ -365,8 +371,33 @@ impl TcpServerBuilder {
         self
     }
 
+    /// How long a connection may sit idle before it is closed, and, unless
+    /// [`TcpServerBuilder::handler_timeout`] says otherwise, how long a
+    /// handler may run. Default 30 s.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// How long one handler may run before the server stops waiting for it.
+    /// Unset, it is the request timeout; `None` waits for every handler
+    /// however long it runs.
+    ///
+    /// What happens at the limit depends on the protocol. A multiplexed
+    /// (`rastcp/2`) request is answered as timed out and its handler is
+    /// dropped; the connection goes on. A plain (`rastcp/1`) frame has no
+    /// tag to say "timed out" with, so the handler is dropped and the
+    /// connection closed: whatever the connection held (a transaction, a
+    /// session) goes with it.
+    ///
+    /// A handler that bounds itself (a database that stops a statement at
+    /// its own deadline and answers with an error) wants `None`: its answer
+    /// is then always the one the caller gets, and its connection outlives a
+    /// slow statement. Dropping a handler where it waits also skips whatever
+    /// it would have put back on the way out. The idle limit stays the
+    /// request timeout either way.
+    pub fn handler_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.handler_timeout = Some(timeout);
         self
     }
 
@@ -447,7 +478,7 @@ impl TcpServerBuilder {
     ///
     /// The cost is bounded by one stretch of computing: a frame that arrives
     /// while the connection's request is computing between two waits is read
-    /// when that stretch ends. A request driven this way keeps the request
+    /// when that stretch ends. A request driven this way keeps the handler
     /// timeout, and one that panics is answered as failed, as a task's is.
     /// Ignored with [`Self::inline_handlers`], which polls every handler
     /// first.
@@ -524,6 +555,7 @@ impl TcpServerBuilder {
                 connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
                 handshake_timeout: self.handshake_timeout,
                 request_timeout: self.request_timeout,
+                handler_timeout: self.handler_timeout.unwrap_or(Some(self.request_timeout)),
                 max_message_size: self.max_message_size,
                 max_in_flight: self.max_in_flight,
                 inline_handlers: self.inline_handlers,
@@ -608,6 +640,7 @@ impl TcpServerBuilder {
             connection_backoff_ms: self.connection_backoff_ms.unwrap_or(100),
             handshake_timeout: self.handshake_timeout,
             request_timeout: self.request_timeout,
+            handler_timeout: self.handler_timeout.unwrap_or(Some(self.request_timeout)),
             max_message_size: self.max_message_size,
             max_in_flight: self.max_in_flight,
             inline_handlers: self.inline_handlers,
@@ -697,6 +730,18 @@ impl TcpServer {
     /// What the other nodes pin. Printed at start-up so setting a cluster up
     /// does not need a detour through `openssl`. `None` for a server on a unix
     /// socket, which presents no certificate.
+    /// How long a connection may sit idle before it is closed
+    /// ([`TcpServerBuilder::request_timeout`]).
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// How long a handler may run before the server stops waiting for it
+    /// ([`TcpServerBuilder::handler_timeout`]); `None` is no limit.
+    pub fn handler_timeout(&self) -> Option<Duration> {
+        self.handler_timeout
+    }
+
     pub fn certificate_fingerprint(&self) -> Option<Fingerprint> {
         self.certificate_fingerprint
     }
@@ -909,6 +954,7 @@ impl TcpServer {
         let handshake_timeout = self.handshake_timeout;
         let auth_timeout = self.auth_timeout;
         let request_timeout = self.request_timeout;
+        let handler_timeout = self.handler_timeout;
         let max_message_size = self.max_message_size;
         let max_in_flight = self.max_in_flight;
         let inline_handlers = self.inline_handlers;
@@ -928,6 +974,7 @@ impl TcpServer {
                     handshake_timeout,
                     auth_timeout,
                     request_timeout,
+                    handler_timeout,
                     max_message_size,
                     max_in_flight,
                     inline_handlers,
@@ -1029,8 +1076,9 @@ impl TcpServer {
     /// the session's `Drop` does (rolling back a transaction, say) happens
     /// after the last of them and never under one. On `rastcp/1` the handler
     /// runs on the connection's own task, so the session goes when that
-    /// request is done. A handler that runs past the request timeout on
-    /// `rastcp/1` is dropped where it stands, and the session with it.
+    /// request is done. A handler that runs past the handler timeout on
+    /// `rastcp/1` is dropped where it stands, and the session with it (see
+    /// [`TcpServerBuilder::handler_timeout`]).
     pub async fn run_with_session<A, S, O, F, Fut>(
         &self,
         context: A,
@@ -1157,6 +1205,8 @@ impl TcpServer {
         peer_addr: Peer,
         handler: &H,
         max_message_size: usize,
+        // The handler timeout, and whether it is the guard's own period.
+        handler_timeout: Option<(Duration, bool)>,
     ) where
         H: Fn(Vec<u8>) -> Fut + Send + Sync,
         Fut: Future<Output = Vec<u8>> + Send,
@@ -1218,9 +1268,18 @@ impl TcpServer {
                             break 'connection;
                         }
 
-                        match guard.run(call, false).await {
-                            Ok(response) => response,
-                            Err(_) => {
+                        // A plain frame has no way to say "timed out", so a
+                        // handler past its limit costs the connection. A
+                        // server with no handler timeout waits for the
+                        // answer instead, whatever it is.
+                        let finished = match handler_timeout {
+                            Some((_, true)) => guard.run(call, false).await.ok(),
+                            Some((limit, false)) => tokio::time::timeout(limit, call).await.ok(),
+                            None => guard.run_unbounded(call, false).await,
+                        };
+                        match finished {
+                            Some(response) => response,
+                            None => {
                                 error!("Handler timed out for {}", peer_addr);
                                 break 'connection;
                             }
@@ -1323,7 +1382,7 @@ impl TcpServer {
                 Ok(std::task::Poll::Pending) => {}
                 Ok(std::task::Poll::Ready(answer)) => {
                     *local = None;
-                    return std::task::Poll::Ready(Event::Local(id, Some(answer.ok())));
+                    return std::task::Poll::Ready(Event::Local(id, Some(answer)));
                 }
                 Err(_) => {
                     *local = None;
@@ -1361,7 +1420,7 @@ impl TcpServer {
         peer_addr: Peer,
         handler: &H,
         max_message_size: usize,
-        request_timeout: Duration,
+        handler_timeout: Option<Duration>,
         max_in_flight: usize,
         inline_handlers: bool,
         drive_alone: bool,
@@ -1450,7 +1509,7 @@ impl TcpServer {
                         // Another request: the one this task was driving
                         // is no longer alone, and goes to the runtime.
                         if let Some(Local { id, call }) = local.0.take() {
-                            let task = in_flight.spawn(async move { (id, call.await.ok()) });
+                            let task = in_flight.spawn(async move { (id, call.await) });
                             ids.insert(task.id(), id);
                         }
                         if drive_alone && in_flight.is_empty() && !reader.has_buffered() {
@@ -1462,7 +1521,7 @@ impl TcpServer {
                                 call: {
                                     let erased: std::pin::Pin<Box<dyn Future<Output = Vec<u8>> + Send>> =
                                         Box::pin(handler(data));
-                                    Box::pin(tokio::time::timeout(request_timeout, erased))
+                                    Box::pin(within_limit(handler_timeout, erased))
                                 },
                             });
                             Ok(())
@@ -1475,7 +1534,7 @@ impl TcpServer {
                             // on the connection it would be copied on its way
                             // into the task.
                             let call = Box::pin(handler(data));
-                            (id, tokio::time::timeout(request_timeout, call).await.ok())
+                            (id, within_limit(handler_timeout, call).await)
                         });
                         ids.insert(task.id(), id);
                         Ok(())
@@ -1516,7 +1575,7 @@ impl TcpServer {
                                         Some(call) => call.poll(cx),
                                         None => std::task::Poll::Pending,
                                     });
-                                    (id, tokio::time::timeout(request_timeout, run).await.ok())
+                                    (id, within_limit(handler_timeout, run).await)
                                 });
                                 ids.insert(task.id(), id);
                                 Ok(())
@@ -1695,6 +1754,7 @@ impl TcpServer {
         handshake_timeout: Duration,
         auth_timeout: Duration,
         request_timeout: Duration,
+        handler_timeout: Option<Duration>,
         max_message_size: usize,
         max_in_flight: usize,
         inline_handlers: bool,
@@ -1760,7 +1820,7 @@ impl TcpServer {
                 peer_addr,
                 &handler,
                 max_message_size,
-                request_timeout,
+                handler_timeout,
                 max_in_flight,
                 inline_handlers,
                 drive_alone,
@@ -1773,6 +1833,7 @@ impl TcpServer {
                 peer_addr,
                 &handler,
                 max_message_size,
+                handler_timeout.map(|limit| (limit, limit == request_timeout)),
             )
             .await;
         }
@@ -1861,7 +1922,7 @@ enum Event {
 }
 
 /// The one request a multiplexed connection drives on its own task
-/// ([`TcpServerBuilder::drive_alone`]), under the request timeout. Boxed, so
+/// ([`TcpServerBuilder::drive_alone`]), under the handler timeout. Boxed, so
 /// it moves to a task of its own without being copied.
 ///
 /// Held as a trait object rather than as `Fut`: the connection's own future
@@ -1873,9 +1934,16 @@ struct Local {
     call: LocalCall,
 }
 
-type LocalCall = std::pin::Pin<
-    Box<dyn Future<Output = Result<Vec<u8>, tokio::time::error::Elapsed>> + Send + 'static>,
->;
+type LocalCall = std::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'static>>;
+
+/// `call`'s answer, or `None` when it ran past `limit`. No limit waits for
+/// the answer, and costs no timer.
+async fn within_limit<F: Future>(limit: Option<Duration>, call: F) -> Option<F::Output> {
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, call).await.ok(),
+        None => Some(call.await),
+    }
+}
 
 /// Where a connection keeps its [`Local`] request. Dropped with one still in
 /// it (a lost peer, an error, a panic of the connection's task), it lets the

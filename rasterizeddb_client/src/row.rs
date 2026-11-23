@@ -93,9 +93,22 @@ pub struct Rows {
     /// Per row: where its cells start in `cells`, and how many it has.
     rows: Vec<(usize, usize)>,
     affected: Option<u64>,
+    /// What the server said about the statement besides its answer.
+    notices: Vec<crate::Notice>,
 }
 
 impl Rows {
+    /// The notices the statement raised, in order: `RAISE NOTICE` in a `DO`
+    /// block, `DROP TABLE IF EXISTS` naming no table, a warning. Empty from
+    /// a server that predates notices. See [`crate::notice`].
+    pub fn notices(&self) -> &[crate::Notice] {
+        &self.notices
+    }
+
+    pub(crate) fn set_notices(&mut self, notices: Vec<crate::Notice>) {
+        self.notices = notices;
+    }
+
     pub(crate) fn affected(count: Option<u64>) -> Self {
         Rows {
             affected: count,
@@ -154,6 +167,7 @@ impl Rows {
             cells,
             rows,
             affected: None,
+            notices: Vec::new(),
         })
     }
 

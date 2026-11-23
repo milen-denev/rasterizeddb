@@ -180,10 +180,13 @@ pub struct NativeListen {
     /// A unix socket served alongside the TCP address, for clients on the
     /// same machine. `None` serves TCP only.
     pub socket: Option<NativeSocket>,
-    /// How long one request may run before it is abandoned and answered as
-    /// timed out, on both the TCP address and the socket; a connection idle
-    /// this long is also closed. `None` is rastcp's default, 30 s.
-    /// `--rdb-request-timeout`.
+    /// How long one statement may run before it is stopped and answered
+    /// with an error (SQLSTATE 57014, as PostgreSQL's `statement_timeout`),
+    /// on both the TCP address and the socket; the connection, and a
+    /// transaction block on it, survive (the block is failed, as a failed
+    /// statement fails it). A connection idle this long is closed. `None`
+    /// is rastcp's default, 30 s. Inside a block, `SET statement_timeout`
+    /// replaces it for the rest of the block. `--rdb-request-timeout`.
     pub request_timeout: Option<std::time::Duration>,
     /// The TCP listener's certificate chain and private key, as PEM file
     /// paths (`--rdb-cert`, `--rdb-key`). `None` makes a self-signed
@@ -293,7 +296,11 @@ async fn bind_native_listener(
     let mut last_error = None;
 
     for attempt in 1..=BIND_ATTEMPTS {
-        let mut builder = TcpServerBuilder::new(&listen.addr, listen.port);
+        // The listener waits for every answer: a statement bounds itself
+        // (`NativeContext::statement_timeout`) and answers 57014, where a
+        // rastcp timeout would drop it mid-way and, on a `rastcp/1`
+        // connection, close the connection and roll back its block.
+        let mut builder = TcpServerBuilder::new(&listen.addr, listen.port).handler_timeout(None);
         if let Some(timeout) = listen.request_timeout {
             builder = builder.request_timeout(timeout);
         }
@@ -4662,7 +4669,10 @@ impl Database {
             }
         }
 
-        let mut builder = TcpServerBuilder::unix(&socket.path).unix_mode(socket.mode);
+        // As `bind_native_listener`'s: statements bound themselves.
+        let mut builder = TcpServerBuilder::unix(&socket.path)
+            .unix_mode(socket.mode)
+            .handler_timeout(None);
         if let Some(timeout) = request_timeout {
             builder = builder.request_timeout(timeout);
         }
@@ -4877,10 +4887,20 @@ impl Database {
             None
         };
 
+        // The listeners' request timeout, as each was built with it: what a
+        // statement may run for (`NativeContext::statement_timeout`).
+        let statement_timeout = Some(
+            server
+                .as_ref()
+                .map(|s| s.request_timeout())
+                .or_else(|| socket_server.as_ref().map(|(s, _)| s.request_timeout()))
+                .unwrap_or(std::time::Duration::from_secs(30)),
+        );
         let context = NativeContext {
             database,
             authentication_required,
             catalog,
+            statement_timeout,
         };
 
         let socket = socket_server.map(|(socket_server, socket_requires_auth)| {
@@ -4894,6 +4914,7 @@ impl Database {
                 database: context.database.clone(),
                 authentication_required: socket_requires_auth,
                 catalog: context.catalog.clone(),
+                statement_timeout: context.statement_timeout,
             };
             (socket_server, socket_context)
         });
@@ -6181,6 +6202,13 @@ pub(crate) struct NativeContext {
     /// ([`crate::pgwire::NativeSession::attach`]); `None` for a listener
     /// serving a database of its own.
     catalog: Option<Arc<catalog::DatabaseCatalog>>,
+    /// How long one statement may run before it is stopped and answered
+    /// with an error (57014, as PostgreSQL's `statement_timeout`): the
+    /// listener's request timeout. The listener itself waits for every
+    /// answer (`handler_timeout(None)`), so a slow statement costs its
+    /// caller an error, never the connection and the block it holds.
+    /// `None` is no limit.
+    statement_timeout: Option<std::time::Duration>,
 }
 
 /// Encodes an error the way the executor does, so a caller needs no special
@@ -6200,6 +6228,13 @@ fn error_response(message: &str) -> Vec<u8> {
 ///
 /// For embedding and tests that build their own [`TcpServer`] (a
 /// listener of their choosing, a shorter request timeout).
+///
+/// A statement is stopped at the server's request timeout and answered
+/// with an error (SQLSTATE 57014). Build `server` with
+/// `handler_timeout(None)`, as the server's own listeners are, so that its
+/// connections survive such a statement: with the default, rastcp gives up
+/// on a request at that same moment, and on a `rastcp/1` connection that
+/// closes the connection and rolls back the block on it.
 pub async fn serve_native(
     server: &TcpServer,
     database: Arc<Database>,
@@ -6209,6 +6244,7 @@ pub async fn serve_native(
         database,
         authentication_required,
         catalog: None,
+        statement_timeout: Some(server.request_timeout()),
     };
     server
         .run_with_session(context, open_native_session, serve_native_request)
@@ -6260,6 +6296,9 @@ pub(crate) struct NativeConnection {
     principal: StdArc<rastcp::session::Principal>,
     multiplexed: bool,
     session: std::sync::OnceLock<crate::pgwire::NativeSession>,
+    /// The connection asked for notices
+    /// ([`crate::pgwire::NATIVE_NOTICES_PREFIX`]): its answers carry them.
+    notices: std::sync::atomic::AtomicBool,
 }
 
 impl NativeConnection {
@@ -6364,6 +6403,7 @@ fn open_native_session(
         principal: principal.clone(),
         multiplexed: connection.multiplexed,
         session: std::sync::OnceLock::new(),
+        notices: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
@@ -6392,7 +6432,8 @@ fn native_session_in(
         principal.superuser,
         context.authentication_required,
         multiplexed,
-    );
+    )
+    .with_statement_timeout(context.statement_timeout);
     match &context.catalog {
         Some(catalog) => session.attach(catalog),
         None => session,
@@ -6410,6 +6451,22 @@ async fn serve_native_request(
     if let Some(name) = request_vec.strip_prefix(crate::pgwire::NATIVE_DATABASE_PREFIX) {
         return connection.select(name);
     }
+    // Ahead of the session, as the database selection is: a setup request,
+    // which must not make the session in the default database before a
+    // selection does.
+    if let Some(rest) = request_vec.strip_prefix(crate::pgwire::NATIVE_NOTICES_PREFIX) {
+        if !rest.is_empty() {
+            return crate::pgwire::native_simple_error(
+                "08P01",
+                "a notices request carries nothing after its ';'",
+                b'I',
+            );
+        }
+        connection
+            .notices
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        return crate::pgwire::native_simple_complete("SET");
+    }
     let session = match connection.session_in(connection.login_database()) {
         Ok(session) => session,
         Err((_, message)) => return error_response(&message),
@@ -6423,7 +6480,10 @@ async fn serve_native_request(
             ..context
         }
     };
-    process_native_request(context, principal, Some(session), request_vec).await
+    // A connection that asked for notices has them carried with each
+    // answer; any other is answered exactly as before.
+    let notices = connection.notices.load(std::sync::atomic::Ordering::Relaxed);
+    process_native_request_for(context, principal, Some(session), request_vec, notices).await
 }
 
 /// One request with no connection session: transaction control is refused.
@@ -6437,11 +6497,26 @@ pub(crate) async fn process_incoming_queries(
     process_native_request(context, principal, None, request_vec).await
 }
 
+/// [`process_native_request_for`] for a connection that did not ask for
+/// notices, as the statement tests drive it.
+#[cfg(test)]
 async fn process_native_request(
     context: NativeContext,
     principal: StdArc<rastcp::session::Principal>,
     session: Option<&crate::pgwire::NativeSession>,
     request_vec: Vec<u8>,
+) -> Vec<u8> {
+    process_native_request_for(context, principal, session, request_vec, false).await
+}
+
+/// One request of a connection, with its statement's notices carried in
+/// front of the answer when the connection asked for them (`notices`).
+async fn process_native_request_for(
+    context: NativeContext,
+    principal: StdArc<rastcp::session::Principal>,
+    session: Option<&crate::pgwire::NativeSession>,
+    request_vec: Vec<u8>,
+    notices: bool,
 ) -> Vec<u8> {
     // Counted as running until it is answered, as pgwire counts its own
     // (`execute_recorded`): the idle trimmer trims after a quiet tick that
@@ -6521,7 +6596,8 @@ async fn process_native_request(
         && session.takes(&query)
     {
         debug!("Native transaction statement from {}", principal);
-        return Box::pin(session.run(&query)).await;
+        let run = Box::pin(session.run(&query));
+        return if notices { crate::pgwire::native_with_notices(run).await } else { run.await };
     }
 
     // Role management is answered by the auth module rather than the RQL
@@ -6619,12 +6695,15 @@ async fn process_native_request(
     if let Some(session) = session
         && session.needs_session_path(&query).await
     {
-        return Box::pin(session.run_alone(&query)).await;
+        let run = Box::pin(session.run_alone(&query));
+        return if notices { crate::pgwire::native_with_notices(run).await } else { run.await };
     }
+
+    let statement_timeout = context.statement_timeout;
 
     #[cfg(not(feature = "query_stats"))]
     {
-        run_native_query_in(&query, context.database, session, exec_template).await
+        run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await
     }
 
     // Recorded for `SHOW QUERIES` the same way a statement arriving over the
@@ -6633,11 +6712,13 @@ async fn process_native_request(
     #[cfg(feature = "query_stats")]
     {
         let Some(recording) = crate::core::query_stats::begin() else {
-            return run_native_query_in(&query, context.database, session, exec_template).await;
+            return run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices)
+                .await;
         };
         let database_name = context.database.name.clone();
         let response = crate::core::query_stats::observe(recording.probe(), async {
-            let response = run_native_query_in(&query, context.database, session, exec_template).await;
+            let response =
+                run_native_query_in(&query, context.database, session, exec_template, statement_timeout, notices).await;
             // Counted inside the scope: outside it the statement's counters are
             // no longer the ones this task can reach.
             crate::core::query_stats::note_rows(rows_of(&response));
@@ -6657,6 +6738,44 @@ async fn process_native_request(
         );
         response
     }
+}
+
+/// The signal one autocommit statement runs under: the listener's statement
+/// timeout as its deadline, as pgwire's `execute_recorded` builds one from
+/// `statement_timeout`. The scan and the waits a statement makes check it,
+/// and a statement past its deadline stops and fails with 57014, its
+/// cleanup done on the way out as for any error ([`timed_out_answer`]).
+///
+/// With `notices`, it also keeps the notices the statement raises
+/// (`StatementCancel::collecting_notices`), for a connection that asked for
+/// them: no scope of their own is opened around the statement.
+fn statement_signal(
+    timeout: Option<std::time::Duration>,
+    notices: bool,
+) -> StdArc<crate::core::cancel::StatementCancel> {
+    let signal = crate::core::cancel::StatementCancel::new(
+        timeout.map(|t| std::time::Instant::now() + t),
+    );
+    StdArc::new(if notices { signal.collecting_notices() } else { signal })
+}
+
+/// `response` saying it was stopped at the statement timeout, with the
+/// SQLSTATE a native error otherwise lacks, when it was.
+fn timed_out_answer(
+    mut response: Vec<u8>,
+    signal: &crate::core::cancel::StatementCancel,
+) -> Vec<u8> {
+    if response.first() == Some(&3)
+        && signal.tripped() == Some(crate::core::cancel::CancelReason::Timeout)
+        && !response.ends_with(b")")
+        && crate::core::sql_scan::contains_ignore_ascii_case(
+            std::str::from_utf8(&response[1..]).unwrap_or(""),
+            b"statement timeout",
+        )
+    {
+        response.extend_from_slice(b" (SQLSTATE 57014)");
+    }
+    response
 }
 
 /// `rdb_index_checkpoint(name)` over the native protocol: one row, one
@@ -6720,14 +6839,29 @@ async fn run_native_query_in(
     database: Arc<Database>,
     session: Option<&crate::pgwire::NativeSession>,
     template: Option<crate::pgwire::NativeTemplate>,
+    statement_timeout: Option<std::time::Duration>,
+    notices: bool,
 ) -> Vec<u8> {
     let response = match session {
         Some(session) => {
-            crate::core::rql::sequence::session::scoped(
+            // The signal scopes the statement's boxed future, not a copy of
+            // it: moved into a scope by value, the statement's future (tens
+            // of kilobytes) was copied on every request.
+            let signal = statement_signal(statement_timeout, notices);
+            let response = crate::core::rql::sequence::session::scoped(
                 session.sequence_scope(),
-                Box::pin(run_native_query_learning(query, database.clone(), session, template)),
+                crate::core::cancel::STATEMENT_CANCEL.scope(
+                    signal.clone(),
+                    Box::pin(run_native_query_learning(query, database.clone(), session, template)),
+                ),
             )
-            .await
+            .await;
+            let response = timed_out_answer(response, &signal);
+            if notices {
+                crate::pgwire::native_engine_notices_answer(response, signal.take_notices())
+            } else {
+                response
+            }
         }
         None => run_native_query(query, database.clone()).await,
     };

@@ -101,8 +101,9 @@ pub(crate) use native_session::{
 };
 pub(crate) use native_session::{
     DATABASE_PREFIX as NATIVE_DATABASE_PREFIX, MARK as NATIVE_MARK,
-    answer_marked as native_answer_marked, simple_complete as native_simple_complete,
-    simple_error as native_simple_error,
+    NOTICES_PREFIX as NATIVE_NOTICES_PREFIX, answer_marked as native_answer_marked,
+    simple_complete as native_simple_complete, simple_error as native_simple_error,
+    engine_notices_answer as native_engine_notices_answer, with_notices as native_with_notices,
 };
 
 /// Start a minimal PostgreSQL wire-protocol server (pgwire).
@@ -11633,6 +11634,8 @@ fn deferred_drops(
             }
         } else if !if_exists {
             return Some(Err(("42P01", format!("table \"{name}\" does not exist"))));
+        } else {
+            crate::core::notice::push("NOTICE", "00000", format!("table \"{name}\" does not exist, skipping"));
         }
     }
     if !cascade {
@@ -15473,6 +15476,12 @@ async fn send_error_response_at<S>(stream: &mut S, sqlstate: &str, message: &str
 where
     S: AsyncWrite + Unpin,
 {
+    // Whatever the statement raised before it failed goes first, as
+    // PostgreSQL sends it (`RAISE NOTICE` then `RAISE EXCEPTION`): it was
+    // dropped with the statement's notices when no completion followed.
+    for notice in crate::core::notice::drain() {
+        send_engine_notice(stream, &notice).await?;
+    }
     // ErrorResponse fields: (type_byte, cstring)..., terminated by 0.
     // Minimal set: Severity (S), SQLSTATE (C), Message (M)
     let mut payload = Vec::new();
