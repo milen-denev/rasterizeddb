@@ -57,8 +57,8 @@ let db = Builder::open("./data")
 
 Three things to know:
 
-- **Hot keys change on the running engine.** `SET CONFIG wal.synchronous_commit = off` through any client works as it does on a server, and `SHOW CONFIG` lists every key with its value. The Builder only sets where a hot key starts.
-- **Startup keys are read once.** `SET CONFIG` on one (`server.*`, `index.*`, `wal.checkpoint_bytes`, `wal.prealloc_kb`, `cache.enabled`) saves it to `rasterizeddb.conf` in the database directory, and the next start on that directory applies it. A value given to the Builder wins over a saved one.
+- **Hot keys change on the running engine.** `SET CONFIG wal.synchronous_commit = off` through any client works as it does on a server, and `SHOW CONFIG` lists every key with its value. With a database directory the change is also saved to `rasterizeddb.conf` there, so the next start keeps it, except for `replication.*` and `vacuum.enabled`, which act on one database. The Builder only sets where a hot key starts, and is not saved; a key the Builder gives wins over a saved one.
+- **Startup keys are read once.** `SET CONFIG` on one (`server.*`, `index.*`, `wal.checkpoint_bytes`, `wal.prealloc_kb`, `cache.enabled`, `cache.size`) saves it to `rasterizeddb.conf` in the database directory, and the next start on that directory applies it. A value given to the Builder wins over a saved one.
 - **Settings belong to the process, not to one database.** Two embedded engines in one process share them. `start` fails if it is given a startup value that can no longer change because an engine in this process already runs with another.
 
 Memory the engine frees goes back to the operating system once it has been idle for a few seconds (`idle_trim`, on by default; glibc only).

@@ -1,11 +1,18 @@
-//! Startup settings saved for the next start: `rasterizeddb.conf` beside the
-//! databases (`--location`).
+//! Settings saved by `SET CONFIG`: `rasterizeddb.conf` beside the databases
+//! (`--location`), applied at every start.
 //!
 //! `SET CONFIG` on a key that is read once at start-up cannot change the
 //! running server, so it saves the value here instead, and the next start
-//! applies it. The file is `section.key = value` lines; `#` starts a comment.
-//! It is the server's, not a database's: one file however many databases
-//! the location holds.
+//! applies it. A hot key (one a running server changes) takes effect at once
+//! and is saved here too, so that a restart does not silently undo it. The
+//! keys that act on one database (`replication.*`, `vacuum.enabled`) are not
+//! saved. The file is `section.key = value` lines; `#` starts a comment. It
+//! is the server's, not a database's: one file however many databases the
+//! location holds.
+//!
+//! A file that does not parse never keeps the server from starting: it
+//! starts with none of it applied, and `SET CONFIG` refuses to save until the
+//! file is fixed, since writing the file whole would drop what it holds.
 //!
 //! **Precedence**, as PostgreSQL's: a flag given on the command line wins over
 //! a saved value, and a saved value over the default. Which of the three a
@@ -48,6 +55,9 @@ struct State {
     /// What each startup key's running value is, as text, and where it came
     /// from. Recorded once at start-up.
     running: BTreeMap<String, (String, Source)>,
+    /// Why the file [`load`] found could not be read, when it could not:
+    /// [`save`] then refuses rather than replace it with one line.
+    broken: Option<String>,
 }
 
 fn state() -> &'static Mutex<State> {
@@ -57,6 +67,7 @@ fn state() -> &'static Mutex<State> {
             path: None,
             saved: BTreeMap::new(),
             running: BTreeMap::new(),
+            broken: None,
         })
     })
 }
@@ -85,7 +96,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, String>, String> {
 
 fn render(saved: &BTreeMap<String, String>) -> String {
     let mut out = String::from(
-        "# Startup settings saved by SET CONFIG, applied at the next start.\n\
+        "# Settings saved by SET CONFIG, applied at every start.\n\
          # A flag given on the command line wins over a value here.\n",
     );
     for (k, v) in saved {
@@ -96,17 +107,32 @@ fn render(saved: &BTreeMap<String, String>) -> String {
 
 /// Reads `<location>/rasterizeddb.conf` and remembers where it is. A missing
 /// file is an empty one. Call once, before the startup settings are applied.
+///
+/// A file that cannot be read or parsed is an `Err` for the caller to report,
+/// and the start goes on without it; the path is still remembered, so that
+/// [`save`] can say what is wrong with the file instead of claiming there is
+/// no data directory.
 pub fn load(location: &Path) -> Result<BTreeMap<String, String>, String> {
     let path = location.join(FILE_NAME);
-    let saved = match std::fs::read_to_string(&path) {
-        Ok(text) => parse(&text)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    let read = match std::fs::read_to_string(&path) {
+        Ok(text) => parse(&text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(format!("reading {}: {e}", path.display())),
     };
     let mut s = state().lock();
     s.path = Some(path);
-    s.saved = saved.clone();
-    Ok(saved)
+    match read {
+        Ok(saved) => {
+            s.saved = saved.clone();
+            s.broken = None;
+            Ok(saved)
+        }
+        Err(e) => {
+            s.saved.clear();
+            s.broken = Some(e.clone());
+            Err(e)
+        }
+    }
 }
 
 /// Forgets the file [`load`] read: what a start with no data directory (an
@@ -117,11 +143,18 @@ pub fn unload() {
     let mut s = state().lock();
     s.path = None;
     s.saved.clear();
+    s.broken = None;
 }
 
 /// Records a startup key's running value and its source.
 pub fn record(key: &str, value: impl Into<String>, source: Source) {
     state().lock().running.insert(key.to_ascii_lowercase(), (value.into(), source));
+}
+
+/// `key`'s running value as recorded at start-up; `None` for a key not
+/// recorded.
+pub fn running(key: &str) -> Option<String> {
+    state().lock().running.get(&key.to_ascii_lowercase()).map(|(v, _)| v.clone())
 }
 
 /// Where `key`'s running value came from; `Default` for a key not recorded.
@@ -148,13 +181,24 @@ pub fn shadowed_by_flag(key: &str) -> bool {
 
 /// Saves `key = value` for the next start, writing the file whole: to a
 /// temporary beside it, synced, then renamed over it. `Err` when the server
-/// was started with no location to keep it in.
+/// was started with no location to keep it in, when the file it found there
+/// does not parse (writing it whole would drop the rest of it), and for a
+/// value the file cannot hold on one line.
 pub fn save(key: &str, value: &str) -> Result<(), String> {
     let mut s = state().lock();
     let path = s
         .path
         .clone()
         .ok_or_else(|| "this server has no data directory to save settings in".to_string())?;
+    if let Some(why) = &s.broken {
+        return Err(format!(
+            "{why}; fix or remove {} first, as saving would replace everything it holds",
+            path.display()
+        ));
+    }
+    if value.contains(['\n', '\r', '#']) {
+        return Err(format!("`{}` cannot be saved: a line break or `#` would not read back", value.escape_debug()));
+    }
     let mut next = s.saved.clone();
     next.insert(key.to_ascii_lowercase(), value.to_string());
     let tmp = path.with_extension("conf.tmp");
@@ -189,5 +233,32 @@ mod tests {
         assert_eq!(p.get("index.residency").map(String::as_str), Some("hybrid"));
         assert!(parse("no equals sign").is_err());
         assert!(parse("nodot = 1").is_err());
+    }
+
+    /// A file that does not parse is kept as it is: `save` refuses, naming
+    /// the line, rather than write a file holding only the new key. The
+    /// state is the process's, so this is the only test in the lib that
+    /// loads a file.
+    #[test]
+    fn a_file_that_does_not_parse_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let text = "server.batch_size = 5000\nthis line has no equals sign\n";
+        std::fs::write(&path, text).unwrap();
+        let e = load(dir.path()).unwrap_err();
+        assert!(e.contains("line 2"), "{e}");
+        let e = save("partition.idle_close_secs", "600").unwrap_err();
+        assert!(e.contains("line 2") && e.contains("fix or remove"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        // Fixed, it saves, keeping what it held.
+        std::fs::write(&path, "server.batch_size = 5000\n").unwrap();
+        load(dir.path()).unwrap();
+        save("partition.idle_close_secs", "600").unwrap();
+        assert!(save("partition.idle_close_secs", "6\nserver.batch_size = 1").is_err());
+        let back = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.get("server.batch_size").map(String::as_str), Some("5000"));
+        assert_eq!(back.get("partition.idle_close_secs").map(String::as_str), Some("600"));
+        unload();
     }
 }

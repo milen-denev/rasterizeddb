@@ -2297,6 +2297,14 @@ const CONFIG_KEYS: &[ConfigKey] = &[
         help: "serve repeated queries from a known offset",
     },
     ConfigKey {
+        section: "cache",
+        key: "size",
+        hot: false,
+        set_with: "--cache-size N (restart)",
+        options: "",
+        help: "entries the query cache holds when it is on",
+    },
+    ConfigKey {
         section: "filter",
         key: "enabled",
         hot: true,
@@ -2648,6 +2656,7 @@ fn config(database: &Arc<Database>) -> Vec<Row> {
             .to_string(),
             ("wal", "writer_delay_ms") => crate::wal_writer_delay_ms().to_string(),
             ("cache", "enabled") => crate::cache::query_cache::enabled().to_string(),
+            ("cache", "size") => crate::cache::query_cache::entries().to_string(),
             ("filter", "enabled") => filters.enabled().to_string(),
             ("filter", "backfill_on_open") => filters.backfill_on_open().to_string(),
             ("filter", "min_pruning_ratio") => filters.min_pruning_ratio().to_string(),
@@ -2744,9 +2753,13 @@ fn pending_of(k: &ConfigKey) -> String {
     crate::configuration::saved::pending(&format!("{}.{}", k.section, k.key)).unwrap_or_default()
 }
 
-/// Where a startup key's running value came from; empty for a hot key.
+/// Where a key's running value came from at start-up; empty for a key that
+/// acts on a database (`replication.*`, `vacuum.enabled`), which is never
+/// saved. A hot key a session changes and saves reads `saved` from then on,
+/// unless a flag set it at start-up: that flag wins at the next start, so it
+/// stays `command line`.
 fn source_of(k: &ConfigKey) -> String {
-    if k.hot {
+    if k.hot && !PROCESS_WIDE_SECTIONS.contains(&k.section) {
         return String::new();
     }
     crate::configuration::saved::source(&format!("{}.{}", k.section, k.key)).name().to_string()
@@ -2772,6 +2785,8 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
         ("wal", "checkpoint_bytes") => number(1, u64::MAX),
         ("wal", "prealloc_kb") => number(0, 1 << 20),
         ("cache", "enabled") => parse_bool(v).map(|b| b.to_string()),
+        // The slot array is built whole at start, two slots an entry.
+        ("cache", "size") => number(1, 100_000_000),
         ("index", "residency") => crate::core::index::paged::Residency::parse(v)
             .map(|r| r.name().to_string())
             .ok_or_else(|| format!("`{v}` is not a residency (memory, hybrid or disk)")),
@@ -2787,8 +2802,83 @@ pub fn startup_value(section: &str, name: &str, value: &str) -> Result<String, S
 /// filter surface, the replication surface, the tables themselves — rather than
 /// reimplemented. That is what keeps `SET CONFIG filter.max_f = 20` and
 /// `SET FILTER max_f = 20` from drifting into meaning different things.
+///
+/// A hot key is applied and then saved, so that a restart does not silently
+/// undo it ([`save_hot`]).
 async fn set_config(database: &Arc<Database>, key: &str, value: &str) -> Result<String, String> {
-    set_config_in(Some(database), key, value).await
+    let reply = set_config_in(Some(database), key, value).await?;
+    Ok(match spec_of(key) {
+        Some(spec) if spec.hot => reply + &save_hot(spec, value),
+        _ => reply,
+    })
+}
+
+fn spec_of(key: &str) -> Option<&'static ConfigKey> {
+    let (section, name) = key.split_once('.')?;
+    CONFIG_KEYS.iter().find(|k| k.section == section && k.key == name)
+}
+
+/// Saves a hot key a session just changed, and says what a restart will do
+/// with it, as a clause for the reply. The value is saved as given, not as
+/// `SHOW CONFIG` shows it: `partition.open_budget = 0` shows the budget it
+/// derives, and a start has to derive it again. It already took effect, so a
+/// save that fails does not fail the statement; the reply says so.
+fn save_hot(spec: &ConfigKey, value: &str) -> String {
+    let full = format!("{}.{}", spec.section, spec.key);
+    if !PROCESS_WIDE_SECTIONS.contains(&spec.section) {
+        return "; not saved: it acts on this database, so a restart returns it to the start-up value".to_string();
+    }
+    let value = value.trim().trim_matches(|c| c == '\'' || c == '"');
+    match crate::configuration::saved::save(&full, value) {
+        Err(why) => format!("; applied now but not saved, so a restart undoes it: {why}"),
+        Ok(()) if crate::configuration::saved::shadowed_by_flag(&full) => {
+            "; saved, but this server was started with a flag for it, which wins over a saved value \
+             at the next start, so remove the flag for this to hold"
+                .to_string()
+        }
+        Ok(()) => {
+            // What a restart would now report, and so what this one does.
+            crate::configuration::saved::record(&full, value, crate::configuration::saved::Source::Saved);
+            "; saved, so it holds after a restart".to_string()
+        }
+    }
+}
+
+/// Applies the hot keys a session saved ([`save_hot`]) at a start, under the
+/// flags: a key `given` says was set at start-up is left to that value and
+/// recorded as the command line's. Records every process-wide hot key's
+/// source for `SHOW CONFIG`.
+///
+/// Synchronous and database-free, so the server can call it before its
+/// runtime exists and an embedding application inside its Builder's checks;
+/// either way before any database opens, so the opens see the values.
+/// Returns a warning for each saved value that was refused: a bad line is
+/// reported and skipped, never a reason not to start, and the file is left
+/// as it is.
+pub fn apply_saved_hot_keys(
+    stored: &std::collections::BTreeMap<String, String>,
+    given: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    use crate::configuration::saved::{self, Source};
+    let mut warnings = Vec::new();
+    for k in CONFIG_KEYS.iter().filter(|k| k.hot && PROCESS_WIDE_SECTIONS.contains(&k.section)) {
+        let full = format!("{}.{}", k.section, k.key);
+        let (text, source) = if given(&full) {
+            (String::new(), Source::CommandLine)
+        } else if let Some(value) = stored.get(&full) {
+            match set_process_wide(&full, k.section, k.key, value) {
+                Ok(_) => (value.clone(), Source::Saved),
+                Err(e) => {
+                    warnings.push(format!("{}: `{full} = {value}` was not applied: {e}", saved::FILE_NAME));
+                    (String::new(), Source::Default)
+                }
+            }
+        } else {
+            (String::new(), Source::Default)
+        };
+        saved::record(&full, text, source);
+    }
+    warnings
 }
 
 /// `SET CONFIG` for a process that configures the engine in code rather than
@@ -2863,6 +2953,87 @@ async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str)
         return Ok(reply);
     }
 
+    if PROCESS_WIDE_SECTIONS.contains(&section) {
+        return set_process_wide(key, section, name, value);
+    }
+    match section {
+        "replication" => {
+            let database = needs_database(database, key)?;
+            if name == "active" {
+                let statement = if parse_bool(value)? {
+                    "REPLICATION ENABLE"
+                } else {
+                    "REPLICATION DISABLE"
+                };
+                let lines = crate::replication::sql::execute(statement, database).await?;
+                return Ok(lines.join("; "));
+            }
+            let lines = crate::replication::sql::execute(
+                &format!("REPLICATION SET {} = '{}'", name, value),
+                database,
+            )
+            .await?;
+            Ok(lines.join("; "))
+        }
+        "vacuum" => {
+            let database = needs_database(database, key)?;
+            let enabled = parse_bool(value)?;
+            // Every target is found before any is changed: a table that cannot
+            // serve data refuses the whole statement rather than leave it
+            // reported applied to rows it never reached. A partitioned table's
+            // targets are its materialized partitions, open or closed (it
+            // keeps the value for every partition it opens later); one
+            // materialized later takes it too.
+            let names = table_names(database);
+            let mut targets: Vec<Arc<DbTable>> = Vec::new();
+            let mut partitioned: Vec<Arc<crate::core::partition::table::PartitionedTable>> = Vec::new();
+            let mut touched = 0usize;
+            let mut partitions = 0usize;
+            for name in names {
+                match database.relation(&name) {
+                    None => continue,
+                    Some(Relation::Plain(table)) => {
+                        table.data().map_err(|e| e.to_string())?;
+                        targets.push(table);
+                    }
+                    Some(Relation::Partitioned(table)) => {
+                        table.check().map_err(|e| e.to_string())?;
+                        partitioned.push(table);
+                    }
+                }
+                touched += 1;
+            }
+            for table in &targets {
+                table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            }
+            for table in &partitioned {
+                partitions += table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
+            }
+            Ok(format!(
+                "background reclamation {} for {} table{}{}",
+                if enabled { "enabled" } else { "disabled" },
+                touched,
+                if touched == 1 { "" } else { "s" },
+                if partitions > 0 {
+                    format!(" ({} partition{})", partitions, if partitions == 1 { "" } else { "s" })
+                } else {
+                    String::new()
+                }
+            ))
+        }
+        _ => Err(format!("`{}` has no live setter", key)),
+    }
+}
+
+/// The sections whose hot keys are process-wide state rather than a
+/// database's: what a session's `SET CONFIG` saves, and what a start applies
+/// from the settings file ([`apply_saved_hot_keys`]). `replication.*` and
+/// `vacuum.enabled` act on an open database and are neither.
+const PROCESS_WIDE_SECTIONS: &[&str] = &["wal", "filter", "query_stats", "auto_compact", "partition", "index_snapshot"];
+
+/// Sets one process-wide hot key. Synchronous, so that a start can apply the
+/// saved ones before its runtime exists.
+fn set_process_wide(key: &str, section: &str, name: &str, value: &str) -> Result<String, String> {
     match section {
         "wal" => match name {
             "synchronous_commit" => {
@@ -2906,24 +3077,6 @@ async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str)
         "filter" => {
             let lines =
                 crate::core::filter::sql::execute(&format!("SET FILTER {} = {}", name, value))?;
-            Ok(lines.join("; "))
-        }
-        "replication" => {
-            let database = needs_database(database, key)?;
-            if name == "active" {
-                let statement = if parse_bool(value)? {
-                    "REPLICATION ENABLE"
-                } else {
-                    "REPLICATION DISABLE"
-                };
-                let lines = crate::replication::sql::execute(statement, database).await?;
-                return Ok(lines.join("; "));
-            }
-            let lines = crate::replication::sql::execute(
-                &format!("REPLICATION SET {} = '{}'", name, value),
-                database,
-            )
-            .await?;
             Ok(lines.join("; "))
         }
         "query_stats" => {
@@ -3063,52 +3216,6 @@ async fn set_config_in(database: Option<&Arc<Database>>, key: &str, value: &str)
                 _ => return Err(format!("`{}` has no live setter", key)),
             }
             Ok(format!("{key} is now {n}"))
-        }
-        "vacuum" => {
-            let database = needs_database(database, key)?;
-            let enabled = parse_bool(value)?;
-            // Every target is found before any is changed: a table that cannot
-            // serve data refuses the whole statement rather than leave it
-            // reported applied to rows it never reached. A partitioned table's
-            // targets are its materialized partitions, open or closed (it
-            // keeps the value for every partition it opens later); one
-            // materialized later takes it too.
-            let names = table_names(database);
-            let mut targets: Vec<Arc<DbTable>> = Vec::new();
-            let mut partitioned: Vec<Arc<crate::core::partition::table::PartitionedTable>> = Vec::new();
-            let mut touched = 0usize;
-            let mut partitions = 0usize;
-            for name in names {
-                match database.relation(&name) {
-                    None => continue,
-                    Some(Relation::Plain(table)) => {
-                        table.data().map_err(|e| e.to_string())?;
-                        targets.push(table);
-                    }
-                    Some(Relation::Partitioned(table)) => {
-                        table.check().map_err(|e| e.to_string())?;
-                        partitioned.push(table);
-                    }
-                }
-                touched += 1;
-            }
-            for table in &targets {
-                table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
-            }
-            for table in &partitioned {
-                partitions += table.set_vacuum_enabled(enabled).map_err(|e| e.to_string())?;
-            }
-            Ok(format!(
-                "background reclamation {} for {} table{}{}",
-                if enabled { "enabled" } else { "disabled" },
-                touched,
-                if touched == 1 { "" } else { "s" },
-                if partitions > 0 {
-                    format!(" ({} partition{})", partitions, if partitions == 1 { "" } else { "s" })
-                } else {
-                    String::new()
-                }
-            ))
         }
         _ => Err(format!("`{}` has no live setter", key)),
     }

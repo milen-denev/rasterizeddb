@@ -21,7 +21,7 @@
 //!    A collision costs a miss instead of serving another query's rows.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use cacheguard::CacheGuard;
 
@@ -181,6 +181,28 @@ pub fn stats() -> (u64, u64, u64) {
 pub fn record_abandoned_hit() {
     HITS.fetch_sub(1, Ordering::Relaxed);
     MISSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Entries the cache holds when nothing says otherwise (`--cache-size`).
+pub const DEFAULT_ENTRIES: usize = 100_000;
+
+/// The entry limit a start asked for (`cache.size`), for a cache not built
+/// yet; [`init`] builds with its own argument.
+static ENTRIES: AtomicUsize = AtomicUsize::new(DEFAULT_ENTRIES);
+
+/// Sets the entry limit [`entries`] reports for a cache not built yet: what
+/// a start that leaves the cache off still configured.
+pub fn set_entries(n: usize) {
+    ENTRIES.store(n, Ordering::Relaxed);
+}
+
+/// The cache's entry limit, `SHOW CONFIG`'s `cache.size`: the built cache's
+/// own, or the configured one while none is built.
+pub fn entries() -> usize {
+    match QUERY_CACHE.get() {
+        Some(cache) => cache.max_capacity(),
+        None => ENTRIES.load(Ordering::Relaxed),
+    }
 }
 
 /// Builds the query cache with room for `max_entries` live entries.

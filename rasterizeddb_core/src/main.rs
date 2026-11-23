@@ -1091,7 +1091,10 @@ fn parse_idle_timeout(value: &str) -> Result<std::time::Duration, String> {
 /// file, and records every startup key's running value and where it came from
 /// for SHOW CONFIG. A saved value that does not parse is reported and
 /// ignored: a bad file must never keep the server from starting.
-fn apply_saved_settings(args: &mut Args) {
+///
+/// Returns what the file holds, for the hot keys it saved, which are applied
+/// once the flags have seeded theirs (`apply_saved_hot_keys`).
+fn apply_saved_settings(args: &mut Args) -> std::collections::BTreeMap<String, String> {
     use rasterizeddb_core::configuration::saved::{self, Source};
     use std::collections::BTreeMap;
     let location = if args.in_memory {
@@ -1117,13 +1120,18 @@ fn apply_saved_settings(args: &mut Args) {
         let source = if flag.is_some() {
             Source::CommandLine
         } else if let Some(v) = stored.get(key) {
-            match v.parse::<T>() {
+            // Checked as `SET CONFIG` checks it before saving: a hand-edited
+            // `cache.size = 0` would otherwise build an unbounded cache.
+            let (section, name) = key.split_once('.').expect("a startup key is section.key");
+            match rasterizeddb_core::core::introspect::startup_value(section, name, v)
+                .and_then(|canonical| canonical.parse::<T>().map_err(|_| format!("`{v}` does not parse")))
+            {
                 Ok(t) => {
                     *flag = Some(t);
                     Source::Saved
                 }
-                Err(_) => {
-                    eprintln!("{}: `{key} = {v}` is not a valid value; ignored", saved::FILE_NAME);
+                Err(e) => {
+                    eprintln!("{}: `{key} = {v}` is not a valid value ({e}); ignored", saved::FILE_NAME);
                     Source::Default
                 }
             }
@@ -1139,9 +1147,49 @@ fn apply_saved_settings(args: &mut Args) {
     one("wal.checkpoint_bytes", &mut args.wal_checkpoint_bytes, &stored, "67108864");
     one("wal.prealloc_kb", &mut args.wal_prealloc_kb, &stored, "1024");
     one("cache.enabled", &mut args.enable_cache, &stored, "false");
+    one("cache.size", &mut args.cache_size, &stored, "100000");
     one("index.residency", &mut args.index_residency, &stored, "memory");
     one("index.cache_mb", &mut args.index_cache_mb, &stored, "0");
     one("index.delta_mb", &mut args.index_delta_mb, &stored, "0");
+    stored
+}
+
+/// Applies the hot keys a session's `SET CONFIG` saved, after the flags have
+/// seeded theirs: a key with a flag keeps the flag's value.
+fn apply_saved_hot_keys(args: &Args, stored: &std::collections::BTreeMap<String, String>) {
+    let given = |key: &str| -> bool {
+        match key {
+            "wal.synchronous_commit" => args.synchronous_commit.is_some(),
+            "wal.writer_delay_ms" => args.wal_writer_delay_ms.is_some(),
+            "filter.enabled" => args.filter_enabled.is_some(),
+            "filter.backfill_on_open" => args.filter_backfill.is_some(),
+            "filter.min_pruning_ratio" => args.filter_min_pruning_ratio.is_some(),
+            "filter.checkpoint_interval_secs" => args.filter_checkpoint_secs.is_some(),
+            "filter.min_f" => args.filter_min_f.is_some(),
+            "filter.default_f" => args.filter_default_f.is_some(),
+            "filter.max_f" => args.filter_max_f.is_some(),
+            "filter.min_selectivity" => args.filter_min_selectivity.is_some(),
+            "filter.min_table_rows" => args.filter_min_table_rows.is_some(),
+            "filter.zone_bounds" => args.filter_zone_bounds.is_some(),
+            "filter.bloom" => args.filter_bloom.is_some(),
+            #[cfg(feature = "query_stats")]
+            "query_stats.enabled" => args.query_stats.is_some(),
+            "auto_compact.enabled" => args.auto_compact.is_some(),
+            "auto_compact.interval_secs" => args.auto_compact_interval_secs.is_some(),
+            "auto_compact.min_slots" => args.auto_compact_min_slots.is_some(),
+            "auto_compact.ratio" => args.auto_compact_ratio.is_some(),
+            "auto_compact.dead_fraction" => args.auto_compact_dead_fraction.is_some(),
+            "auto_compact.dead_fraction_max_slots" => args.auto_compact_dead_fraction_max_slots.is_some(),
+            "auto_compact.cooldown_secs" => args.auto_compact_cooldown_secs.is_some(),
+            "index_snapshot.index_storage" => args.index_storage.is_some(),
+            // No flag: partition.*, the other index_snapshot.* keys,
+            // query_stats.recent.
+            _ => false,
+        }
+    };
+    for warning in rasterizeddb_core::core::introspect::apply_saved_hot_keys(stored, &given) {
+        eprintln!("{warning}");
+    }
 }
 
 /// `--socket-mode` and `--socket-group`, checked, for every unix socket the
@@ -1334,7 +1382,7 @@ fn main() -> std::io::Result<()> {
     let (nofile_before, nofile_now, open_budget) = rasterizeddb_core::core::partition::budget::raise_descriptor_limit();
     // Startup settings `SET CONFIG` saved, under the flags: a flag given here
     // wins (configuration::saved).
-    apply_saved_settings(&mut args);
+    let stored_settings = apply_saved_settings(&mut args);
     // Before the runtime starts a thread: an arena made is not undone.
     if let Some(n) = args.malloc_arenas {
         if !rasterizeddb_core::set_malloc_arenas(n) {
@@ -1578,8 +1626,13 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    let cache_size = args.cache_size.unwrap_or(100_000);
+    // Under the flags, which seeded their keys above; before any database
+    // opens, so the opens see the values.
+    apply_saved_hot_keys(&args, &stored_settings);
+
+    let cache_size = args.cache_size.unwrap_or(query_cache::DEFAULT_ENTRIES);
     let enable_cache = args.enable_cache.unwrap_or(false);
+    query_cache::set_entries(cache_size);
 
     // `init` sizes the slot array itself; the cache is only reachable once the
     // flag is set, so building it first keeps a query from ever seeing a

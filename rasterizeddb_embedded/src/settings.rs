@@ -5,8 +5,10 @@
 //! `main` does for the server: it resolves each startup key from the Builder,
 //! then `rasterizeddb.conf`, then the default, sets it before any engine
 //! thread exists, and records where the running value came from for
-//! `SHOW CONFIG`. The hot keys are left for the engine thread, which applies
-//! them through the same code `SET CONFIG` runs.
+//! `SHOW CONFIG`. The hot keys a session saved in `rasterizeddb.conf` are
+//! applied here too, under the Builder's; the Builder's own hot keys are left
+//! for the engine thread, which applies them through the same code `SET
+//! CONFIG` runs.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -21,10 +23,6 @@ use rasterizeddb_core::core::introspect;
 use rasterizeddb_core::core::kv_cache::{self, EvictionPolicy};
 use rasterizeddb_core::simds::cpu::{self, SimdLevel, SimdRequest};
 
-/// Entries the query cache holds when `Builder::query_cache_entries` names
-/// no other number; the server's `--cache-size` default.
-const DEFAULT_QUERY_CACHE_ENTRIES: usize = 100_000;
-
 /// Every key the engine reads once, before it starts (`SHOW CONFIG KEYS`
 /// with `hot` false), and its default as `SHOW CONFIG` spells it.
 /// `wal.enabled` is not here: it is fixed on.
@@ -34,6 +32,8 @@ pub(crate) const STARTUP_KEYS: &[(&str, &str)] = &[
     ("server.malloc_arenas", "0"),
     ("wal.checkpoint_bytes", "67108864"),
     ("wal.prealloc_kb", "1024"),
+    // Before `cache.enabled`, which builds the cache at this size.
+    ("cache.size", "100000"),
     ("cache.enabled", "false"),
     ("index.residency", "memory"),
     ("index.cache_mb", "0"),
@@ -44,7 +44,6 @@ pub(crate) const STARTUP_KEYS: &[(&str, &str)] = &[
 /// the order given, so the last word on a key wins whichever method said it.
 pub(crate) struct Settings {
     pub config: Vec<(String, String)>,
-    pub query_cache_entries: usize,
     pub simd: Option<SimdLevel>,
     pub scan_prefilter: Option<bool>,
     pub tune_allocator: bool,
@@ -63,7 +62,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             config: Vec::new(),
-            query_cache_entries: DEFAULT_QUERY_CACHE_ENTRIES,
             simd: None,
             scan_prefilter: None,
             tune_allocator: false,
@@ -154,6 +152,11 @@ impl Settings {
                     if !STARTUP_KEYS.iter().any(|(k, _)| *k == key) {
                         return Err(invalid(format!("{key} cannot be set")));
                     }
+                    if key == "cache.size" && value.trim() == "0" {
+                        return Err(invalid(
+                            "query_cache_entries (cache.size) must be above 0; turn the cache off with query_cache(false)",
+                        ));
+                    }
                     let canonical = introspect::startup_value(section, name, value)
                         .map_err(|e| invalid(format!("{key} = {value}: {e}")))?;
                     startup.insert(key, canonical);
@@ -167,9 +170,6 @@ impl Settings {
         }
         if self.join_memory_mb == Some(0) {
             return Err(invalid("join_memory_mb must be above 0: there is no unlimited setting"));
-        }
-        if self.query_cache_entries == 0 {
-            return Err(invalid("query_cache_entries must be above 0; turn the cache off with query_cache(false)"));
         }
         if let Some(level) = self.simd {
             cpu::init(SimdRequest::Fixed(level)).map_err(|e| invalid(format!("Builder::simd: {e}")))?;
@@ -216,6 +216,13 @@ impl Settings {
                 }
             };
             saved::record(key, running(key).unwrap_or_else(|| default.to_string()), source);
+        }
+        // The hot keys a session saved, under the Builder's: a key the
+        // Builder gives keeps the Builder's value, which the engine thread
+        // sets.
+        let given = |key: &str| hot.iter().any(|(k, _)| k == key);
+        for warning in introspect::apply_saved_hot_keys(&stored, &given) {
+            log::warn!("{warning}");
         }
 
         if let Some(on) = self.scan_prefilter {
@@ -291,12 +298,23 @@ impl Settings {
             }
             "wal.checkpoint_bytes" => set_once(&rasterizeddb_core::WAL_CHECKPOINT_BYTES, number()),
             "wal.prealloc_kb" => set_once(&rasterizeddb_core::WAL_PREALLOC_BYTES, number().saturating_mul(1024)),
+            "cache.size" => {
+                let n = number() as usize;
+                match query_cache::QUERY_CACHE.get() {
+                    // Built by an earlier engine in this process.
+                    Some(_) => query_cache::entries() == n,
+                    None => {
+                        query_cache::set_entries(n);
+                        true
+                    }
+                }
+            }
             "cache.enabled" => {
                 let on = value == "true";
                 if on {
                     // Built before the flag is set, so a query never sees a
-                    // half-configured cache.
-                    query_cache::init(self.query_cache_entries);
+                    // half-configured cache; at `cache.size`, set before it.
+                    query_cache::init(query_cache::entries());
                 }
                 set_once(&query_cache::ENABLE_CACHE, on)
             }
@@ -328,6 +346,7 @@ fn running(key: &str) -> Option<String> {
         "server.malloc_arenas" => rasterizeddb_core::malloc_arenas().to_string(),
         "wal.checkpoint_bytes" => rasterizeddb_core::wal_checkpoint_bytes().to_string(),
         "wal.prealloc_kb" => (rasterizeddb_core::wal_prealloc_bytes() / 1024).to_string(),
+        "cache.size" => query_cache::entries().to_string(),
         "cache.enabled" => query_cache::enabled().to_string(),
         "index.residency" => paged::residency().name().to_string(),
         "index.cache_mb" => paged::cache_mb_setting().to_string(),

@@ -339,9 +339,8 @@ impl Builder {
     /// Entries the query cache holds when it is on (`--cache-size`, default
     /// 100 000). The first engine in a process to turn the cache on sizes
     /// it.
-    pub fn query_cache_entries(mut self, entries: usize) -> Self {
-        self.settings.query_cache_entries = entries;
-        self
+    pub fn query_cache_entries(self, entries: usize) -> Self {
+        self.config("cache.size", entries.to_string())
     }
 
     /// Bytes the key/value store may hold, as Redis's `maxmemory`
