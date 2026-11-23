@@ -478,6 +478,20 @@ pub fn parse(item: &str, schema: &[SchemaField]) -> Option<Result<WindowSpec, St
             Err(e) => return Some(Err(e)),
         },
     };
+    // The aggregates' argument rule, as their grouped forms have it:
+    // `min(j) OVER ()` over a document answered one, picked by its bytes.
+    let as_aggregate = match func {
+        WindowFunc::Sum => Some(AggFunc::Sum),
+        WindowFunc::Avg => Some(AggFunc::Avg),
+        WindowFunc::Min => Some(AggFunc::Min),
+        WindowFunc::Max => Some(AggFunc::Max),
+        _ => None,
+    };
+    if let Some(aggregate) = as_aggregate {
+        if let Err(e) = aggregate.check_argument(argument.as_ref()) {
+            return Some(Err(e));
+        }
+    }
     let offset = match arguments.get(1) {
         None => match func {
             // `LAG(x)` and `LEAD(x)` default to one row.

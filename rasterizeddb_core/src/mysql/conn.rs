@@ -694,6 +694,7 @@ impl Session {
             limits: self.shared.config.limits,
             watch: self.peer_watch.clone(),
             parameters,
+            lenient_booleans: true,
         };
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(bridge) => {
@@ -2493,6 +2494,7 @@ impl Session {
             limits: self.shared.config.limits,
             watch: None,
             parameters: HashMap::new(),
+            lenient_booleans: true,
         };
         let mut bridge = match PgBridge::open(self.shared.catalog.clone(), database, options).await
         {

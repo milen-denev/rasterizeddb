@@ -736,6 +736,7 @@ impl Session {
             limits: self.shared.config.limits,
             watch: self.peer_watch.clone(),
             parameters,
+            lenient_booleans: false,
         };
         match PgBridge::open(self.shared.catalog.clone(), database, options).await {
             Ok(b) => {

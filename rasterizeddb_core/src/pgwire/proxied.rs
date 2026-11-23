@@ -101,6 +101,9 @@ pub(crate) struct BridgeOptions {
     pub(crate) watch: Option<StdArc<PeerWatch>>,
     /// StartupMessage parameters (`statement_timeout`, …).
     pub(crate) parameters: HashMap<String, String>,
+    /// The front end's own leniency over booleans: MySQL's `SUM(active)`.
+    /// See `aggregate::MYSQL_BOOLEAN_AGGREGATES`.
+    pub(crate) lenient_booleans: bool,
 }
 
 /// Why a session could not be opened.
@@ -270,12 +273,21 @@ impl PgBridge {
             limits,
             watch,
             parameters,
+            lenient_booleans,
         } = options;
-        tokio::spawn(PEER_WATCH.scope(watch, async move {
+        let session = async move {
             if let Err(e) = serve_proxied(catalog, guard, login, limits, server, parameters).await {
                 log::debug!("proxied session ended: {e}");
             }
-        }));
+        };
+        if lenient_booleans {
+            tokio::spawn(PEER_WATCH.scope(
+                watch,
+                crate::core::rql::aggregate::MYSQL_BOOLEAN_AGGREGATES.scope((), session),
+            ));
+        } else {
+            tokio::spawn(PEER_WATCH.scope(watch, session));
+        }
         let mut bridge = PgBridge {
             io: client,
             out: Vec::with_capacity(1024),

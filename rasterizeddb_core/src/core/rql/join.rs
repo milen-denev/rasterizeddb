@@ -5737,6 +5737,10 @@ fn build_aggregate_stage(
                 }
                 None
             } else if let Ok((rel, field)) = resolve(arg_text) {
+                // Refused over a type with no such aggregate, as over one
+                // table: through a join `sum(text)` answered NULL and
+                // `min(jsonb)` a document picked by its bytes.
+                func.check_argument(Some(&field))?;
                 Some(positional(rel, field, items))
             } else {
                 // `AVG(EXTRACT(EPOCH FROM (a - b)))` — the argument is computed,
