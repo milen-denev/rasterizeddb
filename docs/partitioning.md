@@ -4578,11 +4578,18 @@ and is not designed here.
   (`catalog_views::rewrite_reg_casts`). Test:
   `driver_catalog_and_copy::a_partitioned_table_is_described_as_a_partitioned_parent`.
 - **`pg_inherits`** stays empty: the partitions are not relations a client
-  can name, so `\d` says "Number of partitions: 0". `pg_dump` does not run
-  against this server yet (it stops at `pg_is_in_recovery()`); whoever
-  makes it run must know that it dumps no data for a relkind `'p'` table,
-  expecting the rows in its leaf partitions, so a dump would lose every
-  partitioned table's rows.
+  can name, so `\d` says "Number of partitions: 0".
+- **`pg_dump`** dumps no data for a relkind `'p'` table, expecting the rows
+  in its leaf partitions. So its session alone (`pgwire::pg_dump`, which
+  answers the catalogue queries of a session that set
+  `synchronize_seqscans` off) is shown a partitioned table as a plain one,
+  relkind `'r'`, whose data step is `COPY t TO stdout` over every partition,
+  and its partitioning as a post-data `CREATE INDEX t_partition_key ON
+  public.t USING partition (k, …) WITH (partitions = n)`. A restore here
+  converts the table back; one into PostgreSQL fails that statement and
+  keeps a plain table with every row. [postgres-import.md
+  §11](postgres-import.md#11-the-other-way-pg_dump). Test:
+  `tests/pg_dump_round_trip.rs`.
 - **`pg_index`, `pg_indexes`** list declared indexes from the shell's
   `schema.secondary_indexes`, not live `indexes` (§3.3), and omit the partition
   key.
@@ -4682,8 +4689,9 @@ section specifying the mechanism.
 8. **Index memory** is rebuilt on every reopen; if that churns, use a longer
    idle window or [persistent indexes](persistent-indexes.md), whose v1 loads
    a snapshot instead after a clean close (§7.2, point 4).
-9. **`pg_dump`** does not run against this server yet; once it does, a
-   relkind `'p'` table's rows need dumping by hand (§14).
+9. ~~**`pg_dump`** does not run against this server yet~~: it does since
+   2026-11-23, and a partitioned table's rows are dumped (§14). A dump
+   restores the partitioning here; into PostgreSQL it restores a plain table.
 10. **Out of scope:** a physical tenant drop (§13), and global uniqueness on a
     non-key column, which would need a hidden table partitioned by it and a
     two-partition write protocol.

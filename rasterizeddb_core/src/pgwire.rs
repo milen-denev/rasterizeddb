@@ -50,6 +50,7 @@ mod notify;
 mod explain;
 mod temp_tables;
 mod session_values;
+mod pg_dump;
 mod sql_prepare;
 mod privilege_statements;
 #[cfg(test)]
@@ -3025,6 +3026,9 @@ struct SessionState {
     settings: HashMap<String, String>,
     /// `PREPARE`d statements by name (`sql_prepare`).
     sql_prepared: HashMap<String, sql_prepare::Prepared>,
+    /// What a `pg_dump` session's catalogue queries are answered from
+    /// (`pg_dump`), built once for the transaction it reads in.
+    dump_model: Option<(TxId, StdArc<pg_dump::DumpModel>)>,
     /// The schema changes a `DO` block or an `EXECUTE` of a prepared
     /// statement ran on this statement's behalf, for a branch's DDL log
     /// (`branch::note_ddl`): the client statement itself (`DO …`, `EXECUTE
@@ -3429,6 +3433,7 @@ impl SessionState {
             copy_in_ran: false,
             settings: HashMap::new(),
             sql_prepared: HashMap::new(),
+            dump_model: None,
             branch_ddl: Vec::new(),
             error_text: String::new(),
             error_base: Some(0),
@@ -8400,6 +8405,14 @@ where
     if let Some(pairs) = column_origins::sqlx_origin_pairs(stmt) {
         return column_origins::answer(database, stream, &pairs, omit_description).await;
     }
+    // `pg_dump`'s catalogue queries, answered from the catalogue model
+    // (`pg_dump`): only in its session, which turned `synchronize_seqscans`
+    // off as it connected.
+    if pg_dump::is_dump_session(state)
+        && let Some(kind) = pg_dump::recognize(stmt)
+    {
+        return pg_dump::answer(database, state, stream, stmt, kind, omit_description).await;
+    }
     // `PREPARE`, `EXECUTE`, `DEALLOCATE` (`sql_prepare`): before any
     // rewrite, which would act on a `PREPARE`'s statement as if it ran now.
     if let Some(parsed) = sql_prepare::parse(stmt) {
@@ -8521,6 +8534,20 @@ where
         }
         None => stmt,
     };
+    // `ALTER VIEW v OWNER TO r` and `ALTER SEQUENCE s OWNER TO r`, which
+    // `pg_dump` writes after each: the privilege statement they are, before
+    // the view and sequence statements, which read only their own `ALTER`
+    // forms and refused these ("ALTER VIEW supports only RENAME TO here").
+    if crate::core::sql_scan::contains_ignore_ascii_case(stmt, b" OWNER TO ")
+        && {
+            let head: Vec<String> = stmt.split_whitespace().take(3).map(str::to_ascii_uppercase).collect();
+            head.first().is_some_and(|w| w == "ALTER")
+                && matches!(head.get(1).map(String::as_str), Some("VIEW" | "SEQUENCE" | "MATERIALIZED"))
+        }
+        && let Some(parsed) = crate::core::rql::privileges::parse_privilege_statement(stmt)
+    {
+        return privilege_statements::handle_privilege_statement(database, state, stream, parsed).await;
+    }
     // Views (`core::rql::views`): their own statements are answered here,
     // table DDL is checked against them, and a statement reading one is
     // given its query as a derived table, before anything else plans it.
@@ -11251,6 +11278,16 @@ where
         }
     };
     let statements = split_statements(&normalized);
+    // A string holding no statement, only comments or blanks, is answered
+    // with EmptyQueryResponse, as PostgreSQL answers it: `pg_restore` sends a
+    // dump's header comment alone so. With ReadyForQuery alone, libpq had no
+    // result to give and reported a failure with an empty message, which
+    // `pg_restore --exit-on-error` stopped on.
+    if statements.is_empty() {
+        send_message(stream, b'I', &[]).await?;
+        let status = state.ready_status();
+        return send_ready_for_query(stream, status).await;
+    }
 
     // Several statements outside a block are one implicit transaction, as in
     // PostgreSQL: they commit together, or a failure rolls back the ones

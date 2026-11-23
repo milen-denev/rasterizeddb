@@ -1195,7 +1195,7 @@ fn temp_name(view: &str, database: &Arc<Database>) -> String {
 /// The model of `database` as `tx` sees it: its tables, views, materialized
 /// views and sequences, with every table's figures read here, where the
 /// storage layer is reachable.
-async fn model_for(
+pub(crate) async fn model_for(
     database: &Arc<Database>,
     tx: crate::core::mvcc::transaction::TxId,
 ) -> Result<crate::core::rql::catalog_model::Model, String> {
@@ -2108,21 +2108,21 @@ fn oid_of(name: &str) -> i64 {
 }
 
 /// One sequence as the catalogue relations list it.
-struct SequenceRow {
-    name: String,
-    data_type: String,
-    start: i64,
-    min: i64,
-    max: i64,
-    increment: i64,
-    cycle: bool,
-    cache: i64,
-    last: Option<i64>,
+pub(crate) struct SequenceRow {
+    pub(crate) name: String,
+    pub(crate) data_type: String,
+    pub(crate) start: i64,
+    pub(crate) min: i64,
+    pub(crate) max: i64,
+    pub(crate) increment: i64,
+    pub(crate) cycle: bool,
+    pub(crate) cache: i64,
+    pub(crate) last: Option<i64>,
 }
 
 /// Every sequence of `database` as `tx` sees it: each explicit one with its
 /// counter as it stands, and each implicit one a column default reads.
-async fn sequence_rows(
+pub(crate) async fn sequence_rows(
     database: &Arc<Database>,
     tx: Option<crate::core::mvcc::transaction::TxId>,
 ) -> Result<Vec<SequenceRow>, String> {
