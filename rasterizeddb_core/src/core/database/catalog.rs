@@ -98,6 +98,64 @@ struct Entry {
     sessions: StdArc<CacheGuard<AtomicUsize>>,
 }
 
+/// The file in a catalogue's root that the process serving it holds an
+/// exclusive lock on, for as long as the catalogue is open.
+pub const LOCK_FILE: &str = "rasterizeddb.lock";
+
+/// The exclusive lock on a root's [`LOCK_FILE`]: the operating system's
+/// (`flock` on unix, `LockFileEx` on Windows), so it ends with the process
+/// however it ends, and never outlives it as a stale file would.
+///
+/// Two engines on one directory each replay and truncate the other's
+/// write-ahead log and write the same row files: silent corruption. A second
+/// process, or a second catalogue in this one (the lock is per open file, not
+/// per process), is refused at open instead, before it reads anything.
+#[derive(Debug)]
+struct LocationLock {
+    _file: std::fs::File,
+}
+
+impl LocationLock {
+    fn take(root: &str) -> Result<Self, String> {
+        use std::io::{Read, Seek, Write};
+        std::fs::create_dir_all(root).map_err(|e| format!("creating {root}: {e}"))?;
+        let path = std::path::Path::new(root).join(LOCK_FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("opening {}: {e}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                // Who holds it, when the file can be read (not on Windows,
+                // where the lock covers reads too).
+                let mut holder = String::new();
+                let _ = file.read_to_string(&mut holder);
+                let holder = holder.trim();
+                return Err(format!(
+                    "{root} is already open in another RasterizedDB ({}): two engines on one data                      directory would corrupt it, so this one does not open it. Stop the other, or                      use another directory",
+                    if holder.is_empty() {
+                        "another process, or an earlier engine in this one".to_string()
+                    } else {
+                        format!("process {holder}, or an earlier engine in that process")
+                    }
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("locking {}: {e}", path.display()));
+            }
+        }
+        // Best effort, for the refusal above to name the holder.
+        let _ = file.set_len(0);
+        let _ = file.rewind();
+        let _ = write!(file, "{}", std::process::id());
+        Ok(LocationLock { _file: file })
+    }
+}
+
 /// The databases this process serves.
 pub struct DatabaseCatalog {
     /// Behind a `std` `Arc` so the automatic compaction can hold it weakly
@@ -116,6 +174,9 @@ pub struct DatabaseCatalog {
     /// Each branch's merge base, once opened: `(generation, database)`.
     #[cfg(feature = "db_branching")]
     bases: DashMap<String, (u64, Arc<Database>), ahash::RandomState>,
+    /// Held for the catalogue's life; `None` in memory and for a catalogue
+    /// over databases another one opened.
+    _lock: Option<LocationLock>,
 }
 
 /// Keeps a database attached for as long as a session is using it.
@@ -168,6 +229,10 @@ impl DatabaseCatalog {
         let in_memory = root.is_none();
         let location = root.unwrap_or("");
 
+        // Before anything in the directory is read: a second engine must not
+        // even replay the first one's log.
+        let lock = root.map(LocationLock::take).transpose()?;
+
         // Refusals come back as errors, so the server can say which database
         // would not open and exit, rather than unwinding out of here.
         let default = Database::try_new_named(location, in_memory, default_name).await?;
@@ -192,6 +257,7 @@ impl DatabaseCatalog {
             fixed: false,
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
+            _lock: lock,
         });
         if let Some(root) = root {
             sweep_dropped(std::path::Path::new(root));
@@ -232,6 +298,7 @@ impl DatabaseCatalog {
             fixed: false,
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
+            _lock: None,
         })
     }
 
@@ -252,6 +319,7 @@ impl DatabaseCatalog {
             fixed: true,
             #[cfg(feature = "db_branching")]
             bases: DashMap::with_hasher(ahash::RandomState::new()),
+            _lock: None,
         })
     }
 
@@ -1011,6 +1079,34 @@ mod tests {
     /// recreated database reuses that directory's path. Remembered across the
     /// drop, it refused every commit of the new database — for files that had
     /// been unlinked — until the process restarted.
+    /// Two engines on one directory would replay and truncate each other's
+    /// log: the second open is refused before it reads anything, and the
+    /// directory opens again once the first catalogue is gone.
+    #[tokio::test]
+    async fn a_second_catalogue_on_one_directory_is_refused() {
+        init_globals();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_str().unwrap();
+        let first = DatabaseCatalog::open(Some(path), DEFAULT_DATABASE_NAME).await.unwrap();
+        let wal = root.path().join(crate::core::wal::DEFAULT_WAL_NAME);
+        let wal_before = std::fs::metadata(&wal).map(|m| m.len()).ok();
+
+        let refused = match DatabaseCatalog::open(Some(path), DEFAULT_DATABASE_NAME).await {
+            Err(e) => e,
+            Ok(_) => panic!("a second catalogue opened the same directory"),
+        };
+        assert!(refused.contains("already open"), "{refused}");
+        assert!(refused.contains(&std::process::id().to_string()) || cfg!(windows), "{refused}");
+        assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).ok(), wal_before, "the refused open touched the log");
+
+        // A backup or a branch copies the directory, never the lock.
+        #[cfg(feature = "s3_backup")]
+        assert!(crate::core::backup::excluded_from_copy(LOCK_FILE));
+
+        drop(first);
+        DatabaseCatalog::open(Some(path), DEFAULT_DATABASE_NAME).await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_recreated_database_does_not_inherit_a_dropped_one_s_flush_failure() {
         use crate::core::storage_providers::file_sync::{

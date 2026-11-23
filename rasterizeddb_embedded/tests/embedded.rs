@@ -10,6 +10,15 @@ fn builder(b: Builder) -> Builder {
     if cfg!(unix) { b } else { b.password("app", "embedded-test-password") }
 }
 
+/// One engine runs in a process at a time (a second start is refused), and
+/// the test functions here run in parallel: each holds this while its
+/// engine runs.
+static ONE_ENGINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_engine() -> std::sync::MutexGuard<'static, ()> {
+    ONE_ENGINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 async fn count(client: &rasterizeddb_embedded::Client, sql: &str) -> i64 {
     let rows = client.query(sql, &[]).await.unwrap();
     assert_eq!(rows.len(), 1, "{sql}");
@@ -18,6 +27,7 @@ async fn count(client: &rasterizeddb_embedded::Client, sql: &str) -> i64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn in_memory_round_trip() {
+    let _one = one_engine();
     let db = builder(Builder::in_memory()).worker_threads(2).start().await.unwrap();
     let client = db.connect().await.unwrap();
     client.execute("CREATE TABLE notes (id BIGINT, body TEXT)", &[]).await.unwrap();
@@ -36,6 +46,7 @@ async fn in_memory_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_directory_survives_shutdown_and_reopen() {
+    let _one = one_engine();
     let dir = tempfile::tempdir().unwrap();
     {
         let db = builder(Builder::open(dir.path())).worker_threads(2).start().await.unwrap();
@@ -63,6 +74,7 @@ async fn a_directory_survives_shutdown_and_reopen() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transaction_rolls_back() {
+    let _one = one_engine();
     let db = builder(Builder::in_memory()).worker_threads(2).start().await.unwrap();
     let client = db.connect().await.unwrap();
     client.execute("CREATE TABLE t (id BIGINT)", &[]).await.unwrap();
@@ -77,6 +89,7 @@ async fn a_transaction_rolls_back() {
 
 #[test]
 fn starts_and_stops_without_a_runtime() {
+    let _one = one_engine();
     let db = builder(Builder::in_memory()).worker_threads(1).start_blocking().unwrap();
     assert!(!db.endpoint().is_empty());
     db.shutdown_blocking().unwrap();
@@ -85,6 +98,7 @@ fn starts_and_stops_without_a_runtime() {
 #[cfg(not(unix))]
 #[test]
 fn loopback_without_a_password_is_refused() {
+    let _one = one_engine();
     let err = Builder::in_memory().start_blocking().err().expect("refused");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }

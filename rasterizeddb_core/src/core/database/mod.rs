@@ -4839,6 +4839,14 @@ impl NativeServer {
         self.tcp.as_ref().map(|s| s.local_endpoint())
     }
 
+    /// The SHA-256 fingerprint of the certificate the TCP listener
+    /// presents, when TCP is served: what a client pins
+    /// (`rastcp::tls::Trust::Pinned`) to believe this server alone,
+    /// including a certificate it made for itself at start.
+    pub fn tcp_certificate_fingerprint(&self) -> Option<rastcp::tls::Fingerprint> {
+        self.tcp.as_ref().and_then(|s| s.certificate_fingerprint())
+    }
+
     /// The unix socket served (`unix:/path`), when one is.
     pub fn socket_endpoint(&self) -> Option<String> {
         self.socket.as_ref().map(|(s, _)| s.local_endpoint())

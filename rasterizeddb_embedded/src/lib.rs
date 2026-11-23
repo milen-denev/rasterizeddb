@@ -32,7 +32,10 @@
 //!   functions, privileges), so an embedded database answers exactly as a
 //!   server would.
 //! - **Signals stay yours.** Nothing here installs a Ctrl+C or SIGTERM
-//!   handler. Stop the engine with [`Embedded::shutdown`]: it drains the
+//!   handler: a start turns the engine's own off for the whole process
+//!   (`engine::shutdown::set_signal_hooks(false)`), so neither the native
+//!   listener nor a replication listener brought up later by `REPLICATION
+//!   ENABLE` takes them. Stop the engine with [`Embedded::shutdown`]: it drains the
 //!   requests in flight, seals the index snapshots and checkpoints the
 //!   write-ahead log, so the next open has nothing to replay. Dropping an
 //!   [`Embedded`] does the same, blocking the dropping thread until it is
@@ -89,20 +92,32 @@
 //! - **Hot keys** (`wal.synchronous_commit`, `auto_compact.*`, `filter.*`,
 //!   `partition.*`, `index_snapshot.*`, `query_stats.*`, `vacuum.enabled`)
 //!   can also be changed on the running engine, with `SET CONFIG key = value`
-//!   through any client. A Builder value is only where they start.
+//!   through any client, which also saves the process-wide ones to
+//!   `rasterizeddb.conf` for the next start. A Builder value is only where
+//!   they start.
 //! - **Startup keys** (`server.*`, `index.*`, `wal.checkpoint_bytes`,
-//!   `wal.prealloc_kb`, `cache.enabled`) are read once. `SET CONFIG` on one
+//!   `wal.prealloc_kb`, `cache.enabled`, `cache.size`, `partition.max_open`)
+//!   are read once. `SET CONFIG` on one
 //!   saves it to `rasterizeddb.conf` in the database directory, and the next
 //!   [`Builder::start`] on that directory applies it. A value given to the
 //!   Builder wins over a saved one, as a server's flag does; `SHOW CONFIG`
 //!   shows each value's source (a Builder value reads `command line`).
 //!
-//! **Settings are the process's, not one database's.** The engine keeps them
-//! in process-wide state, so two [`Embedded`] in one process share them: the
-//! second start's values replace the first's for both. A startup value that
-//! cannot change any more, because an engine already runs in this process
-//! with another, makes [`Builder::start`] fail rather than run with a value
-//! nobody asked for.
+//! **One engine at a time in a process.** The engine keeps its settings in
+//! process-wide state, and `SET CONFIG` saves to the running engine's
+//! directory, so a second engine alongside the first would change the
+//! first's settings and save into the wrong file. [`Builder::start`] refuses
+//! while another [`Embedded`] runs (`ErrorKind::AlreadyExists`); serve
+//! several databases from one engine with `CREATE DATABASE` instead. A start
+//! after a stop is fine. Startup values the first engine fixed (the
+//! `OnceLock`s: batch size, worker permits, log checkpoint size, …) stay
+//! fixed for the process: a later start asking for another value fails
+//! rather than run with a value nobody asked for.
+//!
+//! **One process per directory.** The directory is locked
+//! (`rasterizeddb.lock`, an operating-system lock that ends with its holder)
+//! for as long as an engine has it open: a second process, or a server
+//! binary, opening it is refused instead of corrupting it.
 //!
 //! Freed memory goes back to the operating system once the engine has been
 //! idle for a few seconds ([`Builder::idle_trim`], on by default, glibc
@@ -158,10 +173,33 @@ pub struct Builder {
     settings: Settings,
 }
 
+/// Shows where and how the engine would start, and the settings given as
+/// `section.key` values; never the password.
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field(
+                "location",
+                &match &self.location {
+                    Location::Memory => "memory".to_string(),
+                    Location::Directory(dir) => dir.display().to_string(),
+                },
+            )
+            .field("worker_threads", &self.worker_threads)
+            .field("user", &self.credentials.as_ref().map(|(user, _)| user))
+            .field("password", &self.credentials.as_ref().map(|_| "<hidden>"))
+            .field("allow_unauthenticated_loopback", &self.allow_unauthenticated_loopback)
+            .field("request_timeout", &self.request_timeout)
+            .field("config", &self.settings.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Builder {
     /// A database kept in `directory`, created if it does not exist. A
     /// directory written by the server binary opens here, and the reverse.
-    /// One process at a time may open a directory.
+    /// One process at a time may open a directory: another one's open (or
+    /// the server binary's) is refused while this engine runs.
     pub fn open(directory: impl Into<PathBuf>) -> Self {
         Self::new(Location::Directory(directory.into()))
     }
@@ -502,6 +540,14 @@ impl Builder {
     }
 
     fn launch(self) -> io::Result<(oneshot::Receiver<io::Result<Ready>>, Embedded)> {
+        // First: a refused start must leave the running engine's settings
+        // alone. Held by the engine thread until it ends; dropped here if
+        // the start fails before that thread exists.
+        let slot = EngineSlot::take()?;
+        // Before anything the engine starts: none of it may take the
+        // host's Ctrl+C or SIGTERM.
+        rasterizeddb_core::shutdown::set_signal_hooks(false);
+
         let missing = rasterizeddb_core::simds::cpu::features().baseline_missing();
         if !missing.is_empty() {
             return Err(io::Error::new(
@@ -592,6 +638,9 @@ impl Builder {
             .stack_size(ENGINE_STACK)
             .spawn(move || {
                 let result = engine_thread(root, auth, listen, workers, deferred, ready_tx, stop_rx);
+                // Free before the result is sent: a caller that awaits
+                // `shutdown` and starts again at once must find it free.
+                drop(slot);
                 let _ = done_tx.send(result);
             });
         let thread = match spawned {
@@ -606,6 +655,7 @@ impl Builder {
             Embedded {
                 endpoint: String::new(),
                 login,
+                fingerprint: None,
                 catalog: None,
                 stop: Some(stop_tx),
                 done: Some(done_rx),
@@ -616,9 +666,37 @@ impl Builder {
     }
 }
 
+/// The process's one running engine ([`Builder::start`]).
+static ENGINE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds [`ENGINE_RUNNING`] until dropped.
+struct EngineSlot;
+
+impl EngineSlot {
+    fn take() -> io::Result<Self> {
+        ENGINE_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| EngineSlot)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "an embedded engine already runs in this process: its settings are process-wide                      and SET CONFIG saves to its directory, so a second engine alongside it would                      change both. Stop the first (Embedded::shutdown), or serve more databases                      from it with CREATE DATABASE",
+                )
+            })
+    }
+}
+
+impl Drop for EngineSlot {
+    fn drop(&mut self) {
+        ENGINE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
 struct Ready {
     endpoint: String,
     catalog: rclite::Arc<DatabaseCatalog>,
+    /// The loopback TCP listener's certificate, off unix.
+    fingerprint: Option<[u8; 32]>,
 }
 
 fn engine_thread(
@@ -679,9 +757,10 @@ fn engine_thread(
                 .socket_endpoint()
                 .or_else(|| server.tcp_endpoint())
                 .ok_or_else(|| io::Error::other("the engine bound no endpoint"))?;
-            io::Result::Ok((catalog, server, endpoint))
+            let fingerprint = server.tcp_certificate_fingerprint();
+            io::Result::Ok((catalog, server, endpoint, fingerprint))
         };
-        let (catalog, server, endpoint) = match started.await {
+        let (catalog, server, endpoint, fingerprint) = match started.await {
             Ok(started) => started,
             Err(e) => {
                 let _ = ready_tx.send(Err(io::Error::new(e.kind(), e.to_string())));
@@ -693,6 +772,7 @@ fn engine_thread(
         let _ = ready_tx.send(Ok(Ready {
             endpoint,
             catalog: catalog.clone(),
+            fingerprint,
         }));
 
         // A stop request, or the Embedded gone without one: either way, stop.
@@ -708,6 +788,13 @@ fn engine_thread(
         // seals and checkpoints at.
         rasterizeddb_core::shutdown::seal_all(&catalog).await;
         rasterizeddb_core::shutdown::finalize();
+        // The logs are checkpointed and this was the process's one engine:
+        // forget them, or every stop and start on another directory would
+        // keep one more open log (and its descriptor) for the life of the
+        // host, and checkpoint it again at every later stop.
+        for (dir, _) in rasterizeddb_core::core::wal::registered() {
+            rasterizeddb_core::core::wal::remove_for(&dir);
+        }
         served
     });
     // Connection tasks may still be parked; bounded so a client that never
@@ -721,6 +808,9 @@ fn engine_thread(
 pub struct Embedded {
     endpoint: String,
     login: Login,
+    /// The loopback TCP listener's certificate (off unix): what
+    /// [`Embedded::options`] pins.
+    fingerprint: Option<[u8; 32]>,
     catalog: Option<rclite::Arc<DatabaseCatalog>>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<io::Result<()>>>,
@@ -728,10 +818,21 @@ pub struct Embedded {
     private_dir: Option<PathBuf>,
 }
 
+/// The endpoint, and whether the engine is still running; never the login.
+impl std::fmt::Debug for Embedded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedded")
+            .field("endpoint", &self.endpoint)
+            .field("running", &self.thread.as_ref().is_some_and(|t| !t.is_finished()))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Embedded {
     fn ready(mut self, ready: Ready) -> Self {
         self.endpoint = ready.endpoint;
         self.catalog = Some(ready.catalog);
+        self.fingerprint = ready.fingerprint;
         self
     }
 
@@ -752,10 +853,17 @@ impl Embedded {
     }
 
     /// The [`Options`] [`Embedded::connect`] uses: the client's defaults with
-    /// this database's login. Adjust and pass to [`Embedded::connect_with`].
+    /// this database's login, and off unix, where the endpoint is a loopback
+    /// TCP port, trust in this engine's own certificate alone (pinned by its
+    /// fingerprint): a process that took the port first cannot pose as it.
+    /// Adjust and pass to [`Embedded::connect_with`].
     pub fn options(&self) -> Options {
         Options {
             login: self.login.clone(),
+            trust: match self.fingerprint {
+                Some(fingerprint) => rasterizeddb_client::Trust::Pinned(vec![fingerprint]),
+                None => Options::default().trust,
+            },
             ..Options::default()
         }
     }
@@ -830,15 +938,24 @@ impl Drop for Embedded {
 #[cfg(unix)]
 fn private_socket_dir() -> io::Result<Option<PathBuf>> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::hash::{BuildHasher, Hasher};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir();
-    let base = if base.as_os_str().len() > 80 { PathBuf::from("/tmp") } else { base };
+    // The whole socket path must fit a sockaddr_un (107 bytes on Linux, 103
+    // on macOS); checking only the base left room for a TMPDIR whose
+    // directory and socket names together ran past it.
+    const SOCKET_PATH_MAX: usize = 100;
+    let fits = |dir: &std::path::Path| dir.join("native.sock").as_os_str().len() <= SOCKET_PATH_MAX;
+    let temp = std::env::temp_dir();
     for _ in 0..16 {
-        let dir = base.join(format!(
-            "rdb-embedded-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        // Unpredictable, so that another local user cannot claim the names
+        // ahead of this process and block its start.
+        let mut random = std::collections::hash_map::RandomState::new().build_hasher();
+        random.write_u64(NEXT.fetch_add(1, Ordering::Relaxed));
+        let name = format!("rdb-embedded-{}-{:016x}", std::process::id(), random.finish());
+        let dir = match temp.join(&name) {
+            dir if fits(&dir) => dir,
+            _ => PathBuf::from("/tmp").join(&name),
+        };
         match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => return Ok(Some(dir)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,

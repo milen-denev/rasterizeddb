@@ -148,6 +148,9 @@ const EXCLUDED: &[&str] = &[
     // new files, and its first open records their own.
     FLOORS_FILE,
     INSTANCE_FILE,
+    // The serving process's lock: this node's, not the data's, and on
+    // Windows unreadable while held.
+    crate::core::database::catalog::LOCK_FILE,
     "temp.db",
     // Holds copies of what is being uploaded, one subdirectory per log.
     // Backing it up would nest a snapshot inside a snapshot; the walk below

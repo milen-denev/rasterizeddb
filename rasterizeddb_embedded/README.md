@@ -59,7 +59,8 @@ Three things to know:
 
 - **Hot keys change on the running engine.** `SET CONFIG wal.synchronous_commit = off` through any client works as it does on a server, and `SHOW CONFIG` lists every key with its value. With a database directory the change is also saved to `rasterizeddb.conf` there, so the next start keeps it, except for `replication.*` and `vacuum.enabled`, which act on one database. The Builder only sets where a hot key starts, and is not saved; a key the Builder gives wins over a saved one.
 - **Startup keys are read once.** `SET CONFIG` on one (`server.*`, `index.*`, `wal.checkpoint_bytes`, `wal.prealloc_kb`, `cache.enabled`, `cache.size`) saves it to `rasterizeddb.conf` in the database directory, and the next start on that directory applies it. A value given to the Builder wins over a saved one.
-- **Settings belong to the process, not to one database.** Two embedded engines in one process share them. `start` fails if it is given a startup value that can no longer change because an engine in this process already runs with another.
+- **One engine at a time in a process.** Settings are the process's, and `SET CONFIG` saves to the running engine's directory, so `start` refuses while another engine runs (`ErrorKind::AlreadyExists`); serve several databases from one engine with `CREATE DATABASE`. A start after a stop is fine, but a startup value the first engine fixed (batch size, worker permits, …) stays fixed: asking for another fails rather than running with a value nobody asked for.
+- **Your signals stay yours.** Starting turns the engine's own Ctrl+C/SIGTERM handling off for the process, including a replication listener started later by `REPLICATION ENABLE`. Stop the engine with `shutdown()` (or `shutdown_blocking()`), or by dropping it, which blocks until the log is checkpointed.
 
 Memory the engine frees goes back to the operating system once it has been idle for a few seconds (`idle_trim`, on by default; glibc only).
 
@@ -72,7 +73,7 @@ Memory the engine frees goes back to the operating system once it has been idle 
 
 On x86-64 the engine needs an AVX2 CPU (x86-64-v3). `start` refuses on older CPUs rather than crash. For full speed, build with `RUSTFLAGS="-C target-cpu=x86-64-v3"`. ARM64 (aarch64) needs nothing extra.
 
-A database directory written by the `rasterizeddb` server binary opens here, and the reverse. Only one process may have a directory open at a time.
+A database directory written by the `rasterizeddb` server binary opens here, and the reverse. Only one engine may have a directory open at a time: it holds an operating-system lock on `rasterizeddb.lock` there, so a second process, the server binary, or another engine in this process is refused with "already open" instead of corrupting the directory. The lock ends with its holder, even a killed one.
 
 ## License
 
