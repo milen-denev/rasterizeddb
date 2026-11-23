@@ -1656,6 +1656,13 @@ impl KvFile {
         if reads.is_empty() {
             return Ok(());
         }
+        // Resident, the whole batch: one pass under the two read locks
+        // (`try_read_many_sync`). Each read below runs the fetch path's
+        // overlay and page-map steps of its own: an index's hundred rows
+        // were a hundred of those per statement, a fan-out's scan thousands.
+        if self.try_read_many_sync(reads) {
+            return Ok(());
+        }
         let len = self.len.load(Ordering::Acquire);
         let base_len = self.base_len.load(Ordering::Acquire);
 
@@ -1688,7 +1695,12 @@ impl KvFile {
             self.pages(&wanted, base_len).await?;
         }
 
-        // Every page the batch needs is resident now, so each read is memory work.
+        // Every page the batch needs is resident now: the same one pass,
+        // unless a page went again or a read runs past the end, which the
+        // reads one at a time below answer.
+        if self.try_read_many_sync(reads) {
+            return Ok(());
+        }
         let mut first_error = None;
         for (position, buf) in reads.iter_mut() {
             match self.read_at_inner(*position, buf, false).await {

@@ -339,8 +339,25 @@ Two fixes, so far:
   now tries the row fetch's resident path (`try_read_many_sync`) first:
   748k to 666k instructions for the indexed lookup.
 
-Still open: an indexed or routed-and-indexed read on a store table costs
-about 2.6x files, spread through the per-row read path with no single
-hotspot. A load is about 7x slower (284 s against 40 s for 2 x 100k rows,
+- **A batch of rows took the per-read path.** `KvFile::read_many`, which
+  the row fetch takes for an index's rows and a scan's batches, fetched
+  the batch's pages and then ran every read through the async path, with
+  its overlay steps and page map, once per row. That was 100 calls per
+  indexed lookup and about 16,000 per fan-out. It now serves the whole
+  batch in one `try_read_many_sync` pass, before fetching anything and
+  again after, and goes read by read only when that pass declines (a page
+  evicted again, a read past the end).
+
+After all three, in instructions per query (files, then store): the
+indexed lookup 349k / 587k (1.7x, was about 3x), the primary-key range
+302k / 384k (1.27x, was 1.75x), routed + index 349k / 624k (1.8x, was
+2.6x), the 64-partition fan-out on the index 50.4M / 81.0M (1.6x). Point
+reads are level. The file figures move about 30% between runs, because
+background threads count too, so compare the ratios.
+
+Still open: about 1.3-1.8x on reads of many rows. That is the sync pass's
+own work (the state and cache read locks, overlay checks and a copy per
+row, where a file borrows). Closing it means letting a store file lend
+resident pages (`try_borrow_range`), a design change, not done. A load is about 7x slower (284 s against 40 s for 2 x 100k rows,
 multi-row INSERTs). S3 (MinIO/RustFS) is not measured yet; no S3 image is
 on this box.
