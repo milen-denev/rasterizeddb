@@ -948,6 +948,95 @@ async fn a_promoted_middle_takes_its_branches_with_it() {
     );
 }
 
+/// A table placed on a second disk, and partitions dealt over it, come over
+/// as the branch's own: the branch's pool file names its own copy of the
+/// disk, never the parent's, so its reads hold every row and its writes
+/// leave the parent's disk as it was. A branch whose pool file kept the
+/// parent's path would read and write the parent's files; one that lost
+/// the placement would read the table as empty. Both silently.
+#[cfg(feature = "storage_pools")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_on_a_second_disk_comes_over_as_the_branchs_own() {
+    let fx = seeded("disk").await;
+    let disk = tempfile::tempdir().unwrap();
+    let disk_path = disk.path().to_string_lossy().into_owned();
+    let mut prod = fx.client("prod");
+    prod.exec(&format!("STORAGE ADD LOCATION '{disk_path}'")).await;
+    prod.exec(&format!("STORAGE PLACE TABLE far AT '{disk_path}'")).await;
+    prod.exec("CREATE TABLE far (id INT PRIMARY KEY, what TEXT)").await;
+    let rows: Vec<String> = (0..50).map(|i| format!("({i}, 'f{i}')")).collect();
+    prod.exec(&format!("INSERT INTO far (id, what) VALUES {}", rows.join(", "))).await;
+    prod.exec("STORAGE SET POLICY = 'round-robin'").await;
+    prod.exec("CREATE TABLE spread (k BIGINT NOT NULL PRIMARY KEY, n INT) PARTITION BY HASH (k) PARTITIONS 4")
+        .await;
+    let rows: Vec<String> = (0..40).map(|i| format!("({i}, {i})")).collect();
+    prod.exec(&format!("INSERT INTO spread (k, n) VALUES {}", rows.join(", "))).await;
+    let on_disk = |dir: &std::path::Path| -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len()))
+            .filter(|(name, _)| name.ends_with(".db"))
+            .collect();
+        v.sort();
+        v
+    };
+    let parent_disk = on_disk(disk.path());
+    assert!(parent_disk.iter().any(|(n, _)| n.starts_with("far")), "far is not on the disk: {parent_disk:?}");
+    assert!(
+        parent_disk.iter().any(|(n, _)| !n.starts_with("far")),
+        "no partition was dealt to the disk, so the test does not cover them: {parent_disk:?}"
+    );
+
+    let mut admin = fx.client("postgres");
+    admin.exec("CREATE BRANCH dev FROM prod").await;
+    // Every location and placement names the branch's own directory. The
+    // parent's disk appears only as an alias's source, mapped into the
+    // branch, which is how a partition map naming the old path resolves.
+    let dev_dir = fx.root.join("dev").to_string_lossy().into_owned();
+    let pool = std::fs::read_to_string(fx.root.join("dev").join(crate::core::storage::POOL_FILE)).unwrap();
+    for line in pool.lines().filter(|l| !l.starts_with('#')) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["location", .., at] | ["table", at, _] => assert!(
+                at.starts_with(&dev_dir) || *at == "memory",
+                "the branch's pool file places outside the branch:\n{pool}"
+            ),
+            ["alias", _, to] => assert!(to.starts_with(&dev_dir), "an alias leaves the branch:\n{pool}"),
+            _ => {}
+        }
+    }
+
+    let mut dev = fx.client("dev");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM far").await, "50");
+    assert_eq!(dev.scalar("SELECT what FROM far WHERE id = 7").await, "f7");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM spread").await, "40");
+
+    // The branch's writes are its own: the parent's disk is untouched.
+    dev.exec("DELETE FROM far WHERE id < 10").await;
+    dev.exec("INSERT INTO far (id, what) VALUES (100, 'dev')").await;
+    dev.exec("UPDATE spread SET n = n + 1000").await;
+    dev.exec("INSERT INTO spread (k, n) VALUES (100, 100)").await;
+    assert_eq!(on_disk(disk.path()), parent_disk, "a write to the branch changed the parent's disk");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM far").await, "50");
+    assert_eq!(prod.scalar("SELECT SUM(n) FROM spread").await, "780");
+
+    // And a restart reads both back the same.
+    drop((dev, prod, admin));
+    let mut fx = fx;
+    fx.reopen().await;
+    let mut dev = fx.client("dev");
+    let mut prod = fx.client("prod");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM far").await, "41");
+    assert_eq!(dev.scalar("SELECT COUNT(*) FROM spread").await, "41");
+    assert_eq!(dev.scalar("SELECT SUM(n) FROM spread").await, "40880");
+    assert_eq!(prod.scalar("SELECT COUNT(*) FROM far").await, "50");
+    assert_eq!(prod.scalar("SELECT SUM(n) FROM spread").await, "780");
+    drop((dev, prod));
+    crate::core::wal::remove_for(&disk_path);
+}
+
 #[cfg(all(feature = "storage_pools", feature = "kv_storage"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_table_on_a_store_comes_over_as_the_branchs_own() {
