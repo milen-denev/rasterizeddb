@@ -6351,8 +6351,13 @@ fn expand_expression_in_lists(clause: &str) -> String {
                     i += 1;
                     continue;
                 }
+                // An empty list (`NOT IN ()`, an IN subquery that found no
+                // rows, substituted) or an empty item is the other paths'.
                 let items = split_row_items(inner);
-                if items.is_empty() || items.iter().all(|item| is_literal_item(item)) {
+                if items.is_empty()
+                    || items.iter().any(|item| item.trim().is_empty())
+                    || items.iter().all(|item| is_literal_item(item))
+                {
                     i = close + 1;
                     continue;
                 }
