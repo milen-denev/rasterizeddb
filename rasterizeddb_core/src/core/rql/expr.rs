@@ -1267,6 +1267,78 @@ pub(crate) fn array_constructor_body(text: &str) -> Option<&str> {
 }
 
 /// Parses one expression against `schema`.
+/// Whether `text` is a predicate — a value that is true, false or unknown —
+/// rather than an expression: it has, outside quotes and parentheses, a
+/// comparison operator or one of `LIKE`, `ILIKE`, `SIMILAR`, `BETWEEN`,
+/// `IN (`, `IS`, `AND`, `OR`, `NOT`. A `CASE` or a subquery is never one:
+/// its own conditions are inside it.
+pub(crate) fn is_predicate(text: &str) -> bool {
+    let text = text.trim();
+    if crate::core::sql_scan::starts_with_keyword(text, "SELECT")
+        || crate::core::sql_scan::starts_with_keyword(text, "CASE")
+        || crate::core::sql_scan::starts_with_keyword(text, "WITH")
+        || crate::core::sql_scan::starts_with_keyword(text, "VALUES")
+    {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let operator_byte = |b: u8| matches!(b, b'<' | b'>' | b'=' | b'!' | b'-' | b'@' | b'#' | b'|' | b'&' | b'~' | b'^' | b'*' | b'+' | b'/' | b'%');
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' | b'"' => {
+                i = crate::core::sql_scan::quoted_end(bytes, i, b);
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            b'=' | b'<' | b'>' | b'!' | b'~' => {
+                // One comparison operator, on its own: `=`, `<>`, `!=`, `<`,
+                // `>`, `<=`, `>=`, and the regular-expression matches `~`,
+                // `~*`, `!~`, `!~*` (what `SIMILAR TO` is lowered to before
+                // this reads it) — not `->`, `->>`, `=>`, `<@`, `@>`, `#>`,
+                // `<<`, `>>`, `||` or any longer operator.
+                let mut end = i;
+                while end < bytes.len() && operator_byte(bytes[end]) {
+                    end += 1;
+                }
+                let start_ok = i == 0 || !operator_byte(bytes[i - 1]);
+                let op = &text[i..end];
+                if start_ok && i > 0 && matches!(op, "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=" | "~" | "~*" | "!~" | "!~*") {
+                    return true;
+                }
+                i = end;
+                continue;
+            }
+            _ if b.is_ascii_alphabetic() && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'.')) => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                let rest = text[i..].trim_start();
+                // A name followed by `(` or `.` is a call or a qualifier.
+                let called = rest.starts_with('(') && !word.eq_ignore_ascii_case("IN");
+                if !called && !rest.starts_with('.') {
+                    if ["LIKE", "ILIKE", "SIMILAR", "BETWEEN", "IS", "AND", "OR", "NOT"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                        return true;
+                    }
+                    if word.eq_ignore_ascii_case("IN") && rest.starts_with('(') {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -1280,7 +1352,18 @@ pub fn parse(text: &str, schema: &[SchemaField]) -> Result<Expr, String> {
     if text.starts_with('(') {
         if let Some(close) = matching_paren(text, 0) {
             if close == text.len() - 1 {
-                return parse(&text[1..close], schema);
+                let inner = &text[1..close];
+                // A predicate in parentheses is a boolean value:
+                // `('abc' LIKE '%b%')::text`, `'x' || (m LIKE '%o%')::text`.
+                // Read as an expression it was a column named after itself,
+                // or a call named `''`. It is the CASE it means, with
+                // SQL's third value kept: TRUE when it holds, FALSE when its
+                // NOT holds, and NULL when neither does (`NULL LIKE 'a'`),
+                // as PostgreSQL answers.
+                if is_predicate(inner) {
+                    return parse(&format!("CASE WHEN {inner} THEN TRUE WHEN NOT ({inner}) THEN FALSE END"), schema);
+                }
+                return parse(inner, schema);
             }
         }
     }
