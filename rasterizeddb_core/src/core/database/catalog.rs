@@ -136,7 +136,9 @@ impl LocationLock {
                 let _ = file.read_to_string(&mut holder);
                 let holder = holder.trim();
                 return Err(format!(
-                    "{root} is already open in another RasterizedDB ({}): two engines on one data                      directory would corrupt it, so this one does not open it. Stop the other, or                      use another directory",
+                    "{root} is already open in another RasterizedDB ({}): two engines on one data \
+                     directory would corrupt it, so this one does not open it. Stop the other, \
+                     or use another directory",
                     if holder.is_empty() {
                         "another process, or an earlier engine in this one".to_string()
                     } else {

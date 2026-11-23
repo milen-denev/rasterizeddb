@@ -1,5 +1,15 @@
 # Rasterized DB
 
+> **API stability.** What is stable is the server: the `rasterizeddb` binary,
+> its command-line flags, its wire protocols (PostgreSQL, native, MySQL, SQL
+> Server, RESP) and the SQL it answers. The Rust API of this crate,
+> `rasterizeddb_core`, is the server's internals: it is published so the server
+> and the embedded SDK can be built from crates.io, and **any of it may change
+> in any release, a patch release included**. To run the database inside an
+> application, use [`rasterizeddb_embedded`](https://crates.io/crates/rasterizeddb_embedded);
+> to talk to a server, [`rasterizeddb_client`](https://crates.io/crates/rasterizeddb_client).
+> Both follow semver.
+
 ## A new schemaless, high-performance database written from scratch in Rust.
 
 ### Vision
