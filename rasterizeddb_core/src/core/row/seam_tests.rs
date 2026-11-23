@@ -104,6 +104,7 @@ const CALLED_ON_SHELL: &[&str] = &[
     "point_indexes",
     "insert_row",
     "insert_row_in_txn",
+    "insert_conflict_in_txn",
     "insert_version",
     "query_row",
     "count_rows_in_txn",
@@ -476,6 +477,7 @@ async fn a_shell_refuses_every_data_method() {
     expect("point_indexes", unit(shell.point_indexes()));
     expect("insert_row", unit(shell.insert_row(row(1)).await));
     expect("insert_row_in_txn", unit(shell.insert_row_in_txn(row(1), FROZEN_TX).await));
+    expect("insert_conflict_in_txn", unit(shell.insert_conflict_in_txn(row(1), FROZEN_TX).await));
     expect("insert_version", unit(shell.insert_version(row(1), FROZEN_TX, crate::core::mvcc::transaction::NO_TX).await));
     expect(
         "query_row",

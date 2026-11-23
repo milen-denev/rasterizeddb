@@ -22169,6 +22169,12 @@ async fn insert_row_resolved(
     // `early_row` is the row when the check had to encode it to read a key
     // (`Some(None)`: it was refused). Boxed, as it is held across the check.
     let mut early_row: Option<Option<Box<crate::core::row::row::RowWrite>>> = None;
+    // A violation found, reported only once the row is known to be one the
+    // insert would write: PostgreSQL checks a key after the row is in, so a
+    // CHECK (before it) or a uniqueness violation (at it) is the error
+    // instead, and a row `ON CONFLICT` skips or turns into an update never
+    // has its key checked (`insert_conflict_in_txn` below).
+    let mut foreign_key_error: Option<String> = None;
     // What the statement's scope had deferred before this row's check: a
     // row that is not written takes its own deferred checks back.
     let deferred_at = deferred_mark();
@@ -22217,8 +22223,13 @@ async fn insert_row_resolved(
             if let Err(e) =
                 Box::pin(check_foreign_keys_of(&database, Some(&table.schema), table_name, checked, tx)).await
             {
-                error!("{}", e);
-                return ddl_error(&e);
+                // A partitioned table's row is routed by the write, which
+                // has no check without it: reported now, as before.
+                if partitioned.is_some() {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+                foreign_key_error = Some(e);
             }
         }
         None => {
@@ -22285,9 +22296,19 @@ async fn insert_row_resolved(
         // it on first write; the partition's own unique check is exact
         // because every unique key holds every key column (§1b). Boxed:
         // routing adds a materialization to this arm's future.
-        let outcome = match &partitioned {
-            Some(pt) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
-            None => table.insert_row_in_txn(insert_row, tx).await,
+        let outcome = match (&partitioned, foreign_key_error) {
+            (Some(pt), _) => Box::pin(pt.insert_row_in_txn(insert_row, tx)).await,
+            (None, None) => table.insert_row_in_txn(insert_row, tx).await,
+            // Not written: the uniqueness violation the write would have met
+            // is the statement's answer (`ON CONFLICT`'s, or 23505), and the
+            // key's violation only when there is none.
+            (None, Some(e)) => match Box::pin(table.insert_conflict_in_txn(insert_row, tx)).await {
+                Ok(()) => {
+                    error!("{}", e);
+                    return ddl_error(&e);
+                }
+                Err(conflict) => Err(conflict),
+            },
         };
         // Not written (`ON CONFLICT DO NOTHING` skips it, `DO UPDATE` updates
         // the row it met, which is checked as an update): the key this row

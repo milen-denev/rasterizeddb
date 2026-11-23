@@ -450,3 +450,51 @@ async fn concurrent_inserts_of_one_key_insert_it_once() {
         }
     }
 }
+
+/// PostgreSQL checks a foreign key on the row it inserted: a proposed row
+/// `ON CONFLICT` skips, or turns into an update of the row it met, never has
+/// its key checked, and a uniqueness violation is reported before a missing
+/// parent. Each of these was 23503 here, the key checked first. Every answer
+/// is PostgreSQL 17's, over both protocols.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_or_updated_row_does_not_have_its_foreign_key_checked() {
+    let server = TestServer::start().await.expect("server should start");
+    let c = client(&server).await;
+    c.batch_execute(
+        "CREATE TABLE parn (id INT PRIMARY KEY); INSERT INTO parn VALUES (1), (2); \
+         CREATE TABLE chn (id INT PRIMARY KEY, pn INT REFERENCES parn(id)); INSERT INTO chn VALUES (1, 1)",
+    )
+    .await
+    .expect("setup");
+    let code = |e: tokio_postgres::Error| e.as_db_error().map(|d| d.code().code().to_string()).unwrap_or_default();
+
+    assert_eq!(rows(&c, "INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn").await, ["2"]);
+    assert_eq!(tag(&c, "INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO NOTHING").await, 0);
+    assert_eq!(tag(&c, "INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING").await, 0);
+    assert_eq!(tag(&c, "INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO NOTHING").await, 0);
+    assert_eq!(tag(&c, "INSERT INTO chn VALUES (1, 81), (2, 1), (5, 2) ON CONFLICT (id) DO NOTHING").await, 2);
+    for (sql, expected) in [
+        // Inserted: its key is checked.
+        ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO NOTHING", "23503"),
+        // The update's key is checked.
+        ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = EXCLUDED.pn", "23503"),
+        // The duplicate is the error, not the parent.
+        ("INSERT INTO chn VALUES (1, 81)", "23505"),
+    ] {
+        let e = simple(&c, sql).await.expect_err(sql);
+        assert_eq!(code(e), expected, "{sql}");
+    }
+    assert_eq!(rows(&c, "SELECT id, pn FROM chn ORDER BY id").await, ["1|2", "2|1", "5|2"]);
+
+    // The extended protocol.
+    let skip = c.prepare("INSERT INTO chn VALUES ($1, $2) ON CONFLICT DO NOTHING").await.expect("prepare");
+    assert_eq!(c.execute(&skip, &[&1i32, &81i32]).await.expect("skipped"), 0);
+    let e = c.execute(&skip, &[&30i32, &81i32]).await.expect_err("inserted, no parent");
+    assert_eq!(code(e), "23503");
+    let update = c
+        .prepare("INSERT INTO chn VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET pn = 1 RETURNING pn")
+        .await
+        .expect("prepare");
+    let updated = c.query(&update, &[&2i32, &81i32]).await.expect("updated");
+    assert_eq!(updated.iter().map(|r| r.get::<_, i32>(0)).collect::<Vec<_>>(), [1]);
+}

@@ -1024,3 +1024,133 @@ async fn self_referencing_foreign_key_across_a_copy() {
     .await
     .expect("bounded");
 }
+
+/// Runs `sql`: its rows as `a|b` text (`NULL` for a NULL) and its command
+/// tag, or the error's SQLSTATE.
+async fn answer(db: &Arc<Database>, s: &mut Session, sql: &str) -> Result<(Vec<String>, String), String> {
+    Box::pin(execute_recorded(db, &mut s.state, &mut s.server, sql, &[], false, None))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut out = Vec::new();
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'D' => {
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                let mut at = 2;
+                let mut row = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let l = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+                    at += 4;
+                    if l < 0 {
+                        row.push("NULL".to_string());
+                    } else {
+                        row.push(String::from_utf8_lossy(&body[at..at + l as usize]).into_owned());
+                        at += l as usize;
+                    }
+                }
+                out.push(row.join("|"));
+            }
+            b'C' => return Ok((out, String::from_utf8_lossy(&body).trim_end_matches('\0').to_string())),
+            b'E' => return Err(sqlstate_of(&String::from_utf8_lossy(&body)).to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// PostgreSQL checks a foreign key on the row it inserted, after the row is
+/// in: a row `ON CONFLICT` skips, or turns into an update of the row it met,
+/// never has its proposed key checked, and a CHECK or a uniqueness violation
+/// is the error before a missing parent is. Each row's key was checked first
+/// here, so all of these were 23503. Every answer is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_key_is_checked_on_the_row_the_insert_writes() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        for sql in [
+            "CREATE TABLE parn (id int PRIMARY KEY)",
+            "INSERT INTO parn VALUES (1), (2)",
+            "CREATE TABLE chn (id int PRIMARY KEY, pn int REFERENCES parn(id), c int CHECK (c > 0))",
+            "INSERT INTO chn VALUES (1, 1)",
+            "CREATE TABLE ch2 (id int PRIMARY KEY, u int UNIQUE, pn int REFERENCES parn(id))",
+            "INSERT INTO ch2 VALUES (1, 10, 1)",
+            "CREATE SEQUENCE s1",
+            "CREATE TABLE cs (id int PRIMARY KEY, k bigint DEFAULT nextval('s1'), pn int REFERENCES parn(id))",
+            "INSERT INTO cs VALUES (1, 100, 1)",
+            "CREATE TABLE src (id int, pn int)",
+            "INSERT INTO src VALUES (1, 81), (7, 2), (8, 1)",
+            "CREATE TABLE ck (a char(3), b int, pn int REFERENCES parn(id), PRIMARY KEY (a, b))",
+            "INSERT INTO ck VALUES ('x', 1, 1)",
+        ] {
+            ok(&db, &mut s, sql).await;
+        }
+        let ins = |rows: &[&str], tag: &str| -> Result<(Vec<String>, String), String> {
+            Ok((rows.iter().map(|r| r.to_string()).collect(), tag.to_string()))
+        };
+        let err = |code: &str| -> Result<(Vec<String>, String), String> { Err(code.to_string()) };
+        for (sql, expected) in [
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn", ins(&["2"], "INSERT 0 1")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO NOTHING", ins(&[], "INSERT 0 0")),
+            (
+                "INSERT INTO chn VALUES (1, 81) ON CONFLICT ON CONSTRAINT chn_pkey DO UPDATE SET pn = 1 RETURNING id, pn",
+                ins(&["1|1"], "INSERT 0 1"),
+            ),
+            // No conflict: the row is inserted, and its key is missing.
+            ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("INSERT INTO chn VALUES (20, 81) ON CONFLICT (id) DO UPDATE SET pn = 2", err("23503")),
+            // The update's own key is checked.
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = EXCLUDED.pn", err("23503")),
+            ("INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 99", err("23503")),
+            // A row of a multi-row insert.
+            ("INSERT INTO chn VALUES (1, 81), (2, 1), (3, 82) ON CONFLICT (id) DO NOTHING", err("23503")),
+            ("INSERT INTO chn VALUES (1, 81), (2, 1), (5, 2) ON CONFLICT (id) DO NOTHING", ins(&[], "INSERT 0 2")),
+            (
+                "INSERT INTO chn VALUES (1, 81), (2, 77), (6, 2) ON CONFLICT (id) DO UPDATE SET pn = 1 RETURNING id, pn",
+                ins(&["1|1", "2|1", "6|2"], "INSERT 0 3"),
+            ),
+            ("SELECT id, pn FROM chn ORDER BY id", ins(&["1|1", "2|1", "5|2", "6|2"], "SELECT 4")),
+            // Without the clause, or a clash on another key: 23505 first.
+            ("INSERT INTO chn VALUES (1, 81)", err("23505")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT (id) DO NOTHING", err("23505")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT (u) DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ch2 VALUES (2, 10, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ch2 VALUES (1, 11, 81) ON CONFLICT (u) DO NOTHING", err("23505")),
+            // A CHECK is judged before either.
+            ("INSERT INTO chn VALUES (1, 81, -1) ON CONFLICT DO NOTHING", err("23514")),
+            ("INSERT INTO chn VALUES (30, 81, -1)", err("23514")),
+            // A default computed once per row, the skipped row's too.
+            ("INSERT INTO cs (id, pn) VALUES (1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO cs (id, pn) VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING id, k, pn", ins(&["1|100|2"], "INSERT 0 1")),
+            ("SELECT nextval('s1')", ins(&["3"], "SELECT 1")),
+            // INSERT … SELECT.
+            ("INSERT INTO chn (id, pn) SELECT id, pn FROM src ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 2")),
+            (
+                "INSERT INTO chn (id, pn) SELECT id, pn FROM src ON CONFLICT (id) DO UPDATE SET c = 5 RETURNING id, pn, c",
+                ins(&["1|1|5", "7|2|5", "8|1|5"], "INSERT 0 3"),
+            ),
+            // A key compared as the column stores it.
+            ("INSERT INTO ck VALUES ('x  ', 1, 81) ON CONFLICT DO NOTHING", ins(&[], "INSERT 0 0")),
+            ("INSERT INTO ck VALUES ('x', 1, 81) ON CONFLICT (a, b) DO UPDATE SET pn = 2 RETURNING *", ins(&["x  |1|2"], "INSERT 0 1")),
+            ("INSERT INTO ck VALUES ('x', 2, 81) ON CONFLICT (a, b) DO NOTHING", err("23503")),
+        ] {
+            assert_eq!(answer(&db, &mut s, sql).await, expected, "{sql}");
+        }
+        // In a block: the skipped row does not fail it.
+        ok(&db, &mut s, "BEGIN").await;
+        assert_eq!(answer(&db, &mut s, "INSERT INTO chn VALUES (1, 81) ON CONFLICT DO NOTHING").await, ins(&[], "INSERT 0 0"));
+        assert_eq!(
+            answer(&db, &mut s, "INSERT INTO chn VALUES (1, 81) ON CONFLICT (id) DO UPDATE SET pn = 2 RETURNING pn").await,
+            ins(&["2"], "INSERT 0 1")
+        );
+        ok(&db, &mut s, "ROLLBACK").await;
+        assert_eq!(answer(&db, &mut s, "SELECT pn FROM chn WHERE id = 1").await, ins(&["1"], "SELECT 1"));
+    })
+    .await
+    .expect("bounded");
+}
