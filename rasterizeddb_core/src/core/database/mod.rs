@@ -61,7 +61,8 @@ mod physical_alter_tests;
 mod convert_tests;
 #[cfg(test)]
 mod partition_refusal_codes_tests;
-#[cfg(test)]
+// Places one table on a key/value store (`core::storage`).
+#[cfg(all(test, feature = "kv_storage"))]
 mod path_index_pruning_tests;
 pub mod relation;
 pub mod slots;
