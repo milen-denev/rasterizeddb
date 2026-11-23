@@ -767,14 +767,24 @@ where
     send_message(stream, b'G', &response).await?;
     state.copy_in_ran = true;
 
+    // COPY writes a `GENERATED ALWAYS` identity column's values as given,
+    // as PostgreSQL's does: a dump's data is restored with its keys. As a
+    // plain INSERT every row was refused (428C9) and the table restored
+    // empty. Only for such a table: the clause costs a pass per tuple.
+    let always_identity = database.schema_view(&real).is_some_and(|v| {
+        v.schema().defaults.iter().any(|d| {
+            !d.is_deleted && d.identity == Some(crate::core::rql::column_default::IdentityKind::Always)
+        })
+    });
     let insert_head = format!(
-        "INSERT INTO {} ({}) VALUES ",
+        "INSERT INTO {} ({}) {}VALUES ",
         crate::core::rql::views::quote_ident(&table),
         columns
             .iter()
             .map(|(n, _)| crate::core::rql::views::quote_ident(n))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        if always_identity { "OVERRIDING SYSTEM VALUE " } else { "" }
     );
     let own_block = state.transaction.is_none();
     let mut failure: Option<Refusal> = None;

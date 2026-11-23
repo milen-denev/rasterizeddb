@@ -18364,6 +18364,33 @@ async fn execute_alter_table_action(
                 };
             }
 
+            // `ADD GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( … ) ]`,
+            // which is how `pg_dump` writes an identity column: the table
+            // first, then this. It fell to the warning at the end of this
+            // arm, reported done and doing nothing, so a restored identity
+            // column had no default and every insert failed NOT NULL.
+            if first == "ADD" {
+                return match add_identity(&plan.table_name, &schema, &field, detail[3..].trim()) {
+                    Ok(entry) => match database
+                        .reload_with(&plan.table_name, |old| async move {
+                            crate::core::rql::column_default::append(old.io_schema.clone(), &entry)
+                                .await
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                    {
+                        Ok(()) => ddl_ok(0),
+                        Err(failure) => reload_failed(failure, ""),
+                    },
+                    Err(e) => ddl_error(&e),
+                };
+            }
+            // The other identity forms are not built: refused, where they
+            // were ignored as above.
+            if upper.contains("IDENTITY") || upper.starts_with("SET GENERATED") || first == "RESTART" {
+                return ddl_error(&format!("ALTER COLUMN … {detail} is not supported yet"));
+            }
+
             if upper.contains("NOT NULL") {
                 let currently_nullable = nullable::is_nullable(&name, &schema.fields);
                 if first == "DROP" {
@@ -18497,6 +18524,82 @@ async fn execute_alter_table_action(
             }
         }
     }
+}
+
+/// The default record `ALTER COLUMN c ADD GENERATED … AS IDENTITY [ ( … ) ]`
+/// writes, `clause` being the text after `ADD`: what `CREATE TABLE` records
+/// for an identity column, `nextval` of `<table>_<column>_seq` marked with
+/// its kind, after PostgreSQL's checks in its words. The sequence options
+/// are those `CREATE TABLE` accepts, plus `SEQUENCE NAME` when it names that
+/// sequence (`pg_dump` always writes it): this engine names an identity
+/// column's sequence itself.
+fn add_identity(
+    table: &str,
+    schema: &crate::core::row::schema::TableSchema,
+    field: &crate::core::row::schema::SchemaField,
+    clause: &str,
+) -> Result<crate::core::rql::column_default::ColumnDefault, String> {
+    use crate::core::rql::{column_default, sequence};
+    let expected = sequence::sequence_name(table, &field.name);
+    // `SEQUENCE NAME n` out of the options, checked against the name here.
+    let mut clause = clause.to_string();
+    if let Some(open) = clause.find('(')
+        && let Some(close) = crate::core::sql_scan::matching_close(&clause, open)
+    {
+        let options = clause[open + 1..close].to_string();
+        let words: Vec<&str> = options.split_whitespace().collect();
+        if let Some(at) = words
+            .windows(2)
+            .position(|w| w[0].eq_ignore_ascii_case("SEQUENCE") && w[1].eq_ignore_ascii_case("NAME"))
+        {
+            let named = words.get(at + 2).ok_or("SEQUENCE NAME names no sequence")?;
+            if sequence::sequence_name_of(named) != expected {
+                return Err(format!(
+                    "identity option SEQUENCE NAME {named} is not supported: the sequence of identity column \
+                     \"{}\" of table \"{table}\" is named {expected}",
+                    field.name
+                ));
+            }
+            let rest: Vec<&str> = words[..at].iter().chain(words[at + 3..].iter()).copied().collect();
+            clause = format!("{}({}){}", &clause[..open], rest.join(" "), &clause[close + 1..]);
+        }
+    }
+    let (left, kind) = sequence::split_identity_clause(&clause)?;
+    let Some(kind) = kind.filter(|_| left.trim().is_empty()) else {
+        return Err(format!(
+            "syntax error: ALTER COLUMN {} ADD expects GENERATED {{ ALWAYS | BY DEFAULT }} AS IDENTITY, not ADD {clause}",
+            field.name
+        ));
+    };
+    if !sequence::identity_type_ok(&field.db_type) {
+        return Err("identity column type must be smallint, integer, or bigint".to_string());
+    }
+    if column_default::identity_of(&field.name, &schema.defaults).is_some() {
+        return Err(format!("column \"{}\" of relation \"{table}\" is already an identity column", field.name));
+    }
+    let current = schema.defaults.iter().rev().find(|d| d.column.eq_ignore_ascii_case(&field.name));
+    if current.is_some_and(|d| !d.is_deleted && !d.expression.is_empty()) {
+        return Err(format!("column \"{}\" of relation \"{table}\" already has a default value", field.name));
+    }
+    if crate::core::rql::nullable::is_nullable(&field.name, &schema.fields) {
+        return Err(format!(
+            "column \"{}\" of relation \"{table}\" must be declared NOT NULL before identity can be added",
+            field.name
+        ));
+    }
+    let expression = format!("nextval('{expected}')");
+    if expression.len() > column_default::MAX_IDENTITY_EXPRESSION_LEN {
+        return Err(format!(
+            "the identity column \"{}\" of table \"{table}\" has a name too long for its sequence",
+            field.name
+        ));
+    }
+    Ok(column_default::ColumnDefault {
+        column: field.name.clone(),
+        expression,
+        is_deleted: false,
+        identity: Some(kind),
+    })
 }
 
 /// `ADD [CONSTRAINT n] PRIMARY KEY (…)`, its key already checked against the

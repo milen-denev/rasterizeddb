@@ -486,6 +486,21 @@ fn name_of(t: Option<&Tok<'_>>) -> Option<String> {
     }
 }
 
+/// The table named at `toks[i]`, schema qualifier dropped as every other
+/// statement drops it (`public.t`, `public."T"`, what `pg_dump` writes), and
+/// the index after it.
+fn table_at(toks: &[Tok<'_>], i: usize) -> Option<(String, usize)> {
+    match toks.get(i)? {
+        Tok::Word(w) if w.ends_with('.') => match toks.get(i + 1)? {
+            Tok::Quoted(q) => Some((q.clone(), i + 2)),
+            _ => None,
+        },
+        Tok::Word(w) => Some((w.rsplit('.').next().unwrap_or(w).to_string(), i + 1)),
+        Tok::Quoted(q) => Some((q.clone(), i + 1)),
+        _ => None,
+    }
+}
+
 /// `FOR (…)` at `toks[i..]`: the group's inside and the index after it.
 fn for_group(toks: &[Tok<'_>], i: usize, verb: &str) -> Result<(String, usize), String> {
     if !kw(toks.get(i), "FOR") {
@@ -553,8 +568,8 @@ pub fn parse_alter(sql: &str) -> Option<Result<(String, ReshapeOp), String>> {
     if kw(toks.get(i), "ONLY") {
         i += 1;
     }
-    let table = name_of(toks.get(i))?;
-    i += 1;
+    let (table, next) = table_at(&toks, i)?;
+    i = next;
     let (a, b) = (toks.get(i), toks.get(i + 1));
     let parsed = if kw(a, "SPLIT") && kw(b, "PARTITION") {
         for_group(&toks, i + 2, "SPLIT PARTITION").and_then(|(at, j)| {
@@ -634,8 +649,8 @@ pub fn parse_partition_by(sql: &str) -> Option<Result<Conversion, String>> {
     if kw(toks.get(i), "ONLY") {
         i += 1;
     }
-    let table = name_of(toks.get(i))?;
-    i += 1;
+    let (table, next) = table_at(&toks, i)?;
+    i = next;
     if !(kw(toks.get(i), "PARTITION") && kw(toks.get(i + 1), "BY")) {
         return None;
     }
@@ -676,8 +691,8 @@ pub fn parse_partition_index(sql: &str) -> Option<Result<Conversion, String>> {
     if kw(toks.get(i), "ONLY") {
         i += 1;
     }
-    let table = name_of(toks.get(i))?;
-    i += 1;
+    let (table, next) = table_at(&toks, i)?;
+    i = next;
     if !(kw(toks.get(i), "USING") && kw(toks.get(i + 1), "PARTITION")) {
         return None;
     }
@@ -746,6 +761,13 @@ mod parse_tests {
             .unwrap()
             .unwrap();
         assert_eq!(c, Conversion { table: "acct".into(), key: vec!["tenant_id".into()], partitions: 8 });
+        // Schema-qualified, as `pg_dump` writes it.
+        let c = parse_partition_index("CREATE INDEX acct_part ON public.acct USING partition (tenant_id) WITH (partitions = 8)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(c, Conversion { table: "acct".into(), key: vec!["tenant_id".into()], partitions: 8 });
+        let c = parse_partition_by("ALTER TABLE public.\"Acct\" PARTITION BY HASH (tenant_id)").unwrap().unwrap();
+        assert_eq!(c.table, "Acct");
         assert!(parse_partition_index("CREATE INDEX i ON acct USING btree (tenant_id)").is_none());
         assert!(parse_partition_index("CREATE INDEX i ON acct (tenant_id)").is_none());
     }

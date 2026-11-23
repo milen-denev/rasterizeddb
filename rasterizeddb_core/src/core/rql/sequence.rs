@@ -107,7 +107,15 @@ pub fn parse_nextval(expression: &str) -> Option<String> {
     let inner = trimmed[open + 1..close].trim();
     // `nextval('t_c_seq'::regclass)` is what a `pg_dump` emits.
     let inner = inner.split("::").next().unwrap_or(inner).trim();
-    Some(inner.trim_matches(['\'', '"']).to_string())
+    let inner = inner.trim_matches('\'');
+    // And `nextval('public.t_c_seq'::regclass)`, schema-qualified, since a
+    // dump runs with an empty `search_path`: the sequence is `t_c_seq`, the
+    // one its `CREATE SEQUENCE public.t_c_seq` made, as the `nextval` and
+    // `setval` calls read it (`sequence_name_of`). Kept whole, the column
+    // counted on a second, empty sequence named `public.t_c_seq`, and the
+    // first insert after a restore collided with a restored row.
+    let inner = crate::core::sql_scan::last_name_segment(inner);
+    Some(inner.trim_matches('"').to_string())
 }
 
 /// Whether a type name declares a serial column, and the integer type it means.
@@ -880,6 +888,14 @@ mod tests {
         assert_eq!(
             parse_nextval("NEXTVAL(\"t_id_seq\")").as_deref(),
             Some("t_id_seq")
+        );
+        assert_eq!(
+            parse_nextval("nextval('public.t_id_seq'::regclass)").as_deref(),
+            Some("t_id_seq")
+        );
+        assert_eq!(
+            parse_nextval("nextval('public.\"T id\"'::regclass)").as_deref(),
+            Some("T id")
         );
         assert!(parse_nextval("CURRENT_TIMESTAMP").is_none());
         assert!(parse_nextval("gen_random_uuid()").is_none());
