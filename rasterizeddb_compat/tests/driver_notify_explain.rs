@@ -209,6 +209,19 @@ async fn explain_describes_the_engines_plan() {
         plan.iter().any(|l| l.contains("Filter: (b.n > 6)")),
         "{plan:?}"
     );
+    // A comma join plans as the explicit join: the WHERE equality is its
+    // hash key, not a test of every pair, and the pin on `a` reaches `b`'s
+    // scan across it.
+    let plan: Vec<String> = c
+        .query("EXPLAIN SELECT a.x FROM a, b WHERE a.id = b.aid AND a.id = 2", &[])
+        .await
+        .expect("explain a comma join")
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    assert!(plan.iter().any(|l| l.contains("Inner join b: a.id = b.aid")), "{plan:?}");
+    assert!(!plan.iter().any(|l| l.contains("every pair is tested")), "{plan:?}");
+    assert!(plan.iter().any(|l| l.contains("Scan Filter:") && l.contains("aid = 2")), "{plan:?}");
     let analyzed: Vec<String> = c
         .query("EXPLAIN ANALYZE SELECT * FROM a WHERE id = 2", &[])
         .await

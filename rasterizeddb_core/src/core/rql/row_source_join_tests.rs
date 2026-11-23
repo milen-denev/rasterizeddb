@@ -406,6 +406,79 @@ async fn carried_join_constants_answer_as_the_uninferred_plan() {
     close(db, dir.path());
 }
 
+/// A comma join answers as its explicit `JOIN … ON` twin and as the same
+/// equality kept a filter (`(x = y OR 1 = 0)`, which is not lifted):
+/// NULL keys on both sides, duplicate keys, an `INT` against a `BIGINT` and
+/// a `SMALLINT`, `TEXT` against `VARCHAR`, three relations, a pin carried
+/// across, an outer join before it and a `RIGHT JOIN` after it (not lifted;
+/// compared with the filter form only, as no explicit join means it).
+///
+/// Mutation: lift before a later RIGHT JOIN (`padded_later` false): the
+/// last query keeps padded rows the WHERE equality drops.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comma_join_answers_as_its_explicit_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "join_comma").await;
+    exec_ok(&db, "CREATE TABLE l (id BIGINT PRIMARY KEY, x INT, s TEXT)").await;
+    exec_ok(&db, "CREATE TABLE r (id BIGINT PRIMARY KEY, y BIGINT, t VARCHAR(10))").await;
+    exec_ok(&db, "CREATE TABLE m (id BIGINT PRIMARY KEY, z SMALLINT)").await;
+    exec_ok(
+        &db,
+        "INSERT INTO l VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 2, NULL), (4, NULL, 'a'), (5, 3, 'c'), (6, 9, 'z')",
+    )
+    .await;
+    exec_ok(&db, "INSERT INTO r VALUES (10, 1, 'a'), (11, 2, 'b'), (12, 2, 'b'), (13, NULL, NULL), (14, 4, 'c')").await;
+    exec_ok(&db, "INSERT INTO m VALUES (20, 1), (21, 2), (22, NULL), (23, 5)").await;
+    // (comma form, explicit twin or "" for none, the filter form)
+    let cases = [
+        (
+            "SELECT l.id, r.id FROM l, r WHERE l.x = r.y",
+            "SELECT l.id, r.id FROM l JOIN r ON l.x = r.y",
+            "SELECT l.id, r.id FROM l, r WHERE (l.x = r.y OR 1 = 0)",
+        ),
+        (
+            "SELECT l.id, r.id FROM l, r WHERE r.t = l.s",
+            "SELECT l.id, r.id FROM l JOIN r ON r.t = l.s",
+            "SELECT l.id, r.id FROM l, r WHERE (r.t = l.s OR 1 = 0)",
+        ),
+        (
+            "SELECT l.id, r.id, m.id FROM l, r, m WHERE l.x = r.y AND m.z = l.x",
+            "SELECT l.id, r.id, m.id FROM l JOIN r ON l.x = r.y JOIN m ON m.z = l.x",
+            "SELECT l.id, r.id, m.id FROM l, r, m WHERE (l.x = r.y OR 1 = 0) AND (m.z = l.x OR 1 = 0)",
+        ),
+        (
+            "SELECT l.id, r.id FROM l, r WHERE l.x = r.y AND l.s = r.t AND l.x = 2",
+            "SELECT l.id, r.id FROM l JOIN r ON l.x = r.y AND l.s = r.t WHERE l.x = 2",
+            "SELECT l.id, r.id FROM l, r WHERE (l.x = r.y OR 1 = 0) AND (l.s = r.t OR 1 = 0) AND l.x + 0 = 2",
+        ),
+        (
+            "SELECT COUNT(*), SUM(r.id) FROM l, r WHERE l.x = r.y AND r.y > 1",
+            "SELECT COUNT(*), SUM(r.id) FROM l JOIN r ON l.x = r.y WHERE r.y > 1",
+            "SELECT COUNT(*), SUM(r.id) FROM l, r WHERE (l.x = r.y OR 1 = 0) AND r.y > 1",
+        ),
+        (
+            "SELECT l.id, m.id, r.id FROM l LEFT JOIN m ON m.z = l.x, r WHERE r.y = l.x",
+            "SELECT l.id, m.id, r.id FROM l LEFT JOIN m ON m.z = l.x JOIN r ON r.y = l.x",
+            "SELECT l.id, m.id, r.id FROM l LEFT JOIN m ON m.z = l.x, r WHERE (r.y = l.x OR 1 = 0)",
+        ),
+        (
+            "SELECT l.id, r.id, m.id FROM l, r RIGHT JOIN m ON m.z = r.y WHERE l.x = r.y",
+            "",
+            "SELECT l.id, r.id, m.id FROM l, r RIGHT JOIN m ON m.z = r.y WHERE (l.x = r.y OR 1 = 0)",
+        ),
+    ];
+    for (comma, explicit, filtered) in cases {
+        let mut want = table(&db, filtered).await;
+        want.sort();
+        for sql in [comma, explicit].into_iter().filter(|s| !s.is_empty()) {
+            let mut got = table(&db, sql).await;
+            got.sort();
+            assert_eq!(got, want, "{sql}\n  differs from\n{filtered}");
+        }
+    }
+    close(db, dir.path());
+}
+
 /// Outer joins with the partitioned side null-supplying, against a plain
 /// twin holding the same rows. Owners without an account come back
 /// NULL-extended; an account whose `lim` is NULL carries its NULL through

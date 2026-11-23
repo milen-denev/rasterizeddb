@@ -3207,6 +3207,61 @@ pub fn split_qualified(name: &str) -> (Option<String>, String) {
     }
 }
 
+/// Makes a cross join (`FROM a, b`, `a CROSS JOIN b`, an `INNER JOIN` whose
+/// `ON` has no key) an inner join on the top-level `WHERE` equalities
+/// between its relation and one relation before it, each removed from the
+/// post-join filter: `FROM a, b WHERE a.x = b.y` plans as `a JOIN b ON
+/// a.x = b.y` does, a hash join on the key with its NULL keys dropped at the
+/// scan, instead of a pass over every pair. The same answer: a pair the
+/// equality rejects, or whose key is NULL, was dropped by the filter, and is
+/// now never made. Equalities to a second earlier relation stay filters (a
+/// join has one left relation).
+///
+/// Not when a later `RIGHT` or `FULL` join pads the tuples so far with
+/// NULLs: the `WHERE` equality drops those padded tuples, and as a join key
+/// it would no longer see them.
+fn lift_where_equalities(
+    joins: &mut [Option<JoinedRelation>],
+    relations: &[RelationRef],
+    schemas: &[SmallVec<[SchemaField; 20]>],
+    cross_relation: &mut Vec<String>,
+) {
+    for i in 1..joins.len() {
+        if !joins[i].as_ref().is_some_and(|j| j.kind == JoinKind::Cross) {
+            continue;
+        }
+        let padded_later = joins[i + 1..]
+            .iter()
+            .flatten()
+            .any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full));
+        if padded_later {
+            continue;
+        }
+        let mut left_rel: Option<usize> = None;
+        let mut keys: Vec<(String, String)> = Vec::new();
+        cross_relation.retain(|term| {
+            let Some(((ra, ca), (rb, cb))) = column_equality(term, relations, schemas) else {
+                return true;
+            };
+            let (other, other_column, this_column) = if ra == i && rb < i {
+                (rb, cb, ca)
+            } else if rb == i && ra < i {
+                (ra, ca, cb)
+            } else {
+                return true;
+            };
+            if *left_rel.get_or_insert(other) != other {
+                return true;
+            }
+            keys.push((other_column, this_column));
+            false
+        });
+        if let Some(left_rel) = left_rel {
+            joins[i] = Some(JoinedRelation { kind: JoinKind::Inner, left_rel, keys });
+        }
+    }
+}
+
 /// The most constants carried onto one column. A clause pinning a key to
 /// more values than this is not the shape this serves (a point read through
 /// a join), and every one added is a term each scanned row evaluates.
@@ -4147,6 +4202,12 @@ pub fn plan(
             }
         }
     }
+
+    // --- WHERE equalities lifted into a comma join -----------------------
+    //
+    // `FROM a, b WHERE a.x = b.y` is `a JOIN b ON a.x = b.y`: the join
+    // hashes on the key instead of testing every pair (`lift_where_equalities`).
+    lift_where_equalities(&mut joins, &relations, &schemas, &mut cross_relation);
 
     // --- NULL join keys, dropped at the scan ----------------------------
     //
@@ -7981,5 +8042,51 @@ mod outer_join_reference {
         // Not across types: an integer key onto a text column.
         let p = planned("ta a JOIN tb b ON b.s = a.id", "a.id = 5");
         assert!(!pins(&p, 1, "s", "5"), "carried an integer onto text");
+    }
+
+    /// `lift_where_equalities`: a comma join's `WHERE` equalities become
+    /// its keys, as `JOIN … ON` would have them.
+    #[test]
+    fn a_comma_join_hashes_on_its_where_equalities() {
+        let planned = |from: &str, where_clause: &str| {
+            plan(
+                parse_from_clause(from).unwrap(),
+                "a.id",
+                where_clause,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+                &schema_of,
+            )
+            .expect(from)
+        };
+        let join = |p: &JoinPlan, rel: usize| p.relations[rel].join.clone().expect("joined");
+        let p = planned("ta a, tb b", "a.k = b.k");
+        let j = join(&p, 1);
+        assert_eq!((j.kind, j.left_rel, j.keys.clone()), (JoinKind::Inner, 0, vec![("k".to_string(), "k".to_string())]));
+        assert!(p.post_join.is_none(), "the equality is still a filter too");
+        // Written either way round; a second equality joins the key; a
+        // third relation keyed to the first.
+        let p = planned("ta a, tb b, tc c", "b.k = a.k AND b.id = a.id AND c.bk = a.k");
+        let j = join(&p, 1);
+        assert_eq!(j.keys, vec![("k".to_string(), "k".to_string()), ("id".to_string(), "id".to_string())]);
+        let j = join(&p, 2);
+        assert_eq!((j.kind, j.left_rel, j.keys.clone()), (JoinKind::Inner, 0, vec![("k".to_string(), "bk".to_string())]));
+        // A CROSS JOIN is a comma join.
+        assert_eq!(join(&planned("ta a CROSS JOIN tb b", "a.k = b.k"), 1).kind, JoinKind::Inner);
+        // Not before a RIGHT or FULL join, whose padded tuples the WHERE
+        // equality must still see.
+        for from in ["ta a, tb b RIGHT JOIN tc c ON c.bk = b.k", "ta a, tb b FULL JOIN tc c ON c.bk = b.k"] {
+            let p = planned(from, "a.k = b.k");
+            assert_eq!(join(&p, 1).kind, JoinKind::Cross, "{from}");
+            assert!(p.post_join.is_some(), "{from}");
+        }
+        // Not an equality between two columns: still a filter.
+        for term in ["a.k < b.k", "a.k = b.k + 1", "(a.k = b.k OR 1 = 0)"] {
+            let p = planned("ta a, tb b", term);
+            assert_eq!(join(&p, 1).kind, JoinKind::Cross, "{term}");
+        }
     }
 }
