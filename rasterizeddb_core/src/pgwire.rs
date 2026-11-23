@@ -8166,6 +8166,11 @@ pub(crate) fn rewrite_statement_text<'a>(
     if let Cow::Owned(text) = crate::core::sql_scan::plain_branch_parentheses(&stmt) {
         stmt = Cow::Owned(text);
     }
+    // The same for a query inside parentheses, `x IN ((SELECT 1) UNION
+    // (SELECT 2))` (`sql_scan::nested_branch_parentheses`).
+    if let Cow::Owned(text) = crate::core::sql_scan::nested_branch_parentheses(&stmt) {
+        stmt = Cow::Owned(text);
+    }
     // `INSERT INTO t (SELECT …)` and `CREATE TABLE t AS (SELECT …)`: the
     // query in parentheses, the same way (`sql_scan::source_query_parentheses`).
     if let Cow::Owned(text) = crate::core::sql_scan::source_query_parentheses(&stmt) {
@@ -14104,7 +14109,7 @@ fn from_less_first_branch(query: &str) -> Option<Vec<(String, DbType)>> {
     };
     let first = parts.branches.first()?;
     crate::core::rql::set_ops::constant_branch(first)?;
-    match crate::core::rql::no_from::parse(first.trim().trim_start_matches('(').trim_end_matches(')')) {
+    match crate::core::rql::no_from::parse(crate::core::sql_scan::without_outer_parentheses(first)) {
         Some(Ok(select)) => Some(select.columns()),
         _ => None,
     }

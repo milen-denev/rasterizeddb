@@ -171,48 +171,62 @@ pub fn stage<S: StorageIO>(
 /// table constraint (`CHECK (a < b)`), and the `CONSTRAINT name CHECK (…)`
 /// spelling of either.
 pub fn split_clause(definition: &str) -> (String, Option<String>) {
+    let Some((at, end, expression)) = clause_at(definition) else {
+        return (definition.to_string(), None);
+    };
+    let remainder = format!("{} {}", definition[..at].trim_end(), definition[end..].trim_start());
+    (remainder.trim().to_string(), Some(expression))
+}
+
+/// The first `CHECK (…)` of `definition`: where its keyword starts, where
+/// the clause ends (past its closing parenthesis), and its expression.
+pub fn clause_at(definition: &str) -> Option<(usize, usize, String)> {
     let upper = definition.to_ascii_uppercase();
-    let Some(at) = find_keyword(&upper, "CHECK") else {
-        return (definition.to_string(), None);
-    };
+    let at = find_keyword(&upper, "CHECK")?;
     let tail = &definition[at..];
-    let Some(open) = tail.find('(') else {
-        return (definition.to_string(), None);
-    };
+    let open = tail.find('(')?;
     // Nothing but whitespace may sit between the keyword and its parenthesis;
     // otherwise this is a column called `check_total` in some other construct.
     if !tail["CHECK".len()..open].trim().is_empty() {
-        return (definition.to_string(), None);
+        return None;
     }
 
     // Quote- and nesting-aware: a `(` or `)` inside a string literal
     // (`CHECK (s ~ '[)]')`, `CHECK (s <> '(')`) is text. Counted raw, the
     // clause ended inside the literal, and the check was stored cut and
     // never enforced.
-    let Some(close) = crate::core::sql_scan::matching_close(tail, open) else {
-        return (definition.to_string(), None);
-    };
-
-    let expression = tail[open + 1..close].trim().to_string();
-    let remainder = format!(
-        "{} {}",
-        definition[..at].trim_end(),
-        tail[close + 1..].trim_start()
-    );
-    (remainder.trim().to_string(), Some(expression))
+    let close = crate::core::sql_scan::matching_close(tail, open)?;
+    Some((at, at + close + 1, tail[open + 1..close].trim().to_string()))
 }
 
-/// The name PostgreSQL would give an unnamed check on `table`.
-pub fn derived_name(table: &str, column: Option<&str>, ordinal: usize) -> String {
-    // Cut as every derived name is cut: the label survives.
-    let label = crate::core::rql::unique_key::name_with_label;
-    match column {
-        Some(column) => label(
-            &format!("{}_{}", table.to_ascii_lowercase(), column.to_ascii_lowercase()),
-            "_check",
-        ),
-        None => label(&table.to_ascii_lowercase(), &format!("_check{ordinal}")),
+/// Every `CHECK (…)` written on one column, in order, each with the name a
+/// `CONSTRAINT <name>` directly before it gives it, and the definition
+/// without them. `b INT CHECK (b > 0) CONSTRAINT top CHECK (b < 9)` has two:
+/// only the first was read, and the second was dropped without a word and
+/// never enforced.
+pub fn split_column_clauses(definition: &str) -> (String, Vec<(Option<String>, String)>) {
+    let mut remaining = definition.to_string();
+    let mut found = Vec::new();
+    while let Some((at, end, expression)) = clause_at(&remaining) {
+        let before = remaining[..at].trim_end();
+        // `CONSTRAINT <name>` right before the keyword names this check and
+        // goes with it; left behind it would name the next one.
+        let mut words = before.split_whitespace().rev();
+        let named = match (words.next(), words.next()) {
+            (Some(name), Some(keyword)) if keyword.eq_ignore_ascii_case("CONSTRAINT") => Some(name),
+            _ => None,
+        };
+        let (head, name) = match named {
+            Some(name) => {
+                let cut = before[..before.len() - name.len()].trim_end();
+                (cut[..cut.len() - "CONSTRAINT".len()].trim_end(), Some(name.trim_matches('"').to_string()))
+            }
+            None => (before, None),
+        };
+        found.push((name, expression));
+        remaining = format!("{} {}", head, remaining[end..].trim_start()).trim().to_string();
     }
+    (remaining, found)
 }
 
 /// The name PostgreSQL gives an unnamed `ADD CHECK (…)` on `table`:
@@ -1263,16 +1277,24 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_check_takes_the_name_postgres_would_give_it() {
+    fn every_check_written_on_a_column_is_read_with_its_own_name() {
+        let (rest, found) = split_column_clauses("b INT CHECK (b > 0) CONSTRAINT top CHECK (b < 9) NOT NULL CHECK (b <> 5)");
+        assert_eq!(rest, "b INT NOT NULL");
         assert_eq!(
-            derived_name("orders", Some("status"), 0),
-            "orders_status_check"
+            found,
+            vec![
+                (None, "b > 0".to_string()),
+                (Some("top".to_string()), "b < 9".to_string()),
+                (None, "b <> 5".to_string())
+            ]
         );
-        assert_eq!(derived_name("orders", None, 2), "orders_check2");
-        // A long table's derived names keep their labels within the limit.
-        let long = "t".repeat(125);
-        for (name, label) in [(derived_name(&long, Some("a"), 0), "_check"), (derived_name(&long, None, 3), "_check3")] {
-            assert!(name.len() <= 128 && name.ends_with(label), "{name}");
-        }
+        // A name belongs to the check it is written before, not the next.
+        let (rest, found) = split_column_clauses("a INT CONSTRAINT \"Low\" CHECK (a > 0) CHECK (a <> ')')");
+        assert_eq!(rest, "a INT");
+        assert_eq!(found, vec![(Some("Low".to_string()), "a > 0".to_string()), (None, "a <> ')'".to_string())]);
+        // None, and a column only named like the keyword.
+        assert_eq!(split_column_clauses("check_total INT DEFAULT 0"), ("check_total INT DEFAULT 0".to_string(), vec![]));
+        // `split_clause` still takes the first one alone.
+        assert_eq!(split_clause("CONSTRAINT c CHECK (a < b)"), ("CONSTRAINT c".to_string(), Some("a < b".to_string())));
     }
 }

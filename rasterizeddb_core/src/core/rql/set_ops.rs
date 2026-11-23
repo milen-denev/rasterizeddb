@@ -39,7 +39,10 @@ use crate::core::rql::join::UnionParts;
 /// was refused, and an integer column never learned of its `2.5`, which went
 /// out as NULL under the integer's description.
 pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
-    let text = branch.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    // Without the parentheses around the whole branch, and only those: a
+    // list ending in a call (`SELECT 3, CAST(NULL AS numeric)`) lost the
+    // call's own, and was then no list this reads.
+    let text = crate::core::sql_scan::without_outer_parentheses(branch);
     if text.len() < 7 || !text.as_bytes()[..7].eq_ignore_ascii_case(b"SELECT ") {
         return None;
     }
@@ -59,7 +62,7 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
                     Some(at) => item[..at].trim(),
                     None => item,
                 };
-                if value.eq_ignore_ascii_case("NULL") {
+                if value.eq_ignore_ascii_case("NULL") || is_cast_null(value) {
                     (Some(DbType::NULL), 0)
                 } else if value.eq_ignore_ascii_case("TRUE") || value.eq_ignore_ascii_case("FALSE") {
                     (Some(DbType::BOOL), 0)
@@ -82,6 +85,36 @@ pub fn constant_branch(branch: &str) -> Option<Vec<(Option<DbType>, u32)>> {
             })
             .collect(),
     )
+}
+
+/// Whether `value` is a NULL with a type written on it: `NULL::numeric`,
+/// `NULL::numeric(10,2)`, `CAST(NULL AS text)`. Its cells are NULL whatever
+/// the type, so beside a NUMERIC column it is the NULL branch a bare `NULL`
+/// is. It was an expression of unknown type, and `SELECT id, v FROM t EXCEPT
+/// SELECT 3, NULL::numeric` was refused for it.
+fn is_cast_null(value: &str) -> bool {
+    let value = value.trim();
+    let type_name = |text: &str| {
+        let text = text.trim();
+        !text.is_empty()
+            && text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && text.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ',' | '[' | ']' | '.'))
+    };
+    if let Some((null, ty)) = value.split_once("::") {
+        return null.trim().eq_ignore_ascii_case("NULL") && type_name(ty);
+    }
+    let Some(inner) = value
+        .get(..4)
+        .filter(|w| w.eq_ignore_ascii_case("CAST"))
+        .and_then(|_| value[4..].trim_start().strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    match crate::core::rql::join::find_keyword(inner, "AS", 0) {
+        Some(at) => inner[..at].trim().eq_ignore_ascii_case("NULL") && type_name(&inner[at + 2..]),
+        None => false,
+    }
 }
 
 /// Each output column's type in `branch`: as declared, else as its select

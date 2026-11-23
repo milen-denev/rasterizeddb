@@ -1449,17 +1449,22 @@ source) all run now and are no longer gaps. What is still missing:
   NUMERIC `NaN`. A `money` value prints as a plain number (`12.5`), where
   PostgreSQL prints `$12.50`. `'nosuch'::regclass` is not refused (42P01 in
   PostgreSQL): a sequence's name is not known to the text pass that reads
-  the cast. `::regtype` over a column or an expression (`atttypid::regtype`)
-  is not supported, only over a literal; `format_type(atttypid, atttypmod)`
-  answers the same name.
-- **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
+  the cast. `::regtype` over a column (`atttypid::regtype`) is the type's
+  name, and sorts as that text where PostgreSQL sorts a `regtype` by its
+  oid; over any other expression (`(a + 1)::regtype`, `f(a)::regtype`) it is
+  not supported.
+- **DDL**: a row that breaks several `CHECK` constraints at once is
+  reported under the first one written, where PostgreSQL names the first by
+  name (an unnamed check's name is PostgreSQL's: `t_check`, `t_check1`,
+  `t_<column>_check`). `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: a parenthesised set operation as a value
-  (`IN ((SELECT 1) UNION (SELECT 2))`, `EXISTS ((SELECT …) EXCEPT (SELECT
-  …))`; without the inner parentheses it works), a `UNION` of a `NUMERIC`
-  column with a branch that has no `FROM` (`… EXCEPT SELECT 3, NULL::numeric`,
-  refused, 0A000), an outer column
+- **Queries**: `EXISTS` or `ARRAY` over a set operation whose branches have
+  no `FROM` (`EXISTS (SELECT 1 EXCEPT SELECT 1)`), a correlated `EXISTS` over
+  a set operation, a `UNION` of a `NUMERIC` column with a branch that has no
+  `FROM` and computes its value (`… UNION ALL SELECT 9, round(2.567, 1)`,
+  refused, 0A000; a constant or a typed NULL, `NULL::numeric`, works), an
+  outer column
   named bare where the subquery's relations are not all known (a CTE, a
   function in `FROM`, `SELECT *` in a derived table) or two outer relations
   have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on

@@ -6736,7 +6736,7 @@ async fn execute_union(sql: &str, database: &Arc<Database>, tx: TxId) -> Vec<u8>
         .branches
         .first()
         .map(|b| match crate::core::rql::set_ops::constant_branch(b).and_then(|_| {
-            crate::core::rql::no_from::parse(b.trim().trim_start_matches('(').trim_end_matches(')'))
+            crate::core::rql::no_from::parse(crate::core::sql_scan::without_outer_parentheses(b))
         }) {
             Some(Ok(select)) => select.columns().into_iter().map(|(name, _)| Some(name)).collect(),
             _ => crate::core::rql::cte::output_names(b),

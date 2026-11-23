@@ -169,6 +169,8 @@ pub enum PgFunc {
     ColumnIsUpdatable,
     /// `oid::regclass` read as text: the relation's name.
     RegclassName,
+    /// `x::regtype` over a column: the type's name (`reg_casts`).
+    RegtypeName,
     /// `sha224`, `sha256`, `sha384`, `sha512` of a `bytea` (or text's bytes):
     /// the digest as `bytea`.
     Sha224,
@@ -280,7 +282,7 @@ pub const NAMES: &[&str] = &[
     "LASTVAL", "PG_GET_USERBYID", "FORMAT_TYPE", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF", "PG_GET_PARTKEYDEF",
     "PG_GET_FUNCTION_RESULT", "PG_GET_FUNCTION_ARGUMENTS", "PG_GET_FUNCTION_IDENTITY_ARGUMENTS", "PG_GET_EXPR",
     "PG_ENCODING_TO_CHAR", "OBJ_DESCRIPTION", "COL_DESCRIPTION", "SHOBJ_DESCRIPTION", "PG_RELATION_IS_PUBLISHABLE",
-    "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
+    "PG_COLUMN_IS_UPDATABLE", "__REGCLASS_NAME", "__REGTYPE_NAME", "PG_GET_STATISTICSOBJDEF_COLUMNS", "PG_GET_TRIGGERDEF",
     "PG_GET_RULEDEF", "SHA224", "SHA256", "SHA384", "SHA512", "CONVERT_TO", "CONVERT_FROM",
     "SIN", "COS", "TAN", "COT", "ASIN", "ACOS", "ATAN", "ATAN2", "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
     "ISFINITE", "GET_BYTE", "REGEXP_COUNT", "REGEXP_SUBSTR", "REGEXP_SPLIT_TO_ARRAY", "ARRAY_POSITION",
@@ -468,6 +470,7 @@ pub fn lookup(upper: &str, n: usize) -> Option<Result<PgFunc, String>> {
         "PG_RELATION_IS_PUBLISHABLE" => (RelationIsPublishable, &[1]),
         "PG_COLUMN_IS_UPDATABLE" => (ColumnIsUpdatable, &[3]),
         "__REGCLASS_NAME" => (RegclassName, &[1]),
+        "__REGTYPE_NAME" => (RegtypeName, &[1]),
         "ISEMPTY" => (RangeIsEmpty, &[1]),
         "LOWER_INC" => (RangeLowerInc, &[1]),
         "UPPER_INC" => (RangeUpperInc, &[1]),
@@ -534,7 +537,7 @@ pub fn result_type(func: PgFunc, args: &[Expr]) -> DbType {
         TrimScale => DbType::DECIMAL,
         NextVal | CurrVal | SetVal | LastVal => DbType::I64,
         PgGetUserById | FormatType | PgGetIndexDef | PgGetConstraintDef | PgGetPartKeyDef | PgGetFunctionResult
-        | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName => DbType::STRING,
+        | PgGetFunctionArguments | PgGetExpr | PgEncodingToChar | Description | RegclassName | RegtypeName => DbType::STRING,
         RelationIsPublishable | ColumnIsUpdatable => DbType::BOOL,
         Sha224 | Sha256 | Sha384 | Sha512 | ConvertTo => DbType::BYTEA,
         ConvertFrom => DbType::STRING,
@@ -2306,6 +2309,11 @@ pub fn call(func: PgFunc, args: &[Value]) -> Result<Value, String> {
             }
         }
         RegclassName => text_value(crate::core::rql::catalog_model::regclass_name(int_of(&args[0], "the relation's oid")?)),
+        // An oid no type has is shown as the number, as PostgreSQL shows it.
+        RegtypeName => {
+            let oid = int_of(&args[0], "the type's oid")?;
+            text_value(crate::core::rql::catalog_model::format_type(oid, None).unwrap_or_else(|| oid.to_string()))
+        }
         NextVal | CurrVal | SetVal | LastVal => {
             use crate::core::rql::sequence;
             let database = sequence::session::database()

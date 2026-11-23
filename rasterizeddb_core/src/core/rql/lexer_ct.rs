@@ -222,6 +222,8 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
         // Whether each check's name was written (`CONSTRAINT c CHECK …`)
         // rather than derived, for the duplicate rule below.
         let mut named_checks: Vec<bool> = Vec::new();
+        // The column each check was written on, `None` for a table-level one.
+        let mut check_columns: Vec<Option<String>> = Vec::new();
         // Columns declared `character(n)`, which PostgreSQL compares
         // blank-padded and this engine stores as text (see below).
         for col_def in split_definitions(columns_str) {
@@ -239,14 +241,10 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 let (_, table_check) = crate::core::rql::check::split_clause(col_def);
                 if let Some(expression) = table_check {
                     named_checks.push(constraint_name(col_def).is_some());
+                    check_columns.push(None);
                     checks.push(crate::core::rql::check::CheckConstraint {
-                        name: constraint_name(col_def).unwrap_or_else(|| {
-                            crate::core::rql::check::derived_name(
-                                &table_name,
-                                None,
-                                checks.len() + 1,
-                            )
-                        }),
+                        // An unnamed one is named once every check is read.
+                        name: constraint_name(col_def).unwrap_or_default(),
                         expression,
                         is_deleted: false,
                     });
@@ -305,8 +303,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
             // the definition: its expression is a parenthesised group that the
             // type reader, the DEFAULT reader and the constraint reader would
             // each take a piece of.
-            let check_name = column_check_name(col_def);
-            let (col_def_owned, check_expression) = crate::core::rql::check::split_clause(col_def);
+            let (col_def_owned, column_checks) = crate::core::rql::check::split_column_clauses(col_def);
             let col_def = col_def_owned.as_str();
 
             // `GENERATED ALWAYS AS (…) STORED` comes out first, because its
@@ -567,7 +564,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 });
             }
 
-            if let Some(expression) = check_expression {
+            for (check_name, expression) in column_checks {
                 if expression.len() > crate::core::rql::check::MAX_EXPRESSION_LEN {
                     rejection.replace(format!(
                         "a check expression may be at most {} characters",
@@ -576,12 +573,12 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                     return None;
                 }
                 named_checks.push(check_name.is_some());
+                check_columns.push(Some(name.clone()));
                 checks.push(crate::core::rql::check::CheckConstraint {
                     // `a INT CONSTRAINT a_pos CHECK (…)` is named as written;
                     // the name used to be dropped for the derived one.
-                    name: check_name.clone().unwrap_or_else(|| {
-                        crate::core::rql::check::derived_name(&table_name, Some(&name), checks.len() + 1)
-                    }),
+                    // An unnamed one is named once every check is read.
+                    name: check_name.unwrap_or_default(),
                     expression,
                     is_deleted: false,
                 });
@@ -691,29 +688,47 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
 
         // Two checks written with one name are PostgreSQL's 42710; the
         // second used to supersede the first when the table was loaded, so
-        // one of them was silently not enforced. A derived name that meets
-        // a written one is numbered on, as PostgreSQL chooses it.
+        // one of them was silently not enforced.
         for i in 0..checks.len() {
-            let clash = |j: usize| j != i && checks[j].name.eq_ignore_ascii_case(&checks[i].name);
-            if named_checks[i] {
-                if (0..i).any(|j| named_checks[j] && clash(j)) {
-                    rejection.replace(format!(
-                        "constraint \"{}\" for relation \"{}\" already exists",
-                        checks[i].name, table_name
-                    ));
-                    return None;
-                }
-                continue;
+            if named_checks[i] && (0..i).any(|j| named_checks[j] && checks[j].name.eq_ignore_ascii_case(&checks[i].name)) {
+                rejection.replace(format!(
+                    "constraint \"{}\" for relation \"{}\" already exists",
+                    checks[i].name, table_name
+                ));
+                return None;
             }
-            if (0..checks.len()).any(clash) {
-                let base = checks[i].name.clone();
-                let free = (1..1000).map(|n| format!("{base}{n}")).find(|candidate| {
-                    !checks.iter().any(|c| c.name.eq_ignore_ascii_case(candidate))
-                });
-                match free {
-                    Some(name) => checks[i].name = name,
-                    None => {
-                        rejection.replace(format!("could not choose a name for a check on \"{}\"", table_name));
+        }
+        // An unnamed check is named as PostgreSQL's `ChooseConstraintName`
+        // names it, in the order written: `<table>_<column>_check` for one
+        // written on a column, or a table-level one that reads exactly one
+        // column, `<table>_check` otherwise, and numbered from 1 past every
+        // name already taken (`t_check`, `t_check1`). The first table-level
+        // check was `t_check1`, the next `t_check2`: a migration written
+        // against PostgreSQL drops `t_check` and found nothing.
+        {
+            let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let mut taken: Vec<String> =
+                checks.iter().zip(&named_checks).filter(|(_, named)| **named).map(|(c, _)| c.name.clone()).collect();
+            for i in 0..checks.len() {
+                if named_checks[i] {
+                    continue;
+                }
+                let free = |candidate: &str| taken.iter().any(|t| t.eq_ignore_ascii_case(candidate));
+                let chosen = match &check_columns[i] {
+                    Some(column) => crate::core::rql::unique_key::choose_name(
+                        &format!("{}_{}", table_name.to_ascii_lowercase(), column.to_ascii_lowercase()),
+                        "_check",
+                        free,
+                    ),
+                    None => crate::core::rql::check::unnamed_name(&table_name, &checks[i].expression, &column_names, free),
+                };
+                match chosen {
+                    Ok(name) => {
+                        taken.push(name.clone());
+                        checks[i].name = name;
+                    }
+                    Err(reason) => {
+                        rejection.replace(reason);
                         return None;
                     }
                 }
@@ -1358,28 +1373,6 @@ fn inline_constraint_name(def: &str) -> Option<String> {
 }
 
 /// The name of a `CONSTRAINT <name> …` definition.
-/// The name a column definition gives its `CHECK`: `CONSTRAINT <name>`
-/// written directly before the keyword, as in `a INT CONSTRAINT a_pos CHECK
-/// (a > 0)`.
-fn column_check_name(def: &str) -> Option<String> {
-    let upper = def.to_ascii_uppercase();
-    let bytes = upper.as_bytes();
-    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut from = 0;
-    let at = loop {
-        let at = from + upper[from..].find("CHECK")?;
-        let after = at + "CHECK".len();
-        if (at == 0 || !word(bytes[at - 1])) && (after >= bytes.len() || !word(bytes[after])) {
-            break at;
-        }
-        from = after;
-    };
-    let mut before = def[..at].split_whitespace().rev();
-    let name = before.next()?;
-    before.next().filter(|k| k.eq_ignore_ascii_case("CONSTRAINT"))?;
-    Some(name.trim_matches('"').to_string())
-}
-
 fn constraint_name(def: &str) -> Option<String> {
     let upper = def.trim_start().to_ascii_uppercase();
     if !upper.starts_with("CONSTRAINT") {
