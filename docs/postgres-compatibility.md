@@ -1455,16 +1455,17 @@ source) all run now and are no longer gaps. What is still missing:
   PostgreSQL): a sequence's name is not known to the text pass that reads
   the cast. `::regtype` over a column (`atttypid::regtype`) is the type's
   name, and sorts and compares by its oid as in PostgreSQL, except as an
-  `ORDER BY` key of a grouped query or a set operation, which is refused
-  (0A000) rather than sorted by the name; over any other expression
-  (`(a + 1)::regtype`, `f(a)::regtype`) it is not supported.
+  `ORDER BY` key of a grouped or `DISTINCT` query or a set operation, which
+  is refused
+  (0A000) rather than sorted by the name. The same over an expression, a
+  call or an earlier cast (`(a + 1)::regtype`, `f(a)::regtype`,
+  `a::int::regtype`).
 - **DDL**: `CREATE TABLE … (LIKE t INCLUDING …)`, `UNIQUE NULLS NOT DISTINCT`,
   `PARTITION BY RANGE`/`LIST` (tables partition by `HASH` only), and
   `UPDATE … SET a[1] = …`.
-- **Queries**: a `UNION` of a `NUMERIC` column with a branch that has no
-  `FROM` and computes its value (`… UNION ALL SELECT 9, round(2.567, 1)`,
-  refused, 0A000; a constant or a typed NULL, `NULL::numeric`, works), an
-  outer column
+- **Queries**: of two equal `NUMERIC` values written at different scales,
+  `INTERSECT` shows the first branch's digits (`2.25`) where PostgreSQL may
+  show the other's (`2.2500`); an outer column
   named bare where the subquery's relations are not all known (a CTE, a
   function in `FROM`, `SELECT *` in a derived table) or two outer relations
   have it, `TABLESAMPLE … REPEATABLE` (0A000: the sample is drawn anew on
