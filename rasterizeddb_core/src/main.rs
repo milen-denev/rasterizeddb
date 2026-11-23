@@ -1826,8 +1826,10 @@ fn main() -> std::io::Result<()> {
             }
         }
 
-        // Replication, backups and the rastcp protocol are single-database and
-        // act on the default one. Only the PostgreSQL listener routes by name.
+        // Backups and the rastcp protocol are single-database and act on the
+        // default one. Replication starts from it and carries every database
+        // (`Database::start_replication_with`); the PostgreSQL listener routes
+        // by name.
         let arc_database = catalog
             .get(&args.pg_default_db)
             .expect("the catalogue always holds its default database");
@@ -1835,10 +1837,14 @@ fn main() -> std::io::Result<()> {
         // Replication's files are settled at every start that finds them,
         // switched on or not: see `Database::open_replication_storage`. Before
         // the configuration below, which does not change what they hold.
-        if arc_database.has_replication_files() {
-            if let Err(e) = arc_database.open_replication_storage() {
-                eprintln!("replication storage could not be opened: {e}");
-                std::process::exit(2);
+        rasterizeddb_core::core::database::catalog::register_served(catalog.clone());
+        // Every database's, each in its own directory: they all replicate.
+        for database in catalog.all() {
+            if database.has_replication_files() {
+                if let Err(e) = database.open_replication_storage() {
+                    eprintln!("replication storage of database \"{}\" could not be opened: {e}", database.name);
+                    std::process::exit(2);
+                }
             }
         }
 
@@ -1855,7 +1861,9 @@ fn main() -> std::io::Result<()> {
                         std::process::exit(2);
                     }
                     if args.replication {
-                        if let Err(e) = Database::start_replication(arc_database.clone()) {
+                        // With the catalogue: every database replicates,
+                        // each over links of its own to the one listener.
+                        if let Err(e) = Database::start_replication_with(arc_database.clone(), Some(catalog.clone())) {
                             eprintln!("replication could not start: {e}");
                             std::process::exit(2);
                         }

@@ -157,3 +157,5 @@ pub(crate) mod test_support {
 mod tests;
 #[cfg(test)]
 mod hardening_tests;
+#[cfg(test)]
+mod catalog_tests;

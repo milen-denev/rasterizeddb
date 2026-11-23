@@ -54,17 +54,81 @@ thread_local! {
 /// operator who asked for the listener has to be told. Doing it inside the
 /// serving task would report success and then log a failure nobody is watching
 /// for.
-pub fn bind(replication: &StdArc<Replication>) -> std::io::Result<rastcp::server::TcpServer> {
-    bind_on(replication, None)
+pub fn bind(router: &StdArc<Router>) -> std::io::Result<rastcp::server::TcpServer> {
+    bind_on(router, None)
+}
+
+/// The databases the node's one replication listener serves: the default
+/// database, and through the catalogue every other one.
+///
+/// Every database replicates over links of its own, one per database and
+/// peer, and a link's greeting names its database (`Hello::database`, none
+/// for the default). The listener routes a connection by that name at its
+/// greeting and serves every frame after it to that database's replication.
+pub struct Router {
+    default: Arc<Database>,
+    catalog: Option<Arc<crate::core::database::catalog::DatabaseCatalog>>,
+    /// Applies the default stream's `CREATE DATABASE` / `DROP DATABASE`
+    /// records. Owned here, for as long as the listener runs; each database's
+    /// replication holds it weakly ([`Replication::link_catalog`]).
+    _link: Option<StdArc<dyn super::manager::CatalogLink>>,
+}
+
+impl Router {
+    /// A router over `default` and, when given, the catalogue it belongs to.
+    /// Without one, only the default database is served, as before.
+    pub fn new(
+        default: Arc<Database>,
+        catalog: Option<Arc<crate::core::database::catalog::DatabaseCatalog>>,
+        link: Option<StdArc<dyn super::manager::CatalogLink>>,
+    ) -> Router {
+        Router { default, catalog, _link: link }
+    }
+
+    /// The default database's replication: the listener's configuration.
+    pub fn replication(&self) -> StdArc<Replication> {
+        self.default.replication.clone()
+    }
+
+    /// The database a greeting named: the default one for none.
+    fn database(&self, name: Option<&str>) -> Result<Arc<Database>, String> {
+        let Some(name) = name else {
+            return Ok(self.default.clone());
+        };
+        let found = self.catalog.as_ref().and_then(|catalog| catalog.get(name));
+        match found {
+            Some(database) if database.replication.is_active() && database.replication.routed_database().as_deref() == Some(name) => {
+                Ok(database)
+            }
+            Some(_) => Err(format!("database \"{name}\" does not replicate on this node")),
+            None => Err(format!("database \"{name}\" does not exist on this node")),
+        }
+    }
+
+    /// Every database this listener serves, the default one first.
+    fn databases(&self) -> Vec<Arc<Database>> {
+        let mut out = vec![self.default.clone()];
+        if let Some(catalog) = &self.catalog {
+            for name in catalog.names() {
+                if let Some(database) = catalog.get(&name) {
+                    if !Arc::ptr_eq(&database, &self.default) {
+                        out.push(database);
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// [`bind`], serving `listener` when one is given instead of binding
 /// `listen_addr:listen_port`. The listener comes from
 /// [`Replication::serve_on`], which says why a caller would hand one over.
 pub fn bind_on(
-    replication: &StdArc<Replication>,
+    router: &StdArc<Router>,
     listener: Option<std::net::TcpListener>,
 ) -> std::io::Result<rastcp::server::TcpServer> {
+    let replication = router.replication();
     let config = replication.config();
 
     if let Err(e) = config.validate() {
@@ -95,7 +159,7 @@ pub fn bind_on(
     // Who is calling is settled once, when the connection opens, and then
     // known for every frame on it. See [`Greeter`].
     builder = builder.authenticator(StdArc::new(Greeter {
-        replication: replication.clone(),
+        router: router.clone(),
     }));
 
     // Present this node's own certificate rather than a freshly generated one,
@@ -150,18 +214,14 @@ pub fn bind_on(
 /// Serves the bound listener until shutdown, and keeps the log flushed.
 ///
 /// Returns once the listener has drained.
-pub async fn serve(
-    database: Arc<Database>,
-    server: rastcp::server::TcpServer,
-) -> std::io::Result<()> {
-    let replication = database.replication.clone();
-
+pub async fn serve(router: StdArc<Router>, server: rastcp::server::TcpServer) -> std::io::Result<()> {
     let shutdown = server.shutdown_handle();
     crate::shutdown::on_termination(move || shutdown.shutdown());
 
     // Neither file is flushed per commit — see `super::log` — so something has
-    // to close the window between a write and its durability.
-    let flusher = replication.clone();
+    // to close the window between a write and its durability. Every
+    // database's, each its own files.
+    let flusher = router.clone();
     let flush_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -169,13 +229,15 @@ pub async fn serve(
             ticker.tick().await;
             // An fsync is blocking I/O; run on a runtime worker it parks that
             // worker and every task queued behind it for the whole sync.
-            let flusher = flusher.clone();
-            let _ = tokio::task::spawn_blocking(move || flusher.flush()).await;
+            for database in flusher.databases() {
+                let replication = database.replication.clone();
+                let _ = tokio::task::spawn_blocking(move || replication.flush()).await;
+            }
         }
     });
 
     let outcome = server
-        .run_with_context_and_principal(database, handle_frame)
+        .run_with_context_and_principal(router.clone(), handle_frame)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()));
 
@@ -183,7 +245,9 @@ pub async fn serve(
 
     // Everything the log and the state buffered has to reach disk before the
     // process leaves, or a peer's catch-up point goes back in time.
-    replication.flush();
+    for database in router.databases() {
+        database.replication.flush();
+    }
     info!("Replication listener stopped");
     outcome
 }
@@ -205,9 +269,14 @@ pub async fn serve(
 /// cannot tell the difference, and a node with this talks to one without it in
 /// either direction. What it adds is the caller's node id, handed to
 /// [`handle_frame`] with every frame that follows.
-#[derive(Debug)]
 struct Greeter {
-    replication: StdArc<Replication>,
+    router: StdArc<Router>,
+}
+
+impl std::fmt::Debug for Greeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Greeter").finish_non_exhaustive()
+    }
 }
 
 impl rastcp::session::ServerAuthenticator for Greeter {
@@ -228,9 +297,20 @@ impl rastcp::session::ServerAuthenticator for Greeter {
 
             let (reply, caller) = match greeting {
                 Ok((FrameKind::Hello, payload)) => {
-                    let reply = handle_hello(&self.replication, &payload);
-                    let caller = acknowledged_caller(&payload, &reply);
-                    (reply, caller)
+                    // The database the link is for, routed here: its
+                    // replication answers the greeting with its own
+                    // positions. One that is not here, or does not
+                    // replicate, is refused, and the sender tries again
+                    // later (a `CREATE DATABASE` record still on its way).
+                    let named = Hello::decode(&mut Reader::new(&payload)).ok().and_then(|hello| hello.database);
+                    match self.router.database(named.as_deref()) {
+                        Ok(database) => {
+                            let reply = handle_hello(&database.replication, &payload);
+                            let caller = acknowledged_caller(&payload, &reply).map(|node| (node, named));
+                            (reply, caller)
+                        }
+                        Err(e) => (protocol::error_frame(&e), None),
+                    }
                 }
                 Ok((other, _)) => (
                     protocol::error_frame(&format!(
@@ -250,7 +330,9 @@ impl rastcp::session::ServerAuthenticator for Greeter {
             channel.send(&reply).await?;
 
             match caller {
-                Some(node) => Ok(rastcp::session::Principal::new(session_name(node), false)),
+                Some((node, database)) => {
+                    Ok(rastcp::session::Principal::new(session_name(node, database.as_deref()), false))
+                }
                 None => Err(rastcp::error::RastcpError::AuthenticationError(format!(
                     "the replication greeting from {} was refused",
                     channel.peer()
@@ -272,29 +354,43 @@ fn acknowledged_caller(hello: &[u8], reply: &[u8]) -> Option<NodeId> {
     Hello::decode(&mut Reader::new(hello)).ok().map(|hello| hello.node_id)
 }
 
-/// The name a greeted connection's caller goes by in the transport.
-fn session_name(node: NodeId) -> String {
-    format!("node:{node}")
+/// The name a greeted connection's caller goes by in the transport:
+/// `node:3` on the default database's link, `node:3@sales` on another's.
+fn session_name(node: NodeId, database: Option<&str>) -> String {
+    match database {
+        Some(database) => format!("node:{node}@{database}"),
+        None => format!("node:{node}"),
+    }
 }
 
-/// The node a connection was greeted as, or `None` for a connection that was
-/// served without a greeting — which this listener does not do, and which is
+/// The node a connection was greeted as, and the database it was greeted
+/// for (`None`: the default one); `None` for a connection that was served
+/// without a greeting — which this listener does not do, and which is
 /// refused all the same rather than trusted on that account.
-fn greeted_node(principal: &rastcp::session::Principal) -> Option<NodeId> {
-    principal.user.strip_prefix("node:")?.parse().ok()
+fn greeted_node(principal: &rastcp::session::Principal) -> Option<(NodeId, Option<String>)> {
+    let rest = principal.user.strip_prefix("node:")?;
+    match rest.split_once('@') {
+        Some((node, database)) => Some((node.parse().ok()?, Some(database.to_string()))),
+        None => Some((rest.parse().ok()?, None)),
+    }
 }
 
 /// Answers one frame from the node `principal` was greeted as.
 async fn handle_frame(
-    database: Arc<Database>,
+    router: StdArc<Router>,
     principal: StdArc<rastcp::session::Principal>,
     request: Vec<u8>,
 ) -> Vec<u8> {
-    let replication = database.replication.clone();
-
-    let Some(caller) = greeted_node(&principal) else {
+    let Some((caller, named)) = greeted_node(&principal) else {
         return protocol::error_frame("this connection was not opened with HELLO");
     };
+    // The database the connection was greeted for, looked up again for each
+    // frame: one dropped since answers no more of them.
+    let database = match router.database(named.as_deref()) {
+        Ok(database) => database,
+        Err(e) => return protocol::error_frame(&e),
+    };
+    let replication = database.replication.clone();
 
     // Decode with the thread's codec, then let go of it: the borrow cannot be
     // held across the `await`s below, and the payload has to outlive it, so it
@@ -941,6 +1037,27 @@ async fn apply_one(
         let mut failure: Option<String> = None;
         let mut transient = false;
         for statement in &record.statements {
+            // A catalogue change, on the default stream: made in this node's
+            // catalogue, not run as a statement (`CatalogOp`). A schema-only
+            // record, so it is marked in flight before it runs, and applying
+            // it again after a restart finds it done.
+            if replication.routed_database().is_none() {
+                if let Some(op) = super::manager::CatalogOp::parse(statement) {
+                    let applied = match replication.catalog() {
+                        Some(link) => link.apply(op).await,
+                        None => Err("this node cannot apply a catalogue change: its replication was started \
+                                     without its catalogue"
+                            .to_string()),
+                    };
+                    match applied {
+                        Ok(()) => continue,
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
             let Some(purpose) = recognize_query_purpose(statement) else {
                 failure = Some(format!("could not parse `{}`", truncate(statement)));
                 break;
@@ -2201,6 +2318,7 @@ mod tests {
             clock: 1,
             token: String::new(),
             advertised_addr: "10.0.0.9:61171".to_string(),
+            database: None,
         };
         let mut payload = Vec::new();
         hello.encode(&mut payload);
@@ -2223,6 +2341,7 @@ mod tests {
             clock: 1,
             token: String::new(),
             advertised_addr: "10.0.0.9:61171".to_string(),
+            database: None,
         };
         let mut payload = Vec::new();
         hello.encode(&mut payload);
@@ -2254,6 +2373,7 @@ mod tests {
             clock: 1,
             token: "battery-staple".to_string(),
             advertised_addr: "10.0.0.9:61171".to_string(),
+            database: None,
         }
         .encode(&mut payload);
 
@@ -2273,6 +2393,7 @@ mod tests {
             clock: 1,
             token: "correct-horse".to_string(),
             advertised_addr: "10.0.0.9:61171".to_string(),
+            database: None,
         }
         .encode(&mut payload);
 
@@ -2299,6 +2420,7 @@ mod tests {
             clock: 1,
             token: String::new(),
             advertised_addr: "10.0.0.9:61171".to_string(),
+            database: None,
         }
         .encode(&mut payload);
 
@@ -2313,8 +2435,9 @@ mod tests {
     #[tokio::test]
     async fn a_garbled_frame_is_answered_with_an_error_not_a_panic() {
         let database = database().await;
-        let greeted = StdArc::new(rastcp::session::Principal::new(session_name(2), false));
-        let response = handle_frame(database, greeted, vec![0xde, 0xad, 0xbe, 0xef]).await;
+        let greeted = StdArc::new(rastcp::session::Principal::new(session_name(2, None), false));
+        let router = StdArc::new(Router::new(database, None, None));
+        let response = handle_frame(router, greeted, vec![0xde, 0xad, 0xbe, 0xef]).await;
         assert_eq!(
             protocol::parse_header(&response).unwrap().kind,
             FrameKind::Error
@@ -2331,7 +2454,7 @@ mod tests {
         let nobody = StdArc::new(rastcp::session::Principal::anonymous());
 
         let ping = protocol::plain_frame(FrameKind::Ping, 0, &[]);
-        let response = handle_frame(database, nobody, ping).await;
+        let response = handle_frame(StdArc::new(Router::new(database, None, None)), nobody, ping).await;
 
         assert_eq!(
             protocol::parse_header(&response).unwrap().kind,
@@ -2342,9 +2465,12 @@ mod tests {
     #[test]
     fn a_session_name_gives_back_the_node_it_was_made_from() {
         for node in [1u64, 2, 61171, u64::MAX] {
-            let principal = rastcp::session::Principal::new(session_name(node), false);
-            assert_eq!(greeted_node(&principal), Some(node));
+            let principal = rastcp::session::Principal::new(session_name(node, None), false);
+            assert_eq!(greeted_node(&principal), Some((node, None)));
+            let principal = rastcp::session::Principal::new(session_name(node, Some("sales")), false);
+            assert_eq!(greeted_node(&principal), Some((node, Some("sales".to_string()))));
         }
+        assert_eq!(greeted_node(&rastcp::session::Principal::new("node:two@sales", false)), None);
         // Anything else is nobody, including the transport's own anonymous
         // caller and a name that only looks like one of these.
         assert_eq!(greeted_node(&rastcp::session::Principal::anonymous()), None);

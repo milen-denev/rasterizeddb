@@ -2425,6 +2425,76 @@ impl Database {
     /// through the executor, which would make the two futures mutually
     /// recursive if this one were awaited.
     pub fn start_replication(database: Arc<Database>) -> io::Result<()> {
+        // The served catalogue's default database (a `REPLICATION ENABLE` on
+        // it) starts every database, as `--replication` does.
+        let catalog = catalog::served_by_default(&database);
+        Self::start_replication_with(database, catalog)
+    }
+
+    /// [`Database::start_replication`] for the node's default database, with
+    /// the catalogue it belongs to: every other database of `catalog` starts
+    /// replicating too, over links of its own that name it, all served by
+    /// the one listener (`replication::server::Router`), and the default
+    /// stream's `CREATE DATABASE` / `DROP DATABASE` records are applied to it.
+    ///
+    /// Without a catalogue only the default database replicates, as it
+    /// always did.
+    pub fn start_replication_with(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+    ) -> io::Result<()> {
+        Self::start_one_replication(database.clone(), catalog.clone())?;
+        if let Some(catalog) = &catalog {
+            let config = database.replication.config();
+            for name in catalog.names() {
+                let Some(other) = catalog.get(&name) else { continue };
+                if Arc::ptr_eq(&other, &database) {
+                    continue;
+                }
+                // A branch is this node's own copy: its peers have no such
+                // database, and making one would mean shipping it whole.
+                #[cfg(feature = "db_branching")]
+                if catalog.branch_meta(&name).is_some() {
+                    continue;
+                }
+                Self::start_routed_replication(other, &name, &config)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the replication of the non-default database `name` with the
+    /// default database's `config`: the same node, cluster, token and peers,
+    /// its own log and positions, and no listener (the default one routes its
+    /// links to it).
+    pub fn start_routed_replication(
+        database: Arc<Database>,
+        name: &str,
+        config: &crate::replication::ReplicationConfig,
+    ) -> io::Result<()> {
+        database.replication.route_as(name);
+        database
+            .replication
+            .set_config(config.clone())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        Self::start_one_replication(database, None)
+    }
+
+    /// Stops `database`'s replication: its links end, and it takes no more
+    /// records. Its files stay, positions and all.
+    pub fn stop_replication(&self) {
+        self.replication.set_active(false);
+        for peer in self.replication.peers() {
+            if let Some(peer) = self.replication.remove_peer(&peer.name) {
+                peer.stop();
+            }
+        }
+    }
+
+    fn start_one_replication(
+        database: Arc<Database>,
+        catalog: Option<Arc<catalog::DatabaseCatalog>>,
+    ) -> io::Result<()> {
         let replication = database.replication.clone();
         let config = replication.config();
 
@@ -2446,14 +2516,26 @@ impl Database {
             }
         }
 
-        if replication.claim_listener() {
+        // A routed database's links are served by the default database's
+        // listener; only the default one binds.
+        if replication.routed_database().is_none() && replication.claim_listener() {
+            // The catalogue's records are applied through a link the
+            // listener's router owns and every database's replication holds
+            // weakly.
+            let link = catalog.as_ref().map(|catalog| {
+                let link: std::sync::Arc<dyn crate::replication::manager::CatalogLink> =
+                    std::sync::Arc::new(catalog::ReplicatedCatalog::new(catalog.clone()));
+                replication.link_catalog(std::sync::Arc::downgrade(&link));
+                link
+            });
+            let router = std::sync::Arc::new(crate::replication::server::Router::new(database.clone(), catalog, link));
             // Bound here rather than inside the task, so a port that is already
             // held is reported to whoever asked for the listener instead of
             // being logged into the void behind a success.
             // A socket handed over with `Replication::serve_on` if there is
             // one, the configured port otherwise.
             let listener = replication.take_bound_listener();
-            let server = match crate::replication::server::bind_on(&replication, listener) {
+            let server = match crate::replication::server::bind_on(&router, listener) {
                 Ok(server) => server,
                 Err(e) => {
                     replication.release_listener();
@@ -2461,9 +2543,8 @@ impl Database {
                 }
             };
 
-            let listener_database = database.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::replication::server::serve(listener_database, server).await {
+                if let Err(e) = crate::replication::server::serve(router, server).await {
                     error!("Replication listener stopped with an error: {}", e);
                 }
             });
