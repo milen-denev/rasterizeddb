@@ -135,9 +135,11 @@ async fn a_check_that_cannot_route_is_refused_never_skipped() {
         io,
         &crate::core::rql::foreign_key::ForeignKey {
             name: "behind".to_string(),
-            column: "x".to_string(),
+            columns: vec!["x".to_string()],
             parent_table: "nr_p".to_string(),
-            parent_column: "alt".to_string(),
+            parent_columns: vec!["alt".to_string()],
+            match_full: false,
+            on_delete_columns: Vec::new(),
             on_delete: crate::core::rql::foreign_key::ReferentialAction::NoAction,
             on_update: crate::core::rql::foreign_key::ReferentialAction::NoAction,
             is_deleted: false,
@@ -263,7 +265,7 @@ async fn a_failed_parent_column_rename_puts_a_partitioned_childs_key_back() {
     crate::core::wal::remove_for(&dir.path().to_string_lossy());
     let db = open(dir.path()).await;
     let fks = db.partitioned_table("rn_c").unwrap().shell().schema.foreign_keys.clone();
-    assert_eq!(fks.iter().map(|f| f.parent_column.as_str()).collect::<Vec<_>>(), vec!["id"], "{fks:?}");
+    assert_eq!(fks.iter().map(|f| f.parent_column_list()).collect::<Vec<_>>(), vec!["id"], "{fks:?}");
     let e = run(&db, "INSERT INTO rn_c (cid, pid) VALUES (3, 9)").await.unwrap_err();
     assert!(e.contains("violates foreign key constraint"), "{e}");
     run_ok(&db, "INSERT INTO rn_c (cid, pid) VALUES (3, 2)").await;

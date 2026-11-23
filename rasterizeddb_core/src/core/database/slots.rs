@@ -896,7 +896,7 @@ impl Database {
             .referencing_keys(parent)
             .into_iter()
             .filter(|(_, fk)| {
-                !fk.is_deleted && columns.is_none_or(|cs| cs.iter().any(|c| fk.parent_column.eq_ignore_ascii_case(c)))
+                !fk.is_deleted && columns.is_none_or(|cs| cs.iter().any(|c| fk.has_parent_column(c)))
             })
             .map(|(child, _)| child)
             .collect();

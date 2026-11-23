@@ -1785,15 +1785,19 @@ async fn merge_with(
             .unwrap_or_default()
             .iter()
             .filter(|f| !f.is_deleted)
-            .filter(|f| {
+            // Every pair whose referenced column is its parent's serial: a
+            // composite key's paired column is renumbered as a one-column
+            // key's is.
+            .flat_map(|f| f.columns.iter().zip(&f.parent_columns).map(move |(c, p)| (f, c, p)))
+            .filter(|(f, _, parent_column)| {
                 serials
                     .get(&f.parent_table)
-                    .is_some_and(|c| c.eq_ignore_ascii_case(&f.parent_column))
+                    .is_some_and(|c| c.eq_ignore_ascii_case(parent_column))
             })
-            .filter_map(|f| {
+            .filter_map(|(f, column, _)| {
                 columns
                     .iter()
-                    .position(|n| n.eq_ignore_ascii_case(&f.column))
+                    .position(|n| n.eq_ignore_ascii_case(column))
                     .map(|i| (i, f.parent_table.clone()))
             })
             .collect();

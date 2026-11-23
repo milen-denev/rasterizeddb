@@ -364,6 +364,9 @@ impl Database {
             // Between the fence and the first field record that needs it.
             point(self, "after_numeric_fence").map_err(io::Error::other)?;
         }
+        if create.foreign_keys.iter().any(|fk| fk.is_composite()) {
+            self.require_composite_foreign_keys()?;
+        }
         let columns = std::mem::take(&mut create.columns);
         let seed = self.seed_of(&create.table_name).await;
         let mut table =

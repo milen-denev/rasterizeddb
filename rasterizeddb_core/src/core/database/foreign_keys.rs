@@ -47,15 +47,12 @@ impl Database {
             .chain(ct.unique_keys.iter().map(|k| k.name.as_str()))
             .collect();
         for (i, fk) in ct.foreign_keys.iter().enumerate() {
-            if !ct
-                .columns
-                .iter()
-                .any(|c| !crate::core::rql::nullable::is_hidden(&c.name) && c.name.eq_ignore_ascii_case(&fk.column))
-            {
-                return Some(format!("column \"{}\" referenced in foreign key constraint does not exist", fk.column));
-            }
-            if let Err(why) = fk.storable() {
-                return Some(why);
+            if let Some(missing) = fk.columns.iter().find(|column| {
+                !ct.columns
+                    .iter()
+                    .any(|c| !crate::core::rql::nullable::is_hidden(&c.name) && c.name.eq_ignore_ascii_case(column))
+            }) {
+                return Some(format!("column \"{}\" referenced in foreign key constraint does not exist", missing));
             }
             let clash = other_names.iter().any(|n| n.eq_ignore_ascii_case(&fk.name))
                 || ct.foreign_keys[..i].iter().any(|other| other.name.eq_ignore_ascii_case(&fk.name));
@@ -65,16 +62,27 @@ impl Database {
             if let Some(why) = self.parent_refusal(fk, &ct.table_name, &own_side) {
                 return Some(why);
             }
-            // The two columns' types (42804), against the parent as it is
-            // now or as this statement declares it.
-            let child_type = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&fk.column)).map(|c| &c.data_type);
-            let parent_type = if fk.parent_table.eq_ignore_ascii_case(&ct.table_name) {
-                ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&fk.parent_column)).map(|c| c.data_type.clone())
-            } else {
-                self.column_type(&fk.parent_table, &fk.parent_column)
-            };
-            if let (Some(child), Some(parent)) = (child_type, parent_type)
-                && let Some(why) = crate::core::rql::foreign_key::type_refusal(fk, child, &parent)
+            if let Err(why) = fk.storable() {
+                return Some(why);
+            }
+            // Each pair's types (42804), against the parent as it is now or
+            // as this statement declares it.
+            for (at, (column, parent_column)) in fk.columns.iter().zip(&fk.parent_columns).enumerate() {
+                let child_type = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(column)).map(|c| &c.data_type);
+                let parent_type = if fk.parent_table.eq_ignore_ascii_case(&ct.table_name) {
+                    ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(parent_column)).map(|c| c.data_type.clone())
+                } else {
+                    self.column_type(&fk.parent_table, parent_column)
+                };
+                if let (Some(child), Some(parent)) = (child_type, parent_type)
+                    && let Some(why) = crate::core::rql::foreign_key::type_refusal(fk, at, child, &parent)
+                {
+                    return Some(why);
+                }
+            }
+            if fk.is_composite()
+                && let Some(why) =
+                    crate::core::rql::foreign_key::composite_refusal(fk, &ct.table_name, partition_key.is_some())
             {
                 return Some(why);
             }
@@ -92,11 +100,13 @@ impl Database {
             if let Some(why) = referenced_key_refusal(&fk, &own_side()) {
                 return Some(format!("table \"{child}\" has foreign key \"{}\" naming \"{}\": {why}", fk.name, ct.table_name));
             }
-            let parent_type = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(&fk.parent_column)).map(|c| &c.data_type);
-            if let (Some(child_type), Some(parent)) = (self.column_type(&child, &fk.column), parent_type)
-                && let Some(why) = crate::core::rql::foreign_key::type_refusal(&fk, &child_type, parent)
-            {
-                return Some(why);
+            for (at, (column, parent_column)) in fk.columns.iter().zip(&fk.parent_columns).enumerate() {
+                let parent_type = ct.columns.iter().find(|c| c.name.eq_ignore_ascii_case(parent_column)).map(|c| &c.data_type);
+                if let (Some(child_type), Some(parent)) = (self.column_type(&child, column), parent_type)
+                    && let Some(why) = crate::core::rql::foreign_key::type_refusal(&fk, at, &child_type, parent)
+                {
+                    return Some(why);
+                }
             }
         }
         None
@@ -116,42 +126,37 @@ impl Database {
         self.existing_parent_refusal(fk)
     }
 
-    /// The column a `REFERENCES parent` with no column list names: the
-    /// parent's primary key, as in PostgreSQL. `own_table` and `own_key` are
-    /// the declaring table's name and primary key, for a key on itself
-    /// (`CREATE TABLE`'s own declaration, which no schema holds yet).
+    /// The columns a `REFERENCES parent` with no column list names: the
+    /// parent's primary key, one column or several, in key order, as in
+    /// PostgreSQL. `own_table` and `own_key` are the declaring table's name
+    /// and primary key columns, for a key on itself (`CREATE TABLE`'s own
+    /// declaration, which no schema holds yet).
     ///
     /// Refused as PostgreSQL refuses it: a missing parent (42P01), one with
-    /// no primary key (42830), and here also a composite one, since this
-    /// engine's foreign keys are one column. Called under the statement's
-    /// lock on the parent, so the key read is the key enforced.
-    pub(crate) fn default_referenced_column(
+    /// no primary key (42704). A key whose column count differs is the
+    /// caller's to refuse, after the key is matched (42830). Called under
+    /// the statement's lock on the parent, so the key read is the key
+    /// enforced.
+    pub(crate) fn default_referenced_columns(
         &self,
         fk: &ForeignKey,
         own_table: &str,
-        own_key: Option<&str>,
-        own_unique_keys: &[crate::core::rql::unique_key::UniqueKey],
-    ) -> Result<String, String> {
-        // A one-column primary key is the header's; a composite one is only
-        // a unique key, under the primary key's default name.
-        let (key, composite) = if fk.parent_table.eq_ignore_ascii_case(own_table) {
-            (own_key.map(str::to_string), composite_primary_key(own_table, own_unique_keys))
+        own_key: Option<Vec<String>>,
+    ) -> Result<Vec<String>, String> {
+        let key = if fk.parent_table.eq_ignore_ascii_case(own_table) {
+            own_key
         } else {
             let view = self
                 .schema_view(&fk.parent_table)
                 .ok_or_else(|| format!("relation \"{}\" does not exist", fk.parent_table))?;
-            let schema = view.schema();
-            (schema.primary_key.clone(), composite_primary_key(&fk.parent_table, &schema.unique_keys))
+            crate::core::rql::unique_key::primary_key_of_named(view.schema(), &fk.parent_table).map(|k| k.columns)
         };
-        if let Some(key) = key.map(|k| k.trim().trim_matches('"').to_string()).filter(|k| !k.is_empty()) {
-            return Ok(key);
+        match key {
+            Some(columns) if !columns.is_empty() && columns.iter().all(|c| !c.trim().is_empty()) => {
+                Ok(columns.into_iter().map(|c| c.trim().trim_matches('"').to_string()).collect())
+            }
+            _ => Err(format!("there is no primary key for referenced table \"{}\"", fk.parent_table)),
         }
-        if composite {
-            // PostgreSQL's words for one referencing column against a
-            // composite key (42830).
-            return Err("number of referencing and referenced columns for foreign key disagree".to_string());
-        }
-        Err(format!("there is no primary key for referenced table \"{}\"", fk.parent_table))
     }
 
     /// The declared type of `table`'s live column `column`, if both exist.
@@ -185,10 +190,16 @@ impl Database {
     }
 }
 
-/// Whether `table`'s unique keys hold a live composite primary key (one
-/// declared `PRIMARY KEY (a, b)` without a name of its own).
-fn composite_primary_key(table: &str, keys: &[crate::core::rql::unique_key::UniqueKey]) -> bool {
-    let name = crate::core::rql::unique_key::pkey_name(table);
+/// The primary key columns `ct` declares, one or several, in key order:
+/// what a `REFERENCES` of the table itself with no column list names.
+pub(crate) fn create_table_primary_key(ct: &CreateTable) -> Option<Vec<String>> {
+    if let Some(column) = &ct.primary_key {
+        return Some(vec![column.clone()]);
+    }
+    let name = crate::core::rql::unique_key::pkey_name(&ct.table_name);
     // Marked primary under any name, or, from before the mark, by its name.
-    keys.iter().any(|k| !k.is_deleted && k.columns.len() > 1 && (k.primary || k.name.eq_ignore_ascii_case(&name)))
+    ct.unique_keys
+        .iter()
+        .find(|k| !k.is_deleted && !k.is_index() && (k.primary || k.name.eq_ignore_ascii_case(&name)))
+        .map(|k| k.columns.clone())
 }

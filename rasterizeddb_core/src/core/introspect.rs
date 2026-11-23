@@ -1591,7 +1591,10 @@ async fn table_stats(database: &Arc<Database>, name: &str) -> Result<Vec<Row>, S
             "foreign_key",
             format!(
                 "{} : {} -> {}.{}",
-                fk.name, fk.column, fk.parent_table, fk.parent_column
+                fk.name,
+                key_list(&fk.columns),
+                fk.parent_table,
+                key_list(&fk.parent_columns)
             ),
             &format!("ON DELETE {}", action_name(&fk.on_delete)),
         );
@@ -1798,9 +1801,11 @@ fn schema_map(database: &Arc<Database>) -> Result<Vec<Row>, String> {
             out.push(row(&[
                 Cell::Text("fk".to_string()),
                 Cell::Text(schema.name.clone()),
-                Cell::Text(fk.column.clone()),
+                // A composite key's columns as one list, `a, b`, in key
+                // order: the row keeps its positions.
+                Cell::Text(fk.column_list()),
                 Cell::Text(fk.parent_table.clone()),
-                Cell::Text(fk.parent_column.clone()),
+                Cell::Text(fk.parent_column_list()),
                 Cell::Text(fk.name.clone()),
                 Cell::Text(action_name(&fk.on_delete).to_string()),
                 Cell::Text(action_name(&fk.on_update).to_string()),
@@ -3346,6 +3351,15 @@ pub fn sql_type_name(db_type: &DbType) -> &'static str {
         // types: each named as a column declares it. They read `UNKNOWN`,
         // which no statement accepts back.
         other => crate::core::rql::cte::sql_type_name(other).unwrap_or("UNKNOWN"),
+    }
+}
+
+/// A foreign key's columns as a description lists them: `a`, or `(a, b)`
+/// for a composite key.
+fn key_list(columns: &[String]) -> String {
+    match columns {
+        [column] => column.clone(),
+        _ => format!("({})", columns.join(", ")),
     }
 }
 

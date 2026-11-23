@@ -14,6 +14,9 @@ fn owner() -> Option<crate::core::mvcc::owner::StatementOwner> {
     crate::core::mvcc::owner::ensure()
 }
 
+#[path = "fk_composite.rs"]
+mod fk_composite;
+
 use crate::core::{
     database::Database,
     rql::{
@@ -2117,15 +2120,17 @@ fn coerce_key_literal(
     same.then_some(to_text)
 }
 
-/// `fk`'s two columns, the child's in `child` and the parent's (its own
-/// table's for a self-reference), each with its table's type modifiers:
-/// what [`coerce_key_literal`] moves values between. `None` when either is
-/// not there (the probe then reports it).
+/// The two columns of `fk`'s pair `at` (0 for a one-column key), the
+/// child's in `child` and the parent's (its own table's for a
+/// self-reference), each with its table's type modifiers: what
+/// [`coerce_key_literal`] moves values between. `None` when either is not
+/// there (the probe then reports it).
 #[allow(clippy::type_complexity)]
 fn fk_key_fields(
     database: &Arc<Database>,
     child: &crate::core::row::schema::TableSchema,
     fk: &crate::core::rql::foreign_key::ForeignKey,
+    at: usize,
 ) -> Option<(
     (crate::core::row::schema::SchemaField, Vec<crate::core::rql::type_modifier::TypeModifier>),
     (crate::core::row::schema::SchemaField, Vec<crate::core::rql::type_modifier::TypeModifier>),
@@ -2137,20 +2142,23 @@ fn fk_key_fields(
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
             .map(|f| (f.clone(), schema.type_modifiers.clone()))
     };
-    let child_side = field(child, &fk.column)?;
+    let child_side = field(child, fk.columns.get(at)?)?;
+    let parent_column = fk.parent_columns.get(at)?;
     let parent_side = if fk.parent_table.eq_ignore_ascii_case(&child.name) {
-        field(child, &fk.parent_column)?
+        field(child, parent_column)?
     } else {
         let view = database.schema_view(&fk.parent_table)?;
-        field(view.schema(), &fk.parent_column)?
+        field(view.schema(), parent_column)?
     };
     Some((child_side, parent_side))
 }
 
-/// Parent key literals (`parent_column`'s values, as `key_literal` renders
-/// them) at `fk`'s child column's type, index for index: `None` where the
-/// value cannot equal any child value ([`coerce_key_literal`]). The parent
-/// side's probes, actions and checks match children with these.
+/// Parent key literals (a one-column key's referenced column's values, as
+/// `key_literal` renders them) at `fk`'s child column's type, index for
+/// index: `None` where the value cannot equal any child value
+/// ([`coerce_key_literal`]). The parent side's probes, actions and checks
+/// match children with these. A composite key's tuples are mapped by
+/// `fk_composite::parent_tuples_for_child`.
 fn parent_literals_for_child(
     database: &Arc<Database>,
     child_table: &str,
@@ -2159,7 +2167,7 @@ fn parent_literals_for_child(
 ) -> Vec<Option<String>> {
     let fields = database
         .schema_view(child_table)
-        .and_then(|view| fk_key_fields(database, view.schema(), fk));
+        .and_then(|view| fk_key_fields(database, view.schema(), fk, 0));
     match fields {
         Some(((child, child_mods), (parent, parent_mods))) => literals
             .iter()
@@ -2225,15 +2233,25 @@ fn is_key_literal(text: &str) -> bool {
 /// ([`is_key_literal`]), or given nothing while it has a default, which then
 /// is its value. `INSERT INTO c (id) VALUES (1)` under `p INT DEFAULT 99
 /// REFERENCES parent` stored a 99 no parent has, unchecked.
+///
+/// A composite key with any column left out also needs the row: the check
+/// asks for every column of its tuple (`check_foreign_keys_of` leaves a key
+/// alone that it is not given whole, which an `UPDATE` relies on), and an
+/// omitted column's value is its default or NULL.
 fn foreign_key_values_need_the_row(
     schema: &crate::core::row::schema::TableSchema,
     assignments: &[(String, String)],
 ) -> bool {
     schema.foreign_keys.iter().any(|fk| {
-        match assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(&fk.column)) {
-            Some((_, value)) => !value.trim().eq_ignore_ascii_case("NULL") && !is_key_literal(value),
-            None => schema.defaults.iter().any(|d| !d.is_deleted && d.column.eq_ignore_ascii_case(&fk.column)),
-        }
+        fk.columns.iter().any(|key_column| {
+            match assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(key_column)) {
+                Some((_, value)) => !value.trim().eq_ignore_ascii_case("NULL") && !is_key_literal(value),
+                None => {
+                    fk.is_composite()
+                        || schema.defaults.iter().any(|d| !d.is_deleted && d.column.eq_ignore_ascii_case(key_column))
+                }
+            }
+        })
     })
 }
 
@@ -2248,18 +2266,18 @@ fn foreign_key_values_of_row(
 ) -> Result<Vec<(String, String)>, String> {
     let payload = |write_order: u64| row.columns_writing_data.iter().find(|p| u64::from(p.write_order) == write_order);
     let mut out = Vec::with_capacity(schema.foreign_keys.len());
-    for fk in schema.foreign_keys.iter() {
-        if out.iter().any(|(column, _): &(String, String)| column.eq_ignore_ascii_case(&fk.column)) {
+    for key_column in schema.foreign_keys.iter().flat_map(|fk| fk.columns.iter()) {
+        if out.iter().any(|(column, _): &(String, String)| column.eq_ignore_ascii_case(key_column)) {
             continue;
         }
-        let written = assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(&fk.column));
+        let written = assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(key_column));
         if let Some((column, value)) = written
             && (value.trim().eq_ignore_ascii_case("NULL") || is_key_literal(value))
         {
             out.push((column.clone(), value.clone()));
             continue;
         }
-        let Some(field) = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))
+        let Some(field) = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(key_column))
         else {
             continue;
         };
@@ -2272,7 +2290,7 @@ fn foreign_key_values_of_row(
             }
             _ => "NULL".to_string(),
         };
-        out.push((fk.column.clone(), literal));
+        out.push((key_column.clone(), literal));
     }
     Ok(out)
 }
@@ -2310,9 +2328,25 @@ async fn check_foreign_keys_of(
     };
 
     for fk in foreign_keys.iter() {
+        // A one-column key here; a composite one is checked whole, when the
+        // statement gives every column of it (an `UPDATE` assigning some of
+        // them is checked on the rows it writes, `check_written_foreign_keys`).
+        let Some((fk_column, parent_column)) = fk.single() else {
+            let values: Option<Vec<String>> = fk
+                .columns
+                .iter()
+                .map(|key_column| {
+                    assignments.iter().find(|(column, _)| column.eq_ignore_ascii_case(key_column)).map(|(_, v)| v.clone())
+                })
+                .collect();
+            if let Some(values) = values {
+                fk_composite::check_child_row(database, schema, table_name, fk, &values, tx).await?;
+            }
+            continue;
+        };
         let Some((_, literal)) = assignments
             .iter()
-            .find(|(column, _)| column.eq_ignore_ascii_case(&fk.column))
+            .find(|(column, _)| column.eq_ignore_ascii_case(fk_column))
         else {
             continue;
         };
@@ -2331,7 +2365,7 @@ async fn check_foreign_keys_of(
         // a float written `2e20` is `2e+20`, a NUMERIC(10,2) `1.5` is 1.50.
         let shown = schema
             .and_then(|schema| {
-                let field = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))?;
+                let field = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(fk_column))?;
                 if !matches!(
                     field.db_type,
                     crate::core::db_type::DbType::F32 | crate::core::db_type::DbType::F64 | crate::core::db_type::DbType::DECIMAL
@@ -2351,7 +2385,7 @@ async fn check_foreign_keys_of(
                  key ({})=({}) is not present in table \"{}\"",
                 table_name,
                 fk.name,
-                fk.column,
+                fk_column,
                 shown,
                 fk.parent_table
             )
@@ -2365,7 +2399,7 @@ async fn check_foreign_keys_of(
         if FK_VERIFIED
             .try_with(|v| {
                 v.borrow()
-                    .contains(&verified_key(&fk.parent_table, &fk.parent_column, literal))
+                    .contains(&verified_key(&fk.parent_table, parent_column, literal))
             })
             .unwrap_or(false)
         {
@@ -2388,7 +2422,7 @@ async fn check_foreign_keys_of(
         //
         // The value at the parent column's type first (P4 round 3): one that
         // type cannot hold unchanged equals no parent.
-        let coerced = match schema.and_then(|child| fk_key_fields(database, child, fk)) {
+        let coerced = match schema.and_then(|child| fk_key_fields(database, child, fk, 0)) {
             Some(((child, child_mods), (parent, parent_mods))) => {
                 coerce_key_literal(literal, &child, &child_mods, &parent, &parent_mods)
             }
@@ -2400,7 +2434,7 @@ async fn check_foreign_keys_of(
         // A table's key onto itself may be satisfied by a row this same
         // statement has yet to write: asked again at its end.
         let deferred = |raw: &str| {
-            let deferred = defer_self_reference(schema, table_name, fk, raw);
+            let deferred = defer_self_reference(schema, table_name, fk, vec![(fk_column.to_string(), raw.to_string())]);
             // The statement may now fail after it has written: none of its
             // writes may overwrite a row in place, which its abort could not
             // take back (an autocommit `UPDATE` reported 23503 and kept its
@@ -2415,7 +2449,7 @@ async fn check_foreign_keys_of(
         let found = referenced_values_now(
             database,
             &fk.parent_table,
-            &fk.parent_column,
+            parent_column,
             std::slice::from_ref(literal),
             tx,
             Some(1),
@@ -2432,7 +2466,7 @@ async fn check_foreign_keys_of(
         acquire_referenced_waiting(
             database,
             &fk.parent_table,
-            &fk.parent_column,
+            parent_column,
             &key,
             tx,
             crate::core::rql::row_lock::LockStrength::Share,
@@ -2441,7 +2475,7 @@ async fn check_foreign_keys_of(
         let still = referenced_values_now(
             database,
             &fk.parent_table,
-            &fk.parent_column,
+            parent_column,
             std::slice::from_ref(literal),
             tx,
             Some(1),
@@ -2492,8 +2526,10 @@ tokio::task_local! {
 pub(crate) struct DeferredSelfReferences {
     /// Each table a check waits on, with the schema its check reads.
     tables: Vec<(String, std::sync::Arc<crate::core::row::schema::TableSchema>)>,
-    /// `(index into tables, child column, value as the row wrote it)`.
-    checks: Vec<(usize, String, String)>,
+    /// `(index into tables, (child column, value as the row wrote it) for
+    /// each column of the key)`: one pair for a one-column key, the whole
+    /// tuple for a composite one.
+    checks: Vec<(usize, Vec<(String, String)>)>,
 }
 
 impl DeferredSelfReferences {
@@ -2502,14 +2538,15 @@ impl DeferredSelfReferences {
     }
 }
 
-/// Defers the self-reference check of `fk` for `literal` to the end of the
-/// statement, when a statement scope is open. `false` when none is: the
-/// caller then reports the violation at once, as it always did.
+/// Defers the self-reference check of `fk` for `values` (each key column
+/// with the value the row wrote) to the end of the statement, when a
+/// statement scope is open. `false` when none is: the caller then reports
+/// the violation at once, as it always did.
 fn defer_self_reference(
     schema: Option<&crate::core::row::schema::TableSchema>,
     table_name: &str,
     fk: &crate::core::rql::foreign_key::ForeignKey,
-    literal: &str,
+    values: Vec<(String, String)>,
 ) -> bool {
     let Some(schema) = schema else {
         return false;
@@ -2527,7 +2564,7 @@ fn defer_self_reference(
                     deferred.tables.len() - 1
                 }
             };
-            deferred.checks.push((at, fk.column.clone(), literal.to_string()));
+            deferred.checks.push((at, values));
         })
         .is_ok()
 }
@@ -2618,8 +2655,10 @@ async fn check_deferred_self_references(
     tx: TxId,
 ) -> Result<(), String> {
     let mut seen = std::collections::HashSet::new();
-    for (at, column, literal) in deferred.checks {
-        if !seen.insert((at, column.to_ascii_lowercase(), literal.trim().to_string())) {
+    for (at, values) in deferred.checks {
+        let key: Vec<(String, String)> =
+            values.iter().map(|(column, literal)| (column.to_ascii_lowercase(), literal.trim().to_string())).collect();
+        if !seen.insert((at, key)) {
             continue;
         }
         let (table_name, schema) = &deferred.tables[at];
@@ -2627,7 +2666,7 @@ async fn check_deferred_self_references(
             database,
             Some(schema.as_ref()),
             table_name,
-            &[(column, literal)],
+            &values,
             tx,
         ))
         .await?;
@@ -2684,6 +2723,11 @@ async fn prevalidate_foreign_keys(
         .collect();
 
     for fk in foreign_keys.iter() {
+        // One-column keys only: a composite key's rows are each checked
+        // whole by their own insert (`fk_composite::check_child_row`).
+        let Some((fk_column, parent_column)) = fk.single() else {
+            continue;
+        };
         if !database.has_table(&fk.parent_table) {
             continue;
         }
@@ -2692,7 +2736,7 @@ async fn prevalidate_foreign_keys(
         for assignments in &rows {
             let Some((_, literal)) = assignments
                 .iter()
-                .find(|(column, _)| column.eq_ignore_ascii_case(&fk.column))
+                .find(|(column, _)| column.eq_ignore_ascii_case(fk_column))
             else {
                 continue;
             };
@@ -2719,7 +2763,7 @@ async fn prevalidate_foreign_keys(
         let raw = literals;
         let mut literals: Vec<String> = Vec::new();
         let mut proved_raw: Vec<String> = Vec::new();
-        let fields = fk_key_fields(database, &child.schema, fk);
+        let fields = fk_key_fields(database, &child.schema, fk, 0);
         for literal in &raw {
             let coerced = match &fields {
                 Some(((c, cm), (p, pm))) => coerce_key_literal(literal, c, cm, p, pm),
@@ -2737,7 +2781,7 @@ async fn prevalidate_foreign_keys(
         }
 
         let Ok(found) =
-            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None, KeySide::Parent)
+            referenced_values_now(database, &fk.parent_table, parent_column, &literals, tx, None, KeySide::Parent)
                 .await
         else {
             continue;
@@ -2750,7 +2794,7 @@ async fn prevalidate_foreign_keys(
             if acquire_referenced_waiting(
                 database,
                 &fk.parent_table,
-                &fk.parent_column,
+                parent_column,
                 key,
                 tx,
                 crate::core::rql::row_lock::LockStrength::Share,
@@ -2767,7 +2811,7 @@ async fn prevalidate_foreign_keys(
             continue;
         }
         let Ok(still) =
-            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &literals, tx, None, KeySide::Parent)
+            referenced_values_now(database, &fk.parent_table, parent_column, &literals, tx, None, KeySide::Parent)
                 .await
         else {
             continue;
@@ -2776,7 +2820,7 @@ async fn prevalidate_foreign_keys(
             continue;
         }
         for literal in &proved_raw {
-            verified.insert(verified_key(&fk.parent_table, &fk.parent_column, literal));
+            verified.insert(verified_key(&fk.parent_table, parent_column, literal));
         }
     }
     verified
@@ -3243,15 +3287,40 @@ fn default_literal_for(database: &Arc<Database>, table: &str, column: &str) -> S
         .unwrap_or_else(|_| "NULL".to_string())
 }
 
-/// The values a `DELETE` is about to remove from one referenced column.
+/// The values a `DELETE` is about to remove from one referenced column, or
+/// from one composite key's referenced columns.
 pub(crate) struct ReferencedColumn {
-    /// The parent column some foreign key references.
+    /// The parent column some foreign key references; for a composite key,
+    /// its columns' lock name (`fk_composite::lock_column`).
     column: String,
-    /// Each distinct value's stored bytes — what the key lock is taken on.
+    /// Each distinct value's stored bytes — what the key lock is taken on;
+    /// for a composite key, each tuple's lock key.
     stored: Vec<Vec<u8>>,
     /// The same values as SQL literals, index for index — what the
-    /// referencing tables are matched against.
+    /// referencing tables are matched against. Empty for a composite key.
     literals: Vec<String>,
+    /// A composite key's referenced columns, in key order; empty for one
+    /// column.
+    columns: Vec<String>,
+    /// A composite key's tuples, a literal per column, index for index with
+    /// `stored`.
+    tuples: Vec<Vec<String>>,
+}
+
+impl ReferencedColumn {
+    /// Whether these are the values `fk` references: its one column, or a
+    /// composite key's columns in its order.
+    fn of(&self, fk: &crate::core::rql::foreign_key::ForeignKey) -> bool {
+        match fk.single() {
+            Some((_, parent_column)) => self.columns.is_empty() && self.column.eq_ignore_ascii_case(parent_column),
+            None => same_columns(&self.columns, &fk.parent_columns),
+        }
+    }
+}
+
+/// Two column lists naming the same columns in the same order.
+fn same_columns(a: &[String], b: &[String]) -> bool {
+    !a.is_empty() && a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 /// A blocking foreign key (`NO ACTION`, `RESTRICT`) from `parent_table` to
@@ -3266,6 +3335,8 @@ pub(crate) struct SelfReference {
     fk_name: String,
     column: String,
     literals: Vec<String>,
+    /// A composite key, with the child-typed tuples its rows must not hold.
+    composite: Option<(crate::core::rql::foreign_key::ForeignKey, Vec<Vec<String>>)>,
 }
 
 /// After the `DELETE` from `table` ran: a deleted key a remaining row of
@@ -3278,6 +3349,12 @@ async fn check_self_references(
     tx: TxId,
 ) -> Result<(), String> {
     for check in deferred {
+        if let Some((fk, tuples)) = &check.composite {
+            if fk_composite::referenced_by_child(database, table, fk, tuples, tx).await? {
+                return Err(fk_composite::parent_violation(table, fk, table));
+            }
+            continue;
+        }
         let left = referenced_values_now(database, table, &check.column, &check.literals, tx, Some(1), KeySide::Child)
             .await
             .map_err(|e| format!("foreign key \"{}\" could not be checked: {}", check.fk_name, e))?;
@@ -3347,10 +3424,7 @@ async fn apply_on_delete(
     // lock them when they run.
     let children: Vec<(String, TableMode)> = referencing
         .iter()
-        .filter(|(_, fk)| {
-            keys.iter()
-                .any(|k| k.column.eq_ignore_ascii_case(&fk.parent_column) && !k.literals.is_empty())
-        })
+        .filter(|(_, fk)| keys.iter().any(|k| k.of(fk) && !k.stored.is_empty()))
         .map(|(child, fk)| {
             let mode = if fk.on_delete.blocks() { TableMode::AccessShare } else { TableMode::RowExclusive };
             (child.clone(), mode)
@@ -3359,15 +3433,18 @@ async fn apply_on_delete(
     database.tables_for(&children, owner()).await?;
 
     for (child_table, fk) in referencing {
-        let Some(referenced) = keys
-            .iter()
-            .find(|k| k.column.eq_ignore_ascii_case(&fk.parent_column))
-        else {
+        let Some(referenced) = keys.iter().find(|k| k.of(&fk)) else {
             continue;
         };
-        if referenced.literals.is_empty() {
+        if referenced.stored.is_empty() {
             continue;
         }
+        let Some((fk_column, _)) = fk.single() else {
+            fk_composite::on_delete(database, parent_table, &child_table, &fk, &referenced.tuples, depth, tx, &mut deferred)
+                .await?;
+            continue;
+        };
+        let fk_column = fk_column.to_string();
         // The keys at the child column's type (P4 round 3): a key no child
         // value can equal (`7.50` for an integer column) references nothing.
         let child_literals: Vec<String> = parent_literals_for_child(database, &child_table, &fk, &referenced.literals)
@@ -3394,15 +3471,16 @@ async fn apply_on_delete(
             if child_table.eq_ignore_ascii_case(parent_table) {
                 deferred.push(SelfReference {
                     fk_name: fk.name.clone(),
-                    column: fk.column.clone(),
+                    column: fk_column.clone(),
                     literals: child_literals,
+                    composite: None,
                 });
                 continue;
             }
             let referencing = referenced_values_now(
                 database,
                 &child_table,
-                &fk.column,
+                &fk_column,
                 &child_literals,
                 tx,
                 Some(1),
@@ -3420,20 +3498,20 @@ async fn apply_on_delete(
             ReferentialAction::Cascade => {
                 format!(
                     "DELETE FROM {} WHERE {} IN ({})",
-                    child_table, fk.column, list
+                    child_table, fk_column, list
                 )
             }
             ReferentialAction::SetNull => {
                 format!(
                     "UPDATE {} SET {} = NULL WHERE {} IN ({})",
-                    child_table, fk.column, fk.column, list
+                    child_table, fk_column, fk_column, list
                 )
             }
             ReferentialAction::SetDefault => {
-                let literal = default_literal_for(database, &child_table, &fk.column);
+                let literal = default_literal_for(database, &child_table, &fk_column);
                 format!(
                     "UPDATE {} SET {} = {} WHERE {} IN ({})",
-                    child_table, fk.column, literal, fk.column, list
+                    child_table, fk_column, literal, fk_column, list
                 )
             }
             // The blocking actions returned above.
@@ -3469,7 +3547,7 @@ async fn apply_on_delete(
         let left = referenced_values_now(
             database,
             &child_table,
-            &fk.column,
+            &fk_column,
             &child_literals,
             tx,
             Some(1),
@@ -3521,16 +3599,36 @@ async fn keys_about_to_be_deleted(
     tx: TxId,
 ) -> Result<Vec<ReferencedColumn>, String> {
     let mut columns: Vec<String> = Vec::new();
+    // A composite key's referenced columns, each list once, in key order.
+    let mut composites: Vec<Vec<String>> = Vec::new();
     for (_, fk) in referencing_keys(database, table_name) {
-        if !columns
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(&fk.parent_column))
-        {
-            columns.push(fk.parent_column);
+        match fk.single() {
+            Some((_, parent_column)) => {
+                if !columns.iter().any(|c| c.eq_ignore_ascii_case(parent_column)) {
+                    columns.push(parent_column.to_string());
+                }
+            }
+            None => {
+                if !composites.iter().any(|c| same_columns(c, &fk.parent_columns)) {
+                    composites.push(fk.parent_columns.clone());
+                }
+            }
         }
     }
 
-    let mut out = Vec::with_capacity(columns.len());
+    let mut out = Vec::with_capacity(columns.len() + composites.len());
+    for key_columns in composites {
+        let tuples =
+            fk_composite::tuples_as_of(target, &key_columns, where_clause, query_row_fetch, visibility, tx).await?;
+        let (stored, tuples) = tuples.into_iter().unzip();
+        out.push(ReferencedColumn {
+            column: fk_composite::lock_column(&key_columns),
+            stored,
+            literals: Vec::new(),
+            columns: key_columns,
+            tuples,
+        });
+    }
     for column in columns {
         let values =
             column_values_as_of(target, &column, where_clause, query_row_fetch, visibility, tx)
@@ -3539,6 +3637,8 @@ async fn keys_about_to_be_deleted(
             column,
             stored: Vec::with_capacity(values.len()),
             literals: Vec::with_capacity(values.len()),
+            columns: Vec::new(),
+            tuples: Vec::new(),
         };
         for (bytes, literal) in values {
             referenced.stored.push(bytes);
@@ -3649,10 +3749,30 @@ pub(crate) struct KeyChanges {
 /// what it moves to (`None` for NULL). Unchanged values are left out — an
 /// `UPDATE` that rewrites a key to itself changes nothing a child can see.
 struct KeyChange {
+    /// The referenced column; for a composite key, its columns' lock name
+    /// (`fk_composite::lock_column`).
     column: String,
+    /// Each old value's stored bytes; a composite key's tuples' lock keys.
     old_stored: Vec<Vec<u8>>,
+    /// One column's old and new values. Empty for a composite key.
     old_literals: Vec<String>,
     new_literals: Vec<Option<String>>,
+    /// A composite key's referenced columns in key order (empty for one
+    /// column), and its old and new tuples, index for index with
+    /// `old_stored` (`None` for a column the update sets NULL).
+    columns: Vec<String>,
+    old_tuples: Vec<Vec<String>>,
+    new_tuples: Vec<Vec<Option<String>>>,
+}
+
+impl KeyChange {
+    /// Whether these are the values `fk` references (`ReferencedColumn::of`).
+    fn of(&self, fk: &crate::core::rql::foreign_key::ForeignKey) -> bool {
+        match fk.single() {
+            Some((_, parent_column)) => self.columns.is_empty() && self.column.eq_ignore_ascii_case(parent_column),
+            None => same_columns(&self.columns, &fk.parent_columns),
+        }
+    }
 }
 
 /// Whether an `UPDATE` needs one snapshot for the whole statement: a foreign
@@ -3682,10 +3802,18 @@ fn update_needs_statement_snapshot(
             .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name))
             .is_some_and(|f| plan.expressions.iter().any(|(w, _)| *w == f.write_order as u32))
     };
-    schema.foreign_keys.iter().any(|fk| by_expression(&fk.column))
-        || referencing_keys(database, table_name)
+    // A composite key whose columns the statement assigns at all is checked
+    // on the rows it writes (`fk_composite::check_written_rows`), which
+    // needs them written under the statement's snapshot.
+    schema.foreign_keys.iter().any(|fk| match fk.single() {
+        Some((column, _)) => by_expression(column),
+        None => fk
+            .columns
             .iter()
-            .any(|(_, fk)| assigned(&fk.parent_column))
+            .any(|c| assigned(c) || assigned(&crate::core::rql::nullable::flag_column_name(c))),
+    }) || referencing_keys(database, table_name)
+        .iter()
+        .any(|(_, fk)| fk.parent_columns.iter().any(|c| assigned(c)))
 }
 
 /// The child side of an `UPDATE`'s foreign keys.
@@ -3705,7 +3833,56 @@ async fn check_foreign_keys_for_update(
     assignments: &[(String, String)],
     visibility: Option<&crate::core::mvcc::Visibility>,
     tx: TxId,
-) -> Result<Vec<crate::core::row::schema::SchemaField>, String> {
+) -> Result<KeysAfterWrite, String> {
+    let mut after = KeysAfterWrite::default();
+    // Composite keys whose columns the statement assigns: checked on the
+    // rows it writes, each row's new tuple whole (an unassigned column keeps
+    // its value, which only the row knows). With the constant assignments to
+    // their columns (and NULL companions), which the written image does not
+    // carry.
+    {
+        let schema = &target.schema().fields;
+        let write_order_of = |name: &str| {
+            schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(name)).map(|f| f.write_order as u32)
+        };
+        let assigned = |wo: u32| plan.updates.iter().any(|u| u.write_order == wo) || plan.expressions.iter().any(|(w, _)| *w == wo);
+        for fk in target.schema().foreign_keys.iter().filter(|fk| fk.is_composite()) {
+            let orders: Vec<u32> = fk
+                .columns
+                .iter()
+                .flat_map(|c| [write_order_of(c), write_order_of(&crate::core::rql::nullable::flag_column_name(c))])
+                .flatten()
+                .collect();
+            if !orders.iter().any(|wo| assigned(*wo)) {
+                continue;
+            }
+            if visibility.is_none() {
+                return Err("an assignment to a composite foreign key's column needs a statement snapshot".to_string());
+            }
+            after.composite.push(fk.clone());
+            // An expression's column (and its NULL companion) holds a
+            // placeholder in the plan's payloads until the write computes
+            // it; the written image carries the value.
+            let computed: Vec<u32> = fk
+                .columns
+                .iter()
+                .filter_map(|c| write_order_of(c).map(|wo| (c, wo)))
+                .filter(|(_, wo)| plan.expressions.iter().any(|(w, _)| w == wo))
+                .flat_map(|(c, wo)| [Some(wo), write_order_of(&crate::core::rql::nullable::flag_column_name(c))])
+                .flatten()
+                .collect();
+            for u in plan.updates.iter().filter(|u| orders.contains(&u.write_order) && !computed.contains(&u.write_order)) {
+                if !after.constants.iter().any(|c| c.write_order == u.write_order) {
+                    after.constants.push(crate::core::row::row::ColumnWritePayload {
+                        data: u.data.clone(),
+                        write_order: u.write_order,
+                        column_type: u.column_type.clone(),
+                        size: u.size,
+                    });
+                }
+            }
+        }
+    }
     let schema = &target.schema().fields;
     let expression_of = |name: &str| {
         schema
@@ -3730,7 +3907,8 @@ async fn check_foreign_keys_for_update(
         .schema()
         .foreign_keys
         .iter()
-        .filter_map(|fk| expression_of(&fk.column).map(|(f, e)| (fk.column.clone(), f, e)))
+        .filter_map(|fk| fk.single())
+        .filter_map(|(column, _)| expression_of(column).map(|(f, e)| (column.to_string(), f, e)))
         .collect();
     // An expression that answers anew at every evaluation (`nextval('s')`,
     // `gen_random_uuid()`) has no value until the write computes it:
@@ -3748,15 +3926,16 @@ async fn check_foreign_keys_for_update(
         }
         !volatile
     });
-    if by_expression.is_empty() && after_write.is_empty() {
-        return Ok(after_write);
+    after.columns = after_write;
+    if by_expression.is_empty() && after.columns.is_empty() {
+        return Ok(after);
     }
     let Some(visibility) = visibility else {
         return Err("an expression assigned to a foreign-key column needs a statement snapshot"
             .to_string());
     };
     if by_expression.is_empty() {
-        return Ok(after_write);
+        return Ok(after);
     }
     let full = crate::core::row::table::Table::<crate::core::storage_providers::backend::DbStorageProvider>::build_full_row_fetch(schema);
     let rows = relation_rows_as_of(
@@ -3791,7 +3970,25 @@ async fn check_foreign_keys_for_update(
             }
         }
     }
-    Ok(after_write)
+    Ok(after)
+}
+
+/// What an `UPDATE`'s foreign keys check once its rows are written
+/// ([`check_written_foreign_keys`]).
+#[derive(Default)]
+pub(crate) struct KeysAfterWrite {
+    /// One-column keys' columns assigned a volatile expression.
+    columns: Vec<crate::core::row::schema::SchemaField>,
+    /// Composite keys whose columns the statement assigns.
+    composite: Vec<crate::core::rql::foreign_key::ForeignKey>,
+    /// The constant assignments to those keys' columns and NULL companions.
+    constants: Vec<crate::core::row::row::ColumnWritePayload>,
+}
+
+impl KeysAfterWrite {
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.composite.is_empty()
+    }
 }
 
 /// The foreign keys of `columns`, checked against the rows an `UPDATE`
@@ -3804,11 +4001,14 @@ async fn check_foreign_keys_for_update(
 async fn check_written_foreign_keys(
     database: &Arc<Database>,
     table_name: &str,
-    columns: &[crate::core::row::schema::SchemaField],
+    after: &KeysAfterWrite,
     written: &[crate::core::row::row::Row],
     tx: TxId,
 ) -> Result<(), String> {
-    for field in columns {
+    if !after.composite.is_empty() {
+        fk_composite::check_written_rows(database, table_name, &after.composite, &after.constants, written, tx).await?;
+    }
+    for field in &after.columns {
         let mut seen = std::collections::HashSet::new();
         for row in written {
             let Some(cell) = row.columns.iter().find(|c| u64::from(c.schema_id) == field.write_order) else {
@@ -3850,22 +4050,37 @@ async fn keys_about_to_change(
             || plan.expressions.iter().any(|(w, _)| *w == write_order)
     };
 
+    let touched = |field: &crate::core::row::schema::SchemaField| {
+        let flag = crate::core::rql::nullable::flag_field(&field.name, schema);
+        assigned(field.write_order as u32) || flag.is_some_and(|f| assigned(f.write_order as u32))
+    };
     let mut columns: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+    // A composite key's referenced columns, each list once, when the
+    // statement assigns any of them.
+    let mut composites: Vec<Vec<crate::core::row::schema::SchemaField>> = Vec::new();
     for (_, fk) in referencing_keys(database, table_name) {
-        let Some(field) = schema
+        let fields: Option<Vec<crate::core::row::schema::SchemaField>> = fk
+            .parent_columns
             .iter()
-            .find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.parent_column))
-        else {
+            .map(|column| schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column)).cloned())
+            .collect();
+        let Some(fields) = fields else {
             continue;
         };
-        let flag = crate::core::rql::nullable::flag_field(&field.name, schema);
-        let touched = assigned(field.write_order as u32)
-            || flag.is_some_and(|f| assigned(f.write_order as u32));
-        if touched && !columns.iter().any(|c| c.write_order == field.write_order) {
-            columns.push(field.clone());
+        if fk.single().is_some() {
+            let field = &fields[0];
+            if touched(field) && !columns.iter().any(|c| c.write_order == field.write_order) {
+                columns.push(field.clone());
+            }
+        } else if fields.iter().any(touched)
+            && !composites.iter().any(|c| {
+                c.len() == fields.len() && c.iter().zip(&fields).all(|(a, b)| a.write_order == b.write_order)
+            })
+        {
+            composites.push(fields);
         }
     }
-    if columns.is_empty() {
+    if columns.is_empty() && composites.is_empty() {
         return Ok(None);
     }
 
@@ -3891,12 +4106,14 @@ async fn keys_about_to_change(
     let mut changes = Vec::with_capacity(columns.len());
     for field in columns {
         let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
-        let wo = field.write_order as u32;
         let mut change = KeyChange {
             column: field.name.clone(),
             old_stored: Vec::new(),
             old_literals: Vec::new(),
             new_literals: Vec::new(),
+            columns: Vec::new(),
+            old_tuples: Vec::new(),
+            new_tuples: Vec::new(),
         };
         let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
         for row in &rows {
@@ -3911,49 +4128,7 @@ async fn keys_about_to_change(
             };
 
             // The new value, as the write path will compute it.
-            let new: Option<(Vec<u8>, crate::core::db_type::DbType)> = if let Some((_, expr)) =
-                plan.expressions.iter().find(|(w, _)| *w == wo)
-            {
-                let value = crate::core::rql::expr::eval_into(expr, row, schema.as_slice(), &field)?;
-                match value {
-                    crate::core::rql::expr::Value::Null => None,
-                    crate::core::rql::expr::Value::Data { bytes, db_type } => {
-                        Some((bytes.to_vec(), db_type))
-                    }
-                }
-            } else {
-                let set_null = flag.as_ref().is_some_and(|f| {
-                    plan.updates.iter().any(|u| {
-                        u.write_order == f.write_order as u32
-                            && u.data.into_slice().first().copied().unwrap_or(0) != 0
-                    })
-                });
-                if set_null {
-                    None
-                } else {
-                    match plan.updates.iter().find(|u| u.write_order == wo) {
-                        Some(u) => Some((u.data.into_slice().to_vec(), field.db_type.clone())),
-                        // Only the companion was assigned, and to "not null":
-                        // the value bytes stay what they were.
-                        None => Some((old.clone(), field.db_type.clone())),
-                    }
-                }
-            };
-            let new_literal = match &new {
-                Some((bytes, ty)) if *ty == field.db_type => Some(key_literal(&field, bytes)?),
-                // An expression's result is in the type it computed in (`3 - id`
-                // over an INT is a BIGINT), which the write path narrows; its
-                // literal is rendered in that type, and compared as a literal.
-                Some((bytes, ty)) => Some(
-                    crate::core::rql::subquery::value_to_literal(ty, bytes).ok_or_else(|| {
-                        format!(
-                            "cannot apply ON UPDATE for \"{}\": the new value is unrepresentable",
-                            field.name
-                        )
-                    })?,
-                ),
-                None => None,
-            };
+            let new_literal = updated_key_literal(plan, schema, row, &field, flag.as_ref(), &old)?;
             let old_literal = key_literal(&field, &old)?;
             if new_literal.as_deref() == Some(old_literal.as_str()) {
                 continue;
@@ -3980,10 +4155,128 @@ async fn keys_about_to_change(
             changes.push(change);
         }
     }
+    for fields in composites {
+        let flags: Vec<Option<crate::core::row::schema::SchemaField>> =
+            fields.iter().map(|f| crate::core::rql::nullable::flag_field(&f.name, schema).cloned()).collect();
+        let names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+        let mut change = KeyChange {
+            column: fk_composite::lock_column(&names),
+            old_stored: Vec::new(),
+            old_literals: Vec::new(),
+            new_literals: Vec::new(),
+            columns: names,
+            old_tuples: Vec::new(),
+            new_tuples: Vec::new(),
+        };
+        let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+        'rows: for row in &rows {
+            let mut old_cells = Vec::with_capacity(fields.len());
+            let mut old_tuple = Vec::with_capacity(fields.len());
+            let mut new_tuple = Vec::with_capacity(fields.len());
+            for (field, flag) in fields.iter().zip(&flags) {
+                let old_null = flag.as_ref().is_some_and(|f| {
+                    cell(row, f.write_order as u64).is_some_and(|b| b.first().copied().unwrap_or(0) != 0)
+                });
+                // A tuple with a NULL in it is referenced by nothing.
+                if old_null {
+                    continue 'rows;
+                }
+                let Some(old) = cell(row, field.write_order as u64) else {
+                    continue 'rows;
+                };
+                new_tuple.push(updated_key_literal(plan, schema, row, field, flag.as_ref(), &old)?);
+                old_tuple.push(key_literal(field, &old)?);
+                old_cells.push(old);
+            }
+            if new_tuple.iter().zip(&old_tuple).all(|(new, old)| new.as_deref() == Some(old.as_str())) {
+                continue;
+            }
+            let key = fk_composite::lock_key(&old_cells);
+            match index.get(&key) {
+                Some(&i) => {
+                    if change.new_tuples[i] != new_tuple {
+                        return Err(format!(
+                            "cannot apply ON UPDATE for ({}): rows sharing the key ({}) are updated to different \
+                             values",
+                            change.columns.join(", "),
+                            change.old_tuples[i].join(", ")
+                        ));
+                    }
+                }
+                None => {
+                    index.insert(key.clone(), change.old_stored.len());
+                    change.old_stored.push(key);
+                    change.old_tuples.push(old_tuple);
+                    change.new_tuples.push(new_tuple);
+                }
+            }
+        }
+        if !change.old_stored.is_empty() {
+            changes.push(change);
+        }
+    }
     if changes.is_empty() {
         return Ok(None);
     }
     Ok(Some(KeyChanges { columns: changes }))
+}
+
+/// The value an `UPDATE` gives key column `field` of `row` (`old`, its
+/// stored bytes now), as the write path will compute it, rendered as a
+/// literal; `None` for NULL. Constant assignments from the plan's payloads,
+/// expressions evaluated against the row as it stands before the update.
+fn updated_key_literal(
+    plan: &crate::core::rql::lexer_ur::UpdateRow,
+    schema: &[crate::core::row::schema::SchemaField],
+    row: &crate::core::row::row::Row,
+    field: &crate::core::row::schema::SchemaField,
+    flag: Option<&crate::core::row::schema::SchemaField>,
+    old: &[u8],
+) -> Result<Option<String>, String> {
+    let wo = field.write_order as u32;
+    let new: Option<(Vec<u8>, crate::core::db_type::DbType)> = if let Some((_, expr)) =
+        plan.expressions.iter().find(|(w, _)| *w == wo)
+    {
+        let value = crate::core::rql::expr::eval_into(expr, row, schema, field)?;
+        match value {
+            crate::core::rql::expr::Value::Null => None,
+            crate::core::rql::expr::Value::Data { bytes, db_type } => {
+                Some((bytes.to_vec(), db_type))
+            }
+        }
+    } else {
+        let set_null = flag.is_some_and(|f| {
+            plan.updates.iter().any(|u| {
+                u.write_order == f.write_order as u32
+                    && u.data.into_slice().first().copied().unwrap_or(0) != 0
+            })
+        });
+        if set_null {
+            None
+        } else {
+            match plan.updates.iter().find(|u| u.write_order == wo) {
+                Some(u) => Some((u.data.into_slice().to_vec(), field.db_type.clone())),
+                // Only the companion was assigned, and to "not null":
+                // the value bytes stay what they were.
+                None => Some((old.to_vec(), field.db_type.clone())),
+            }
+        }
+    };
+    Ok(match &new {
+        Some((bytes, ty)) if *ty == field.db_type => Some(key_literal(field, bytes)?),
+        // An expression's result is in the type it computed in (`3 - id`
+        // over an INT is a BIGINT), which the write path narrows; its
+        // literal is rendered in that type, and compared as a literal.
+        Some((bytes, ty)) => Some(
+            crate::core::rql::subquery::value_to_literal(ty, bytes).ok_or_else(|| {
+                format!(
+                    "cannot apply ON UPDATE for \"{}\": the new value is unrepresentable",
+                    field.name
+                )
+            })?,
+        ),
+        None => None,
+    })
 }
 
 /// Before the `UPDATE` writes: locks every key it moves — the same exclusive
@@ -4020,11 +4313,11 @@ async fn lock_keys_before_update(
         if child_table.eq_ignore_ascii_case(parent_table) {
             continue;
         }
-        let Some(change) = changes
-            .columns
-            .iter()
-            .find(|c| c.column.eq_ignore_ascii_case(&fk.parent_column))
-        else {
+        let Some(change) = changes.columns.iter().find(|c| c.of(&fk)) else {
+            continue;
+        };
+        let Some((fk_column, _)) = fk.single() else {
+            fk_composite::restrict_update(database, parent_table, &child_table, &fk, change, tx).await?;
             continue;
         };
         let child_literals: Vec<String> = parent_literals_for_child(database, &child_table, &fk, &change.old_literals)
@@ -4037,7 +4330,7 @@ async fn lock_keys_before_update(
         let referencing = referenced_values_now(
             database,
             &child_table,
-            &fk.column,
+            fk_column,
             &child_literals,
             tx,
             Some(1),
@@ -4087,7 +4380,7 @@ async fn apply_on_update(
     // `apply_on_delete`): read for a check, written by an action.
     let children: Vec<(String, TableMode)> = referencing
         .iter()
-        .filter(|(_, fk)| changes.columns.iter().any(|c| c.column.eq_ignore_ascii_case(&fk.parent_column)))
+        .filter(|(_, fk)| changes.columns.iter().any(|c| c.of(fk)))
         .map(|(child, fk)| {
             let mode = match fk.on_update {
                 ReferentialAction::NoAction | ReferentialAction::Restrict => TableMode::AccessShare,
@@ -4099,13 +4392,14 @@ async fn apply_on_update(
     database.tables_for(&children, owner()).await?;
 
     for (child_table, fk) in referencing {
-        let Some(change) = changes
-            .columns
-            .iter()
-            .find(|c| c.column.eq_ignore_ascii_case(&fk.parent_column))
-        else {
+        let Some(change) = changes.columns.iter().find(|c| c.of(&fk)) else {
             continue;
         };
+        let Some((fk_column, _)) = fk.single() else {
+            fk_composite::on_update(database, parent_table, &child_table, &fk, change, depth, tx).await?;
+            continue;
+        };
+        let fk_column = fk_column.to_string();
         let unchecked =
             |e: String| format!("foreign key \"{}\" could not be checked: {}", fk.name, e);
         let violation = || {
@@ -4163,38 +4457,38 @@ async fn apply_on_update(
                     for i in &vanished {
                         case.push_str(&format!(
                             " WHEN {} = {} THEN {}",
-                            fk.column,
+                            fk_column,
                             old_for_child[*i].as_deref().unwrap_or("NULL"),
                             new_of(*i)
                         ));
                     }
-                    case.push_str(&format!(" ELSE {} END", fk.column));
+                    case.push_str(&format!(" ELSE {} END", fk_column));
                     case
                 };
                 Some(format!(
                     "UPDATE {} SET {} = {} WHERE {} IN ({})",
                     child_table,
-                    fk.column,
+                    fk_column,
                     set,
-                    fk.column,
+                    fk_column,
                     vanished_literals.join(", ")
                 ))
             }
             ReferentialAction::SetNull => Some(format!(
                 "UPDATE {} SET {} = NULL WHERE {} IN ({})",
                 child_table,
-                fk.column,
-                fk.column,
+                fk_column,
+                fk_column,
                 vanished_literals.join(", ")
             )),
             ReferentialAction::SetDefault => {
-                let literal = default_literal_for(database, &child_table, &fk.column);
+                let literal = default_literal_for(database, &child_table, &fk_column);
                 Some(format!(
                     "UPDATE {} SET {} = {} WHERE {} IN ({})",
                     child_table,
-                    fk.column,
+                    fk_column,
                     literal,
-                    fk.column,
+                    fk_column,
                     vanished_literals.join(", ")
                 ))
             }
@@ -4218,7 +4512,7 @@ async fn apply_on_update(
         let left = referenced_values_now(
             database,
             &child_table,
-            &fk.column,
+            &fk_column,
             &vanished_literals,
             tx,
             Some(1),
@@ -5854,10 +6148,10 @@ async fn retype_by_cast(
     let in_a_foreign_key = schema
         .foreign_keys
         .iter()
-        .any(|fk| !fk.is_deleted && fk.column.eq_ignore_ascii_case(&field.name))
+        .any(|fk| !fk.is_deleted && fk.has_column(&field.name))
         || referencing_keys(database, table_name)
             .iter()
-            .any(|(_, fk)| !fk.is_deleted && fk.parent_column.eq_ignore_ascii_case(&field.name));
+            .any(|(_, fk)| !fk.is_deleted && fk.has_parent_column(&field.name));
     if in_a_foreign_key && !widens_an_integer {
         return Err(format!(
             "ALTER COLUMN {} TYPE {}: the column is a side of a foreign key, and only widening an integer \
@@ -6074,10 +6368,10 @@ async fn retype_using(
     let in_a_foreign_key = schema
         .foreign_keys
         .iter()
-        .any(|fk| !fk.is_deleted && fk.column.eq_ignore_ascii_case(&field.name))
+        .any(|fk| !fk.is_deleted && fk.has_column(&field.name))
         || referencing_keys(database, table_name)
             .iter()
-            .any(|(_, fk)| !fk.is_deleted && fk.parent_column.eq_ignore_ascii_case(&field.name));
+            .any(|(_, fk)| !fk.is_deleted && fk.has_parent_column(&field.name));
     if in_a_foreign_key {
         return Err(format!(
             "ALTER COLUMN {} TYPE {} USING: the column is a side of a foreign key, whose references the new \
@@ -6988,7 +7282,7 @@ fn keys_depending_on_constraint(
     let mut dependents: Vec<(String, String)> = database
         .referencing_keys(table)
         .into_iter()
-        .filter(|(_, fk)| !fk.is_deleted && fk.parent_column.eq_ignore_ascii_case(&column))
+        .filter(|(_, fk)| !fk.is_deleted && fk.single().is_some_and(|(_, parent)| parent.eq_ignore_ascii_case(&column)))
         .map(|(child, fk)| (child, fk.name))
         .collect();
     dependents.sort();
@@ -12247,17 +12541,17 @@ fn supply_generated_values(
 }
 
 /// Fills in each `REFERENCES parent` written with no column list: the
-/// parent's primary key (`Database::default_referenced_column`). After the
-/// CREATE's locks, so the parent's key cannot change before it is checked.
+/// parent's primary key, one column or several
+/// (`Database::default_referenced_columns`). After the CREATE's locks, so
+/// the parent's key cannot change before it is checked.
 fn resolve_default_referenced_columns(
     database: &Database,
     create_table: &mut crate::core::rql::lexer_ct::CreateTable,
 ) -> Result<(), String> {
     let own_table = create_table.table_name.clone();
-    let own_key = create_table.primary_key.clone();
-    let own_unique = create_table.unique_keys.clone();
-    for fk in create_table.foreign_keys.iter_mut().filter(|fk| fk.parent_column.is_empty()) {
-        fk.parent_column = database.default_referenced_column(fk, &own_table, own_key.as_deref(), &own_unique)?;
+    let own_key = crate::core::database::create_table_primary_key(create_table);
+    for fk in create_table.foreign_keys.iter_mut().filter(|fk| fk.parent_columns.is_empty()) {
+        fk.parent_columns = database.default_referenced_columns(fk, &own_table, own_key.clone())?;
     }
     Ok(())
 }
@@ -13488,15 +13782,16 @@ async fn add_foreign_key(
         Ok(fk) => fk,
         Err(e) => return ddl_error(&e),
     };
-    if !crate::core::rql::nullable::visible_fields(&schema.fields)
-        .iter()
-        .any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column))
+    let visible = crate::core::rql::nullable::visible_fields(&schema.fields);
+    if let Some(missing) =
+        fk.columns.iter().find(|c| !visible.iter().any(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(c)))
     {
-        return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", fk.column));
+        return ddl_error(&format!("column \"{}\" referenced in foreign key constraint does not exist", missing));
     }
-    if fk.parent_column.is_empty() {
-        match database.default_referenced_column(&fk, table_name, schema.primary_key.as_deref(), &schema.unique_keys) {
-            Ok(column) => fk.parent_column = column,
+    if fk.parent_columns.is_empty() {
+        let own_key = crate::core::rql::unique_key::primary_key_of_named(schema, table_name).map(|k| k.columns);
+        match database.default_referenced_columns(&fk, table_name, own_key) {
+            Ok(columns) => fk.parent_columns = columns,
             Err(e) => return ddl_error(&e),
         }
     }
@@ -13505,16 +13800,13 @@ async fn add_foreign_key(
             return ddl_error(&format!("constraint \"{}\" for table \"{}\" already exists", fk.name, table_name));
         }
     } else {
-        let stem = foreign_key::key_stem(table_name, &fk.column);
+        let stem = foreign_key::key_stem(table_name, &fk.columns);
         fk.name = match crate::core::rql::unique_key::choose_name(&stem, foreign_key::FKEY_LABEL, |candidate| {
             constraint_name_taken(schema, table_name, candidate)
         }) {
             Ok(name) => name,
             Err(e) => return ddl_error(&e),
         };
-    }
-    if let Err(e) = fk.storable() {
-        return ddl_error(&e);
     }
     let refusal = if fk.parent_table.eq_ignore_ascii_case(table_name) {
         let key = match database.partitioned_table(table_name) {
@@ -13531,18 +13823,34 @@ async fn add_foreign_key(
     if let Some(why) = refusal {
         return ddl_error(&why);
     }
-    // The two columns' types (42804): the child's as it is, the parent's as
-    // it is (this table's own, for a self-reference).
-    let child_type = schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column)).map(|f| f.db_type.clone());
-    let parent_type = if fk.parent_table.eq_ignore_ascii_case(table_name) {
-        schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.parent_column)).map(|f| f.db_type.clone())
-    } else {
-        database.column_type(&fk.parent_table, &fk.parent_column)
-    };
-    if let (Some(child), Some(parent)) = (child_type, parent_type)
-        && let Some(why) = foreign_key::type_refusal(&fk, &child, &parent)
-    {
-        return ddl_error(&why);
+    if let Err(e) = fk.storable() {
+        return ddl_error(&e);
+    }
+    // Each pair's types (42804): the child's as it is, the parent's as it
+    // is (this table's own, for a self-reference).
+    for (at, (column, parent_column)) in fk.columns.iter().zip(&fk.parent_columns).enumerate() {
+        let child_type =
+            schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column)).map(|f| f.db_type.clone());
+        let parent_type = if fk.parent_table.eq_ignore_ascii_case(table_name) {
+            schema.fields.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(parent_column)).map(|f| f.db_type.clone())
+        } else {
+            database.column_type(&fk.parent_table, parent_column)
+        };
+        if let (Some(child), Some(parent)) = (child_type, parent_type)
+            && let Some(why) = foreign_key::type_refusal(&fk, at, &child, &parent)
+        {
+            return ddl_error(&why);
+        }
+    }
+    if fk.is_composite() {
+        if let Some(why) = foreign_key::composite_refusal(&fk, table_name, database.partitioned_table(table_name).is_some()) {
+            return ddl_error(&why);
+        }
+        // Before the first record that needs it: a binary that would read a
+        // composite key as one column refuses this directory instead.
+        if let Err(e) = database.require_composite_foreign_keys() {
+            return ddl_error(&format!("could not mark the database for composite foreign keys: {e}"));
+        }
     }
     if not_valid {
         info!("ALTER TABLE {table_name}: foreign key {} added NOT VALID; its existing rows are not checked", fk.name);
@@ -13625,13 +13933,21 @@ async fn existing_rows_break_foreign_key(
         crate::core::database::Relation::Partitioned(pt) => pt.visibility_now_for(tx),
     };
     let schema = &child.schema().fields;
-    let Some(field) = schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(&fk.column)).cloned() else {
-        return Err(format!("column \"{}\" of relation \"{}\" does not exist", fk.column, table_name));
-    };
-    let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
-    let mut wanted = vec![field.clone()];
-    wanted.extend(flag.clone());
+    // Each key column with its NULL companion; one for a one-column key.
+    let mut key: Vec<(crate::core::row::schema::SchemaField, Option<crate::core::row::schema::SchemaField>)> =
+        Vec::with_capacity(fk.columns.len());
+    for column in &fk.columns {
+        let Some(field) = schema.iter().find(|f| !f.is_deleted && f.name.eq_ignore_ascii_case(column)).cloned() else {
+            return Err(format!("column \"{}\" of relation \"{}\" does not exist", column, table_name));
+        };
+        let flag = crate::core::rql::nullable::flag_field(&field.name, schema).cloned();
+        key.push((field, flag));
+    }
+    let wanted: Vec<crate::core::row::schema::SchemaField> =
+        key.iter().flat_map(|(field, flag)| std::iter::once(field.clone()).chain(flag.clone())).collect();
     let fetch = crate::core::rql::join::fetch_for(&wanted, schema);
+    // A composite key's tuples waiting to be probed, a literal per column.
+    let mut pending_tuples: Vec<Vec<String>> = Vec::new();
     let holders = database.row_tables_held(table_name).await.map_err(|e| e.to_string())?;
     use crate::core::storage_providers::traits::StorageIO as _;
 
@@ -13671,23 +13987,49 @@ async fn existing_rows_break_foreign_key(
                 .await
                 .map_err(|e| format!("could not read a row of \"{table_name}\" to validate the key: {e}"))?;
             let cell = |write_order: u64| row.columns.iter().find(|c| u64::from(c.schema_id) == write_order);
-            if let Some(f) = &flag
-                && cell(f.write_order).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0)
-            {
+            // Each key column's stored bytes, `None` for a NULL.
+            let mut values: smallvec::SmallVec<[Option<&[u8]>; 4]> = smallvec::SmallVec::new();
+            for (field, flag) in &key {
+                let null = flag
+                    .as_ref()
+                    .is_some_and(|f| cell(f.write_order).is_some_and(|c| c.data.into_slice().first().copied().unwrap_or(0) != 0));
+                values.push(if null { None } else { cell(field.write_order).map(|c| c.data.into_slice()) });
+            }
+            let nulls = values.iter().filter(|v| v.is_none()).count();
+            if nulls > 0 {
+                // MATCH SIMPLE: a row with a NULL key column references
+                // nothing. MATCH FULL: only a row with all of them NULL.
+                if fk.match_full && nulls < values.len() {
+                    return Ok(Some(fk_composite::match_full_violation(table_name, fk)));
+                }
                 continue;
             }
-            let Some(value) = cell(field.write_order) else {
-                continue;
+            let seen_key = match values.as_slice() {
+                [Some(bytes)] => bytes.to_vec(),
+                _ => fk_composite::lock_key(&values.iter().map(|v| v.unwrap_or_default().to_vec()).collect::<Vec<_>>()),
             };
-            let bytes = value.data.into_slice();
-            if seen.contains(bytes) {
+            if seen.contains(&seen_key) {
                 continue;
             }
             if seen.len() >= VALIDATION_SEEN_CAP {
                 seen.clear();
             }
-            seen.insert(bytes.to_vec());
-            pending.push(key_literal(&field, bytes)?);
+            seen.insert(seen_key);
+            if fk.is_composite() {
+                let mut tuple = Vec::with_capacity(values.len());
+                for ((field, _), bytes) in key.iter().zip(&values) {
+                    tuple.push(key_literal(field, bytes.unwrap_or_default())?);
+                }
+                pending_tuples.push(tuple);
+                if pending_tuples.len() >= REFERENCED_PROBE_CHUNK {
+                    if let Some(violation) = Box::pin(first_tuple_without_parent(database, table_name, fk, &pending_tuples, tx)).await? {
+                        return Ok(Some(violation));
+                    }
+                    pending_tuples.clear();
+                }
+                continue;
+            }
+            pending.push(key_literal(&key[0].0, values[0].unwrap_or_default())?);
             if pending.len() >= REFERENCED_PROBE_CHUNK {
                 if let Some(violation) = first_value_without_parent(database, table_name, fk, &pending, tx).await? {
                     return Ok(Some(violation));
@@ -13696,7 +14038,64 @@ async fn existing_rows_break_foreign_key(
             }
         }
     }
+    if fk.is_composite() {
+        return Box::pin(first_tuple_without_parent(database, table_name, fk, &pending_tuples, tx)).await;
+    }
     first_value_without_parent(database, table_name, fk, &pending, tx).await
+}
+
+/// The first of `tuples` (child tuples of composite key `fk`, a literal per
+/// column) that is no key of its parent, as `existing_rows_break_foreign_key`
+/// reports it, or `None`: the chunk probed whole, and split in halves when
+/// it comes up short until the missing tuple is alone.
+async fn first_tuple_without_parent(
+    database: &Arc<Database>,
+    table_name: &str,
+    fk: &crate::core::rql::foreign_key::ForeignKey,
+    tuples: &[Vec<String>],
+    tx: TxId,
+) -> Result<Option<String>, String> {
+    // Each value at its parent column's type (P4 round 3); a tuple one of
+    // whose values that type cannot hold unchanged has no parent.
+    let view = database.schema_view(table_name);
+    let fields: Vec<Option<_>> = (0..fk.columns.len())
+        .map(|at| view.as_ref().and_then(|view| fk_key_fields(database, view.schema(), fk, at)))
+        .collect();
+    drop(view);
+    let mut probes: Vec<(&Vec<String>, Vec<String>)> = Vec::with_capacity(tuples.len());
+    for tuple in tuples {
+        let coerced: Option<Vec<String>> = tuple
+            .iter()
+            .enumerate()
+            .map(|(at, literal)| match &fields[at] {
+                Some(((c, cm), (p, pm))) => coerce_key_literal(literal, c, cm, p, pm),
+                None => Some(literal.clone()),
+            })
+            .collect();
+        match coerced {
+            Some(probe) => probes.push((tuple, probe)),
+            None => return Ok(Some(fk_composite::violation(table_name, fk, tuple))),
+        }
+    }
+    let chunk_size = (REFERENCED_PROBE_CHUNK / fk.columns.len().max(1)).max(1);
+    let mut pending: Vec<&[(&Vec<String>, Vec<String>)]> = probes.chunks(chunk_size).rev().collect();
+    while let Some(chunk) = pending.pop() {
+        if chunk.is_empty() {
+            continue;
+        }
+        let values: Vec<Vec<String>> = chunk.iter().map(|(_, probe)| probe.clone()).collect();
+        let found = fk_composite::tuples_now(database, &fk.parent_table, &fk.parent_columns, &values, tx, None).await?;
+        if found.len() >= chunk.len() {
+            continue;
+        }
+        if chunk.len() == 1 {
+            return Ok(Some(fk_composite::violation(table_name, fk, chunk[0].0)));
+        }
+        let (left, right) = chunk.split_at(chunk.len() / 2);
+        pending.push(right);
+        pending.push(left);
+    }
+    Ok(None)
 }
 
 /// Distinct values [`existing_rows_break_foreign_key`] remembers before it
@@ -13712,20 +14111,23 @@ async fn first_value_without_parent(
     literals: &[String],
     tx: TxId,
 ) -> Result<Option<String>, String> {
+    let Some((fk_column, parent_column)) = fk.single() else {
+        return Err(format!("foreign key \"{}\" is composite: its rows are validated as tuples", fk.name));
+    };
     let violation = |value: &str| {
         format!(
             "insert or update on table \"{}\" violates foreign key constraint \"{}\": key ({})=({}) is not \
              present in table \"{}\"",
             table_name,
             fk.name,
-            fk.column,
+            fk_column,
             value.trim_matches('\''),
             fk.parent_table
         )
     };
     // Each value at the parent column's type (P4 round 3); one that type
     // cannot hold unchanged has no parent.
-    let fields = database.schema_view(table_name).and_then(|view| fk_key_fields(database, view.schema(), fk));
+    let fields = database.schema_view(table_name).and_then(|view| fk_key_fields(database, view.schema(), fk, 0));
     // (the child's value as it is named, the value probed)
     let mut probes: Vec<(&String, String)> = Vec::with_capacity(literals.len());
     for literal in literals {
@@ -13745,7 +14147,7 @@ async fn first_value_without_parent(
         }
         let values: Vec<String> = chunk.iter().map(|(_, probe)| probe.clone()).collect();
         let found =
-            referenced_values_now(database, &fk.parent_table, &fk.parent_column, &values, tx, None, KeySide::Parent)
+            referenced_values_now(database, &fk.parent_table, parent_column, &values, tx, None, KeySide::Parent)
                 .await?;
         if found.len() >= chunk.len() {
             continue;
@@ -16740,16 +17142,26 @@ async fn foreign_keys_hold_after_retype(
     let mut keys: Vec<(String, crate::core::rql::foreign_key::ForeignKey)> = schema
         .foreign_keys
         .iter()
-        .filter(|fk| !fk.is_deleted && fk.column.eq_ignore_ascii_case(column))
+        .filter(|fk| !fk.is_deleted && fk.has_column(column))
         .map(|fk| (table_name.to_string(), fk.clone()))
         .collect();
     for (child, fk) in referencing_keys(database, table_name) {
         if !fk.is_deleted
-            && fk.parent_column.eq_ignore_ascii_case(column)
+            && fk.has_parent_column(column)
             && !keys.iter().any(|(c, k)| c.eq_ignore_ascii_case(&child) && k.name == fk.name)
         {
             keys.push((child, fk));
         }
+    }
+    // A composite key compares tuples, which the one-column comparison below
+    // does not: retyping one of its columns is refused, never judged by a
+    // part of the key.
+    if let Some((_, fk)) = keys.iter().find(|(_, fk)| fk.is_composite()) {
+        return Err(format!(
+            "ALTER COLUMN {column} TYPE: the column is part of composite foreign key \"{}\", and changing how it \
+             stores its values is not supported yet",
+            fk.name
+        ));
     }
     let texts = |rows: Vec<crate::core::row::row::Row>| -> Vec<String> {
         rows.iter()
@@ -16757,25 +17169,28 @@ async fn foreign_keys_hold_after_retype(
             .collect()
     };
     for (child, fk) in keys {
-        let child_converts = child.eq_ignore_ascii_case(table_name) && fk.column.eq_ignore_ascii_case(column);
+        let Some((fk_column, fk_parent_column)) = fk.single() else {
+            continue;
+        };
+        let child_converts = child.eq_ignore_ascii_case(table_name) && fk_column.eq_ignore_ascii_case(column);
         let parent_converts =
-            fk.parent_table.eq_ignore_ascii_case(table_name) && fk.parent_column.eq_ignore_ascii_case(column);
+            fk.parent_table.eq_ignore_ascii_case(table_name) && fk_parent_column.eq_ignore_ascii_case(column);
         let read = |table: &str, col: &str| {
             format!("SELECT {col}::text FROM {table} WHERE {col} IS NOT NULL")
         };
-        let parents = texts(run_subquery(&read(&fk.parent_table, &fk.parent_column), database, reader).await?);
+        let parents = texts(run_subquery(&read(&fk.parent_table, fk_parent_column), database, reader).await?);
         let mut held = std::collections::HashSet::new();
         for text in parents {
             held.insert(converted_numeric_text(&text, parent_converts.then_some(to))?.1);
         }
-        let children = texts(run_subquery(&read(&child, &fk.column), database, reader).await?);
+        let children = texts(run_subquery(&read(&child, fk_column), database, reader).await?);
         for text in children {
             let (shown, key) = converted_numeric_text(&text, child_converts.then_some(to))?;
             if !held.contains(&key) {
                 return Err(format!(
                     "insert or update on table \"{}\" violates foreign key constraint \"{}\": \
                      key ({})=({}) is not present in table \"{}\"",
-                    child, fk.name, fk.column, shown, fk.parent_table
+                    child, fk.name, fk_column, shown, fk.parent_table
                 ));
             }
         }
@@ -23487,7 +23902,7 @@ pub(crate) async fn execute_with_need(
 
             // The key columns whose check waits for the write: see
             // `check_foreign_keys_for_update`.
-            let mut keys_after_write: Vec<crate::core::row::schema::SchemaField> = Vec::new();
+            let mut keys_after_write = KeysAfterWrite::default();
             if let Some(assignments) =
                 crate::core::rql::lexer_ur::assignments_of_update(&query_sql(&query))
             {
@@ -24576,7 +24991,7 @@ async fn partitioned_update_foreign_keys(
     depth: usize,
     tx: TxId,
 ) -> Result<
-    (Option<crate::core::mvcc::Visibility>, Option<KeyChanges>, Vec<crate::core::row::schema::SchemaField>),
+    (Option<crate::core::mvcc::Visibility>, Option<KeyChanges>, KeysAfterWrite),
     String,
 > {
     let schema = &pt.shell().schema;
@@ -24585,7 +25000,7 @@ async fn partitioned_update_foreign_keys(
         .or_else(|| foreign_keys_read.then(|| pt.visibility_for(tx)));
     let foreign_key_visibility = statement_visibility.as_ref().filter(|_| foreign_keys_read);
     let target = crate::core::database::Relation::Partitioned(pt.clone());
-    let mut keys_after_write = Vec::new();
+    let mut keys_after_write = KeysAfterWrite::default();
     if let Some(assignments) = crate::core::rql::lexer_ur::assignments_of_update(sql) {
         keys_after_write = check_foreign_keys_for_update(
             database,

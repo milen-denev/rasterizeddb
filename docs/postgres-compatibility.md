@@ -588,8 +588,36 @@ filtered and evaluated by the same paths as anything else, and a cascade that
 triggers another cascade works by recursion rather than a second mechanism. A
 cycle is caught by a depth limit rather than recursing forever.
 
-Composite keys are refused outright: enforcing one column of a two-column key
-would enforce something weaker than what was declared.
+**Composite keys** (`FOREIGN KEY (a, b) REFERENCES p (x, y)`, as a table
+constraint, named or not, in `CREATE TABLE` or `ALTER TABLE … ADD`) are
+enforced on the tuple, never column by column: a row references the one
+parent row holding all of its key values at once.
+
+- `REFERENCES p` with no column list is `p`'s primary key, composite or not.
+- The referenced columns must be exactly some `UNIQUE` or `PRIMARY KEY` of
+  `p`, in any order (`REFERENCES p (y, x)` against `PRIMARY KEY (x, y)` is
+  accepted, as PostgreSQL accepts it); otherwise 42830, "there is no unique
+  constraint matching given keys for referenced table". Lists of different
+  lengths are 42830 too ("number of referencing and referenced columns for
+  foreign key disagree"), a referenced column listed twice 42830, a missing
+  column 42703, and each pair's types are judged as a one-column key's are
+  (42804). This is stricter than the one-column rule below, on purpose.
+- `MATCH SIMPLE` (the default): a row with any key column NULL is exempt.
+  `MATCH FULL`: the key's columns are all NULL or none is, else 23503 with
+  PostgreSQL's "MATCH FULL does not allow mixing of null and nonnull key
+  values". `MATCH PARTIAL` is 0A000, as in PostgreSQL.
+- Checked on `INSERT` (multi-row, `ON CONFLICT`, `INSERT … SELECT`, `COPY`),
+  on `UPDATE` (each written row's new tuple, an unassigned column keeping its
+  value), by `ADD` over the rows already there (23503) unless `NOT VALID`,
+  and by `VALIDATE CONSTRAINT`. A key onto the table itself is asked at the
+  end of the statement, as a one-column one is.
+- The parent's `DELETE`, and an `UPDATE` that moves a referenced tuple, are
+  refused (23503) while a child still references it (`NO ACTION`,
+  `RESTRICT`). The violation names the tuple: `key (a, b)=(2, 2) is not
+  present in table "p"`.
+- An unnamed key is `<table>_<a>_<b>_fkey`, numbered on a collision.
+- Not supported (0A000): a composite key on or onto a hash-partitioned table;
+  a composite key's `CASCADE`, `SET NULL` and `SET DEFAULT` actions.
 
 Since the partitioning work's phase 3 P4 (`docs/partitioning.md`, "Phase 3 P4
 as built") foreign keys also run to and from hash-partitioned tables, and:
@@ -620,6 +648,39 @@ covers, and `CREATE TABLE` may reference a table that does not exist yet (each
 insert's check names it); identifiers are not case-folded.
 
 ### Release note: foreign keys from older binaries
+
+**Composite keys and older binaries.** A composite key is stored in the same
+sidecar as every other key (`<table>_schema_FK.db`, fixed 519-byte records),
+as one record per column pair, back to back, its first pair first. A
+one-column key's record is unchanged, so every existing database reads back
+as it was. What a composite key adds lives in the spare 129th byte of each
+name slot, which no build ever read as part of a name: a flag byte (this
+record is a pair of a composite key; `MATCH FULL`), the pair's position, the
+key's pair count, and whether `ON DELETE SET … (cols)` names the pair's
+column.
+
+An older binary must never read such a key as something weaker (say, a
+one-column key on `a` alone), so two things stand in its way:
+
+1. **It refuses to open the directory.** The first composite key written
+   sets the `composite_foreign_key_v1` flag in the database's
+   `incompat_features` file, durably and before its records; every binary
+   since that file exists (2026-10-23; every release from 1.0.0-rc.1 on)
+   refuses, at open and before it touches anything, a directory carrying a
+   flag it does not know, naming it. A directory that holds a composite key
+   without the flag (a point-in-time restore, a replica, both of which bring
+   the records and not the flag) is fenced again by this binary when it
+   reads the table's schema, and by a restore before it hands the directory
+   over.
+2. **A binary older than the fence still fails loudly.** Each pair's
+   referenced column is stored after a `\x01` marker byte. A build that
+   knows foreign keys but not `incompat_features` (development builds of
+   2026-08-26 to 2026-10-23; no release) reads every pair as a one-column
+   key onto a column named `"\x01x"`, which no table has: an insert or
+   update giving the column a value, and a `DELETE` of the parent, fail
+   naming that column instead of enforcing `a` against `x` alone. An
+   `UPDATE` of the parent's key is the one statement such a build lets
+   through unchecked.
 
 What a database written by an older binary holds, read by this one:
 

@@ -653,7 +653,7 @@ fn parse_create_table(qp: &QueryPurpose, rejection: &mut Option<String>) -> Opti
                 )
                 .collect();
             for i in unnamed_foreign_keys {
-                let stem = crate::core::rql::foreign_key::key_stem(&table_name, &foreign_keys[i].column);
+                let stem = crate::core::rql::foreign_key::key_stem(&table_name, &foreign_keys[i].columns);
                 match crate::core::rql::unique_key::choose_name(
                     &stem,
                     crate::core::rql::foreign_key::FKEY_LABEL,
@@ -2316,9 +2316,9 @@ mod partitioning_refusal_tests {
             let (ct, _) = parse(sql);
             let ct = ct.expect(sql);
             assert_eq!(ct.foreign_keys.len(), 1, "{}", sql);
-            assert_eq!(ct.foreign_keys[0].column, "b");
+            assert_eq!(ct.foreign_keys[0].columns, ["b"]);
             assert_eq!(ct.foreign_keys[0].parent_table, "u");
-            assert_eq!(ct.foreign_keys[0].parent_column, "id");
+            assert_eq!(ct.foreign_keys[0].parent_columns, ["id"]);
         }
 
         // Phase 3 P4: an unnamed key is PostgreSQL's `<t>_<col>_fkey`,
@@ -2342,7 +2342,7 @@ mod partitioning_refusal_tests {
         );
         let ct = ct.unwrap_or_else(|| panic!("inline names: {reason:?}"));
         assert_eq!(
-            ct.foreign_keys.iter().map(|f| (f.name.as_str(), f.column.as_str())).collect::<Vec<_>>(),
+            ct.foreign_keys.iter().map(|f| (f.name.as_str(), f.columns[0].as_str())).collect::<Vec<_>>(),
             [("a_to_u", "a"), ("b key", "b"), ("t_c_fkey", "c")]
         );
 

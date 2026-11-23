@@ -418,6 +418,12 @@ pub(crate) struct Constraint {
     pub foreign_keys: Vec<i64>,
     pub on_update: &'static str,
     pub on_delete: &'static str,
+    /// A foreign key's `confmatchtype`: `s` (MATCH SIMPLE) or `f` (MATCH
+    /// FULL); a blank for any other constraint.
+    pub match_type: &'static str,
+    /// A foreign key's referenced columns, in key order, resolved to the
+    /// parent's attnums into `foreign_keys` once the model is complete.
+    pub foreign_columns: Vec<String>,
     pub definition: String,
 }
 
@@ -895,6 +901,8 @@ fn table_indexes(
                 foreign_keys: Vec::new(),
                 on_update: "a",
                 on_delete: "a",
+                match_type: " ",
+                foreign_columns: Vec::new(),
                 definition: format!(
                     "{} ({})",
                     if primary { "PRIMARY KEY" } else { "UNIQUE" },
@@ -945,29 +953,42 @@ fn table_indexes(
     for fk in schema.foreign_keys.iter().filter(|f| !f.is_deleted) {
         let (on_update, update_text) = action_code(&fk.on_update);
         let (on_delete, delete_text) = action_code(&fk.on_delete);
+        let list = |columns: &[String]| columns.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        // PostgreSQL's `pg_get_constraintdef`: `FOREIGN KEY (a, b)
+        // REFERENCES p(x, y) [MATCH FULL] [ON UPDATE …] [ON DELETE … [(cols)]]`.
         let mut definition = format!(
             "FOREIGN KEY ({}) REFERENCES {}({})",
-            quote_ident(&fk.column),
+            list(&fk.columns),
             quote_ident(&fk.parent_table),
-            quote_ident(&fk.parent_column)
+            list(&fk.parent_columns)
         );
+        if fk.match_full {
+            definition.push_str(" MATCH FULL");
+        }
         if !update_text.is_empty() {
             definition.push_str(&format!(" ON UPDATE {update_text}"));
         }
         if !delete_text.is_empty() {
             definition.push_str(&format!(" ON DELETE {delete_text}"));
+            if !fk.on_delete_columns.is_empty() {
+                definition.push_str(&format!(" ({})", list(&fk.on_delete_columns)));
+            }
         }
         constraints.push(Constraint {
             oid: oid_of(&format!("{name}.{}.con", fk.name)),
             name: fk.name.clone(),
             contype: "f",
             index: 0,
-            keys: attnum_of(&fk.column).into_iter().collect(),
+            // In key order, as `conkey` lists them; a column that is not
+            // there leaves the whole list out rather than a part of it.
+            keys: fk.columns.iter().map(|c| attnum_of(c)).collect::<Option<Vec<i64>>>().unwrap_or_default(),
             foreign_table: oid_of(&fk.parent_table),
-            // The parent's attnum is resolved when the model is complete.
+            // The parent's attnums are resolved when the model is complete.
             foreign_keys: Vec::new(),
             on_update,
             on_delete,
+            match_type: if fk.match_full { "f" } else { "s" },
+            foreign_columns: fk.parent_columns.clone(),
             definition,
         });
     }
@@ -982,6 +1003,8 @@ fn table_indexes(
             foreign_keys: Vec::new(),
             on_update: "a",
             on_delete: "a",
+            match_type: " ",
+            foreign_columns: Vec::new(),
             definition: format!("CHECK (({}))", check.expression.trim()),
         });
     }
@@ -1090,25 +1113,17 @@ pub(crate) async fn build_model(
         })
         .collect();
     for rel in rels.iter_mut() {
-        let Some(relation) = database.relation(&rel.name) else {
-            continue;
-        };
-        let schema = relation.schema();
         for con in rel.constraints.iter_mut().filter(|c| c.contype == "f") {
-            let parent_column = schema
-                .foreign_keys
+            let Some(columns) = parents.get(&con.foreign_table) else {
+                continue;
+            };
+            // In key order, `confkey` index for index with `conkey`.
+            con.foreign_keys = con
+                .foreign_columns
                 .iter()
-                .find(|f| !f.is_deleted && f.name == con.name)
-                .map(|f| f.parent_column.clone());
-            if let (Some(columns), Some(parent_column)) =
-                (parents.get(&con.foreign_table), parent_column)
-            {
-                con.foreign_keys = columns
-                    .iter()
-                    .filter(|(n, _)| n.eq_ignore_ascii_case(&parent_column))
-                    .map(|(_, a)| *a)
-                    .collect();
-            }
+                .map(|wanted| columns.iter().find(|(n, _)| n.eq_ignore_ascii_case(wanted)).map(|(_, a)| *a))
+                .collect::<Option<Vec<i64>>>()
+                .unwrap_or_default();
         }
     }
     for view in gathered
@@ -1965,7 +1980,7 @@ pub(crate) fn rows_of(view: &str, model: &Model) -> Option<Vec<Vec<V>>> {
                         V::I(c.foreign_table),
                         t(if c.contype == "f" { c.on_update } else { " " }),
                         t(if c.contype == "f" { c.on_delete } else { " " }),
-                        t(if c.contype == "f" { "s" } else { " " }),
+                        t(if c.contype == "f" { c.match_type } else { " " }),
                         V::B(true),
                         V::I(0),
                         V::B(false),

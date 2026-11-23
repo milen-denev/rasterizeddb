@@ -107,6 +107,9 @@ mod alter_declaration_tests;
 mod fk_partition_tests;
 
 #[cfg(test)]
+mod fk_composite_tests;
+
+#[cfg(test)]
 mod rename_column_crash_tests;
 
 pub(crate) mod column_declarations;

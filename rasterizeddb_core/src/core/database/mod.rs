@@ -35,6 +35,7 @@ mod create_intent;
 #[cfg(test)]
 mod create_failure_tests;
 mod foreign_keys;
+pub(crate) use foreign_keys::create_table_primary_key;
 pub(crate) mod partitioned;
 mod partitioned_ddl;
 #[cfg(test)]
@@ -1939,6 +1940,18 @@ impl Database {
             // the flag): fenced before anything touches the table, so an
             // older binary is refused this directory rather than misreading it.
             if !in_memory {
+                if let Err(e) =
+                    incompat::fence_composite_foreign_keys(std::path::Path::new(location), &table.schema.foreign_keys)
+                {
+                    error!(
+                        "table '{}' is left unopened: it holds a composite foreign key and the directory could not \
+                         be marked for it ({}): {}",
+                        table_name,
+                        incompat::COMPOSITE_FOREIGN_KEY_V1,
+                        e
+                    );
+                    continue;
+                }
                 if let Err(e) = incompat::fence_numeric_own_scale(std::path::Path::new(location), &table.schema.fields) {
                     error!(
                         "table '{}' is left unopened: it keeps NUMERIC values at their own scale and the \
@@ -4360,6 +4373,10 @@ impl Database {
         if !own_scale.is_empty() && temp_seed(&create_table.table_name).is_none() {
             self.require_numeric_own_scale()?;
         }
+        if create_table.foreign_keys.iter().any(|fk| fk.is_composite()) && temp_seed(&create_table.table_name).is_none()
+        {
+            self.require_composite_foreign_keys()?;
+        }
         let table_name = &create_table.table_name;
         let columns = std::mem::take(&mut create_table.columns);
 
@@ -4497,6 +4514,17 @@ impl Database {
     pub(crate) fn require_numeric_own_scale(&self) -> io::Result<()> {
         match self.location.as_deref() {
             Some(root) => incompat::require(std::path::Path::new(root), incompat::NUMERIC_OWN_SCALE_V1),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the database as holding composite foreign keys
+    /// (`incompat::COMPOSITE_FOREIGN_KEY_V1`) before the first record of one
+    /// is written, so a binary that would read one as a one-column key
+    /// refuses to open it instead. Nothing to mark for a database in memory.
+    pub(crate) fn require_composite_foreign_keys(&self) -> io::Result<()> {
+        match self.location.as_deref() {
+            Some(root) => incompat::require(std::path::Path::new(root), incompat::COMPOSITE_FOREIGN_KEY_V1),
             None => Ok(()),
         }
     }

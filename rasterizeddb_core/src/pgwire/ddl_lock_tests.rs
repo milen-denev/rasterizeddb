@@ -227,7 +227,7 @@ async fn fk_ddl_locks_the_other_side() {
     ok(&db, &mut r, "COMMIT").await;
     let (_, out, _) = finish("RENAME COLUMN", rename).await;
     out.expect("RENAME COLUMN after the child's reader");
-    let parent_column = db.schema_view("c").unwrap().schema().foreign_keys[0].parent_column.clone();
+    let parent_column = db.schema_view("c").unwrap().schema().foreign_keys[0].parent_column_list();
     assert_eq!(parent_column, "pk", "the child's key does not follow the renamed column");
 
     // A parent reader does not hold back ADD FOREIGN KEY...

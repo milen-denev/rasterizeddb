@@ -1179,7 +1179,7 @@ fn nulls_clause(words: &str) -> Result<(), String> {
 /// The offset of the `)` closing the `(` that `text` starts with, outside
 /// quotes. The first `)` is not it: `pg_dump` writes an expression index as
 /// `(lower(email))`.
-fn list_close(text: &str) -> Option<usize> {
+pub(crate) fn list_close(text: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
     for (i, c) in text.char_indices() {
@@ -1203,7 +1203,7 @@ fn list_close(text: &str) -> Option<usize> {
 }
 
 /// `text` split at its top-level commas, outside quotes and parentheses.
-fn split_items(text: &str) -> Vec<&str> {
+pub(crate) fn split_items(text: &str) -> Vec<&str> {
     let mut items = Vec::new();
     let (mut depth, mut start) = (0usize, 0usize);
     let mut quote: Option<char> = None;

@@ -10960,8 +10960,22 @@ pub(crate) fn sqlstate_for(message: &str) -> &'static str {
     // exactly, `undefined_column` for a column it names that is not there.
     if has("there is no unique constraint matching given keys for referenced table")
         || has("number of referencing and referenced columns for foreign key disagree")
+        || has("foreign key referenced-columns list must not contain duplicates")
     {
         return "42830";
+    }
+    // A composite foreign key's clauses PostgreSQL refuses: `MATCH PARTIAL`
+    // and a column list on an `ON UPDATE` action (0A000), a key over more
+    // columns than an index may hold (54011), and an `ON DELETE SET` list
+    // naming a column outside the key (42P10).
+    if has("match partial not yet implemented") || (has("a column list with set ") && has("is only supported for on delete actions")) {
+        return "0A000";
+    }
+    if has("keys in a foreign key") && has("cannot have more than") {
+        return "54011";
+    }
+    if has("referenced in on delete set action must be part of foreign key") {
+        return "42P10";
     }
     // `undefined_object`: `REFERENCES parent` with no column list, on a
     // parent with no primary key.
