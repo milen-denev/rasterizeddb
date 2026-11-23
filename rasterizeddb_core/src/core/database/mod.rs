@@ -1416,6 +1416,9 @@ pub struct Database {
     /// changed only with the slot it mirrors, under this lock. Named only in
     /// `slots.rs`.
     fk_reverse: parking_lot::RwLock<slots::FkReverse>,
+    /// Some table has been filed in [`Self::fk_reverse`] with a foreign key
+    /// onto itself (`Database::may_reference_itself`). Set only in `slots.rs`.
+    fk_onto_itself: std::sync::atomic::AtomicBool,
     /// Names a CREATE or a partitioned DROP is working on (see
     /// [`Database::claim_name`]).
     name_claims: DashMap<String, (), ahash::RandomState>,
@@ -1988,6 +1991,7 @@ impl Database {
             table_slots,
             partitioned_tables: DashMap::with_hasher(ahash::RandomState::new()),
             fk_reverse: parking_lot::RwLock::new(slots::FkReverse::default()),
+            fk_onto_itself: std::sync::atomic::AtomicBool::new(false),
             name_claims: DashMap::with_hasher(ahash::RandomState::new()),
             partition_ddl: tokio::sync::Mutex::new(()),
             partition_maintenance: crate::core::partition::maintenance::Scheduler::new(),

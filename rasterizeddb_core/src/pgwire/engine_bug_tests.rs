@@ -809,3 +809,218 @@ async fn between_with_a_null_bound_or_symmetric_answers_as_postgresql_does() {
     ok(&db, &mut s, "DELETE FROM bt WHERE v BETWEEN NULL AND 100 OR id = 4").await;
     assert_eq!(one(&db, &mut s, "SELECT count(*) FROM bt").await, vec![r(&[Some("3")])]);
 }
+
+/// A statement refused with a foreign-key violation (23503).
+async fn refused_23503(db: &Arc<Database>, s: &mut Session, sql: &str) {
+    let e = rows(db, s, sql).await.expect_err(sql);
+    assert_eq!(sqlstate_of(&e), "23503", "{sql}: {e}");
+}
+
+/// `id, p` of every row of `table`, in id order, `p` as text or "-".
+async fn id_p(db: &Arc<Database>, s: &mut Session, table: &str) -> String {
+    let sql = format!("SELECT id, p FROM {table} ORDER BY id");
+    one(db, s, &sql)
+        .await
+        .iter()
+        .map(|row| format!("{}:{}", row[0].as_deref().unwrap_or("-"), row[1].as_deref().unwrap_or("-")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A table's foreign key onto itself is checked at the end of the statement,
+/// once every row of it is in, as PostgreSQL 17 checks a key that is not
+/// deferrable: a row may be its own parent, and rows of one `INSERT` may be
+/// each other's. Each row's check ran before its row was written, so `(1,
+/// 1)` and `(2, 3), (3, 2)` were refused (23503). What PostgreSQL refuses
+/// still is, and leaves nothing behind. Every answer is PostgreSQL 17's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_is_checked_at_the_end_of_an_insert() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE s (id int PRIMARY KEY, p int REFERENCES s (id))").await;
+        ok(&db, &mut s, "INSERT INTO s VALUES (1, 1)").await;
+        ok(&db, &mut s, "INSERT INTO s VALUES (2, 3), (3, 2)").await;
+        refused_23503(&db, &mut s, "INSERT INTO s VALUES (4, 99)").await;
+        // A row of the statement found, the other not: neither is kept.
+        refused_23503(&db, &mut s, "INSERT INTO s VALUES (5, 6), (6, 98)").await;
+        ok(&db, &mut s, "INSERT INTO s VALUES (7, NULL), (8, 7)").await;
+        ok(&db, &mut s, "INSERT INTO s SELECT id + 10, p + 10 FROM s WHERE id IN (2, 3)").await;
+        refused_23503(&db, &mut s, "INSERT INTO s SELECT id + 20, p + 50 FROM s WHERE id = 2").await;
+        assert_eq!(
+            one(&db, &mut s, "INSERT INTO s VALUES (40, 41), (41, 42), (42, 40) RETURNING id, p").await,
+            vec![r(&[Some("40"), Some("41")]), r(&[Some("41"), Some("42")]), r(&[Some("42"), Some("40")])]
+        );
+        assert_eq!(id_p(&db, &mut s, "s").await, "1:1 2:3 3:2 7:- 8:7 12:13 13:12 40:41 41:42 42:40");
+
+        // A key onto a UNIQUE column that is not the primary key.
+        ok(&db, &mut s, "CREATE TABLE nd (id int PRIMARY KEY, code text UNIQUE, p text REFERENCES nd (code))").await;
+        ok(&db, &mut s, "INSERT INTO nd VALUES (1, 'a', 'b'), (2, 'b', 'a')").await;
+        refused_23503(&db, &mut s, "INSERT INTO nd VALUES (3, 'c', 'zz')").await;
+        ok(&db, &mut s, "INSERT INTO nd VALUES (4, 'd', 'd')").await;
+        assert_eq!(one(&db, &mut s, "SELECT count(*) FROM nd").await, vec![r(&[Some("3")])]);
+    })
+    .await
+    .expect("bounded");
+}
+
+/// `ON CONFLICT`: a row the clause skips or turns into an update is not
+/// checked as inserted (PostgreSQL checks inserted rows only), and the
+/// update of `DO UPDATE` is checked at the end of the statement too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_under_on_conflict() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE oc (id int PRIMARY KEY, p int REFERENCES oc (id))").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 1) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 99) ON CONFLICT (id) DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 99) ON CONFLICT DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (2, 3), (3, 2) ON CONFLICT (id) DO NOTHING").await;
+        ok(&db, &mut s, "INSERT INTO oc VALUES (1, 9), (9, 9) ON CONFLICT (id) DO UPDATE SET p = EXCLUDED.p").await;
+        refused_23503(&db, &mut s, "INSERT INTO oc VALUES (1, 97) ON CONFLICT (id) DO UPDATE SET p = EXCLUDED.p").await;
+        refused_23503(&db, &mut s, "INSERT INTO oc VALUES (5, 95) ON CONFLICT (id) DO UPDATE SET p = EXCLUDED.p").await;
+        assert_eq!(id_p(&db, &mut s, "oc").await, "1:9 2:3 3:2 9:9");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// `UPDATE` and `DELETE` of a table that references itself: both sides of
+/// the key are judged on the statement's end state. A row that is its own
+/// parent may move its key with its reference; a key still referenced by a
+/// row the statement does not repoint is refused; under `RESTRICT` too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_is_checked_at_the_end_of_an_update_or_delete() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE u (id int PRIMARY KEY, p int REFERENCES u (id))").await;
+        ok(&db, &mut s, "INSERT INTO u VALUES (1, 1)").await;
+        ok(&db, &mut s, "UPDATE u SET id = 10, p = 10 WHERE id = 1").await;
+        refused_23503(&db, &mut s, "UPDATE u SET p = 96 WHERE id = 10").await;
+        ok(&db, &mut s, "INSERT INTO u VALUES (2, 10), (3, 2)").await;
+        // Row 2 still references 10.
+        refused_23503(&db, &mut s, "UPDATE u SET id = 20, p = 20 WHERE id = 10").await;
+        ok(&db, &mut s, "UPDATE u SET id = id + 100, p = p + 100").await;
+        ok(&db, &mut s, "UPDATE u SET p = id + 1 WHERE id = 102").await;
+        ok(&db, &mut s, "UPDATE u SET p = id WHERE id = 102").await;
+        assert_eq!(id_p(&db, &mut s, "u").await, "102:102 103:102 110:110");
+
+        ok(&db, &mut s, "CREATE TABLE d (id int PRIMARY KEY, p int REFERENCES d (id))").await;
+        ok(&db, &mut s, "INSERT INTO d VALUES (1, 1), (2, 3), (3, 2), (4, 1)").await;
+        ok(&db, &mut s, "DELETE FROM d WHERE id IN (2, 3)").await;
+        refused_23503(&db, &mut s, "DELETE FROM d WHERE id = 1").await;
+        ok(&db, &mut s, "DELETE FROM d WHERE id IN (1, 4)").await;
+        assert_eq!(id_p(&db, &mut s, "d").await, "");
+
+        ok(
+            &db,
+            &mut s,
+            "CREATE TABLE rs (id int PRIMARY KEY, p int REFERENCES rs (id) ON DELETE RESTRICT ON UPDATE RESTRICT)",
+        )
+        .await;
+        ok(&db, &mut s, "INSERT INTO rs VALUES (1, 1), (2, 3), (3, 2), (4, 4), (5, 4)").await;
+        ok(&db, &mut s, "UPDATE rs SET id = 10, p = 10 WHERE id = 1").await;
+        // Row 5 still references 4.
+        refused_23503(&db, &mut s, "UPDATE rs SET id = 40, p = 40 WHERE id = 4").await;
+        ok(&db, &mut s, "DELETE FROM rs WHERE id IN (2, 3)").await;
+        refused_23503(&db, &mut s, "DELETE FROM rs WHERE id = 4").await;
+        ok(&db, &mut s, "DELETE FROM rs").await;
+        assert_eq!(id_p(&db, &mut s, "rs").await, "");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// Inside a block each statement is checked at its own end: a violation
+/// fails the statement, and `ROLLBACK TO SAVEPOINT` takes its rows back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_inside_a_block() {
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE blk (id int PRIMARY KEY, p int REFERENCES blk (id))").await;
+        ok(&db, &mut s, "BEGIN").await;
+        ok(&db, &mut s, "INSERT INTO blk VALUES (20, 21), (21, 20)").await;
+        ok(&db, &mut s, "INSERT INTO blk VALUES (22, 22)").await;
+        ok(&db, &mut s, "UPDATE blk SET id = 23, p = 23 WHERE id = 22").await;
+        ok(&db, &mut s, "COMMIT").await;
+        ok(&db, &mut s, "BEGIN").await;
+        refused_23503(&db, &mut s, "INSERT INTO blk VALUES (30, 95)").await;
+        ok(&db, &mut s, "ROLLBACK").await;
+        ok(&db, &mut s, "BEGIN").await;
+        ok(&db, &mut s, "SAVEPOINT a").await;
+        refused_23503(&db, &mut s, "INSERT INTO blk VALUES (31, 32), (32, 94)").await;
+        ok(&db, &mut s, "ROLLBACK TO SAVEPOINT a").await;
+        ok(&db, &mut s, "INSERT INTO blk VALUES (33, 33)").await;
+        ok(&db, &mut s, "COMMIT").await;
+        assert_eq!(id_p(&db, &mut s, "blk").await, "20:21 21:20 23:23 33:33");
+    })
+    .await
+    .expect("bounded");
+}
+
+/// Runs `COPY table FROM STDIN` with `data` (text format) as the client's
+/// rows, and returns its tag or its error.
+async fn copy_in(db: &Arc<Database>, s: &mut Session, table: &str, data: &str) -> Result<String, String> {
+    use tokio::io::AsyncWriteExt;
+    // The client's CopyData and CopyDone, ahead of the statement that reads
+    // them (the duplex holds them).
+    let mut frames = Vec::new();
+    for chunk in data.as_bytes().chunks(8192) {
+        frames.push(b'd');
+        frames.extend_from_slice(&((chunk.len() + 4) as i32).to_be_bytes());
+        frames.extend_from_slice(chunk);
+    }
+    frames.push(b'c');
+    frames.extend_from_slice(&4i32.to_be_bytes());
+    s.client.write_all(&frames).await.unwrap();
+    let sql = format!("COPY {table} FROM STDIN");
+    Box::pin(execute_recorded(db, &mut s.state, &mut s.server, &sql, &[], false, None))
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    loop {
+        let kind = s.client.read_u8().await.unwrap();
+        let len = s.client.read_i32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        s.client.read_exact(&mut body).await.unwrap();
+        match kind {
+            b'C' => return Ok(String::from_utf8_lossy(&body).trim_end_matches('\0').to_string()),
+            b'E' => return Err(String::from_utf8_lossy(&body).to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// `COPY` is one statement: a row may reference a row of a later batch
+/// (it inserts 500 rows a statement), and one missing parent anywhere
+/// refuses the whole copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_referencing_foreign_key_across_a_copy() {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        let db = db().await;
+        let mut s = session(&db);
+        ok(&db, &mut s, "CREATE TABLE cp (id int PRIMARY KEY, p int REFERENCES cp (id))").await;
+        assert_eq!(copy_in(&db, &mut s, "cp", "1\t2\n2\t1\n3\t3\n").await.as_deref(), Ok("COPY 3"));
+        let e = copy_in(&db, &mut s, "cp", "4\t93\n").await.expect_err("an orphan");
+        assert_eq!(sqlstate_of(&e), "23503", "{e}");
+        assert_eq!(id_p(&db, &mut s, "cp").await, "1:2 2:1 3:3");
+
+        ok(&db, &mut s, "CREATE TABLE big (id int PRIMARY KEY, p int REFERENCES big (id))").await;
+        // Row i references i + 1, the last the first: every reference but
+        // the last points forward, most into a later batch.
+        let rows: String = (1..=1200).map(|i| format!("{i}\t{}\n", i % 1200 + 1)).collect();
+        assert_eq!(copy_in(&db, &mut s, "big", &rows).await.as_deref(), Ok("COPY 1200"));
+        let rows: String =
+            (1201..=2400).map(|i| format!("{i}\t{}\n", if i < 2400 { i + 1 } else { 99999 })).collect();
+        let e = copy_in(&db, &mut s, "big", &rows).await.expect_err("an orphan in the last batch");
+        assert_eq!(sqlstate_of(&e), "23503", "{e}");
+        assert_eq!(
+            one(&db, &mut s, "SELECT count(*), min(id), max(id) FROM big").await,
+            vec![r(&[Some("1200"), Some("1"), Some("1200")])]
+        );
+    })
+    .await
+    .expect("bounded");
+}
