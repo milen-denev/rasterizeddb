@@ -235,7 +235,7 @@ database, which is what lets one database's credentials never open another.
 
 | Phase | Ships | Size | Gate |
 |---|---|---|---|
-| **R0: security floor** (the sharding plan's T0) | C1–C5 closed: user SQL cannot read or write `rdb_roles` or `__rdb_*`; checks fail closed; `CREATE VIEW` checks the creator; `OWNER TO` needs ownership or superuser, with unowned objects assigned at open; whole-word role options; `DROP ROLE` removes its ACL rows; `trust` is not admin; the IMPORT gate (`pgwire.rs:2436` vs `migrate/sql.rs:57`); MySQL/TDS `USE` re-authenticates; `CREATE DATABASE` copies only the owner (RD1) | ~1–1.5k LOC | An attack suite, one mutation-checked test per hole and per protocol (pgwire, native, MySQL, TDS). **A patch release** |
+| **R0: security floor** (the sharding plan's T0) | C1–C5 closed: user SQL cannot read or write `rdb_roles` or `__rdb_*`; checks fail closed; `CREATE VIEW` checks the creator; `OWNER TO` needs ownership or superuser, with unowned objects assigned at open; whole-word role options; `DROP ROLE` removes its ACL rows; `trust` is not admin; the IMPORT gate (`pgwire.rs:2436` vs `migrate/sql.rs:57`); MySQL/TDS `USE` re-authenticates; `CREATE DATABASE` copies only the owner (RD1) | ~1–1.5k LOC | An attack suite, one mutation-checked test per hole and per protocol (pgwire, native, MySQL, TDS). **Ships in 1.1.0** (RD5) |
 | **R1: model v2 and cache** | Role and object ids; `__rdb_authid`, `__rdb_auth_members`, ACL v2 bitsets; the migration and `roles_v2`; `AclSnapshot`; `authorize` at object resolution on every path; ownership checks on every object kind; real sequence, function and type privileges; the CTE and `FOR UPDATE` rules; the system capability for internal writes; the process-admin attribute | ~5–7k LOC | The §6 budget; the pgdiff privilege corpus green; crash images of the migration |
 | **R2: PostgreSQL completeness** | SET ROLE; INHERIT/ADMIN/SET options; CREATEROLE/CREATEDB/CONNECTION LIMIT/VALID UNTIL; ALTER ROLE SET/RENAME; changing your own password; storing verifiers as given; REASSIGN/DROP OWNED; dependency-checked DROP ROLE; default privileges for every kind; REVOKE CASCADE; column privileges; SECURITY DEFINER; §7's introspection; MySQL/T-SQL mappings | ~5–6k LOC | psql `\du \dp \ddp`, `pg_dumpall --roles-only` restore, the ORM drivers' role probes |
 | **R3: row-level security** | Policies, `FORCE`, `BYPASSRLS`. Policies are injected as predicates before the scan, so the prefilter and indexes still apply; the learned-statement and query caches are keyed by policy generation | ~4–5k LOC | Policy correctness against PG17; a point read on an RLS table within 5% of the same query with the predicate written by hand |
@@ -256,12 +256,14 @@ database, which is what lets one database's credentials never open another.
   privilege registry, and its admin operations wait for R0.
 - The sharding plan's T1 becomes "use R1's process-admin attribute".
 
-## 10. Decisions for the owner
+## 10. Decisions (decided by the owner 2026-11-23)
 
-| # | Decision | Recommendation |
+RD1–RD4 accepted as recommended. RD5 changed: R0 ships in 1.1.0, not as a patch.
+
+| # | Decision | Outcome |
 |---|---|---|
 | RD1 | What `CREATE DATABASE` copies. Today: every role and verifier from the default database | **The creating role and the `OWNER` only** (`roles.create_database_roles = owner`). `all` stays available as a setting for those who rely on today's behaviour |
 | RD2 | Whether verifiers are readable through SQL | **Never**, not even by superusers. Internal APIs (the gateway, replication) get them by capability |
 | RD3 | md5 | Keep accepting it where configured, warn at each md5 login, and make SCRAM the default for new passwords. Off for new installs |
 | RD4 | `KV` privilege default | Granted to PUBLIC, so nothing changes for existing apps. Revocable per database |
-| RD5 | Release target | **R0 as a patch release (1.0.1)** as soon as it is green. R1 and R2 for 1.1.0 |
+| RD5 | Release target | **DECIDED: R0 ships in 1.1.0**, not a 1.0.x patch (owner's call; recommendation was 1.0.1). R1 and R2 also target 1.1.0 |
