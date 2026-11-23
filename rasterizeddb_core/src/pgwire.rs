@@ -74,6 +74,8 @@ mod engine_bug_tests;
 #[cfg(test)]
 mod correlated_subquery_tests;
 #[cfg(test)]
+mod vacuum_snapshot_tests;
+#[cfg(test)]
 mod shape_repair_tests;
 mod fixed_rows;
 mod native_session;
